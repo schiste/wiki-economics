@@ -7,6 +7,16 @@ For software dependency and license inventory, see
 
 All data comes from publicly available Wikimedia dumps. No private APIs, CheckUser data, or non-public datasets are used.
 
+Reuse of Wikimedia dump content is governed separately from this
+project's MIT/Apache-2.0 software license. Refer to the [Wikimedia dumps
+legal page](https://dumps.wikimedia.org/legal.html) and the [Wikimedia
+Foundation Terms of Use](https://foundation.wikimedia.org/wiki/Policy:Terms_of_Use)
+for the canonical reuse terms. As of this writing the dump *content* is
+predominantly licensed under [CC BY-SA 4.0](https://creativecommons.org/licenses/by-sa/4.0/)
+(with some metadata fields under [CC0](https://creativecommons.org/publicdomain/zero/1.0/));
+verify against the official sources before publishing derivative
+analytics, since the upstream terms can change.
+
 ### MediaWiki History dumps
 
 The primary data source. These are tab-separated files published by the Wikimedia Foundation at [dumps.wikimedia.org/other/mediawiki_history](https://dumps.wikimedia.org/other/mediawiki_history/). Each row represents a revision event and contains 76 columns covering:

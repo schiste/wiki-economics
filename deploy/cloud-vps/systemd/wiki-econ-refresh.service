@@ -18,6 +18,19 @@ PrivateTmp=yes
 ProtectHome=true
 PrivateDevices=true
 ProtectSystem=full
+# Additional kernel-surface and namespace hardening for the batch refresh
+# unit. Run `systemd-analyze security wiki-econ-refresh.service` after a
+# config change to confirm the score has not regressed.
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 ReadWritePaths=/srv/wiki-economics /etc/wiki-economics /etc/wiki-economics.env
 
 [Install]

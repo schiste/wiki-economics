@@ -635,15 +635,11 @@ fn parse_logging_events(
                     }
                     "logitem" => {
                         match current.take() {
-                            Some(item)
-                                if matches!(item.log_type.as_deref(), Some("patrol")) =>
-                            {
+                            Some(item) if matches!(item.log_type.as_deref(), Some("patrol")) => {
                                 patrol_writer.add(item.into_patrol_row())?;
                                 patrol_count += 1;
                             }
-                            Some(item)
-                                if matches!(item.log_type.as_deref(), Some("rights")) =>
-                            {
+                            Some(item) if matches!(item.log_type.as_deref(), Some("rights")) => {
                                 rights_writer.add(item.into_rights_row())?;
                                 rights_count += 1;
                             }
@@ -2043,6 +2039,12 @@ fn format_year_month(year_month_key: i32) -> String {
 }
 
 fn parse_timestamp_seconds(value: &str) -> Option<i64> {
+    // MediaWiki dump timestamps are documented as UTC, so we attach UTC
+    // here without consulting a tz database. `chrono` is built with
+    // `default-features = false` and ships no tz database in this binary;
+    // any future need to interpret non-UTC timestamps must be a
+    // deliberate change to both this call site and the chrono feature
+    // flags in Cargo.toml.
     let normalized = normalize_timestamp(value);
     NaiveDateTime::parse_from_str(&normalized, "%Y-%m-%d %H:%M:%S")
         .ok()

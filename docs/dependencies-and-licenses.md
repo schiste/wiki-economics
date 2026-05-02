@@ -19,7 +19,9 @@ remain the checked-in manifests and lockfiles:
   pipeline, Python sidecar workflow, dashboard, and local build/query stack.
 - Wikimedia dump content is separate from software licensing. The reuse terms
   for Wikimedia datasets and derived content should be evaluated independently
-  from the licenses of the tools listed here.
+  from the licenses of the tools listed here. The canonical entry points are
+  the [Wikimedia dumps legal page](https://dumps.wikimedia.org/legal.html) and
+  the [Wikimedia Foundation Terms of Use](https://foundation.wikimedia.org/wiki/Policy:Terms_of_Use).
 - External toolchains such as Rust, Python, Node.js, and npm are required to
   work on the repository locally, but they are installed outside this repo and
   are not vendored here.

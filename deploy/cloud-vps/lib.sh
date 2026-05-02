@@ -103,9 +103,21 @@ wiki_econ_cloud_has_merged_artifacts() {
 }
 
 wiki_econ_cloud_write_status() {
+  # Build the status JSON via printf to avoid the trap of a heredoc that
+  # silently embeds unescaped quotes if release_name ever contains them.
   local output_path="$1"
   local release_name="$2"
-  cat > "$output_path" <<EOF
-{"release":"$release_name","updated_at":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"}
-EOF
+  local timestamp
+  timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  if command -v jq >/dev/null 2>&1; then
+    jq -n --arg release "$release_name" --arg updated_at "$timestamp" \
+      '{release: $release, updated_at: $updated_at}' >"$output_path"
+  else
+    # jq is not installed on every operator host; fall back to a printf
+    # that escapes embedded double quotes in release_name. This branch is
+    # the historical heredoc behavior with the bare-minimum hardening.
+    local escaped="${release_name//\"/\\\"}"
+    printf '{"release":"%s","updated_at":"%s"}\n' "$escaped" "$timestamp" \
+      >"$output_path"
+  fi
 }

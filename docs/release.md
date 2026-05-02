@@ -67,4 +67,21 @@ For a public repo, keep these enabled:
 1. Branch protection for `main`.
 2. Required CI before merge.
 3. Dependabot alerts and updates.
-4. Issue/PR templates when the collaboration workflow settles.
+4. Issue and PR templates (already shipped under `.github/`).
+
+## Versioning & Changelog
+
+The repo follows [Semantic Versioning](https://semver.org/) at the
+package level (`Cargo.toml`'s `version` field). The first stable
+release is `v1.0.0`; pre-1.0 changes can break compatibility within a
+minor bump.
+
+Tag releases as `vMAJOR.MINOR.PATCH` (e.g. `v0.2.0`). Do not tag
+internal data refreshes — those are operational events, not code
+releases.
+
+Maintain a `CHANGELOG.md` at the repository root following the
+[Keep a Changelog](https://keepachangelog.com/) format. Each tagged
+release gets a section with the date and a short list of `Added`,
+`Changed`, `Deprecated`, `Removed`, `Fixed`, `Security` bullets.
+The unreleased section accumulates work-in-progress between tags.

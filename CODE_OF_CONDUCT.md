@@ -23,4 +23,9 @@ Participation in this project should stay respectful, direct, and constructive. 
 
 Project maintainers may remove comments, close threads, reject contributions, or block participants whose behavior harms the project or its contributors.
 
-Report conduct issues privately to the maintainers using the contact information available on the repository profile.
+Report conduct issues privately by opening a [GitHub security
+advisory](https://github.com/christophehenner/wiki-economics/security/advisories/new)
+on the repository (advisories support private reporting), or by
+contacting the maintainer listed on the repository profile. Reports
+are read by the project maintainers only and are handled
+confidentially.

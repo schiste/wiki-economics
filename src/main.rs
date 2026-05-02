@@ -2,14 +2,14 @@
 
 mod bench;
 mod compute;
+#[cfg(test)]
+mod end_to_end_tests;
 mod fetch;
 mod ingest;
 mod merge;
 mod patrol;
 mod schema;
 mod storage;
-#[cfg(test)]
-mod end_to_end_tests;
 #[cfg(test)]
 mod test_support;
 
@@ -977,8 +977,13 @@ mod tests {
         );
 
         write_patrol_compute_input(data_dir.path(), "patrolcomputewiki")?;
-        let result =
-            ops.compute_patrol("patrolcomputewiki", data_dir.path(), output_dir.path(), false, None);
+        let result = ops.compute_patrol(
+            "patrolcomputewiki",
+            data_dir.path(),
+            output_dir.path(),
+            false,
+            None,
+        );
         result?;
         assert!(
             output_dir
@@ -998,8 +1003,13 @@ mod tests {
             .join("_patrol_parts");
         fs::create_dir_all(&parts_dir)?;
         fs::write(parts_dir.join("stale.parquet"), b"stale-bytes")?;
-        let rebuild_result =
-            ops.compute_patrol("patrolcomputewiki", data_dir.path(), output_dir.path(), true, None);
+        let rebuild_result = ops.compute_patrol(
+            "patrolcomputewiki",
+            data_dir.path(),
+            output_dir.path(),
+            true,
+            None,
+        );
         rebuild_result?;
         let stale_gone = !parts_dir.join("stale.parquet").exists();
         assert!(stale_gone);

@@ -130,12 +130,24 @@ python3 -m unittest scripts/test_fetch_patrol.py
 ## Project Guides
 
 - [Architecture](docs/architecture.md)
+- [Admin Server](docs/admin-server.md)
 - [Cloud VPS Deployment](docs/cloud-vps-deploy.md)
 - [Development](docs/development.md)
 - [Benchmarking](docs/benchmarking.md)
 - [Dependencies and Licenses](docs/dependencies-and-licenses.md)
 - [Publishing](docs/release.md)
+- [Security Model](docs/security.md)
 - [Stack and Data Sources](docs/stack-and-data-sources.md)
+- [Troubleshooting](docs/troubleshooting.md)
+
+## Platform Notes
+
+- macOS and Linux are first-class platforms. CI runs on `ubuntu-latest`
+  and the developer-side flow is exercised on macOS.
+- Windows is supported on a best-effort basis. `site/src/data` is a
+  symlink to `../../output`, which requires Developer Mode or
+  `git config core.symlinks true` to clone correctly. See the
+  troubleshooting guide for details.
 
 ## Data and Artifacts
 

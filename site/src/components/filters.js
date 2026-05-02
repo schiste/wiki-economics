@@ -276,6 +276,12 @@ export async function queryGrouped(db, table, {
   for (const c of sumCols) selects.push(`CAST(SUM("${c}") AS DOUBLE) as "${c}"`)
   for (const c of avgCols) selects.push(`CAST(AVG("${c}") AS DOUBLE) as "${c}"`)
 
+  // SQL is built by string interpolation deliberately. This runs against an
+  // in-browser DuckDB-WASM database loaded from the user's own session — the
+  // sandbox boundary is the user's tab, not a shared backend. If you ever
+  // copy this pattern into a server-side context (Node admin, edge worker,
+  // anywhere a value can travel between users), replace the interpolation
+  // with parameterized queries first; the inputs here are not validated.
   const conditions = [`wiki = '${wiki}'`]
   if (userTypes?.length)
     conditions.push(`user_type IN (${userTypes.map(t => `'${t}'`).join(",")})`)
