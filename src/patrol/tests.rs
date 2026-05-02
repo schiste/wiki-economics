@@ -1140,6 +1140,24 @@ fn artifact_helpers_cover_bootstrap_merge_refresh_and_defaults() -> Result<()> {
 }
 
 #[test]
+fn clear_patrol_parts_dir_is_idempotent_and_removes_existing_dir() -> Result<()> {
+    init_test_tracing();
+    let temp_dir = TestDir::new()?;
+    let output_dir = temp_dir.path().join("output");
+
+    // Missing dir → no-op (covers the early-return path).
+    clear_patrol_parts_dir(&output_dir, "missingwiki")?;
+
+    // Existing dir with a stray file → removed.
+    let parts_dir = output_dir.join("livewiki").join("_patrol_parts");
+    fs::create_dir_all(&parts_dir)?;
+    fs::write(parts_dir.join("stale.parquet"), b"stale")?;
+    clear_patrol_parts_dir(&output_dir, "livewiki")?;
+    assert!(!parts_dir.exists());
+    Ok(())
+}
+
+#[test]
 fn bootstrap_patrol_parts_writes_atomically_and_ignores_stray_tmp_files() -> Result<()> {
     init_test_tracing();
     let temp_dir = TestDir::new()?;

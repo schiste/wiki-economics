@@ -349,10 +349,7 @@ pub fn compute_patrol(
     }
 
     if rebuild {
-        let parts_dir = patrol_parts_dir(output_dir, wiki);
-        if parts_dir.exists() {
-            fs::remove_dir_all(&parts_dir)?;
-        }
+        clear_patrol_parts_dir(output_dir, wiki)?;
     } else {
         bootstrap_patrol_parts_from_final(output_dir, wiki)?;
     }
@@ -1459,9 +1456,14 @@ impl PatrolRowMetrics {
             .map(|entry| entry.latencies_hours.clone())
             .unwrap_or_default();
         latencies.sort_by(f64::total_cmp);
-        let median_latency_hours = latencies
-            .get(latencies.len().checked_div(2).unwrap_or_default())
-            .copied();
+        // Lower-median convention: for an even-length vec, return the lower of
+        // the two middle elements rather than the upper. Matches the standard
+        // statistics convention. Empty vec → None.
+        let median_latency_hours = if latencies.is_empty() {
+            None
+        } else {
+            latencies.get((latencies.len() - 1) / 2).copied()
+        };
         let p90_latency_hours = if latencies.is_empty() {
             None
         } else {
@@ -1617,6 +1619,19 @@ fn min_patrollers_for_half_share(counts: &[u32], total_patrols: u64) -> u32 {
 
 fn patrol_parts_dir(output_dir: &Path, wiki: &str) -> PathBuf {
     output_dir.join(wiki).join("_patrol_parts")
+}
+
+/// Wipe the per-wiki `_patrol_parts` directory if it exists. Used by the
+/// `--rebuild` path of `compute_patrol` to ensure stale month parts from a
+/// prior run are not silently mixed with the recomputed output. Idempotent:
+/// a missing directory is treated as a no-op.
+fn clear_patrol_parts_dir(output_dir: &Path, wiki: &str) -> Result<()> {
+    let parts_dir = patrol_parts_dir(output_dir, wiki);
+    if !parts_dir.exists() {
+        return Ok(());
+    }
+    fs::remove_dir_all(&parts_dir)?;
+    Ok(())
 }
 
 fn patrol_part_path(output_dir: &Path, wiki: &str, year_month_key: i32) -> PathBuf {

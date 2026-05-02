@@ -21,6 +21,18 @@ pub fn merge_outputs(output_dir: &Path) -> Result<()> {
         if !entry.file_type()?.is_dir() {
             continue;
         }
+        // Skip leading-underscore directories (markers, internal scratch). The
+        // current layout never reads them but the filter is defensive against
+        // future per-wiki sidecar dirs (e.g. `_patrol_parts`) being
+        // accidentally treated as wiki output dirs and dragged into the merge
+        // because their name happens to lack a leading underscore.
+        if entry
+            .file_name()
+            .to_str()
+            .is_some_and(|name| name.starts_with('_'))
+        {
+            continue;
+        }
         let wiki_dir = entry.path();
         for file_entry in fs::read_dir(&wiki_dir)? {
             let file_entry = file_entry?;
@@ -139,6 +151,36 @@ mod tests {
             LazyFrame::scan_parquet(merged_path.as_str().into(), Default::default())?.collect()?;
         assert_eq!(merged.height(), 2);
 
+        Ok(())
+    }
+
+    #[test]
+    fn merge_outputs_skips_underscore_prefixed_subdirectories() -> Result<()> {
+        init_test_tracing();
+        let output_dir = TestDir::new()?;
+        write_metric(output_dir.path(), "frwiki", "metric", 1)?;
+        // Sidecar dir mimicking _patrol_parts at the wiki-output root level.
+        // Without the underscore filter, merge would walk it and try to
+        // concatenate its parquets into the merged output with a foreign
+        // schema.
+        let sidecar = output_dir.path().join("_internal");
+        fs::create_dir_all(&sidecar)?;
+        let mut sidecar_df =
+            DataFrame::new_infer_height(vec![Column::new("unrelated_col".into(), vec!["x"])])?;
+        let mut sidecar_file = fs::File::create(sidecar.join("strange.parquet"))?;
+        ParquetWriter::new(&mut sidecar_file).finish(&mut sidecar_df)?;
+
+        merge_outputs(output_dir.path())?;
+
+        let merged = output_dir.path().join("metric.parquet");
+        let merged_path = merged.to_string_lossy().to_string();
+        let df =
+            LazyFrame::scan_parquet(merged_path.as_str().into(), Default::default())?.collect()?;
+        // Only the legitimate wiki dir contributes rows.
+        assert_eq!(df.height(), 1);
+        // The sidecar's "strange" parquet must not have been promoted to the
+        // root.
+        assert!(!output_dir.path().join("strange.parquet").exists());
         Ok(())
     }
 

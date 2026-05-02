@@ -127,6 +127,8 @@ trait Ops {
         wiki: &str,
         data_dir: &std::path::Path,
         output_dir: &std::path::Path,
+        rebuild: bool,
+        limit_months: Option<usize>,
     ) -> Result<()>;
     fn benchmark(
         &self,
@@ -169,8 +171,10 @@ impl Ops for RealOps {
         wiki: &str,
         data_dir: &std::path::Path,
         output_dir: &std::path::Path,
+        rebuild: bool,
+        limit_months: Option<usize>,
     ) -> Result<()> {
-        patrol::compute_patrol(wiki, data_dir, output_dir, false, None)
+        patrol::compute_patrol(wiki, data_dir, output_dir, rebuild, limit_months)
     }
 
     fn benchmark(
@@ -259,7 +263,7 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
                     ops.compute_all(wiki, &data_dir, &output_dir)
                 })?;
                 run_timed_stage("patrol_compute", Some(wiki), || {
-                    ops.compute_patrol(wiki, &data_dir, &output_dir)
+                    ops.compute_patrol(wiki, &data_dir, &output_dir, false, None)
                 })?;
             }
             run_timed_stage("merge", None, || ops.merge_outputs(&output_dir))?;
@@ -284,11 +288,7 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
         } => {
             for wiki in &wikis {
                 run_timed_stage("patrol_compute", Some(wiki), || {
-                    if rebuild || limit_months.is_some() {
-                        patrol::compute_patrol(wiki, &data_dir, &output_dir, rebuild, limit_months)
-                    } else {
-                        ops.compute_patrol(wiki, &data_dir, &output_dir)
-                    }
+                    ops.compute_patrol(wiki, &data_dir, &output_dir, rebuild, limit_months)
                 })?;
             }
         }
@@ -326,7 +326,7 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
                     ops.compute_all(wiki, &data_dir, &output_dir)
                 })?;
                 run_timed_stage("patrol_compute", Some(wiki), || {
-                    ops.compute_patrol(wiki, &data_dir, &output_dir)
+                    ops.compute_patrol(wiki, &data_dir, &output_dir, false, None)
                 })?;
             }
             run_timed_stage("merge", None, || ops.merge_outputs(&output_dir))?;
@@ -572,9 +572,19 @@ mod tests {
             Ok(())
         }
 
-        fn compute_patrol(&self, wiki: &str, data_dir: &Path, output_dir: &Path) -> Result<()> {
+        fn compute_patrol(
+            &self,
+            wiki: &str,
+            data_dir: &Path,
+            output_dir: &Path,
+            rebuild: bool,
+            limit_months: Option<usize>,
+        ) -> Result<()> {
+            let limit_str = limit_months
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "_".to_string());
             self.record(format!(
-                "compute_patrol:{wiki}:{}:{}",
+                "compute_patrol:{wiki}:{}:{}:{rebuild}:{limit_str}",
                 data_dir.display(),
                 output_dir.display()
             ));
@@ -634,7 +644,14 @@ mod tests {
             Ok(())
         }
 
-        fn compute_patrol(&self, _wiki: &str, _data_dir: &Path, _output_dir: &Path) -> Result<()> {
+        fn compute_patrol(
+            &self,
+            _wiki: &str,
+            _data_dir: &Path,
+            _output_dir: &Path,
+            _rebuild: bool,
+            _limit_months: Option<usize>,
+        ) -> Result<()> {
             if self.fail_stage == "compute_patrol" {
                 anyhow::bail!("compute patrol failed");
             }
@@ -726,9 +743,9 @@ mod tests {
             ops.calls.into_inner(),
             vec![
                 "compute:frwiki:d:o",
-                "compute_patrol:frwiki:d:o",
+                "compute_patrol:frwiki:d:o:false:_",
                 "compute:dewiki:d:o",
-                "compute_patrol:dewiki:d:o",
+                "compute_patrol:dewiki:d:o:false:_",
                 "merge:o",
             ]
         );
@@ -775,37 +792,43 @@ mod tests {
 
         run_with_ops(cli, &ops)?;
 
-        assert_eq!(ops.calls.into_inner(), vec!["compute_patrol:frwiki:d:o"]);
+        assert_eq!(
+            ops.calls.into_inner(),
+            vec!["compute_patrol:frwiki:d:o:false:_"]
+        );
         Ok(())
     }
 
     #[test]
-    fn run_with_ops_dispatches_patrol_compute_rebuild_via_real_pipeline() -> Result<()> {
+    fn run_with_ops_dispatches_patrol_compute_with_rebuild_flag() -> Result<()> {
         init_test_tracing();
         let data_dir = TestDir::new()?;
         let output_dir = TestDir::new()?;
-        write_patrol_compute_input(data_dir.path(), "testwiki")?;
+        // Path content is hashed for the recording assertion only; actual
+        // parquet output is asserted in the RealOps integration further down.
+        let data_path = data_dir.path().to_str().expect("utf-8 path").to_string();
+        let output_path = output_dir.path().to_str().expect("utf-8 path").to_string();
         let cli = Cli::try_parse_from([
             "wiki-econ",
             "--data-dir",
-            data_dir.path().to_str().expect("utf-8 path"),
+            &data_path,
             "--output-dir",
-            output_dir.path().to_str().expect("utf-8 path"),
+            &output_path,
             "patrol-compute",
             "testwiki",
             "--rebuild",
+            "--limit-months",
+            "3",
         ])?;
         let ops = RecordingOps::default();
 
         run_with_ops(cli, &ops)?;
 
-        assert!(ops.calls.into_inner().is_empty());
-        assert!(
-            output_dir
-                .path()
-                .join("testwiki")
-                .join("patrol.parquet")
-                .exists()
+        assert_eq!(
+            ops.calls.into_inner(),
+            vec![format!(
+                "compute_patrol:testwiki:{data_path}:{output_path}:true:3"
+            )]
         );
         Ok(())
     }
@@ -864,7 +887,7 @@ mod tests {
                 "fetch_patrol:frwiki:dataset",
                 "ingest:frwiki:dataset",
                 "compute:frwiki:dataset:results",
-                "compute_patrol:frwiki:dataset:results",
+                "compute_patrol:frwiki:dataset:results:false:_",
                 "merge:results",
             ]
         );
@@ -954,7 +977,9 @@ mod tests {
         );
 
         write_patrol_compute_input(data_dir.path(), "patrolcomputewiki")?;
-        ops.compute_patrol("patrolcomputewiki", data_dir.path(), output_dir.path())?;
+        let result =
+            ops.compute_patrol("patrolcomputewiki", data_dir.path(), output_dir.path(), false, None);
+        result?;
         assert!(
             output_dir
                 .path()
@@ -962,6 +987,22 @@ mod tests {
                 .join("patrol.parquet")
                 .exists()
         );
+
+        // Re-run with rebuild=true after pre-creating the parts dir; this
+        // exercises the branch in patrol::compute_patrol that wipes
+        // _patrol_parts before recomputing month parts. Ensures the rebuild
+        // arg threads through `Ops::compute_patrol` to the real pipeline.
+        let parts_dir = output_dir
+            .path()
+            .join("patrolcomputewiki")
+            .join("_patrol_parts");
+        fs::create_dir_all(&parts_dir)?;
+        fs::write(parts_dir.join("stale.parquet"), b"stale-bytes")?;
+        let rebuild_result =
+            ops.compute_patrol("patrolcomputewiki", data_dir.path(), output_dir.path(), true, None);
+        rebuild_result?;
+        let stale_gone = !parts_dir.join("stale.parquet").exists();
+        assert!(stale_gone);
         Ok(())
     }
 
@@ -1150,7 +1191,7 @@ mod tests {
         ops.fetch_patrol("frwiki", data_dir)?;
         ops.ingest_wiki("frwiki", data_dir)?;
         ops.compute_all("frwiki", data_dir, output_dir)?;
-        ops.compute_patrol("frwiki", data_dir, output_dir)?;
+        ops.compute_patrol("frwiki", data_dir, output_dir, false, None)?;
         ops.benchmark(&wikis, data_dir, output_dir, 0, 1, false)?;
         ops.merge_outputs(output_dir)?;
         Ok(())
