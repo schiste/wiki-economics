@@ -4,6 +4,9 @@
   "license": "(MIT OR Apache-2.0)",
   "scripts": {
     "build": "cargo build --release",
+    "build:site": "scripts/build-site.sh",
+    "ci:local": "./scripts/ci-local.sh",
+    "refresh": "scripts/refresh.sh",
     "setup": "scripts/setup.sh",
     "dev": "scripts/dev.sh",
     "start": "scripts/dev.sh"

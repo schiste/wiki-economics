@@ -4,6 +4,21 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+echo "==> bash -n scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh"
+bash -n scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh
+
+echo "==> node --check site/admin-server.cjs"
+node --check site/admin-server.cjs
+
+echo "==> node --check site/observablehq.config.js"
+node --check site/observablehq.config.js
+
+echo "==> ./scripts/build-site.sh --help"
+./scripts/build-site.sh --help
+
+echo "==> ./scripts/refresh.sh --help"
+./scripts/refresh.sh --help
+
 echo "==> cargo fmt --all -- --check"
 cargo fmt --all -- --check
 
@@ -37,5 +52,12 @@ python3 -m py_compile \
 
 echo "==> python3 -m unittest scripts/test_fetch_patrol.py"
 python3 -m unittest scripts/test_fetch_patrol.py
+
+if [ -f "$ROOT/output/manifest.json" ]; then
+  echo "==> ./scripts/build-site.sh"
+  ./scripts/build-site.sh
+else
+  echo "==> skipping site build smoke check (output/manifest.json not present)"
+fi
 
 echo "==> all local checks passed"

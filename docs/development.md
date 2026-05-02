@@ -43,6 +43,44 @@ Expected bar:
 - coverage is expected to stay at 100% line coverage in the exported LCOV artifact
 - dependency and advisory checks are part of the normal workflow
 
+The local verification script also checks:
+
+- shell syntax for the shared operational scripts
+- Node syntax for the dev/operator admin server and Observable config
+- helper entrypoint usage for `scripts/build-site.sh` and `scripts/refresh.sh`
+- a production site build when merged dashboard artifacts are already present locally
+
+## Runtime Profiles
+
+The repo is intentionally one codebase with two orchestration modes:
+
+- `local`: `scripts/setup.sh`, `scripts/dev.sh`, and the admin UI/API for interactive onboarding
+- `production`: `deploy/cloud-vps/` wrappers, static site serving, and scheduled refreshes
+
+The shared contract across both modes is:
+
+- the Rust CLI
+- the Python patrol pipeline
+- the merged artifact format under `output/`
+- the Observable production site build
+
+The main rule is that deployment differences should live in scripts and env,
+not in forked pipeline logic.
+
+## Shared Operational Entry Points
+
+The repo-level operational scripts are:
+
+- `scripts/setup.sh` for local bootstrap
+- `scripts/dev.sh` for the local dashboard plus dev/operator admin API
+- `scripts/refresh.sh` for shared batch refresh orchestration
+- `scripts/build-site.sh` for production-style Observable builds
+
+Shared runtime path handling lives in `scripts/lib/wiki_econ.sh`.
+
+Production wrappers under `deploy/cloud-vps/` should call those shared scripts
+rather than reimplementing pipeline steps.
+
 ## CI Structure
 
 GitHub Actions is split into three jobs:
@@ -102,7 +140,7 @@ The following are live architecture contracts, not incidental implementation det
 - compute prefers the partitioned incremental path when that layout exists
 - compatibility fallback for older parquet layouts still exists for both full-wiki and partitioned loads and should not be broken casually
 - per-wiki metric outputs should include a `wiki` column before merge
-- merge is responsible for refreshing shared dashboard artifacts in `output/` (`manifest.json`, `defaults_*.json`)
+- merge is responsible for refreshing shared dashboard artifacts in `output/` (`manifest.json`, `defaults_*.json`) from the checked-in generator scripts under `site/data-build/`
 - patrol compute also refreshes its merged/default artifacts because it still runs through the Python sidecar pipeline
 
 If any of these change, update `docs/architecture.md`, tests, and storage helpers together.

@@ -96,9 +96,10 @@ The dashboard has a very small direct JavaScript dependency surface.
 | `@observablehq/framework` | `^1.13.4` | site generation and client framework | `ISC` |
 | `duckdb` | `^1.4.4` | build-time and browser query engine | `MIT` |
 
-DuckDB is also required locally as a CLI for the shell-based `output/*.json.sh`
-generators. The repository does not vendor the DuckDB CLI binary itself; users
-install it separately through their platform package manager.
+DuckDB is also required locally as a CLI for the checked-in
+`site/data-build/*.json.sh` generators. The repository does not vendor the
+DuckDB CLI binary itself; users install it separately through their platform
+package manager.
 
 ## Python Sidecar
 

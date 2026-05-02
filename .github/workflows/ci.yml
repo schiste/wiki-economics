@@ -22,6 +22,11 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
+      - name: Install Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -29,6 +34,20 @@ jobs:
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@v2
+
+      - name: Check shell script syntax
+        run: bash -n scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh
+
+      - name: Check Node entrypoint syntax
+        run: |
+          node --check site/admin-server.cjs
+          node --check site/observablehq.config.js
+
+      - name: Check helper CLI entrypoints
+        run: |
+          ./scripts/build-site.sh --help
+          ./scripts/refresh.sh --help
+          ./scripts/setup.sh --help
 
       - name: Check formatting
         run: cargo fmt --all -- --check

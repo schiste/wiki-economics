@@ -8,6 +8,11 @@ The repository currently has three main parts:
 - A Python sidecar pipeline for patrol logging data.
 - An Observable Framework site for publishing the resulting datasets and charts.
 
+The repo now supports two runtime profiles from the same codebase:
+
+- `local`: interactive development, local data onboarding, and the dev/operator admin UI
+- `production`: static read-only site serving plus scheduled refresh orchestration for a VPS
+
 ## Repository Status
 
 This repository is curated for a public open-source release. Source code, documentation, vendored patches, lockfiles, and quality gates are tracked here; generated data, local caches, build outputs, and installed dependencies are intentionally excluded from version control.
@@ -18,6 +23,12 @@ For a friendlier local bootstrap, run:
 
 ```sh
 ./scripts/setup.sh
+```
+
+or:
+
+```sh
+npm run setup
 ```
 
 That script will:
@@ -55,7 +66,13 @@ Build the Rust CLI:
 cargo build --release
 ```
 
-Run a small end-to-end example:
+Run a small end-to-end refresh:
+
+```sh
+./scripts/refresh.sh frwiki
+```
+
+Expanded equivalent:
 
 ```sh
 cargo run --release -- fetch frwiki
@@ -66,12 +83,10 @@ cargo run --release -- merge
 
 Pass `--version YYYY-MM` to `fetch` or `run` when you need a specific dump snapshot. If omitted, the CLI defaults to the previous UTC month.
 
-Build the site:
+Build the production site against the current local artifacts:
 
 ```sh
-cd site
-npm install
-npm run build
+./scripts/build-site.sh
 ```
 
 The Observable site reads generated dashboard artifacts from `site/src/data -> ../../output`. Build `output/` locally before expecting the dashboard pages to render real data.
@@ -81,6 +96,8 @@ Start the local dashboard and admin server together:
 ```sh
 scripts/dev.sh
 ```
+
+The admin API is a local/dev operator tool. It is intentionally not part of the public production surface.
 
 ## Local Verification
 
@@ -93,6 +110,11 @@ Preferred full local verification command:
 Equivalent expanded commands:
 
 ```sh
+bash -n scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh
+node --check site/admin-server.cjs
+node --check site/observablehq.config.js
+./scripts/build-site.sh --help
+./scripts/refresh.sh --help
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
@@ -108,6 +130,7 @@ python3 -m unittest scripts/test_fetch_patrol.py
 ## Project Guides
 
 - [Architecture](docs/architecture.md)
+- [Cloud VPS Deployment](docs/cloud-vps-deploy.md)
 - [Development](docs/development.md)
 - [Benchmarking](docs/benchmarking.md)
 - [Dependencies and Licenses](docs/dependencies-and-licenses.md)
@@ -118,6 +141,7 @@ python3 -m unittest scripts/test_fetch_patrol.py
 
 - `data/` is fetched or generated locally and is intentionally not committed.
 - `output/` is generated locally and feeds the dashboard via `site/src/data -> ../../output`.
+- `site/data-build/` contains the checked-in generator scripts that materialize `manifest.json` and `defaults_*.json` into the active output directory.
 - `site/dist/` and `site/node_modules/` are build artifacts and local dependencies.
 
 If you need small permanent fixtures for tests, add them deliberately rather than checking in ad hoc working data.
