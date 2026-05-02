@@ -1,10 +1,10 @@
 use anyhow::Result;
 use polars::prelude::*;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use tracing::debug;
 
-use super::write_output;
+use super::{ChurnAccumulator, write_output};
 
 pub(crate) fn normalize_period_key(year_month_key: i32, period_type: &str) -> Result<i32> {
     let year = year_month_key / 100;
@@ -84,89 +84,29 @@ pub(crate) fn build_cohort_output(
     .map_err(Into::into)
 }
 
-/// Compute churn (arrivals, departures, rates) for a given time granularity.
+/// Compute churn (arrivals, departures, rates) for a given time granularity by
+/// feeding `editor_months` rows through a single `ChurnAccumulator`. This is a
+/// thin wrapper that exists so the legacy `compute()` (whole-history) path and
+/// the incremental compute path in `super` share the same accumulator code.
 /// `editor_months` must have columns: event_user_id, year_month_key, edits.
-fn churn_for_granularity(editor_months: &DataFrame, period_type: &str) -> Result<DataFrame> {
+fn churn_via_accumulator(
+    editor_months: &DataFrame,
+    period_type: &'static str,
+) -> Result<DataFrame> {
     let user_ids = editor_months.column("event_user_id")?.i64()?;
     let year_month_keys = editor_months.column("year_month_key")?.i32()?;
 
-    let mut seen: HashSet<(i64, i32)> = HashSet::new();
-    let mut active: BTreeMap<i32, u32> = BTreeMap::new();
-    let mut spans: HashMap<i64, (i32, i32)> = HashMap::new();
-
+    let mut accumulator = ChurnAccumulator::new(period_type);
     for index in 0..editor_months.height() {
         let (Some(user_id), Some(year_month_key)) =
             (user_ids.get(index), year_month_keys.get(index))
         else {
             continue;
         };
-
         let period_key = normalize_period_key(year_month_key, period_type)?;
-        if !seen.insert((user_id, period_key)) {
-            continue;
-        }
-
-        *active.entry(period_key).or_insert(0) += 1;
-
-        spans
-            .entry(user_id)
-            .and_modify(|(first, last)| {
-                if period_key < *first {
-                    *first = period_key;
-                }
-                if period_key > *last {
-                    *last = period_key;
-                }
-            })
-            .or_insert((period_key, period_key));
+        accumulator.observe(user_id, period_key);
     }
-
-    let mut arrivals: HashMap<i32, u32> = HashMap::new();
-    let mut departures: HashMap<i32, u32> = HashMap::new();
-    for (first, last) in spans.into_values() {
-        *arrivals.entry(first).or_insert(0) += 1;
-        *departures.entry(last).or_insert(0) += 1;
-    }
-
-    let period_keys: Vec<i32> = active.keys().copied().collect();
-    let periods: Vec<String> = period_keys
-        .iter()
-        .map(|period_key| format_period_key(*period_key, period_type))
-        .collect();
-    let active_editors: Vec<u32> = period_keys
-        .iter()
-        .map(|period_key| active[period_key])
-        .collect();
-    let arrivals_out: Vec<u32> = period_keys
-        .iter()
-        .map(|period_key| arrivals.get(period_key).copied().unwrap_or(0))
-        .collect();
-    let departures_out: Vec<u32> = period_keys
-        .iter()
-        .map(|period_key| departures.get(period_key).copied().unwrap_or(0))
-        .collect();
-    let arrival_rate: Vec<f64> = arrivals_out
-        .iter()
-        .zip(&active_editors)
-        .map(|(&arrivals_count, &active_count)| arrivals_count as f64 / active_count as f64)
-        .collect();
-    let departure_rate: Vec<f64> = departures_out
-        .iter()
-        .zip(&active_editors)
-        .map(|(&departures_count, &active_count)| departures_count as f64 / active_count as f64)
-        .collect();
-    let period_count = periods.len();
-
-    DataFrame::new_infer_height(vec![
-        Column::new("period".into(), periods),
-        Column::new("active_editors".into(), active_editors),
-        Column::new("arrivals".into(), arrivals_out),
-        Column::new("departures".into(), departures_out),
-        Column::new("period_type".into(), vec![period_type; period_count]),
-        Column::new("arrival_rate".into(), arrival_rate),
-        Column::new("departure_rate".into(), departure_rate),
-    ])
-    .map_err(Into::into)
+    accumulator.finish()
 }
 
 /// Compute labor market metrics: participation, churn, cohort survival.
@@ -240,9 +180,9 @@ pub fn compute(wiki: &str, base: &DataFrame, output_dir: &Path) -> Result<()> {
         .agg([col("revision_id").count().alias("edits")])
         .collect()?;
 
-    let churn_monthly = churn_for_granularity(&editor_months, "month")?;
-    let churn_quarterly = churn_for_granularity(&editor_months, "quarter")?;
-    let churn_yearly = churn_for_granularity(&editor_months, "year")?;
+    let churn_monthly = churn_via_accumulator(&editor_months, "month")?;
+    let churn_quarterly = churn_via_accumulator(&editor_months, "quarter")?;
+    let churn_yearly = churn_via_accumulator(&editor_months, "year")?;
 
     let churn_frames = [
         churn_monthly.lazy(),
@@ -260,7 +200,7 @@ pub fn compute(wiki: &str, base: &DataFrame, output_dir: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{build_cohort_output, churn_for_granularity, format_period_key};
+    use super::{build_cohort_output, churn_via_accumulator, format_period_key};
     use polars::prelude::*;
 
     #[test]
@@ -272,7 +212,7 @@ mod tests {
         ];
         let editor_months = DataFrame::new_infer_height(columns)?;
 
-        let churn = churn_for_granularity(&editor_months, "quarter")?;
+        let churn = churn_via_accumulator(&editor_months, "quarter")?;
         let arrivals = churn.column("arrivals")?.u32()?.get(0);
         let active = churn.column("active_editors")?.u32()?.get(0);
 
@@ -302,8 +242,8 @@ mod tests {
         ];
         let editor_months = DataFrame::new_infer_height(columns)?;
 
-        let monthly = churn_for_granularity(&editor_months, "month")?;
-        let yearly = churn_for_granularity(&editor_months, "year")?;
+        let monthly = churn_via_accumulator(&editor_months, "month")?;
+        let yearly = churn_via_accumulator(&editor_months, "year")?;
 
         assert_eq!(monthly.height(), 4);
         assert_eq!(yearly.height(), 2);
@@ -321,7 +261,7 @@ mod tests {
         ];
         let editor_months = DataFrame::new_infer_height(columns)?;
 
-        let err = churn_for_granularity(&editor_months, "week").expect_err("invalid period type");
+        let err = churn_via_accumulator(&editor_months, "week").expect_err("invalid period type");
         assert!(err.to_string().contains("unsupported period type"));
         Ok(())
     }

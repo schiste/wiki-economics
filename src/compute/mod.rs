@@ -12,7 +12,7 @@ use tracing::info;
 
 use crate::{schema, storage};
 
-struct ChurnAccumulator {
+pub(super) struct ChurnAccumulator {
     period_type: &'static str,
     seen: HashSet<(i64, i32)>,
     active: BTreeMap<i32, u32>,
@@ -20,7 +20,7 @@ struct ChurnAccumulator {
 }
 
 impl ChurnAccumulator {
-    fn new(period_type: &'static str) -> Self {
+    pub(super) fn new(period_type: &'static str) -> Self {
         Self {
             period_type,
             seen: HashSet::new(),
@@ -29,7 +29,7 @@ impl ChurnAccumulator {
         }
     }
 
-    fn observe(&mut self, user_id: i64, period_key: i32) {
+    pub(super) fn observe(&mut self, user_id: i64, period_key: i32) {
         if !self.seen.insert((user_id, period_key)) {
             return;
         }
@@ -48,7 +48,7 @@ impl ChurnAccumulator {
             .or_insert((period_key, period_key));
     }
 
-    fn finish(self) -> Result<DataFrame> {
+    pub(super) fn finish(self) -> Result<DataFrame> {
         let mut arrivals: HashMap<i32, u32> = HashMap::new();
         let mut departures: HashMap<i32, u32> = HashMap::new();
         for (first, last) in self.spans.into_values() {
