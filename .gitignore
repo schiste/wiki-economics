@@ -1,0 +1,14 @@
+/target
+/.chau7/
+/.claude/
+/data/
+/output/*
+!/output/*.json.sh
+/site/dist/
+/site/node_modules/
+/site/src/.observablehq/
+/site/src/data/.observablehq/
+/scripts/__pycache__/
+__pycache__/
+*.py[cod]
+.DS_Store

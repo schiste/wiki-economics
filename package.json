@@ -1,0 +1,10 @@
+{
+  "name": "wiki-economics",
+  "private": true,
+  "license": "(MIT OR Apache-2.0)",
+  "scripts": {
+    "build": "cargo build --release",
+    "dev": "scripts/dev.sh",
+    "start": "scripts/dev.sh"
+  }
+}
