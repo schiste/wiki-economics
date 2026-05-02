@@ -1,11 +1,24 @@
+import path from "node:path";
+
 const isDev = process.argv.some(a => a === "preview" || a === "dev");
+const distDir = process.env.WIKI_ECON_SITE_DIST_DIR
+  ? path.resolve(process.env.WIKI_ECON_SITE_DIST_DIR)
+  : "dist";
+const adminPort = process.env.WIKI_ECON_ADMIN_PORT || "3001";
 
 export default {
   title: "Wikipedia Economics",
   root: "src",
-  output: "dist",
+  output: distDir,
   pager: false,
   head: `<link rel="stylesheet" href="./style.css">
+<script>
+window.__wikiEconAdminApiBase=(function(){
+  var proto=window.location&&window.location.protocol?window.location.protocol:"http:";
+  var host=window.location&&window.location.hostname?window.location.hostname:"127.0.0.1";
+  return proto+"//"+host+":${adminPort}";
+})();
+</script>
 <script>
 (function(){var t=localStorage.getItem("wk-theme");if(t&&t!=="auto"){document.documentElement.setAttribute("data-theme",t);document.documentElement.style.colorScheme=t;}})();
 </script>

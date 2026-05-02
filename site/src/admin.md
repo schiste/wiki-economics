@@ -6,7 +6,7 @@ title: Admin
 
 <div class="page-intro">
 
-Monitor and manage the data pipeline. Each wiki now flows through six stages: **fetch** (history dumps) → **patrol fetch** (logging XML) → **ingest** (convert to parquet) → **compute** (core metrics) → **patrol compute** (patrol metrics) → **publish** (refresh site data). Start the admin server with `node site/admin-server.cjs` to enable pipeline commands from this page.
+Monitor and manage the data pipeline. Each wiki now flows through six stages: **fetch** (history dumps) → **patrol fetch** (logging XML) → **ingest** (convert to parquet) → **compute** (core metrics) → **patrol compute** (patrol metrics) → **publish** (refresh site data). Start the dev/operator admin server with `scripts/dev.sh` or `WIKI_ECON_ADMIN_ENABLED=1 node site/admin-server.cjs` to enable pipeline commands from this page.
 
 </div>
 
@@ -28,7 +28,7 @@ function emptyWikiStatus(name) {
 ```
 
 ```js
-const API = "http://127.0.0.1:3001"
+const API = globalThis.__wikiEconAdminApiBase || "http://127.0.0.1:3001"
 const apiAvailable = Mutable(false)
 const jobStatus = Mutable(null)
 const liveManifest = Mutable(initialManifest)
@@ -44,6 +44,12 @@ const SNAPSHOT_VERSION_RE = /^\d{4}-\d{2}$/
 const languageNames = typeof Intl !== "undefined" && Intl.DisplayNames
   ? new Intl.DisplayNames(["en"], {type: "language"})
   : null
+
+function cliFlags(manifest = initialManifest || {}) {
+  const dataDir = manifest?.data_dir || "data"
+  const outputDir = manifest?.output_dir || "output"
+  return `--data-dir ${dataDir} --output-dir ${outputDir}`
+}
 
 function normalizeSnapshotVersion(value) {
   const trimmed = typeof value === "string" ? value.trim() : ""
@@ -172,7 +178,7 @@ async function runCommand(action, wikiOrOptions = null) {
       }
     }, 500)
   } catch (e) {
-    alert("Admin server not reachable. Run: node site/admin-server.cjs")
+    alert("Admin server not reachable. Run scripts/dev.sh or WIKI_ECON_ADMIN_ENABLED=1 node site/admin-server.cjs")
   }
 }
 
@@ -255,7 +261,7 @@ const supportedWikis = Array.from(new Set(job?.supportedWikis || [])).sort((a, b
 const suggestedVersion = normalizeSnapshotVersion(job?.suggestedVersion) || ""
 ```
 
-<p class="filter-desc">Last scanned: ${currentManifest.generated_at}${apiStatus ? html` · <span style="color:#2e7d32">API connected</span>` : html` · <span style="color:#c62828">API offline</span> — run <code>node site/admin-server.cjs</code>`}</p>
+<p class="filter-desc">Last scanned: ${currentManifest.generated_at}${apiStatus ? html` · <span style="color:#2e7d32">API connected</span>` : html` · <span style="color:#c62828">API offline</span> — run <code>scripts/dev.sh</code> or <code>WIKI_ECON_ADMIN_ENABLED=1 node site/admin-server.cjs</code>`}</p>
 
 <!-- ── Job output panel ───────────────────────────────────── -->
 
@@ -654,7 +660,7 @@ const snapshotVersion = view(snapshotVersionInput)
 
 ```js
 html`<div class="admin-fetch-actions">
-  ${!apiStatus ? html`<div class="warning">Start the admin server to enable commands: <code>node site/admin-server.cjs</code></div>` : ""}
+  ${!apiStatus ? html`<div class="warning">Start the dev/operator admin server to enable commands: <code>scripts/dev.sh</code> or <code>WIKI_ECON_ADMIN_ENABLED=1 node site/admin-server.cjs</code></div>` : ""}
   ${onboardingWikiOptions.length === 0 ? html`<div class="warning">No supported onboarding projects were reported by the admin API yet.</div>` : ""}
   <button class="admin-btn primary" ?disabled=${!apiStatus} onclick=${() => {
         const w = onboardingWiki
@@ -671,8 +677,8 @@ html`<div class="admin-fetch-actions">
         runCommand("fetch", {wiki: w, version})
       }}>Fetch missing</button>
   ${!apiStatus ? html`
-      <pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && node site/admin-server.cjs</pre>
-      <pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && cargo run --release -- run ${onboardingWiki || "frwiki"}${normalizeSnapshotVersion(snapshotVersion) ? ` --version ${normalizeSnapshotVersion(snapshotVersion)}` : ""}</pre>`
+      <pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && WIKI_ECON_ADMIN_ENABLED=1 node site/admin-server.cjs</pre>
+      <pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && cargo run --release -- ${cliFlags(currentManifest)} run ${onboardingWiki || "frwiki"}${normalizeSnapshotVersion(snapshotVersion) ? ` --version ${normalizeSnapshotVersion(snapshotVersion)}` : ""}</pre>`
     : ""}
 </div>`
 ```
@@ -697,7 +703,7 @@ const selectedWikiRunning = Boolean(job?.running && job?.progress?.wiki === sele
 ```js
 !hasSelectedWiki
   ? html`<span></span>`
-  : html`${!apiStatus ? html`<div class="warning">Admin API offline. Run <code>node site/admin-server.cjs</code> to use maintenance actions.</div>` : ""}
+  : html`${!apiStatus ? html`<div class="warning">Admin API offline. Run <code>scripts/dev.sh</code> or <code>WIKI_ECON_ADMIN_ENABLED=1 node site/admin-server.cjs</code> to use maintenance actions.</div>` : ""}
     <div class="admin-maintenance-actions">
       <button class="admin-btn primary" ?disabled=${!apiStatus} title=${actionTooltipWithApi("run", apiStatus)} onclick=${() => runCommand("run", {wiki: selectedWiki, version: preferredSnapshotVersion(w)})}>run full pipeline</button>
       <button class="admin-btn" ?disabled=${!apiStatus} title=${actionTooltipWithApi("fetch", apiStatus)} onclick=${() => runCommand("fetch", {wiki: selectedWiki, version: preferredSnapshotVersion(w)})}>fetch missing</button>
@@ -727,7 +733,7 @@ const selectedWikiRunning = Boolean(job?.running && job?.progress?.wiki === sele
   : html`<div class="warning">No raw dumps found for <strong>${selectedWiki}</strong>.</div>
     ${apiStatus
       ? html`<button class="admin-btn primary" title=${actionTooltipWithApi("fetch", apiStatus)} onclick=${() => runCommand("fetch", {wiki: selectedWiki, version: preferredSnapshotVersion(w)})}>Fetch missing</button>`
-      : html`<pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && cargo run --release -- fetch ${selectedWiki}</pre>`
+      : html`<pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && cargo run --release -- ${cliFlags(currentManifest)} fetch ${selectedWiki}</pre>`
     }`
 ```
 
@@ -749,7 +755,7 @@ const selectedWikiRunning = Boolean(job?.running && job?.progress?.wiki === sele
   : html`<div class="warning">No patrol data found for <strong>${selectedWiki}</strong>.</div>
     ${apiStatus
       ? html`<button class="admin-btn" title=${actionTooltipWithApi("patrol-fetch", apiStatus)} onclick=${() => runCommand("patrol-fetch", selectedWiki)}>Fetch patrol data</button>`
-      : html`<pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && python3 scripts/fetch_patrol.py ${selectedWiki} --data-dir data</pre>`
+      : html`<pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && cargo run --release -- ${cliFlags(currentManifest)} patrol-fetch ${selectedWiki}</pre>`
     }`
 ```
 
@@ -771,7 +777,7 @@ const selectedWikiRunning = Boolean(job?.running && job?.progress?.wiki === sele
   : html`<div class="warning">No ingested data for <strong>${selectedWiki}</strong>.</div>
     ${apiStatus
       ? html`<button class="admin-btn" title=${actionTooltipWithApi("ingest", apiStatus)} onclick=${() => runCommand("ingest", selectedWiki)}>Ingest ${selectedWiki}</button>`
-      : html`<pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && cargo run --release -- ingest ${selectedWiki}</pre>`
+      : html`<pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && cargo run --release -- ${cliFlags(currentManifest)} ingest ${selectedWiki}</pre>`
     }`
 ```
 
@@ -788,7 +794,7 @@ const selectedWikiRunning = Boolean(job?.running && job?.progress?.wiki === sele
   : html`<div class="warning">No metrics computed for <strong>${selectedWiki}</strong>.</div>
     ${apiStatus
       ? html`<button class="admin-btn" title=${actionTooltipWithApi("compute", apiStatus)} onclick=${() => runCommand("compute", selectedWiki)}>Compute ${selectedWiki}</button>`
-      : html`<pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && cargo run --release -- compute ${selectedWiki}</pre>`
+      : html`<pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && cargo run --release -- ${cliFlags(currentManifest)} compute ${selectedWiki}</pre>`
     }`
 ```
 
@@ -805,7 +811,7 @@ const selectedWikiRunning = Boolean(job?.running && job?.progress?.wiki === sele
   : html`<div class="warning">No site data found for <strong>${selectedWiki}</strong>.</div>
     ${apiStatus
       ? html`<button class="admin-btn" title=${actionTooltipWithApi("merge", apiStatus)} onclick=${() => runCommand("merge")}>Publish site data</button>`
-      : html`<pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && cargo run --release -- merge</pre>`
+      : html`<pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && cargo run --release -- ${cliFlags(currentManifest)} merge</pre>`
     }`
 ```
 

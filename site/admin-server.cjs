@@ -1,7 +1,7 @@
 #!/usr/bin/env node
-// Companion API server for the admin page.
-// Run alongside `npm run dev`:  node admin-server.js
-// Exposes pipeline commands on port 3001 (local only).
+// Dev/operator API server for the admin page.
+// Run alongside `npm run dev` or `scripts/dev.sh`.
+// Production deployments should keep this server disabled.
 
 const http = require("http");
 const { execFileSync, spawn } = require("child_process");
@@ -9,14 +9,19 @@ const path = require("path");
 const fs = require("fs");
 
 const ROOT = path.resolve(__dirname, "..");
-const DATA_DIR = path.join(ROOT, "data");
-const OUTPUT_DIR = path.join(ROOT, "output");
-const PORT = 3001;
+const RUNTIME_ENV = process.env.WIKI_ECON_ENV || "local";
+const ADMIN_ENABLED = (process.env.WIKI_ECON_ADMIN_ENABLED ?? (RUNTIME_ENV === "production" ? "0" : "1")) === "1";
+const PORT = Number.parseInt(process.env.WIKI_ECON_ADMIN_PORT || "3001", 10);
+const SITE_PORT = Number.parseInt(process.env.WIKI_ECON_SITE_PORT || "3000", 10);
+const DATA_DIR = resolveConfiguredPath("WIKI_ECON_DATA_DIR", "data");
+const OUTPUT_DIR = resolveConfiguredPath("WIKI_ECON_OUTPUT_DIR", "output");
+const GENERATOR_DIR = resolveConfiguredPath("WIKI_ECON_GENERATOR_DIR", path.join("site", "data-build"));
 const DEFAULT_RUNNER = {
   program: "cargo",
   args: ["run", "--release", "--"],
   label: "cargo run --release --",
 };
+const ALLOWED_ORIGINS = resolveAllowedOrigins();
 
 let currentJob = null;
 let jobLog = [];
@@ -29,6 +34,46 @@ let manifestCacheAt = 0;
 const MANIFEST_CACHE_TTL_MS = 1500;
 const REQUIRED_MERGED_METRICS = 9;
 let supportedWikisCache = null;
+
+if (!ADMIN_ENABLED) {
+  console.error("Admin API is disabled for this runtime. Set WIKI_ECON_ADMIN_ENABLED=1 to opt in.");
+  process.exit(1);
+}
+
+function resolveConfiguredPath(envVar, fallback) {
+  const value = process.env[envVar];
+  if (!value) return path.resolve(ROOT, fallback);
+  return path.isAbsolute(value) ? value : path.resolve(ROOT, value);
+}
+
+function resolveAllowedOrigins() {
+  const configured = process.env.WIKI_ECON_ALLOWED_ORIGINS;
+  if (!configured) {
+    return new Set([
+      `http://127.0.0.1:${SITE_PORT}`,
+      `http://localhost:${SITE_PORT}`,
+    ]);
+  }
+  return new Set(
+    configured
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter(Boolean),
+  );
+}
+
+function applyCors(req, res) {
+  const origin = req.headers.origin;
+  if (!origin) return;
+  if (ALLOWED_ORIGINS.has("*")) {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+    return;
+  }
+  if (ALLOWED_ORIGINS.has(origin)) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  }
+}
 
 function resolveRunner() {
   const customBin = process.env.WIKI_ECON_BIN;
@@ -114,10 +159,16 @@ function refreshManifest(force = false) {
     return manifestCache;
   }
 
-  const manifestScript = path.join(ROOT, "output", "manifest.json.sh");
+  const manifestScript = path.join(GENERATOR_DIR, "manifest.json.sh");
   const output = execFileSync("/bin/bash", [manifestScript], {
     cwd: ROOT,
     encoding: "utf8",
+    env: {
+      ...process.env,
+      WIKI_ECON_DATA_DIR: DATA_DIR,
+      WIKI_ECON_OUTPUT_DIR: OUTPUT_DIR,
+      WIKI_ECON_GENERATOR_DIR: GENERATOR_DIR,
+    },
   });
   manifestCache = JSON.parse(output);
   manifestCacheAt = now;
@@ -298,8 +349,7 @@ function getProgress() {
 }
 
 const server = http.createServer((req, res) => {
-  // CORS for localhost:3000 -> localhost:3001
-  res.setHeader("Access-Control-Allow-Origin", "*");
+  applyCors(req, res);
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
@@ -347,6 +397,8 @@ const server = http.createServer((req, res) => {
       globalJob: lastGlobalJob,
       supportedWikis: loadSupportedWikipedias(),
       suggestedVersion: suggestedSnapshotVersion(),
+      adminEnabled: ADMIN_ENABLED,
+      adminPort: PORT,
     }));
     return;
   }
@@ -418,24 +470,31 @@ const server = http.createServer((req, res) => {
           commandSpec = wiki
             ? {
                 program: resolveRunner().program,
-                args: [...resolveRunner().args, action, wiki, ...(version && (action === "fetch" || action === "run") ? ["--version", version] : [])],
-                label: `${resolveRunner().label} ${action} ${wiki}${version && (action === "fetch" || action === "run") ? ` --version ${version}` : ""}`,
+                args: [
+                  ...resolveRunner().args,
+                  "--data-dir", DATA_DIR,
+                  "--output-dir", OUTPUT_DIR,
+                  action,
+                  wiki,
+                  ...(version && (action === "fetch" || action === "run") ? ["--version", version] : []),
+                ],
+                label: `${resolveRunner().label} --data-dir ${DATA_DIR} --output-dir ${OUTPUT_DIR} ${action} ${wiki}${version && (action === "fetch" || action === "run") ? ` --version ${version}` : ""}`,
               }
             : null;
           break;
         case "merge":
           commandSpec = {
             program: resolveRunner().program,
-            args: [...resolveRunner().args, "merge"],
-            label: `${resolveRunner().label} merge`,
+            args: [...resolveRunner().args, "--data-dir", DATA_DIR, "--output-dir", OUTPUT_DIR, "merge"],
+            label: `${resolveRunner().label} --data-dir ${DATA_DIR} --output-dir ${OUTPUT_DIR} merge`,
           };
           break;
         case "patrol-fetch":
           commandSpec = wiki
             ? {
                 program: resolveRunner().program,
-                args: [...resolveRunner().args, "patrol-fetch", wiki],
-                label: `${resolveRunner().label} patrol-fetch ${wiki}`,
+                args: [...resolveRunner().args, "--data-dir", DATA_DIR, "--output-dir", OUTPUT_DIR, "patrol-fetch", wiki],
+                label: `${resolveRunner().label} --data-dir ${DATA_DIR} --output-dir ${OUTPUT_DIR} patrol-fetch ${wiki}`,
               }
             : null;
           break;
@@ -443,8 +502,8 @@ const server = http.createServer((req, res) => {
           commandSpec = wiki
             ? {
                 program: resolveRunner().program,
-                args: [...resolveRunner().args, "patrol-compute", wiki],
-                label: `${resolveRunner().label} patrol-compute ${wiki}`,
+                args: [...resolveRunner().args, "--data-dir", DATA_DIR, "--output-dir", OUTPUT_DIR, "patrol-compute", wiki],
+                label: `${resolveRunner().label} --data-dir ${DATA_DIR} --output-dir ${OUTPUT_DIR} patrol-compute ${wiki}`,
               }
             : null;
           break;
@@ -467,7 +526,14 @@ const server = http.createServer((req, res) => {
 
       const proc = spawn(commandSpec.program, commandSpec.args, {
         cwd: ROOT,
-        env: { ...process.env, RUST_LOG: "info", PYTHONUNBUFFERED: "1" },
+        env: {
+          ...process.env,
+          RUST_LOG: "info",
+          PYTHONUNBUFFERED: "1",
+          WIKI_ECON_DATA_DIR: DATA_DIR,
+          WIKI_ECON_OUTPUT_DIR: OUTPUT_DIR,
+          WIKI_ECON_GENERATOR_DIR: GENERATOR_DIR,
+        },
       });
       currentJob = {
         command: commandSpec.label,
@@ -546,4 +612,8 @@ server.listen(PORT, "127.0.0.1", () => {
   console.log(`Admin API server listening on http://127.0.0.1:${PORT}`);
   console.log(`Runner: ${runner.label}`);
   console.log(`Working dir: ${ROOT}`);
+  console.log(`Data dir: ${DATA_DIR}`);
+  console.log(`Output dir: ${OUTPUT_DIR}`);
+  console.log(`Generator dir: ${GENERATOR_DIR}`);
+  console.log(`Allowed origins: ${Array.from(ALLOWED_ORIGINS).join(", ")}`);
 });
