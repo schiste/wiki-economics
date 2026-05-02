@@ -1,0 +1,24 @@
+[Unit]
+Description=wiki-economics batch refresh
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=wiki-econ
+Group=wiki-econ
+EnvironmentFile=/etc/wiki-economics.env
+WorkingDirectory=/srv/wiki-economics/app/current
+ExecStart=/srv/wiki-economics/app/current/deploy/cloud-vps/run-refresh.sh
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=true
+PrivateDevices=true
+ProtectSystem=full
+ReadWritePaths=/srv/wiki-economics /etc/wiki-economics /etc/wiki-economics.env
+
+[Install]
+WantedBy=multi-user.target
