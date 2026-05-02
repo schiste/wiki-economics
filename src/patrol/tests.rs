@@ -613,7 +613,7 @@ fn writers_flush_empty_batches_and_at_threshold() -> Result<()> {
         current_revision_id: 10,
         prev_revision_id: 9,
         is_auto: false,
-    });
+    })?;
     patrol_writer.add(PatrolRow {
         log_id: 2,
         timestamp: "2026-01-02 00:00:00".to_string(),
@@ -623,7 +623,7 @@ fn writers_flush_empty_batches_and_at_threshold() -> Result<()> {
         current_revision_id: 11,
         prev_revision_id: 0,
         is_auto: true,
-    });
+    })?;
     patrol_writer.finish()?;
     assert_eq!(read_parquet_df(&patrol_path, None)?.height(), 2);
 
@@ -634,15 +634,49 @@ fn writers_flush_empty_batches_and_at_threshold() -> Result<()> {
         target_user: "EditorA".to_string(),
         old_groups: String::new(),
         new_groups: "autopatrolled".to_string(),
-    });
+    })?;
     rights_writer.add(RightsRow {
         timestamp: "2026-01-02 00:00:00".to_string(),
         target_user: "EditorA".to_string(),
         old_groups: "autopatrolled".to_string(),
         new_groups: String::new(),
-    });
+    })?;
     rights_writer.finish()?;
     assert_eq!(read_parquet_df(&rights_path, None)?.height(), 2);
+    Ok(())
+}
+
+#[test]
+fn writer_add_signatures_are_fallible() -> Result<()> {
+    // Locks in the contract that `add` returns `Result<()>` instead of panicking
+    // on flush failure. If this stops compiling because the return type drifts,
+    // the panic-removal in PatrolWriter::add / RightsWriter::add was reverted.
+    init_test_tracing();
+    let temp_dir = TestDir::new()?;
+
+    let mut patrol = PatrolWriter::new_with_batch_rows(&temp_dir.path().join("p.parquet"), 100)?;
+    let patrol_result: Result<()> = patrol.add(PatrolRow {
+        log_id: 1,
+        timestamp: "2026-01-01 00:00:00".to_string(),
+        user: None,
+        user_id: None,
+        page_title: None,
+        current_revision_id: 0,
+        prev_revision_id: 0,
+        is_auto: false,
+    });
+    patrol_result?;
+    patrol.finish()?;
+
+    let mut rights = RightsWriter::new_with_batch_rows(&temp_dir.path().join("r.parquet"), 100)?;
+    let rights_result: Result<()> = rights.add(RightsRow {
+        timestamp: "2026-01-01 00:00:00".to_string(),
+        target_user: "u".to_string(),
+        old_groups: String::new(),
+        new_groups: "autopatrolled".to_string(),
+    });
+    rights_result?;
+    rights.finish()?;
     Ok(())
 }
 

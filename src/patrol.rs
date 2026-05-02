@@ -599,7 +599,7 @@ fn parse_logging_events(
                             rights_writer,
                             &mut patrol_count,
                             &mut rights_count,
-                        );
+                        )?;
                         current_tag = None;
                     }
                     _ => current_tag = None,
@@ -643,18 +643,19 @@ fn finish_log_item(
     rights_writer: &mut RightsWriter,
     patrol_count: &mut usize,
     rights_count: &mut usize,
-) {
+) -> Result<()> {
     match item {
         Some(item) if matches!(item.log_type.as_deref(), Some("patrol")) => {
-            patrol_writer.add(item.into_patrol_row());
+            patrol_writer.add(item.into_patrol_row())?;
             *patrol_count += 1;
         }
         Some(item) if matches!(item.log_type.as_deref(), Some("rights")) => {
-            rights_writer.add(item.into_rights_row());
+            rights_writer.add(item.into_rights_row())?;
             *rights_count += 1;
         }
         _ => {}
     }
+    Ok(())
 }
 
 fn apply_decoded_log_text(
@@ -766,7 +767,7 @@ impl PatrolWriter {
         })
     }
 
-    fn add(&mut self, row: PatrolRow) {
+    fn add(&mut self, row: PatrolRow) -> Result<()> {
         self.batch.log_id.push(row.log_id);
         self.batch.timestamp.push(row.timestamp);
         self.batch.user.push(row.user);
@@ -776,8 +777,9 @@ impl PatrolWriter {
         self.batch.prev_revision_id.push(row.prev_revision_id);
         self.batch.is_auto.push(row.is_auto);
         if self.batch.log_id.len() >= self.batch_rows {
-            self.flush().expect("patrol batch flush should succeed");
+            self.flush()?;
         }
+        Ok(())
     }
 
     fn flush(&mut self) -> Result<()> {
@@ -814,14 +816,15 @@ impl RightsWriter {
         })
     }
 
-    fn add(&mut self, row: RightsRow) {
+    fn add(&mut self, row: RightsRow) -> Result<()> {
         self.batch.timestamp.push(row.timestamp);
         self.batch.target_user.push(row.target_user);
         self.batch.old_groups.push(row.old_groups);
         self.batch.new_groups.push(row.new_groups);
         if self.batch.timestamp.len() >= self.batch_rows {
-            self.flush().expect("rights batch flush should succeed");
+            self.flush()?;
         }
+        Ok(())
     }
 
     fn flush(&mut self) -> Result<()> {
