@@ -1,5 +1,9 @@
 name: CI
 
+# Third-party actions are pinned to commit SHAs (with the human-readable
+# version in a trailing comment) to defend against tag-takeover supply-chain
+# attacks. Refresh SHAs deliberately; do not switch back to floating tags.
+
 on:
   push:
     branches:
@@ -20,23 +24,29 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
       - name: Install Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
         with:
           node-version: 22
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # @stable as of pin
         with:
           components: rustfmt, clippy
 
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
 
       - name: Check shell script syntax
         run: bash -n scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh
+
+      - name: Run shellcheck
+        uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38  # 2.0.0
+        with:
+          additional_files: scripts/lib/wiki_econ.sh
+          scandir: ./scripts ./site/data-build ./deploy/cloud-vps
 
       - name: Check Node entrypoint syntax
         run: |
@@ -55,8 +65,9 @@ jobs:
       - name: Lint
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - name: Run tests
-        run: cargo test --all-targets --all-features
+      # Note: the test suite runs in the `coverage` job under cargo-llvm-cov,
+      # which subsumes a plain `cargo test`. Running `cargo test` here too
+      # would double the wall time without adding signal.
 
       - name: Check Python scripts
         run: python3 -m py_compile scripts/fetch_patrol.py scripts/compute_patrol.py scripts/check_lcov.py scripts/test_fetch_patrol.py scripts/test_check_lcov.py
@@ -73,16 +84,16 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # @stable as of pin
 
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
 
       - name: Install coverage tooling
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@51cd0b8c0499559d9a4d75c0f5c67bec3a894ec8  # v2
         with:
           tool: cargo-llvm-cov
 
@@ -93,7 +104,7 @@ jobs:
         run: python3 scripts/check_lcov.py target/llvm-cov.info
 
       - name: Upload coverage artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: llvm-cov-lcov
           path: target/llvm-cov.info
@@ -105,16 +116,16 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # @stable as of pin
 
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
 
       - name: Install security tooling
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@51cd0b8c0499559d9a4d75c0f5c67bec3a894ec8  # v2
         with:
           tool: cargo-deny,cargo-audit
 
@@ -123,3 +134,6 @@ jobs:
 
       - name: cargo-audit
         run: cargo audit -D warnings
+
+      - name: Vendor patch hygiene
+        run: scripts/check_vendor_polars.sh

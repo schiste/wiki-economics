@@ -6,19 +6,26 @@ const distDir = process.env.WIKI_ECON_SITE_DIST_DIR
   : "dist";
 const adminPort = process.env.WIKI_ECON_ADMIN_PORT || "3001";
 
+// The admin API base URL is only injected into the page head in dev/preview
+// builds so production HTML never advertises the local-only admin port. The
+// admin page itself is also conditionally added to the nav in dev mode below.
+const adminApiScript = isDev
+  ? `<script>
+window.__wikiEconAdminApiBase=(function(){
+  var proto=window.location&&window.location.protocol?window.location.protocol:"http:";
+  var host=window.location&&window.location.hostname?window.location.hostname:"127.0.0.1";
+  return proto+"//"+host+":${adminPort}";
+})();
+</script>`
+  : "";
+
 export default {
   title: "Wikipedia Economics",
   root: "src",
   output: distDir,
   pager: false,
   head: `<link rel="stylesheet" href="./style.css">
-<script>
-window.__wikiEconAdminApiBase=(function(){
-  var proto=window.location&&window.location.protocol?window.location.protocol:"http:";
-  var host=window.location&&window.location.hostname?window.location.hostname:"127.0.0.1";
-  return proto+"//"+host+":${adminPort}";
-})();
-</script>
+${adminApiScript}
 <script>
 (function(){var t=localStorage.getItem("wk-theme");if(t&&t!=="auto"){document.documentElement.setAttribute("data-theme",t);document.documentElement.style.colorScheme=t;}})();
 </script>
