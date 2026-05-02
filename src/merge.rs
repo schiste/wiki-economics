@@ -1,5 +1,6 @@
 use anyhow::Result;
 use polars::prelude::*;
+use std::env;
 use std::fs;
 use std::path::Path;
 use std::process::Command;
@@ -64,6 +65,13 @@ pub fn merge_outputs(output_dir: &Path) -> Result<()> {
 }
 
 fn materialize_dashboard_artifacts(output_dir: &Path) -> Result<()> {
+    let generator_dir = env::var("WIKI_ECON_GENERATOR_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| Path::new("site").join("data-build"));
+    materialize_dashboard_artifacts_from_dir(output_dir, &generator_dir)
+}
+
+fn materialize_dashboard_artifacts_from_dir(output_dir: &Path, generator_dir: &Path) -> Result<()> {
     for script_name in [
         "defaults_business.json.sh",
         "defaults_gdp.json.sh",
@@ -72,11 +80,14 @@ fn materialize_dashboard_artifacts(output_dir: &Path) -> Result<()> {
         "defaults_patrol.json.sh",
         "manifest.json.sh",
     ] {
-        let script_path = output_dir.join(script_name);
+        let script_path = generator_dir.join(script_name);
         if !script_path.is_file() {
             continue;
         }
-        let output = Command::new("bash").arg(&script_path).output()?;
+        let output = Command::new("bash")
+            .arg(&script_path)
+            .env("WIKI_ECON_OUTPUT_DIR", output_dir)
+            .output()?;
         if !output.status.success() {
             anyhow::bail!(
                 "dashboard artifact generator failed: {}",
@@ -151,10 +162,11 @@ mod tests {
     fn materialize_dashboard_artifacts_runs_json_generators() -> Result<()> {
         init_test_tracing();
         let output_dir = TestDir::new()?;
-        let script = output_dir.path().join("defaults_gdp.json.sh");
+        let generator_dir = TestDir::new()?;
+        let script = generator_dir.path().join("defaults_gdp.json.sh");
         fs::write(&script, "#!/bin/sh\nprintf '{\"ok\":true}'\n")?;
 
-        materialize_dashboard_artifacts(output_dir.path())?;
+        materialize_dashboard_artifacts_from_dir(output_dir.path(), generator_dir.path())?;
 
         assert_eq!(
             fs::read_to_string(output_dir.path().join("defaults_gdp.json"))?,
@@ -167,10 +179,11 @@ mod tests {
     fn materialize_dashboard_artifacts_errors_on_failed_generator() -> Result<()> {
         init_test_tracing();
         let output_dir = TestDir::new()?;
-        let script = output_dir.path().join("defaults_gdp.json.sh");
+        let generator_dir = TestDir::new()?;
+        let script = generator_dir.path().join("defaults_gdp.json.sh");
         fs::write(&script, "#!/bin/sh\nexit 1\n")?;
 
-        let err = materialize_dashboard_artifacts(output_dir.path())
+        let err = materialize_dashboard_artifacts_from_dir(output_dir.path(), generator_dir.path())
             .expect_err("failed generator should surface an error");
 
         assert!(

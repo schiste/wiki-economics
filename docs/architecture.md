@@ -4,7 +4,7 @@ This document records the decisions that currently matter to the codebase.
 
 ## Pipeline Overview
 
-The project has four distinct data layers rooted under `data/` and `output/`:
+The project has five distinct data layers rooted under `data/` and `output/`:
 
 1. `data/raw/<wiki>/...tsv.bz2`
    Wikimedia MediaWiki History dump shards fetched from `dumps.wikimedia.org`.
@@ -21,9 +21,13 @@ The project has four distinct data layers rooted under `data/` and `output/`:
 5. `output/defaults_*.json` and `output/manifest.json`
    Materialized dashboard artifacts consumed through the `site/src/data -> output` symlink.
 
+The checked-in generator sources for those dashboard artifacts live under
+`site/data-build/*.json.sh`. Generated JSON belongs in `output/`, not next to
+the checked-in scripts.
+
 The online-facing layer should use `output/`. The compute pipeline should use `data/parquet/`. The `data/warehouse/` layer exists for future metric work that needs more than the analytical columns.
 
-There is also a fifth operational location that matters during ingest:
+There is also an operational location that matters during ingest:
 
 - `data/parquet/<wiki>/_markers/<source>.done`
 
@@ -105,7 +109,7 @@ Important decisions:
 
 - merge only reads per-wiki metric files from `output/<wiki>/`
 - merged outputs are written to `output/<metric>.parquet`
-- merge also materializes the shared dashboard JSON artifacts (`defaults_*.json`, `manifest.json`) so the site does not rely on stale Observable cache loaders
+- merge also materializes the shared dashboard JSON artifacts (`defaults_*.json`, `manifest.json`) from the checked-in generators under `site/data-build/` so the site does not rely on stale Observable cache loaders
 - merge assumes every per-wiki metric output already includes a `wiki` column
 
 If a new metric omits the `wiki` column, merge will still concatenate files, but the combined output will be much less useful. Keep the `wiki` column in per-wiki outputs.

@@ -3,6 +3,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+# shellcheck disable=SC1091
+. "$ROOT/scripts/lib/wiki_econ.sh"
 
 YES=0
 SKIP_SYSTEM_PACKAGES=0
@@ -241,18 +243,18 @@ ensure_cargo_tool() {
 }
 
 install_site_dependencies() {
-  if [ -d site/node_modules ]; then
+  if [ -d "$WIKI_ECON_SITE_DIR/node_modules" ]; then
     celebrate "Dashboard dependencies are already installed."
   else
     say "Installing dashboard dependencies."
-    (cd site && npm ci)
+    (cd "$WIKI_ECON_SITE_DIR" && npm ci)
     celebrate "Dashboard dependencies are installed."
   fi
 }
 
 prepare_local_directories() {
   say "Preparing local data directories."
-  mkdir -p data/raw data/parquet data/warehouse output
+  wiki_econ_ensure_local_dirs
   celebrate "Local data directories are ready."
 }
 
@@ -267,7 +269,9 @@ build_project() {
   celebrate "Rust CLI build completed."
 
   say "Building the Observable dashboard."
-  (cd site && npm run build)
+  "$ROOT/scripts/build-site.sh" \
+    --output-dir "$WIKI_ECON_OUTPUT_DIR" \
+    --dist-dir "$WIKI_ECON_SITE_DIST_DIR"
   celebrate "Dashboard build completed."
 }
 
@@ -278,6 +282,8 @@ ${BOLD}Setup complete.${RESET}
 Next useful commands:
 
   scripts/dev.sh
+  scripts/refresh.sh frwiki
+  scripts/build-site.sh
   cargo run --release -- fetch frwiki
   cargo run --release -- ingest frwiki
   cargo run --release -- compute frwiki
@@ -322,6 +328,7 @@ main() {
   banner
 
   package_manager="$(detect_package_manager)"
+  wiki_econ_init_runtime
   if [ "$package_manager" = "none" ]; then
     warn "No supported package manager detected. Automatic OS-level installs are disabled."
   else

@@ -69,7 +69,7 @@ The interactive dashboard is built with [Observable Framework](https://observabl
 
 Key frontend patterns:
 
-- **Pre-computed defaults** — shell-based data loaders (`.json.sh`) run DuckDB queries at build time to produce ~80 KB JSON files for the default view of each page. This makes initial page load instant
+- **Pre-computed defaults** — checked-in generator scripts under `site/data-build/` run DuckDB queries at build time to produce ~80 KB JSON files for the default view of each page. This makes initial page load instant
 - **DuckDB WASM** — when a user changes filters, [DuckDB compiled to WebAssembly](https://duckdb.org/docs/api/wasm/overview) queries Parquet files directly in the browser. The ~34 MB DuckDB runtime is lazy-loaded only when needed
 - **Shared filter bar** — a single `filters.js` component provides consistent wiki, user type, namespace, date range, and granularity controls across all pages
 
@@ -77,7 +77,7 @@ Key frontend patterns:
 
 DuckDB serves two roles:
 
-1. **Build-time** (shell scripts) — the `.json.sh` data loaders use the DuckDB CLI to aggregate Parquet files into pre-computed JSON defaults
+1. **Build-time** (shell scripts) — the `site/data-build/*.json.sh` generators use the DuckDB CLI to aggregate Parquet files into pre-computed JSON defaults
 2. **Client-side** (browser) — DuckDB-WASM runs SQL queries on Parquet files when users apply non-default filters, enabling interactive exploration without a backend server
 
 ### Storage layout
@@ -98,12 +98,16 @@ output/
   *.parquet                 ← merged cross-wiki files
 
 site/
+  data-build/
+    defaults_*.json.sh      ← checked-in dashboard artifact generators
+    manifest.json.sh
   src/
     *.md                    ← Observable pages
     components/             ← shared JS (filters, charts)
     data/
       *.parquet             ← symlinked or copied from output/
-      defaults_*.json.sh    ← build-time data loaders
+      defaults_*.json       ← generated dashboard defaults from output/
+      manifest.json         ← generated dashboard manifest from output/
 ```
 
 ### Quality gates

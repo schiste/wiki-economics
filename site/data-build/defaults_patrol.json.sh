@@ -1,7 +1,9 @@
 #!/bin/bash
 # Observable data loader — pre-computes default view for patrol.md
 
-DIR="$(dirname "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
+DIR="${WIKI_ECON_OUTPUT_DIR:-$ROOT/output}"
 
 resolve_scalar() {
   duckdb :memory: -csv -noheader -c "$1" | tr -d '\r\n'

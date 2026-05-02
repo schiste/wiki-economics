@@ -2,8 +2,7 @@
 /.chau7/
 /.claude/
 /data/
-/output/*
-!/output/*.json.sh
+/output/
 /site/dist/
 /site/node_modules/
 /site/src/.observablehq/
