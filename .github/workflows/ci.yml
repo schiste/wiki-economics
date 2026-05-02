@@ -59,10 +59,10 @@ jobs:
         run: cargo test --all-targets --all-features
 
       - name: Check Python scripts
-        run: python3 -m py_compile scripts/fetch_patrol.py scripts/compute_patrol.py scripts/check_lcov.py scripts/test_fetch_patrol.py
+        run: python3 -m py_compile scripts/fetch_patrol.py scripts/compute_patrol.py scripts/check_lcov.py scripts/test_fetch_patrol.py scripts/test_check_lcov.py
 
       - name: Run Python tests
-        run: python3 -m unittest scripts/test_fetch_patrol.py
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
 
       - name: Check docs
         run: cargo doc --no-deps

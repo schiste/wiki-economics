@@ -173,6 +173,14 @@ The repo is expected to stay green on:
 - `cargo llvm-cov --workspace --all-features --all-targets --lcov --output-path /tmp/wiki-economics-target/llvm-cov.info`
 - `python3 scripts/check_lcov.py /tmp/wiki-economics-target/llvm-cov.info`
 
+The lcov gate hard-fails on any uncovered `DA:` (line) record. It also parses
+`BRDA:` (branch) records when present and reports a coverage summary, but the
+branch gate is informational by default: `cargo-llvm-cov` only emits branch
+records on a nightly toolchain with the unstable `--branch` flag, and the repo
+pins stable. Running `cargo +nightly llvm-cov --branch ...` followed by
+`scripts/check_lcov.py --require-branches lcov.info` is supported for local
+opt-in branch enforcement.
+
 If you change the architecture significantly, expect to add tests instead of weakening the gates.
 
 ## Vendored Polars Patch

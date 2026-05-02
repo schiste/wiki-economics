@@ -593,13 +593,21 @@ fn parse_logging_events(
                         current_tag = None;
                     }
                     "logitem" => {
-                        finish_log_item(
-                            current.take(),
-                            patrol_writer,
-                            rights_writer,
-                            &mut patrol_count,
-                            &mut rights_count,
-                        )?;
+                        match current.take() {
+                            Some(item)
+                                if matches!(item.log_type.as_deref(), Some("patrol")) =>
+                            {
+                                patrol_writer.add(item.into_patrol_row())?;
+                                patrol_count += 1;
+                            }
+                            Some(item)
+                                if matches!(item.log_type.as_deref(), Some("rights")) =>
+                            {
+                                rights_writer.add(item.into_rights_row())?;
+                                rights_count += 1;
+                            }
+                            _ => {}
+                        }
                         current_tag = None;
                     }
                     _ => current_tag = None,
@@ -635,27 +643,6 @@ fn parse_logging_events(
 
 fn local_name(event: &quick_xml::events::BytesStart<'_>) -> String {
     String::from_utf8_lossy(event.local_name().as_ref()).to_string()
-}
-
-fn finish_log_item(
-    item: Option<LogItem>,
-    patrol_writer: &mut PatrolWriter,
-    rights_writer: &mut RightsWriter,
-    patrol_count: &mut usize,
-    rights_count: &mut usize,
-) -> Result<()> {
-    match item {
-        Some(item) if matches!(item.log_type.as_deref(), Some("patrol")) => {
-            patrol_writer.add(item.into_patrol_row())?;
-            *patrol_count += 1;
-        }
-        Some(item) if matches!(item.log_type.as_deref(), Some("rights")) => {
-            rights_writer.add(item.into_rights_row())?;
-            *rights_count += 1;
-        }
-        _ => {}
-    }
-    Ok(())
 }
 
 fn apply_decoded_log_text(

@@ -43,15 +43,16 @@ cargo deny check advisories bans licenses sources
 echo "==> cargo audit -D warnings"
 cargo audit -D warnings
 
-echo "==> python3 -m py_compile scripts/fetch_patrol.py scripts/compute_patrol.py scripts/check_lcov.py scripts/test_fetch_patrol.py"
+echo "==> python3 -m py_compile scripts/fetch_patrol.py scripts/compute_patrol.py scripts/check_lcov.py scripts/test_fetch_patrol.py scripts/test_check_lcov.py"
 python3 -m py_compile \
   scripts/fetch_patrol.py \
   scripts/compute_patrol.py \
   scripts/check_lcov.py \
-  scripts/test_fetch_patrol.py
+  scripts/test_fetch_patrol.py \
+  scripts/test_check_lcov.py
 
-echo "==> python3 -m unittest scripts/test_fetch_patrol.py"
-python3 -m unittest scripts/test_fetch_patrol.py
+echo "==> python3 -m unittest discover -s scripts -p 'test_*.py'"
+python3 -m unittest discover -s scripts -p 'test_*.py'
 
 if [ -f "$ROOT/output/manifest.json" ]; then
   echo "==> ./scripts/build-site.sh"
