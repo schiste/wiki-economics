@@ -1,5 +1,8 @@
 # Stack & Data Sources
 
+For software dependency and license inventory, see
+[`docs/dependencies-and-licenses.md`](dependencies-and-licenses.md).
+
 ## Data sources
 
 All data comes from publicly available Wikimedia dumps. No private APIs, CheckUser data, or non-public datasets are used.

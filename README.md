@@ -110,6 +110,7 @@ python3 -m unittest scripts/test_fetch_patrol.py
 - [Architecture](docs/architecture.md)
 - [Development](docs/development.md)
 - [Benchmarking](docs/benchmarking.md)
+- [Dependencies and Licenses](docs/dependencies-and-licenses.md)
 - [Publishing](docs/release.md)
 - [Stack and Data Sources](docs/stack-and-data-sources.md)
 
