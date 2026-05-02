@@ -221,11 +221,17 @@ ensure_rust_toolchain() {
 ensure_command() {
   local command_name="$1"
   local label="$2"
+  local install_hint="${3:-}"
   if have "$command_name"; then
     celebrate "$label is available."
     return
   fi
-  die "$label is still missing. Install it and rerun ./scripts/setup.sh."
+  printf "%s[error]%s %s is still missing.\n" "$RED" "$RESET" "$label" >&2
+  if [ -n "$install_hint" ]; then
+    printf "        %s\n" "$install_hint" >&2
+  fi
+  printf "        After installing, rerun ./scripts/setup.sh.\n" >&2
+  exit 1
 }
 
 ensure_cargo_tool() {
@@ -267,6 +273,17 @@ build_project() {
   say "Building the Rust CLI."
   cargo build --release
   celebrate "Rust CLI build completed."
+
+  # First-run guard: building the Observable dashboard against an empty
+  # output/ tree produces a site that renders with zero data and no
+  # explanation, which is confusing as a first-time experience. If no merged
+  # manifest exists yet, skip the site build and steer the operator at a
+  # refresh first; print_next_steps already lists scripts/refresh.sh.
+  if [ ! -f "$WIKI_ECON_OUTPUT_DIR/manifest.json" ]; then
+    warn "Skipping dashboard build: $WIKI_ECON_OUTPUT_DIR/manifest.json is missing."
+    warn "Run scripts/refresh.sh <wiki> to generate data, then rerun npm run build:site."
+    return
+  fi
 
   say "Building the Observable dashboard."
   "$ROOT/scripts/build-site.sh" \
@@ -337,10 +354,16 @@ main() {
   fi
 
   ensure_rust_toolchain
-  ensure_command python3 "Python 3"
-  ensure_command node "Node.js"
-  ensure_command npm "npm"
-  ensure_command duckdb "DuckDB CLI"
+  ensure_command python3 "Python 3" \
+    "Install via your OS package manager (apt-get install python3, brew install python3, etc.)."
+  ensure_command node "Node.js" \
+    "Install Node.js 20+ from https://nodejs.org/ or your package manager."
+  ensure_command npm "npm" \
+    "npm typically ships with Node.js; reinstall Node.js if missing."
+  # Stock Debian/Ubuntu repos do not provide a duckdb package, so the apt-get
+  # path silently no-ops on Linux. Point users at the upstream installer.
+  ensure_command duckdb "DuckDB CLI" \
+    "Install from https://duckdb.org/docs/installation/ (brew install duckdb on macOS)."
 
   if [ "$SKIP_QUALITY_TOOLS" -eq 0 ]; then
     say "Installing contributor quality tools."
