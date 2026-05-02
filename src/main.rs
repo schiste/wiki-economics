@@ -9,6 +9,8 @@ mod patrol;
 mod schema;
 mod storage;
 #[cfg(test)]
+mod end_to_end_tests;
+#[cfg(test)]
 mod test_support;
 
 use anyhow::Result;
