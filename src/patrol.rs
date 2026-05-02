@@ -14,7 +14,7 @@ use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::storage;
 
@@ -195,6 +195,7 @@ fn build_transport() -> Result<ReqwestPatrolTransport> {
         dump_client: Client::builder()
             .user_agent(USER_AGENT)
             .timeout(Duration::from_secs(3600))
+            .redirect(crate::fetch::dumps_host_only_redirect_policy())
             .build()?,
         api_client: Client::builder()
             .user_agent(USER_AGENT)
@@ -514,8 +515,51 @@ fn download_logging_dump<T: PatrolTransport + ?Sized>(
         }
         file.write_all(&buffer[..bytes_read])?;
     }
+    // Sync and drop before the magic check below opens a fresh handle.
+    file.flush()?;
+    drop(file);
+
+    // mediawiki_history dumps do not publish checksums, so we apply a cheap
+    // gzip-magic check post-download to catch CDN truncation, HTML error
+    // pages served as 200, and other corruption that satisfied
+    // Content-Length but is not actually a gzipped XML stream.
+    if let Err(integrity_error) = verify_gzip_magic(dest_path) {
+        warn!(
+            path = %dest_path.display(),
+            error = %integrity_error,
+            "downloaded patrol dump failed gzip magic check; removing and aborting"
+        );
+        let _ = fs::remove_file(dest_path);
+        return Err(integrity_error);
+    }
 
     info!(wiki = wiki, path = %dest_path.display(), "downloaded patrol log dump");
+    Ok(())
+}
+
+/// Magic-byte check for gzipped patrol log dumps. See `fetch::verify_bz2_magic`
+/// for context on why this is the strongest available integrity gate for the
+/// `mediawiki_history`/`pages-logging` dump endpoints.
+fn verify_gzip_magic(path: &Path) -> Result<()> {
+    const GZIP_MAGIC: [u8; 2] = [0x1f, 0x8b];
+    let mut file = File::open(path)
+        .with_context(|| format!("failed to open {} for magic-byte check", path.display()))?;
+    let mut header = [0_u8; 2];
+    let mut filled = 0;
+    while filled < header.len() {
+        match file.read(&mut header[filled..])? {
+            0 => break,
+            n => filled += n,
+        }
+    }
+    if filled < GZIP_MAGIC.len() || header != GZIP_MAGIC {
+        anyhow::bail!(
+            "downloaded file {} does not begin with gzip magic (1f 8b); got {} byte(s) {:02x?}",
+            path.display(),
+            filled,
+            &header[..filled]
+        );
+    }
     Ok(())
 }
 

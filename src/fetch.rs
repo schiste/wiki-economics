@@ -3,6 +3,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use reqwest::StatusCode;
 use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, HeaderMap, RANGE};
+use reqwest::redirect::Policy;
 use std::ffi::OsStr;
 use std::fs;
 use std::fs::OpenOptions;
@@ -12,11 +13,20 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 const BASE_URL: &str = "https://dumps.wikimedia.org/other/mediawiki_history";
+pub(crate) const DUMPS_HOST: &str = "dumps.wikimedia.org";
 const USER_AGENT: &str = "wiki-econ/0.1 (Wikipedia economic analysis research tool)";
 const FETCH_MAX_PARALLELISM: usize = 4;
 const FETCH_MAX_RETRIES: usize = 3;
 const FETCH_RETRY_BACKOFF_MS: u64 = 500;
 const FETCH_MAX_PARALLELISM_ENV: &str = "WIKI_ECON_FETCH_MAX_PARALLELISM";
+/// Bzip2 magic bytes ("BZh"). Every valid bz2 file begins with these three
+/// bytes before the version digit. Used to surface CDN corruption / truncation
+/// at fetch time, before the file is moved into the ingest pipeline. Note: the
+/// upstream `mediawiki_history` dump path does NOT publish checksums (no
+/// dumpstatus.json / sha1sums.txt), so end-to-end SHA verification is not
+/// possible; magic-byte validation is the cheapest meaningful integrity gate
+/// we can apply on top of TLS.
+const BZ2_MAGIC: &[u8] = b"BZh";
 
 /// Wikis partitioned yearly in the dumps (medium-sized wikis).
 const YEARLY_WIKIS: &[&str] = &[
@@ -108,14 +118,112 @@ fn build_file_list(wiki: &str, version: &str) -> Result<Vec<String>> {
     }
 }
 
+/// Maximum redirect chain length the dumps-host policy will follow before
+/// giving up. Matches reqwest's stock `Policy::limited(10)` ceiling so the
+/// custom policy doesn't accidentally permit infinite redirect loops.
+const REDIRECT_MAX_HOPS: usize = 10;
+
+/// Decision returned by the redirect-policy core: did we follow, reject for
+/// host mismatch, or reject for hop ceiling? Pulled out of the closure so
+/// the policy logic is unit-testable without standing up a real HTTP client.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum RedirectDecision {
+    Follow,
+    BlockedHost(String),
+    TooManyHops,
+}
+
+#[cfg(test)]
+pub(crate) fn evaluate_redirect(host: Option<&str>, hops: usize) -> RedirectDecision {
+    evaluate_redirect_for(host, hops, DUMPS_HOST)
+}
+
+pub(crate) fn evaluate_redirect_for(
+    host: Option<&str>,
+    hops: usize,
+    allowed_host: &str,
+) -> RedirectDecision {
+    if hops >= REDIRECT_MAX_HOPS {
+        return RedirectDecision::TooManyHops;
+    }
+    match host {
+        Some(host) if host == allowed_host => RedirectDecision::Follow,
+        Some(host) => RedirectDecision::BlockedHost(host.to_owned()),
+        None => RedirectDecision::BlockedHost(String::new()),
+    }
+}
+
+/// Custom redirect policy that only follows redirects whose target host
+/// matches the dumps.wikimedia.org canonical host. Bounds the blast radius of
+/// an open-redirect on the upstream server to in-host targets only. A URL
+/// missing a host is treated the same as a non-dumps host: the redirect is
+/// rejected so the request errors loudly rather than traveling somewhere
+/// unexpected.
+pub(crate) fn dumps_host_only_redirect_policy() -> Policy {
+    redirect_policy_for_host(DUMPS_HOST.to_owned())
+}
+
+/// Test-friendly variant: same logic as `dumps_host_only_redirect_policy`
+/// but with a caller-supplied allowlisted host. Lets unit tests drive the
+/// `Follow` / `TooManyHops` arms against `127.0.0.1` without making real
+/// network calls to dumps.wikimedia.org.
+pub(crate) fn redirect_policy_for_host(allowed_host: String) -> Policy {
+    Policy::custom(move |attempt| {
+        let host = attempt.url().host_str().map(str::to_owned);
+        match evaluate_redirect_for(host.as_deref(), attempt.previous().len(), &allowed_host) {
+            RedirectDecision::Follow => attempt.follow(),
+            RedirectDecision::BlockedHost(host) => attempt.error(format!(
+                "redirect to non-allowed host {host:?} blocked by policy"
+            )),
+            RedirectDecision::TooManyHops => {
+                attempt.error(format!("redirect chain exceeded {REDIRECT_MAX_HOPS} hops"))
+            }
+        }
+    })
+}
+
 fn build_transport() -> Result<ReqwestTransport> {
     let client = reqwest::blocking::Client::builder()
         .user_agent(USER_AGENT)
         .timeout(Duration::from_secs(3600))
+        .redirect(dumps_host_only_redirect_policy())
         .build()
         .map_err(anyhow::Error::from)?;
 
     Ok(ReqwestTransport { client })
+}
+
+/// Verify a freshly downloaded `.tsv.bz2` file begins with the bz2 magic
+/// header. Catches truncated, empty, or HTML-error-page-as-200 responses that
+/// passed Content-Length validation but produced an unusable file.
+pub(crate) fn verify_bz2_magic(path: &Path) -> Result<()> {
+    let mut file = fs::File::open(path)
+        .with_context(|| format!("failed to open {} for magic-byte check", path.display()))?;
+    let mut header = [0_u8; 3];
+    let read = read_filled(&mut file, &mut header)?;
+    if read < BZ2_MAGIC.len() || header != BZ2_MAGIC {
+        anyhow::bail!(
+            "downloaded file {} does not begin with bz2 magic ('BZh'); got {} byte(s) {:02x?}",
+            path.display(),
+            read,
+            &header[..read]
+        );
+    }
+    Ok(())
+}
+
+/// Best-effort filled read: returns the number of bytes actually read into
+/// `buf`. A short file produces a short read with no error, which is the
+/// behavior the magic-byte helpers want.
+fn read_filled<R: Read>(reader: &mut R, buf: &mut [u8]) -> Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match reader.read(&mut buf[filled..])? {
+            0 => break,
+            n => filled += n,
+        }
+    }
+    Ok(filled)
 }
 
 impl HttpTransport for ReqwestTransport {
@@ -501,6 +609,15 @@ fn download_file_with_transport<T: HttpTransport>(
     loop {
         match download_attempt(transport, url, dest, plan, visible_progress) {
             Ok(downloaded) => {
+                if let Err(integrity_error) = verify_bz2_magic(dest) {
+                    warn!(
+                        path = %dest.display(),
+                        error = %integrity_error,
+                        "downloaded file failed bz2 magic check; removing and aborting"
+                    );
+                    let _ = fs::remove_file(dest);
+                    return Err(integrity_error);
+                }
                 info!(
                     path = %dest.display(),
                     bytes = downloaded,
@@ -899,12 +1016,12 @@ mod tests {
         let dest = temp_dir.path().join("download.tsv.bz2");
         let transport = FakeTransport::with_outcomes(
             [ok_head(Some(13), false)],
-            [ok_get(b"payload-bytes", false)],
+            [ok_get(b"BZhpayload-by", false)],
         );
 
         download_file_with_transport(&transport, TEST_URL, &dest, false)?;
 
-        assert_eq!(fs::read(&dest)?, b"payload-bytes");
+        assert_eq!(fs::read(&dest)?, b"BZhpayload-by");
         Ok(())
     }
 
@@ -931,12 +1048,12 @@ mod tests {
         init_test_tracing();
         let temp_dir = TestDir::new()?;
         let dest = temp_dir.path().join("download.tsv.bz2");
-        fs::write(&dest, b"payload-bytes")?;
+        fs::write(&dest, b"BZhpayload-by")?;
         let transport = FakeTransport::with_outcomes([ok_head(Some(13), true)], []);
 
         download_file_with_transport(&transport, TEST_URL, &dest, false)?;
 
-        assert_eq!(fs::read(&dest)?, b"payload-bytes");
+        assert_eq!(fs::read(&dest)?, b"BZhpayload-by");
         assert_eq!(transport.get_requests(), 0);
         Ok(())
     }
@@ -949,12 +1066,198 @@ mod tests {
         fs::write(&dest, [])?;
         let transport = FakeTransport::with_outcomes(
             [ok_head(Some(11), false)],
-            [ok_get(b"fresh-bytes", false)],
+            [ok_get(b"BZhfresh-by", false)],
         );
 
         download_file_with_transport(&transport, TEST_URL, &dest, false)?;
 
-        assert_eq!(fs::read(&dest)?, b"fresh-bytes");
+        assert_eq!(fs::read(&dest)?, b"BZhfresh-by");
+        Ok(())
+    }
+
+    #[test]
+    fn download_file_rejects_payload_with_bad_magic_bytes() -> Result<()> {
+        init_test_tracing();
+        let temp_dir = TestDir::new()?;
+        let dest = temp_dir.path().join("download.tsv.bz2");
+        // Body deliberately does not start with "BZh"; this simulates a CDN
+        // returning an HTML error page or a truncated/corrupted payload that
+        // happens to satisfy Content-Length.
+        let transport = FakeTransport::with_outcomes(
+            [ok_head(Some(13), false)],
+            [ok_get(b"<!DOCTYPE htm", false)],
+        );
+
+        let err = download_file_with_transport(&transport, TEST_URL, &dest, false)
+            .expect_err("non-bz2 body should fail magic check");
+
+        assert!(err.to_string().contains("bz2 magic"));
+        assert!(!dest.exists(), "failed payload should be removed");
+        Ok(())
+    }
+
+    #[test]
+    fn verify_bz2_magic_accepts_real_magic_and_rejects_short_or_wrong_files() -> Result<()> {
+        init_test_tracing();
+        let temp_dir = TestDir::new()?;
+
+        let good = temp_dir.path().join("good.bz2");
+        fs::write(&good, b"BZh91AY")?;
+        verify_bz2_magic(&good)?;
+
+        let bad = temp_dir.path().join("bad.bz2");
+        fs::write(&bad, b"GIF87a")?;
+        let err = verify_bz2_magic(&bad).expect_err("non-bz2 should fail");
+        assert!(err.to_string().contains("bz2 magic"));
+
+        let empty = temp_dir.path().join("empty.bz2");
+        fs::write(&empty, b"")?;
+        let err = verify_bz2_magic(&empty).expect_err("empty file should fail");
+        assert!(err.to_string().contains("does not begin with bz2 magic"));
+
+        let tiny = temp_dir.path().join("tiny.bz2");
+        fs::write(&tiny, b"BZ")?;
+        let err = verify_bz2_magic(&tiny).expect_err("2-byte file should fail");
+        assert!(err.to_string().contains("does not begin with bz2 magic"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn redirect_policy_follows_one_hop_within_allowed_host() -> Result<()> {
+        init_test_tracing();
+        // Two responses on the same local port: a 302 to a different path on
+        // the same host (which the policy must follow), then a 200 with a
+        // small body. Drives the `Follow` arm of the closure.
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let address = listener.local_addr()?;
+        let target_url = format!("http://{address}/dump.tsv.bz2");
+        let redirect_url = format!("http://{address}/redirect");
+        let target_url_for_thread = target_url.clone();
+        let handle = thread::spawn(move || -> Result<()> {
+            let responses = vec![
+                format!(
+                    "HTTP/1.1 302 Found\r\nLocation: {}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    target_url_for_thread
+                ),
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string(),
+            ];
+            for response in responses {
+                let (mut stream, _) = listener.accept()?;
+                let mut reader = BufReader::new(stream.try_clone()?);
+                let mut line = String::new();
+                while reader.read_line(&mut line)? > 0 && line != "\r\n" {
+                    line.clear();
+                }
+                stream.write_all(response.as_bytes())?;
+            }
+            Ok(())
+        });
+
+        let client = reqwest::blocking::Client::builder()
+            .redirect(redirect_policy_for_host("127.0.0.1".to_string()))
+            .timeout(Duration::from_secs(2))
+            .build()?;
+        let response = client.get(&redirect_url).send()?;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.text()?, "ok");
+        let _ = handle.join();
+        Ok(())
+    }
+    // Note: the hop-ceiling test above intentionally leaks its server thread
+    // because reqwest stops following at hop 10 and the listener's next
+    // accept() blocks indefinitely. The thread dies when the test process
+    // exits.
+
+    #[test]
+    fn redirect_policy_aborts_chains_past_hop_ceiling() -> Result<()> {
+        init_test_tracing();
+        // Repeated 302s within the allowed host. The policy's hop ceiling (10)
+        // must reject the chain even though every hop is host-allowed; drives
+        // the `TooManyHops` arm.
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(false)?;
+        let address = listener.local_addr()?;
+        let entry_url = format!("http://{address}/hop/0");
+        let address_str = address.to_string();
+        // The thread is intentionally not joined: reqwest stops following at
+        // the policy ceiling and the listener loop will block on its next
+        // accept(). Letting the thread leak is acceptable for this test since
+        // the listener+thread are dropped when the test process exits.
+        thread::spawn(move || {
+            for next in 1..14_u32 {
+                let (mut stream, _) = listener.accept().expect("accept");
+                let mut reader =
+                    BufReader::new(stream.try_clone().expect("clone stream for reader"));
+                let mut line = String::new();
+                while reader.read_line(&mut line).unwrap_or(0) > 0 && line != "\r\n" {
+                    line.clear();
+                }
+                let response = format!(
+                    "HTTP/1.1 302 Found\r\nLocation: http://{address_str}/hop/{next}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+
+        let client = reqwest::blocking::Client::builder()
+            .redirect(redirect_policy_for_host("127.0.0.1".to_string()))
+            .timeout(Duration::from_secs(5))
+            .build()?;
+        let err = client
+            .get(&entry_url)
+            .send()
+            .expect_err("redirect chain past ceiling must fail");
+        assert!(err.is_redirect());
+        Ok(())
+    }
+
+    #[test]
+    fn evaluate_redirect_returns_decisions_for_each_branch() {
+        init_test_tracing();
+        assert_eq!(
+            evaluate_redirect(Some(DUMPS_HOST), 0),
+            RedirectDecision::Follow
+        );
+        assert_eq!(
+            evaluate_redirect(Some(DUMPS_HOST), REDIRECT_MAX_HOPS - 1),
+            RedirectDecision::Follow,
+        );
+        assert_eq!(
+            evaluate_redirect(Some(DUMPS_HOST), REDIRECT_MAX_HOPS),
+            RedirectDecision::TooManyHops,
+        );
+        assert_eq!(
+            evaluate_redirect(Some("evil.example.com"), 0),
+            RedirectDecision::BlockedHost("evil.example.com".to_owned()),
+        );
+        assert_eq!(
+            evaluate_redirect(None, 0),
+            RedirectDecision::BlockedHost(String::new()),
+        );
+    }
+
+    #[test]
+    fn dumps_host_only_redirect_policy_blocks_offsite_targets() -> Result<()> {
+        init_test_tracing();
+        // Stand up a local server that 302s to evil.example.com. The custom
+        // redirect policy must refuse to follow the redirect; the request
+        // surfaces as an error rather than silently traveling to the
+        // non-dumps host.
+        let response =
+            "HTTP/1.1 302 Found\r\nLocation: http://evil.example.com/\r\nContent-Length: 0\r\n\r\n"
+                .to_string();
+        let (url, _requests, handle) = spawn_test_server(vec![response])?;
+        let client = reqwest::blocking::Client::builder()
+            .redirect(dumps_host_only_redirect_policy())
+            .timeout(Duration::from_secs(2))
+            .build()?;
+        let err = client
+            .get(&url)
+            .send()
+            .expect_err("redirect to non-dumps host must fail");
+        assert!(err.is_redirect());
+        let _ = handle.join();
         Ok(())
     }
 
@@ -963,15 +1266,15 @@ mod tests {
         init_test_tracing();
         let temp_dir = TestDir::new()?;
         let dest = temp_dir.path().join("download.tsv.bz2");
-        fs::write(&dest, b"payload-")?;
+        fs::write(&dest, b"BZhpaylo")?;
         let transport = FakeTransport::with_outcomes(
             [ok_head(Some(13), true)],
-            [ok_get(b"payload-bytes", true)],
+            [ok_get(b"BZhpayload-by", true)],
         );
 
         download_file_with_transport(&transport, TEST_URL, &dest, false)?;
 
-        assert_eq!(fs::read(&dest)?, b"payload-bytes");
+        assert_eq!(fs::read(&dest)?, b"BZhpayload-by");
         assert_eq!(transport.requested_ranges(), vec![Some(8)]);
         Ok(())
     }
@@ -985,13 +1288,13 @@ mod tests {
             [ok_head(Some(13), false)],
             [
                 status_get(StatusCode::SERVICE_UNAVAILABLE),
-                ok_get(b"payload-bytes", false),
+                ok_get(b"BZhpayload-by", false),
             ],
         );
 
         download_file_with_transport(&transport, TEST_URL, &dest, false)?;
 
-        assert_eq!(fs::read(&dest)?, b"payload-bytes");
+        assert_eq!(fs::read(&dest)?, b"BZhpayload-by");
         assert_eq!(transport.get_requests(), 2);
         Ok(())
     }
@@ -1004,12 +1307,12 @@ mod tests {
         fs::write(&dest, b"stale")?;
         let transport = FakeTransport::with_outcomes(
             [status_head(StatusCode::METHOD_NOT_ALLOWED)],
-            [ok_get(b"payload-bytes", false)],
+            [ok_get(b"BZhpayload-by", false)],
         );
 
         download_file_with_transport(&transport, TEST_URL, &dest, false)?;
 
-        assert_eq!(fs::read(&dest)?, b"payload-bytes");
+        assert_eq!(fs::read(&dest)?, b"BZhpayload-by");
         Ok(())
     }
 
@@ -1198,8 +1501,8 @@ mod tests {
         let transport = FakeTransport::with_outcomes(
             [ok_head(Some(13), false), ok_head(Some(13), false)],
             [
-                ok_get(b"payload-bytes", false),
-                ok_get(b"payload-bytes", false),
+                ok_get(b"BZhpayload-by", false),
+                ok_get(b"BZhpayload-by", false),
             ],
         );
         let paths = fetch_paths_with_transport(&transport, wiki, "2002-01", data_dir.path())?;
@@ -1217,7 +1520,7 @@ mod tests {
         let dest = temp_dir.path().join("missing").join("download.tsv.bz2");
         let transport = FakeTransport::with_outcomes(
             [ok_head(Some(11), false)],
-            [ok_get(b"fresh-bytes", false)],
+            [ok_get(b"BZhfresh-by", false)],
         );
         let err = download_file_with_transport(&transport, TEST_URL, &dest, false)
             .expect_err("missing parent directory should fail");
@@ -1339,7 +1642,7 @@ mod tests {
         init_test_tracing();
         let temp_dir = TestDir::new()?;
         let dest = temp_dir.path().join("download.tsv.bz2");
-        let payload = b"payload-bytes";
+        let payload = b"BZhpayload-by";
         let transport = FakeTransport::with_outcomes(
             [ok_head(Some(payload.len() as u64), true)],
             [
@@ -1365,8 +1668,8 @@ mod tests {
         init_test_tracing();
         let temp_dir = TestDir::new()?;
         let dest = temp_dir.path().join("download.tsv.bz2");
-        fs::write(&dest, b"payload-")?;
-        let transport = FakeTransport::with_outcomes([], [ok_get(b"payload-bytes", true)]);
+        fs::write(&dest, b"BZhpaylo")?;
+        let transport = FakeTransport::with_outcomes([], [ok_get(b"BZhpayload-by", true)]);
 
         let downloaded = download_attempt(
             &transport,
@@ -1382,7 +1685,7 @@ mod tests {
         .expect("download attempt should resume successfully");
 
         assert_eq!(downloaded, 13);
-        assert_eq!(fs::read(&dest)?, b"payload-bytes");
+        assert_eq!(fs::read(&dest)?, b"BZhpayload-by");
         Ok(())
     }
 
@@ -1396,7 +1699,7 @@ mod tests {
             [
                 FakeGetOutcome::Response {
                     status: StatusCode::OK,
-                    body: b"payload-bytes".to_vec(),
+                    body: b"BZhpayload-by".to_vec(),
                     accepts_ranges: false,
                     fail_after: Some(7),
                 },
@@ -1457,7 +1760,7 @@ mod tests {
             [],
             [FakeGetOutcome::Response {
                 status: StatusCode::OK,
-                body: b"payload-bytes".to_vec(),
+                body: b"BZhpayload-by".to_vec(),
                 accepts_ranges: false,
                 fail_after: None,
             }],
@@ -1469,7 +1772,7 @@ mod tests {
 
         assert_eq!(response.status, StatusCode::OK);
         assert_eq!(response.content_length, Some(13));
-        assert_eq!(bytes, b"payload-bytes");
+        assert_eq!(bytes, b"BZhpayload-by");
         Ok(())
     }
 

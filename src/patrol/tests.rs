@@ -437,9 +437,13 @@ fn download_logging_dump_writes_and_resumes_existing_files() -> Result<()> {
     let temp_dir = TestDir::new()?;
     let dest = temp_dir.path().join("patrol.xml.gz");
 
-    let first = FakePatrolTransport::new(vec![b"abc".to_vec()], Vec::new());
+    // First-write payload starts with the gzip magic (1f 8b) so the
+    // post-download integrity check succeeds. The resume scenario then
+    // appends additional bytes; the magic check still passes because the
+    // file's first two bytes never change after the initial write.
+    let first = FakePatrolTransport::new(vec![b"\x1f\x8b\x08".to_vec()], Vec::new());
     download_logging_dump(&first, "testwiki", &dest)?;
-    assert_eq!(fs::read(&dest)?, b"abc");
+    assert_eq!(fs::read(&dest)?, b"\x1f\x8b\x08");
     assert_eq!(
         first.get_calls(),
         vec![(
@@ -451,7 +455,7 @@ fn download_logging_dump_writes_and_resumes_existing_files() -> Result<()> {
 
     let second = FakePatrolTransport::new(vec![b"def".to_vec()], Vec::new());
     download_logging_dump(&second, "testwiki", &dest)?;
-    assert_eq!(fs::read(&dest)?, b"abcdef");
+    assert_eq!(fs::read(&dest)?, b"\x1f\x8b\x08def");
     assert_eq!(
         second.get_calls(),
         vec![(
@@ -460,6 +464,38 @@ fn download_logging_dump_writes_and_resumes_existing_files() -> Result<()> {
             Some(3),
         )]
     );
+    Ok(())
+}
+
+#[test]
+fn download_logging_dump_rejects_payload_with_bad_gzip_magic() -> Result<()> {
+    init_test_tracing();
+    let temp_dir = TestDir::new()?;
+    let dest = temp_dir.path().join("patrol.xml.gz");
+
+    // Server returns bytes that are not a gzip stream. The post-download
+    // magic check must reject the response and remove the corrupt file so
+    // that ingest never sees it.
+    let transport = FakePatrolTransport::new(vec![b"<!DOCTYPE htm".to_vec()], Vec::new());
+    let err = download_logging_dump(&transport, "testwiki", &dest)
+        .expect_err("non-gzip payload must fail magic check");
+    assert!(err.to_string().contains("gzip magic"));
+    assert!(!dest.exists(), "corrupt patrol dump should be removed");
+    Ok(())
+}
+
+#[test]
+fn download_logging_dump_rejects_short_payload() -> Result<()> {
+    init_test_tracing();
+    let temp_dir = TestDir::new()?;
+    let dest = temp_dir.path().join("patrol.xml.gz");
+
+    // A single-byte response is shorter than the 2-byte gzip magic header.
+    let transport = FakePatrolTransport::new(vec![b"\x1f".to_vec()], Vec::new());
+    let err = download_logging_dump(&transport, "testwiki", &dest)
+        .expect_err("1-byte payload must fail magic check");
+    assert!(err.to_string().contains("gzip magic"));
+    assert!(!dest.exists());
     Ok(())
 }
 
