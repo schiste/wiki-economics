@@ -1,0 +1,1275 @@
+/* ═══════════════════════════════════════════════════════════
+   Wikipedia Economics — Editorial Design System
+   Aesthetic: Research publication meets data journalism
+   ═══════════════════════════════════════════════════════════ */
+
+/* ── Self-hosted IBM Plex (SIL OFL) ────────────────────── */
+
+@font-face {
+  font-family: "IBM Plex Serif";
+  src: url("./fonts/ibm-plex-serif-latin-400-normal.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "IBM Plex Serif";
+  src: url("./fonts/ibm-plex-serif-latin-400-italic.woff2") format("woff2");
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: "IBM Plex Serif";
+  src: url("./fonts/ibm-plex-serif-latin-500-normal.woff2") format("woff2");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "IBM Plex Sans";
+  src: url("./fonts/ibm-plex-sans-latin-400-normal.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "IBM Plex Sans";
+  src: url("./fonts/ibm-plex-sans-latin-500-normal.woff2") format("woff2");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "IBM Plex Sans";
+  src: url("./fonts/ibm-plex-sans-latin-600-normal.woff2") format("woff2");
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "IBM Plex Sans";
+  src: url("./fonts/ibm-plex-sans-latin-700-normal.woff2") format("woff2");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "IBM Plex Mono";
+  src: url("./fonts/ibm-plex-mono-latin-400-normal.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* ── Design Tokens ──────────────────────────────────────── */
+:root {
+  --wk-serif: "IBM Plex Serif", Georgia, serif;
+  --wk-sans: "IBM Plex Sans", system-ui, -apple-system, sans-serif;
+  --wk-mono: "IBM Plex Mono", ui-monospace, monospace;
+
+  /* warm palette */
+  --wk-teal: #3d9b82;
+  --wk-coral: #d45d47;
+  --wk-blue: #5b8cbf;
+  --wk-amber: #c99a2e;
+  --wk-lavender: #8b7ec0;
+
+  --wk-radius: 6px;
+  --wk-radius-lg: 10px;
+  --wk-shadow-sm: 0 1px 3px rgba(0,0,0,0.06);
+  --wk-shadow-md: 0 2px 8px rgba(0,0,0,0.08);
+  --wk-transition: 0.2s ease;
+}
+
+/* dark mode tokens (Observable default is dark with near-midnight) */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --wk-surface: #171b22;
+    --wk-surface-raised: #1e222b;
+    --wk-border: rgba(255,255,255,0.07);
+    --wk-border-accent: rgba(255,255,255,0.12);
+    --wk-text-primary: #e2ddd3;
+    --wk-text-secondary: #9e9889;
+    --wk-text-tertiary: #8d8880;
+    --wk-shadow-sm: 0 1px 3px rgba(0,0,0,0.25);
+    --wk-shadow-md: 0 2px 10px rgba(0,0,0,0.3);
+    --wk-bar-bg: rgba(17,19,24,0.88);
+  }
+}
+
+/* light mode tokens */
+@media (prefers-color-scheme: light) {
+  :root {
+    --wk-surface: #ffffff;
+    --wk-surface-raised: #f7f5f0;
+    --wk-border: rgba(0,0,0,0.08);
+    --wk-border-accent: rgba(0,0,0,0.22);
+    --wk-text-primary: #1c1c1e;
+    --wk-text-secondary: #636360;
+    --wk-text-tertiary: #706e6b;
+    --wk-blue: #3674a8;
+    --wk-bar-bg: rgba(248,246,241,0.92);
+  }
+}
+
+/* force dark tokens when Observable uses near-midnight theme */
+[data-theme="dark"], .observablehq--dark {
+  --wk-surface: #171b22;
+  --wk-surface-raised: #1e222b;
+  --wk-border: rgba(255,255,255,0.07);
+  --wk-border-accent: rgba(255,255,255,0.12);
+  --wk-text-primary: #e2ddd3;
+  --wk-text-secondary: #9e9889;
+  --wk-text-tertiary: #8d8880;
+  --wk-shadow-sm: 0 1px 3px rgba(0,0,0,0.25);
+  --wk-shadow-md: 0 2px 10px rgba(0,0,0,0.3);
+  --wk-bar-bg: rgba(17,19,24,0.88);
+  --wk-blue: #5b8cbf;
+}
+
+/* ── Manual theme overrides (for theme toggle) ────────── */
+
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --theme-foreground: #e0e0e0;
+  --theme-background: #15171e;
+  --theme-foreground-muted: color-mix(in srgb, #e0e0e0 60%, #15171e);
+  --theme-foreground-faint: color-mix(in srgb, #e0e0e0 50%, #15171e);
+  --theme-foreground-faintest: color-mix(in srgb, #e0e0e0 14%, #15171e);
+  --theme-foreground-fainter: color-mix(in srgb, #e0e0e0 30%, #15171e);
+  --theme-foreground-focus: #5b8ff9;
+  --theme-background-alt: color-mix(in srgb, #e0e0e0 4%, #15171e);
+}
+
+html[data-theme="light"] {
+  color-scheme: light;
+  --theme-foreground: #1b1e23;
+  --theme-background: #ffffff;
+  --theme-foreground-muted: color-mix(in srgb, #1b1e23 60%, #ffffff);
+  --theme-foreground-faint: color-mix(in srgb, #1b1e23 50%, #ffffff);
+  --theme-foreground-faintest: color-mix(in srgb, #1b1e23 14%, #ffffff);
+  --theme-foreground-fainter: color-mix(in srgb, #1b1e23 30%, #ffffff);
+  --theme-foreground-focus: #3b5fc0;
+  --theme-background-alt: color-mix(in srgb, #1b1e23 4%, #ffffff);
+  --wk-surface: #ffffff;
+  --wk-surface-raised: #f7f5f0;
+  --wk-border: rgba(0,0,0,0.08);
+  --wk-border-accent: rgba(0,0,0,0.22);
+  --wk-text-primary: #1c1c1e;
+  --wk-text-secondary: #636360;
+  --wk-text-tertiary: #706e6b;
+  --wk-blue: #3674a8;
+  --wk-bar-bg: rgba(248,246,241,0.92);
+  --wk-shadow-sm: 0 1px 3px rgba(0,0,0,0.06);
+  --wk-shadow-md: 0 2px 8px rgba(0,0,0,0.08);
+}
+
+/* ── Remove Observable's max-width constraints ──────────── */
+
+#observablehq-main p,
+#observablehq-main table,
+#observablehq-main figure,
+#observablehq-main figcaption,
+#observablehq-main h1,
+#observablehq-main h2,
+#observablehq-main h3,
+#observablehq-main h4,
+#observablehq-main h5,
+#observablehq-main h6,
+#observablehq-main blockquote,
+#observablehq-main ol,
+#observablehq-main ul,
+#observablehq-main .katex-display,
+#observablehq-main .note,
+#observablehq-main .warning {
+  max-width: none;
+}
+
+/* ── Typography ─────────────────────────────────────────── */
+
+#observablehq-main h1 {
+  font-family: var(--wk-serif);
+  font-weight: 500;
+  font-size: 2.1rem;
+  letter-spacing: -0.02em;
+  line-height: 1.15;
+  margin-bottom: 0.25rem;
+  font-optical-sizing: auto;
+}
+
+#observablehq-main h2 {
+  font-family: var(--wk-serif);
+  font-weight: 450;
+  font-size: 1.35rem;
+  letter-spacing: -0.015em;
+  line-height: 1.25;
+  margin-top: 0;
+  margin-bottom: 0.6rem;
+}
+
+#observablehq-main h3 {
+  font-family: var(--wk-sans);
+  font-weight: 600;
+  font-size: 0.95rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--wk-text-secondary, var(--theme-foreground-muted));
+  margin-top: 0;
+  margin-bottom: 0.5rem;
+}
+
+#observablehq-main p,
+#observablehq-main li,
+#observablehq-main td {
+  font-family: var(--wk-sans);
+}
+
+/* ── Page intro ─────────────────────────────────────────── */
+
+.page-intro {
+  font-family: var(--wk-serif);
+  font-size: 1.05rem;
+  font-weight: 350;
+  font-style: italic;
+  color: var(--wk-text-secondary, var(--theme-foreground-muted));
+  max-width: none;
+  line-height: 1.65;
+  margin: -0.25rem 0 1.5rem;
+  padding-bottom: 1rem;
+  border-bottom: 1px solid var(--wk-border, var(--theme-foreground-faintest));
+}
+
+/* ── Sticky filter bar ──────────────────────────────────── */
+
+.filters-bar {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  background: var(--wk-bar-bg, var(--theme-background));
+  backdrop-filter: blur(14px) saturate(1.4);
+  -webkit-backdrop-filter: blur(14px) saturate(1.4);
+  border-bottom: 1px solid var(--wk-border, var(--theme-foreground-faintest));
+  padding: 0.6rem 1rem 0.5rem;
+  margin: 0 -1rem 0;
+}
+
+/* fade-out gradient at bottom of filter bar */
+.filters-bar::after {
+  content: "";
+  position: absolute;
+  bottom: -16px;
+  left: 0;
+  right: 0;
+  height: 16px;
+  background: linear-gradient(to bottom, var(--theme-background), transparent);
+  pointer-events: none;
+  z-index: 99;
+}
+
+.filters-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 0.55rem;
+  align-items: start;
+}
+
+.filters-row > * {
+  min-width: 0;
+  flex: 0 0 auto;
+  width: auto !important;
+  max-width: none;
+}
+
+.filters-row > .observablehq--block {
+  margin: 0 !important;
+}
+
+/* When filter bar is rendered via view(createFilterBar()), remove wrapper margin */
+.observablehq--block:has(> .filters-bar) {
+  margin: 0 !important;
+}
+
+/* ── Modern input controls inside filter bar ────────────── */
+
+/* All forms: kill margins, inline layout, shrink to content, left-align */
+.filters-bar form,
+.filters-row form {
+  margin: 0 !important;
+  font-family: var(--wk-sans);
+  display: inline-flex !important;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.3rem;
+  vertical-align: top;
+  width: auto !important;
+  max-width: none !important;
+}
+
+/* Top-level labels (e.g. "Wiki", "User types", "Time scale") */
+.filters-bar form > label,
+.filters-row form > label {
+  font-family: var(--wk-sans) !important;
+  font-size: 0.58rem !important;
+  font-weight: 700 !important;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--wk-text-tertiary, var(--theme-foreground-faint)) !important;
+  margin-bottom: 0;
+  line-height: 1;
+  padding: 0;
+  width: auto !important;
+}
+
+/* ── Pill-chip checkboxes (User types) ──────────────────── */
+
+.filters-bar form div > label:has(input[type="checkbox"]) {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.25rem 0.5rem;
+  margin: 0.05rem 0.1rem;
+  font-family: var(--wk-sans);
+  font-size: 0.72rem;
+  font-weight: 500;
+  color: var(--wk-text-secondary, var(--theme-foreground-muted));
+  background: var(--wk-surface, var(--theme-background));
+  border: 1px solid var(--wk-border-accent, var(--theme-foreground-fainter));
+  border-radius: 100px;
+  cursor: pointer;
+  user-select: none;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+  line-height: 1.35;
+}
+
+.filters-bar form div > label:has(input[type="checkbox"]):hover {
+  border-color: var(--wk-blue);
+  color: var(--wk-text-primary, var(--theme-foreground));
+}
+
+.filters-bar form div > label:has(input[type="checkbox"]:checked) {
+  background: color-mix(in srgb, var(--wk-blue) 15%, transparent);
+  border-color: color-mix(in srgb, var(--wk-blue) 50%, transparent);
+  color: var(--wk-text-primary, var(--theme-foreground));
+  font-weight: 600;
+}
+
+/* hide the native checkbox, replace with dot indicator */
+.filters-bar form div > label > input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  border: 1.5px solid var(--wk-text-tertiary, var(--theme-foreground-faint));
+  margin: 0;
+  padding: 0;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  flex-shrink: 0;
+}
+
+.filters-bar form div > label > input[type="checkbox"]:checked {
+  background: var(--wk-blue);
+  border-color: var(--wk-blue);
+  box-shadow: 0 0 0 1.5px color-mix(in srgb, var(--wk-blue) 30%, transparent);
+}
+
+/* focus ring on the pill label when checkbox is keyboard-focused */
+.filters-bar form div > label:has(input[type="checkbox"]:focus-visible) {
+  outline: 2px solid var(--wk-blue);
+  outline-offset: 1px;
+}
+
+/* ── Segmented control (radios — Time scale) ─────────────── */
+
+.filters-bar form:has(input[type="radio"]) > div {
+  display: inline-flex;
+  background: var(--wk-surface, var(--theme-background));
+  border: 1px solid var(--wk-border-accent, var(--theme-foreground-fainter));
+  border-radius: 100px;
+  padding: 2px;
+  gap: 0;
+}
+
+.filters-bar form div > label:has(input[type="radio"]) {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.18rem 0.55rem;
+  font-family: var(--wk-sans);
+  font-size: 0.72rem;
+  font-weight: 500;
+  color: var(--wk-text-tertiary, var(--theme-foreground-faint));
+  border-radius: 100px;
+  cursor: pointer;
+  user-select: none;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+  line-height: 1.35;
+  margin: 0;
+}
+
+.filters-bar form div > label:has(input[type="radio"]):hover {
+  color: var(--wk-text-primary, var(--theme-foreground));
+}
+
+.filters-bar form div > label:has(input[type="radio"]:checked) {
+  background: var(--wk-blue);
+  color: #fff;
+  font-weight: 600;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.15);
+}
+
+/* hide native radio visually but keep it focusable */
+.filters-bar form div > label > input[type="radio"] {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 0;
+  height: 0;
+  margin: 0;
+  padding: 0;
+  position: absolute;
+  opacity: 0;
+}
+
+/* focus ring on the label when radio is keyboard-focused */
+.filters-bar form div > label:has(input[type="radio"]:focus-visible) {
+  outline: 2px solid var(--wk-blue);
+  outline-offset: 1px;
+}
+
+/* ── Styled select (Wiki dropdown) ───────────────────────── */
+
+.filters-bar form select {
+  font-family: var(--wk-sans);
+  font-size: 0.72rem;
+  font-weight: 500;
+  padding: 0.25rem 1.6rem 0.25rem 0.5rem;
+  background: var(--wk-surface, var(--theme-background));
+  border: 1px solid var(--wk-border-accent, var(--theme-foreground-fainter));
+  border-radius: 100px;
+  color: var(--wk-text-primary, var(--theme-foreground));
+  cursor: pointer;
+  transition: border-color 0.15s ease;
+  appearance: none;
+  -webkit-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg width='10' height='6' viewBox='0 0 10 6' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M1 1L5 5L9 1' stroke='%239e9889' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 0.45rem center;
+  line-height: 1.35;
+  min-width: 0;
+  width: auto;
+}
+
+.filters-bar form select:hover {
+  border-color: var(--wk-blue);
+}
+
+.filters-bar form select:focus-visible {
+  outline: 2px solid var(--wk-blue);
+  outline-offset: 1px;
+  border-color: var(--wk-blue);
+}
+
+/* ── Date range wrapper (From + To in one flex item) ────── */
+
+.date-range {
+  display: inline-flex;
+  flex-wrap: nowrap;
+  gap: 0.25rem;
+  align-items: end;
+  flex-shrink: 0;
+}
+
+.date-range > .observablehq--block {
+  margin: 0 !important;
+}
+
+/* ── Compact text inputs (From / To) ─────────────────────── */
+
+.filters-bar form input[type="text"] {
+  font-family: var(--wk-mono);
+  font-size: 0.72rem;
+  font-weight: 400;
+  padding: 0.25rem 0.45rem;
+  width: 5rem;
+  background: var(--wk-surface, var(--theme-background));
+  border: 1px solid var(--wk-border-accent, var(--theme-foreground-fainter));
+  border-radius: 100px;
+  color: var(--wk-text-primary, var(--theme-foreground));
+  transition: border-color 0.15s ease;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.35;
+}
+
+.filters-bar form input[type="text"]:hover {
+  border-color: var(--wk-blue);
+}
+
+.filters-bar form input[type="text"]:focus-visible {
+  outline: 2px solid var(--wk-blue);
+  outline-offset: 1px;
+  border-color: var(--wk-blue);
+}
+
+/* ── Toggle switch (Breakdown toggle on GDP) ─────────────── */
+
+/* Observable Inputs.toggle produces: <form><label>Label</label><input type="checkbox" name="input"></form> */
+.filters-bar form:has(> input[type="checkbox"]) {
+  flex-direction: row !important;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.filters-bar form:has(> input[type="checkbox"]) > label {
+  font-size: 0.58rem !important;
+  white-space: nowrap;
+  max-width: none !important;
+  width: auto !important;
+}
+
+.filters-bar form > input[type="checkbox"] {
+  position: relative;
+  appearance: none;
+  -webkit-appearance: none;
+  width: 30px;
+  height: 16px;
+  border-radius: 100px;
+  background: var(--wk-border-accent, var(--theme-foreground-fainter));
+  border: none;
+  cursor: pointer;
+  transition: background 0.2s ease;
+  vertical-align: middle;
+  margin: 0;
+  flex-shrink: 0;
+}
+
+.filters-bar form > input[type="checkbox"]:checked {
+  background: var(--wk-blue);
+}
+
+.filters-bar form > input[type="checkbox"]:focus-visible {
+  outline: 2px solid var(--wk-blue);
+  outline-offset: 2px;
+}
+
+.filters-bar form > input[type="checkbox"]::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: white;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.2);
+  transition: transform 0.2s ease;
+}
+
+.filters-bar form > input[type="checkbox"]:checked::after {
+  transform: translateX(14px);
+}
+
+/* ── Namespace row (summary + select/clear inline) ────────── */
+
+.ns-row {
+  display: flex;
+  align-items: baseline;
+  gap: 0 0.35rem;
+  margin-top: 0.25rem;
+}
+
+.ns-row > details {
+  flex: 0 1 auto;
+}
+
+.ns-row > .observablehq--block {
+  margin: 0 !important;
+  flex: 0 0 auto;
+}
+
+.filters-bar details > summary {
+  font-family: var(--wk-sans);
+  font-size: 0.68rem;
+  font-weight: 500;
+  color: var(--wk-text-tertiary, var(--theme-foreground-faint));
+  cursor: pointer;
+  user-select: none;
+  letter-spacing: 0.03em;
+  padding: 0.2rem 0.5rem;
+  border-radius: 100px;
+  transition: all 0.15s ease;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.filters-bar details > summary:hover {
+  color: var(--wk-text-secondary, var(--theme-foreground-muted));
+  background: color-mix(in srgb, var(--wk-blue) 6%, transparent);
+}
+
+.filters-bar details > summary:focus-visible {
+  outline: 2px solid var(--wk-blue);
+  outline-offset: 1px;
+}
+
+.filters-bar details > summary::marker,
+.filters-bar details > summary::-webkit-details-marker {
+  display: none;
+}
+
+.filters-bar details > summary::before {
+  content: "▸";
+  font-size: 0.7em;
+  transition: transform 0.2s ease;
+  display: inline-block;
+}
+
+.filters-bar details[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+/* Namespace checkboxes get pill style too */
+.filters-bar details form div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.15rem;
+  padding: 0.25rem 0;
+}
+
+/* Select all / Clear all links (inline next to summary) */
+.ns-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 0;
+}
+
+.ns-actions a {
+  font-family: var(--wk-sans);
+  font-size: 0.62rem;
+  font-weight: 600;
+  color: var(--wk-blue);
+  text-decoration: none;
+  padding: 0.15rem 0.4rem;
+  border-radius: 100px;
+  transition: background 0.12s ease;
+  white-space: nowrap;
+}
+
+.ns-actions a:hover {
+  background: color-mix(in srgb, var(--wk-blue) 10%, transparent);
+}
+
+.ns-actions a:focus-visible {
+  outline: 2px solid var(--wk-blue);
+  outline-offset: 1px;
+}
+
+.ns-actions a + a::before {
+  content: "·";
+  color: var(--wk-text-tertiary, var(--theme-foreground-faint));
+  margin-right: 0.15rem;
+  font-weight: 400;
+}
+
+/* ── Filter description sentence (inside sticky bar) ───── */
+
+.filter-desc {
+  font-family: var(--wk-sans);
+  font-size: 0.74rem;
+  font-weight: 500;
+  color: var(--wk-text-secondary, var(--theme-foreground-muted));
+  margin: 0.3rem 0 0;
+  line-height: 1.4;
+  letter-spacing: 0.005em;
+  padding: 0.15rem 0;
+  display: flex;
+  align-items: baseline;
+  gap: 0.35rem;
+}
+
+/* Fold / unfold toggle for filter bar */
+.filters-toggle {
+  flex-shrink: 0;
+  margin-left: auto;
+  background: none;
+  border: 1px solid var(--wk-border-accent, var(--theme-foreground-fainter));
+  border-radius: 100px;
+  color: var(--wk-text-tertiary, var(--theme-foreground-faint));
+  font-size: 0.65rem;
+  padding: 0.1rem 0.4rem;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  line-height: 1.3;
+  font-family: var(--wk-sans);
+}
+
+.filters-toggle:hover {
+  color: var(--wk-text-secondary, var(--theme-foreground-muted));
+  border-color: var(--wk-blue);
+  background: color-mix(in srgb, var(--wk-blue) 6%, transparent);
+}
+
+.filters-toggle:focus-visible {
+  outline: 2px solid var(--wk-blue);
+  outline-offset: 1px;
+}
+
+/* Collapsed state: hide controls, keep description visible */
+.filters-bar.filters-collapsed .filters-row,
+.filters-bar.filters-collapsed .ns-row {
+  display: none;
+}
+
+/* ── KPI cards ──────────────────────────────────────────── */
+
+.kpi-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+  gap: 0.65rem;
+  margin: 1rem 0 1.75rem;
+}
+
+.kpi-card {
+  background: var(--wk-surface, var(--theme-background));
+  border: 1px solid var(--wk-border, var(--theme-foreground-faintest));
+  border-radius: var(--wk-radius-lg);
+  padding: 0.9rem 1rem 0.75rem;
+  text-align: center;
+  position: relative;
+  overflow: hidden;
+  box-shadow: var(--wk-shadow-sm);
+  transition: box-shadow var(--wk-transition), border-color var(--wk-transition);
+}
+
+.kpi-card:hover {
+  box-shadow: var(--wk-shadow-md);
+  border-color: var(--wk-border-accent, var(--theme-foreground-fainter));
+}
+
+/* Accent stripe at top of each KPI card */
+.kpi-card::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  background: var(--wk-blue);
+  opacity: 0.6;
+}
+
+.kpi-card:nth-child(2)::before { background: var(--wk-teal); }
+.kpi-card:nth-child(3)::before { background: var(--wk-amber); }
+.kpi-card:nth-child(4)::before { background: var(--wk-coral); }
+
+.kpi-card .kpi-value {
+  font-family: var(--wk-sans);
+  font-size: 1.65rem;
+  font-weight: 700;
+  line-height: 1.15;
+  color: var(--wk-text-primary, var(--theme-foreground));
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+
+.kpi-card .kpi-label {
+  font-family: var(--wk-sans);
+  font-size: 0.68rem;
+  font-weight: 600;
+  color: var(--wk-text-secondary, var(--theme-foreground-muted));
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin-top: 0.3rem;
+}
+
+.kpi-card .kpi-sub {
+  font-family: var(--wk-sans);
+  font-size: 0.65rem;
+  font-weight: 400;
+  color: var(--wk-text-tertiary, var(--theme-foreground-faint));
+  margin-top: 0.15rem;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Chart sections ─────────────────────────────────────── */
+
+.chart-section {
+  margin: 1.75rem 0;
+  padding: 1.4rem 1.3rem 1.1rem;
+  border: 1px solid var(--wk-border, var(--theme-foreground-faintest));
+  border-radius: var(--wk-radius-lg);
+  background: var(--wk-surface, var(--theme-background));
+  box-shadow: var(--wk-shadow-sm);
+  position: relative;
+}
+
+/* ── Loading overlay (shown while DuckDB computes) ─────── */
+
+body.wk-loading .chart-section::after {
+  content: "Computing…";
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: color-mix(in srgb, var(--wk-surface, var(--theme-background)) 82%, transparent);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+  border-radius: var(--wk-radius-lg);
+  z-index: 10;
+  font-family: var(--wk-sans);
+  font-size: 0.85rem;
+  font-weight: 500;
+  color: var(--wk-text-secondary, var(--theme-foreground-muted));
+  letter-spacing: 0.03em;
+  animation: wk-loading-pulse 1.8s ease-in-out infinite;
+}
+
+body.wk-loading .kpi-card .kpi-value {
+  opacity: 0.3;
+  transition: opacity 0.3s ease;
+}
+
+@keyframes wk-loading-pulse {
+  0%, 100% { opacity: 0.6; }
+  50% { opacity: 1; }
+}
+
+.chart-section h2 {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+/* subtle decorative line before chart headings */
+.chart-section h2::before {
+  content: "";
+  width: 4px;
+  height: 1.1em;
+  background: var(--wk-blue);
+  border-radius: 2px;
+  flex-shrink: 0;
+  opacity: 0.7;
+}
+
+.chart-section:nth-of-type(2) h2::before { background: var(--wk-teal); }
+.chart-section:nth-of-type(3) h2::before { background: var(--wk-coral); }
+.chart-section:nth-of-type(4) h2::before { background: var(--wk-amber); }
+.chart-section:nth-of-type(5) h2::before { background: var(--wk-lavender); }
+.chart-section:nth-of-type(6) h2::before { background: var(--wk-teal); }
+.chart-section:nth-of-type(7) h2::before { background: var(--wk-blue); }
+
+/* ── Notes ──────────────────────────────────────────────── */
+
+.note {
+  font-family: var(--wk-sans);
+  font-size: 0.8rem;
+  font-weight: 400;
+  color: var(--wk-text-secondary, var(--theme-foreground-muted));
+  border-left: 3px solid var(--wk-border-accent, var(--theme-foreground-faintest));
+  padding: 0.5rem 0.85rem;
+  margin: 0.6rem 0 1rem;
+  line-height: 1.55;
+  background: color-mix(in srgb, var(--wk-surface-raised, var(--theme-background)) 60%, transparent);
+  border-radius: 0 var(--wk-radius) var(--wk-radius) 0;
+}
+
+.note strong {
+  color: var(--wk-text-primary, var(--theme-foreground));
+  font-weight: 600;
+}
+
+/* ── Methodology collapsibles ───────────────────────────── */
+
+.methodology {
+  font-family: var(--wk-sans);
+  font-size: 0.75rem;
+  color: var(--wk-text-tertiary, var(--theme-foreground-faint));
+  margin: 0.75rem 0 0.25rem;
+  line-height: 1.55;
+}
+
+.methodology summary {
+  font-family: var(--wk-sans);
+  font-size: 0.72rem;
+  font-weight: 500;
+  color: var(--wk-text-tertiary, var(--theme-foreground-faint));
+  cursor: pointer;
+  user-select: none;
+  letter-spacing: 0.03em;
+  text-transform: uppercase;
+  padding: 0.3rem 0;
+  transition: color var(--wk-transition);
+}
+
+.methodology summary:hover {
+  color: var(--wk-text-secondary, var(--theme-foreground-muted));
+}
+
+.methodology p {
+  margin: 0.35rem 0;
+  font-style: italic;
+  max-width: 72ch;
+}
+
+/* ── Warning / empty state ──────────────────────────────── */
+
+.warning {
+  font-family: var(--wk-sans);
+  color: var(--wk-text-secondary, var(--theme-foreground-muted));
+  background: color-mix(in srgb, var(--wk-amber) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--wk-amber) 25%, transparent);
+  border-radius: var(--wk-radius);
+  padding: 0.7rem 1rem;
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
+
+.warning code {
+  background: color-mix(in srgb, var(--wk-amber) 12%, transparent);
+  padding: 0.1em 0.35em;
+  border-radius: 3px;
+  font-size: 0.9em;
+}
+
+/* ── Sidebar refinements ────────────────────────────────── */
+
+#observablehq-sidebar {
+  font-family: var(--wk-sans);
+  width: calc(200px + var(--observablehq-sidebar-padding-left, 0px));
+  left: -200px;
+}
+
+#observablehq-sidebar .observablehq-link a {
+  font-family: var(--wk-serif);
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  padding-left: 1rem;
+  padding-right: 0.5rem;
+}
+
+/* hide original close button (moved to sidebar bottom) */
+#observablehq-sidebar-close {
+  display: none !important;
+}
+
+/* ── Sidebar bottom controls ─────────────────────────────── */
+
+.sidebar-bottom {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  padding: 0.75rem 1rem;
+  border-top: 1px solid var(--wk-border, var(--theme-foreground-faintest));
+  background: inherit;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+/* Theme segmented control */
+.sidebar-theme {
+  display: flex;
+  background: var(--wk-surface, var(--theme-background));
+  border: 1px solid var(--wk-border-accent, var(--theme-foreground-fainter));
+  border-radius: 100px;
+  padding: 2px;
+  gap: 0;
+}
+
+.theme-btn {
+  flex: 1;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.25rem;
+  padding: 0.25rem 0.35rem;
+  font-family: var(--wk-sans);
+  font-size: 0.62rem;
+  font-weight: 500;
+  color: var(--wk-text-tertiary, var(--theme-foreground-faint));
+  background: transparent;
+  border: none;
+  border-radius: 100px;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+  line-height: 1.3;
+}
+
+.theme-btn:hover {
+  color: var(--wk-text-primary, var(--theme-foreground));
+}
+
+.theme-btn:focus-visible {
+  outline: 2px solid var(--wk-blue);
+  outline-offset: 1px;
+}
+
+.theme-btn.active {
+  background: var(--wk-blue);
+  color: #fff;
+  font-weight: 600;
+  box-shadow: 0 1px 3px rgba(0,0,0,0.15);
+}
+
+/* Collapse button */
+.sidebar-collapse-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.3rem;
+  padding: 0.3rem 0.5rem;
+  font-family: var(--wk-sans);
+  font-size: 0.65rem;
+  font-weight: 500;
+  color: var(--wk-text-tertiary, var(--theme-foreground-faint));
+  cursor: pointer;
+  border-radius: 100px;
+  transition: all 0.15s ease;
+  user-select: none;
+}
+
+.sidebar-collapse-btn:hover {
+  color: var(--wk-text-secondary, var(--theme-foreground-muted));
+  background: color-mix(in srgb, var(--wk-blue) 6%, transparent);
+}
+
+.sidebar-collapse-btn:focus-visible {
+  outline: 2px solid var(--wk-blue);
+  outline-offset: 1px;
+}
+
+/* Give sidebar room for bottom controls */
+#observablehq-sidebar {
+  padding-bottom: 5.5rem;
+}
+
+/* match Observable's responsive breakpoints but with narrower sidebar */
+@media (min-width: calc(840px + 6rem)) {
+  #observablehq-sidebar-toggle:checked ~ #observablehq-center,
+  #observablehq-sidebar-toggle:indeterminate ~ #observablehq-center {
+    --observablehq-inset-left: calc(200px + 1rem);
+  }
+}
+
+/* ── Observable input refinements ───────────────────────── */
+
+#observablehq-main form > label {
+  font-family: var(--wk-sans);
+  font-size: 0.78rem;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+}
+
+/* ── Tables ─────────────────────────────────────────────── */
+
+#observablehq-main table {
+  font-family: var(--wk-sans);
+  font-size: 0.82rem;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Code blocks in admin page ──────────────────────────── */
+
+#observablehq-main pre {
+  font-family: var(--wk-mono);
+  font-size: 0.8rem;
+  border-radius: var(--wk-radius);
+}
+
+/* ── Plot chart tweaks ──────────────────────────────────── */
+
+/* Plot tooltips */
+[class*="plot"] [aria-label="tip"] {
+  font-family: var(--wk-sans) !important;
+  font-size: 0.78rem !important;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Responsive ─────────────────────────────────────────── */
+
+@media (max-width: 640px) {
+  .kpi-row {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .filters-row {
+    gap: 0.3rem 0.6rem;
+  }
+
+  .chart-section {
+    padding: 1rem 0.85rem;
+    margin: 1.25rem 0;
+  }
+
+  #observablehq-main h1 {
+    font-size: 1.65rem;
+  }
+
+  .page-intro {
+    font-size: 0.95rem;
+  }
+
+  .filter-desc {
+    font-size: 0.67rem;
+  }
+}
+
+/* ── Export buttons ─────────────────────────────────────── */
+
+.chart-export-wrap {
+  position: relative;
+}
+
+.chart-export-bar {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.25rem;
+  margin-top: 0.35rem;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+.chart-section:hover .chart-export-bar,
+.chart-export-bar:focus-within {
+  opacity: 1;
+}
+
+.export-btn {
+  font-family: var(--wk-sans);
+  font-size: 0.6rem;
+  font-weight: 600;
+  padding: 0.18rem 0.45rem;
+  background: var(--wk-surface, var(--theme-background));
+  border: 1px solid var(--wk-border-accent, var(--theme-foreground-fainter));
+  border-radius: 100px;
+  color: var(--wk-text-tertiary, var(--theme-foreground-faint));
+  cursor: pointer;
+  transition: all 0.15s ease;
+  white-space: nowrap;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.export-btn:hover {
+  color: var(--wk-blue);
+  border-color: var(--wk-blue);
+  background: color-mix(in srgb, var(--wk-blue) 6%, transparent);
+}
+
+.export-btn:focus-visible {
+  outline: 2px solid var(--wk-blue);
+  outline-offset: 1px;
+}
+
+.page-export-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem;
+  margin: 0.75rem 0 1.25rem;
+  padding: 0.5rem 0;
+  border-top: 1px solid var(--wk-border, var(--theme-foreground-faintest));
+}
+
+.page-export-label {
+  font-family: var(--wk-sans);
+  font-size: 0.58rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--wk-text-tertiary, var(--theme-foreground-faint));
+  margin-right: 0.15rem;
+}
+
+/* ── Print / screenshot refinements ─────────────────────── */
+
+@media print {
+  #observablehq-sidebar,
+  #observablehq-sidebar-toggle {
+    display: none !important;
+  }
+
+  #observablehq-toc {
+    display: none !important;
+  }
+
+  body {
+    max-width: none !important;
+  }
+
+  #observablehq-center {
+    margin: 0 !important;
+    padding: 0 1rem !important;
+    --observablehq-inset-left: 0px !important;
+    --observablehq-inset-right: 0px !important;
+  }
+
+  #observablehq-main {
+    padding-right: 0 !important;
+  }
+
+  .filters-bar {
+    position: static;
+    backdrop-filter: none;
+  }
+
+  .filters-bar .filters-row,
+  .filters-bar .ns-row,
+  .filters-bar .filters-toggle {
+    display: none !important;
+  }
+
+  .filters-bar .filter-desc {
+    margin: 0;
+    padding: 0.25rem 0;
+    font-size: 0.8rem;
+  }
+
+  .methodology {
+    display: none;
+  }
+
+  .chart-export-bar,
+  .page-export-bar {
+    display: none !important;
+  }
+
+  /* ── Single-chart print mode ──────────────────────────── */
+  /* When printing a single chart, hide everything else and
+     show the target chart section with methodology unfolded. */
+
+  body.wk-print-chart {
+    visibility: hidden;
+  }
+
+  body.wk-print-chart .wk-print-target {
+    visibility: visible;
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 100%;
+    border: none !important;
+    box-shadow: none !important;
+    margin: 0 !important;
+    padding: 1.5rem 1rem !important;
+    background: white !important;
+  }
+
+  body.wk-print-chart .wk-print-target * {
+    visibility: visible;
+  }
+
+  body.wk-print-chart .wk-print-target .chart-export-bar {
+    display: none !important;
+  }
+
+  body.wk-print-chart .wk-print-target .methodology {
+    display: block !important;
+  }
+}

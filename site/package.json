@@ -1,0 +1,16 @@
+{
+  "name": "wiki-economics-dashboard",
+  "version": "0.1.0",
+  "type": "module",
+  "license": "(MIT OR Apache-2.0)",
+  "scripts": {
+    "dev": "observable preview",
+    "build": "observable build"
+  },
+  "dependencies": {
+    "@observablehq/framework": "^1.13.4"
+  },
+  "devDependencies": {
+    "duckdb": "^1.4.4"
+  }
+}
