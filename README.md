@@ -12,6 +12,30 @@ The repository currently has three main parts:
 
 This repository is curated for a public open-source release. Source code, documentation, vendored patches, lockfiles, and quality gates are tracked here; generated data, local caches, build outputs, and installed dependencies are intentionally excluded from version control.
 
+## One-Command Setup
+
+For a friendlier local bootstrap, run:
+
+```sh
+./scripts/setup.sh
+```
+
+That script will:
+
+- check or install the main system dependencies when it can
+- ensure the Rust toolchain and optional contributor cargo tools are present
+- install the dashboard dependencies
+- create the local `data/` and `output/` directories
+- build the Rust CLI and Observable dashboard
+
+Useful flags:
+
+```sh
+./scripts/setup.sh --skip-quality-tools
+./scripts/setup.sh --skip-system-packages
+./scripts/setup.sh --yes
+```
+
 ## Quick Start
 
 Prerequisites:

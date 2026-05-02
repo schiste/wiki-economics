@@ -4,6 +4,7 @@
   "license": "(MIT OR Apache-2.0)",
   "scripts": {
     "build": "cargo build --release",
+    "setup": "scripts/setup.sh",
     "dev": "scripts/dev.sh",
     "start": "scripts/dev.sh"
   }

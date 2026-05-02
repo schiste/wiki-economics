@@ -4,6 +4,14 @@ This document records the policies and maintenance rules that still matter after
 
 ## Local Quality Gates
 
+For first-time local bootstrap, prefer:
+
+```sh
+./scripts/setup.sh
+```
+
+That setup script installs repo dependencies, ensures the Rust toolchain is ready, prepares local directories, and builds the CLI plus dashboard before you start iterating.
+
 Preferred full local verification command:
 
 ```sh
