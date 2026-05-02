@@ -1104,6 +1104,54 @@ fn artifact_helpers_cover_bootstrap_merge_refresh_and_defaults() -> Result<()> {
 }
 
 #[test]
+fn bootstrap_patrol_parts_writes_atomically_and_ignores_stray_tmp_files() -> Result<()> {
+    init_test_tracing();
+    let temp_dir = TestDir::new()?;
+    let output_dir = temp_dir.path().join("output");
+
+    // Build a small final patrol.parquet so bootstrap has something to split.
+    let rows: Vec<(MetricKey, PatrolRowMetrics)> = vec![(
+        MetricKey {
+            year_month_key: 202601,
+            page_namespace: 0,
+            user_type: UserType::Registered,
+        },
+        PatrolRowMetrics::default(),
+    )];
+    let final_path = output_dir.join("testwiki").join("patrol.parquet");
+    fs::create_dir_all(
+        final_path
+            .parent()
+            .expect("final path should have a parent"),
+    )?;
+    write_patrol_metrics_df(&final_path, "testwiki", &rows)?;
+
+    // Simulate an interrupted prior bootstrap: stray .parquet.tmp from a
+    // different month, with garbage content. Pre-rename atomicity, the old
+    // direct File::create path could leave a corrupt .parquet here that
+    // existing_patrol_months would then count as complete. With the rename
+    // pattern, .parquet.tmp survivors are filtered out by extension.
+    let parts_dir = output_dir.join("testwiki").join("_patrol_parts");
+    fs::create_dir_all(&parts_dir)?;
+    let stray_tmp = parts_dir.join("2025-12.parquet.tmp");
+    fs::write(&stray_tmp, b"not parquet")?;
+
+    bootstrap_patrol_parts_from_final(&output_dir, "testwiki")?;
+
+    // Bootstrap produced the real month file…
+    assert!(parts_dir.join("2026-01.parquet").exists());
+    // …and did not leave its own .parquet.tmp behind on success.
+    assert!(!parts_dir.join("2026-01.parquet.tmp").exists());
+    // The stray pre-existing .tmp must not be promoted to a complete month.
+    assert!(!parts_dir.join("2025-12.parquet").exists());
+    assert_eq!(
+        existing_patrol_months(&output_dir, "testwiki")?,
+        BTreeSet::from([202601])
+    );
+    Ok(())
+}
+
+#[test]
 fn write_defaults_patrol_json_filters_rows_and_nulls() -> Result<()> {
     let temp_dir = TestDir::new()?;
     let output_dir = temp_dir.path().join("output");

@@ -1618,8 +1618,26 @@ fn existing_patrol_months(output_dir: &Path, wiki: &str) -> Result<BTreeSet<i32>
 
 fn bootstrap_patrol_parts_from_final(output_dir: &Path, wiki: &str) -> Result<()> {
     let parts_dir = patrol_parts_dir(output_dir, wiki);
-    if parts_dir.exists() && fs::read_dir(&parts_dir)?.next().is_some() {
-        return Ok(());
+    // Only treat the parts dir as already-bootstrapped if at least one
+    // committed `.parquet` exists. Leftover `.parquet.tmp` files from a
+    // previously interrupted run are removed here so the retry can lay down
+    // a clean rename target rather than being blocked indefinitely.
+    if parts_dir.exists() {
+        let mut has_parquet = false;
+        for entry in fs::read_dir(&parts_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            match path.extension().and_then(|ext| ext.to_str()) {
+                Some("parquet") => has_parquet = true,
+                Some("tmp") => {
+                    let _ = fs::remove_file(&path);
+                }
+                _ => {}
+            }
+        }
+        if has_parquet {
+            return Ok(());
+        }
     }
     let final_path = output_dir.join(wiki).join("patrol.parquet");
     if !final_path.exists() {
@@ -1637,13 +1655,17 @@ fn bootstrap_patrol_parts_from_final(output_dir: &Path, wiki: &str) -> Result<()
         let month_string = format_year_month(month);
         let mask = df.column("year_month")?.str()?.equal(month_string.as_str());
         let month_df = df.filter(&mask)?;
-        let path = patrol_part_path(output_dir, wiki, month);
-        ensure_parent_dir(&path)?;
+        let final_path = patrol_part_path(output_dir, wiki, month);
+        ensure_parent_dir(&final_path)?;
+        let temp_path = final_path.with_extension("parquet.tmp");
         let mut month_df = month_df;
-        let mut file = File::create(path)?;
-        ParquetWriter::new(&mut file)
-            .with_compression(ParquetCompression::Zstd(None))
-            .finish(&mut month_df)?;
+        {
+            let mut file = File::create(&temp_path)?;
+            ParquetWriter::new(&mut file)
+                .with_compression(ParquetCompression::Zstd(None))
+                .finish(&mut month_df)?;
+        }
+        fs::rename(&temp_path, &final_path)?;
     }
     Ok(())
 }
