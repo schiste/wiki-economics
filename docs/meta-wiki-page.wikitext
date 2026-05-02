@@ -1,0 +1,169 @@
+{{Notice|This project is in early development and actively seeking community feedback on its metrics and approach. See [[#Feedback]] below.}}
+
+== Wikipedia Economics ==
+
+'''Wikipedia Economics''' is a project that applies economic indicators to Wikipedia activity data. Every edit is a unit of production, every editor is a worker, every namespace is a sector of the economy. By borrowing well-understood frameworks from economics — [[w:Gross domestic product|GDP]], [[w:Labour economics|labor statistics]], [[w:Economic inequality|inequality metrics]], [[w:Quality control|quality control]] — the project offers a complementary lens on the health, resilience, and dynamics of wiki communities.
+
+The goal is not to reduce editors to numbers, but to surface structural patterns that are difficult to see in raw activity logs: Is output concentrated in too few hands? Are newcomers being retained? Is quality control keeping pace with content production? These are questions every wiki community asks — economics provides a shared vocabulary to answer them.
+
+=== Scope ===
+
+The current public release is intentionally '''Wikipedia-first'''. Local onboarding currently targets supported Wikipedia language editions, starting with the yearly-partitioned projects that can be fetched cleanly from [[w:Wikipedia:Database download|Wikimedia dumps]]. Very large monthly-partitioned projects such as English Wikipedia are planned, but not part of the current onboarding path yet.
+
+== Indicators ==
+
+The project computes four families of indicators, each inspired by a branch of economics.
+
+=== Edit Distribution ===
+
+How evenly are edits distributed among editors? High concentration may signal efficiency (experienced editors are productive) or fragility (the community depends on a few individuals). Four complementary measures capture different facets of this question:
+
+{| class="wikitable"
+! Indicator !! Description
+|-
+| '''[[w:Gini coefficient|Gini coefficient]]''' || Measures overall edit inequality on a 0–1 scale. 0 = every editor contributes equally; 1 = one editor does everything. Wikipedia communities typically show high Gini values (0.8–0.95), reflecting the well-known pattern where a small core produces most content.
+|-
+| '''[[w:Theil index|Theil index]]''' || An entropy-based inequality measure. Unlike Gini, Theil is ''decomposable'': it can separate within-group and between-group inequality (e.g., across namespaces or user types).
+|-
+| '''[[w:Palma ratio|Palma ratio]]''' || The ratio of edits by the top 10% of editors to edits by the bottom 40%. Focuses on the extremes of the distribution rather than the middle, making it sensitive to changes in the most and least active segments.
+|-
+| '''Fragility (bus factor)''' || The minimum number of top editors whose combined output accounts for 50% of all edits. A low number means the wiki's output depends on very few people — a [[w:Bus factor|bus factor]] risk. Tracked both as an absolute count and as a percentage of the editor base.
+|}
+
+=== Community ===
+
+Wikipedia's workforce can be studied like a [[w:Labour economics|labor market]]: people arrive, contribute for a time, and eventually leave. Understanding these flows helps answer whether a community is growing, shrinking, or churning.
+
+{| class="wikitable"
+! Indicator !! Description
+|-
+| '''Active editors''' || Count of unique contributors who made at least one edit in a given period. The most basic measure of community size.
+|-
+| '''Arrivals''' || Editors whose first recorded edit falls within the period. Measures the inflow of new contributors.
+|-
+| '''Departures''' || Editors who were active in the previous period but not in the current one. Measures attrition.
+|-
+| '''Arrival & departure rates''' || Arrivals (or departures) divided by active editors. Normalizes flows relative to community size, making wikis of different sizes comparable.
+|-
+| '''Cohort retention''' || For each yearly cohort (editors who made their first edit in year ''Y''), tracks what fraction remain active in subsequent years. Reveals whether a wiki retains its newcomers or loses them quickly.
+|-
+| '''User type breakdown''' || Splits the workforce into registered editors, anonymous (IP) editors, temporary accounts, and bots. Each group has different behaviors, motivations, and policy implications.
+|}
+
+=== Content Production ===
+
+In national economics, [[w:Gross domestic product|GDP]] measures the total value of goods and services produced. On Wikipedia, '''output''' is the content produced by editors, measured in bytes and edits.
+
+{| class="wikitable"
+! Indicator !! Description
+|-
+| '''Gross output''' || Total bytes added across all edits. Counts every byte contributed, regardless of whether it survives.
+|-
+| '''Net output''' || Bytes added minus bytes removed. What actually remains in the encyclopedia — the closest analogue to GDP.
+|-
+| '''Content churn''' || The gap between gross and net output. High churn means a large share of work is undone by reverts, deletions, or rework.
+|-
+| '''Revert rate''' || Fraction of edits that are [[w:Wikipedia:Reverting|identity-reverted]]. A proxy for unproductive or contested labor.
+|-
+| '''Productivity''' || Net bytes per edit. Measures how much lasting content each edit produces on average.
+|-
+| '''Productivity per capita''' || Net bytes per active editor. The wiki equivalent of [[w:GDP per capita|GDP per capita]].
+|-
+| '''Activity tiers''' || Editors grouped by monthly edit count (1, 2–4, 5–24, 25–99, 100+). Shows how output and editor counts distribute across levels of engagement.
+|-
+| '''Sectoral output''' || Breakdown by [[w:Wikipedia:Namespace|namespace]] (article, talk, user, project, template, etc.). Each namespace is an economic ''sector'' with different dynamics.
+|-
+| '''User type share''' || Percentage of total edits contributed by registered editors, anonymous editors, temporary accounts, and bots. Tracks how the composition of the workforce evolves.
+|}
+
+=== Patrol ===
+
+[[w:Wikipedia:Patrolled edit|Patrolling]] is Wikipedia's quality-control mechanism: experienced editors review new edits and pages to catch vandalism, errors, and policy violations. These indicators measure whether the community's "immune system" is keeping up.
+
+{| class="wikitable"
+! Indicator !! Description
+|-
+| '''Patrol volume''' || Total number of patrol actions per period, split between new-page patrols and diff (edit) patrols.
+|-
+| '''Unique patrollers''' || Count of distinct editors who performed at least one patrol action. Measures the size of the quality-control workforce.
+|-
+| '''Patrol coverage''' || Percentage of revisions that were manually patrolled. Low coverage means edits go unreviewed.
+|-
+| '''Adjusted coverage''' || Includes revisions that were [[w:Wikipedia:Autopatrolled|autopatrolled]] (automatically marked as reviewed for trusted editors). Gives a fuller picture of how much content is effectively reviewed.
+|-
+| '''Patrol latency''' || Median and 90th-percentile time (in hours) between an edit being created and being patrolled. Measures how quickly the community responds.
+|-
+| '''Patroller concentration''' || The minimum number of patrollers needed to account for 50% of all patrol actions — a fragility measure for the quality-control function, analogous to the edit distribution bus factor.
+|}
+
+All patrol indicators can be filtered by the '''author type''' of the patrolled edit (registered, anonymous, temporary, bot). This enables analysis such as: "Do anonymous edits get patrolled faster than registered ones?"
+
+== Data sources ==
+
+The project consumes publicly available Wikimedia data:
+
+# '''[[w:Wikipedia:Database download#MediaWiki history dumps|MediaWiki History dumps]]''' — the primary data source. These TSV files contain one row per revision event with 76 columns covering editor metadata, page state, and revision details. The project filters to revision-creation events and retains 10 analytical columns.
+# '''[[w:Wikipedia:Database download#Pages logging|MediaWiki logging dumps]]''' — XML dumps of the <code>logging</code> table, used specifically for patrol events (<code>log_type=patrol</code>) and user-rights changes (to determine autopatrol membership).
+
+No private data, [[w:CheckUser|CheckUser]] information, or non-public APIs are used. All inputs are available to anyone from [https://dumps.wikimedia.org/ dumps.wikimedia.org].
+
+== Technical overview ==
+
+The pipeline has four stages:
+
+# '''Fetch''' — downloads dumps from Wikimedia, streaming to disk without buffering entire files in memory. Supports resume for interrupted downloads.
+# '''Ingest''' — converts raw TSV dumps into [[w:Apache Parquet|Parquet]] files, filtering to revision-creation events and normalizing columns. Produces a compact analytical layer (~10 columns) suitable for fast aggregation.
+# '''Compute''' — reads Parquet partitions one month at a time and produces per-wiki metric files. Most metrics are computed independently per month; only cohort tracking and churn rates require cross-month state.
+# '''Merge''' — concatenates per-wiki outputs into combined Parquet files for cross-wiki analysis.
+
+The compute engine is written in [[w:Rust (programming language)|Rust]] using [[w:Polars (software)|Polars]] for dataframe operations. Patrol metrics use a [[w:Python (programming language)|Python]] pipeline. The interactive dashboard is built with [https://observablehq.com/framework/ Observable Framework] and uses [[w:DuckDB|DuckDB]] compiled to [[w:WebAssembly|WebAssembly]] for client-side queries directly on Parquet files.
+
+=== Filtering dimensions ===
+
+All indicators support consistent filtering by:
+
+* '''Wiki''' — any processed Wikipedia language edition
+* '''User type''' — registered, anonymous, temporary, bot (classification follows [[w:MediaWiki|MediaWiki]]'s own flags)
+* '''Namespace''' — any [[w:Wikipedia:Namespace|MediaWiki namespace]] present in the data
+* '''Time range''' — arbitrary start/end month (YYYY-MM)
+* '''Granularity''' — month, quarter, or year aggregation
+
+== Why "economics"? ==
+
+The economic metaphor is not decorative. Each indicator family maps to a real branch of economics:
+
+* '''Edit Distribution''' ← [[w:Economic inequality|inequality economics]] (Gini, Theil, Palma are standard measures used by the World Bank and OECD)
+* '''Community''' ← [[w:Labour economics|labor economics]] (arrival/departure rates, cohort analysis, workforce composition)
+* '''Content Production''' ← [[w:National accounts|national accounting]] (gross vs. net output, productivity, sectoral breakdown)
+* '''Patrol''' ← [[w:Regulatory economics|regulatory economics]] / quality inspection (coverage rates, response times, inspector concentration)
+
+This framing provides two advantages: (1) the metrics are well-defined and peer-reviewed in the economics literature, avoiding ad-hoc definitions; (2) they are immediately legible to anyone familiar with economic reporting, which includes most policy-makers and institutional stakeholders.
+
+== Current status ==
+
+This project is in '''early development'''. The pipeline runs, the dashboard is functional, and the core indicators are computed. However:
+
+* The metric definitions would benefit from community review — are they measuring the right things? Are there edge cases specific to wiki communities that the standard economic definitions miss?
+* The indicator set is not final. Additional metrics may be added, and existing ones may be refined based on feedback.
+* Cross-wiki validation is ongoing across Wikipedia language editions, and the onboarding path is being widened incrementally rather than claiming Wikimedia-wide support up front.
+
+== Feedback ==
+
+This project is explicitly seeking feedback from the Wikimedia community. Areas where input is especially valuable:
+
+* '''Metric relevance''' — Which indicators are most useful for your community? Which are missing?
+* '''Metric definitions''' — Do the economic analogies hold? Where do wiki-specific dynamics break the metaphor?
+* '''Interpretation''' — What contextual knowledge would help interpret the numbers? (e.g., known bot campaigns, policy changes, content drives that create spikes)
+* '''Naming''' — Are the indicator names clear and appropriate for a volunteer community?
+
+Please leave feedback on the [[{{TALKPAGENAME}}|talk page]].
+
+== See also ==
+
+* [[w:Wikipedia:Statistics|Wikipedia:Statistics]]
+* [[w:Wikipedia:Wikimedia in figures|Wikimedia in figures]]
+* [[m:Research:Index|Wikimedia Research]]
+* [[w:Wikipedia:Database download|Database downloads]]
+
+[[Category:Wikimedia research]]
+[[Category:Wikipedia statistics]]
