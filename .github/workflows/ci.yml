@@ -21,6 +21,8 @@ jobs:
   quality:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      PYTHON_TEST_DEPENDENCIES: pyarrow
 
     steps:
       - name: Check out repository
@@ -79,6 +81,9 @@ jobs:
       - name: Check Python scripts
         run: python3 -m py_compile scripts/fetch_patrol.py scripts/compute_patrol.py scripts/check_lcov.py scripts/test_fetch_patrol.py scripts/test_check_lcov.py
 
+      - name: Install Python test dependencies
+        run: python3 -m pip install --disable-pip-version-check $PYTHON_TEST_DEPENDENCIES
+
       - name: Run Python tests
         run: python3 -m unittest discover -s scripts -p 'test_*.py'
 
@@ -88,6 +93,8 @@ jobs:
   coverage:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      LLVM_COV_OUTPUT_PATH: /tmp/wiki-economics-target/llvm-cov.info
 
     steps:
       - name: Check out repository
@@ -107,16 +114,16 @@ jobs:
           tool: cargo-llvm-cov
 
       - name: Run coverage
-        run: cargo llvm-cov --workspace --all-features --all-targets --lcov --output-path target/llvm-cov.info
+        run: cargo llvm-cov --workspace --all-features --all-targets --lcov --output-path "$LLVM_COV_OUTPUT_PATH"
 
       - name: Validate LCOV line coverage
-        run: python3 scripts/check_lcov.py target/llvm-cov.info
+        run: python3 scripts/check_lcov.py "$LLVM_COV_OUTPUT_PATH"
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4
         with:
           name: llvm-cov-lcov
-          path: target/llvm-cov.info
+          path: ${{ env.LLVM_COV_OUTPUT_PATH }}
           if-no-files-found: error
 
   security:
