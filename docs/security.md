@@ -21,87 +21,100 @@ The repository ships three runtime surfaces:
 
 ## Admin server threat model
 
-**Current posture (the only deployed configuration we support):**
+The admin server now supports two explicit security postures.
+
+### Local/dev posture
+
+This remains the default developer experience:
 
 - Binds only to `127.0.0.1`, never `0.0.0.0`. The bind address is
-  hard-coded; there is no environment variable to expose it.
-- Disabled in the production runtime: the systemd unit does not start
-  the server, and `WIKI_ECON_ADMIN_ENABLED` defaults to `0` whenever
-  `WIKI_ECON_ENV=production`. The nginx config in
-  [`deploy/cloud-vps/nginx/wiki-economics.conf`](../deploy/cloud-vps/nginx/wiki-economics.conf)
-  also returns 404 for `/admin`.
-- The CORS allowlist is the secondary defense layer: only origins
-  matching `WIKI_ECON_ALLOWED_ORIGINS` (default: `127.0.0.1:3000`,
-  `localhost:3000`) get a CORS header.
-- Every action is dispatched via `child_process.spawn(program, [args])`
-  with an explicit allowlist of action names. No code path reaches
-  `bash -c` or any shell-string interpretation.
-- The `wiki` parameter is sanitized to `[a-z0-9_]` before reaching
-  `spawn`.
+  hard-coded; there is no environment variable to expose it directly.
+- Runs without a login flow when `WIKI_ECON_ADMIN_AUTH_MODE=none`.
+- Accepts the local Observable preview origins by default
+  (`127.0.0.1:3000`, `localhost:3000`) for CORS.
 
-**What this protects against:**
+Accepted risks in that mode:
 
-- Casual local-network attackers (the loopback bind).
-- Cross-origin request forgery from a non-allowlisted page (the CORS
-  allowlist).
+- Same-host XSS in a local page that is already on the allowlist.
+- DNS rebinding against loopback-hosted development tooling.
+- A rogue local process binding the admin port first.
+
+These are acceptable only because the tool is assumed to be used by a
+single operator on the same host.
+
+### Hosted/VPS posture
+
+The supported hosted deployment keeps the same loopback bind, but adds a
+real authentication boundary in front of the operator surface:
+
+- nginx publishes `/admin` and `/admin-api/*` and proxies them to the
+  loopback-bound Node server.
+- The Node server requires `WIKI_ECON_ADMIN_AUTH_MODE=oidc` when
+  `WIKI_ECON_ENV=production`.
+- Logins use an OpenID Connect authorization-code flow.
+- The returned email address must be present in
+  `WIKI_ECON_ADMIN_ALLOWED_EMAILS`.
+- Sessions are stored in signed, short-lived cookies with `HttpOnly`,
+  `SameSite=Lax`, and `Secure` in production.
+- Mutating routes enforce same-origin checks using `Origin` and
+  `Referer`.
+
+That posture is intentionally simple:
+
+- no project-side user database
+- no in-repo list of operators
+- no password auth
+- no shell-string command execution
+
+The intended secret sources are deployment secrets (for example GitHub
+Actions secrets) rendered into `/etc/wiki-economics.env`.
+
+Recommended practice:
+
+- use secret names that match the runtime env vars exactly
+- render them atomically with `deploy/cloud-vps/render-env.sh`
+- treat `WIKI_ECON_ADMIN_PUBLIC_ORIGIN` as part of the trusted auth config,
+  not as an incidental convenience
+
+### What the admin server still protects against
+
+- Casual local-network attackers (loopback bind).
+- Cross-site request forgery against the hosted admin session
+  (SameSite cookies plus origin checks).
 - Command injection via the `wiki` parameter (sanitization + array-form
-  spawn).
+  `spawn`).
+- Anonymous or unapproved logins in hosted mode (OIDC plus email
+  allowlist).
 
-**What this does NOT protect against:**
+### What this still does NOT protect against
 
-- Same-host XSS in any page served from `127.0.0.1:3000`. Such a page is
-  in the CORS allowlist by default and can fire mutations.
-- DNS-rebinding attacks that rebind a hostname to `127.0.0.1` to bypass
-  CORS. Origin checking on the server is the line of defense; the
-  Origin header is not trusted to be authentic.
-- A rogue local process binding the admin port before the official
-  server. The admin server fails closed if `bind` returns `EADDRINUSE`,
-  but a process that binds first wins until the operator reboots.
+- A compromised authenticated operator browser session.
+- Misconfigured reverse proxy headers that cause the server to compute
+  the wrong public origin for redirects or origin checks.
+- Any identity provider that returns an email claim the project
+  operator should not trust.
 
-These are accepted risks for a *dev/operator tool that runs on the same
-host as the operator*. They become unacceptable the moment the admin
-surface is reachable from another host.
+The hosted model therefore assumes:
 
-## Forward path: Wikimedia OAuth 2.0
+- TLS termination is correct.
+- nginx forwards canonical `Host` / `X-Forwarded-*` headers.
+- the configured `WIKI_ECON_ADMIN_PUBLIC_ORIGIN` is correct when set.
+- the chosen OIDC provider is one whose email claims you trust for
+  operator identity.
 
-If the admin surface ever needs remote access (multi-operator workflow,
-hosted dashboard with privileged actions, batch-trigger from a
-collaboration tool), the right authentication path is **Wikimedia OAuth
-2.0** rather than a project-local pre-shared secret.
+## Why this is not Wikimedia OAuth today
 
-Why Wikimedia OAuth:
+The current hosted implementation uses generic OpenID Connect because
+the requirement is an **email allowlist** sourced from deployment
+secrets. That does not map cleanly to a Wikimedia-native login model:
 
-- The likely operator population is already authenticated to Wikimedia
-  (they are Wikipedia/Wikimedia community members or research
-  collaborators).
-- Wikimedia OAuth 2.0 supports user-group gating, which lets the admin
-  surface restrict to a designated MediaWiki user group rather than
-  manage a separate identity store.
-- The dependency model is unidirectional: the project depends on
-  Wikimedia identity, never the other way around. No project-side user
-  database to hold or breach.
+- Wikimedia OAuth is a strong fit when you want username- or
+  user-group-based authorization.
+- It is not the right fit for a pure email-allowlist design.
 
-Sketch of the integration (do not implement until there is a deployment
-need; the present production surface runs with admin disabled):
-
-1. Register a consumer at
-   <https://meta.wikimedia.org/wiki/Special:OAuthConsumerRegistration>.
-   Request the minimum scope set, which for a read-mostly admin surface
-   is typically `mwoauth-authonly`.
-2. Add an OAuth callback endpoint (`/oauth/callback`) to
-   `site/admin-server.cjs` that exchanges the authorization code for an
-   access token via
-   `https://meta.wikimedia.org/w/rest.php/oauth2/access_token`.
-3. Validate access tokens by calling
-   `https://meta.wikimedia.org/w/rest.php/oauth2/resource/profile` and
-   reading `username` and `groups`.
-4. Gate POST endpoints on either an explicit username allowlist
-   maintained in `WIKI_ECON_ADMIN_USERS` or membership in a designated
-   MediaWiki user group.
-5. Issue a short-lived session cookie with `Secure; HttpOnly; SameSite=Lax`
-   so subsequent requests do not need to round-trip OAuth.
-
-Until that work happens, the admin surface stays loopback-only.
+If the project later wants Wikimedia-native operator auth, the natural
+next step is a separate Wikimedia OAuth 2.0 mode that authorizes by
+username or MediaWiki group rather than by email.
 
 ## Fetch surface
 

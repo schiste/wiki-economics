@@ -15,7 +15,7 @@ The shared parts stay the same:
 The production differences are operational:
 
 - the public site is static and read-only
-- the dev-only admin API is not exposed
+- the admin surface is loopback-only at the process layer and published through nginx only when authentication is configured
 - batch refresh runs from a scheduled service
 - code releases and output releases are versioned separately
 
@@ -49,9 +49,11 @@ Key properties:
 
 - `deploy/cloud-vps/bootstrap.sh`
 - `deploy/cloud-vps/deploy-release.sh`
+- `deploy/cloud-vps/render-env.sh`
 - `deploy/cloud-vps/run-refresh.sh`
 - `deploy/cloud-vps/rollback.sh`
 - `deploy/cloud-vps/env.example`
+- `deploy/cloud-vps/systemd/wiki-econ-admin.service`
 - `deploy/cloud-vps/systemd/wiki-econ-refresh.service`
 - `deploy/cloud-vps/systemd/wiki-econ-refresh.timer`
 - `deploy/cloud-vps/nginx/wiki-economics.conf`
@@ -70,11 +72,57 @@ sudo ./deploy/cloud-vps/bootstrap.sh
 - `/etc/wiki-economics.env`
 - `/etc/wiki-economics/wikis.txt`
 
+If you already have deployment secrets wired up, you can render
+`/etc/wiki-economics.env` non-interactively with `deploy/cloud-vps/render-env.sh`
+instead of editing it by hand.
+
 At minimum, make sure the wiki list contains only the projects you actually
 intend to refresh on that VPS.
 
 `bootstrap.sh` installs the Rust toolchain for the dedicated `wiki-econ`
 service user so that code deploys can run without building as `root`.
+
+## Hosted Admin Authentication
+
+The supported hosted admin model is:
+
+- `site/admin-server.cjs` still binds to `127.0.0.1`
+- nginx proxies `/admin` and `/admin-api/*` to that loopback server
+- the server requires `WIKI_ECON_ADMIN_AUTH_MODE=oidc`
+- the signed-in email address must be present in `WIKI_ECON_ADMIN_ALLOWED_EMAILS`
+
+Required `/etc/wiki-economics.env` settings:
+
+- `WIKI_ECON_ADMIN_ENABLED=1`
+- `WIKI_ECON_ADMIN_AUTH_MODE=oidc`
+- `WIKI_ECON_ADMIN_PUBLIC_ORIGIN`
+- `WIKI_ECON_ADMIN_OIDC_ISSUER`
+- `WIKI_ECON_ADMIN_OIDC_CLIENT_ID`
+- `WIKI_ECON_ADMIN_OIDC_CLIENT_SECRET`
+- `WIKI_ECON_ADMIN_ALLOWED_EMAILS`
+- `WIKI_ECON_ADMIN_SESSION_SECRET`
+
+Recommended secret-management pattern:
+
+- keep those values in deployment secrets such as GitHub Actions secrets
+- use the same secret names as the env vars when possible
+- render them into `/etc/wiki-economics.env` during deploy/bootstrap with `deploy/cloud-vps/render-env.sh`
+- do not commit operator emails or client secrets into git
+
+Example pattern for a deploy job running over SSH:
+
+```sh
+sudo env \
+  WIKI_ECON_ADMIN_ENABLED=1 \
+  WIKI_ECON_ADMIN_AUTH_MODE=oidc \
+  WIKI_ECON_ADMIN_PUBLIC_ORIGIN="$WIKI_ECON_ADMIN_PUBLIC_ORIGIN" \
+  WIKI_ECON_ADMIN_OIDC_ISSUER="$WIKI_ECON_ADMIN_OIDC_ISSUER" \
+  WIKI_ECON_ADMIN_OIDC_CLIENT_ID="$WIKI_ECON_ADMIN_OIDC_CLIENT_ID" \
+  WIKI_ECON_ADMIN_OIDC_CLIENT_SECRET="$WIKI_ECON_ADMIN_OIDC_CLIENT_SECRET" \
+  WIKI_ECON_ADMIN_ALLOWED_EMAILS="$WIKI_ECON_ADMIN_ALLOWED_EMAILS" \
+  WIKI_ECON_ADMIN_SESSION_SECRET="$WIKI_ECON_ADMIN_SESSION_SECRET" \
+  /srv/wiki-economics/app/current/deploy/cloud-vps/render-env.sh /etc/wiki-economics.env
+```
 
 ## Code Deployment
 
@@ -98,6 +146,12 @@ After the first deploy, you can also run the copy from the current release:
 
 ```sh
 sudo -u wiki-econ -H /srv/wiki-economics/app/current/deploy/cloud-vps/deploy-release.sh
+```
+
+If the authenticated admin service is enabled, restart it after a code deploy:
+
+```sh
+sudo systemctl restart wiki-econ-admin.service
 ```
 
 ## Batch Refresh
@@ -126,9 +180,11 @@ It uses:
 Install the `systemd` files:
 
 ```sh
+sudo cp deploy/cloud-vps/systemd/wiki-econ-admin.service /etc/systemd/system/
 sudo cp deploy/cloud-vps/systemd/wiki-econ-refresh.service /etc/systemd/system/
 sudo cp deploy/cloud-vps/systemd/wiki-econ-refresh.timer /etc/systemd/system/
 sudo systemctl daemon-reload
+sudo systemctl enable --now wiki-econ-admin.service
 sudo systemctl enable --now wiki-econ-refresh.timer
 ```
 
@@ -149,7 +205,7 @@ sudo systemctl reload nginx
 The provided config:
 
 - serves `/srv/wiki-economics/site/current`
-- blocks `/admin`
+- proxies `/admin`, `/admin.html`, and `/admin-api/*` to the loopback auth server
 - serves Observable assets directly
 
 ## Rollback
@@ -166,6 +222,7 @@ You can roll code back independently from published artifacts.
 ## Safety Rules
 
 - Do not expose `site/admin-server.cjs` publicly in production.
+- Do expose it only through nginx on loopback with `WIKI_ECON_ADMIN_AUTH_MODE=oidc`.
 - Do not rebuild output in place.
 - Do not use one directory for both versioned source scripts and live data artifacts.
 - Keep the enabled wiki list narrow at first.

@@ -48,7 +48,8 @@ fi
 
 echo "Bootstrap complete."
 echo "Next steps:"
-echo "  1. Edit /etc/wiki-economics.env"
+echo "  1. Edit /etc/wiki-economics.env or render it from deployment secrets with deploy/cloud-vps/render-env.sh"
 echo "  2. Edit /etc/wiki-economics/wikis.txt"
 echo "  3. Run sudo -u $SERVICE_USER -H ./deploy/cloud-vps/deploy-release.sh"
 echo "  4. Install the nginx and systemd files from deploy/cloud-vps/"
+echo "  5. If you enable the hosted admin surface, provision OIDC client settings, a canonical public origin, and the email allowlist in /etc/wiki-economics.env"

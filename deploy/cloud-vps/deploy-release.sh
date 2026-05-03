@@ -39,3 +39,4 @@ else
 fi
 
 echo "Deployed application release: $release_name"
+echo "If wiki-econ-admin.service is enabled, restart it so the new app release is loaded."

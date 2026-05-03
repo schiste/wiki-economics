@@ -1,0 +1,25 @@
+[Unit]
+Description=wiki-economics authenticated admin server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=wiki-econ
+Group=wiki-econ
+EnvironmentFile=/etc/wiki-economics.env
+Environment=WIKI_ECON_ENV=production
+Environment=WIKI_ECON_ADMIN_ENABLED=1
+WorkingDirectory=/srv/wiki-economics/app/current
+ExecStart=/usr/bin/env node /srv/wiki-economics/app/current/site/admin-server.cjs
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=true
+PrivateDevices=true
+ProtectSystem=full
+ReadWritePaths=/srv/wiki-economics /etc/wiki-economics /etc/wiki-economics.env
+
+[Install]
+WantedBy=multi-user.target

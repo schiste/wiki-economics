@@ -11,7 +11,7 @@ The repository currently has three main parts:
 The repo now supports two runtime profiles from the same codebase:
 
 - `local`: interactive development, local data onboarding, and the dev/operator admin UI
-- `production`: static read-only site serving plus scheduled refresh orchestration for a VPS
+- `production`: static public dashboard serving, scheduled refresh orchestration for a VPS, and an optional authenticated admin surface
 
 ## Repository Status
 
@@ -58,7 +58,7 @@ Prerequisites:
 
 This repository does not bundle Wikimedia datasets or precomputed dashboard outputs. A clean clone starts with no `data/` or `output/` tree; fetch and compute those locally.
 
-The current public release is intentionally Wikipedia-first. Local onboarding currently targets the supported yearly-partitioned language editions surfaced in the admin picker; monthly-partitioned giant projects such as `enwiki` still need dedicated fetch planning.
+The current public release is intentionally Wikipedia-first. The admin picker covers every Wikipedia language edition published in the Wikimedia history dumps; the CLI still rejects monthly-partitioned giants such as `enwiki` until the dedicated fetch planner for those projects lands.
 
 Build the Rust CLI:
 
@@ -97,7 +97,12 @@ Start the local dashboard and admin server together:
 scripts/dev.sh
 ```
 
-The admin API is a local/dev operator tool. It is intentionally not part of the public production surface.
+In local development, the admin API is a loopback-only operator tool. In VPS deployments, the supported hosted admin model is an authenticated OpenID Connect login flow with an env-driven email allowlist. No in-repo user database is used.
+
+For hosted deployments, keep the allowlist and OIDC credentials in deployment
+secrets and render them into `/etc/wiki-economics.env`; the recommended secret
+names match the runtime env vars exactly (`WIKI_ECON_ADMIN_ALLOWED_EMAILS`,
+`WIKI_ECON_ADMIN_SESSION_SECRET`, and so on).
 
 ## Local Verification
 
@@ -111,8 +116,11 @@ Equivalent expanded commands:
 
 ```sh
 bash -n scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh
+node --check site/admin-auth.cjs
 node --check site/admin-server.cjs
 node --check site/observablehq.config.js
+node --test site/admin-auth.test.cjs
+node --test site/admin-server.test.cjs
 ./scripts/build-site.sh --help
 ./scripts/refresh.sh --help
 cargo fmt --all -- --check
@@ -123,8 +131,9 @@ cargo llvm-cov --workspace --all-features --all-targets --lcov --output-path /tm
 python3 scripts/check_lcov.py /tmp/wiki-economics-target/llvm-cov.info
 cargo deny check advisories bans licenses sources
 cargo audit -D warnings
-python3 -m py_compile scripts/fetch_patrol.py scripts/compute_patrol.py scripts/check_lcov.py scripts/test_fetch_patrol.py
-python3 -m unittest scripts/test_fetch_patrol.py
+scripts/check_vendor_polars.sh
+python3 -m py_compile scripts/fetch_patrol.py scripts/compute_patrol.py scripts/check_lcov.py scripts/test_fetch_patrol.py scripts/test_check_lcov.py
+python3 -m unittest discover -s scripts -p 'test_*.py'
 ```
 
 ## Project Guides
