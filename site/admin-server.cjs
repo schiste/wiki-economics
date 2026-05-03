@@ -89,9 +89,15 @@ function resolveRunner() {
 
 function loadSupportedWikipedias() {
   if (supportedWikisCache) return supportedWikisCache;
+  // Scrape the WIKIPEDIA_DATABASES constant from src/fetch.rs so the picker's
+  // universe stays in lockstep with the Rust source. The CLI's actual
+  // partitioning dispatch (yearly / all-time / monthly) lives elsewhere in
+  // the same file; the picker shows the full set and lets the CLI surface
+  // partitioning errors at fetch time for the rare cases where the dump
+  // shape doesn't match the picker's offer.
   const fetchSourcePath = path.join(ROOT, "src", "fetch.rs");
   const source = fs.readFileSync(fetchSourcePath, "utf8");
-  const match = source.match(/const YEARLY_WIKIS:\s*&\[&str\]\s*=\s*&\[(?<body>[\s\S]*?)\];/);
+  const match = source.match(/const WIKIPEDIA_DATABASES:\s*&\[&str\]\s*=\s*&\[(?<body>[\s\S]*?)\];/);
   if (!match?.groups?.body) return [];
   supportedWikisCache = Array.from(match.groups.body.matchAll(/"([^"]+)"/g), (entry) => entry[1]).sort();
   return supportedWikisCache;

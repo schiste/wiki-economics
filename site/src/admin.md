@@ -64,8 +64,21 @@ function validSnapshotVersion(value) {
 function wikipediaProjectLabel(wiki) {
   if (!wiki) return "Unknown project"
   const code = wiki.endsWith("wiki") ? wiki.slice(0, -4) : wiki
-  const language = languageNames?.of(code)
-  return language ? `${language} Wikipedia (${wiki})` : `${wiki} (Wikipedia)`
+  // Intl.DisplayNames.of throws RangeError on inputs that aren't valid
+  // BCP-47 tags (e.g. "simple", "bat_smg", "zh_classical", "nrm"); also
+  // returns the input unchanged if it doesn't recognize the tag. Try the
+  // raw code first, then a hyphen-normalized variant for codes that use
+  // MediaWiki's underscore convention. Fall through to the bare wiki name
+  // on any failure so the picker label can never crash.
+  const variants = [code, code.replace(/_/g, "-")]
+  for (const candidate of variants) {
+    let language = null
+    try { language = languageNames?.of(candidate) ?? null } catch { language = null }
+    if (language && language.toLowerCase() !== candidate.toLowerCase()) {
+      return `${language} Wikipedia (${wiki})`
+    }
+  }
+  return `${wiki} (Wikipedia)`
 }
 
 function preferredSnapshotVersion(wikiStatus = null) {
@@ -618,27 +631,53 @@ display(html`<div class="admin-pipeline-board">
 
 ## Fetch a New Wiki
 
-<div class="note">Pick a locally supported Wikipedia language edition to start the full pipeline (fetch → patrol fetch → ingest → compute → patrol compute → publish). The picker is sourced from the current yearly-partitioned onboarding set; giant monthly-partitioned Wikipedias such as <code>enwiki</code> stay out of this list until the dedicated fetch planner lands.</div>
+<div class="note">Pick a Wikipedia language edition to start the full pipeline (fetch → patrol fetch → ingest → compute → patrol compute → publish). The picker covers every Wikipedia language edition published in the <code>mediawiki_history</code> dumps; the CLI will surface a clear error if a particular wiki uses a partitioning shape (monthly for <code>enwiki</code>, etc.) that the local fetch planner does not yet support.</div>
 
 ```js
+// Searchable single-field picker: an Inputs.text element with a paired
+// <datalist> so typing filters the dropdown of suggestions natively.
+// Selecting an option sets the input's value to the wiki database code;
+// typing free text still works (the Run button validates against the
+// supported set before dispatching). Inputs.text gives us the standard
+// label + view() reactivity wiring; we just attach the datalist.
 const onboardingWikiOptions = supportedWikis
-const onboardingWikiDefault = onboardingWikiOptions.includes(adminUiState.onboardingWiki)
+const onboardingWikiOptionsSet = new Set(onboardingWikiOptions)
+const onboardingWikiInitial = onboardingWikiOptionsSet.has(adminUiState.onboardingWiki)
   ? adminUiState.onboardingWiki
-  : (onboardingWikiOptions[0] ?? null)
-if (onboardingWikiDefault) adminUiState.onboardingWiki = onboardingWikiDefault
-const onboardingWikiInput = onboardingWikiOptions.length > 0
-  ? Inputs.select(onboardingWikiOptions, {
-      label: "Project",
-      value: onboardingWikiDefault,
-      format: wikipediaProjectLabel
-    })
-  : null
-if (onboardingWikiInput) {
-  onboardingWikiInput.addEventListener("input", () => {
-    adminUiState.onboardingWiki = onboardingWikiInput.value
-  })
+  : (onboardingWikiOptions[0] ?? "")
+if (onboardingWikiInitial) adminUiState.onboardingWiki = onboardingWikiInitial
+
+const onboardingWikiDatalistId = "onboarding-wiki-list"
+const onboardingWikiInput = Inputs.text({
+  label: `Project (${onboardingWikiOptions.length} Wikipedias)`,
+  value: onboardingWikiInitial,
+  placeholder: "Type to filter (e.g. fr, japan, simple) or pick from the list…",
+  submit: false
+})
+const onboardingWikiInputElement = onboardingWikiInput.querySelector("input[type='text']")
+if (onboardingWikiInputElement) {
+  onboardingWikiInputElement.setAttribute("list", onboardingWikiDatalistId)
+  onboardingWikiInputElement.setAttribute("autocomplete", "off")
+  onboardingWikiInputElement.setAttribute("spellcheck", "false")
+  onboardingWikiInputElement.classList.add("admin-wiki-combobox")
 }
-const onboardingWiki = onboardingWikiInput ? view(onboardingWikiInput) : null
+onboardingWikiInput.appendChild(html`<datalist id=${onboardingWikiDatalistId}>${onboardingWikiOptions.map(
+  (wiki) => html`<option value=${wiki}>${wikipediaProjectLabel(wiki)}</option>`
+)}</datalist>`)
+onboardingWikiInput.addEventListener("input", () => {
+  adminUiState.onboardingWiki = onboardingWikiInput.value
+})
+const onboardingWikiRaw = view(onboardingWikiInput)
+```
+
+```js
+// Trim and normalize the raw text into either a known wiki code or null;
+// downstream cells (the Run/Fetch buttons) treat null as "no valid pick".
+const onboardingWikiTrimmed = (onboardingWikiRaw || "").trim()
+const onboardingWiki = onboardingWikiOptionsSet.has(onboardingWikiTrimmed)
+  ? onboardingWikiTrimmed
+  : null
+const onboardingWikiUnknown = onboardingWikiTrimmed.length > 0 && onboardingWiki === null
 ```
 
 ```js
@@ -662,6 +701,7 @@ const snapshotVersion = view(snapshotVersionInput)
 html`<div class="admin-fetch-actions">
   ${!apiStatus ? html`<div class="warning">Start the dev/operator admin server to enable commands: <code>scripts/dev.sh</code> or <code>WIKI_ECON_ADMIN_ENABLED=1 node site/admin-server.cjs</code></div>` : ""}
   ${onboardingWikiOptions.length === 0 ? html`<div class="warning">No supported onboarding projects were reported by the admin API yet.</div>` : ""}
+  ${onboardingWikiUnknown ? html`<div class="warning">No project matches <code>${onboardingWikiTrimmed}</code>. Pick one from the dropdown — typing partial text filters in place.</div>` : ""}
   <button class="admin-btn primary" ?disabled=${!apiStatus} onclick=${() => {
         const w = onboardingWiki
         const version = normalizeSnapshotVersion(snapshotVersion)
