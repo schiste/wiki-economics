@@ -7,11 +7,20 @@ cd "$ROOT"
 echo "==> bash -n scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh"
 bash -n scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh
 
+echo "==> node --check site/admin-auth.cjs"
+node --check site/admin-auth.cjs
+
 echo "==> node --check site/admin-server.cjs"
 node --check site/admin-server.cjs
 
 echo "==> node --check site/observablehq.config.js"
 node --check site/observablehq.config.js
+
+echo "==> node --test site/admin-auth.test.cjs"
+node --test site/admin-auth.test.cjs
+
+echo "==> node --test site/admin-server.test.cjs"
+node --test site/admin-server.test.cjs
 
 echo "==> ./scripts/build-site.sh --help"
 ./scripts/build-site.sh --help

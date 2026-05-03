@@ -50,8 +50,14 @@ jobs:
 
       - name: Check Node entrypoint syntax
         run: |
+          node --check site/admin-auth.cjs
           node --check site/admin-server.cjs
           node --check site/observablehq.config.js
+
+      - name: Run Node unit tests
+        run: |
+          node --test site/admin-auth.test.cjs
+          node --test site/admin-server.test.cjs
 
       - name: Check helper CLI entrypoints
         run: |

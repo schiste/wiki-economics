@@ -21,6 +21,12 @@ Preferred full local verification command:
 Expanded commands:
 
 ```sh
+bash -n scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh
+node --check site/admin-auth.cjs
+node --check site/admin-server.cjs
+node --check site/observablehq.config.js
+node --test site/admin-auth.test.cjs
+node --test site/admin-server.test.cjs
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets --all-features
@@ -29,8 +35,9 @@ cargo llvm-cov --workspace --all-features --all-targets --lcov --output-path /tm
 python3 scripts/check_lcov.py /tmp/wiki-economics-target/llvm-cov.info
 cargo deny check advisories bans licenses sources
 cargo audit -D warnings
-python3 -m py_compile scripts/fetch_patrol.py scripts/compute_patrol.py scripts/check_lcov.py scripts/test_fetch_patrol.py
-python3 -m unittest scripts/test_fetch_patrol.py
+scripts/check_vendor_polars.sh
+python3 -m py_compile scripts/fetch_patrol.py scripts/compute_patrol.py scripts/check_lcov.py scripts/test_fetch_patrol.py scripts/test_check_lcov.py
+python3 -m unittest discover -s scripts -p 'test_*.py'
 ```
 
 Cargo build artifacts are intentionally routed out of the repo via
@@ -55,7 +62,7 @@ The local verification script also checks:
 The repo is intentionally one codebase with two orchestration modes:
 
 - `local`: `scripts/setup.sh`, `scripts/dev.sh`, and the admin UI/API for interactive onboarding
-- `production`: `deploy/cloud-vps/` wrappers, static site serving, and scheduled refreshes
+- `production`: `deploy/cloud-vps/` wrappers, static site serving, scheduled refreshes, and an optional authenticated admin surface behind the loopback-only Node server
 
 The shared contract across both modes is:
 

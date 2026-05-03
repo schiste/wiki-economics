@@ -1396,10 +1396,8 @@ mod tests {
         // The picker universe must be a superset of every dispatch constant
         // so the admin UI never offers a wiki the CLI cannot match against.
         for wiki in YEARLY_WIKIS {
-            assert!(
-                WIKIPEDIA_DATABASES.contains(wiki),
-                "YEARLY_WIKIS entry {wiki} missing from WIKIPEDIA_DATABASES"
-            );
+            #[rustfmt::skip]
+            assert!(WIKIPEDIA_DATABASES.contains(wiki), "YEARLY_WIKIS entry {wiki} missing from WIKIPEDIA_DATABASES");
         }
         // Among MONTHLY_WIKIS, only enwiki is a Wikipedia language edition;
         // wikidatawiki and commonswiki are deliberately excluded from the
@@ -1413,12 +1411,8 @@ mod tests {
         sorted.dedup();
         assert_eq!(sorted.len(), WIKIPEDIA_DATABASES.len());
         for pair in WIKIPEDIA_DATABASES.windows(2) {
-            assert!(
-                pair[0] < pair[1],
-                "WIKIPEDIA_DATABASES not sorted at {} -> {}",
-                pair[0],
-                pair[1]
-            );
+            #[rustfmt::skip]
+            assert!(pair[0] < pair[1], "WIKIPEDIA_DATABASES not sorted at {} -> {}", pair[0], pair[1]);
         }
     }
 
