@@ -6,7 +6,7 @@ title: Admin
 
 <div class="page-intro">
 
-Monitor and manage the data pipeline. Each wiki now flows through six stages: **fetch** (history dumps) → **patrol fetch** (logging XML) → **ingest** (convert to parquet) → **compute** (core metrics) → **patrol compute** (patrol metrics) → **publish** (refresh site data). Start the dev/operator admin server with `scripts/dev.sh` or `WIKI_ECON_ADMIN_ENABLED=1 node site/admin-server.cjs` to enable pipeline commands from this page.
+Monitor and manage the data pipeline. Each wiki now flows through six stages: **fetch** (history dumps) → **patrol fetch** (logging XML) → **ingest** (convert to parquet) → **compute** (core metrics) → **patrol compute** (patrol metrics) → **publish** (refresh site data). In local development, start the dev/operator admin server with `scripts/dev.sh` or `WIKI_ECON_ADMIN_ENABLED=1 node site/admin-server.cjs`. In VPS deployments, this page is intended to be served through the authenticated admin server.
 
 </div>
 
@@ -28,9 +28,10 @@ function emptyWikiStatus(name) {
 ```
 
 ```js
-const API = globalThis.__wikiEconAdminApiBase || "http://127.0.0.1:3001"
+const API = globalThis.__wikiEconAdminApiBase || "http://127.0.0.1:3001/api"
 const apiAvailable = Mutable(false)
 const jobStatus = Mutable(null)
+const authState = Mutable({enabled: false, authenticated: true, loginUrl: null, logoutUrl: null, user: null})
 const liveManifest = Mutable(initialManifest)
 const adminUiState = globalThis.__wikiEconAdminState ??= {
   showRunningLog: false,
@@ -144,16 +145,44 @@ function copyIconButton(getText, label = "Copy output") {
   </button>`
 }
 
+function adminConnectionHelp() {
+  const auth = authState.value || {}
+  if (auth.enabled && auth.authenticated === false) {
+    const loginUrl = auth.loginUrl || "/admin/login"
+    return html`<span style="color:#c62828">authentication required</span> — <a href=${loginUrl}>sign in</a>`
+  }
+  return html`<span style="color:#c62828">API offline</span> — run <code>scripts/dev.sh</code> or <code>WIKI_ECON_ADMIN_ENABLED=1 node site/admin-server.cjs</code>`
+}
+
+function adminConnectionWarning() {
+  const auth = authState.value || {}
+  if (auth.enabled && auth.authenticated === false) {
+    const loginUrl = auth.loginUrl || "/admin/login"
+    return html`<div class="warning">Admin authentication required. <a href=${loginUrl}>Sign in</a> to continue.</div>`
+  }
+  return html`<div class="warning">Start the dev/operator admin server to enable commands: <code>scripts/dev.sh</code> or <code>WIKI_ECON_ADMIN_ENABLED=1 node site/admin-server.cjs</code></div>`
+}
+
 async function checkApi() {
   try {
-    const r = await fetch(`${API}/api/status`)
+    const r = await fetch(`${API}/status`, {credentials: "same-origin"})
+    const data = await r.json().catch(() => null)
+    if (r.status === 401) {
+      apiAvailable.value = false
+      jobStatus.value = data
+      authState.value = data?.auth || {enabled: true, authenticated: false, loginUrl: "/admin/login", logoutUrl: null, user: null}
+      return
+    }
     if (r.ok) {
-      const data = await r.json()
       apiAvailable.value = true
       jobStatus.value = data
+      authState.value = data?.auth || {enabled: false, authenticated: true, loginUrl: null, logoutUrl: null, user: null}
       if (data.manifest?.wikis) {
         liveManifest.value = data.manifest
       }
+    } else {
+      apiAvailable.value = false
+      jobStatus.value = data
     }
   } catch {
     apiAvailable.value = false
@@ -175,8 +204,18 @@ async function runCommand(action, wikiOrOptions = null) {
       ...(options.wiki ? {wiki: options.wiki} : {}),
       ...(requestedVersion ? {version: requestedVersion} : {})
     })
-    const r = await fetch(`${API}/api/${action}`, {method: "POST", headers: {"Content-Type": "application/json"}, body})
+    const r = await fetch(`${API}/${action}`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body,
+      credentials: "same-origin"
+    })
     const data = await r.json()
+    if (r.status === 401) {
+      authState.value = data?.auth || {enabled: true, authenticated: false, loginUrl: "/admin/login", logoutUrl: null, user: null}
+      alert("Admin authentication required. Sign in again to continue.")
+      return
+    }
     if (data.error) { alert(data.error); return }
     adminUiState.showRunningLog = false
     adminUiState.showJobLog = false
@@ -266,6 +305,7 @@ invalidation.then(() => {
 ```js
 const apiStatus = apiAvailable
 const job = jobStatus
+const auth = authState
 const currentManifest = liveManifest || initialManifest || {generated_at: "unknown", wikis: {}, merged: []}
 const currentWikis = currentManifest.wikis || {}
 const wikiJobMap = job?.wikiJobs || {}
@@ -274,7 +314,7 @@ const supportedWikis = Array.from(new Set(job?.supportedWikis || [])).sort((a, b
 const suggestedVersion = normalizeSnapshotVersion(job?.suggestedVersion) || ""
 ```
 
-<p class="filter-desc">Last scanned: ${currentManifest.generated_at}${apiStatus ? html` · <span style="color:#2e7d32">API connected</span>` : html` · <span style="color:#c62828">API offline</span> — run <code>scripts/dev.sh</code> or <code>WIKI_ECON_ADMIN_ENABLED=1 node site/admin-server.cjs</code>`}</p>
+<p class="filter-desc">Last scanned: ${currentManifest.generated_at}${apiStatus ? html` · <span style="color:#2e7d32">API connected</span>` : html` · ${adminConnectionHelp()}`}</p>
 
 <!-- ── Job output panel ───────────────────────────────────── -->
 
@@ -324,6 +364,11 @@ display(html`<div class="admin-control-strip">
   <div class="admin-control-chip">
     <span class="admin-control-label">Last scan</span>
     <strong>${currentManifest.generated_at}</strong>
+  </div>
+  <div class="admin-control-chip">
+    <span class="admin-control-label">Signed in</span>
+    <strong>${auth?.user?.email || (auth?.enabled ? "Required" : "Local mode")}</strong>
+    ${auth?.logoutUrl ? html`<a href=${auth.logoutUrl}>sign out</a>` : ""}
   </div>
 </div>`)
 ```
@@ -699,7 +744,7 @@ const snapshotVersion = view(snapshotVersionInput)
 
 ```js
 html`<div class="admin-fetch-actions">
-  ${!apiStatus ? html`<div class="warning">Start the dev/operator admin server to enable commands: <code>scripts/dev.sh</code> or <code>WIKI_ECON_ADMIN_ENABLED=1 node site/admin-server.cjs</code></div>` : ""}
+  ${!apiStatus ? adminConnectionWarning() : ""}
   ${onboardingWikiOptions.length === 0 ? html`<div class="warning">No supported onboarding projects were reported by the admin API yet.</div>` : ""}
   ${onboardingWikiUnknown ? html`<div class="warning">No project matches <code>${onboardingWikiTrimmed}</code>. Pick one from the dropdown — typing partial text filters in place.</div>` : ""}
   <button class="admin-btn primary" ?disabled=${!apiStatus} onclick=${() => {
@@ -743,7 +788,7 @@ const selectedWikiRunning = Boolean(job?.running && job?.progress?.wiki === sele
 ```js
 !hasSelectedWiki
   ? html`<span></span>`
-  : html`${!apiStatus ? html`<div class="warning">Admin API offline. Run <code>scripts/dev.sh</code> or <code>WIKI_ECON_ADMIN_ENABLED=1 node site/admin-server.cjs</code> to use maintenance actions.</div>` : ""}
+  : html`${!apiStatus ? adminConnectionWarning() : ""}
     <div class="admin-maintenance-actions">
       <button class="admin-btn primary" ?disabled=${!apiStatus} title=${actionTooltipWithApi("run", apiStatus)} onclick=${() => runCommand("run", {wiki: selectedWiki, version: preferredSnapshotVersion(w)})}>run full pipeline</button>
       <button class="admin-btn" ?disabled=${!apiStatus} title=${actionTooltipWithApi("fetch", apiStatus)} onclick=${() => runCommand("fetch", {wiki: selectedWiki, version: preferredSnapshotVersion(w)})}>fetch missing</button>

@@ -1,12 +1,24 @@
 #!/usr/bin/env node
-// Dev/operator API server for the admin page.
-// Run alongside `npm run dev` or `scripts/dev.sh`.
-// Production deployments should keep this server disabled.
+// Admin server for the wiki-economics operator surface.
+// - Local/dev mode: loopback-only API for scripts/dev.sh and Observable preview.
+// - VPS mode: authenticated /admin page plus authenticated /admin-api/* routes.
 
 const http = require("http");
 const { execFileSync, spawn } = require("child_process");
 const path = require("path");
 const fs = require("fs");
+const {
+  buildAuthorizeUrl,
+  escapeHtml,
+  normalizeEmail,
+  parseAllowedEmails,
+  parseCookies,
+  randomToken,
+  sanitizeNextPath,
+  serializeCookie,
+  signJsonToken,
+  verifyJsonToken,
+} = require("./admin-auth.cjs");
 
 const ROOT = path.resolve(__dirname, "..");
 const RUNTIME_ENV = process.env.WIKI_ECON_ENV || "local";
@@ -16,11 +28,33 @@ const SITE_PORT = Number.parseInt(process.env.WIKI_ECON_SITE_PORT || "3000", 10)
 const DATA_DIR = resolveConfiguredPath("WIKI_ECON_DATA_DIR", "data");
 const OUTPUT_DIR = resolveConfiguredPath("WIKI_ECON_OUTPUT_DIR", "output");
 const GENERATOR_DIR = resolveConfiguredPath("WIKI_ECON_GENERATOR_DIR", path.join("site", "data-build"));
+const SITE_DIST_DIR = resolveConfiguredPath("WIKI_ECON_SITE_DIST_DIR", path.join("site", "dist"));
 const DEFAULT_RUNNER = {
   program: "cargo",
   args: ["run", "--release", "--"],
   label: "cargo run --release --",
 };
+const LEGACY_API_PREFIX = "/api";
+const PROXY_API_PREFIX = "/admin-api";
+const ADMIN_PAGE_PATH = "/admin";
+const ADMIN_LOGIN_PATH = "/admin/login";
+const ADMIN_LOGOUT_PATH = "/admin/logout";
+const ADMIN_OAUTH_START_PATH = "/admin/oauth/start";
+const ADMIN_OAUTH_CALLBACK_PATH = "/admin/oauth/callback";
+const ADMIN_AUTH_MODE = process.env.WIKI_ECON_ADMIN_AUTH_MODE || "none";
+const AUTH_ENABLED = ADMIN_AUTH_MODE !== "none";
+const ADMIN_ALLOWED_EMAILS = parseAllowedEmails(process.env.WIKI_ECON_ADMIN_ALLOWED_EMAILS || "");
+const ADMIN_SESSION_SECRET = process.env.WIKI_ECON_ADMIN_SESSION_SECRET || "";
+const ADMIN_SESSION_COOKIE_NAME = process.env.WIKI_ECON_ADMIN_SESSION_COOKIE_NAME || "wiki_econ_admin_session";
+const ADMIN_OAUTH_STATE_COOKIE_NAME = process.env.WIKI_ECON_ADMIN_OAUTH_STATE_COOKIE_NAME || "wiki_econ_admin_oauth_state";
+const ADMIN_SESSION_TTL_SECS = parsePositiveInt(process.env.WIKI_ECON_ADMIN_SESSION_TTL_SECS, 8 * 60 * 60);
+const ADMIN_REQUIRE_VERIFIED_EMAIL = (process.env.WIKI_ECON_ADMIN_REQUIRE_VERIFIED_EMAIL || "1") !== "0";
+const ADMIN_SECURE_COOKIES = (process.env.WIKI_ECON_ADMIN_SECURE_COOKIES ?? (RUNTIME_ENV === "production" ? "1" : "0")) === "1";
+const ADMIN_PUBLIC_ORIGIN = normalizeConfiguredOrigin(process.env.WIKI_ECON_ADMIN_PUBLIC_ORIGIN || "");
+const ADMIN_OIDC_ISSUER = process.env.WIKI_ECON_ADMIN_OIDC_ISSUER || "";
+const ADMIN_OIDC_CLIENT_ID = process.env.WIKI_ECON_ADMIN_OIDC_CLIENT_ID || "";
+const ADMIN_OIDC_CLIENT_SECRET = process.env.WIKI_ECON_ADMIN_OIDC_CLIENT_SECRET || "";
+const ADMIN_OIDC_SCOPES = (process.env.WIKI_ECON_ADMIN_OIDC_SCOPES || "openid email profile").trim();
 const ALLOWED_ORIGINS = resolveAllowedOrigins();
 
 let currentJob = null;
@@ -34,10 +68,45 @@ let manifestCacheAt = 0;
 const MANIFEST_CACHE_TTL_MS = 1500;
 const REQUIRED_MERGED_METRICS = 9;
 let supportedWikisCache = null;
+let oidcMetadataPromise = null;
 
 if (!ADMIN_ENABLED) {
   console.error("Admin API is disabled for this runtime. Set WIKI_ECON_ADMIN_ENABLED=1 to opt in.");
   process.exit(1);
+}
+
+if (RUNTIME_ENV === "production" && !AUTH_ENABLED) {
+  console.error("Refusing to run the admin server in production without authentication. Set WIKI_ECON_ADMIN_AUTH_MODE=oidc.");
+  process.exit(1);
+}
+
+if (AUTH_ENABLED && ADMIN_AUTH_MODE !== "oidc") {
+  console.error(`Unsupported WIKI_ECON_ADMIN_AUTH_MODE: ${ADMIN_AUTH_MODE}. Expected "none" or "oidc".`);
+  process.exit(1);
+}
+
+if (AUTH_ENABLED) {
+  const missing = [];
+  if (!ADMIN_OIDC_ISSUER) missing.push("WIKI_ECON_ADMIN_OIDC_ISSUER");
+  if (!ADMIN_OIDC_CLIENT_ID) missing.push("WIKI_ECON_ADMIN_OIDC_CLIENT_ID");
+  if (!ADMIN_OIDC_CLIENT_SECRET) missing.push("WIKI_ECON_ADMIN_OIDC_CLIENT_SECRET");
+  if (!ADMIN_SESSION_SECRET || ADMIN_SESSION_SECRET.length < 32) missing.push("WIKI_ECON_ADMIN_SESSION_SECRET (32+ chars)");
+  if (ADMIN_ALLOWED_EMAILS.size === 0) missing.push("WIKI_ECON_ADMIN_ALLOWED_EMAILS");
+  if (missing.length > 0) {
+    console.error(`Missing required admin auth configuration: ${missing.join(", ")}`);
+    process.exit(1);
+  }
+}
+
+function parsePositiveInt(value, fallback) {
+  const parsed = Number.parseInt(value || "", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function requestHeaderValue(req, name) {
+  const raw = req.headers[name];
+  if (Array.isArray(raw)) return raw[0] || "";
+  return raw || "";
 }
 
 function resolveConfiguredPath(envVar, fallback) {
@@ -46,32 +115,431 @@ function resolveConfiguredPath(envVar, fallback) {
   return path.isAbsolute(value) ? value : path.resolve(ROOT, value);
 }
 
+function normalizeConfiguredOrigin(value) {
+  const trimmed = String(value || "").trim();
+  return trimmed ? trimmed.replace(/\/+$/, "") : "";
+}
+
 function resolveAllowedOrigins() {
   const configured = process.env.WIKI_ECON_ALLOWED_ORIGINS;
-  if (!configured) {
-    return new Set([
-      `http://127.0.0.1:${SITE_PORT}`,
-      `http://localhost:${SITE_PORT}`,
-    ]);
+  const origins = new Set();
+  if (configured) {
+    for (const entry of configured.split(",")) {
+      const origin = normalizeConfiguredOrigin(entry);
+      if (origin) origins.add(origin);
+    }
   }
-  return new Set(
-    configured
-      .split(",")
-      .map((entry) => entry.trim())
-      .filter(Boolean),
-  );
+  if (ADMIN_PUBLIC_ORIGIN) origins.add(ADMIN_PUBLIC_ORIGIN);
+  if (origins.size === 0) {
+    origins.add(`http://127.0.0.1:${SITE_PORT}`);
+    origins.add(`http://localhost:${SITE_PORT}`);
+  }
+  return origins;
+}
+
+function currentRequestOrigin(req) {
+  if (ADMIN_PUBLIC_ORIGIN) return ADMIN_PUBLIC_ORIGIN;
+  const proto = requestHeaderValue(req, "x-forwarded-proto") || (RUNTIME_ENV === "production" ? "https" : "http");
+  const host = requestHeaderValue(req, "x-forwarded-host") || requestHeaderValue(req, "host") || `127.0.0.1:${PORT}`;
+  return normalizeConfiguredOrigin(`${proto}://${host}`);
+}
+
+function externalUrl(req, pathname) {
+  return new URL(pathname, `${currentRequestOrigin(req)}/`).toString();
+}
+
+function isOriginAllowed(origin, req) {
+  const normalized = normalizeConfiguredOrigin(origin);
+  if (!normalized) return false;
+  if (ALLOWED_ORIGINS.has("*")) return true;
+  if (ALLOWED_ORIGINS.has(normalized)) return true;
+  return normalized === currentRequestOrigin(req);
 }
 
 function applyCors(req, res) {
-  const origin = req.headers.origin;
+  const origin = requestHeaderValue(req, "origin");
   if (!origin) return;
   if (ALLOWED_ORIGINS.has("*")) {
     res.setHeader("Access-Control-Allow-Origin", "*");
     return;
   }
-  if (ALLOWED_ORIGINS.has(origin)) {
+  if (isOriginAllowed(origin, req)) {
     res.setHeader("Access-Control-Allow-Origin", origin);
     res.setHeader("Vary", "Origin");
+  }
+}
+
+function appendSetCookie(res, cookieValue) {
+  const current = res.getHeader("Set-Cookie");
+  if (!current) {
+    res.setHeader("Set-Cookie", [cookieValue]);
+    return;
+  }
+  if (Array.isArray(current)) {
+    res.setHeader("Set-Cookie", [...current, cookieValue]);
+    return;
+  }
+  res.setHeader("Set-Cookie", [current, cookieValue]);
+}
+
+function clearAuthCookies(res) {
+  const expired = new Date(0);
+  appendSetCookie(res, serializeCookie(ADMIN_SESSION_COOKIE_NAME, "", {
+    maxAge: 0,
+    expires: expired,
+    httpOnly: true,
+    secure: ADMIN_SECURE_COOKIES,
+    sameSite: "Lax",
+    path: "/",
+  }));
+  appendSetCookie(res, serializeCookie(ADMIN_OAUTH_STATE_COOKIE_NAME, "", {
+    maxAge: 0,
+    expires: expired,
+    httpOnly: true,
+    secure: ADMIN_SECURE_COOKIES,
+    sameSite: "Lax",
+    path: "/",
+  }));
+}
+
+function writeJson(res, statusCode, body, extraHeaders = {}) {
+  res.writeHead(statusCode, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
+    ...extraHeaders,
+  });
+  res.end(JSON.stringify(body));
+}
+
+function writeHtml(res, statusCode, html) {
+  res.writeHead(statusCode, {
+    "Content-Type": "text/html; charset=utf-8",
+    "Cache-Control": "no-store",
+  });
+  res.end(html);
+}
+
+function redirect(res, location, extraHeaders = {}) {
+  res.writeHead(302, {
+    Location: location,
+    "Cache-Control": "no-store",
+    ...extraHeaders,
+  });
+  res.end();
+}
+
+function loginUrlFor(nextPath = ADMIN_PAGE_PATH) {
+  return `${ADMIN_LOGIN_PATH}?next=${encodeURIComponent(sanitizeNextPath(nextPath, ADMIN_PAGE_PATH))}`;
+}
+
+function authStatus(session, req) {
+  return {
+    enabled: AUTH_ENABLED,
+    mode: AUTH_ENABLED ? ADMIN_AUTH_MODE : "none",
+    authenticated: AUTH_ENABLED ? Boolean(session) : true,
+    loginUrl: AUTH_ENABLED && !session ? loginUrlFor(ADMIN_PAGE_PATH) : null,
+    logoutUrl: AUTH_ENABLED && session ? ADMIN_LOGOUT_PATH : null,
+    user: session ? {
+      email: session.email,
+      name: session.name || session.email,
+    } : null,
+    publicOrigin: currentRequestOrigin(req),
+  };
+}
+
+function unauthorizedApiResponse(res, req) {
+  writeJson(res, 401, {
+    error: "Authentication required",
+    auth: authStatus(null, req),
+  });
+}
+
+function requireTrustedOrigin(req, res) {
+  const origin = requestHeaderValue(req, "origin");
+  if (origin && isOriginAllowed(origin, req)) return true;
+
+  const referer = requestHeaderValue(req, "referer");
+  if (referer) {
+    try {
+      const refererOrigin = new URL(referer).origin;
+      if (isOriginAllowed(refererOrigin, req)) return true;
+    } catch {
+      // ignore parse failures
+    }
+  }
+
+  writeJson(res, 403, { error: "Untrusted origin" });
+  return false;
+}
+
+function readSession(req) {
+  if (!AUTH_ENABLED) return null;
+  const cookies = parseCookies(requestHeaderValue(req, "cookie"));
+  const payload = verifyJsonToken(cookies[ADMIN_SESSION_COOKIE_NAME], ADMIN_SESSION_SECRET);
+  if (!payload || typeof payload !== "object") return null;
+  if (!payload.email || !payload.exp) return null;
+  if ((Number(payload.exp) || 0) <= Math.floor(Date.now() / 1000)) return null;
+  const normalized = normalizeEmail(payload.email);
+  if (!ADMIN_ALLOWED_EMAILS.has(normalized)) return null;
+  return {
+    email: normalized,
+    name: typeof payload.name === "string" ? payload.name : normalized,
+    sub: typeof payload.sub === "string" ? payload.sub : "",
+    provider: typeof payload.provider === "string" ? payload.provider : "",
+  };
+}
+
+function issueSession(res, profile) {
+  const expiresAt = Math.floor(Date.now() / 1000) + ADMIN_SESSION_TTL_SECS;
+  const token = signJsonToken({
+    email: profile.email,
+    name: profile.name || profile.email,
+    sub: profile.sub,
+    provider: ADMIN_OIDC_ISSUER,
+    exp: expiresAt,
+  }, ADMIN_SESSION_SECRET);
+  appendSetCookie(res, serializeCookie(ADMIN_SESSION_COOKIE_NAME, token, {
+    maxAge: ADMIN_SESSION_TTL_SECS,
+    httpOnly: true,
+    secure: ADMIN_SECURE_COOKIES,
+    sameSite: "Lax",
+    path: "/",
+  }));
+}
+
+function renderAuthPage({ title, heading, message, actionUrl, actionLabel, secondaryActionUrl, secondaryActionLabel }) {
+  const secondary = secondaryActionUrl && secondaryActionLabel
+    ? `<p><a href="${escapeHtml(secondaryActionUrl)}">${escapeHtml(secondaryActionLabel)}</a></p>`
+    : "";
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${escapeHtml(title)}</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      font-family: "IBM Plex Sans", system-ui, sans-serif;
+      background:
+        radial-gradient(circle at top, rgba(17, 94, 89, 0.16), transparent 45%),
+        linear-gradient(180deg, #f5f7fb 0%, #edf1f7 100%);
+      color: #17202a;
+    }
+    .card {
+      width: min(32rem, calc(100vw - 2rem));
+      box-sizing: border-box;
+      background: rgba(255,255,255,0.92);
+      border: 1px solid rgba(23,32,42,0.08);
+      border-radius: 1.25rem;
+      box-shadow: 0 18px 50px rgba(23,32,42,0.12);
+      padding: 2rem;
+    }
+    h1 { margin: 0 0 0.75rem; font-size: 1.6rem; }
+    p { line-height: 1.55; }
+    a.button {
+      display: inline-block;
+      margin-top: 1rem;
+      padding: 0.8rem 1rem;
+      border-radius: 999px;
+      background: #0b5d57;
+      color: #fff;
+      font-weight: 600;
+      text-decoration: none;
+    }
+    code {
+      padding: 0.15rem 0.35rem;
+      border-radius: 0.4rem;
+      background: rgba(23,32,42,0.08);
+      font-family: "IBM Plex Mono", ui-monospace, monospace;
+    }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>${escapeHtml(heading)}</h1>
+    <p>${message}</p>
+    ${actionUrl && actionLabel ? `<a class="button" href="${escapeHtml(actionUrl)}">${escapeHtml(actionLabel)}</a>` : ""}
+    ${secondary}
+  </main>
+</body>
+</html>`;
+}
+
+function renderMissingAdminPage() {
+  return renderAuthPage({
+    title: "Admin page unavailable",
+    heading: "Admin page unavailable",
+    message: "The built admin page was not found in the current site release. Run the site build before exposing the authenticated admin surface.",
+  });
+}
+
+function serveAdminPage(res) {
+  const adminHtmlPath = path.join(SITE_DIST_DIR, "admin.html");
+  if (!fs.existsSync(adminHtmlPath)) {
+    writeHtml(res, 503, renderMissingAdminPage());
+    return;
+  }
+  res.writeHead(200, {
+    "Content-Type": "text/html; charset=utf-8",
+    "Cache-Control": "no-store",
+  });
+  fs.createReadStream(adminHtmlPath).pipe(res);
+}
+
+function renderLoginPage(req, message, nextPath) {
+  const next = sanitizeNextPath(nextPath, ADMIN_PAGE_PATH);
+  return renderAuthPage({
+    title: "Sign in to wiki-economics admin",
+    heading: "Sign in to wiki-economics admin",
+    message,
+    actionUrl: `${ADMIN_OAUTH_START_PATH}?next=${encodeURIComponent(next)}`,
+    actionLabel: "Continue to sign in",
+    secondaryActionUrl: "/",
+    secondaryActionLabel: "Back to dashboard",
+  });
+}
+
+async function fetchJson(url, options = {}) {
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      Accept: "application/json",
+      ...(options.headers || {}),
+    },
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`${response.status} ${response.statusText}: ${text.slice(0, 300)}`);
+  }
+  return text ? JSON.parse(text) : {};
+}
+
+async function loadOidcMetadata() {
+  if (!oidcMetadataPromise) {
+    oidcMetadataPromise = (async () => {
+      const issuer = new URL(ADMIN_OIDC_ISSUER.endsWith("/") ? ADMIN_OIDC_ISSUER : `${ADMIN_OIDC_ISSUER}/`);
+      const discoveryUrl = new URL(".well-known/openid-configuration", issuer);
+      const metadata = await fetchJson(discoveryUrl.toString());
+      for (const key of ["authorization_endpoint", "token_endpoint", "userinfo_endpoint"]) {
+        if (!metadata[key]) {
+          throw new Error(`OIDC discovery document is missing ${key}`);
+        }
+      }
+      return metadata;
+    })();
+  }
+  return oidcMetadataPromise;
+}
+
+function normalizeOidcProfile(profile) {
+  const email = normalizeEmail(profile.email);
+  if (!email) {
+    throw new Error("The identity provider did not return an email address.");
+  }
+  if (ADMIN_REQUIRE_VERIFIED_EMAIL && Object.hasOwn(profile, "email_verified") && profile.email_verified !== true) {
+    throw new Error(`The identity provider returned an unverified email for ${email}.`);
+  }
+  if (!ADMIN_ALLOWED_EMAILS.has(email)) {
+    throw new Error(`The signed-in email ${email} is not in the configured allowlist.`);
+  }
+  return {
+    email,
+    name: typeof profile.name === "string" && profile.name.trim() ? profile.name.trim() : email,
+    sub: typeof profile.sub === "string" ? profile.sub : email,
+  };
+}
+
+async function startOidcLogin(req, res, nextPath) {
+  const metadata = await loadOidcMetadata();
+  const state = randomToken(24);
+  const nonce = randomToken(24);
+  const next = sanitizeNextPath(nextPath, ADMIN_PAGE_PATH);
+  const stateToken = signJsonToken({
+    state,
+    nonce,
+    next,
+    exp: Math.floor(Date.now() / 1000) + 10 * 60,
+  }, ADMIN_SESSION_SECRET);
+  appendSetCookie(res, serializeCookie(ADMIN_OAUTH_STATE_COOKIE_NAME, stateToken, {
+    maxAge: 10 * 60,
+    httpOnly: true,
+    secure: ADMIN_SECURE_COOKIES,
+    sameSite: "Lax",
+    path: "/",
+  }));
+  const authorizeUrl = buildAuthorizeUrl({
+    authorizationEndpoint: metadata.authorization_endpoint,
+    clientId: ADMIN_OIDC_CLIENT_ID,
+    redirectUri: externalUrl(req, ADMIN_OAUTH_CALLBACK_PATH),
+    scopes: ADMIN_OIDC_SCOPES,
+    state,
+    nonce,
+  });
+  redirect(res, authorizeUrl);
+}
+
+async function finishOidcLogin(req, res, url) {
+  const error = url.searchParams.get("error");
+  const errorDescription = url.searchParams.get("error_description");
+  if (error) {
+    const message = errorDescription ? `${error}: ${errorDescription}` : error;
+    clearAuthCookies(res);
+    redirect(res, `${ADMIN_LOGIN_PATH}?error=${encodeURIComponent(message)}`);
+    return;
+  }
+
+  const code = url.searchParams.get("code");
+  const state = url.searchParams.get("state");
+  const cookies = parseCookies(requestHeaderValue(req, "cookie"));
+  const savedState = verifyJsonToken(cookies[ADMIN_OAUTH_STATE_COOKIE_NAME], ADMIN_SESSION_SECRET);
+  clearAuthCookies(res);
+
+  if (!code || !state || !savedState || typeof savedState !== "object") {
+    redirect(res, `${ADMIN_LOGIN_PATH}?error=${encodeURIComponent("Missing or expired OAuth state.")}`);
+    return;
+  }
+  if ((Number(savedState.exp) || 0) <= Math.floor(Date.now() / 1000)) {
+    redirect(res, `${ADMIN_LOGIN_PATH}?error=${encodeURIComponent("OAuth state expired. Please try again.")}`);
+    return;
+  }
+  if (savedState.state !== state) {
+    redirect(res, `${ADMIN_LOGIN_PATH}?error=${encodeURIComponent("OAuth state mismatch. Please try again.")}`);
+    return;
+  }
+
+  try {
+    const metadata = await loadOidcMetadata();
+    const tokenResponse = await fetchJson(metadata.token_endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+      },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        client_id: ADMIN_OIDC_CLIENT_ID,
+        client_secret: ADMIN_OIDC_CLIENT_SECRET,
+        redirect_uri: externalUrl(req, ADMIN_OAUTH_CALLBACK_PATH),
+      }),
+    });
+    if (!tokenResponse.access_token) {
+      throw new Error("OIDC token response did not contain an access token.");
+    }
+    const profile = await fetchJson(metadata.userinfo_endpoint, {
+      headers: {
+        Authorization: `Bearer ${tokenResponse.access_token}`,
+      },
+    });
+    const normalized = normalizeOidcProfile(profile);
+    issueSession(res, normalized);
+    redirect(res, sanitizeNextPath(savedState.next, ADMIN_PAGE_PATH));
+  } catch (authError) {
+    redirect(res, `${ADMIN_LOGIN_PATH}?error=${encodeURIComponent(authError.message)}`);
   }
 }
 
@@ -127,10 +595,6 @@ function safeReadDir(dir) {
   }
 }
 
-function countFiles(dir, ext) {
-  return safeReadDir(dir).filter(f => f.endsWith(ext)).length;
-}
-
 function countExisting(paths) {
   return paths.filter((entry) => fs.existsSync(entry)).length;
 }
@@ -179,6 +643,14 @@ function refreshManifest(force = false) {
   manifestCache = JSON.parse(output);
   manifestCacheAt = now;
   return manifestCache;
+}
+
+function refreshManifestSafely(force = false) {
+  try {
+    return refreshManifest(force);
+  } catch {
+    return null;
+  }
 }
 
 function markerManifestIsValid(markerPath) {
@@ -280,12 +752,7 @@ function getProgress() {
   const action = currentJob.action ?? null;
   if (!wiki && action !== "merge" && action !== "cancel") return null;
 
-  let manifest;
-  try {
-    manifest = refreshManifest();
-  } catch {
-    manifest = { wikis: {}, merged: [] };
-  }
+  const manifest = refreshManifestSafely() || { wikis: {}, merged: [] };
   const wikiStatus = wiki ? manifest.wikis?.[wiki] ?? null : null;
   const stage = currentJob.stage || (action === "run" ? "fetch" : action);
   let done = 0;
@@ -354,99 +821,166 @@ function getProgress() {
   return { wiki, stage, done, total, pct, detail };
 }
 
-const server = http.createServer((req, res) => {
+function matchApiPath(pathname) {
+  if (pathname.startsWith(`${LEGACY_API_PREFIX}/`)) return pathname.slice(LEGACY_API_PREFIX.length + 1);
+  if (pathname.startsWith(`${PROXY_API_PREFIX}/`)) return pathname.slice(PROXY_API_PREFIX.length + 1);
+  return null;
+}
+
+function buildStatusPayload(req, session) {
+  const progress = getProgress();
+  const effectiveJob = currentJob
+    ? {
+        command: currentJob.command,
+        action: currentJob.action,
+        wiki: currentJob.wiki,
+        stage: currentJob.stage,
+        running: true,
+        exitCode: null,
+        log: jobLog,
+        progress,
+      }
+    : lastJob;
+  const manifest = refreshManifestSafely() || { error: "Manifest unavailable" };
+  return {
+    running: currentJob !== null,
+    command: effectiveJob?.command ?? null,
+    action: effectiveJob?.action ?? null,
+    wiki: effectiveJob?.wiki ?? null,
+    log: effectiveJob?.log ?? [],
+    exitCode: effectiveJob?.exitCode ?? jobExitCode,
+    progress,
+    manifest,
+    job: effectiveJob,
+    wikiJobs: Object.fromEntries(lastWikiJobs.entries()),
+    globalJob: lastGlobalJob,
+    supportedWikis: loadSupportedWikipedias(),
+    suggestedVersion: suggestedSnapshotVersion(),
+    adminEnabled: ADMIN_ENABLED,
+    adminPort: PORT,
+    auth: authStatus(session, req),
+  };
+}
+
+async function handleRequest(req, res) {
   applyCors(req, res);
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
-  if (req.method === "OPTIONS") { res.writeHead(204); res.end(); return; }
+  if (req.method === "OPTIONS") {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
 
   const url = new URL(req.url, `http://localhost:${PORT}`);
+  const session = AUTH_ENABLED ? readSession(req) : null;
 
-  // GET /api/status — poll job progress
-  if (req.method === "GET" && url.pathname === "/api/status") {
-    let manifest = null;
-    try {
-      manifest = refreshManifest();
-    } catch (error) {
-      manifest = { error: error.message };
+  if (req.method === "GET" && (url.pathname === ADMIN_PAGE_PATH || url.pathname === `${ADMIN_PAGE_PATH}.html`)) {
+    if (AUTH_ENABLED && !session) {
+      redirect(res, loginUrlFor(ADMIN_PAGE_PATH));
+      return;
     }
-    let progress = null;
-    try {
-      progress = getProgress();
-    } catch {
-      progress = null;
+    serveAdminPage(res);
+    return;
+  }
+
+  if (AUTH_ENABLED && req.method === "GET" && url.pathname === ADMIN_LOGIN_PATH) {
+    if (session) {
+      redirect(res, sanitizeNextPath(url.searchParams.get("next"), ADMIN_PAGE_PATH));
+      return;
     }
-    const effectiveJob = currentJob
-      ? {
-          command: currentJob.command,
-          action: currentJob.action,
-          wiki: currentJob.wiki,
-          stage: currentJob.stage,
-          running: true,
-          exitCode: null,
-          log: jobLog,
-          progress,
-        }
-      : lastJob;
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify({
-      running: currentJob !== null,
-      command: effectiveJob?.command ?? null,
-      action: effectiveJob?.action ?? null,
-      wiki: effectiveJob?.wiki ?? null,
-      log: effectiveJob?.log ?? [],
-      exitCode: effectiveJob?.exitCode ?? jobExitCode,
-      progress,
-      manifest,
-      job: effectiveJob,
-      wikiJobs: Object.fromEntries(lastWikiJobs.entries()),
-      globalJob: lastGlobalJob,
-      supportedWikis: loadSupportedWikipedias(),
-      suggestedVersion: suggestedSnapshotVersion(),
-      adminEnabled: ADMIN_ENABLED,
-      adminPort: PORT,
+    const errorMessage = url.searchParams.get("error");
+    const message = errorMessage
+      ? `Sign-in failed: <code>${escapeHtml(errorMessage)}</code>`
+      : "This admin surface is protected. Sign in with the configured OpenID Connect provider using an email address from the authorized allowlist.";
+    writeHtml(res, 200, renderLoginPage(req, message, url.searchParams.get("next")));
+    return;
+  }
+
+  if (AUTH_ENABLED && req.method === "GET" && url.pathname === ADMIN_OAUTH_START_PATH) {
+    await startOidcLogin(req, res, url.searchParams.get("next"));
+    return;
+  }
+
+  if (AUTH_ENABLED && req.method === "GET" && url.pathname === ADMIN_OAUTH_CALLBACK_PATH) {
+    await finishOidcLogin(req, res, url);
+    return;
+  }
+
+  if (AUTH_ENABLED && (req.method === "GET" || req.method === "POST") && url.pathname === ADMIN_LOGOUT_PATH) {
+    if (req.method === "POST" && !requireTrustedOrigin(req, res)) return;
+    clearAuthCookies(res);
+    writeHtml(res, 200, renderAuthPage({
+      title: "Signed out",
+      heading: "Signed out",
+      message: "Your admin session has been cleared.",
+      actionUrl: loginUrlFor(ADMIN_PAGE_PATH),
+      actionLabel: "Sign in again",
+      secondaryActionUrl: "/",
+      secondaryActionLabel: "Back to dashboard",
     }));
     return;
   }
 
-  // POST /api/<action> — start a pipeline command
-  if (req.method === "POST" && url.pathname.startsWith("/api/")) {
+  const apiPath = matchApiPath(url.pathname);
+  if (req.method === "GET" && apiPath === "status") {
+    if (AUTH_ENABLED && !session) {
+      unauthorizedApiResponse(res, req);
+      return;
+    }
+    writeJson(res, 200, buildStatusPayload(req, session));
+    return;
+  }
+
+  if (req.method === "POST" && apiPath) {
+    if (AUTH_ENABLED && !session) {
+      unauthorizedApiResponse(res, req);
+      return;
+    }
+    if (AUTH_ENABLED && !requireTrustedOrigin(req, res)) {
+      return;
+    }
+
     let body = "";
-    req.on("data", c => body += c);
+    req.on("data", (chunk) => {
+      body += chunk;
+    });
     req.on("end", () => {
-      const params = body ? JSON.parse(body) : {};
-      const action = url.pathname.slice(5);
+      let params = {};
+      try {
+        params = body ? JSON.parse(body) : {};
+      } catch {
+        writeJson(res, 400, { error: "Invalid JSON request body" });
+        return;
+      }
+      const action = apiPath;
 
       if (currentJob) {
         if (action === "cancel") {
           currentJob.cancelRequested = true;
           currentJob.proc.kill("SIGTERM");
           appendJobLog(`\n[cancel requested for pid ${currentJob.pid}]`);
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ started: false, cancelled: true, pid: currentJob.pid }));
+          writeJson(res, 200, { started: false, cancelled: true, pid: currentJob.pid });
           return;
         }
-        res.writeHead(409, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "A job is already running", command: currentJob.command }));
+        writeJson(res, 409, { error: "A job is already running", command: currentJob.command });
         return;
       }
 
-      const wiki = (params.wiki || "").replace(/[^a-z0-9_]/gi, ""); // sanitize
+      const wiki = (params.wiki || "").replace(/[^a-z0-9_]/gi, "");
       const version = normalizeVersion(params.version);
       if (version && !isValidVersion(version)) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Invalid version. Use YYYY-MM." }));
+        writeJson(res, 400, { error: "Invalid version. Use YYYY-MM." });
         return;
       }
 
       if (action === "cleanup") {
         if (!wiki) {
-          res.writeHead(400, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "cleanup requires a wiki parameter" }));
+          writeJson(res, 400, { error: "cleanup requires a wiki parameter" });
           return;
         }
         const summary = cleanupWikiArtifacts(wiki);
-        refreshManifest(true);
+        refreshManifestSafely(true);
         setSyntheticJobLog(
           {
             command: `cleanup ${wiki}`,
@@ -462,8 +996,7 @@ const server = http.createServer((req, res) => {
           ],
           0,
         );
-        res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ started: false, cleaned: true, summary }));
+        writeJson(res, 200, { started: false, cleaned: true, summary });
         return;
       }
 
@@ -514,18 +1047,17 @@ const server = http.createServer((req, res) => {
             : null;
           break;
         case "cancel":
-          res.writeHead(409, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "No job is currently running" }));
+          writeJson(res, 409, { error: "No job is currently running" });
           return;
         default:
           commandSpec = null;
       }
 
       if (!commandSpec) {
-        res.writeHead(400, { "Content-Type": "application/json" });
-        res.end(JSON.stringify({ error: "Invalid action or missing wiki parameter" }));
+        writeJson(res, 400, { error: "Invalid action or missing wiki parameter" });
         return;
       }
+
       const startTime = new Date().toISOString().replace("T", " ").replace(/\.\d+Z$/, " UTC");
       jobLog = [`$ ${commandSpec.label}\nStarted: ${startTime}\n`];
       jobExitCode = null;
@@ -539,6 +1071,7 @@ const server = http.createServer((req, res) => {
           WIKI_ECON_DATA_DIR: DATA_DIR,
           WIKI_ECON_OUTPUT_DIR: OUTPUT_DIR,
           WIKI_ECON_GENERATOR_DIR: GENERATOR_DIR,
+          WIKI_ECON_SITE_DIST_DIR: SITE_DIST_DIR,
         },
       });
       currentJob = {
@@ -552,8 +1085,8 @@ const server = http.createServer((req, res) => {
         cancelRequested: false,
       };
 
-      proc.stdout.on("data", d => appendJobLog(d.toString()));
-      proc.stderr.on("data", d => appendJobLog(d.toString()));
+      proc.stdout.on("data", (data) => appendJobLog(data.toString()));
+      proc.stderr.on("data", (data) => appendJobLog(data.toString()));
       proc.on("close", (code, signal) => {
         const cancelled = currentJob?.cancelRequested && signal === "SIGTERM";
         const renderedExit = cancelled ? "cancelled" : code;
@@ -577,9 +1110,9 @@ const server = http.createServer((req, res) => {
           lastGlobalJob = completedJob;
         }
         currentJob = null;
-        refreshManifest(true);
+        refreshManifestSafely(true);
       });
-      proc.on("error", error => {
+      proc.on("error", (error) => {
         jobLog.push(`\n[failed to start: ${error.message}]`);
         jobExitCode = 1;
         const failedJob = {
@@ -599,27 +1132,61 @@ const server = http.createServer((req, res) => {
           lastGlobalJob = failedJob;
         }
         currentJob = null;
-        refreshManifest(true);
+        refreshManifestSafely(true);
       });
 
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ started: true, command: commandSpec.label, pid: proc.pid }));
+      writeJson(res, 200, { started: true, command: commandSpec.label, pid: proc.pid });
       console.log(`[admin] started: ${commandSpec.label} (pid ${proc.pid})`);
     });
     return;
   }
 
-  res.writeHead(404);
+  res.writeHead(404, { "Cache-Control": "no-store" });
   res.end("Not found");
-});
+}
 
-server.listen(PORT, "127.0.0.1", () => {
-  const runner = resolveRunner();
-  console.log(`Admin API server listening on http://127.0.0.1:${PORT}`);
-  console.log(`Runner: ${runner.label}`);
-  console.log(`Working dir: ${ROOT}`);
-  console.log(`Data dir: ${DATA_DIR}`);
-  console.log(`Output dir: ${OUTPUT_DIR}`);
-  console.log(`Generator dir: ${GENERATOR_DIR}`);
-  console.log(`Allowed origins: ${Array.from(ALLOWED_ORIGINS).join(", ")}`);
-});
+function createServer() {
+  return http.createServer((req, res) => {
+    Promise.resolve(handleRequest(req, res)).catch((error) => {
+      console.error(`[admin] unhandled error: ${error.stack || error.message}`);
+      if (!res.headersSent) {
+        writeJson(res, 500, { error: "Internal server error" });
+      } else {
+        res.end();
+      }
+    });
+  });
+}
+
+function startServer() {
+  const server = createServer();
+  server.listen(PORT, "127.0.0.1", () => {
+    const runner = resolveRunner();
+    console.log(`Admin server listening on http://127.0.0.1:${PORT}`);
+    console.log(`Runner: ${runner.label}`);
+    console.log(`Working dir: ${ROOT}`);
+    console.log(`Data dir: ${DATA_DIR}`);
+    console.log(`Output dir: ${OUTPUT_DIR}`);
+    console.log(`Generator dir: ${GENERATOR_DIR}`);
+    console.log(`Site dist dir: ${SITE_DIST_DIR}`);
+    console.log(`Allowed origins: ${Array.from(ALLOWED_ORIGINS).join(", ")}`);
+    console.log(`Auth mode: ${ADMIN_AUTH_MODE}`);
+    if (AUTH_ENABLED) {
+      console.log(`Authorized admin emails: ${ADMIN_ALLOWED_EMAILS.size}`);
+      console.log(`OIDC issuer: ${ADMIN_OIDC_ISSUER}`);
+    }
+  });
+  return server;
+}
+
+if (require.main === module) {
+  startServer();
+}
+
+module.exports = {
+  ADMIN_PAGE_PATH,
+  PROXY_API_PREFIX,
+  createServer,
+  handleRequest,
+  startServer,
+};

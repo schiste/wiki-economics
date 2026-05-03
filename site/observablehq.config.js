@@ -5,19 +5,18 @@ const distDir = process.env.WIKI_ECON_SITE_DIST_DIR
   ? path.resolve(process.env.WIKI_ECON_SITE_DIST_DIR)
   : "dist";
 const adminPort = process.env.WIKI_ECON_ADMIN_PORT || "3001";
+const adminApiBase = process.env.WIKI_ECON_ADMIN_API_BASE
+  ? process.env.WIKI_ECON_ADMIN_API_BASE
+  : (isDev ? `http://127.0.0.1:${adminPort}/api` : "/admin-api");
 
-// The admin API base URL is only injected into the page head in dev/preview
-// builds so production HTML never advertises the local-only admin port. The
-// admin page itself is also conditionally added to the nav in dev mode below.
-const adminApiScript = isDev
-  ? `<script>
-window.__wikiEconAdminApiBase=(function(){
-  var proto=window.location&&window.location.protocol?window.location.protocol:"http:";
-  var host=window.location&&window.location.hostname?window.location.hostname:"127.0.0.1";
-  return proto+"//"+host+":${adminPort}";
-})();
-</script>`
-  : "";
+// The admin page is intentionally hidden from the public nav in non-dev
+// builds, but the built HTML still exists so an authenticated VPS admin
+// server can serve it at /admin. The injected API base switches between the
+// local loopback API in dev and the reverse-proxied same-origin path in VPS
+// deployments.
+const adminApiScript = `<script>
+window.__wikiEconAdminApiBase=${JSON.stringify(adminApiBase)};
+</script>`;
 
 export default {
   title: "Wikipedia Economics",
