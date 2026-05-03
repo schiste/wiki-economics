@@ -82,6 +82,10 @@ function wikipediaProjectLabel(wiki) {
   return `${wiki} (Wikipedia)`
 }
 
+function wikipediaProjectSearchText(wiki) {
+  return `${wiki} ${wikipediaProjectLabel(wiki)}`.toLowerCase()
+}
+
 function preferredSnapshotVersion(wikiStatus = null) {
   return validSnapshotVersion(wikiStatus?.raw?.version)
     ?? validSnapshotVersion(adminUiState.snapshotVersion)
@@ -679,40 +683,116 @@ display(html`<div class="admin-pipeline-board">
 <div class="note">Pick a Wikipedia language edition to start the full pipeline (fetch → patrol fetch → ingest → compute → patrol compute → publish). The picker covers every Wikipedia language edition published in the <code>mediawiki_history</code> dumps; the CLI will surface a clear error if a particular wiki uses a partitioning shape (monthly for <code>enwiki</code>, etc.) that the local fetch planner does not yet support.</div>
 
 ```js
-// Searchable single-field picker: an Inputs.text element with a paired
-// <datalist> so typing filters the dropdown of suggestions natively.
-// Selecting an option sets the input's value to the wiki database code;
-// typing free text still works (the Run button validates against the
-// supported set before dispatching). Inputs.text gives us the standard
-// label + view() reactivity wiring; we just attach the datalist.
+// Searchable project picker. It starts empty by default, opens the full
+// project list when the field is clicked, and filters in place as the
+// operator types either a wiki code or a language name.
 const onboardingWikiOptions = supportedWikis
 const onboardingWikiOptionsSet = new Set(onboardingWikiOptions)
 const onboardingWikiInitial = onboardingWikiOptionsSet.has(adminUiState.onboardingWiki)
   ? adminUiState.onboardingWiki
-  : (onboardingWikiOptions[0] ?? "")
-if (onboardingWikiInitial) adminUiState.onboardingWiki = onboardingWikiInitial
+  : ""
+adminUiState.onboardingWiki = onboardingWikiInitial
 
-const onboardingWikiDatalistId = "onboarding-wiki-list"
 const onboardingWikiInput = Inputs.text({
   label: `Project (${onboardingWikiOptions.length} Wikipedias)`,
   value: onboardingWikiInitial,
-  placeholder: "Type to filter (e.g. fr, japan, simple) or pick from the list…",
+  placeholder: "Type a Wikipedia project name or code…",
   submit: false
 })
 const onboardingWikiInputElement = onboardingWikiInput.querySelector("input[type='text']")
 if (onboardingWikiInputElement) {
-  onboardingWikiInputElement.setAttribute("list", onboardingWikiDatalistId)
   onboardingWikiInputElement.setAttribute("autocomplete", "off")
   onboardingWikiInputElement.setAttribute("spellcheck", "false")
   onboardingWikiInputElement.classList.add("admin-wiki-combobox")
 }
-onboardingWikiInput.appendChild(html`<datalist id=${onboardingWikiDatalistId}>${onboardingWikiOptions.map(
-  (wiki) => html`<option value=${wiki}>${wikipediaProjectLabel(wiki)}</option>`
-)}</datalist>`)
-onboardingWikiInput.addEventListener("input", () => {
-  adminUiState.onboardingWiki = onboardingWikiInput.value
-})
-const onboardingWikiRaw = view(onboardingWikiInput)
+const onboardingWikiPicker = html`<div class="admin-project-picker"></div>`
+const onboardingWikiTip = html`<div class="admin-project-picker-tip">Tip: click the field to browse every supported project, or type to filter by language name or wiki code.</div>`
+const onboardingWikiMenu = html`<div class="admin-project-picker-menu" hidden></div>`
+onboardingWikiPicker.append(onboardingWikiInput, onboardingWikiTip, onboardingWikiMenu)
+onboardingWikiPicker.value = onboardingWikiInitial
+
+function setOnboardingWikiValue(value, {closeMenu = false} = {}) {
+  const nextValue = typeof value === "string" ? value : ""
+  if (onboardingWikiInputElement && onboardingWikiInputElement.value !== nextValue) {
+    onboardingWikiInputElement.value = nextValue
+  }
+  adminUiState.onboardingWiki = nextValue
+  onboardingWikiPicker.value = nextValue
+  onboardingWikiPicker.dispatchEvent(new Event("input", {bubbles: true}))
+  if (closeMenu) hideOnboardingWikiMenu()
+}
+
+function onboardingWikiMatches(wiki, query) {
+  const normalized = query.trim().toLowerCase()
+  if (!normalized) return true
+  return wikipediaProjectSearchText(wiki).includes(normalized)
+}
+
+function showOnboardingWikiMenu() {
+  onboardingWikiPicker.dataset.open = "true"
+  onboardingWikiMenu.hidden = false
+  renderOnboardingWikiMenu()
+}
+
+function hideOnboardingWikiMenu() {
+  onboardingWikiPicker.dataset.open = "false"
+  onboardingWikiMenu.hidden = true
+}
+
+function renderOnboardingWikiMenu() {
+  const query = onboardingWikiInputElement?.value || ""
+  const matches = onboardingWikiOptions.filter((wiki) => onboardingWikiMatches(wiki, query))
+  onboardingWikiMenu.replaceChildren(
+    ...(matches.length > 0
+      ? matches.map((wiki) => {
+          const option = html`<button type="button" class="admin-project-picker-option">
+            <span class="admin-project-picker-option-label">${wikipediaProjectLabel(wiki)}</span>
+            <code class="admin-project-picker-option-code">${wiki}</code>
+          </button>`
+          option.addEventListener("click", () => {
+            setOnboardingWikiValue(wiki, {closeMenu: true})
+          })
+          return option
+        })
+      : [html`<div class="admin-project-picker-empty">No supported project matches <code>${query.trim() || "that search"}</code>.</div>`])
+  )
+}
+
+if (onboardingWikiInputElement) {
+  onboardingWikiInputElement.addEventListener("focus", showOnboardingWikiMenu)
+  onboardingWikiInputElement.addEventListener("click", showOnboardingWikiMenu)
+  onboardingWikiInputElement.addEventListener("input", () => {
+    setOnboardingWikiValue(onboardingWikiInputElement.value)
+    renderOnboardingWikiMenu()
+  })
+  onboardingWikiInputElement.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      hideOnboardingWikiMenu()
+      return
+    }
+    if (event.key === "Enter") {
+      const typed = (onboardingWikiInputElement.value || "").trim()
+      if (onboardingWikiOptionsSet.has(typed)) {
+        event.preventDefault()
+        setOnboardingWikiValue(typed, {closeMenu: true})
+      }
+    }
+  })
+}
+onboardingWikiMenu.addEventListener("mousedown", (event) => event.preventDefault())
+const closeOnboardingWikiPicker = (event) => {
+  if (!onboardingWikiPicker.contains(event.target)) {
+    hideOnboardingWikiMenu()
+  }
+}
+if (typeof document !== "undefined") {
+  document.addEventListener("pointerdown", closeOnboardingWikiPicker)
+  invalidation.then(() => {
+    document.removeEventListener("pointerdown", closeOnboardingWikiPicker)
+  })
+}
+
+const onboardingWikiRaw = view(onboardingWikiPicker)
 ```
 
 ```js
@@ -746,7 +826,7 @@ const snapshotVersion = view(snapshotVersionInput)
 html`<div class="admin-fetch-actions">
   ${!apiStatus ? adminConnectionWarning() : ""}
   ${onboardingWikiOptions.length === 0 ? html`<div class="warning">No supported onboarding projects were reported by the admin API yet.</div>` : ""}
-  ${onboardingWikiUnknown ? html`<div class="warning">No project matches <code>${onboardingWikiTrimmed}</code>. Pick one from the dropdown — typing partial text filters in place.</div>` : ""}
+  ${onboardingWikiUnknown ? html`<div class="warning">No project matches <code>${onboardingWikiTrimmed}</code>. Click the field to reopen the full project list, or keep typing to narrow it down.</div>` : ""}
   <button class="admin-btn primary" ?disabled=${!apiStatus} onclick=${() => {
         const w = onboardingWiki
         const version = normalizeSnapshotVersion(snapshotVersion)
@@ -1313,6 +1393,75 @@ currentManifest.merged.length > 0
   gap: 0.5rem;
   align-items: center;
   flex-wrap: wrap;
+}
+.admin-project-picker {
+  position: relative;
+  min-width: min(34rem, 100%);
+  flex: 1 1 28rem;
+}
+.admin-project-picker label,
+.admin-project-picker .inputs-3a86ea {
+  width: 100%;
+}
+.admin-project-picker-tip {
+  margin-top: 0.25rem;
+  font-size: 0.74rem;
+  color: var(--theme-foreground-muted);
+}
+.admin-wiki-combobox {
+  cursor: text;
+}
+.admin-project-picker-menu {
+  position: absolute;
+  z-index: 20;
+  top: calc(100% + 0.45rem);
+  left: 0;
+  right: 0;
+  max-height: 18rem;
+  overflow-y: auto;
+  padding: 0.35rem;
+  border: 1px solid var(--theme-foreground-faintest);
+  border-radius: 0.7rem;
+  background: color-mix(in srgb, var(--theme-background) 94%, white 6%);
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.12);
+  backdrop-filter: blur(10px) saturate(1.1);
+}
+.admin-project-picker-option {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.8rem;
+  padding: 0.55rem 0.7rem;
+  border: 0;
+  border-radius: 0.55rem;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.admin-project-picker-option:hover,
+.admin-project-picker-option:focus-visible {
+  background: color-mix(in srgb, var(--wk-blue) 14%, transparent);
+  outline: none;
+}
+.admin-project-picker-option-label {
+  min-width: 0;
+  font-size: 0.86rem;
+}
+.admin-project-picker-option-code {
+  flex: 0 0 auto;
+  font-size: 0.75rem;
+  color: var(--theme-foreground-muted);
+}
+.admin-project-picker-empty {
+  padding: 0.7rem 0.8rem;
+  font-size: 0.82rem;
+  color: var(--theme-foreground-muted);
+}
+[data-theme="dark"] .admin-project-picker-menu {
+  background: color-mix(in srgb, #171b22 92%, #242b36 8%);
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35);
 }
 .admin-maintenance-actions,
 .admin-action-group {
