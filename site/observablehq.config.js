@@ -92,6 +92,7 @@ document.addEventListener("DOMContentLoaded",function(){
       name: "Indicators",
       pages: [
         { name: "Edit Distribution", path: "/inequality" },
+        { name: "Edit Variation", path: "/edit-variation" },
         { name: "Community", path: "/labor" },
         { name: "Content Production", path: "/gdp" },
         { name: "Patrol", path: "/patrol" },

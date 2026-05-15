@@ -13,6 +13,7 @@ Wikipedia can be understood through the lens of economics: every edit is a unit 
 <div class="landing-nav">
 
 - **[Edit Distribution →](/inequality)** — How evenly are edits distributed? Gini, Theil, Palma, and fragility metrics.
+- **[Edit Variation →](/edit-variation)** — The biggest week-over-week edit spikes, with direct links to the affected wiki pages.
 - **[Community →](/labor)** — Editor workforce: arrivals, departures, retention, and cohort survival.
 - **[Content Production →](/gdp)** — Output measured in bytes and edits, by namespace, user type, and activity tier.
 - **[Patrol →](/patrol)** — Quality control: patrol volume, latency, coverage, and reviewer concentration.
