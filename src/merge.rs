@@ -86,6 +86,7 @@ fn materialize_dashboard_artifacts(output_dir: &Path) -> Result<()> {
 fn materialize_dashboard_artifacts_from_dir(output_dir: &Path, generator_dir: &Path) -> Result<()> {
     for script_name in [
         "defaults_business.json.sh",
+        "defaults_edit_variation.json.sh",
         "defaults_gdp.json.sh",
         "defaults_inequality.json.sh",
         "defaults_labor.json.sh",
