@@ -809,7 +809,7 @@ html[data-theme="light"] {
 /* ── Loading overlay (shown while DuckDB computes) ─────── */
 
 body.wk-loading .chart-section::after {
-  content: "Computing…";
+  content: "Loading…";
   position: absolute;
   inset: 0;
   display: flex;
@@ -825,7 +825,12 @@ body.wk-loading .chart-section::after {
   font-weight: 500;
   color: var(--wk-text-secondary, var(--theme-foreground-muted));
   letter-spacing: 0.03em;
+  text-align: center;
   animation: wk-loading-pulse 1.8s ease-in-out infinite;
+}
+
+body.wk-loading[data-wk-stage="engine"] .chart-section::after {
+  content: "Initializing query engine (first load, ~8s)…";
 }
 
 body.wk-loading .kpi-card .kpi-value {
@@ -836,6 +841,63 @@ body.wk-loading .kpi-card .kpi-value {
 @keyframes wk-loading-pulse {
   0%, 100% { opacity: 0.6; }
   50% { opacity: 1; }
+}
+
+/* ── Top progress bar + status pill (real stages, not a fake timer) ──
+   "start" = fast precomputed-defaults path; "engine" = cold-starting
+   DuckDB-WASM, the one step that actually takes ~8s. */
+
+.wk-progress {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 3px;
+  z-index: 1000;
+  pointer-events: none;
+  opacity: 0;
+  background: transparent;
+  transition: opacity 0.2s ease;
+}
+
+body.wk-loading .wk-progress {
+  opacity: 1;
+}
+
+.wk-progress-bar {
+  height: 100%;
+  width: 0%;
+  background: var(--wk-teal);
+  transition: width 0.3s ease;
+}
+
+.wk-progress-bar.wk-progress-trickle {
+  transition: width 8s cubic-bezier(0.1, 0.7, 0.3, 1);
+  width: 85% !important;
+}
+
+.wk-progress-status {
+  position: fixed;
+  top: 8px;
+  right: 14px;
+  z-index: 1000;
+  font-family: var(--wk-sans);
+  font-size: 0.68rem;
+  font-weight: 500;
+  color: var(--wk-text-secondary, var(--theme-foreground-muted));
+  background: var(--wk-surface, var(--theme-background));
+  border: 1px solid var(--wk-border, var(--theme-foreground-faintest));
+  padding: 0.2rem 0.6rem;
+  border-radius: 999px;
+  box-shadow: var(--wk-shadow-sm);
+  opacity: 0;
+  transform: translateY(-4px);
+  transition: opacity 0.2s ease, transform 0.2s ease;
+}
+
+body.wk-loading .wk-progress-status {
+  opacity: 1;
+  transform: translateY(0);
 }
 
 .chart-section h2 {

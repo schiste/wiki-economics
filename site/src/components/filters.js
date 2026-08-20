@@ -84,21 +84,65 @@ export function fmtNum(n) {
 /**
  * Loading-state counter for chart sections.
  * Uses RAF debounce so dependent cells don't cause a flash.
+ *
+ * The progress bar's stage reflects the actual code path a caller is about
+ * to take (`useDefaults`), not a fake timer: the "engine" stage only shows
+ * when a cell is really about to cold-start DuckDB-WASM, which is the one
+ * step (~8s) that dominates load time on the slow path.
  */
 let _loadingCount = 0;
 let _loadingRaf = 0;
+let _progressEls = null;
 
-export function startLoading() {
+const STAGES = {
+  start: {pct: 15, text: "Loading…", trickle: false},
+  engine: {pct: 40, text: "Initializing query engine (first load, ~8s)…", trickle: true},
+  done: {pct: 100, text: "", trickle: false},
+};
+
+function ensureProgressUI() {
+  if (_progressEls) return _progressEls;
+  const wrap = document.createElement("div");
+  wrap.className = "wk-progress";
+  const bar = document.createElement("div");
+  bar.className = "wk-progress-bar";
+  wrap.appendChild(bar);
+  const status = document.createElement("div");
+  status.className = "wk-progress-status";
+  document.body.append(wrap, status);
+  _progressEls = {bar, status};
+  return _progressEls;
+}
+
+function setStage(stage) {
+  const {bar, status} = ensureProgressUI();
+  const s = STAGES[stage];
+  bar.classList.toggle("wk-progress-trickle", !!s.trickle);
+  bar.style.width = s.pct + "%";
+  status.textContent = s.text;
+  document.body.dataset.wkStage = stage;
+}
+
+/**
+ * @param {boolean} useDefaults - whether this load will use precomputed
+ *   defaults (fast) or run a live DuckDB query (slow, cold-starts the engine).
+ */
+export function startLoading(useDefaults = true) {
   _loadingCount++;
   cancelAnimationFrame(_loadingRaf);
   document.body.classList.add("wk-loading");
+  setStage(useDefaults ? "start" : "engine");
 }
 
 export function doneLoading() {
   _loadingCount = Math.max(0, _loadingCount - 1);
   if (_loadingCount === 0) {
+    setStage("done");
     _loadingRaf = requestAnimationFrame(() => {
-      if (_loadingCount === 0) document.body.classList.remove("wk-loading");
+      if (_loadingCount === 0) {
+        document.body.classList.remove("wk-loading");
+        if (_progressEls) _progressEls.bar.classList.remove("wk-progress-trickle");
+      }
     });
   }
 }

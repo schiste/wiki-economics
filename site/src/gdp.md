@@ -40,7 +40,7 @@ const {wiki, userTypes, granularity, startPeriod, endPeriod, namespaces, breakdo
 ```js
 const useDefaults = isDefaultView(filters, defaults)
 
-startLoading()
+startLoading(useDefaults)
 let output, byType
 if (useDefaults) {
   output = defaults.output
@@ -260,7 +260,7 @@ withExport(breakdown
 const tierOrder = ["1 edit", "2-4 edits", "5-24 edits", "25-99 edits", "100+ edits"]
 const tierColors = ["#bdd7e7", "#6baed6", "#3182bd", "#08519c", "#022a5a"]
 
-startLoading()
+startLoading(useDefaults)
 let tiersAgg
 if (useDefaults) {
   tiersAgg = defaults.tiers.map(d => ({...d, activity_tier: d.activity_tier, editors: d.editors, total_edits: d.total_edits, gross_bytes: d.gross_bytes, net_bytes: d.net_bytes}))
@@ -356,7 +356,7 @@ Editors are bucketed by monthly edit count into five tiers: **1 edit** (one-time
 ## User Type Share of Economy
 
 ```js
-startLoading()
+startLoading(useDefaults)
 let shareAgg
 if (useDefaults) {
   // Compute shares from pre-aggregated type share data
@@ -418,7 +418,7 @@ This stacked area shows what fraction of total edits comes from each user type o
 ## Sectoral Output (by Namespace)
 
 ```js
-startLoading()
+startLoading(useDefaults)
 let sectorAgg
 if (useDefaults) {
   // Default view has only ns 0, so sectoral is just one sector

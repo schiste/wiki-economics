@@ -38,7 +38,7 @@ const useDefaults = isDefaultView(filters, defaults)
 const startP = toPeriod(startPeriod, granularity)
 const endP = toPeriod(endPeriod, granularity)
 
-startLoading()
+startLoading(useDefaults)
 let workforce, churnData
 if (useDefaults) {
   workforce = defaults.workforce
@@ -143,7 +143,7 @@ Same metric broken down by editor classification. Watch for the **temporary acco
 </div>
 
 ```js
-startLoading()
+startLoading(useDefaults)
 let typeAgg
 if (useDefaults) {
   typeAgg = defaults.byType
@@ -243,7 +243,7 @@ withExport(Plot.plot({
 <div class="note"><a href="https://en.wikipedia.org/wiki/Survival_analysis">Survival</a> heatmap for registered editors. Each row is a cohort (year of first edit). Colors show what fraction of that cohort is still around (last edit in that year or later). The last column is partial data. The "n=" column shows initial cohort size — small cohorts can produce misleading stability.</div>
 
 ```js
-startLoading()
+startLoading(useDefaults)
 let cohortData
 if (useDefaults) {
   cohortData = defaults.cohorts

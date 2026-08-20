@@ -34,7 +34,7 @@ const {wiki, userTypes, granularity, startPeriod, endPeriod} = filters
 
 ```js
 const useDefaults = isDefaultView(filters, defaults, {defaultNamespaces: null})
-startLoading()
+startLoading(useDefaults)
 let ineqData
 if (useDefaults) {
   ineqData = defaults.data

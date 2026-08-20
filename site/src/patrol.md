@@ -38,7 +38,7 @@ const {wiki, userTypes, granularity, startPeriod, endPeriod, namespaces} = filte
 
 ```js
 const useDefaults = isDefaultView(filters, defaults)
-startLoading()
+startLoading(useDefaults)
 let data
 if (useDefaults) {
   data = defaults.patrol

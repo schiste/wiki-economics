@@ -55,7 +55,7 @@ const useDefaults = isDefaultView(filters, defaults)
 
 ```js
 // Churn data (registered editors only, pre-aggregated)
-startLoading()
+startLoading(useDefaults)
 const startP = toPeriod(startPeriod, granularity)
 const endP = toPeriod(endPeriod, granularity)
 let churnData
@@ -70,7 +70,7 @@ doneLoading()
 
 ```js
 // Activity tier data — respects user type filter
-startLoading()
+startLoading(useDefaults)
 let tierAgg
 if (useDefaults) {
   tierAgg = defaults.tiers
@@ -95,7 +95,7 @@ const tierOrder = ["1-4 edits", "5-24 edits", "25-99 edits", "100+ edits"]
 
 ```js
 // GDP data — respects user type and namespace filters
-startLoading()
+startLoading(useDefaults)
 let survivalByPeriod, gdpRaw
 if (useDefaults) {
   survivalByPeriod = defaults.survival.map(d => ({
@@ -124,7 +124,7 @@ doneLoading()
 const talkNs = [1, 3, 5, 7, 9, 11, 13, 15, 101, 829, 1729]
 const contentNs = [0, 2, 4, 6, 8, 10, 12, 14, 100, 828, 1728]
 
-startLoading()
+startLoading(useDefaults)
 let eqByPeriod
 if (useDefaults) {
   // defaults.equilibrium has per-period per-namespace aggregates
@@ -155,7 +155,7 @@ doneLoading()
 
 ```js
 // Cohort data for LTV
-startLoading()
+startLoading(useDefaults)
 let cohortData, yearlyBytesPerEditor
 if (useDefaults) {
   cohortData = defaults.cohorts
@@ -298,7 +298,7 @@ Each period, every editor matching the selected user types is placed into one bu
 </div>
 
 ```js
-startLoading()
+startLoading(useDefaults)
 const funnelData = useDefaults
   ? defaults.funnel
   : Array.from(await (await getDb()).sql`SELECT * FROM funnel WHERE wiki = ${wiki}`)
