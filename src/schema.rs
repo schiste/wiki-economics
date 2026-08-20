@@ -1,16 +1,17 @@
-/// MediaWiki History Dump schema (76 columns)
+/// MediaWiki History Dump schema (78 columns)
 /// Reference: https://wikitech.wikimedia.org/wiki/Data_Platform/Data_Lake/Edits/MediaWiki_history_dumps
 use polars::prelude::*;
 
 /// Column names in TSV order. The dump has no header row.
 pub const COLUMNS: &[&str] = &[
-    // Event global fields (0–4)
+    // Event global fields (0–5)
     "wiki_db",
+    "event_log_id",
     "event_entity",
     "event_type",
     "event_timestamp",
     "event_comment",
-    // Event user fields (5–25)
+    // Event user fields (6–27)
     "event_user_id",
     "event_user_central_id",
     "event_user_text_historical",
@@ -27,12 +28,13 @@ pub const COLUMNS: &[&str] = &[
     "event_user_is_anonymous",
     "event_user_is_temporary",
     "event_user_is_permanent",
+    "event_user_is_cross_wiki",
     "event_user_registration_timestamp",
     "event_user_creation_timestamp",
     "event_user_first_edit_timestamp",
     "event_user_revision_count",
     "event_user_seconds_since_previous_revision",
-    // Page fields (26–38)
+    // Page fields (28–40)
     "page_id",
     "page_title_historical",
     "page_title",
@@ -46,7 +48,7 @@ pub const COLUMNS: &[&str] = &[
     "page_first_edit_timestamp",
     "page_revision_count",
     "page_seconds_since_previous_revision",
-    // User fields (39–57)
+    // User fields (41–59)
     "user_id",
     "user_central_id",
     "user_text_historical",
@@ -66,7 +68,7 @@ pub const COLUMNS: &[&str] = &[
     "user_registration_timestamp",
     "user_creation_timestamp",
     "user_first_edit_timestamp",
-    // Revision fields (58–75)
+    // Revision fields (60–77)
     "revision_id",
     "revision_parent_id",
     "revision_minor_edit",
@@ -181,7 +183,7 @@ mod tests {
 
     #[test]
     fn schema_lists_expected_column_count() {
-        assert_eq!(COLUMNS.len(), 76);
+        assert_eq!(COLUMNS.len(), 78);
     }
 
     #[test]
