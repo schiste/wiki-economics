@@ -58,12 +58,18 @@ document.addEventListener("DOMContentLoaded",function(){
     });
     themeDiv.appendChild(btn);
   });
+  var adminLink=document.createElement("a");
+  adminLink.className="sidebar-admin-link";
+  adminLink.href="/admin";
+  adminLink.title="Admin";
+  adminLink.textContent="\\u2699 Admin";
   var collapse=document.createElement("label");
   collapse.className="sidebar-collapse-btn";
   collapse.setAttribute("for","observablehq-sidebar-toggle");
   collapse.title="Collapse sidebar";
   collapse.textContent="\\u25C2 Collapse";
   bottom.appendChild(themeDiv);
+  bottom.appendChild(adminLink);
   bottom.appendChild(collapse);
   sidebar.appendChild(bottom);
   function addFilterToggle(desc){
