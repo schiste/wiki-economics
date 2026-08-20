@@ -28,9 +28,9 @@ jobs:
       WIKI_ECON_ADMIN_AUTH_MODE: oidc
       WIKI_ECON_ADMIN_BIND_HOST: 0.0.0.0
       WIKI_ECON_ADMIN_PORT: "8000"
-      WIKI_ECON_DATA_DIR: /data/project/<TOOL_NAME>/wiki-economics/data
-      WIKI_ECON_OUTPUT_DIR: /data/project/<TOOL_NAME>/wiki-economics/output
-      WIKI_ECON_SITE_DIST_DIR: /data/project/<TOOL_NAME>/wiki-economics/site-dist
+      WIKI_ECON_DATA_DIR: /data/project/wiki-economics/data
+      WIKI_ECON_OUTPUT_DIR: /data/project/wiki-economics/output
+      WIKI_ECON_SITE_DIST_DIR: /data/project/wiki-economics/site-dist
 
   - name: wiki-econ-refresh
     image: <TOOL_IMAGE>
@@ -39,7 +39,7 @@ jobs:
     memory: 4Gi
     cpu: "1"
     envvars:
-      WIKI_ECON_DATA_DIR: /data/project/<TOOL_NAME>/wiki-economics/data
-      WIKI_ECON_OUTPUT_DIR: /data/project/<TOOL_NAME>/wiki-economics/output
-      WIKI_ECON_SITE_DIST_DIR: /data/project/<TOOL_NAME>/wiki-economics/site-dist
+      WIKI_ECON_DATA_DIR: /data/project/wiki-economics/data
+      WIKI_ECON_OUTPUT_DIR: /data/project/wiki-economics/output
+      WIKI_ECON_SITE_DIST_DIR: /data/project/wiki-economics/site-dist
       WIKI_ECON_ENABLED_WIKIS: nlwiki
