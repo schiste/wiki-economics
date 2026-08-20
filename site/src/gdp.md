@@ -42,6 +42,7 @@ const useDefaults = isDefaultView(filters, defaults)
 
 startLoading(useDefaults)
 let output, byType
+try {
 if (useDefaults) {
   output = defaults.output
   byType = defaults.byType
@@ -71,7 +72,9 @@ if (useDefaults) {
     .flatMap(([period, types]) => types.map(([user_type, agg]) => ({period, user_type, ...agg})))
     .sort((a, b) => d3.ascending(a.period, b.period))
 }
-doneLoading()
+} finally {
+  doneLoading()
+}
 
 const tickStep = Math.max(1, Math.floor(output.length / 20))
 const typeColor = {legend: true, domain: ["registered", "temporary", "anonymous", "bot"], range: ["steelblue", "orange", "gold", "tomato"]}
@@ -262,6 +265,7 @@ const tierColors = ["#bdd7e7", "#6baed6", "#3182bd", "#08519c", "#022a5a"]
 
 startLoading(useDefaults)
 let tiersAgg
+try {
 if (useDefaults) {
   tiersAgg = defaults.tiers.map(d => ({...d, activity_tier: d.activity_tier, editors: d.editors, total_edits: d.total_edits, gross_bytes: d.gross_bytes, net_bytes: d.net_bytes}))
 } else {
@@ -280,7 +284,9 @@ if (useDefaults) {
     .flatMap(([period, tList]) => tList.map(([activity_tier, agg]) => ({period, activity_tier, ...agg})))
     .sort((a, b) => d3.ascending(a.period, b.period))
 }
-doneLoading()
+} finally {
+  doneLoading()
+}
 
 const tierTick = Math.max(1, Math.floor(new Set(tiersAgg.map(d => d.period)).size / 20))
 ```
@@ -358,6 +364,7 @@ Editors are bucketed by monthly edit count into five tiers: **1 edit** (one-time
 ```js
 startLoading(useDefaults)
 let shareAgg
+try {
 if (useDefaults) {
   // Compute shares from pre-aggregated type share data
   const shareGrouped = d3.rollups(defaults.typeShare, v => d3.sum(v, d => d.edits), d => d.period, d => d.user_type)
@@ -381,7 +388,9 @@ if (useDefaults) {
     })
     .sort((a, b) => d3.ascending(a.period, b.period))
 }
-doneLoading()
+} finally {
+  doneLoading()
+}
 ```
 
 ```js
@@ -420,6 +429,7 @@ This stacked area shows what fraction of total edits comes from each user type o
 ```js
 startLoading(useDefaults)
 let sectorAgg
+try {
 if (useDefaults) {
   // Default view has only ns 0, so sectoral is just one sector
   sectorAgg = defaults.byNamespace.map(d => ({
@@ -442,7 +452,9 @@ if (useDefaults) {
     .flatMap(([period, nsList]) => nsList.map(([ns_label, agg]) => ({period, ns_label, ...agg})))
     .sort((a, b) => d3.ascending(a.period, b.period))
 }
-doneLoading()
+} finally {
+  doneLoading()
+}
 ```
 
 ```js

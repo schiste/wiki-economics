@@ -40,6 +40,7 @@ const endP = toPeriod(endPeriod, granularity)
 
 startLoading(useDefaults)
 let workforce, churnData
+try {
 if (useDefaults) {
   workforce = defaults.workforce
   churnData = defaults.churn
@@ -57,7 +58,9 @@ if (useDefaults) {
   const churnRaw = Array.from(await db.sql`SELECT * FROM churn WHERE wiki = ${wiki}`)
   churnData = churnRaw.filter(d => d.period_type === granularity && d.period >= startP && d.period <= endP)
 }
-doneLoading()
+} finally {
+  doneLoading()
+}
 const tickStep = Math.max(1, Math.floor(workforce.length / 20))
 ```
 
@@ -145,6 +148,7 @@ Same metric broken down by editor classification. Watch for the **temporary acco
 ```js
 startLoading(useDefaults)
 let typeAgg
+try {
 if (useDefaults) {
   typeAgg = defaults.byType
 } else {
@@ -158,7 +162,9 @@ if (useDefaults) {
     .flatMap(([period, types]) => types.map(([user_type, editors]) => ({period, user_type, editors})))
     .sort((a, b) => d3.ascending(a.period, b.period))
 }
-doneLoading()
+} finally {
+  doneLoading()
+}
 ```
 
 ```js
@@ -245,6 +251,7 @@ withExport(Plot.plot({
 ```js
 startLoading(useDefaults)
 let cohortData
+try {
 if (useDefaults) {
   cohortData = defaults.cohorts
 } else {
@@ -252,7 +259,9 @@ if (useDefaults) {
   const db = await DDB.of({cohorts: FileAttachment("data/labor_cohorts.parquet")})
   cohortData = Array.from(await db.sql`SELECT * FROM cohorts WHERE wiki = ${wiki} ORDER BY cohort_year, year`)
 }
-doneLoading()
+} finally {
+  doneLoading()
+}
 const latestYear = d3.max(cohortData, d => d.year)
 
 const heatmap = cohortData

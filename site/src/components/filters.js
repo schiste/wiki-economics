@@ -83,7 +83,10 @@ export function fmtNum(n) {
 
 /**
  * Loading-state counter for chart sections.
- * Uses RAF debounce so dependent cells don't cause a flash.
+ * Debounces removal via setTimeout (not requestAnimationFrame) so dependent
+ * cells don't cause a flash — rAF callbacks are suspended entirely while the
+ * document is hidden (backgrounded tab), which would otherwise leave the
+ * loading indicator stuck until the tab regains visibility.
  *
  * The progress bar's stage reflects the actual code path a caller is about
  * to take (`useDefaults`), not a fake timer: the "engine" stage only shows
@@ -91,7 +94,7 @@ export function fmtNum(n) {
  * step (~8s) that dominates load time on the slow path.
  */
 let _loadingCount = 0;
-let _loadingRaf = 0;
+let _loadingTimer = 0;
 let _progressEls = null;
 
 const STAGES = {
@@ -129,7 +132,7 @@ function setStage(stage) {
  */
 export function startLoading(useDefaults = true) {
   _loadingCount++;
-  cancelAnimationFrame(_loadingRaf);
+  clearTimeout(_loadingTimer);
   document.body.classList.add("wk-loading");
   setStage(useDefaults ? "start" : "engine");
 }
@@ -138,12 +141,12 @@ export function doneLoading() {
   _loadingCount = Math.max(0, _loadingCount - 1);
   if (_loadingCount === 0) {
     setStage("done");
-    _loadingRaf = requestAnimationFrame(() => {
+    _loadingTimer = setTimeout(() => {
       if (_loadingCount === 0) {
         document.body.classList.remove("wk-loading");
         if (_progressEls) _progressEls.bar.classList.remove("wk-progress-trickle");
       }
-    });
+    }, 0);
   }
 }
 

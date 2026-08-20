@@ -36,6 +36,7 @@ const {wiki, userTypes, granularity, startPeriod, endPeriod} = filters
 const useDefaults = isDefaultView(filters, defaults, {defaultNamespaces: null})
 startLoading(useDefaults)
 let ineqData
+try {
 if (useDefaults) {
   ineqData = defaults.data
 } else {
@@ -47,7 +48,9 @@ if (useDefaults) {
     wiki, userTypes, namespaces: null, startPeriod, endPeriod, granularity
   })
 }
-doneLoading()
+} finally {
+  doneLoading()
+}
 const tickStep = Math.max(1, Math.floor(ineqData.length / 20))
 const latest = ineqData.length > 0 ? ineqData[ineqData.length - 1] : null
 ```

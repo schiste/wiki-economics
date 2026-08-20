@@ -40,6 +40,7 @@ const {wiki, userTypes, granularity, startPeriod, endPeriod, namespaces} = filte
 const useDefaults = isDefaultView(filters, defaults)
 startLoading(useDefaults)
 let data
+try {
 if (useDefaults) {
   data = defaults.patrol
 } else {
@@ -54,7 +55,9 @@ if (useDefaults) {
     wiki, userTypes, namespaces, startPeriod, endPeriod, granularity
   })
 }
-doneLoading()
+} finally {
+  doneLoading()
+}
 ```
 
 ```js

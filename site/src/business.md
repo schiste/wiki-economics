@@ -59,19 +59,23 @@ startLoading(useDefaults)
 const startP = toPeriod(startPeriod, granularity)
 const endP = toPeriod(endPeriod, granularity)
 let churnData
+try {
 if (useDefaults) {
   churnData = defaults.churn
 } else {
   const churnRaw = Array.from(await (await getDb()).sql`SELECT period, period_type, active_editors, arrivals, departures, arrival_rate, departure_rate FROM churn WHERE wiki = ${wiki}`)
   churnData = churnRaw.filter(d => d.period_type === granularity && d.period >= startP && d.period <= endP)
 }
-doneLoading()
+} finally {
+  doneLoading()
+}
 ```
 
 ```js
 // Activity tier data — respects user type filter
 startLoading(useDefaults)
 let tierAgg
+try {
 if (useDefaults) {
   tierAgg = defaults.tiers
 } else {
@@ -88,7 +92,9 @@ if (useDefaults) {
     .flatMap(([period, tiers]) => tiers.map(([tier, vals]) => ({period, tier, ...vals})))
     .sort((a, b) => d3.ascending(a.period, b.period))
 }
-doneLoading()
+} finally {
+  doneLoading()
+}
 
 const tierOrder = ["1-4 edits", "5-24 edits", "25-99 edits", "100+ edits"]
 ```
@@ -97,6 +103,7 @@ const tierOrder = ["1-4 edits", "5-24 edits", "25-99 edits", "100+ edits"]
 // GDP data — respects user type and namespace filters
 startLoading(useDefaults)
 let survivalByPeriod, gdpRaw
+try {
 if (useDefaults) {
   survivalByPeriod = defaults.survival.map(d => ({
     ...d,
@@ -116,7 +123,9 @@ if (useDefaults) {
     .map(([period, v]) => ({period, ...v}))
     .sort((a, b) => d3.ascending(a.period, b.period))
 }
-doneLoading()
+} finally {
+  doneLoading()
+}
 ```
 
 ```js
@@ -126,6 +135,7 @@ const contentNs = [0, 2, 4, 6, 8, 10, 12, 14, 100, 828, 1728]
 
 startLoading(useDefaults)
 let eqByPeriod
+try {
 if (useDefaults) {
   // defaults.equilibrium has per-period per-namespace aggregates
   const eqGrouped = d3.rollups(defaults.equilibrium, v => {
@@ -150,13 +160,16 @@ if (useDefaults) {
     .filter(d => d.ratio != null)
     .sort((a, b) => d3.ascending(a.period, b.period))
 }
-doneLoading()
+} finally {
+  doneLoading()
+}
 ```
 
 ```js
 // Cohort data for LTV
 startLoading(useDefaults)
 let cohortData, yearlyBytesPerEditor
+try {
 if (useDefaults) {
   cohortData = defaults.cohorts
   yearlyBytesPerEditor = defaults.yearlyBytesPerEditor.map(d => ({
@@ -175,7 +188,9 @@ if (useDefaults) {
     d => d.year_month.slice(0, 4)
   ).map(([year, bytesPerEditor]) => ({year, bytesPerEditor}))
 }
-doneLoading()
+} finally {
+  doneLoading()
+}
 
 // Estimated LTV per cohort: sum of (survival_rate x avg_bytes_per_editor) for each year
 const ltvByCohort = d3.groups(cohortData, d => d.cohort_year)
@@ -299,16 +314,20 @@ Each period, every editor matching the selected user types is placed into one bu
 
 ```js
 startLoading(useDefaults)
-const funnelData = useDefaults
-  ? defaults.funnel
-  : Array.from(await (await getDb()).sql`SELECT * FROM funnel WHERE wiki = ${wiki}`)
-  .map(d => ({
-    ...d,
-    pct_5: d.cohort_size > 0 ? d.reached_5 / d.cohort_size : 0,
-    pct_25: d.cohort_size > 0 ? d.reached_25 / d.cohort_size : 0,
-    pct_100: d.cohort_size > 0 ? d.reached_100 / d.cohort_size : 0,
-  }))
-doneLoading()
+let funnelData
+try {
+  funnelData = useDefaults
+    ? defaults.funnel
+    : Array.from(await (await getDb()).sql`SELECT * FROM funnel WHERE wiki = ${wiki}`)
+    .map(d => ({
+      ...d,
+      pct_5: d.cohort_size > 0 ? d.reached_5 / d.cohort_size : 0,
+      pct_25: d.cohort_size > 0 ? d.reached_25 / d.cohort_size : 0,
+      pct_100: d.cohort_size > 0 ? d.reached_100 / d.cohort_size : 0,
+    }))
+} finally {
+  doneLoading()
+}
 
 const funnelLong = funnelData.flatMap(d => [
   {cohort_year: d.cohort_year, milestone: "5+ edits", pct: d.pct_5, editors: d.reached_5, cohort_size: d.cohort_size},
