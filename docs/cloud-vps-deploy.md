@@ -91,18 +91,18 @@ The supported hosted admin model is:
 
 - `site/admin-server.cjs` still binds to `127.0.0.1`
 - nginx proxies `/admin` and `/admin-api/*` to that loopback server
-- the server requires `WIKI_ECON_ADMIN_AUTH_MODE=oidc`
-- the signed-in email address must be present in `WIKI_ECON_ADMIN_ALLOWED_EMAILS`
+- the server requires `WIKI_ECON_ADMIN_AUTH_MODE=mediawiki`
+- the signed-in Wikimedia username must be present in `WIKI_ECON_ADMIN_ALLOWED_USERNAMES`
 
 Required `/etc/wiki-economics.env` settings:
 
 - `WIKI_ECON_ADMIN_ENABLED=1`
-- `WIKI_ECON_ADMIN_AUTH_MODE=oidc`
+- `WIKI_ECON_ADMIN_AUTH_MODE=mediawiki`
 - `WIKI_ECON_ADMIN_PUBLIC_ORIGIN`
-- `WIKI_ECON_ADMIN_OIDC_ISSUER`
-- `WIKI_ECON_ADMIN_OIDC_CLIENT_ID`
-- `WIKI_ECON_ADMIN_OIDC_CLIENT_SECRET`
-- `WIKI_ECON_ADMIN_ALLOWED_EMAILS`
+- `WIKI_ECON_ADMIN_MEDIAWIKI_HOST`
+- `WIKI_ECON_ADMIN_MEDIAWIKI_CLIENT_ID`
+- `WIKI_ECON_ADMIN_MEDIAWIKI_CLIENT_SECRET`
+- `WIKI_ECON_ADMIN_ALLOWED_USERNAMES`
 - `WIKI_ECON_ADMIN_SESSION_SECRET`
 
 Recommended secret-management pattern:
@@ -110,19 +110,19 @@ Recommended secret-management pattern:
 - keep those values in deployment secrets such as GitHub Actions secrets
 - use the same secret names as the env vars when possible
 - render them into `/etc/wiki-economics.env` during deploy/bootstrap with `deploy/cloud-vps/render-env.sh`
-- do not commit operator emails or client secrets into git
+- do not commit operator usernames or client secrets into git
 
 Example pattern for a deploy job running over SSH:
 
 ```sh
 sudo env \
   WIKI_ECON_ADMIN_ENABLED=1 \
-  WIKI_ECON_ADMIN_AUTH_MODE=oidc \
+  WIKI_ECON_ADMIN_AUTH_MODE=mediawiki \
   WIKI_ECON_ADMIN_PUBLIC_ORIGIN="$WIKI_ECON_ADMIN_PUBLIC_ORIGIN" \
-  WIKI_ECON_ADMIN_OIDC_ISSUER="$WIKI_ECON_ADMIN_OIDC_ISSUER" \
-  WIKI_ECON_ADMIN_OIDC_CLIENT_ID="$WIKI_ECON_ADMIN_OIDC_CLIENT_ID" \
-  WIKI_ECON_ADMIN_OIDC_CLIENT_SECRET="$WIKI_ECON_ADMIN_OIDC_CLIENT_SECRET" \
-  WIKI_ECON_ADMIN_ALLOWED_EMAILS="$WIKI_ECON_ADMIN_ALLOWED_EMAILS" \
+  WIKI_ECON_ADMIN_MEDIAWIKI_HOST="$WIKI_ECON_ADMIN_MEDIAWIKI_HOST" \
+  WIKI_ECON_ADMIN_MEDIAWIKI_CLIENT_ID="$WIKI_ECON_ADMIN_MEDIAWIKI_CLIENT_ID" \
+  WIKI_ECON_ADMIN_MEDIAWIKI_CLIENT_SECRET="$WIKI_ECON_ADMIN_MEDIAWIKI_CLIENT_SECRET" \
+  WIKI_ECON_ADMIN_ALLOWED_USERNAMES="$WIKI_ECON_ADMIN_ALLOWED_USERNAMES" \
   WIKI_ECON_ADMIN_SESSION_SECRET="$WIKI_ECON_ADMIN_SESSION_SECRET" \
   /srv/wiki-economics/app/current/deploy/cloud-vps/render-env.sh /etc/wiki-economics.env
 ```
@@ -225,7 +225,7 @@ You can roll code back independently from published artifacts.
 ## Safety Rules
 
 - Do not expose `site/admin-server.cjs` publicly in production.
-- Do expose it only through nginx on loopback with `WIKI_ECON_ADMIN_AUTH_MODE=oidc`.
+- Do expose it only through nginx on loopback with `WIKI_ECON_ADMIN_AUTH_MODE=mediawiki`.
 - Do not rebuild output in place.
 - Do not use one directory for both versioned source scripts and live data artifacts.
 - Keep the enabled wiki list narrow at first.

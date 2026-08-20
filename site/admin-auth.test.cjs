@@ -5,7 +5,7 @@ const assert = require("node:assert/strict");
 
 const {
   buildAuthorizeUrl,
-  parseAllowedEmails,
+  parseAllowedUsernames,
   parseCookies,
   sanitizeNextPath,
   serializeCookie,
@@ -13,15 +13,15 @@ const {
   verifyJsonToken,
 } = require("./admin-auth.cjs");
 
-test("parseAllowedEmails normalizes common separator styles", () => {
-  const allowed = parseAllowedEmails("Alice@example.org, bob@example.org\ncarol@example.org ; DAVE@example.org");
+test("parseAllowedUsernames normalizes common separator styles without lowercasing", () => {
+  const allowed = parseAllowedUsernames("Alice, Bob\nCarol ; DaveDave");
   assert.deepEqual(
     Array.from(allowed).sort(),
     [
-      "alice@example.org",
-      "bob@example.org",
-      "carol@example.org",
-      "dave@example.org",
+      "Alice",
+      "Bob",
+      "Carol",
+      "DaveDave",
     ],
   );
 });

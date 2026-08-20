@@ -19,11 +19,11 @@ const LOCAL_ENV = {
 const HOSTED_ENV = {
   WIKI_ECON_ENV: "production",
   WIKI_ECON_ADMIN_ENABLED: "1",
-  WIKI_ECON_ADMIN_AUTH_MODE: "oidc",
-  WIKI_ECON_ADMIN_OIDC_ISSUER: "https://accounts.example.test",
-  WIKI_ECON_ADMIN_OIDC_CLIENT_ID: "wiki-econ-test-client",
-  WIKI_ECON_ADMIN_OIDC_CLIENT_SECRET: "wiki-econ-test-secret",
-  WIKI_ECON_ADMIN_ALLOWED_EMAILS: "alice@example.org",
+  WIKI_ECON_ADMIN_AUTH_MODE: "mediawiki",
+  WIKI_ECON_ADMIN_MEDIAWIKI_HOST: "https://meta.wikimedia.example.test",
+  WIKI_ECON_ADMIN_MEDIAWIKI_CLIENT_ID: "wiki-econ-test-client",
+  WIKI_ECON_ADMIN_MEDIAWIKI_CLIENT_SECRET: "wiki-econ-test-secret",
+  WIKI_ECON_ADMIN_ALLOWED_USERNAMES: "Alice",
   WIKI_ECON_ADMIN_SESSION_SECRET: "0123456789abcdef0123456789abcdef",
   WIKI_ECON_ADMIN_SECURE_COOKIES: "0",
 };
@@ -80,13 +80,13 @@ async function startServer(t, envOverrides) {
   };
 }
 
-function sessionCookie(secret, email = "alice@example.org") {
+function sessionCookie(secret, username = "Alice") {
   const token = signJsonToken(
     {
-      email,
+      username,
       name: "Alice Example",
-      sub: "alice-example",
-      provider: "https://accounts.example.test",
+      sub: "12345",
+      provider: "https://meta.wikimedia.example.test",
       exp: Math.floor(Date.now() / 1000) + 60 * 60,
     },
     secret,
@@ -218,7 +218,7 @@ test("hosted mode serves /admin and /admin-api/status when a valid session cooki
   assert.equal(statusResponse.statusCode, 200);
   const statusBody = JSON.parse(statusResponse.text());
   assert.equal(statusBody.auth.authenticated, true);
-  assert.equal(statusBody.auth.user.email, "alice@example.org");
+  assert.equal(statusBody.auth.user.username, "Alice");
 
   const pageResponse = await invoke(module, {
     url: "/admin",

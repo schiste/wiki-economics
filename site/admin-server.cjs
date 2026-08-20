@@ -10,8 +10,8 @@ const fs = require("fs");
 const {
   buildAuthorizeUrl,
   escapeHtml,
-  normalizeEmail,
-  parseAllowedEmails,
+  normalizeUsername,
+  parseAllowedUsernames,
   parseCookies,
   randomToken,
   sanitizeNextPath,
@@ -44,18 +44,16 @@ const ADMIN_OAUTH_START_PATH = "/admin/oauth/start";
 const ADMIN_OAUTH_CALLBACK_PATH = "/admin/oauth/callback";
 const ADMIN_AUTH_MODE = process.env.WIKI_ECON_ADMIN_AUTH_MODE || "none";
 const AUTH_ENABLED = ADMIN_AUTH_MODE !== "none";
-const ADMIN_ALLOWED_EMAILS = parseAllowedEmails(process.env.WIKI_ECON_ADMIN_ALLOWED_EMAILS || "");
+const ADMIN_ALLOWED_USERNAMES = parseAllowedUsernames(process.env.WIKI_ECON_ADMIN_ALLOWED_USERNAMES || "");
 const ADMIN_SESSION_SECRET = process.env.WIKI_ECON_ADMIN_SESSION_SECRET || "";
 const ADMIN_SESSION_COOKIE_NAME = process.env.WIKI_ECON_ADMIN_SESSION_COOKIE_NAME || "wiki_econ_admin_session";
 const ADMIN_OAUTH_STATE_COOKIE_NAME = process.env.WIKI_ECON_ADMIN_OAUTH_STATE_COOKIE_NAME || "wiki_econ_admin_oauth_state";
 const ADMIN_SESSION_TTL_SECS = parsePositiveInt(process.env.WIKI_ECON_ADMIN_SESSION_TTL_SECS, 8 * 60 * 60);
-const ADMIN_REQUIRE_VERIFIED_EMAIL = (process.env.WIKI_ECON_ADMIN_REQUIRE_VERIFIED_EMAIL || "1") !== "0";
 const ADMIN_SECURE_COOKIES = (process.env.WIKI_ECON_ADMIN_SECURE_COOKIES ?? (RUNTIME_ENV === "production" ? "1" : "0")) === "1";
 const ADMIN_PUBLIC_ORIGIN = normalizeConfiguredOrigin(process.env.WIKI_ECON_ADMIN_PUBLIC_ORIGIN || "");
-const ADMIN_OIDC_ISSUER = process.env.WIKI_ECON_ADMIN_OIDC_ISSUER || "";
-const ADMIN_OIDC_CLIENT_ID = process.env.WIKI_ECON_ADMIN_OIDC_CLIENT_ID || "";
-const ADMIN_OIDC_CLIENT_SECRET = process.env.WIKI_ECON_ADMIN_OIDC_CLIENT_SECRET || "";
-const ADMIN_OIDC_SCOPES = (process.env.WIKI_ECON_ADMIN_OIDC_SCOPES || "openid email profile").trim();
+const ADMIN_MEDIAWIKI_HOST = (process.env.WIKI_ECON_ADMIN_MEDIAWIKI_HOST || "https://meta.wikimedia.org").replace(/\/+$/, "");
+const ADMIN_MEDIAWIKI_CLIENT_ID = process.env.WIKI_ECON_ADMIN_MEDIAWIKI_CLIENT_ID || "";
+const ADMIN_MEDIAWIKI_CLIENT_SECRET = process.env.WIKI_ECON_ADMIN_MEDIAWIKI_CLIENT_SECRET || "";
 const ALLOWED_ORIGINS = resolveAllowedOrigins();
 
 let currentJob = null;
@@ -69,7 +67,6 @@ let manifestCacheAt = 0;
 const MANIFEST_CACHE_TTL_MS = 1500;
 const REQUIRED_MERGED_METRICS = 9;
 let supportedWikisCache = null;
-let oidcMetadataPromise = null;
 
 if (!ADMIN_ENABLED) {
   console.error("Admin API is disabled for this runtime. Set WIKI_ECON_ADMIN_ENABLED=1 to opt in.");
@@ -77,22 +74,21 @@ if (!ADMIN_ENABLED) {
 }
 
 if (RUNTIME_ENV === "production" && !AUTH_ENABLED) {
-  console.error("Refusing to run the admin server in production without authentication. Set WIKI_ECON_ADMIN_AUTH_MODE=oidc.");
+  console.error("Refusing to run the admin server in production without authentication. Set WIKI_ECON_ADMIN_AUTH_MODE=mediawiki.");
   process.exit(1);
 }
 
-if (AUTH_ENABLED && ADMIN_AUTH_MODE !== "oidc") {
-  console.error(`Unsupported WIKI_ECON_ADMIN_AUTH_MODE: ${ADMIN_AUTH_MODE}. Expected "none" or "oidc".`);
+if (AUTH_ENABLED && ADMIN_AUTH_MODE !== "mediawiki") {
+  console.error(`Unsupported WIKI_ECON_ADMIN_AUTH_MODE: ${ADMIN_AUTH_MODE}. Expected "none" or "mediawiki".`);
   process.exit(1);
 }
 
 if (AUTH_ENABLED) {
   const missing = [];
-  if (!ADMIN_OIDC_ISSUER) missing.push("WIKI_ECON_ADMIN_OIDC_ISSUER");
-  if (!ADMIN_OIDC_CLIENT_ID) missing.push("WIKI_ECON_ADMIN_OIDC_CLIENT_ID");
-  if (!ADMIN_OIDC_CLIENT_SECRET) missing.push("WIKI_ECON_ADMIN_OIDC_CLIENT_SECRET");
+  if (!ADMIN_MEDIAWIKI_CLIENT_ID) missing.push("WIKI_ECON_ADMIN_MEDIAWIKI_CLIENT_ID");
+  if (!ADMIN_MEDIAWIKI_CLIENT_SECRET) missing.push("WIKI_ECON_ADMIN_MEDIAWIKI_CLIENT_SECRET");
   if (!ADMIN_SESSION_SECRET || ADMIN_SESSION_SECRET.length < 32) missing.push("WIKI_ECON_ADMIN_SESSION_SECRET (32+ chars)");
-  if (ADMIN_ALLOWED_EMAILS.size === 0) missing.push("WIKI_ECON_ADMIN_ALLOWED_EMAILS");
+  if (ADMIN_ALLOWED_USERNAMES.size === 0) missing.push("WIKI_ECON_ADMIN_ALLOWED_USERNAMES");
   if (missing.length > 0) {
     console.error(`Missing required admin auth configuration: ${missing.join(", ")}`);
     process.exit(1);
@@ -319,8 +315,8 @@ function authStatus(session, req) {
     loginUrl: AUTH_ENABLED && !session ? loginUrlFor(ADMIN_PAGE_PATH) : null,
     logoutUrl: AUTH_ENABLED && session ? ADMIN_LOGOUT_PATH : null,
     user: session ? {
-      email: session.email,
-      name: session.name || session.email,
+      username: session.username,
+      name: session.name || session.username,
     } : null,
     publicOrigin: currentRequestOrigin(req),
   };
@@ -356,12 +352,12 @@ function readSession(req) {
   const cookies = parseCookies(requestHeaderValue(req, "cookie"));
   const payload = verifyJsonToken(cookies[ADMIN_SESSION_COOKIE_NAME], ADMIN_SESSION_SECRET);
   if (!payload || typeof payload !== "object") return null;
-  if (!payload.email || !payload.exp) return null;
+  if (!payload.username || !payload.exp) return null;
   if ((Number(payload.exp) || 0) <= Math.floor(Date.now() / 1000)) return null;
-  const normalized = normalizeEmail(payload.email);
-  if (!ADMIN_ALLOWED_EMAILS.has(normalized)) return null;
+  const normalized = normalizeUsername(payload.username);
+  if (!ADMIN_ALLOWED_USERNAMES.has(normalized)) return null;
   return {
-    email: normalized,
+    username: normalized,
     name: typeof payload.name === "string" ? payload.name : normalized,
     sub: typeof payload.sub === "string" ? payload.sub : "",
     provider: typeof payload.provider === "string" ? payload.provider : "",
@@ -371,10 +367,10 @@ function readSession(req) {
 function issueSession(res, profile) {
   const expiresAt = Math.floor(Date.now() / 1000) + ADMIN_SESSION_TTL_SECS;
   const token = signJsonToken({
-    email: profile.email,
-    name: profile.name || profile.email,
+    username: profile.username,
+    name: profile.name || profile.username,
     sub: profile.sub,
-    provider: ADMIN_OIDC_ISSUER,
+    provider: ADMIN_MEDIAWIKI_HOST,
     exp: expiresAt,
   }, ADMIN_SESSION_SECRET);
   appendSetCookie(res, serializeCookie(ADMIN_SESSION_COOKIE_NAME, token, {
@@ -498,49 +494,30 @@ async function fetchJson(url, options = {}) {
   return text ? JSON.parse(text) : {};
 }
 
-async function loadOidcMetadata() {
-  if (!oidcMetadataPromise) {
-    oidcMetadataPromise = (async () => {
-      const issuer = new URL(ADMIN_OIDC_ISSUER.endsWith("/") ? ADMIN_OIDC_ISSUER : `${ADMIN_OIDC_ISSUER}/`);
-      const discoveryUrl = new URL(".well-known/openid-configuration", issuer);
-      const metadata = await fetchJson(discoveryUrl.toString());
-      for (const key of ["authorization_endpoint", "token_endpoint", "userinfo_endpoint"]) {
-        if (!metadata[key]) {
-          throw new Error(`OIDC discovery document is missing ${key}`);
-        }
-      }
-      return metadata;
-    })();
-  }
-  return oidcMetadataPromise;
+function mediawikiEndpoint(pathSuffix) {
+  return `${ADMIN_MEDIAWIKI_HOST}${pathSuffix}`;
 }
 
-function normalizeOidcProfile(profile) {
-  const email = normalizeEmail(profile.email);
-  if (!email) {
-    throw new Error("The identity provider did not return an email address.");
+function normalizeMediawikiProfile(profile) {
+  const username = normalizeUsername(profile.username);
+  if (!username) {
+    throw new Error("The identity provider did not return a username.");
   }
-  if (ADMIN_REQUIRE_VERIFIED_EMAIL && Object.hasOwn(profile, "email_verified") && profile.email_verified !== true) {
-    throw new Error(`The identity provider returned an unverified email for ${email}.`);
-  }
-  if (!ADMIN_ALLOWED_EMAILS.has(email)) {
-    throw new Error(`The signed-in email ${email} is not in the configured allowlist.`);
+  if (!ADMIN_ALLOWED_USERNAMES.has(username)) {
+    throw new Error(`The signed-in user ${username} is not in the configured allowlist.`);
   }
   return {
-    email,
-    name: typeof profile.name === "string" && profile.name.trim() ? profile.name.trim() : email,
-    sub: typeof profile.sub === "string" ? profile.sub : email,
+    username,
+    name: typeof profile.realname === "string" && profile.realname.trim() ? profile.realname.trim() : username,
+    sub: profile.sub != null ? String(profile.sub) : username,
   };
 }
 
-async function startOidcLogin(req, res, nextPath) {
-  const metadata = await loadOidcMetadata();
+async function startMediawikiLogin(req, res, nextPath) {
   const state = randomToken(24);
-  const nonce = randomToken(24);
   const next = sanitizeNextPath(nextPath, ADMIN_PAGE_PATH);
   const stateToken = signJsonToken({
     state,
-    nonce,
     next,
     exp: Math.floor(Date.now() / 1000) + 10 * 60,
   }, ADMIN_SESSION_SECRET);
@@ -552,17 +529,15 @@ async function startOidcLogin(req, res, nextPath) {
     path: "/",
   }));
   const authorizeUrl = buildAuthorizeUrl({
-    authorizationEndpoint: metadata.authorization_endpoint,
-    clientId: ADMIN_OIDC_CLIENT_ID,
+    authorizationEndpoint: mediawikiEndpoint("/w/rest.php/oauth2/authorize"),
+    clientId: ADMIN_MEDIAWIKI_CLIENT_ID,
     redirectUri: externalUrl(req, ADMIN_OAUTH_CALLBACK_PATH),
-    scopes: ADMIN_OIDC_SCOPES,
     state,
-    nonce,
   });
   redirect(res, authorizeUrl);
 }
 
-async function finishOidcLogin(req, res, url) {
+async function finishMediawikiLogin(req, res, url) {
   const error = url.searchParams.get("error");
   const errorDescription = url.searchParams.get("error_description");
   if (error) {
@@ -592,8 +567,7 @@ async function finishOidcLogin(req, res, url) {
   }
 
   try {
-    const metadata = await loadOidcMetadata();
-    const tokenResponse = await fetchJson(metadata.token_endpoint, {
+    const tokenResponse = await fetchJson(mediawikiEndpoint("/w/rest.php/oauth2/access_token"), {
       method: "POST",
       headers: {
         "Content-Type": "application/x-www-form-urlencoded",
@@ -601,20 +575,20 @@ async function finishOidcLogin(req, res, url) {
       body: new URLSearchParams({
         grant_type: "authorization_code",
         code,
-        client_id: ADMIN_OIDC_CLIENT_ID,
-        client_secret: ADMIN_OIDC_CLIENT_SECRET,
+        client_id: ADMIN_MEDIAWIKI_CLIENT_ID,
+        client_secret: ADMIN_MEDIAWIKI_CLIENT_SECRET,
         redirect_uri: externalUrl(req, ADMIN_OAUTH_CALLBACK_PATH),
       }),
     });
     if (!tokenResponse.access_token) {
-      throw new Error("OIDC token response did not contain an access token.");
+      throw new Error("MediaWiki OAuth token response did not contain an access token.");
     }
-    const profile = await fetchJson(metadata.userinfo_endpoint, {
+    const profile = await fetchJson(mediawikiEndpoint("/w/rest.php/oauth2/resource/profile"), {
       headers: {
         Authorization: `Bearer ${tokenResponse.access_token}`,
       },
     });
-    const normalized = normalizeOidcProfile(profile);
+    const normalized = normalizeMediawikiProfile(profile);
     issueSession(res, normalized);
     redirect(res, sanitizeNextPath(savedState.next, ADMIN_PAGE_PATH));
   } catch (authError) {
@@ -971,18 +945,18 @@ async function handleRequest(req, res) {
     const errorMessage = url.searchParams.get("error");
     const message = errorMessage
       ? `Sign-in failed: <code>${escapeHtml(errorMessage)}</code>`
-      : "This admin surface is protected. Sign in with the configured OpenID Connect provider using an email address from the authorized allowlist.";
+      : "This admin surface is protected. Sign in with your Wikimedia account; your username must be in the authorized allowlist.";
     writeHtml(res, 200, renderLoginPage(req, message, url.searchParams.get("next")));
     return;
   }
 
   if (AUTH_ENABLED && req.method === "GET" && url.pathname === ADMIN_OAUTH_START_PATH) {
-    await startOidcLogin(req, res, url.searchParams.get("next"));
+    await startMediawikiLogin(req, res, url.searchParams.get("next"));
     return;
   }
 
   if (AUTH_ENABLED && req.method === "GET" && url.pathname === ADMIN_OAUTH_CALLBACK_PATH) {
-    await finishOidcLogin(req, res, url);
+    await finishMediawikiLogin(req, res, url);
     return;
   }
 
@@ -1255,8 +1229,8 @@ function startServer() {
     console.log(`Allowed origins: ${Array.from(ALLOWED_ORIGINS).join(", ")}`);
     console.log(`Auth mode: ${ADMIN_AUTH_MODE}`);
     if (AUTH_ENABLED) {
-      console.log(`Authorized admin emails: ${ADMIN_ALLOWED_EMAILS.size}`);
-      console.log(`OIDC issuer: ${ADMIN_OIDC_ISSUER}`);
+      console.log(`Authorized admin usernames: ${ADMIN_ALLOWED_USERNAMES.size}`);
+      console.log(`MediaWiki OAuth host: ${ADMIN_MEDIAWIKI_HOST}`);
     }
   });
   return server;

@@ -2,15 +2,17 @@
 
 const crypto = require("crypto");
 
-function normalizeEmail(value) {
-  return typeof value === "string" ? value.trim().toLowerCase() : "";
+function normalizeUsername(value) {
+  // MediaWiki usernames are case-sensitive past the first character, so
+  // unlike emails this is trim-only, not lowercased.
+  return typeof value === "string" ? value.trim() : "";
 }
 
-function parseAllowedEmails(value) {
+function parseAllowedUsernames(value) {
   const allowed = new Set();
   for (const entry of String(value || "").split(/[\n,;]+/)) {
-    const email = normalizeEmail(entry);
-    if (email) allowed.add(email);
+    const username = normalizeUsername(entry);
+    if (username) allowed.add(username);
   }
   return allowed;
 }
@@ -91,9 +93,9 @@ function buildAuthorizeUrl({
   url.searchParams.set("client_id", clientId);
   url.searchParams.set("redirect_uri", redirectUri);
   url.searchParams.set("response_type", "code");
-  url.searchParams.set("scope", scopes);
+  if (scopes) url.searchParams.set("scope", scopes);
   url.searchParams.set("state", state);
-  url.searchParams.set("nonce", nonce);
+  if (nonce) url.searchParams.set("nonce", nonce);
   return url.toString();
 }
 
@@ -121,8 +123,8 @@ function sanitizeNextPath(value, fallback = "/admin") {
 module.exports = {
   buildAuthorizeUrl,
   escapeHtml,
-  normalizeEmail,
-  parseAllowedEmails,
+  normalizeUsername,
+  parseAllowedUsernames,
   parseCookies,
   randomToken,
   sanitizeNextPath,

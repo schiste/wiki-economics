@@ -41,16 +41,24 @@ treat this as an operator checklist rather than something already executed:
 1. **Request a tool account** and file a Phabricator "Toolforge (Quota
    requests)" ticket for storage, sized off the first wiki's transient peak
    (nlwiki ≈8.71GB; add frwiki's ≈31GB peak later once nlwiki is validated).
-2. **Register an OIDC client** for the admin surface (issuer, client id,
-   secret, redirect URI). Reuse the identity provider Cloud VPS's
-   `WIKI_ECON_ADMIN_OIDC_ISSUER` already points at if it can issue a second
-   redirect URI; otherwise register a new application.
+2. **Register a MediaWiki OAuth2 consumer** on `meta.wikimedia.org` via
+   `Special:OAuthConsumerRegistration/propose`. Use OAuth2, set the callback
+   URL to the exact production URL
+   (`https://<tool-domain>/admin/oauth/callback` — must match exactly, no
+   trailing slash differences), and pick "This consumer is for use only by
+   ‎<your username>" (owner-only) so it's usable immediately without
+   waiting on admin approval. This yields a client ID and, since it's a
+   confidential client, a client secret (no PKCE needed).
 3. **Store secrets**: `toolforge envvars create <NAME> <VALUE>` for
-   `WIKI_ECON_ADMIN_OIDC_CLIENT_ID`, `WIKI_ECON_ADMIN_OIDC_CLIENT_SECRET`,
-   `WIKI_ECON_ADMIN_SESSION_SECRET`, `WIKI_ECON_ADMIN_ALLOWED_EMAILS`,
-   `WIKI_ECON_ADMIN_PUBLIC_ORIGIN`, `WIKI_ECON_ADMIN_OIDC_ISSUER` — same
-   variable names `site/admin-server.cjs` already reads from `process.env`,
-   see `deploy/cloud-vps/env.example` for the full list and expected shape.
+   `WIKI_ECON_ADMIN_MEDIAWIKI_CLIENT_ID`,
+   `WIKI_ECON_ADMIN_MEDIAWIKI_CLIENT_SECRET`,
+   `WIKI_ECON_ADMIN_SESSION_SECRET`, `WIKI_ECON_ADMIN_ALLOWED_USERNAMES`
+   (comma/newline-separated Wikimedia usernames, case-sensitive),
+   `WIKI_ECON_ADMIN_PUBLIC_ORIGIN` — same variable names
+   `site/admin-server.cjs` already reads from `process.env`, see
+   `deploy/cloud-vps/env.example` for the full list and expected shape.
+   `WIKI_ECON_ADMIN_MEDIAWIKI_HOST` defaults to `https://meta.wikimedia.org`
+   and only needs to be set as an envvar if that ever changes.
 4. **Build the image**: `toolforge build start <repo-url>
    --dockerfile deploy/toolforge/Dockerfile` (or `docker build -f
    deploy/toolforge/Dockerfile .` + push to a registry Toolforge can pull

@@ -97,12 +97,13 @@ Start the local dashboard and admin server together:
 scripts/dev.sh
 ```
 
-In local development, the admin API is a loopback-only operator tool. In VPS deployments, the supported hosted admin model is an authenticated OpenID Connect login flow with an env-driven email allowlist. No in-repo user database is used.
+In local development, the admin API is a loopback-only operator tool. In hosted deployments, the supported admin model is an authenticated `meta.wikimedia.org` OAuth 2 login flow with an env-driven username allowlist. No in-repo user database is used.
 
-For hosted deployments, keep the allowlist and OIDC credentials in deployment
-secrets and render them into `/etc/wiki-economics.env`; the recommended secret
-names match the runtime env vars exactly (`WIKI_ECON_ADMIN_ALLOWED_EMAILS`,
-`WIKI_ECON_ADMIN_SESSION_SECRET`, and so on).
+For hosted deployments, keep the allowlist and MediaWiki OAuth2 credentials in
+deployment secrets and render them into `/etc/wiki-economics.env`; the
+recommended secret names match the runtime env vars exactly
+(`WIKI_ECON_ADMIN_ALLOWED_USERNAMES`, `WIKI_ECON_ADMIN_SESSION_SECRET`, and so
+on).
 
 ## Local Verification
 

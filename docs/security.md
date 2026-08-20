@@ -49,11 +49,11 @@ real authentication boundary in front of the operator surface:
 
 - nginx publishes `/admin` and `/admin-api/*` and proxies them to the
   loopback-bound Node server.
-- The Node server requires `WIKI_ECON_ADMIN_AUTH_MODE=oidc` when
+- The Node server requires `WIKI_ECON_ADMIN_AUTH_MODE=mediawiki` when
   `WIKI_ECON_ENV=production`.
-- Logins use an OpenID Connect authorization-code flow.
-- The returned email address must be present in
-  `WIKI_ECON_ADMIN_ALLOWED_EMAILS`.
+- Logins use `meta.wikimedia.org`'s OAuth2 authorization-code flow.
+- The returned username must be present in
+  `WIKI_ECON_ADMIN_ALLOWED_USERNAMES`.
 - Sessions are stored in signed, short-lived cookies with `HttpOnly`,
   `SameSite=Lax`, and `Secure` in production.
 - Mutating routes enforce same-origin checks using `Origin` and
@@ -83,38 +83,42 @@ Recommended practice:
   (SameSite cookies plus origin checks).
 - Command injection via the `wiki` parameter (sanitization + array-form
   `spawn`).
-- Anonymous or unapproved logins in hosted mode (OIDC plus email
-  allowlist).
+- Anonymous or unapproved logins in hosted mode (Wikimedia OAuth 2 plus
+  a username allowlist).
 
 ### What this still does NOT protect against
 
 - A compromised authenticated operator browser session.
 - Misconfigured reverse proxy headers that cause the server to compute
   the wrong public origin for redirects or origin checks.
-- Any identity provider that returns an email claim the project
-  operator should not trust.
+- A Wikimedia account takeover of an allowlisted username (the server
+  trusts `meta.wikimedia.org` as the identity authority).
 
 The hosted model therefore assumes:
 
 - TLS termination is correct.
 - nginx forwards canonical `Host` / `X-Forwarded-*` headers.
 - the configured `WIKI_ECON_ADMIN_PUBLIC_ORIGIN` is correct when set.
-- the chosen OIDC provider is one whose email claims you trust for
-  operator identity.
+- `meta.wikimedia.org` is the trusted authority for the usernames in
+  `WIKI_ECON_ADMIN_ALLOWED_USERNAMES`.
 
-## Why this is not Wikimedia OAuth today
+## Wikimedia OAuth today
 
-The current hosted implementation uses generic OpenID Connect because
-the requirement is an **email allowlist** sourced from deployment
-secrets. That does not map cleanly to a Wikimedia-native login model:
+The hosted implementation authenticates operators through the classic
+MediaWiki `Extension:OAuth` 2.0 flow on `meta.wikimedia.org`
+(`Special:OAuthConsumerRegistration`), not generic OpenID Connect:
 
-- Wikimedia OAuth is a strong fit when you want username- or
-  user-group-based authorization.
-- It is not the right fit for a pure email-allowlist design.
-
-If the project later wants Wikimedia-native operator auth, the natural
-next step is a separate Wikimedia OAuth 2.0 mode that authorizes by
-username or MediaWiki group rather than by email.
+- `meta.wikimedia.org` has no OIDC discovery document, so the client
+  talks to its fixed OAuth2 endpoints directly
+  (`/w/rest.php/oauth2/authorize`, `/w/rest.php/oauth2/access_token`,
+  `/w/rest.php/oauth2/resource/profile`) rather than via
+  `.well-known/openid-configuration`.
+- Authorization is by **username**, not email: MediaWiki's OAuth2
+  profile endpoint always returns a stable `username`, but only
+  returns `email` when the user separately grants that consent, so
+  email cannot be relied on as an allowlist key.
+- The registered consumer is a confidential OAuth2 client (has a
+  client secret), so the flow does not need PKCE.
 
 ## Fetch surface
 

@@ -5,7 +5,7 @@
 #
 # Replace <TOOL_IMAGE> with the image built from deploy/toolforge/Dockerfile
 # (`toolforge build` or `docker build` + registry push — see README.md).
-# Secrets referenced below (WIKI_ECON_ADMIN_OIDC_*, etc.) must already exist
+# Secrets referenced below (WIKI_ECON_ADMIN_MEDIAWIKI_*, etc.) must already exist
 # via `toolforge envvars create` before loading this file; Toolforge injects
 # them into the job's environment automatically.
 #
@@ -25,7 +25,7 @@ jobs:
     port: 8000
     envvars:
       WIKI_ECON_ADMIN_ENABLED: "1"
-      WIKI_ECON_ADMIN_AUTH_MODE: oidc
+      WIKI_ECON_ADMIN_AUTH_MODE: mediawiki
       WIKI_ECON_ADMIN_BIND_HOST: 0.0.0.0
       WIKI_ECON_ADMIN_PORT: "8000"
       WIKI_ECON_DATA_DIR: /data/project/wiki-economics/data

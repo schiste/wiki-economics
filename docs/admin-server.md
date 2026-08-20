@@ -24,10 +24,10 @@ The runtime is controlled by `WIKI_ECON_ADMIN_AUTH_MODE`:
 
 - `none`
   Use for local development. No login flow is required.
-- `oidc`
-  Use for hosted deployments. The admin page and API require an OpenID Connect
-  login, and the resulting email address must be present in
-  `WIKI_ECON_ADMIN_ALLOWED_EMAILS`.
+- `mediawiki`
+  Use for hosted deployments. The admin page and API require a Wikimedia
+  account login via `meta.wikimedia.org`'s OAuth 2 flow, and the resulting
+  username must be present in `WIKI_ECON_ADMIN_ALLOWED_USERNAMES`.
 
 If `WIKI_ECON_ENV=production` and `WIKI_ECON_ADMIN_ENABLED=1`, the server
 refuses to start with `WIKI_ECON_ADMIN_AUTH_MODE=none`.
@@ -46,16 +46,14 @@ refuses to start with `WIKI_ECON_ADMIN_AUTH_MODE=none`.
 | `WIKI_ECON_GENERATOR_DIR` | `site/data-build/` | Where merge looks for dashboard JSON generators. |
 | `WIKI_ECON_SITE_DIST_DIR` | `site/dist/` | Where the built `admin.html` is read from when serving `/admin`. |
 | `WIKI_ECON_ALLOWED_ORIGINS` | local preview origins | Extra origin allowlist entries for CORS / CSRF checks. In hosted mode the request's own public origin is also accepted. |
-| `WIKI_ECON_ADMIN_AUTH_MODE` | `none` | `none` for local dev, `oidc` for hosted admin. |
-| `WIKI_ECON_ADMIN_ALLOWED_EMAILS` | empty | Comma/newline-separated allowlist of authorized operator email addresses. |
+| `WIKI_ECON_ADMIN_AUTH_MODE` | `none` | `none` for local dev, `mediawiki` for hosted admin. |
+| `WIKI_ECON_ADMIN_ALLOWED_USERNAMES` | empty | Comma/newline-separated allowlist of authorized operator Wikimedia usernames (case-sensitive). |
 | `WIKI_ECON_ADMIN_SESSION_SECRET` | empty | HMAC secret used to sign the short-lived session and OAuth-state cookies. Use 32+ random bytes. |
 | `WIKI_ECON_ADMIN_SESSION_TTL_SECS` | `28800` | Session lifetime in seconds. |
 | `WIKI_ECON_ADMIN_SECURE_COOKIES` | `1` in production | Adds the `Secure` flag to auth cookies. |
-| `WIKI_ECON_ADMIN_OIDC_ISSUER` | empty | OIDC issuer URL used for discovery. |
-| `WIKI_ECON_ADMIN_OIDC_CLIENT_ID` | empty | OIDC client ID. |
-| `WIKI_ECON_ADMIN_OIDC_CLIENT_SECRET` | empty | OIDC client secret. |
-| `WIKI_ECON_ADMIN_OIDC_SCOPES` | `openid email profile` | Scopes requested during login. |
-| `WIKI_ECON_ADMIN_REQUIRE_VERIFIED_EMAIL` | `1` | Rejects identities where `email_verified` is explicitly false. |
+| `WIKI_ECON_ADMIN_MEDIAWIKI_HOST` | `https://meta.wikimedia.org` | Base URL of the MediaWiki OAuth2 host. |
+| `WIKI_ECON_ADMIN_MEDIAWIKI_CLIENT_ID` | empty | OAuth2 consumer client ID, from `Special:OAuthConsumerRegistration`. |
+| `WIKI_ECON_ADMIN_MEDIAWIKI_CLIENT_SECRET` | empty | OAuth2 consumer client secret. |
 | `WIKI_ECON_ADMIN_PUBLIC_ORIGIN` | unset | Optional canonical external origin. If unset, the server derives it from `X-Forwarded-*` headers. |
 
 ## Routes
@@ -66,8 +64,8 @@ refuses to start with `WIKI_ECON_ADMIN_AUTH_MODE=none`.
 | --- | --- | --- |
 | `GET` | `/admin` | Serve the built admin page after authentication. |
 | `GET` | `/admin/login` | Render the hosted login page. |
-| `GET` | `/admin/oauth/start` | Begin the OIDC authorization-code flow. |
-| `GET` | `/admin/oauth/callback` | Finish the OIDC flow, validate email, issue a signed session cookie. |
+| `GET` | `/admin/oauth/start` | Begin the MediaWiki OAuth2 authorization-code flow. |
+| `GET` | `/admin/oauth/callback` | Finish the OAuth2 flow, validate username, issue a signed session cookie. |
 | `GET`/`POST` | `/admin/logout` | Clear the admin session cookie. |
 
 ### API routes
@@ -98,31 +96,31 @@ A new POST while a job is running returns `409 Conflict`; jobs are not queued.
 
 The hosted mode intentionally avoids project-local user management:
 
-- your identity provider authenticates the operator
-- the repo only checks whether the returned email address is in
-  `WIKI_ECON_ADMIN_ALLOWED_EMAILS`
+- Wikimedia (via `meta.wikimedia.org`'s OAuth2 flow) authenticates the operator
+- the repo only checks whether the returned username is in
+  `WIKI_ECON_ADMIN_ALLOWED_USERNAMES`
 - the allowlist is expected to come from deployment secrets, not git
 
-The current intended pattern is to keep the allowlist and OIDC credentials in
-deployment secrets (for example GitHub Actions secrets) and render them into
-`/etc/wiki-economics.env` on the VPS.
+The current intended pattern is to keep the allowlist and OAuth2 credentials
+in deployment secrets (for example GitHub Actions secrets, or
+`toolforge envvars create` on Toolforge) and render/inject them into the
+runtime environment rather than committing them.
 
 Recommended secret names:
 
-- `WIKI_ECON_ADMIN_ALLOWED_EMAILS`
+- `WIKI_ECON_ADMIN_ALLOWED_USERNAMES`
 - `WIKI_ECON_ADMIN_SESSION_SECRET`
-- `WIKI_ECON_ADMIN_OIDC_ISSUER`
-- `WIKI_ECON_ADMIN_OIDC_CLIENT_ID`
-- `WIKI_ECON_ADMIN_OIDC_CLIENT_SECRET`
+- `WIKI_ECON_ADMIN_MEDIAWIKI_CLIENT_ID`
+- `WIKI_ECON_ADMIN_MEDIAWIKI_CLIENT_SECRET`
 - `WIKI_ECON_ADMIN_PUBLIC_ORIGIN`
 
 The repository ships `deploy/cloud-vps/render-env.sh` so a deployment job can
 forward those values directly and atomically rewrite the VPS env file without
-hand-editing operator email addresses on disk.
+hand-editing the operator allowlist on disk.
 
 ## CSRF and session handling
 
-- OIDC state is stored in a signed short-lived cookie.
+- OAuth2 state is stored in a signed short-lived cookie.
 - Successful logins issue a signed session cookie with `HttpOnly` and
   `SameSite=Lax`; production deployments also set `Secure`.
 - Mutating API routes perform same-origin checks using `Origin` and `Referer`
