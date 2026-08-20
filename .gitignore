@@ -3,6 +3,7 @@
 /.claude/
 /data/
 /output/
+/node_modules/
 /site/dist/
 /site/node_modules/
 /site/src/.observablehq/

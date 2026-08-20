@@ -3,12 +3,16 @@
   "private": true,
   "license": "(MIT OR Apache-2.0)",
   "scripts": {
-    "build": "cargo build --release",
+    "rust-build": "cargo build --release",
     "build:site": "scripts/build-site.sh",
     "ci:local": "./scripts/ci-local.sh",
     "refresh": "scripts/refresh.sh",
     "setup": "scripts/setup.sh",
     "dev": "scripts/dev.sh",
     "start": "scripts/dev.sh"
+  },
+  "dependencies": {
+    "@observablehq/framework": "^1.13.4",
+    "duckdb": "^1.4.4"
   }
 }

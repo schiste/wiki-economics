@@ -3,8 +3,10 @@
 # Load with:
 #   toolforge jobs load deploy/toolforge/jobs.yaml
 #
-# Replace <TOOL_IMAGE> with the image built from deploy/toolforge/Dockerfile
-# (`toolforge build` or `docker build` + registry push — see README.md).
+# Replace <TOOL_IMAGE> with a short image name from `toolforge jobs images`
+# after `toolforge build start <repo-url>` finishes (Toolforge's Build
+# Service — Cloud Native Buildpacks, detected from root Cargo.toml +
+# package.json + Procfile; no Dockerfile involved — see README.md).
 # Secrets referenced below (WIKI_ECON_ADMIN_MEDIAWIKI_*, etc.) must already exist
 # via `toolforge envvars create` before loading this file; Toolforge injects
 # them into the job's environment automatically.

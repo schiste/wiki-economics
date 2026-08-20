@@ -17,12 +17,34 @@ Toolforge entirely.
 
 ## Files
 
-- `Dockerfile` — multi-stage build: Rust CLI, Node admin server + site
-  build tooling (the `site/data-build/*.cjs` generators query Parquet
-  through the `duckdb` npm package's Node bindings, so no separate DuckDB
-  CLI is installed). No Python — `src/patrol.rs` implements fetch/compute
-  patrol natively; the Python scripts under `scripts/` are only used by
-  `scripts/ci-local.sh`, not the production refresh path.
+- No Dockerfile: Toolforge's Build Service only supports Cloud Native
+  Buildpacks (`toolforge build start` does not accept a Dockerfile, and
+  there's no documented path to reference a custom-built Docker image from
+  `toolforge jobs`/`toolforge webservice`). The image is instead built by
+  buildpack auto-detection from three files at the **repo root**:
+  `Cargo.toml` (Rust CLI, detected by the Rust buildpack), `package.json` +
+  `package-lock.json` (Node — `@observablehq/framework` and `duckdb`,
+  needed by `scripts/build-site.sh` and the `site/data-build/*.cjs`
+  generators; the `site/data-build/*.cjs` generators query Parquet through
+  the `duckdb` npm package's Node bindings, so no separate DuckDB CLI is
+  needed), and `Procfile` (`web: node site/admin-server.cjs`, which
+  `admin-server.cjs` itself needs zero npm dependencies to run — it only
+  uses Node built-ins + local `./admin-auth.cjs`). No Python — `src/patrol.rs`
+  implements fetch/compute patrol natively; the Python scripts under
+  `scripts/` are only used by `scripts/ci-local.sh`, not the production
+  refresh path.
+
+  **This combination is the open, untested question this deployment path
+  answers.** Toolforge documents "Node + one other language" as a general,
+  supported Build Service feature (the builder auto-injects the `nodejs`
+  buildpack ahead of the primary-language buildpack — this isn't something
+  configured via a `project.toml`), and Rust is a separately documented
+  Toolforge buildpack. Whether the two combine cleanly in one image has not
+  been verified end-to-end against a real Toolforge build — step 4 below is
+  the actual test. If it fails, the fallback is splitting into two images
+  (a Rust-only image for the CLI/refresh job, a Node-only image for the
+  admin webservice, coordinating through the shared NFS data/output dirs)
+  rather than reintroducing a Dockerfile, which Toolforge cannot consume.
 - `jobs.yaml` — Toolforge Jobs definitions: `wiki-econ-admin` (continuous,
   serves `/admin*` and the built static site on one process/port — Toolforge
   has no per-tool nginx layer) and `wiki-econ-refresh` (scheduled, runs the
@@ -61,13 +83,22 @@ treat this as an operator checklist rather than something already executed:
    `deploy/cloud-vps/env.example` for the full list and expected shape.
    `WIKI_ECON_ADMIN_MEDIAWIKI_HOST` defaults to `https://meta.wikimedia.org`
    and only needs to be set as an envvar if that ever changes.
-4. **Build the image**: `toolforge build start <repo-url>
-   --dockerfile deploy/toolforge/Dockerfile` (or `docker build -f
-   deploy/toolforge/Dockerfile .` + push to a registry Toolforge can pull
-   from). Confirm the actual `toolforge build` invocation against current
-   Toolforge docs — the CLI surface changes over time.
-5. **Fill in `jobs.yaml`**: replace `<TOOL_IMAGE>` and `<TOOL_NAME>`
-   placeholders, then `toolforge jobs load deploy/toolforge/jobs.yaml`.
+4. **Build the image**: `toolforge build start <repo-url>` (buildpack
+   auto-detection from the repo root's `Cargo.toml` + `package.json` +
+   `Procfile` — see "Files" above for why this combination is unverified).
+   Watch the build logs closely: confirm both a Rust buildpack step and a
+   Node buildpack step run, and that the final image actually contains a
+   working `wiki-econ` binary on `PATH` alongside a Node runtime. If the
+   build fails to combine the two runtimes, fall back to splitting into
+   two separate buildpack-built images (Rust-only for the CLI/refresh job,
+   Node-only for the admin webservice) rather than reaching for a
+   Dockerfile, which Toolforge's Build Service cannot consume. Confirm the
+   actual `toolforge build start` invocation against current Toolforge
+   docs — the CLI surface changes over time.
+5. **Fill in `jobs.yaml`**: run `toolforge jobs images` to get the short
+   image name the build produced, replace the `<TOOL_IMAGE>` placeholders
+   in `jobs.yaml` with it, then `toolforge jobs load
+   deploy/toolforge/jobs.yaml`.
 6. **Start the admin webservice** (`wiki-econ-admin`) and confirm `/admin`
    and a static site asset both resolve on the assigned Toolforge domain.
 7. **Trigger `wiki-econ-refresh` once manually** (`toolforge jobs run
@@ -114,7 +145,11 @@ before assuming NFS quota is still the only lever.
 
 ## Open risks worth re-checking before relying on this
 
-- **Non-root UID**: the Dockerfile doesn't pin a specific UID/GID —
+- **Rust + Node in one buildpack image**: see "Files" above — this is the
+  single biggest open question and step 4 of the runbook is the actual
+  test. No Dockerfile fallback exists on this platform; the fallback if
+  buildpacks can't combine both runtimes is two separate images.
+- **Non-root UID**: buildpack-built images don't pin a specific UID/GID —
   Toolforge assigns this at the Kubernetes level. If file permissions on
   mounted NFS paths misbehave, this is the first place to look.
 - **Toolforge Jobs YAML schema**: `jobs.yaml` here is written from current
