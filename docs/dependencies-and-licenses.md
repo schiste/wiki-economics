@@ -52,7 +52,7 @@ That gives the project a deliberately permissive software-license posture.
 | Polars | Dataframe engine for ingest and compute | `MIT` |
 | vendored `polars-utils` patch | In-tree patch carried under `vendor/polars-utils` | `MIT` |
 | Observable Framework | Dashboard build/runtime framework | `ISC` |
-| `duckdb` npm package | Browser-side and build-time query support | `MIT` |
+| `duckdb` npm package | Browser-side, Node-binding build-time, and merge-time (Rust-invoked) query support | `MIT` |
 
 ## Direct Rust Dependencies
 
@@ -96,12 +96,12 @@ The dashboard has a very small direct JavaScript dependency surface.
 | Package | Version spec | Role | License |
 |---------|--------------|------|---------|
 | `@observablehq/framework` | `^1.13.4` | site generation and client framework | `ISC` |
-| `duckdb` | `^1.4.4` | build-time and browser query engine | `MIT` |
+| `duckdb` | `^1.4.4` | build-time, browser, and merge-time query engine | `MIT` |
 
-DuckDB is also required locally as a CLI for the checked-in
-`site/data-build/*.json.sh` generators. The repository does not vendor the
-DuckDB CLI binary itself; users install it separately through their platform
-package manager.
+The checked-in `site/data-build/*.cjs` generators (invoked both by
+`site/admin-server.cjs` and by the Rust merge pipeline in `src/merge.rs`) use
+this same npm package's Node bindings rather than a separately installed
+DuckDB CLI, so no DuckDB CLI binary needs to be installed on the host.
 
 ## Python Sidecar
 
@@ -122,7 +122,6 @@ than tracked in-repo libraries:
 - Rust stable plus `rustfmt` and `clippy`
 - Python 3
 - Node.js and npm
-- DuckDB CLI
 
 Treat their licenses as upstream toolchain concerns rather than part of the
 repository's own vendored dependency inventory.

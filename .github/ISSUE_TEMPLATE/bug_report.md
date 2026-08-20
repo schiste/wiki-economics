@@ -25,7 +25,6 @@ labels: bug
 - OS: <!-- e.g. macOS 14.5, Ubuntu 24.04 -->
 - Rust: `rustc --version`
 - Node: `node --version`
-- DuckDB CLI: `duckdb --version`
 - Repo commit: `git rev-parse HEAD`
 
 ## Logs / artifacts

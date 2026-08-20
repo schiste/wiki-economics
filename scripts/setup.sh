@@ -157,13 +157,6 @@ install_missing_system_packages() {
     esac
   fi
 
-  if ! have duckdb; then
-    case "$manager" in
-      brew) packages+=("duckdb") ;;
-      apt-get) packages+=("duckdb") ;;
-    esac
-  fi
-
   if [ "${#packages[@]}" -eq 0 ]; then
     celebrate "System packages already look complete."
     return
@@ -360,10 +353,6 @@ main() {
     "Install Node.js 20+ from https://nodejs.org/ or your package manager."
   ensure_command npm "npm" \
     "npm typically ships with Node.js; reinstall Node.js if missing."
-  # Stock Debian/Ubuntu repos do not provide a duckdb package, so the apt-get
-  # path silently no-ops on Linux. Point users at the upstream installer.
-  ensure_command duckdb "DuckDB CLI" \
-    "Install from https://duckdb.org/docs/installation/ (brew install duckdb on macOS)."
 
   if [ "$SKIP_QUALITY_TOOLS" -eq 0 ]; then
     say "Installing contributor quality tools."

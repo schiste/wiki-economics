@@ -4,15 +4,6 @@ A short list of the failure modes a stranger to the repo is most likely
 to hit on a clean machine. If you encounter something not listed here,
 please open an issue with the relevant log lines.
 
-## "DuckDB CLI is still missing" after `./scripts/setup.sh`
-
-`scripts/setup.sh` checks for the `duckdb` binary and prints an
-actionable install URL when missing. On stock Debian/Ubuntu there is no
-`duckdb` package in the default repositories, so the apt-based install
-path silently no-ops. Install from
-<https://duckdb.org/docs/installation/> (or `brew install duckdb` on
-macOS), then rerun `./scripts/setup.sh`.
-
 ## The dashboard renders with no data after first install
 
 `scripts/setup.sh` deliberately skips the Observable build when

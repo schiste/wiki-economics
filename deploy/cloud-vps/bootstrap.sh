@@ -15,9 +15,6 @@ fi
 
 apt-get update
 apt-get install -y git curl ca-certificates build-essential python3 python3-venv nodejs npm nginx
-if ! apt-get install -y duckdb; then
-  echo "Warning: failed to install duckdb from apt. Install a DuckDB CLI package manually before running refresh jobs." >&2
-fi
 
 if ! id "$SERVICE_USER" >/dev/null 2>&1; then
   useradd --system --create-home --home-dir "$BASE_DIR" --shell /bin/bash "$SERVICE_USER"

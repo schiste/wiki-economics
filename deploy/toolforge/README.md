@@ -18,9 +18,11 @@ Toolforge entirely.
 ## Files
 
 - `Dockerfile` — multi-stage build: Rust CLI, Node admin server + site
-  build tooling, pinned DuckDB CLI. No Python — `src/patrol.rs` implements
-  fetch/compute patrol natively; the Python scripts under `scripts/` are
-  only used by `scripts/ci-local.sh`, not the production refresh path.
+  build tooling (the `site/data-build/*.cjs` generators query Parquet
+  through the `duckdb` npm package's Node bindings, so no separate DuckDB
+  CLI is installed). No Python — `src/patrol.rs` implements fetch/compute
+  patrol natively; the Python scripts under `scripts/` are only used by
+  `scripts/ci-local.sh`, not the production refresh path.
 - `jobs.yaml` — Toolforge Jobs definitions: `wiki-econ-admin` (continuous,
   serves `/admin*` and the built static site on one process/port — Toolforge
   has no per-tool nginx layer) and `wiki-econ-refresh` (scheduled, runs the

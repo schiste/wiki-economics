@@ -16,6 +16,9 @@ node --check site/admin-server.cjs
 echo "==> node --check site/observablehq.config.js"
 node --check site/observablehq.config.js
 
+echo "==> node --check site/data-build/*.cjs site/data-build/lib/*.cjs"
+for f in site/data-build/*.cjs site/data-build/lib/*.cjs; do node --check "$f"; done
+
 echo "==> node --test site/admin-auth.test.cjs"
 node --test site/admin-auth.test.cjs
 

@@ -54,7 +54,6 @@ Prerequisites:
 - Rust stable with `rustfmt` and `clippy`
 - Python 3
 - Node.js and npm
-- DuckDB CLI for dashboard artifact generation
 
 This repository does not bundle Wikimedia datasets or precomputed dashboard outputs. A clean clone starts with no `data/` or `output/` tree; fetch and compute those locally.
 
@@ -120,6 +119,7 @@ bash -n scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh
 node --check site/admin-auth.cjs
 node --check site/admin-server.cjs
 node --check site/observablehq.config.js
+for f in site/data-build/*.cjs site/data-build/lib/*.cjs; do node --check "$f"; done
 node --test site/admin-auth.test.cjs
 node --test site/admin-server.test.cjs
 ./scripts/build-site.sh --help

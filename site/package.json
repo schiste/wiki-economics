@@ -8,9 +8,7 @@
     "build": "observable build"
   },
   "dependencies": {
-    "@observablehq/framework": "^1.13.4"
-  },
-  "devDependencies": {
+    "@observablehq/framework": "^1.13.4",
     "duckdb": "^1.4.4"
   }
 }

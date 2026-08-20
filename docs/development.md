@@ -25,6 +25,7 @@ bash -n scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh
 node --check site/admin-auth.cjs
 node --check site/admin-server.cjs
 node --check site/observablehq.config.js
+for f in site/data-build/*.cjs site/data-build/lib/*.cjs; do node --check "$f"; done
 node --test site/admin-auth.test.cjs
 node --test site/admin-server.test.cjs
 cargo fmt --all -- --check
