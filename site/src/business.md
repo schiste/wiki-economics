@@ -19,7 +19,7 @@ const {wikis, nsByWiki, rangeByWiki, defaultWiki, maxMonth} = parseDefaultsMeta(
 ```
 
 ```js
-const _preload = setTimeout(() => import("observablehq:stdlib/duckdb"), 1)
+const _preload = setTimeout(() => import("npm:@observablehq/duckdb"), 1)
 ```
 
 ```js
@@ -42,7 +42,7 @@ const _bizFiles = {
 let _bizDb = null
 async function getDb() {
   if (!_bizDb) {
-    const {DuckDBClient: DDB} = await import("observablehq:stdlib/duckdb")
+    const {DuckDBClient: DDB} = await import("npm:@observablehq/duckdb")
     _bizDb = await DDB.of(_bizFiles)
   }
   return _bizDb

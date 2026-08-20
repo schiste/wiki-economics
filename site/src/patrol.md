@@ -25,7 +25,7 @@ const {wikis, nsByWiki, rangeByWiki, defaultWiki, maxMonth} = parseDefaultsMeta(
 ```
 
 ```js
-const _preload = setTimeout(() => import("observablehq:stdlib/duckdb"), 1)
+const _preload = setTimeout(() => import("npm:@observablehq/duckdb"), 1)
 ```
 
 ```js
@@ -43,7 +43,7 @@ let data
 if (useDefaults) {
   data = defaults.patrol
 } else {
-  const {DuckDBClient: DDB} = await import("observablehq:stdlib/duckdb")
+  const {DuckDBClient: DDB} = await import("npm:@observablehq/duckdb")
   const db = await DDB.of({
     patrol: FileAttachment("data/patrol.parquet"),
   })

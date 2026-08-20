@@ -22,7 +22,7 @@ const {wikis, nsByWiki, rangeByWiki, defaultWiki, maxMonth} = parseDefaultsMeta(
 ```
 
 ```js
-const _preload = setTimeout(() => import("observablehq:stdlib/duckdb"), 1)
+const _preload = setTimeout(() => import("npm:@observablehq/duckdb"), 1)
 ```
 
 ```js
@@ -44,7 +44,7 @@ if (useDefaults) {
   workforce = defaults.workforce
   churnData = defaults.churn
 } else {
-  const {DuckDBClient: DDB} = await import("observablehq:stdlib/duckdb")
+  const {DuckDBClient: DDB} = await import("npm:@observablehq/duckdb")
   const db = await DDB.of({
     labor: FileAttachment("data/labor_monthly.parquet"),
     cohorts: FileAttachment("data/labor_cohorts.parquet"),
@@ -148,7 +148,7 @@ let typeAgg
 if (useDefaults) {
   typeAgg = defaults.byType
 } else {
-  const {DuckDBClient: DDB} = await import("observablehq:stdlib/duckdb")
+  const {DuckDBClient: DDB} = await import("npm:@observablehq/duckdb")
   const db = await DDB.of({labor: FileAttachment("data/labor_monthly.parquet")})
   const laborRaw = await db.sql`SELECT year_month, user_type, page_namespace, unique_editors FROM labor WHERE wiki = ${wiki}`
   const byType = Array.from(laborRaw)
@@ -248,7 +248,7 @@ let cohortData
 if (useDefaults) {
   cohortData = defaults.cohorts
 } else {
-  const {DuckDBClient: DDB} = await import("observablehq:stdlib/duckdb")
+  const {DuckDBClient: DDB} = await import("npm:@observablehq/duckdb")
   const db = await DDB.of({cohorts: FileAttachment("data/labor_cohorts.parquet")})
   cohortData = Array.from(await db.sql`SELECT * FROM cohorts WHERE wiki = ${wiki} ORDER BY cohort_year, year`)
 }

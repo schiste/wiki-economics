@@ -19,7 +19,7 @@ const {wikis, nsByWiki, rangeByWiki, defaultWiki, maxMonth} = parseDefaultsMeta(
 ```
 
 ```js
-const _preload = setTimeout(() => import("observablehq:stdlib/duckdb"), 1)
+const _preload = setTimeout(() => import("npm:@observablehq/duckdb"), 1)
 ```
 
 <!-- ── Filters ────────────────────────────────────────────────── -->
@@ -46,7 +46,7 @@ if (useDefaults) {
   output = defaults.output
   byType = defaults.byType
 } else {
-  const {DuckDBClient: DDB} = await import("observablehq:stdlib/duckdb")
+  const {DuckDBClient: DDB} = await import("npm:@observablehq/duckdb")
   const db = await DDB.of({
     gdp: FileAttachment("data/gdp.parquet"),
     typeShare: FileAttachment("data/gdp_user_type_share.parquet"),
@@ -265,7 +265,7 @@ let tiersAgg
 if (useDefaults) {
   tiersAgg = defaults.tiers.map(d => ({...d, activity_tier: d.activity_tier, editors: d.editors, total_edits: d.total_edits, gross_bytes: d.gross_bytes, net_bytes: d.net_bytes}))
 } else {
-  const {DuckDBClient: DDB} = await import("observablehq:stdlib/duckdb")
+  const {DuckDBClient: DDB} = await import("npm:@observablehq/duckdb")
   const db = await DDB.of({tiers: FileAttachment("data/gdp_activity_tiers.parquet")})
   const tiersRaw = Array.from(await db.sql`SELECT * FROM tiers WHERE wiki = ${wiki}`)
   const tiersFiltered = tiersRaw
@@ -368,7 +368,7 @@ if (useDefaults) {
     })
     .sort((a, b) => d3.ascending(a.period, b.period))
 } else {
-  const {DuckDBClient: DDB} = await import("observablehq:stdlib/duckdb")
+  const {DuckDBClient: DDB} = await import("npm:@observablehq/duckdb")
   const db = await DDB.of({typeShare: FileAttachment("data/gdp_user_type_share.parquet")})
   const shareRaw = await db.sql`SELECT * FROM typeShare WHERE wiki = ${wiki}`
   const shareData = Array.from(shareRaw)
@@ -427,7 +427,7 @@ if (useDefaults) {
     edits: d.edits, gross_bytes: d.gross_bytes, net_bytes: d.net_bytes
   }))
 } else {
-  const {DuckDBClient: DDB} = await import("observablehq:stdlib/duckdb")
+  const {DuckDBClient: DDB} = await import("npm:@observablehq/duckdb")
   const db = await DDB.of({gdp: FileAttachment("data/gdp.parquet")})
   const gdpRaw = await db.sql`SELECT year_month, page_namespace, user_type, gross_bytes_added, net_bytes, total_edits FROM gdp WHERE wiki = ${wiki}`
   const sectorRows = Array.from(gdpRaw)

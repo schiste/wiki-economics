@@ -17,7 +17,7 @@ const {wikis, rangeByWiki, defaultWiki, maxMonth} = parseDefaultsMeta(defaults)
 ```
 
 ```js
-const _preload = setTimeout(() => import("observablehq:stdlib/duckdb"), 1)
+const _preload = setTimeout(() => import("npm:@observablehq/duckdb"), 1)
 ```
 
 <!-- ── Sticky filter bar ─────────────────────────────────── -->
@@ -39,7 +39,7 @@ let ineqData
 if (useDefaults) {
   ineqData = defaults.data
 } else {
-  const {DuckDBClient: DDB} = await import("observablehq:stdlib/duckdb")
+  const {DuckDBClient: DDB} = await import("npm:@observablehq/duckdb")
   const db = await DDB.of({inequality: FileAttachment("data/inequality.parquet")})
   ineqData = await queryGrouped(db, "inequality", {
     sumCols: ["total_editors", "total_edits", "min_editors_50pct"],
