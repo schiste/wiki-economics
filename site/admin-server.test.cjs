@@ -76,6 +76,7 @@ async function startServer(t, envOverrides) {
   return {
     module,
     host: "127.0.0.1:3443",
+    distDir: path.join(tempRoot, "dist"),
   };
 }
 
@@ -258,4 +259,48 @@ test("hosted mode enforces same-origin checks on mutating admin API requests", a
   });
   assert.equal(accepted.statusCode, 409);
   assert.equal(JSON.parse(accepted.text()).error, "No job is currently running");
+});
+
+test("static fallback serves site assets from SITE_DIST_DIR with per-path cache-control", async (t) => {
+  const { module, host, distDir } = await startServer(t, LOCAL_ENV);
+  fs.writeFileSync(path.join(distDir, "index.html"), "<!doctype html><h1>Home</h1>", "utf8");
+  fs.mkdirSync(path.join(distDir, "gdp"), { recursive: true });
+  fs.writeFileSync(path.join(distDir, "gdp.html"), "<!doctype html><h1>GDP</h1>", "utf8");
+  fs.mkdirSync(path.join(distDir, "_observablehq"), { recursive: true });
+  fs.writeFileSync(path.join(distDir, "_observablehq", "client.js"), "console.log('ok')", "utf8");
+  fs.mkdirSync(path.join(distDir, "_file"), { recursive: true });
+  fs.writeFileSync(path.join(distDir, "_file", "data.csv"), "a,b\n1,2\n", "utf8");
+
+  const index = await invoke(module, { url: "/", headers: { host } });
+  assert.equal(index.statusCode, 200);
+  assert.match(index.text(), /Home/);
+  assert.equal(index.getHeader("cache-control"), undefined);
+
+  // $uri.html fallback, mirroring nginx's try_files $uri $uri.html $uri/ =404
+  const extensionless = await invoke(module, { url: "/gdp", headers: { host } });
+  assert.equal(extensionless.statusCode, 200);
+  assert.match(extensionless.text(), /GDP/);
+
+  const observablehq = await invoke(module, { url: "/_observablehq/client.js", headers: { host } });
+  assert.equal(observablehq.statusCode, 200);
+  assert.equal(observablehq.getHeader("content-type"), "text/javascript; charset=utf-8");
+  assert.equal(observablehq.getHeader("cache-control"), "public, max-age=3600");
+
+  const file = await invoke(module, { url: "/_file/data.csv", headers: { host } });
+  assert.equal(file.statusCode, 200);
+  assert.equal(file.getHeader("cache-control"), "public, max-age=600");
+
+  const missing = await invoke(module, { url: "/does-not-exist", headers: { host } });
+  assert.equal(missing.statusCode, 404);
+});
+
+test("static fallback refuses to escape SITE_DIST_DIR via path traversal", async (t) => {
+  const { module, host, distDir } = await startServer(t, LOCAL_ENV);
+  fs.writeFileSync(path.join(path.dirname(distDir), "secret.txt"), "top secret", "utf8");
+
+  const response = await invoke(module, {
+    url: "/..%2Fsecret.txt",
+    headers: { host },
+  });
+  assert.equal(response.statusCode, 404);
 });

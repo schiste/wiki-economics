@@ -1,0 +1,45 @@
+# Toolforge Jobs definitions for wiki-economics.
+#
+# Load with:
+#   toolforge jobs load deploy/toolforge/jobs.yaml
+#
+# Replace <TOOL_IMAGE> with the image built from deploy/toolforge/Dockerfile
+# (`toolforge build` or `docker build` + registry push — see README.md).
+# Secrets referenced below (WIKI_ECON_ADMIN_OIDC_*, etc.) must already exist
+# via `toolforge envvars create` before loading this file; Toolforge injects
+# them into the job's environment automatically.
+#
+# Confirm the actual continuous-job vs. webservice split against current
+# Toolforge Jobs framework docs before first deploy — this file assumes the
+# admin server runs as a `continuous` job fronted by Toolforge's own
+# ingress, matching the single-process-on-$PORT webservice model described
+# in deploy/toolforge/README.md.
+
+jobs:
+  - name: wiki-econ-admin
+    image: <TOOL_IMAGE>
+    command: node site/admin-server.cjs
+    continuous: true
+    memory: 1Gi
+    cpu: "0.5"
+    port: 8000
+    envvars:
+      WIKI_ECON_ADMIN_ENABLED: "1"
+      WIKI_ECON_ADMIN_AUTH_MODE: oidc
+      WIKI_ECON_ADMIN_BIND_HOST: 0.0.0.0
+      WIKI_ECON_ADMIN_PORT: "8000"
+      WIKI_ECON_DATA_DIR: /data/project/<TOOL_NAME>/wiki-economics/data
+      WIKI_ECON_OUTPUT_DIR: /data/project/<TOOL_NAME>/wiki-economics/output
+      WIKI_ECON_SITE_DIST_DIR: /data/project/<TOOL_NAME>/wiki-economics/site-dist
+
+  - name: wiki-econ-refresh
+    image: <TOOL_IMAGE>
+    command: deploy/toolforge/run-refresh.sh
+    schedule: "0 3 * * 0" # weekly; tighten only after measuring real run time
+    memory: 4Gi
+    cpu: "1"
+    envvars:
+      WIKI_ECON_DATA_DIR: /data/project/<TOOL_NAME>/wiki-economics/data
+      WIKI_ECON_OUTPUT_DIR: /data/project/<TOOL_NAME>/wiki-economics/output
+      WIKI_ECON_SITE_DIST_DIR: /data/project/<TOOL_NAME>/wiki-economics/site-dist
+      WIKI_ECON_ENABLED_WIKIS: nlwiki

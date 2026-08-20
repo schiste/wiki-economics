@@ -24,6 +24,7 @@ const ROOT = path.resolve(__dirname, "..");
 const RUNTIME_ENV = process.env.WIKI_ECON_ENV || "local";
 const ADMIN_ENABLED = (process.env.WIKI_ECON_ADMIN_ENABLED ?? (RUNTIME_ENV === "production" ? "0" : "1")) === "1";
 const PORT = Number.parseInt(process.env.WIKI_ECON_ADMIN_PORT || "3001", 10);
+const BIND_HOST = process.env.WIKI_ECON_ADMIN_BIND_HOST || "127.0.0.1";
 const SITE_PORT = Number.parseInt(process.env.WIKI_ECON_SITE_PORT || "3000", 10);
 const DATA_DIR = resolveConfiguredPath("WIKI_ECON_DATA_DIR", "data");
 const OUTPUT_DIR = resolveConfiguredPath("WIKI_ECON_OUTPUT_DIR", "output");
@@ -226,6 +227,84 @@ function redirect(res, location, extraHeaders = {}) {
     ...extraHeaders,
   });
   res.end();
+}
+
+// Static fallback for the built Observable site. Only reached when nothing
+// else in handleRequest matched, i.e. Cloud VPS never hits this path because
+// nginx serves site assets directly and only proxies /admin* here.
+const STATIC_MIME_TYPES = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".mjs": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".json": "application/json; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".webp": "image/webp",
+  ".ico": "image/x-icon",
+  ".woff": "font/woff",
+  ".woff2": "font/woff2",
+  ".txt": "text/plain; charset=utf-8",
+  ".csv": "text/csv; charset=utf-8",
+  ".parquet": "application/octet-stream",
+  ".map": "application/json; charset=utf-8",
+  ".wasm": "application/wasm",
+};
+
+function staticContentType(filePath) {
+  return STATIC_MIME_TYPES[path.extname(filePath).toLowerCase()] || "application/octet-stream";
+}
+
+function staticCacheControl(pathname) {
+  if (pathname.startsWith("/_observablehq/") || pathname.startsWith("/_npm/")) {
+    return "public, max-age=3600";
+  }
+  if (pathname.startsWith("/_file/")) {
+    return "public, max-age=600";
+  }
+  return null;
+}
+
+// Mirrors nginx's `try_files $uri $uri.html $uri/ =404` against SITE_DIST_DIR.
+function resolveStaticFile(pathname) {
+  let decoded;
+  try {
+    decoded = decodeURIComponent(pathname);
+  } catch {
+    return null;
+  }
+  const relative = decoded.replace(/^\/+/, "");
+  const candidateRoot = path.resolve(SITE_DIST_DIR, relative);
+  if (candidateRoot !== SITE_DIST_DIR && !candidateRoot.startsWith(SITE_DIST_DIR + path.sep)) {
+    return null;
+  }
+  const candidates = [candidateRoot, `${candidateRoot}.html`, path.join(candidateRoot, "index.html")];
+  for (const candidate of candidates) {
+    try {
+      if (fs.statSync(candidate).isFile()) return candidate;
+    } catch {
+      // try next candidate
+    }
+  }
+  return null;
+}
+
+function serveStaticAsset(req, res, pathname) {
+  const filePath = resolveStaticFile(pathname);
+  if (!filePath) return false;
+  const cacheControl = staticCacheControl(pathname);
+  const headers = { "Content-Type": staticContentType(filePath) };
+  if (cacheControl) headers["Cache-Control"] = cacheControl;
+  res.writeHead(200, headers);
+  if (req.method === "HEAD") {
+    res.end();
+    return true;
+  }
+  fs.createReadStream(filePath).pipe(res);
+  return true;
 }
 
 function loginUrlFor(nextPath = ADMIN_PAGE_PATH) {
@@ -1141,6 +1220,10 @@ async function handleRequest(req, res) {
     return;
   }
 
+  if ((req.method === "GET" || req.method === "HEAD") && serveStaticAsset(req, res, url.pathname)) {
+    return;
+  }
+
   res.writeHead(404, { "Cache-Control": "no-store" });
   res.end("Not found");
 }
@@ -1160,9 +1243,9 @@ function createServer() {
 
 function startServer() {
   const server = createServer();
-  server.listen(PORT, "127.0.0.1", () => {
+  server.listen(PORT, BIND_HOST, () => {
     const runner = resolveRunner();
-    console.log(`Admin server listening on http://127.0.0.1:${PORT}`);
+    console.log(`Admin server listening on http://${BIND_HOST}:${PORT}`);
     console.log(`Runner: ${runner.label}`);
     console.log(`Working dir: ${ROOT}`);
     console.log(`Data dir: ${DATA_DIR}`);

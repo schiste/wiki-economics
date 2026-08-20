@@ -1,5 +1,8 @@
 # Cloud VPS Deployment
 
+For deploying to Wikimedia Toolforge instead, see
+[`deploy/toolforge/README.md`](../deploy/toolforge/README.md).
+
 This repository supports two runtime profiles from the same codebase:
 
 - local development and operator use

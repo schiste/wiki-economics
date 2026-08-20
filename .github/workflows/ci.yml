@@ -45,13 +45,13 @@ jobs:
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
 
       - name: Check shell script syntax
-        run: bash -n scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh
+        run: bash -n scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh deploy/toolforge/*.sh
 
       - name: Run shellcheck
         uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38  # 2.0.0
         with:
           additional_files: scripts/lib/wiki_econ.sh
-          scandir: ./scripts ./site/data-build ./deploy/cloud-vps
+          scandir: ./scripts ./site/data-build ./deploy/cloud-vps ./deploy/toolforge
 
       - name: Check Node entrypoint syntax
         run: |
