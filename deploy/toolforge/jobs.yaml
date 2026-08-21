@@ -11,37 +11,53 @@
 # via `toolforge envvars create` before loading this file; Toolforge injects
 # them into the job's environment automatically.
 #
+# WIKI_ECON_BIN must also be set tool-wide (`toolforge envvars create
+# WIKI_ECON_BIN /workspace/target/release/wiki-econ`, path confirmed from the
+# build logs) before either job below runs: the buildpack image ships no Rust
+# toolchain, and scripts/lib/wiki_econ.sh falls back to `cargo run --release
+# --` when it's unset, which fails with `cargo: command not found`. See
+# README.md's Runbook step 5.
+#
 # Confirm the actual continuous-job vs. webservice split against current
 # Toolforge Jobs framework docs before first deploy — this file assumes the
 # admin server runs as a `continuous` job fronted by Toolforge's own
 # ingress, matching the single-process-on-$PORT webservice model described
 # in deploy/toolforge/README.md.
+#
+# Top-level must be a bare list, not a `jobs:`-keyed mapping: the installed
+# `toolforge jobs load` (jobs_cli/cli.py's op_load) does `for job in
+# jobslist` over the raw parsed YAML with no unwrapping, so a `jobs:` wrapper
+# key iterates as the single string "jobs" and crashes with
+# `AttributeError: 'str' object has no attribute 'get'`.
 
-jobs:
-  - name: wiki-econ-admin
-    image: <TOOL_IMAGE>
-    command: node site/admin-server.cjs
-    continuous: true
-    memory: 1Gi
-    cpu: "0.5"
-    port: 8000
-    envvars:
-      WIKI_ECON_ADMIN_ENABLED: "1"
-      WIKI_ECON_ADMIN_AUTH_MODE: mediawiki
-      WIKI_ECON_ADMIN_BIND_HOST: 0.0.0.0
-      WIKI_ECON_ADMIN_PORT: "8000"
-      WIKI_ECON_DATA_DIR: /data/project/wiki-economics/data
-      WIKI_ECON_OUTPUT_DIR: /data/project/wiki-economics/output
-      WIKI_ECON_SITE_DIST_DIR: /data/project/wiki-economics/site-dist
+- name: wiki-econ-admin
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: node site/admin-server.cjs
+  continuous: true
+  memory: 1Gi
+  cpu: "0.5"
+  port: 8000
+  envvars:
+    WIKI_ECON_ADMIN_ENABLED: "1"
+    WIKI_ECON_ADMIN_AUTH_MODE: mediawiki
+    WIKI_ECON_ADMIN_BIND_HOST: 0.0.0.0
+    WIKI_ECON_ADMIN_PORT: "8000"
+    WIKI_ECON_DATA_DIR: /data/project/wiki-economics/data
+    WIKI_ECON_OUTPUT_DIR: /data/project/wiki-economics/output
+    WIKI_ECON_SITE_DIST_DIR: /data/project/wiki-economics/site-dist
+    # Display-only: shown in the admin UI's Scheduled Refresh panel. Keep in
+    # sync with the wiki-econ-refresh job's `schedule` below by hand — the
+    # admin pod has no Toolforge API credentials to read it directly.
+    WIKI_ECON_REFRESH_SCHEDULE: "0 3 * * 0"
 
-  - name: wiki-econ-refresh
-    image: <TOOL_IMAGE>
-    command: deploy/toolforge/run-refresh.sh
-    schedule: "0 3 * * 0" # weekly; tighten only after measuring real run time
-    memory: 4Gi
-    cpu: "1"
-    envvars:
-      WIKI_ECON_DATA_DIR: /data/project/wiki-economics/data
-      WIKI_ECON_OUTPUT_DIR: /data/project/wiki-economics/output
-      WIKI_ECON_SITE_DIST_DIR: /data/project/wiki-economics/site-dist
-      WIKI_ECON_ENABLED_WIKIS: nlwiki
+- name: wiki-econ-refresh
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: deploy/toolforge/run-refresh.sh
+  schedule: "0 3 * * 0" # weekly; tighten only after measuring real run time
+  memory: 4Gi
+  cpu: "1"
+  envvars:
+    WIKI_ECON_DATA_DIR: /data/project/wiki-economics/data
+    WIKI_ECON_OUTPUT_DIR: /data/project/wiki-economics/output
+    WIKI_ECON_SITE_DIST_DIR: /data/project/wiki-economics/site-dist
+    WIKI_ECON_ENABLED_WIKIS: nlwiki

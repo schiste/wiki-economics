@@ -105,27 +105,37 @@ treat this as an operator checklist rather than something already executed:
    Dockerfile, which Toolforge's Build Service cannot consume. Confirm the
    actual `toolforge build start` invocation against current Toolforge
    docs — the CLI surface changes over time.
-5. **Fill in `jobs.yaml`**: run `toolforge jobs images` to get the short
+5. **Point scripts at the compiled binary**: the buildpack run image ships
+   no Rust toolchain — only the compiled `wiki-econ` binary, at
+   `/workspace/target/release/wiki-econ`. `scripts/lib/wiki_econ.sh` (used
+   by `run-refresh.sh` and every job/cron entrypoint) falls back to `cargo
+   run --release --` when `WIKI_ECON_BIN` is unset, which fails on
+   Toolforge since `cargo` isn't present. Set it once, tool-wide, before
+   running any job: `toolforge envvars create WIKI_ECON_BIN
+   /workspace/target/release/wiki-econ` (confirm the actual in-image path
+   from the build logs — buildpack layer paths can change across
+   `pack`/heroku-buildpack versions).
+6. **Fill in `jobs.yaml`**: run `toolforge jobs images` to get the short
    image name the build produced, replace the `<TOOL_IMAGE>` placeholders
    in `jobs.yaml` with it, then `toolforge jobs load
    deploy/toolforge/jobs.yaml`.
-6. **Start the admin webservice** (`wiki-econ-admin`) and confirm `/admin`
+7. **Start the admin webservice** (`wiki-econ-admin`) and confirm `/admin`
    and a static site asset both resolve on the assigned Toolforge domain.
-7. **Trigger `wiki-econ-refresh` once manually** (`toolforge jobs run
+8. **Trigger `wiki-econ-refresh` once manually** (`toolforge jobs run
    wiki-econ-refresh` or equivalent), then confirm: parquet outputs appear
    under `WIKI_ECON_OUTPUT_DIR`, the site builds under
    `WIKI_ECON_SITE_DIST_DIR`, the raw `.bz2` files are deleted afterward,
    and NFS usage stays under the granted quota. Re-run once more to confirm
    idempotency (marker manifest still validates without the raw file
    present).
-8. **Measure real numbers** this plan couldn't produce without live access:
+9. **Measure real numbers** this plan couldn't produce without live access:
    peak RSS during ingest against the job's memory limit (`jobs.yaml`
    currently requests 4Gi for the refresh job, adjustable up to Toolforge's
    per-job ceiling), actual wall-clock refresh time (to size the cron
    schedule), and the patrol data (`data/patrol/<wiki>`) storage footprint,
    which was never measured empirically this session.
-9. Once nlwiki is verified end-to-end, repeat for frwiki (after the quota
-   bump), then decommission the Cloud VPS deployment.
+10. Once nlwiki is verified end-to-end, repeat for frwiki (after the quota
+    bump), then decommission the Cloud VPS deployment.
 
 ## Object storage was considered and rejected for now
 
