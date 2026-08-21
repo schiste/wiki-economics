@@ -21,7 +21,7 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 # shellcheck disable=SC1091
 . "$ROOT/scripts/lib/wiki_econ.sh"
 
-: "${WIKI_ECON_ENABLED_WIKIS:?Set WIKI_ECON_ENABLED_WIKIS (space or comma separated) in jobs.yaml}"
+: "${WIKI_ECON_ENABLED_WIKIS:?Set WIKI_ECON_ENABLED_WIKIS (space or comma separated) with toolforge envvars create}"
 
 # Write a status marker + rolling history to the shared NFS output dir on
 # every exit (success, an early `exit 1` artifact check below, or a

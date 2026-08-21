@@ -7,50 +7,24 @@
 # after `toolforge build start <repo-url>` finishes (Toolforge's Build
 # Service — Cloud Native Buildpacks, detected from root Cargo.toml +
 # package.json + Procfile; no Dockerfile involved — see README.md).
-# Secrets referenced below (WIKI_ECON_ADMIN_MEDIAWIKI_*, etc.) must already exist
-# via `toolforge envvars create` before loading this file; Toolforge injects
-# them into the job's environment automatically.
+# Runtime configuration must already exist via `toolforge envvars create` before
+# loading this file; Toolforge injects tool-wide variables into every job.
 #
 # WIKI_ECON_BIN must also be set tool-wide (`toolforge envvars create
 # WIKI_ECON_BIN /data/project/wiki-economics/app/current/wiki-econ`) before
-# either job below runs. Operators install immutable binaries on shared NFS
+# the job below runs. Operators install immutable binaries on shared NFS
 # over SSH; the buildpack image intentionally does not compile or contain one.
 # See README.md's binary release runbook.
-#
-# Confirmed in production: despite `continuous: true` below, wiki-econ-admin
-# is actually run as a plain `toolforge webservice` (start it with
-# `toolforge webservice buildservice start`, not `toolforge jobs load` for
-# this entry), not loaded as a Toolforge Job — `toolforge jobs list` never
-# shows it. The `continuous: true` block is left here as living
-# documentation of its required image/port/envvars, but restarts must go
-# through `toolforge webservice restart`, which is what
-# deploy/toolforge/rebuild-image.sh does.
 #
 # Top-level must be a bare list, not a `jobs:`-keyed mapping: the installed
 # `toolforge jobs load` (jobs_cli/cli.py's op_load) does `for job in
 # jobslist` over the raw parsed YAML with no unwrapping, so a `jobs:` wrapper
 # key iterates as the single string "jobs" and crashes with
 # `AttributeError: 'str' object has no attribute 'get'`.
-
-- name: wiki-econ-admin
-  image: tool-wiki-economics/tool-wiki-economics:latest
-  command: node site/admin-server.cjs
-  continuous: true
-  memory: 1Gi
-  cpu: "0.5"
-  port: 8000
-  envvars:
-    WIKI_ECON_ADMIN_ENABLED: "1"
-    WIKI_ECON_ADMIN_AUTH_MODE: mediawiki
-    WIKI_ECON_ADMIN_BIND_HOST: 0.0.0.0
-    WIKI_ECON_ADMIN_PORT: "8000"
-    WIKI_ECON_DATA_DIR: /data/project/wiki-economics/data
-    WIKI_ECON_OUTPUT_DIR: /data/project/wiki-economics/output
-    WIKI_ECON_SITE_DIST_DIR: /data/project/wiki-economics/site-dist
-    # Display-only: shown in the admin UI's Scheduled Refresh panel. Keep in
-    # sync with the wiki-econ-refresh job's `schedule` below by hand — the
-    # admin pod has no Toolforge API credentials to read it directly.
-    WIKI_ECON_REFRESH_SCHEDULE: "0 3 * * 0"
+#
+# wiki-econ-admin is a buildservice webservice, not a Toolforge Job. Manage it
+# with `toolforge webservice buildservice ...`; its environment is documented
+# in README.md and deploy/toolforge/rebuild-image.sh restarts it after builds.
 
 - name: wiki-econ-refresh
   image: tool-wiki-economics/tool-wiki-economics:latest
@@ -58,10 +32,5 @@
   schedule: "0 3 * * 0" # weekly; tighten only after measuring real run time
   # Use Toolforge's per-container ceiling. The Rust process logs cgroup
   # current, peak, and limit values throughout page_weekly_edits.
-  memory: 6Gi
+  mem: 6Gi
   cpu: "1"
-  envvars:
-    WIKI_ECON_DATA_DIR: /data/project/wiki-economics/data
-    WIKI_ECON_OUTPUT_DIR: /data/project/wiki-economics/output
-    WIKI_ECON_SITE_DIST_DIR: /data/project/wiki-economics/site-dist
-    WIKI_ECON_ENABLED_WIKIS: nlwiki

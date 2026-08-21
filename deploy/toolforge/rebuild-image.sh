@@ -65,8 +65,7 @@ toolforge webservice restart
 
 echo "==> Restarting continuous Toolforge Jobs (if any)"
 # wiki-econ-admin is deployed as a plain `toolforge webservice`, not loaded
-# from jobs.yaml despite that file defining it with `continuous: true` (see
-# the comment in jobs.yaml) — restarted above. This loop is defensive
+# from jobs.yaml, and was restarted above. This loop is defensive
 # future-proofing in case that ever changes, or another continuous job is
 # added later.
 toolforge jobs list 2>/dev/null | grep -E '^\| ' | tail -n +2 |

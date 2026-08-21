@@ -25,7 +25,7 @@ Toolforge entirely.
 - `.github/workflows/ci.yml` builds the release binary on an x86-64 Ubuntu
   24.04 runner after quality, coverage, and security jobs pass. It validates
   the ELF format, dynamic libraries, and `--help`, uploads a 30-day artifact,
-  and deploys through the Toolforge SSH bastion.
+  and leaves deployment to an operator using the Toolforge SSH bastion.
 - `deploy-binary.sh` uploads to a staging path and calls
   `install-binary.sh` as the tool account. Releases live at
   `/data/project/wiki-economics/app/releases/<git-sha>/wiki-econ`; the stable
@@ -35,10 +35,9 @@ Toolforge entirely.
 - `rebuild-image.sh` rebuilds only the Toolforge image and restarts continuous
   processes. It uses detached JSON output and polls the exact build ID, so a
   disconnected log stream or concurrent build cannot produce a false result.
-- `jobs.yaml` — Toolforge Jobs definitions: `wiki-econ-admin` (continuous,
-  serves `/admin*` and the built static site on one process/port — Toolforge
-  has no per-tool nginx layer) and `wiki-econ-refresh` (scheduled, runs the
-  pipeline and rebuilds the site).
+- `jobs.yaml` — the loadable `wiki-econ-refresh` scheduled Job definition.
+  `wiki-econ-admin` serves `/admin*` and the built static site as a separate
+  buildservice webservice; it is not duplicated as a Toolforge Job.
 - `run-refresh.sh` — wraps `scripts/refresh.sh` for the scheduled job.
   Unlike Cloud VPS's `run-refresh.sh`, this does not keep a `releases/`
   history: retaining multiple full output generations is expensive against
@@ -69,6 +68,18 @@ credentials and does not deploy or restart services. The operator needs:
   `wiki-economics` tool, so `become wiki-economics` succeeds;
 - GitHub CLI access to download the release artifact produced for the exact
   `main` commit being deployed.
+
+The following tool-wide variables must exist before loading or running the
+refresh Job (repeat `toolforge envvars create` to update an existing value):
+
+```sh
+become wiki-economics toolforge envvars create WIKI_ECON_BIN /data/project/wiki-economics/app/current/wiki-econ
+become wiki-economics toolforge envvars create WIKI_ECON_ENABLED_WIKIS nlwiki
+become wiki-economics toolforge envvars create WIKI_ECON_DATA_DIR /data/project/wiki-economics/data
+become wiki-economics toolforge envvars create WIKI_ECON_OUTPUT_DIR /data/project/wiki-economics/output
+become wiki-economics toolforge envvars create WIKI_ECON_SITE_DIST_DIR /data/project/wiki-economics/site-dist
+become wiki-economics toolforge envvars create WIKI_ECON_REFRESH_SCHEDULE '0 3 * * 0'
+```
 
 ### First cutover
 
@@ -107,17 +118,22 @@ TOOLFORGE_SSH_TARGET=login.toolforge.org \
 ```
 
 When site, Node, shared script, or Toolforge deployment files changed, rebuild
-the lightweight image at the same SHA (Cargo remains skipped):
+the lightweight image from `main` (Cargo remains skipped). Toolforge's Build
+Service accepts named refs rather than raw commit SHAs, so verify `main` before
+and after the build when pinning it to a release:
 
 ```sh
+test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$release_sha"
 ssh login.toolforge.org \
-  "become wiki-economics bash -s -- 'https://github.com/schiste/wiki-economics.git' '$release_sha'" \
+  "become wiki-economics bash -s -- 'https://github.com/schiste/wiki-economics.git' main" \
   < deploy/toolforge/rebuild-image.sh
+test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$release_sha"
 ```
 
-Reload `deploy/toolforge/jobs.yaml` when the job definition changed, after
-reviewing the dry-run output. The release artifact and checksum are retained
-in GitHub for 30 days. NFS release directories are deliberately not
+Reload `deploy/toolforge/jobs.yaml` when the job definition changes. The file
+uses the field names emitted by Toolforge CLI 0.3.9's `jobs dump`; inspect a
+fresh dump when upgrading the CLI. The release artifact and checksum are
+retained in GitHub for 30 days. NFS release directories are deliberately not
 auto-deleted; automatic pruning can turn a quota issue into the loss of a
 known-good rollback target.
 
@@ -186,11 +202,9 @@ before assuming NFS quota is still the only lever.
 - **Non-root UID**: buildpack-built images don't pin a specific UID/GID —
   Toolforge assigns this at the Kubernetes level. If file permissions on
   mounted NFS paths misbehave, this is the first place to look.
-- **Toolforge Jobs YAML schema**: `jobs.yaml` here is written from current
-  documentation and may not match the exact schema Toolforge expects
-  (field names, whether `port:` is valid for a `continuous` job, etc.) —
-  validate with `toolforge jobs load --dry-run` (or equivalent) before a
-  real load.
+- **Toolforge Jobs YAML schema**: `jobs.yaml` round-trips the schema emitted
+  by Toolforge CLI 0.3.9 (`mem`, not `memory`). Re-check `toolforge jobs dump`
+  after CLI upgrades before loading it in production.
 - **Admin-UI-triggered jobs**: `site/admin-server.cjs` can itself spawn
   `cargo run` / the compiled binary for on-demand fetch/ingest/compute runs
   from the admin UI. On Toolforge that spawns inside the `wiki-econ-admin`
