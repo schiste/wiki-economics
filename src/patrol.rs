@@ -5,8 +5,9 @@ use polars::prelude::*;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 use regex::Regex;
+use reqwest::StatusCode;
 use reqwest::blocking::Client;
-use reqwest::header::RANGE;
+use reqwest::header::{CONTENT_RANGE, HeaderMap, RANGE};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
@@ -210,7 +211,16 @@ impl PatrolTransport for ReqwestPatrolTransport {
         if let Some(range_start) = range_start {
             request = request.header(RANGE, format!("bytes={range_start}-"));
         }
-        let response = request.send()?.error_for_status()?;
+        let response = request.send()?;
+        if response.status() == StatusCode::RANGE_NOT_SATISFIABLE
+            && range_start
+                .is_some_and(|start| unsatisfied_range_total(response.headers()) == Some(start))
+        {
+            return Ok(PatrolTransportResponse {
+                body: Box::new(std::io::empty()),
+            });
+        }
+        let response = response.error_for_status()?;
         Ok(PatrolTransportResponse {
             body: Box::new(response),
         })
@@ -220,6 +230,16 @@ impl PatrolTransport for ReqwestPatrolTransport {
         let response = self.api_client.get(url).send()?.error_for_status()?;
         response.json().map_err(Into::into)
     }
+}
+
+fn unsatisfied_range_total(headers: &HeaderMap) -> Option<u64> {
+    headers
+        .get(CONTENT_RANGE)?
+        .to_str()
+        .ok()?
+        .strip_prefix("bytes */")?
+        .parse()
+        .ok()
 }
 
 #[cfg(any(test, coverage))]

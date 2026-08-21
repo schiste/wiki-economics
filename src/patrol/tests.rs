@@ -432,6 +432,32 @@ fn reqwest_patrol_transport_propagates_connection_errors() -> Result<()> {
 }
 
 #[test]
+fn reqwest_patrol_transport_accepts_only_an_exactly_complete_range() -> Result<()> {
+    let transport = build_transport()?;
+    let response = "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Range: bytes */3\r\nContent-Length: 0\r\n\r\n";
+
+    let (complete_url, complete_handle) = serve_once(response.to_string())?;
+    let mut complete = transport.get(&format!("{complete_url}/dump.xml.gz"), Some(3))?;
+    let mut body = Vec::new();
+    complete.body.read_to_end(&mut body)?;
+    assert!(body.is_empty());
+    complete_handle
+        .join()
+        .expect("complete-range server thread should finish");
+
+    let (mismatch_url, mismatch_handle) = serve_once(response.to_string())?;
+    let mismatch = match transport.get(&format!("{mismatch_url}/dump.xml.gz"), Some(2)) {
+        Ok(_) => panic!("a mismatched local size must preserve the HTTP 416 error"),
+        Err(error) => error,
+    };
+    assert!(mismatch.to_string().contains("416"));
+    mismatch_handle
+        .join()
+        .expect("mismatched-range server thread should finish");
+    Ok(())
+}
+
+#[test]
 fn download_logging_dump_writes_and_resumes_existing_files() -> Result<()> {
     init_test_tracing();
     let temp_dir = TestDir::new()?;
