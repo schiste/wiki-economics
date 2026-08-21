@@ -24,28 +24,29 @@ set -euo pipefail
 #      container start. Every continuous process has to be restarted by
 #      hand for a rebuild to actually take effect.
 
-REPO_URL="${WIKI_ECON_REPO_URL:-https://github.com/schiste/wiki-economics.git}"
+REPO_URL="${1:-${WIKI_ECON_REPO_URL:-https://github.com/schiste/wiki-economics.git}}"
+SOURCE_REF="${2:-${WIKI_ECON_SOURCE_REF:-main}}"
 POLL_INTERVAL_SECS="${WIKI_ECON_BUILD_POLL_INTERVAL:-20}"
 POLL_TIMEOUT_SECS="${WIKI_ECON_BUILD_POLL_TIMEOUT:-1800}"
 
-echo "==> Starting build for $REPO_URL"
-# Ignore this command's own exit code / log output: see note (1) above.
-# The build itself is a server-side pipeline independent of this CLI call.
-toolforge build start "$REPO_URL" || true
+echo "==> Starting build for $REPO_URL at $SOURCE_REF"
+# Detached JSON output gives us the exact build ID. This avoids both the
+# flaky streaming-log connection and accidentally polling a different build
+# that happened to start at the same time.
+start_json="$(toolforge build start --ref "$SOURCE_REF" --detach --json "$REPO_URL")"
+build_id="$(jq -er '.new_build.name // .new_build.build_id' <<< "$start_json")"
 
-echo "==> Waiting for the newest build to finish (polling toolforge build list)"
+echo "==> Waiting for build $build_id to finish"
 elapsed=0
 build_status=""
-build_id=""
 while [ "$elapsed" -lt "$POLL_TIMEOUT_SECS" ]; do
-  # Newest build is always the first data row; skip the single header line.
-  build_line="$(toolforge build list | sed -n '2p')"
-  build_id="$(awk '{print $1}' <<< "$build_line")"
-  build_status="$(awk '{print $2}' <<< "$build_line")"
+  build_status="$(toolforge build show --json "$build_id" | jq -er '.build.status')"
 
-  if [ "$build_status" = "ok" ] || [ "$build_status" = "error" ] || [ "$build_status" = "failed" ]; then
-    break
-  fi
+  case "$build_status" in
+    ok|error|cancelled|timeout)
+      break
+      ;;
+  esac
 
   sleep "$POLL_INTERVAL_SECS"
   elapsed=$((elapsed + POLL_INTERVAL_SECS))
