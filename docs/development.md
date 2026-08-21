@@ -29,11 +29,11 @@ for f in site/data-build/*.cjs site/data-build/lib/*.cjs; do node --check "$f"; 
 node --test site/admin-auth.test.cjs
 node --test site/admin-server.test.cjs
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets --all-features
-cargo doc --no-deps
-cargo llvm-cov --workspace --all-features --all-targets --lcov --output-path /tmp/wiki-economics-target/llvm-cov.info
-python3 scripts/check_lcov.py /tmp/wiki-economics-target/llvm-cov.info
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo test --locked --all-targets --all-features
+cargo doc --locked --no-deps
+cargo llvm-cov --locked --workspace --all-features --all-targets --lcov --output-path target/llvm-cov.info
+python3 scripts/check_lcov.py target/llvm-cov.info
 cargo deny check advisories bans licenses sources
 cargo audit -D warnings
 scripts/check_vendor_polars.sh

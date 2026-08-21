@@ -11,7 +11,7 @@ wiki_econ_cloud_prepare_toolchain_env
 release_stamp="$(wiki_econ_cloud_release_stamp)"
 tmp_dir="$WIKI_ECON_APP_RELEASES/.tmp-$release_stamp"
 
-mkdir -p "$WIKI_ECON_APP_RELEASES" "$WIKI_ECON_SITE_RELEASES"
+mkdir -p "$WIKI_ECON_APP_RELEASES" "$WIKI_ECON_SITE_RELEASES" "$WIKI_ECON_CARGO_TARGET_DIR"
 rm -rf "$tmp_dir"
 git clone --depth 1 --branch "$WIKI_ECON_REPO_REF" "$WIKI_ECON_REPO_URL" "$tmp_dir"
 
@@ -22,8 +22,10 @@ site_release="$WIKI_ECON_SITE_RELEASES/$release_name"
 
 mv "$tmp_dir" "$release_dir"
 
-export CARGO_TARGET_DIR="$release_dir/target"
-(cd "$release_dir" && cargo build --release)
+export CARGO_TARGET_DIR="$WIKI_ECON_CARGO_TARGET_DIR"
+(cd "$release_dir" && cargo build --release --locked)
+mkdir -p "$release_dir/target/release"
+install -m 0755 "$CARGO_TARGET_DIR/release/wiki-econ" "$release_dir/target/release/wiki-econ"
 (cd "$release_dir/site" && npm ci)
 
 wiki_econ_cloud_switch_symlink "$WIKI_ECON_APP_CURRENT" "$release_dir"

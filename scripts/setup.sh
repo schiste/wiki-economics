@@ -264,7 +264,7 @@ build_project() {
   fi
 
   say "Building the Rust CLI."
-  cargo build --release
+  cargo build --release --locked
   celebrate "Rust CLI build completed."
 
   # First-run guard: building the Observable dashboard against an empty
@@ -294,10 +294,10 @@ Next useful commands:
   scripts/dev.sh
   scripts/refresh.sh frwiki
   scripts/build-site.sh
-  cargo run --release -- fetch frwiki
-  cargo run --release -- ingest frwiki
-  cargo run --release -- compute frwiki
-  cargo run --release -- merge
+  cargo run --release --locked -- fetch frwiki
+  cargo run --release --locked -- ingest frwiki
+  cargo run --release --locked -- compute frwiki
+  cargo run --release --locked -- merge
 
 Notes:
 - The admin picker lives at http://127.0.0.1:3000/admin once scripts/dev.sh is running.

@@ -19,7 +19,7 @@ trap cleanup EXIT INT TERM
 
 # 1. Build Rust binary in release mode
 echo "==> Building Rust binary (release)..."
-cargo build --release
+cargo build --release --locked
 
 # 2. Install site dependencies if needed
 wiki_econ_ensure_site_deps

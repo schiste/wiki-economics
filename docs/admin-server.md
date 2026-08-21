@@ -40,7 +40,7 @@ refuses to start with `WIKI_ECON_ADMIN_AUTH_MODE=none`.
 | `WIKI_ECON_ADMIN_PORT` | `3001` | Loopback port to bind. |
 | `WIKI_ECON_SITE_PORT` | `3000` | Used for the local dev allowlist when the admin page runs from the Observable preview server. |
 | `WIKI_ECON_ENV` | `local` | When `production`, the server enforces authenticated mode if enabled. |
-| `WIKI_ECON_BIN` | (uses `cargo run --release --`) | Override path to the compiled `wiki-econ` binary. |
+| `WIKI_ECON_BIN` | (uses `cargo run --release --locked --`) | Override path to the compiled `wiki-econ` binary. |
 | `WIKI_ECON_DATA_DIR` | `data/` | Where the pipeline reads raw + intermediate parquet. |
 | `WIKI_ECON_OUTPUT_DIR` | `output/` | Where the pipeline writes per-wiki and merged metric parquet. |
 | `WIKI_ECON_GENERATOR_DIR` | `site/data-build/` | Where merge looks for dashboard JSON generators. |

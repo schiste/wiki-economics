@@ -62,7 +62,7 @@ The current public release is intentionally Wikipedia-first. The admin picker co
 Build the Rust CLI:
 
 ```sh
-cargo build --release
+cargo build --release --locked
 ```
 
 Run a small end-to-end refresh:
@@ -74,10 +74,10 @@ Run a small end-to-end refresh:
 Expanded equivalent:
 
 ```sh
-cargo run --release -- fetch frwiki
-cargo run --release -- ingest frwiki
-cargo run --release -- compute frwiki
-cargo run --release -- merge
+cargo run --release --locked -- fetch frwiki
+cargo run --release --locked -- ingest frwiki
+cargo run --release --locked -- compute frwiki
+cargo run --release --locked -- merge
 ```
 
 Pass `--version YYYY-MM` to `fetch` or `run` when you need a specific dump snapshot. If omitted, the CLI defaults to the previous UTC month.

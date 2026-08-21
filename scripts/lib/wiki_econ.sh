@@ -97,7 +97,7 @@ wiki_econ_cli_label() {
   if [ -n "${WIKI_ECON_BIN:-}" ]; then
     printf '%s' "$WIKI_ECON_BIN"
   else
-    printf '%s' "cargo run --release --"
+    printf '%s' "cargo run --release --locked --"
   fi
 }
 
@@ -113,7 +113,7 @@ wiki_econ_run_cli() {
     )
   else
     cmd=(
-      cargo run --release --
+      cargo run --release --locked --
       --data-dir "$WIKI_ECON_DATA_DIR"
       --output-dir "$WIKI_ECON_OUTPUT_DIR"
       "$@"

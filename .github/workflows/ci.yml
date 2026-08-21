@@ -77,7 +77,7 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Lint
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       # Note: the test suite runs in the `coverage` job under cargo-llvm-cov,
       # which subsumes a plain `cargo test`. Running `cargo test` here too
@@ -93,13 +93,13 @@ jobs:
         run: python3 -m unittest discover -s scripts -p 'test_*.py'
 
       - name: Check docs
-        run: cargo doc --no-deps
+        run: cargo doc --locked --no-deps
 
   coverage:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
-      LLVM_COV_OUTPUT_PATH: /tmp/wiki-economics-target/llvm-cov.info
+      LLVM_COV_OUTPUT_PATH: target/llvm-cov.info
 
     steps:
       - name: Check out repository
@@ -122,7 +122,7 @@ jobs:
           tool: cargo-llvm-cov
 
       - name: Run coverage
-        run: cargo llvm-cov --workspace --all-features --all-targets --lcov --output-path "$LLVM_COV_OUTPUT_PATH"
+        run: cargo llvm-cov --locked --workspace --all-features --all-targets --lcov --output-path "$LLVM_COV_OUTPUT_PATH"
 
       - name: Validate LCOV line coverage
         run: python3 scripts/check_lcov.py "$LLVM_COV_OUTPUT_PATH"

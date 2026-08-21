@@ -138,7 +138,8 @@ sudo -u wiki-econ -H ./deploy/cloud-vps/deploy-release.sh
 This will:
 
 - clone the configured Git ref into a new release directory
-- build the Rust CLI in that release
+- build the Rust CLI with a persistent dependency cache under
+  `WIKI_ECON_CARGO_TARGET_DIR`, then copy only the executable into the release
 - install frontend dependencies
 - switch `app/current`
 - rebuild the static site against the current published artifacts, if any

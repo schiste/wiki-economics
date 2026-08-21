@@ -34,7 +34,9 @@ fs4 = "1.1.0"
 
 [profile.release]
 opt-level = 3
-lto = true
+# Fat LTO made the final wiki-econ link dominate release builds. Thin LTO
+# retains cross-crate optimization while keeping routine deploys practical.
+lto = "thin"
 
 [patch.crates-io]
 polars-utils = { path = "vendor/polars-utils" }

@@ -34,20 +34,20 @@ echo "==> ./scripts/refresh.sh --help"
 echo "==> cargo fmt --all -- --check"
 cargo fmt --all -- --check
 
-echo "==> cargo clippy --all-targets --all-features -- -D warnings"
-cargo clippy --all-targets --all-features -- -D warnings
+echo "==> cargo clippy --locked --all-targets --all-features -- -D warnings"
+cargo clippy --locked --all-targets --all-features -- -D warnings
 
-echo "==> cargo test --all-targets --all-features"
-cargo test --all-targets --all-features
+echo "==> cargo test --locked --all-targets --all-features"
+cargo test --locked --all-targets --all-features
 
-echo "==> cargo doc --no-deps"
-cargo doc --no-deps
+echo "==> cargo doc --locked --no-deps"
+cargo doc --locked --no-deps
 
-echo "==> cargo llvm-cov --workspace --all-features --all-targets --lcov --output-path /tmp/wiki-economics-target/llvm-cov.info"
-cargo llvm-cov --workspace --all-features --all-targets --lcov --output-path /tmp/wiki-economics-target/llvm-cov.info
+echo "==> cargo llvm-cov --locked --workspace --all-features --all-targets --lcov --output-path target/llvm-cov.info"
+cargo llvm-cov --locked --workspace --all-features --all-targets --lcov --output-path target/llvm-cov.info
 
-echo "==> python3 scripts/check_lcov.py /tmp/wiki-economics-target/llvm-cov.info"
-python3 scripts/check_lcov.py /tmp/wiki-economics-target/llvm-cov.info
+echo "==> python3 scripts/check_lcov.py target/llvm-cov.info"
+python3 scripts/check_lcov.py target/llvm-cov.info
 
 echo "==> cargo deny check advisories bans licenses sources"
 cargo deny check advisories bans licenses sources
