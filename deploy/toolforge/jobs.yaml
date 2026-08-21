@@ -30,7 +30,7 @@
   image: tool-wiki-economics/tool-wiki-economics:latest
   command: deploy/toolforge/run-refresh.sh
   schedule: "0 3 * * 0" # weekly; tighten only after measuring real run time
-  filelog: "yes"
+  filelog: true
   mount: all
   # Use Toolforge's per-container ceiling. The Rust process logs cgroup
   # current, peak, and limit values throughout page_weekly_edits.
