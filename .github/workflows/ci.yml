@@ -166,3 +166,130 @@ jobs:
 
       - name: Vendor patch hygiene
         run: scripts/check_vendor_patches.sh
+
+  deploy-toolforge:
+    name: Build and deploy Toolforge release
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs:
+      - quality
+      - coverage
+      - security
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment: toolforge
+    concurrency:
+      group: toolforge-production
+      cancel-in-progress: false
+
+    steps:
+      - name: Check out repository history
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        with:
+          fetch-depth: 0
+
+      - name: Classify deployment changes
+        id: changes
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          rust_changed=false
+          image_changed=false
+
+          if [[ "$BEFORE_SHA" =~ ^0+$ ]] || ! git cat-file -e "$BEFORE_SHA^{commit}"; then
+            changed_files="$(git ls-tree -r --name-only "$GITHUB_SHA")"
+          else
+            changed_files="$(git diff --name-only "$BEFORE_SHA" "$GITHUB_SHA")"
+          fi
+
+          while IFS= read -r path; do
+            case "$path" in
+              .cargo/*|Cargo.toml|Cargo.lock|rust-toolchain.toml|src/*|vendor/*)
+                rust_changed=true
+                ;;
+            esac
+            case "$path" in
+              Procfile|package.json|package-lock.json|RustConfig|scripts/*|site/*|deploy/toolforge/*)
+                image_changed=true
+                ;;
+            esac
+          done <<< "$changed_files"
+
+          echo "rust=$rust_changed" >> "$GITHUB_OUTPUT"
+          echo "image=$image_changed" >> "$GITHUB_OUTPUT"
+          printf 'Rust binary changed: %s\nToolforge image changed: %s\n' \
+            "$rust_changed" "$image_changed"
+
+      - name: Install Rust toolchain
+        if: steps.changes.outputs.rust == 'true'
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # @stable as of pin
+        with:
+          toolchain: 1.98.0
+
+      - name: Cache release artifacts
+        if: steps.changes.outputs.rust == 'true'
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          workspaces: ". -> target"
+          shared-key: toolforge-release
+          cache-on-failure: true
+
+      - name: Build release binary
+        if: steps.changes.outputs.rust == 'true'
+        run: cargo build --release --locked
+
+      - name: Verify release binary
+        if: steps.changes.outputs.rust == 'true'
+        run: |
+          file target/release/wiki-econ
+          file target/release/wiki-econ | grep -Eq 'ELF 64-bit.*x86-64'
+          if ldd target/release/wiki-econ | grep -F 'not found'; then
+            echo "Release binary has unresolved shared libraries" >&2
+            exit 1
+          fi
+          target/release/wiki-econ --help >/dev/null
+          sha256sum target/release/wiki-econ > target/release/wiki-econ.sha256
+
+      - name: Upload release artifact
+        if: steps.changes.outputs.rust == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          name: wiki-econ-linux-x86_64-${{ github.sha }}
+          path: |
+            target/release/wiki-econ
+            target/release/wiki-econ.sha256
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Configure Toolforge SSH
+        if: steps.changes.outputs.rust == 'true' || steps.changes.outputs.image == 'true'
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.TOOLFORGE_SSH_PRIVATE_KEY }}
+          SSH_KNOWN_HOSTS: ${{ secrets.TOOLFORGE_KNOWN_HOSTS }}
+          TOOLFORGE_SSH_USER: ${{ secrets.TOOLFORGE_SSH_USER }}
+        run: |
+          test -n "$SSH_PRIVATE_KEY"
+          test -n "$SSH_KNOWN_HOSTS"
+          test -n "$TOOLFORGE_SSH_USER"
+          install -d -m 0700 "$HOME/.ssh"
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
+          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
+          chmod 0600 "$HOME/.ssh/id_ed25519" "$HOME/.ssh/known_hosts"
+          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            "$TOOLFORGE_SSH_USER@login.toolforge.org" true
+
+      - name: Deploy Rust binary
+        if: steps.changes.outputs.rust == 'true'
+        env:
+          TOOLFORGE_SSH_TARGET: ${{ secrets.TOOLFORGE_SSH_USER }}@login.toolforge.org
+        run: deploy/toolforge/deploy-binary.sh target/release/wiki-econ "$GITHUB_SHA"
+
+      - name: Rebuild lightweight Toolforge image
+        if: steps.changes.outputs.image == 'true'
+        env:
+          TOOLFORGE_SSH_TARGET: ${{ secrets.TOOLFORGE_SSH_USER }}@login.toolforge.org
+        run: |
+          ssh -o BatchMode=yes "$TOOLFORGE_SSH_TARGET" \
+            "become wiki-economics test -x /data/project/wiki-economics/app/current/wiki-econ"
+          ssh -o BatchMode=yes "$TOOLFORGE_SSH_TARGET" \
+            "become wiki-economics bash -s -- 'https://github.com/$GITHUB_REPOSITORY.git' '$GITHUB_SHA'" \
+            < deploy/toolforge/rebuild-image.sh
