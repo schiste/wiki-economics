@@ -74,12 +74,8 @@ fn merge_metric_batched(
 
     let temp_path = dest.with_file_name(format!(".{metric_name}.merge.tmp"));
     if temp_path.exists() {
-        fs::remove_file(&temp_path).with_context(|| {
-            format!(
-                "failed to remove abandoned merge output {}",
-                temp_path.display()
-            )
-        })?;
+        fs::remove_file(&temp_path)
+            .with_context(|| format!("failed to remove abandoned merge output {temp_path:?}"))?;
     }
 
     let merge_result = (|| -> Result<(usize, usize, u64)> {
@@ -109,14 +105,7 @@ fn merge_metric_batched(
                     .set_low_memory(true)
                     .read_parallel(ParallelStrategy::None)
                     .finish()?;
-                ensure!(
-                    batch.height() == rows,
-                    "merge read {} rows from {} at offset {}, expected {}",
-                    batch.height(),
-                    path.display(),
-                    offset,
-                    rows
-                );
+                ensure!(batch.height() == rows, "short merge read for {path:?}");
                 writer.write_batch(&batch)?;
                 offset += rows;
                 total_rows += rows;
@@ -294,10 +283,9 @@ mod tests {
         write_metric(output_dir.path(), "frwiki", "metric", 2)?;
         let enwiki_dir = output_dir.path().join("enwiki");
         fs::create_dir_all(&enwiki_dir)?;
-        let mut enwiki = df!(
-            "wiki" => &["enwiki", "enwiki", "enwiki"],
-            "value" => &[1_i64, 3, 5]
-        )?;
+        let wikis = Column::new("wiki".into(), &["enwiki", "enwiki", "enwiki"]);
+        let values = Column::new("value".into(), &[1_i64, 3, 5]);
+        let mut enwiki = DataFrame::new(3, vec![wikis, values])?;
         let mut enwiki_file = File::create(enwiki_dir.join("metric.parquet"))?;
         ParquetWriter::new(&mut enwiki_file).finish(&mut enwiki)?;
         let paths = vec![
@@ -347,6 +335,27 @@ mod tests {
         assert!(!error.to_string().is_empty());
         assert_eq!(fs::read(&dest)?, b"known-good");
         assert!(!output_dir.path().join(".metric.parquet.merge.tmp").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn merge_metric_batched_reports_abandoned_temp_cleanup_failure() -> Result<()> {
+        let output_dir = TestDir::new()?;
+        write_metric(output_dir.path(), "enwiki", "metric", 1)?;
+        let dest = output_dir.path().join("metric.parquet");
+        let abandoned = output_dir.path().join(".metric.parquet.merge.tmp");
+        fs::create_dir(&abandoned)?;
+
+        let error = merge_metric_batched(
+            "metric.parquet",
+            &[output_dir.path().join("enwiki/metric.parquet")],
+            &dest,
+            1,
+        )
+        .expect_err("a directory cannot be removed as an abandoned output file");
+
+        assert!(error.to_string().contains("failed to remove abandoned"));
+        assert!(!dest.exists());
         Ok(())
     }
 
