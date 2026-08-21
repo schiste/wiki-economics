@@ -19,6 +19,12 @@ const FETCH_MAX_PARALLELISM: usize = 4;
 const FETCH_MAX_RETRIES: usize = 3;
 const FETCH_RETRY_BACKOFF_MS: u64 = 500;
 const FETCH_MAX_PARALLELISM_ENV: &str = "WIKI_ECON_FETCH_MAX_PARALLELISM";
+/// Extra headroom required beyond the summed remote byte total before a
+/// fetch is allowed to start. Not a tight budget — just enough to fail fast
+/// on a clearly undersized quota (e.g. frwiki's ~31GB transient peak against
+/// a small Toolforge NFS allocation) rather than discovering it after
+/// downloading most of the dump.
+const FETCH_DISK_HEADROOM_MARGIN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// Bzip2 magic bytes ("BZh"). Every valid bz2 file begins with these three
 /// bytes before the version digit. Used to surface CDN corruption / truncation
 /// at fetch time, before the file is moved into the ingest pipeline. Note: the
@@ -1093,10 +1099,118 @@ fn fetch_wiki_from_base_with_transport<T: HttpTransport>(
     Ok(paths)
 }
 
+/// Sum the remote byte total for `files` (minus bytes already present
+/// locally from a prior partial download) and compare it against the
+/// filesystem's available space at `data_dir`, failing fast if a full
+/// download clearly won't fit. Best-effort: files whose remote size can't
+/// be determined are excluded from the total rather than blocking the
+/// fetch, and if the disk-space query itself fails (e.g. unsupported
+/// filesystem), the check is skipped with a warning instead of hard-failing
+/// unrelated environments like local dev or CI.
+fn check_disk_headroom<T: HttpTransport>(
+    transport: &T,
+    base_url: &str,
+    wiki: &str,
+    version: &str,
+    files: &[String],
+    data_dir: &Path,
+) -> Result<()> {
+    let raw_dir = data_dir.join("raw").join(wiki);
+    let mut needed_bytes: u64 = 0;
+    let mut unknown_files = 0usize;
+
+    for filename in files {
+        let url = format!("{base_url}/{version}/{wiki}/{filename}");
+        let dest = raw_dir.join(filename);
+        match probe_remote_file(transport, &url)?.and_then(|info| info.content_length) {
+            Some(total_size) => {
+                let local_size = fs::metadata(&dest).map(|meta| meta.len()).unwrap_or(0);
+                needed_bytes += total_size.saturating_sub(local_size);
+            }
+            None => unknown_files += 1,
+        }
+    }
+
+    if unknown_files > 0 {
+        warn!(
+            wiki = wiki,
+            unknown_files = unknown_files,
+            "could not determine remote size for some dump files; disk-headroom check is a lower bound"
+        );
+    }
+
+    if needed_bytes == 0 {
+        return Ok(());
+    }
+
+    let available_bytes = match fs4::available_space(data_dir) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            warn!(
+                error = %error,
+                path = %data_dir.display(),
+                "could not determine available disk space; skipping headroom check"
+            );
+            return Ok(());
+        }
+    };
+
+    let required_bytes = needed_bytes + FETCH_DISK_HEADROOM_MARGIN_BYTES;
+    if available_bytes < required_bytes {
+        anyhow::bail!(
+            "insufficient disk space to fetch {wiki}: need ~{needed_bytes} bytes \
+             (+{FETCH_DISK_HEADROOM_MARGIN_BYTES} bytes margin) but only {available_bytes} \
+             bytes available at {}",
+            data_dir.display()
+        );
+    }
+
+    info!(
+        wiki = wiki,
+        needed_bytes = needed_bytes,
+        available_bytes = available_bytes,
+        "disk headroom check passed"
+    );
+    Ok(())
+}
+
 /// Fetch all dump files for a wiki.
 pub fn fetch_wiki(wiki: &str, version: &str, data_dir: &Path) -> Result<Vec<PathBuf>> {
     let transport = build_transport()?;
+    let files = build_file_list(wiki, version)?;
+    check_disk_headroom(&transport, BASE_URL, wiki, version, &files, data_dir)?;
     fetch_wiki_from_base_with_transport(&transport, BASE_URL, wiki, version, data_dir)
+}
+
+/// Delete a wiki's downloaded `.bz2` dump files, freeing the on-disk peak
+/// they occupy as soon as `ingest_wiki` has consumed them. Only `fetch_wiki`
+/// (writer) and `ingest_wiki` (reader) ever touch `data/raw/<wiki>`, so this
+/// is safe to call immediately once ingest succeeds — no downstream stage
+/// (compute, patrol) reads from it. Missing directories are a no-op, matching
+/// the idempotent `find ... -delete` this replaces in `run-refresh.sh`.
+pub fn cleanup_raw_dump(wiki: &str, data_dir: &Path) -> Result<()> {
+    let raw_dir = data_dir.join("raw").join(wiki);
+    if !raw_dir.exists() {
+        return Ok(());
+    }
+
+    let mut removed = 0usize;
+    for entry in fs::read_dir(&raw_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) == Some("bz2") {
+            fs::remove_file(&path)?;
+            removed += 1;
+        }
+    }
+
+    info!(
+        wiki = wiki,
+        removed_files = removed,
+        path = %raw_dir.display(),
+        "cleaned up raw dump files"
+    );
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1329,6 +1443,30 @@ mod tests {
             version,
             data_dir,
         )
+    }
+
+    #[test]
+    fn cleanup_raw_dump_removes_only_bz2_files() -> Result<()> {
+        init_test_tracing();
+        let temp_dir = TestDir::new()?;
+        let raw_dir = temp_dir.path().join("raw").join("testwiki");
+        fs::create_dir_all(&raw_dir)?;
+        fs::write(raw_dir.join("2026-02.testwiki.all-time.tsv.bz2"), b"BZh")?;
+        fs::write(raw_dir.join("notes.txt"), b"keep me")?;
+
+        cleanup_raw_dump("testwiki", temp_dir.path())?;
+
+        assert!(!raw_dir.join("2026-02.testwiki.all-time.tsv.bz2").exists());
+        assert!(raw_dir.join("notes.txt").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_raw_dump_is_a_noop_for_missing_directory() -> Result<()> {
+        init_test_tracing();
+        let temp_dir = TestDir::new()?;
+        cleanup_raw_dump("nosuchwiki", temp_dir.path())?;
+        Ok(())
     }
 
     fn spawn_test_server(responses: Vec<String>) -> Result<(String, RequestLog, TestServerHandle)> {
@@ -1978,6 +2116,80 @@ mod tests {
         ]);
 
         assert_eq!(probe_remote_file(&transport, TEST_URL)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn check_disk_headroom_passes_when_space_is_sufficient() -> Result<()> {
+        init_test_tracing();
+        let temp_dir = TestDir::new()?;
+        let transport = FakeTransport::with_head_outcomes([ok_head(Some(1024), true)]);
+
+        check_disk_headroom(
+            &transport,
+            "http://example.invalid",
+            "testwiki",
+            "2026-02",
+            &["2026-02.testwiki.all-time.tsv.bz2".to_string()],
+            temp_dir.path(),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn check_disk_headroom_skips_files_with_unknown_remote_size() -> Result<()> {
+        init_test_tracing();
+        let temp_dir = TestDir::new()?;
+        let transport = FakeTransport::with_head_outcomes([ok_head(None, false)]);
+
+        check_disk_headroom(
+            &transport,
+            "http://example.invalid",
+            "testwiki",
+            "2026-02",
+            &["2026-02.testwiki.all-time.tsv.bz2".to_string()],
+            temp_dir.path(),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn check_disk_headroom_credits_already_downloaded_bytes() -> Result<()> {
+        init_test_tracing();
+        let temp_dir = TestDir::new()?;
+        let raw_dir = temp_dir.path().join("raw").join("testwiki");
+        fs::create_dir_all(&raw_dir)?;
+        fs::write(raw_dir.join("2026-02.testwiki.all-time.tsv.bz2"), b"BZh")?;
+        let transport = FakeTransport::with_head_outcomes([ok_head(Some(3), true)]);
+
+        check_disk_headroom(
+            &transport,
+            "http://example.invalid",
+            "testwiki",
+            "2026-02",
+            &["2026-02.testwiki.all-time.tsv.bz2".to_string()],
+            temp_dir.path(),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn check_disk_headroom_fails_when_space_is_insufficient() -> Result<()> {
+        init_test_tracing();
+        let temp_dir = TestDir::new()?;
+        let transport = FakeTransport::with_head_outcomes([ok_head(Some(u64::MAX / 2), true)]);
+
+        let err = check_disk_headroom(
+            &transport,
+            "http://example.invalid",
+            "testwiki",
+            "2026-02",
+            &["2026-02.testwiki.all-time.tsv.bz2".to_string()],
+            temp_dir.path(),
+        )
+        .expect_err("an exabyte-scale file should never fit");
+
+        assert!(err.to_string().contains("insufficient disk space"));
         Ok(())
     }
 

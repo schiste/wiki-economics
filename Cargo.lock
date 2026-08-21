@@ -745,6 +745,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs4"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e72ed92b67c146290f88e9c89d60ca163ea417a446f61ffd7b72df3e7f1dfd5"
+dependencies = [
+ "rustix",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1872,7 +1882,7 @@ dependencies = [
  "bytes",
  "chrono",
  "fast-float2",
- "fs4",
+ "fs4 0.13.1",
  "futures",
  "glob",
  "hashbrown 0.16.1",
@@ -3504,6 +3514,7 @@ dependencies = [
  "chrono",
  "clap",
  "flate2",
+ "fs4 1.1.0",
  "indicatif",
  "polars",
  "quick-xml",

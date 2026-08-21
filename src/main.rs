@@ -116,6 +116,7 @@ trait Ops {
     fn fetch_wiki(&self, wiki: &str, version: &str, data_dir: &std::path::Path) -> Result<()>;
     fn fetch_patrol(&self, wiki: &str, data_dir: &std::path::Path) -> Result<()>;
     fn ingest_wiki(&self, wiki: &str, data_dir: &std::path::Path) -> Result<()>;
+    fn cleanup_raw_dump(&self, wiki: &str, data_dir: &std::path::Path) -> Result<()>;
     fn compute_all(
         &self,
         wiki: &str,
@@ -155,6 +156,10 @@ impl Ops for RealOps {
 
     fn ingest_wiki(&self, wiki: &str, data_dir: &std::path::Path) -> Result<()> {
         ingest::ingest_wiki(wiki, data_dir).map(|_| ())
+    }
+
+    fn cleanup_raw_dump(&self, wiki: &str, data_dir: &std::path::Path) -> Result<()> {
+        fetch::cleanup_raw_dump(wiki, data_dir)
     }
 
     fn compute_all(
@@ -322,6 +327,9 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
                     ops.fetch_patrol(wiki, &data_dir)
                 })?;
                 run_timed_stage("ingest", Some(wiki), || ops.ingest_wiki(wiki, &data_dir))?;
+                run_timed_stage("cleanup_raw", Some(wiki), || {
+                    ops.cleanup_raw_dump(wiki, &data_dir)
+                })?;
                 run_timed_stage("compute", Some(wiki), || {
                     ops.compute_all(wiki, &data_dir, &output_dir)
                 })?;
@@ -563,6 +571,11 @@ mod tests {
             Ok(())
         }
 
+        fn cleanup_raw_dump(&self, wiki: &str, data_dir: &Path) -> Result<()> {
+            self.record(format!("cleanup_raw:{wiki}:{}", data_dir.display()));
+            Ok(())
+        }
+
         fn compute_all(&self, wiki: &str, data_dir: &Path, output_dir: &Path) -> Result<()> {
             self.record(format!(
                 "compute:{wiki}:{}:{}",
@@ -633,6 +646,13 @@ mod tests {
         fn ingest_wiki(&self, _wiki: &str, _data_dir: &Path) -> Result<()> {
             if self.fail_stage == "ingest" {
                 anyhow::bail!("ingest failed");
+            }
+            Ok(())
+        }
+
+        fn cleanup_raw_dump(&self, _wiki: &str, _data_dir: &Path) -> Result<()> {
+            if self.fail_stage == "cleanup_raw" {
+                anyhow::bail!("cleanup raw failed");
             }
             Ok(())
         }
@@ -886,6 +906,7 @@ mod tests {
                 "fetch:frwiki:2025-12:dataset",
                 "fetch_patrol:frwiki:dataset",
                 "ingest:frwiki:dataset",
+                "cleanup_raw:frwiki:dataset",
                 "compute:frwiki:dataset:results",
                 "compute_patrol:frwiki:dataset:results:false:_",
                 "merge:results",
@@ -911,6 +932,13 @@ mod tests {
                 "ingestwiki"
             ))?
             .is_empty()
+        );
+
+        ops.cleanup_raw_dump("ingestwiki", data_dir.path())?;
+        assert!(
+            !raw_ingest_dir
+                .join("2026-02.ingestwiki.all-time.tsv.bz2")
+                .exists()
         );
 
         let fetch_err = ops
@@ -1200,6 +1228,7 @@ mod tests {
         ops.fetch_wiki("frwiki", "2026-02", data_dir)?;
         ops.fetch_patrol("frwiki", data_dir)?;
         ops.ingest_wiki("frwiki", data_dir)?;
+        ops.cleanup_raw_dump("frwiki", data_dir)?;
         ops.compute_all("frwiki", data_dir, output_dir)?;
         ops.compute_patrol("frwiki", data_dir, output_dir, false, None)?;
         ops.benchmark(&wikis, data_dir, output_dir, 0, 1, false)?;
@@ -1249,6 +1278,21 @@ mod tests {
         )
         .expect_err("run ingest failure should propagate");
         assert!(err.to_string().contains("ingest failed"));
+        Ok(())
+    }
+
+    #[test]
+    fn run_command_propagates_cleanup_raw_errors() -> Result<()> {
+        init_test_tracing();
+        let cli = Cli::try_parse_from(["wiki-econ", "run", "frwiki"])?;
+        let err = run_with_ops(
+            cli,
+            &FailingOps {
+                fail_stage: "cleanup_raw",
+            },
+        )
+        .expect_err("run cleanup_raw failure should propagate");
+        assert!(err.to_string().contains("cleanup raw failed"));
         Ok(())
     }
 

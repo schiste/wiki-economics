@@ -7,9 +7,13 @@ set -euo pipefail
 # releases/current symlink history for output/site: Toolforge's NFS quota is
 # small (see deploy/toolforge/README.md), and retaining multiple full output
 # generations is expensive relative to the benefit. This refreshes
-# WIKI_ECON_OUTPUT_DIR / WIKI_ECON_SITE_DIST_DIR in place instead, then
-# deletes the raw dump files for the wikis just refreshed. That's safe
-# because src/storage.rs::marker_manifest_is_valid only checks that
+# WIKI_ECON_OUTPUT_DIR / WIKI_ECON_SITE_DIST_DIR in place instead.
+#
+# Raw dump cleanup is NOT done here: `wiki-econ run` (invoked by
+# scripts/refresh.sh) deletes each wiki's raw .bz2 files itself immediately
+# after that wiki's ingest stage succeeds, rather than waiting for every
+# wiki in the batch plus the site build to finish. That's safe because
+# src/storage.rs::marker_manifest_is_valid only checks that
 # warehouse/analytical parquet outputs exist, never the raw .bz2 source —
 # later runs stay idempotent without it.
 
@@ -55,14 +59,6 @@ for page in index.html business.html gdp.html inequality.html labor.html patrol.
   if [ ! -f "$WIKI_ECON_SITE_DIST_DIR/$page" ]; then
     echo "Site build is missing required page: $WIKI_ECON_SITE_DIST_DIR/$page" >&2
     exit 1
-  fi
-done
-
-echo "==> Cleaning up raw dumps for refreshed wikis"
-for wiki in "${wikis[@]}"; do
-  raw_dir="$WIKI_ECON_DATA_DIR/raw/$wiki"
-  if [ -d "$raw_dir" ]; then
-    find "$raw_dir" -name '*.bz2' -type f -print -delete
   fi
 done
 

@@ -49,13 +49,23 @@ Toolforge entirely.
   serves `/admin*` and the built static site on one process/port — Toolforge
   has no per-tool nginx layer) and `wiki-econ-refresh` (scheduled, runs the
   pipeline and rebuilds the site).
-- `run-refresh.sh` — wraps `scripts/refresh.sh` for the scheduled job, then
-  deletes the raw `.bz2` dumps for the refreshed wikis. This is safe because
+- `run-refresh.sh` — wraps `scripts/refresh.sh` for the scheduled job.
+  Unlike Cloud VPS's `run-refresh.sh`, this does not keep a `releases/`
+  history: retaining multiple full output generations is expensive against
+  a small NFS quota. Raw `.bz2` dump cleanup happens inside the pipeline
+  itself, not in this script: `wiki-econ run` deletes each wiki's raw dump
+  immediately after that wiki's ingest stage succeeds (`src/main.rs`'s
+  `Commands::Run` loop, backed by `fetch::cleanup_raw_dump`), rather than
+  waiting for every wiki in the batch plus the site build to finish. This
+  keeps the on-disk transient peak lower — the raw dump doesn't linger
+  through the rest of that wiki's own compute/patrol stages, through every
+  other wiki's full pipeline, and through the final merge. It's safe because
   `src/storage.rs::marker_manifest_is_valid` only checks that the
   warehouse/analytical parquet outputs exist, never the raw source file —
-  later refreshes stay idempotent without it. Unlike Cloud VPS's
-  `run-refresh.sh`, this does not keep a `releases/` history: retaining
-  multiple full output generations is expensive against a small NFS quota.
+  later refreshes stay idempotent without it. `wiki-econ fetch` also
+  preflights available disk space against the summed remote dump size
+  before downloading anything, so an undersized quota (e.g. frwiki's ~31GB
+  peak) fails fast instead of after partially downloading a large dump.
 
 ## Runbook
 
