@@ -1140,11 +1140,30 @@ fn fetch_wiki_from_base_with_transport<T: HttpTransport>(
     version: &str,
     data_dir: &Path,
 ) -> Result<Vec<PathBuf>> {
-    let raw_dir = data_dir.join("raw").join(wiki);
-    fs::create_dir_all(&raw_dir)?;
-
     let files = build_file_list(wiki, version)?;
     let parallelism = fetch_parallelism(files.len());
+    fetch_wiki_from_base_with_transport_at_parallelism(
+        transport,
+        base_url,
+        wiki,
+        version,
+        data_dir,
+        files,
+        parallelism,
+    )
+}
+
+fn fetch_wiki_from_base_with_transport_at_parallelism<T: HttpTransport>(
+    transport: &T,
+    base_url: &str,
+    wiki: &str,
+    version: &str,
+    data_dir: &Path,
+    files: Vec<String>,
+    parallelism: usize,
+) -> Result<Vec<PathBuf>> {
+    let raw_dir = data_dir.join("raw").join(wiki);
+    fs::create_dir_all(&raw_dir)?;
 
     info!(
         wiki = wiki,
@@ -1269,9 +1288,19 @@ fn check_disk_headroom<T: HttpTransport>(
 /// Fetch all dump files for a wiki.
 pub fn fetch_wiki(wiki: &str, version: &str, data_dir: &Path) -> Result<Vec<PathBuf>> {
     let transport = build_transport()?;
+    fetch_wiki_with_transport(&transport, BASE_URL, wiki, version, data_dir)
+}
+
+fn fetch_wiki_with_transport<T: HttpTransport>(
+    transport: &T,
+    base_url: &str,
+    wiki: &str,
+    version: &str,
+    data_dir: &Path,
+) -> Result<Vec<PathBuf>> {
     let files = build_file_list(wiki, version)?;
-    check_disk_headroom(&transport, BASE_URL, wiki, version, &files, data_dir)?;
-    fetch_wiki_from_base_with_transport(&transport, BASE_URL, wiki, version, data_dir)
+    check_disk_headroom(transport, base_url, wiki, version, &files, data_dir)?;
+    fetch_wiki_from_base_with_transport(transport, base_url, wiki, version, data_dir)
 }
 
 /// Delete a wiki's downloaded `.bz2` dump files, freeing the on-disk peak
@@ -1547,21 +1576,6 @@ mod tests {
             content_length,
             accepts_ranges,
         }
-    }
-
-    fn fetch_paths_with_transport(
-        transport: &FakeTransport,
-        wiki: &str,
-        version: &str,
-        data_dir: &Path,
-    ) -> Result<Vec<PathBuf>> {
-        fetch_wiki_from_base_with_transport(
-            transport,
-            "http://example.invalid",
-            wiki,
-            version,
-            data_dir,
-        )
     }
 
     #[test]
@@ -2226,8 +2240,16 @@ mod tests {
         fs::create_dir_all(&raw_dir)?;
         let existing = raw_dir.join(filename);
         fs::write(&existing, b"already-here")?;
-        let transport = FakeTransport::with_outcomes([ok_head(Some(12), true)], []);
-        let paths = fetch_paths_with_transport(&transport, wiki, "2026-02", data_dir.path())?;
+        let transport =
+            FakeTransport::with_outcomes([ok_head(Some(12), true), ok_head(Some(12), true)], []);
+        let paths = fetch_wiki_with_transport(
+            &transport,
+            "http://example.invalid",
+            wiki,
+            "2026-02",
+            data_dir.path(),
+        )
+        .expect("an existing dump should pass orchestration without downloading");
 
         assert_eq!(paths, vec![existing]);
         assert_eq!(transport.get_requests(), 0);
@@ -2279,7 +2301,17 @@ mod tests {
                 ok_get(b"BZhpayload-by", false),
             ],
         );
-        let paths = fetch_paths_with_transport(&transport, wiki, "2002-01", data_dir.path())?;
+        let files = build_file_list(wiki, "2002-01")?;
+        let paths = fetch_wiki_from_base_with_transport_at_parallelism(
+            &transport,
+            "http://example.invalid",
+            wiki,
+            "2002-01",
+            data_dir.path(),
+            files,
+            2,
+        )
+        .expect("parallel fetch should complete");
 
         assert_eq!(paths.len(), 2);
         assert!(paths.iter().all(|path| path.exists()));
@@ -2390,7 +2422,8 @@ mod tests {
             "2026-02",
             &["2026-02.testwiki.all-time.tsv.bz2".to_string()],
             temp_dir.path(),
-        )?;
+        )
+        .expect("headroom check should pass");
         Ok(())
     }
 
@@ -2407,7 +2440,8 @@ mod tests {
             "2026-02",
             &["2026-02.testwiki.all-time.tsv.bz2".to_string()],
             temp_dir.path(),
-        )?;
+        )
+        .expect("unknown remote size should not block the fetch");
         Ok(())
     }
 
@@ -2427,8 +2461,27 @@ mod tests {
             "2026-02",
             &["2026-02.testwiki.all-time.tsv.bz2".to_string()],
             temp_dir.path(),
-        )?;
+        )
+        .expect("fully downloaded bytes should require no more space");
         Ok(())
+    }
+
+    #[test]
+    fn check_disk_headroom_skips_failed_space_query() {
+        init_test_tracing();
+        let temp_dir = TestDir::new().expect("temporary directory");
+        let missing_data_dir = temp_dir.path().join("missing");
+        let transport = FakeTransport::with_head_outcomes([ok_head(Some(1024), true)]);
+
+        check_disk_headroom(
+            &transport,
+            "http://example.invalid",
+            "testwiki",
+            "2026-02",
+            &["2026-02.testwiki.all-time.tsv.bz2".to_string()],
+            &missing_data_dir,
+        )
+        .expect("an unavailable filesystem-space query is best-effort");
     }
 
     #[test]

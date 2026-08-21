@@ -88,6 +88,26 @@ fn materialize_dashboard_artifacts(output_dir: &Path) -> Result<()> {
 // must not block the metric-parquet merge that already succeeded. Failures
 // are logged and that artifact is skipped rather than propagated.
 fn materialize_dashboard_artifacts_from_dir(output_dir: &Path, generator_dir: &Path) -> Result<()> {
+    materialize_dashboard_artifacts_with_runner(
+        output_dir,
+        generator_dir,
+        |interpreter, script_path, output_dir| {
+            Command::new(interpreter)
+                .arg(script_path)
+                .env("WIKI_ECON_OUTPUT_DIR", output_dir)
+                .output()
+        },
+    )
+}
+
+fn materialize_dashboard_artifacts_with_runner<F>(
+    output_dir: &Path,
+    generator_dir: &Path,
+    mut run: F,
+) -> Result<()>
+where
+    F: FnMut(&str, &Path, &Path) -> std::io::Result<std::process::Output>,
+{
     for script_name in [
         "defaults_business.json.cjs",
         "defaults_edit_variation.json.cjs",
@@ -106,11 +126,7 @@ fn materialize_dashboard_artifacts_from_dir(output_dir: &Path, generator_dir: &P
         } else {
             "bash"
         };
-        let output = match Command::new(interpreter)
-            .arg(&script_path)
-            .env("WIKI_ECON_OUTPUT_DIR", output_dir)
-            .output()
-        {
+        let output = match run(interpreter, &script_path, output_dir) {
             Ok(output) => output,
             Err(err) => {
                 warn!(script = %script_path.display(), error = %err, "failed to spawn dashboard artifact generator");
@@ -271,6 +287,36 @@ mod tests {
             fs::read_to_string(output_dir.path().join("defaults_gdp.json"))?,
             "{\"ok\":true}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn materialize_dashboard_artifacts_skips_spawn_failures() -> Result<()> {
+        init_test_tracing();
+        let output_dir = TestDir::new()?;
+        let generator_dir = TestDir::new()?;
+        fs::write(
+            generator_dir.path().join("manifest.json.sh"),
+            "#!/bin/sh\nprintf '{}'\n",
+        )
+        .expect("write generator fixture");
+        let mut attempts = 0;
+
+        materialize_dashboard_artifacts_with_runner(
+            output_dir.path(),
+            generator_dir.path(),
+            |_, _, _| {
+                attempts += 1;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "injected missing interpreter",
+                ))
+            },
+        )
+        .expect("spawn failures are best-effort");
+
+        assert_eq!(attempts, 1);
+        assert!(!output_dir.path().join("manifest.json").exists());
         Ok(())
     }
 }

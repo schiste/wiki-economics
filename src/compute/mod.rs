@@ -821,7 +821,21 @@ fn compute_page_weekly_edits(wiki: &str, data_dir: &Path, output_dir: &Path) -> 
     // single in-memory DataFrame, which is what exceeded the memory ceiling
     // when this pipeline used collect() (verified across multiple prior
     // attempts, regardless of how the partition merges were batched).
-    let sunk = joined.sink(
+    sink_lazy_frame_to_parquet(joined, &path)?;
+    let bytes = fs::metadata(&path)?.len();
+    info!(
+        wiki = wiki,
+        metric = "page_weekly_edits",
+        bytes = bytes,
+        elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
+        path = %path.display(),
+        "wrote metric output"
+    );
+    Ok(())
+}
+
+fn sink_lazy_frame_to_parquet(frame: LazyFrame, path: &Path) -> Result<()> {
+    let sunk = frame.sink(
         SinkDestination::File {
             target: SinkTarget::Path(path.to_string_lossy().as_ref().into()),
         },
@@ -832,15 +846,6 @@ fn compute_page_weekly_edits(wiki: &str, data_dir: &Path, output_dir: &Path) -> 
         UnifiedSinkArgs::default(),
     )?;
     sunk.collect_with_engine(Engine::Streaming)?;
-    let bytes = fs::metadata(&path)?.len();
-    info!(
-        wiki = wiki,
-        metric = "page_weekly_edits",
-        bytes = bytes,
-        elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
-        path = %path.display(),
-        "wrote metric output"
-    );
     Ok(())
 }
 
@@ -1135,7 +1140,8 @@ mod tests {
             Column::new("page_id".into(), vec![10_i64, 10, 10]),
             Column::new("page_title".into(), vec!["Alpha", "Alpha", "Alpha"]),
             Column::new("page_namespace".into(), vec![0_i32, 0, 0]),
-        ])?;
+        ])
+        .expect("valid January fixture");
         let mut feb = DataFrame::new_infer_height(vec![
             Column::new(
                 "event_timestamp".into(),
@@ -1148,7 +1154,8 @@ mod tests {
             Column::new("page_id".into(), vec![10_i64, 10, 20]),
             Column::new("page_title".into(), vec!["Alpha", "Alpha", "Beta"]),
             Column::new("page_namespace".into(), vec![0_i32, 0, 0]),
-        ])?;
+        ])
+        .expect("valid February fixture");
 
         ParquetWriter::new(&mut fs::File::create(jan_dir.join("part-000.parquet"))?)
             .finish(&mut jan)?;
@@ -1455,6 +1462,29 @@ mod tests {
         assert_eq!(wow_rate, vec![None, Some(-0.5), None, Some(0.0)]);
 
         Ok(())
+    }
+
+    #[test]
+    fn streaming_parquet_sink_rejects_nested_sinks() {
+        let output_dir = TestDir::new().expect("temporary output directory");
+        let first_path = output_dir.path().join("first.parquet");
+        let second_path = output_dir.path().join("second.parquet");
+        let frame = DataFrame::new_infer_height(vec![Column::new("value".into(), [1_i64])])
+            .expect("valid sink fixture")
+            .lazy();
+        let first_sink = frame
+            .sink(
+                SinkDestination::File {
+                    target: SinkTarget::Path(first_path.to_string_lossy().as_ref().into()),
+                },
+                FileWriteFormat::Parquet(std::sync::Arc::new(ParquetWriteOptions::default())),
+                UnifiedSinkArgs::default(),
+            )
+            .expect("first sink should be accepted");
+
+        let error = sink_lazy_frame_to_parquet(first_sink, &second_path)
+            .expect_err("Polars must reject a sink layered on another sink");
+        assert!(error.to_string().contains("cannot create a sink"));
     }
 
     #[test]
