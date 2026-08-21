@@ -41,8 +41,12 @@ Toolforge entirely.
 - `run-refresh.sh` — wraps `scripts/refresh.sh` for the scheduled job.
   Unlike Cloud VPS's `run-refresh.sh`, this does not keep a `releases/`
   history: retaining multiple full output generations is expensive against
-  a small NFS quota. Raw `.bz2` dump cleanup happens inside the pipeline
-  itself, not in this script: `wiki-econ run` deletes each wiki's raw dump
+  a small NFS quota. Parquet files are written to temporary siblings and
+  renamed only after successful completion. The Observable site is built in
+  a clean hidden sibling directory, then the stable `site-dist` symlink is
+  atomically switched and the prior site release is removed. Raw `.bz2` dump
+  cleanup happens inside the pipeline itself, not in this script:
+  `wiki-econ run` deletes each wiki's raw dump
   immediately after that wiki's ingest stage succeeds (`src/main.rs`'s
   `Commands::Run` loop, backed by `fetch::cleanup_raw_dump`), rather than
   waiting for every wiki in the batch plus the site build to finish. This
