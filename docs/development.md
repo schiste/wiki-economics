@@ -21,7 +21,7 @@ Preferred full local verification command:
 Expanded commands:
 
 ```sh
-bash -n scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh
+bash -n scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh deploy/toolforge/*.sh
 node --check site/admin-auth.cjs
 node --check site/admin-server.cjs
 node --check site/observablehq.config.js
@@ -63,7 +63,7 @@ The local verification script also checks:
 The repo is intentionally one codebase with two orchestration modes:
 
 - `local`: `scripts/setup.sh`, `scripts/dev.sh`, and the admin UI/API for interactive onboarding
-- `production`: `deploy/cloud-vps/` wrappers, static site serving, scheduled refreshes, and an optional authenticated admin surface behind the loopback-only Node server
+- `production`: `deploy/cloud-vps/` or `deploy/toolforge/` wrappers, static site serving, scheduled refreshes, and an optional authenticated admin surface
 
 The shared contract across both modes is:
 
@@ -86,18 +86,22 @@ The repo-level operational scripts are:
 
 Shared runtime path handling lives in `scripts/lib/wiki_econ.sh`.
 
-Production wrappers under `deploy/cloud-vps/` should call those shared scripts
-rather than reimplementing pipeline steps.
+Production wrappers under `deploy/cloud-vps/` and `deploy/toolforge/` should
+call those shared scripts rather than reimplementing pipeline steps.
 
 ## CI Structure
 
-GitHub Actions is split into three jobs:
+GitHub Actions is split into four jobs:
 
-- `quality`: formatting, clippy, Rust tests, Python patrol script checks, docs
+- `quality`: formatting, clippy, Python patrol script checks, docs
 - `coverage`: `cargo llvm-cov` LCOV export plus `scripts/check_lcov.py` enforcing zero uncovered lines
 - `security`: `cargo-deny` and `cargo-audit`
+- `deploy-toolforge`: after the other jobs pass on `main`, selectively builds
+  and deploys the Rust binary and/or refreshes the Toolforge source image
 
-That split is intentional. Keep fast correctness failures separate from coverage drift and dependency-policy drift.
+That split is intentional. Keep fast correctness failures separate from
+coverage drift, dependency-policy drift, and production credentials. The
+coverage run subsumes the ordinary Rust test suite.
 
 The LCOV check is deliberate. `cargo llvm-cov --summary-only` can under-report line coverage on fully exercised lines because of sub-line region artifacts around `?` and similar expressions. CI treats the exported LCOV file as the source of truth for line coverage.
 

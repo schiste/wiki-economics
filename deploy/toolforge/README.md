@@ -17,34 +17,24 @@ Toolforge entirely.
 
 ## Files
 
-- No Dockerfile: Toolforge's Build Service only supports Cloud Native
-  Buildpacks (`toolforge build start` does not accept a Dockerfile, and
-  there's no documented path to reference a custom-built Docker image from
-  `toolforge jobs`/`toolforge webservice`). The image is instead built by
-  buildpack auto-detection from three files at the **repo root**:
-  `Cargo.toml` (Rust CLI, detected by the Rust buildpack), `package.json` +
-  `package-lock.json` (Node — `@observablehq/framework` and `duckdb`,
-  needed by `scripts/build-site.sh` and the `site/data-build/*.cjs`
-  generators; the `site/data-build/*.cjs` generators query Parquet through
-  the `duckdb` npm package's Node bindings, so no separate DuckDB CLI is
-  needed), and `Procfile` (`web: node site/admin-server.cjs`, which
-  `admin-server.cjs` itself needs zero npm dependencies to run — it only
-  uses Node built-ins + local `./admin-auth.cjs`). No Python — `src/patrol.rs`
-  implements fetch/compute patrol natively; the Python scripts under
-  `scripts/` are only used by `scripts/ci-local.sh`, not the production
-  refresh path.
-
-  **This combination is the open, untested question this deployment path
-  answers.** Toolforge documents "Node + one other language" as a general,
-  supported Build Service feature (the builder auto-injects the `nodejs`
-  buildpack ahead of the primary-language buildpack — this isn't something
-  configured via a `project.toml`), and Rust is a separately documented
-  Toolforge buildpack. Whether the two combine cleanly in one image has not
-  been verified end-to-end against a real Toolforge build — step 4 below is
-  the actual test. If it fails, the fallback is splitting into two images
-  (a Rust-only image for the CLI/refresh job, a Node-only image for the
-  admin webservice, coordinating through the shared NFS data/output dirs)
-  rather than reintroducing a Dockerfile, which Toolforge cannot consume.
+- No Dockerfile: Toolforge's Build Service still builds the Node runtime,
+  npm dependencies, repository scripts, and `Procfile` into its supported
+  Cloud Native Buildpack image. `RustConfig` sets `RUST_SKIP_BUILD=1`, so the
+  detected Rust buildpack does not repeat the expensive Cargo build. Set the
+  build-only variable `WIKI_ECON_BUILD_RUST=1` for an emergency manual build.
+- `.github/workflows/ci.yml` builds the release binary on an x86-64 Ubuntu
+  24.04 runner after quality, coverage, and security jobs pass. It validates
+  the ELF format, dynamic libraries, and `--help`, uploads a 30-day artifact,
+  and deploys through the Toolforge SSH bastion.
+- `deploy-binary.sh` uploads to a staging path and calls
+  `install-binary.sh` as the tool account. Releases live at
+  `/data/project/wiki-economics/app/releases/<git-sha>/wiki-econ`; the stable
+  runtime path is `/data/project/wiki-economics/app/current/wiki-econ`.
+- `rollback-binary.sh` validates a retained release and atomically changes
+  `current` without compiling or downloading anything.
+- `rebuild-image.sh` rebuilds only the Toolforge image and restarts continuous
+  processes. It uses detached JSON output and polls the exact build ID, so a
+  disconnected log stream or concurrent build cannot produce a false result.
 - `jobs.yaml` — Toolforge Jobs definitions: `wiki-econ-admin` (continuous,
   serves `/admin*` and the built static site on one process/port — Toolforge
   has no per-tool nginx layer) and `wiki-econ-refresh` (scheduled, runs the
@@ -69,89 +59,87 @@ Toolforge entirely.
 
 ## Runbook
 
-None of the following can be run without a live Toolforge tool account, so
-treat this as an operator checklist rather than something already executed:
+### One-time GitHub setup
 
-1. **Request a tool account** and file a Phabricator "Toolforge (Quota
-   requests)" ticket for storage, sized off the first wiki's transient peak
-   (nlwiki ≈8.71GB; add frwiki's ≈31GB peak later once nlwiki is validated).
-2. **Register a MediaWiki OAuth2 consumer** on `meta.wikimedia.org` via
-   `Special:OAuthConsumerRegistration/propose`. Use OAuth2, set the callback
-   URL to the exact production URL
-   (`https://<tool-domain>/admin/oauth/callback` — must match exactly, no
-   trailing slash differences), and pick "This consumer is for use only by
-   ‎<your username>" (owner-only) so it's usable immediately without
-   waiting on admin approval. This yields a client ID and, since it's a
-   confidential client, a client secret (no PKCE needed).
-3. **Store secrets**: `toolforge envvars create <NAME> <VALUE>` for
-   `WIKI_ECON_ADMIN_MEDIAWIKI_CLIENT_ID`,
-   `WIKI_ECON_ADMIN_MEDIAWIKI_CLIENT_SECRET`,
-   `WIKI_ECON_ADMIN_SESSION_SECRET`, `WIKI_ECON_ADMIN_ALLOWED_USERNAMES`
-   (comma/newline-separated Wikimedia usernames, case-sensitive),
-   `WIKI_ECON_ADMIN_PUBLIC_ORIGIN` — same variable names
-   `site/admin-server.cjs` already reads from `process.env`, see
-   `deploy/cloud-vps/env.example` for the full list and expected shape.
-   `WIKI_ECON_ADMIN_MEDIAWIKI_HOST` defaults to `https://meta.wikimedia.org`
-   and only needs to be set as an envvar if that ever changes.
-4. **Build the image**: `toolforge build start <repo-url>` (buildpack
-   auto-detection from the repo root's `Cargo.toml` + `package.json` +
-   `Procfile` — see "Files" above for why this combination is unverified).
-   Watch the build logs closely: confirm both a Rust buildpack step and a
-   Node buildpack step run, and that the final image actually contains a
-   working `wiki-econ` binary on `PATH` alongside a Node runtime. If the
-   build fails to combine the two runtimes, fall back to splitting into
-   two separate buildpack-built images (Rust-only for the CLI/refresh job,
-   Node-only for the admin webservice) rather than reaching for a
-   Dockerfile, which Toolforge's Build Service cannot consume. Confirm the
-   actual `toolforge build start` invocation against current Toolforge
-   docs — the CLI surface changes over time.
+Create a protected GitHub environment named `toolforge`, ideally with a
+required reviewer, and add these environment secrets before merging the
+deployment workflow:
 
-   **For every rebuild after the first** (i.e. once `jobs.yaml` is loaded
-   and the admin webservice is started per steps 6-7), use
-   `deploy/toolforge/rebuild-image.sh` instead of a bare `toolforge build
-   start`. Pushing a new image under `:latest` does not affect pods already
-   running — Kubernetes env/binaries are fixed at container start — so a
-   rebuild that isn't paired with an explicit restart silently leaves the
-   old binary running indefinitely (this is exactly what caused a `spawn
-   cargo ENOENT` incident: the admin webservice's pod predated
-   `WIKI_ECON_BIN` being set tool-wide, and nothing restarted it after the
-   image that would have fixed the fallback was pushed). The script polls
-   `toolforge build list` for true build completion (working around
-   `toolforge build start`'s own flaky log stream, which can disconnect
-   with `ChunkedEncodingError` and exit 0 mid-build) and then restarts the
-   admin webservice — and defensively, any Toolforge Job actually running
-   as `continuous` — so the new image takes effect everywhere automatically.
-5. **Point scripts at the compiled binary**: the buildpack run image ships
-   no Rust toolchain — only the compiled `wiki-econ` binary, at
-   `/workspace/target/release/wiki-econ`. `scripts/lib/wiki_econ.sh` (used
-   by `run-refresh.sh` and every job/cron entrypoint) falls back to `cargo
-   run --release --` when `WIKI_ECON_BIN` is unset, which fails on
-   Toolforge since `cargo` isn't present. Set it once, tool-wide, before
-   running any job: `toolforge envvars create WIKI_ECON_BIN
-   /workspace/target/release/wiki-econ` (confirm the actual in-image path
-   from the build logs — buildpack layer paths can change across
-   `pack`/heroku-buildpack versions).
-6. **Fill in `jobs.yaml`**: run `toolforge jobs images` to get the short
-   image name the build produced, replace the `<TOOL_IMAGE>` placeholders
-   in `jobs.yaml` with it, then `toolforge jobs load
-   deploy/toolforge/jobs.yaml`.
-7. **Start the admin webservice** (`wiki-econ-admin`) and confirm `/admin`
-   and a static site asset both resolve on the assigned Toolforge domain.
-8. **Trigger `wiki-econ-refresh` once manually** (`toolforge jobs run
-   wiki-econ-refresh` or equivalent), then confirm: parquet outputs appear
-   under `WIKI_ECON_OUTPUT_DIR`, the site builds under
-   `WIKI_ECON_SITE_DIST_DIR`, the raw `.bz2` files are deleted afterward,
-   and NFS usage stays under the granted quota. Re-run once more to confirm
-   idempotency (marker manifest still validates without the raw file
-   present).
-9. **Measure real numbers** this plan couldn't produce without live access:
-   peak RSS during ingest against the job's memory limit (`jobs.yaml`
-   currently requests 4Gi for the refresh job, adjustable up to Toolforge's
-   per-job ceiling), actual wall-clock refresh time (to size the cron
-   schedule), and the patrol data (`data/patrol/<wiki>`) storage footprint,
-   which was never measured empirically this session.
-10. Once nlwiki is verified end-to-end, repeat for frwiki (after the quota
-    bump), then decommission the Cloud VPS deployment.
+- `TOOLFORGE_SSH_USER`: a Toolforge member's Developer account username.
+- `TOOLFORGE_SSH_PRIVATE_KEY`: a dedicated SSH private key whose public key
+  is registered for that Developer account. Do not reuse a personal default
+  key if a narrowly scoped CI key can be registered.
+- `TOOLFORGE_KNOWN_HOSTS`: the verified `login.toolforge.org` host-key lines.
+  Copy known-good entries from an operator's `~/.ssh/known_hosts`; do not
+  disable strict host-key checking in CI.
+
+The corresponding user must be a member of the `wiki-economics` tool so
+`become wiki-economics` succeeds. GitHub CLI configuration is optional; the
+workflow uses the standard SSH client.
+
+### First cutover
+
+1. Merge only after the `toolforge` environment and all three secrets exist.
+   The main-branch workflow waits for quality, coverage, and security checks,
+   builds the Linux release, installs it on NFS, changes `WIKI_ECON_BIN` to
+   `/data/project/wiki-economics/app/current/wiki-econ`, and restarts the
+   webservice. It then rebuilds the source image at the exact Git SHA; Cargo
+   is skipped in that Toolforge build.
+2. Confirm the release and environment from the Toolforge bastion:
+
+   ```sh
+   become wiki-economics ls -l /data/project/wiki-economics/app/current
+   become wiki-economics toolforge envvars show WIKI_ECON_BIN
+   become wiki-economics /data/project/wiki-economics/app/current/wiki-econ --help
+   become wiki-economics toolforge webservice status
+   ```
+
+3. Run `wiki-econ-refresh` manually, confirm the expected Parquet/site
+   outputs, then run it a second time to verify marker-based idempotency.
+
+### Normal releases
+
+Every push to `main` is classified by changed path after CI passes:
+
+- Rust inputs (`src/`, Cargo files, toolchain config, or `vendor/`) build and
+  deploy a new binary using a persistent GitHub release cache.
+- Node, site, shared script, `RustConfig`, or Toolforge deployment changes
+  trigger the lightweight Toolforge image build and process restart.
+- Documentation-only and unrelated CI changes perform no deployment work.
+
+The release artifact and checksum are retained in GitHub for 30 days. NFS
+release directories are deliberately not auto-deleted; automatic pruning can
+turn a quota issue into the loss of a known-good rollback target.
+
+### Rollback
+
+List retained SHAs, switch to one, and restart the webservice:
+
+```sh
+ssh login.toolforge.org 'become wiki-economics find /data/project/wiki-economics/app/releases -mindepth 1 -maxdepth 1 -type d -printf "%f\n"'
+ssh login.toolforge.org 'become wiki-economics bash /workspace/deploy/toolforge/rollback-binary.sh <40-character-sha>'
+ssh login.toolforge.org 'become wiki-economics toolforge webservice restart'
+```
+
+If `/workspace` does not contain the desired script version, stream the local
+copy instead:
+
+```sh
+ssh login.toolforge.org 'become wiki-economics bash -s -- <40-character-sha>' \
+  < deploy/toolforge/rollback-binary.sh
+ssh login.toolforge.org 'become wiki-economics toolforge webservice restart'
+```
+
+For disaster recovery when GitHub deployment is unavailable, start a manual
+Toolforge build with:
+
+```sh
+toolforge build start --envvar WIKI_ECON_BUILD_RUST=1 \
+  --ref main https://github.com/schiste/wiki-economics.git
+```
+
+That restores the old cold-build behavior and is expected to take
+substantially longer.
 
 ## Object storage was considered and rejected for now
 
@@ -181,10 +169,10 @@ before assuming NFS quota is still the only lever.
 
 ## Open risks worth re-checking before relying on this
 
-- **Rust + Node in one buildpack image**: see "Files" above — this is the
-  single biggest open question and step 4 of the runbook is the actual
-  test. No Dockerfile fallback exists on this platform; the fallback if
-  buildpacks can't combine both runtimes is two separate images.
+- **Runner/runtime ABI**: the GitHub job intentionally uses Ubuntu 24.04
+  x86-64, matching the current Toolforge runtime and OpenSSL 3. Re-check the
+  binary with `file`, `ldd`, and `--help` after either platform changes its
+  base image; the workflow performs the same checks before every deploy.
 - **Non-root UID**: buildpack-built images don't pin a specific UID/GID —
   Toolforge assigns this at the Kubernetes level. If file permissions on
   mounted NFS paths misbehave, this is the first place to look.

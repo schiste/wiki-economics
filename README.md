@@ -142,6 +142,7 @@ python3 -m unittest discover -s scripts -p 'test_*.py'
 - [Architecture](docs/architecture.md)
 - [Admin Server](docs/admin-server.md)
 - [Cloud VPS Deployment](docs/cloud-vps-deploy.md)
+- [Toolforge Deployment](deploy/toolforge/README.md)
 - [Development](docs/development.md)
 - [Benchmarking](docs/benchmarking.md)
 - [Dependencies and Licenses](docs/dependencies-and-licenses.md)
@@ -152,7 +153,7 @@ python3 -m unittest discover -s scripts -p 'test_*.py'
 
 ## Platform Notes
 
-- macOS and Linux are first-class platforms. CI runs on `ubuntu-latest`
+- macOS and Linux are first-class platforms. CI runs on Ubuntu 24.04.
   and the developer-side flow is exercised on macOS.
 - Windows is supported on a best-effort basis. `site/src/data` is a
   symlink to `../../output`, which requires Developer Mode or
