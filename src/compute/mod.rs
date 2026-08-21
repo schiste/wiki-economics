@@ -637,16 +637,37 @@ fn compute_page_weekly_edits(wiki: &str, data_dir: &Path, output_dir: &Path) -> 
     // warehouse can hold tens of millions of revision-level rows, which
     // exceeds Toolforge's per-container memory ceiling if scanned and
     // grouped all at once. Each partition is collected immediately after
-    // its own group_by, so peak memory is bounded by one partition's size,
-    // not the full history. A week that spans a month boundary produces a
-    // partial-count row from each of its two partitions here; the merge
-    // group_by below sums those back together.
+    // its own group_by, so peak memory during this loop is bounded by one
+    // partition's size, not the full history. A week that spans a month
+    // boundary produces a partial-count row from each of its two
+    // partitions here; the batch and final merges below sum those back
+    // together.
+    //
+    // Merging is done as a two-level tree (partitions -> batches -> final)
+    // rather than collecting all partition frames and concatenating them
+    // once at the end: holding all ~300 partition frames simultaneously
+    // and then group_by-ing the ~40M-row concatenation is itself enough
+    // to exceed the memory ceiling, even though no single partition is
+    // large. Merging in small batches bounds the number of partition
+    // frames held live at once, and the batch-level merges are cheap to
+    // hold and re-merge at the end since they're already deduplicated.
+    const MERGE_BATCH_SIZE: usize = 20;
+
     info!(
         wiki = wiki,
         partitions = partitions.len(),
         "page_weekly_edits: starting per-partition reduction"
     );
-    let mut weekly_frames = Vec::with_capacity(partitions.len());
+    let weekly_group_keys = || {
+        [
+            col("page_id"),
+            col("page_namespace"),
+            col("page_title"),
+            col("week_start"),
+        ]
+    };
+    let mut batch_frames = Vec::with_capacity(MERGE_BATCH_SIZE);
+    let mut merged_batches = Vec::new();
     let mut running_rows: usize = 0;
     for (idx, partition) in partitions.iter().enumerate() {
         let partition_weekly = warehouse_lazyframe(&partition.dir)?
@@ -660,12 +681,7 @@ fn compute_page_weekly_edits(wiki: &str, data_dir: &Path, output_dir: &Path) -> 
                     .truncate(lit("1w"))
                     .alias("week_start"),
             )
-            .group_by([
-                col("page_id"),
-                col("page_namespace"),
-                col("page_title"),
-                col("week_start"),
-            ])
+            .group_by(weekly_group_keys())
             .agg([col("page_id").count().alias("edits")])
             .collect()?;
         running_rows += partition_weekly.height();
@@ -678,22 +694,33 @@ fn compute_page_weekly_edits(wiki: &str, data_dir: &Path, output_dir: &Path) -> 
             running_rows = running_rows,
             "page_weekly_edits: reduced partition"
         );
-        weekly_frames.push(partition_weekly);
+        batch_frames.push(partition_weekly);
+
+        let is_last_partition = idx + 1 == partitions.len();
+        if batch_frames.len() >= MERGE_BATCH_SIZE || is_last_partition {
+            let batch_merged = concat_frames(std::mem::take(&mut batch_frames))?
+                .lazy()
+                .group_by(weekly_group_keys())
+                .agg([col("edits").sum()])
+                .collect()?;
+            info!(
+                wiki = wiki,
+                batch = merged_batches.len() + 1,
+                batch_rows = batch_merged.height(),
+                "page_weekly_edits: merged partition batch"
+            );
+            merged_batches.push(batch_merged);
+        }
     }
 
     info!(
         wiki = wiki,
-        running_rows = running_rows,
-        "page_weekly_edits: concatenating and merging partition reductions"
+        batches = merged_batches.len(),
+        "page_weekly_edits: merging partition batches"
     );
-    let weekly_merged = concat_frames(weekly_frames)?
+    let weekly_merged = concat_frames(merged_batches)?
         .lazy()
-        .group_by([
-            col("page_id"),
-            col("page_namespace"),
-            col("page_title"),
-            col("week_start"),
-        ])
+        .group_by(weekly_group_keys())
         .agg([col("edits").sum()])
         .collect()?;
     info!(
