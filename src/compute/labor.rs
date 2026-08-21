@@ -162,7 +162,7 @@ pub fn compute(wiki: &str, base: &DataFrame, output_dir: &Path) -> Result<()> {
         .unique()?
         .sort(Default::default())?
         .i32()?
-        .into_iter()
+        .iter()
         .flatten()
         .collect();
 

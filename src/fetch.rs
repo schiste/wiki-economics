@@ -510,7 +510,11 @@ impl AttemptError {
     /// Retryable error carrying the response status that caused it, so the
     /// retry loop can honor a 429's `Retry-After` header (or fall back to a
     /// longer rate-limit-specific backoff) instead of the general schedule.
-    fn retryable_status(status: StatusCode, retry_after: Option<Duration>, error: anyhow::Error) -> Self {
+    fn retryable_status(
+        status: StatusCode,
+        retry_after: Option<Duration>,
+        error: anyhow::Error,
+    ) -> Self {
         Self {
             error,
             retryable: true,

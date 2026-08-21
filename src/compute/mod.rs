@@ -774,8 +774,15 @@ fn compute_page_weekly_edits(wiki: &str, data_dir: &Path, output_dir: &Path) -> 
         )
         .with_columns([
             col("week_start").dt().iso_year().alias("iso_year"),
-            col("week_start").dt().week().cast(DataType::Int32).alias("iso_week"),
-            col("week_start").dt().to_string("%Y-%m-%d").alias("week_start"),
+            col("week_start")
+                .dt()
+                .week()
+                .cast(DataType::Int32)
+                .alias("iso_week"),
+            col("week_start")
+                .dt()
+                .to_string("%Y-%m-%d")
+                .alias("week_start"),
         ])
         .select([
             col("week_start"),
@@ -1352,7 +1359,7 @@ mod tests {
         let user_types: Vec<String> = inequality
             .column("user_type")?
             .str()?
-            .into_iter()
+            .iter()
             .flatten()
             .map(ToOwned::to_owned)
             .collect();
@@ -1385,29 +1392,24 @@ mod tests {
         let week_start: Vec<String> = weekly
             .column("week_start")?
             .str()?
-            .into_iter()
+            .iter()
             .flatten()
             .map(ToOwned::to_owned)
             .collect();
-        let edits: Vec<u32> = weekly
-            .column("edits")?
-            .u32()?
-            .into_iter()
-            .flatten()
-            .collect();
+        let edits: Vec<u32> = weekly.column("edits")?.u32()?.iter().flatten().collect();
         let previous_week_edits: Vec<u32> = weekly
             .column("previous_week_edits")?
             .u32()?
-            .into_iter()
+            .iter()
             .flatten()
             .collect();
         let wow_change: Vec<i64> = weekly
             .column("wow_change")?
             .i64()?
-            .into_iter()
+            .iter()
             .flatten()
             .collect();
-        let wow_rate: Vec<Option<f64>> = weekly.column("wow_rate")?.f64()?.into_iter().collect();
+        let wow_rate: Vec<Option<f64>> = weekly.column("wow_rate")?.f64()?.iter().collect();
 
         assert_eq!(
             week_start,
@@ -1524,7 +1526,7 @@ mod tests {
             churn
                 .column("period_type")?
                 .str()?
-                .into_iter()
+                .iter()
                 .flatten()
                 .any(|value| value == "quarter")
         );
@@ -1603,7 +1605,7 @@ mod tests {
             labor
                 .column("user_type")?
                 .str()?
-                .into_iter()
+                .iter()
                 .flatten()
                 .any(|value| value == "temporary")
         );
@@ -1625,7 +1627,7 @@ mod tests {
         let user_types: Vec<String> = loaded
             .column("user_type")?
             .str()?
-            .into_iter()
+            .iter()
             .flatten()
             .map(ToOwned::to_owned)
             .collect();

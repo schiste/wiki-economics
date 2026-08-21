@@ -165,4 +165,4 @@ jobs:
         run: cargo audit -D warnings
 
       - name: Vendor patch hygiene
-        run: scripts/check_vendor_polars.sh
+        run: scripts/check_vendor_patches.sh

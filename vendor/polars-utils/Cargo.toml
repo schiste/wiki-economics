@@ -12,7 +12,7 @@
 [package]
 edition = "2024"
 name = "polars-utils"
-version = "0.53.0"
+version = "0.55.2"
 authors = ["Ritchie Vink <ritchie46@gmail.com>"]
 build = "build.rs"
 autolib = false
@@ -28,6 +28,10 @@ repository = "https://github.com/pola-rs/polars"
 resolver = "2"
 
 [features]
+async-utils = [
+    "dep:tokio",
+    "dep:futures",
+]
 bigidx = []
 dsl-schema = [
     "dep:schemars",
@@ -43,6 +47,7 @@ python = [
 ]
 serde = [
     "dep:serde",
+    "polars-config/serde",
     "serde/derive",
     "dep:rmp-serde",
     "dep:flate2",
@@ -91,6 +96,10 @@ default-features = true
 [dependencies.foldhash]
 version = "0.2.0"
 
+[dependencies.futures]
+version = "0.3.25"
+optional = true
+
 [dependencies.half]
 version = "2.7.1"
 features = [
@@ -101,7 +110,7 @@ features = [
 optional = false
 
 [dependencies.hashbrown]
-version = "0.16.0"
+version = "0.17.1"
 features = [
     "rayon",
     "serde",
@@ -129,20 +138,24 @@ version = "0.4.2"
 version = "0.2"
 
 [dependencies.numpy]
-version = "0.27"
+version = "0.29"
 features = ["half"]
 optional = true
 
+[dependencies.polars-config]
+version = "0.55.2"
+default-features = false
+
 [dependencies.polars-error]
-version = "0.53.0"
+version = "0.55.2"
 default-features = false
 
 [dependencies.pyo3]
-version = "0.27"
+version = "0.29"
 optional = true
 
 [dependencies.rand]
-version = "0.9"
+version = "0.10"
 
 [dependencies.raw-cpuid]
 version = "11"
@@ -158,7 +171,7 @@ version = "1.3"
 optional = true
 
 [dependencies.schemars]
-version = "0.9.0"
+version = "1.2.1"
 features = ["preserve_order"]
 optional = true
 
@@ -185,14 +198,26 @@ version = "1"
 version = "0.1"
 
 [dependencies.sysinfo]
-version = "0.37"
+version = "0.39"
 features = ["system"]
+optional = true
+default-features = false
+
+[dependencies.tokio]
+version = "1.44"
+features = [
+    "rt",
+    "sync",
+]
 optional = true
 default-features = false
 
 [dependencies.uuid]
 version = "1.15.1"
-features = ["v4"]
+features = [
+    "v4",
+    "v7",
+]
 
 [dev-dependencies.proptest]
 version = "1.6"
@@ -200,10 +225,11 @@ features = ["std"]
 default-features = false
 
 [dev-dependencies.rand]
-version = "0.9"
+version = "0.10"
 
 [build-dependencies.version_check]
 version = "0.9.4"
 
 [lints.clippy]
 collapsible_if = "allow"
+question_mark = "allow"

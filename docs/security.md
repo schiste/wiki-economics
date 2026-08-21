@@ -169,7 +169,7 @@ is non-zero on every ingest run and the threat is hypothetical.
 - Third-party GitHub Actions are pinned to commit SHAs (see
   [`ci.yml`](../.github/workflows/ci.yml)). Refresh the SHAs
   deliberately; do not switch back to floating `@v4` tags.
-- The vendored `polars-utils` patch under `vendor/polars-utils` is
-  documented in [`PATCHES.md`](../vendor/polars-utils/PATCHES.md). The
-  `scripts/check_vendor_polars.sh` step in CI fails when that document
-  is missing or stale.
+- Every crate under `vendor/` carries a `PATCHES.md` register describing
+  its pinned upstream version and local security delta. The
+  `scripts/check_vendor_patches.sh` step in CI fails when a register is
+  missing or does not name its upstream version.

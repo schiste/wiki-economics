@@ -17,17 +17,19 @@ pub mod prefetch {
     /// # Safety
     ///
     /// This should only be called with pointers to valid memory.
-    unsafe fn prefetch_l2_impl(_ptr: *const u8) {
+    unsafe fn prefetch_l2_impl(ptr: *const u8) {
+        _ = ptr; // Silence unused - not always used on all platforms.
+
         #[cfg(target_arch = "x86_64")]
         {
             use std::arch::x86_64::*;
-            unsafe { _mm_prefetch(_ptr as *const _, _MM_HINT_T1) };
+            unsafe { _mm_prefetch(ptr as *const _, _MM_HINT_T1) };
         }
 
         #[cfg(all(target_arch = "aarch64", feature = "nightly"))]
         {
             use std::arch::aarch64::*;
-            unsafe { _prefetch(_ptr as *const _, _PREFETCH_READ, _PREFETCH_LOCALITY2) };
+            unsafe { _prefetch(ptr as *const _, _PREFETCH_READ, _PREFETCH_LOCALITY2) };
         }
     }
 

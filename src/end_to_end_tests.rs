@@ -150,13 +150,13 @@ fn pipeline_ingests_computes_and_merges_a_tinywiki_fixture() -> Result<()> {
     let year_months: Vec<String> = registered_rows
         .column("year_month")?
         .str()?
-        .into_iter()
+        .iter()
         .map(|opt| opt.unwrap_or("").to_string())
         .collect();
     let unique_editors: Vec<u32> = registered_rows
         .column("unique_editors")?
         .u32()?
-        .into_iter()
+        .iter()
         .map(|opt| opt.unwrap_or(0))
         .collect();
     let editors_by_month: HashMap<String, u32> =
@@ -175,25 +175,25 @@ fn pipeline_ingests_computes_and_merges_a_tinywiki_fixture() -> Result<()> {
     let periods: Vec<String> = monthly_churn
         .column("period")?
         .str()?
-        .into_iter()
+        .iter()
         .map(|opt| opt.unwrap_or("").to_string())
         .collect();
     let active: Vec<u32> = monthly_churn
         .column("active_editors")?
         .u32()?
-        .into_iter()
+        .iter()
         .map(|opt| opt.unwrap_or(0))
         .collect();
     let arrivals: Vec<u32> = monthly_churn
         .column("arrivals")?
         .u32()?
-        .into_iter()
+        .iter()
         .map(|opt| opt.unwrap_or(0))
         .collect();
     let departures: Vec<u32> = monthly_churn
         .column("departures")?
         .u32()?
-        .into_iter()
+        .iter()
         .map(|opt| opt.unwrap_or(0))
         .collect();
     let churn_by_month: HashMap<String, (u32, u32, u32)> = periods
@@ -225,7 +225,7 @@ fn pipeline_ingests_computes_and_merges_a_tinywiki_fixture() -> Result<()> {
         let wiki_values: Vec<String> = df
             .column("wiki")?
             .str()?
-            .into_iter()
+            .iter()
             .map(|opt| opt.unwrap_or("").to_string())
             .collect();
         assert!(

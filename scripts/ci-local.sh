@@ -55,8 +55,8 @@ cargo deny check advisories bans licenses sources
 echo "==> cargo audit -D warnings"
 cargo audit -D warnings
 
-echo "==> scripts/check_vendor_polars.sh"
-scripts/check_vendor_polars.sh
+echo "==> scripts/check_vendor_patches.sh"
+scripts/check_vendor_patches.sh
 
 echo "==> python3 -m py_compile scripts/fetch_patrol.py scripts/compute_patrol.py scripts/check_lcov.py scripts/test_fetch_patrol.py scripts/test_check_lcov.py"
 python3 -m py_compile \
