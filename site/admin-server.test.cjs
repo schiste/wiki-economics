@@ -77,6 +77,7 @@ async function startServer(t, envOverrides) {
     module,
     host: "127.0.0.1:3443",
     distDir: path.join(tempRoot, "dist"),
+    outputDir: path.join(tempRoot, "output"),
   };
 }
 
@@ -303,4 +304,85 @@ test("static fallback refuses to escape SITE_DIST_DIR via path traversal", async
     headers: { host },
   });
   assert.equal(response.statusCode, 404);
+});
+
+test("status reports the resolved runner, environment, and enabled wikis", async (t) => {
+  const { module, host } = await startServer(t, {
+    ...LOCAL_ENV,
+    WIKI_ECON_ENABLED_WIKIS: "nlwiki, frwiki",
+  });
+  // resolveRunner() reads WIKI_ECON_BIN from process.env at request time
+  // (not module-load time, unlike DATA_DIR/OUTPUT_DIR/ENABLED_WIKIS), so it
+  // must be set around the request rather than via startServer()'s
+  // load-then-restore env handling.
+  const previousBin = process.env.WIKI_ECON_BIN;
+  process.env.WIKI_ECON_BIN = "/usr/local/bin/wiki-econ";
+  t.after(() => {
+    if (previousBin == null) delete process.env.WIKI_ECON_BIN;
+    else process.env.WIKI_ECON_BIN = previousBin;
+  });
+
+  const response = await invoke(module, { url: "/api/status", headers: { host } });
+  assert.equal(response.statusCode, 200);
+  const body = JSON.parse(response.text());
+  assert.equal(body.runner.mode, "bin");
+  assert.match(body.runner.label, /wiki-econ/);
+  assert.deepEqual(body.enabledWikis, ["nlwiki", "frwiki"]);
+});
+
+test("status falls back to the cargo runner and no enabled wikis when unset", async (t) => {
+  const { module, host } = await startServer(t, LOCAL_ENV);
+  const response = await invoke(module, { url: "/api/status", headers: { host } });
+  const body = JSON.parse(response.text());
+  assert.equal(body.runner.mode, "cargo");
+  assert.match(body.runner.label, /cargo run/);
+  assert.deepEqual(body.enabledWikis, []);
+});
+
+test("scheduledRefresh tolerates a missing status file", async (t) => {
+  const { module, host } = await startServer(t, LOCAL_ENV);
+  const response = await invoke(module, { url: "/api/status", headers: { host } });
+  const body = JSON.parse(response.text());
+  assert.equal(body.scheduledRefresh.last, null);
+  assert.deepEqual(body.scheduledRefresh.history, []);
+  assert.equal(body.scheduledRefresh.schedule, null);
+});
+
+test("scheduledRefresh tolerates malformed JSON without throwing", async (t) => {
+  const { module, host, outputDir } = await startServer(t, LOCAL_ENV);
+  fs.writeFileSync(path.join(outputDir, ".refresh-status.json"), "{not valid json", "utf8");
+  fs.writeFileSync(
+    path.join(outputDir, ".refresh-history.jsonl"),
+    'not json\n{"startedAt":"2026-08-16T03:00:00Z","finishedAt":"2026-08-16T03:12:00Z","exitCode":0,"wikis":["nlwiki"],"durationSecs":720}\n',
+    "utf8",
+  );
+  const response = await invoke(module, { url: "/api/status", headers: { host } });
+  assert.equal(response.statusCode, 200);
+  const body = JSON.parse(response.text());
+  assert.equal(body.scheduledRefresh.last, null);
+  assert.equal(body.scheduledRefresh.history.length, 1);
+  assert.equal(body.scheduledRefresh.history[0].exitCode, 0);
+});
+
+test("scheduledRefresh surfaces the last run and configured schedule", async (t) => {
+  const { module, host, outputDir } = await startServer(t, {
+    ...LOCAL_ENV,
+    WIKI_ECON_REFRESH_SCHEDULE: "0 3 * * 0",
+  });
+  const entry = {
+    startedAt: "2026-08-16T03:00:00Z",
+    finishedAt: "2026-08-16T03:12:00Z",
+    exitCode: 0,
+    wikis: ["nlwiki"],
+    durationSecs: 720,
+  };
+  fs.writeFileSync(path.join(outputDir, ".refresh-status.json"), JSON.stringify(entry), "utf8");
+  fs.writeFileSync(path.join(outputDir, ".refresh-history.jsonl"), `${JSON.stringify(entry)}\n`, "utf8");
+
+  const response = await invoke(module, { url: "/api/status", headers: { host } });
+  const body = JSON.parse(response.text());
+  assert.equal(body.scheduledRefresh.schedule, "0 3 * * 0");
+  assert.deepEqual(body.scheduledRefresh.last, entry);
+  assert.equal(body.scheduledRefresh.history.length, 1);
+  assert.deepEqual(body.scheduledRefresh.history[0], entry);
 });

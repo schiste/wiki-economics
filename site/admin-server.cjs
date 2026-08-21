@@ -55,6 +55,14 @@ const ADMIN_MEDIAWIKI_HOST = (process.env.WIKI_ECON_ADMIN_MEDIAWIKI_HOST || "htt
 const ADMIN_MEDIAWIKI_CLIENT_ID = process.env.WIKI_ECON_ADMIN_MEDIAWIKI_CLIENT_ID || "";
 const ADMIN_MEDIAWIKI_CLIENT_SECRET = process.env.WIKI_ECON_ADMIN_MEDIAWIKI_CLIENT_SECRET || "";
 const ALLOWED_ORIGINS = resolveAllowedOrigins();
+// Display-only: the admin server can't query Toolforge Jobs state directly
+// (no Kubernetes/Toolforge API credentials in the pod), so the configured
+// schedule is sourced from tool-wide config, not confirmed against Toolforge.
+const REFRESH_SCHEDULE = process.env.WIKI_ECON_REFRESH_SCHEDULE || null;
+const ENABLED_WIKIS = (process.env.WIKI_ECON_ENABLED_WIKIS || "")
+  .split(/[,\s]+/)
+  .map((entry) => entry.trim())
+  .filter(Boolean);
 
 let currentJob = null;
 let jobLog = [];
@@ -62,6 +70,12 @@ let jobExitCode = null;
 let lastJob = null;
 let lastWikiJobs = new Map();
 let lastGlobalJob = null;
+// Capped history alongside the single "last job" trackers above, so the UI
+// can show more than just the most recent run per wiki without needing any
+// persistence beyond process lifetime.
+const JOB_HISTORY_LIMIT = 5;
+let lastWikiJobHistory = new Map();
+let lastGlobalJobHistory = [];
 let manifestCache = null;
 let manifestCacheAt = 0;
 const MANIFEST_CACHE_TTL_MS = 1500;
@@ -608,6 +622,55 @@ function resolveRunner() {
   return DEFAULT_RUNNER;
 }
 
+function runnerInfo() {
+  const runner = resolveRunner();
+  return {
+    mode: process.env.WIKI_ECON_BIN ? "bin" : "cargo",
+    label: runner.label,
+  };
+}
+
+function recordJobHistory(completedJob) {
+  if (completedJob.wiki) {
+    const history = [completedJob, ...(lastWikiJobHistory.get(completedJob.wiki) || [])].slice(0, JOB_HISTORY_LIMIT);
+    lastWikiJobHistory.set(completedJob.wiki, history);
+  } else {
+    lastGlobalJobHistory = [completedJob, ...lastGlobalJobHistory].slice(0, JOB_HISTORY_LIMIT);
+  }
+}
+
+// Best-effort read of the status marker `deploy/toolforge/run-refresh.sh`
+// writes to the shared NFS output dir. The admin webservice and the
+// `wiki-econ-refresh` scheduled Job run in separate Toolforge pods with no
+// shared process memory and no Toolforge/Kubernetes API access from the
+// admin pod, so this file is the only channel between them.
+function readRefreshStatus() {
+  let last = null;
+  try {
+    last = JSON.parse(fs.readFileSync(path.join(OUTPUT_DIR, ".refresh-status.json"), "utf8"));
+  } catch {
+    last = null;
+  }
+  let history = [];
+  try {
+    history = fs
+      .readFileSync(path.join(OUTPUT_DIR, ".refresh-history.jsonl"), "utf8")
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .map((line) => {
+        try {
+          return JSON.parse(line);
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
+  } catch {
+    history = [];
+  }
+  return { schedule: REFRESH_SCHEDULE, last, history };
+}
+
 function loadSupportedWikipedias() {
   if (supportedWikisCache) return supportedWikisCache;
   // Scrape the WIKIPEDIA_DATABASES constant from src/fetch.rs so the picker's
@@ -666,6 +729,8 @@ function setSyntheticJobLog(meta, lines, exitCode = 0) {
     running: false,
     log: [...jobLog],
     finishedAt: new Date().toISOString(),
+    diskHeadroom: null,
+    rawCleanup: null,
   };
   lastJob = completedJob;
   if (completedJob.wiki) {
@@ -673,6 +738,7 @@ function setSyntheticJobLog(meta, lines, exitCode = 0) {
   } else {
     lastGlobalJob = completedJob;
   }
+  recordJobHistory(completedJob);
   currentJob = null;
 }
 
@@ -769,8 +835,30 @@ function cleanupWikiArtifacts(wiki) {
   };
 }
 
+// Returns the first line of `chunk` matching `pattern`, trimmed; falls back
+// to the whole trimmed chunk if no single line matches (chunks aren't
+// guaranteed to be line-aligned).
+function firstMatchingLine(chunk, pattern) {
+  for (const line of chunk.split(/\r?\n/)) {
+    if (pattern.test(line)) return line.trim();
+  }
+  return chunk.trim();
+}
+
 function trackStageFromChunk(chunk) {
   if (!currentJob) return;
+
+  // These two are incidental facts logged mid-stage by src/fetch.rs, not
+  // stages themselves, so they're checked independently of the stage
+  // if/else-if chain below rather than folded into it.
+  if (/disk headroom check passed/i.test(chunk)) {
+    currentJob.diskHeadroom = { ok: true, message: firstMatchingLine(chunk, /disk headroom check passed/i) };
+  } else if (/insufficient disk space to fetch/i.test(chunk)) {
+    currentJob.diskHeadroom = { ok: false, message: firstMatchingLine(chunk, /insufficient disk space to fetch/i) };
+  }
+  if (/cleaned up raw dump files/i.test(chunk)) {
+    currentJob.rawCleanup = { done: true, message: firstMatchingLine(chunk, /cleaned up raw dump files/i) };
+  }
 
   const explicitMatches = [...chunk.matchAll(/\bstage=([a-z_]+)/g)];
   if (explicitMatches.length > 0) {
@@ -871,7 +959,16 @@ function getProgress() {
   }
 
   const pct = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
-  return { wiki, stage, done, total, pct, detail };
+  return {
+    wiki,
+    stage,
+    done,
+    total,
+    pct,
+    detail,
+    diskHeadroom: currentJob.diskHeadroom ?? null,
+    rawCleanup: currentJob.rawCleanup ?? null,
+  };
 }
 
 function matchApiPath(pathname) {
@@ -907,10 +1004,16 @@ function buildStatusPayload(req, session) {
     job: effectiveJob,
     wikiJobs: Object.fromEntries(lastWikiJobs.entries()),
     globalJob: lastGlobalJob,
+    wikiJobHistory: Object.fromEntries(lastWikiJobHistory.entries()),
+    globalJobHistory: lastGlobalJobHistory,
     supportedWikis: loadSupportedWikipedias(),
     suggestedVersion: suggestedSnapshotVersion(),
     adminEnabled: ADMIN_ENABLED,
     adminPort: PORT,
+    environment: RUNTIME_ENV,
+    enabledWikis: ENABLED_WIKIS,
+    runner: runnerInfo(),
+    scheduledRefresh: readRefreshStatus(),
     auth: authStatus(session, req),
   };
 }
@@ -1155,6 +1258,8 @@ async function handleRequest(req, res) {
           running: false,
           log: [...jobLog],
           finishedAt: new Date().toISOString(),
+          diskHeadroom: currentJob?.diskHeadroom ?? null,
+          rawCleanup: currentJob?.rawCleanup ?? null,
         };
         lastJob = completedJob;
         if (completedJob.wiki) {
@@ -1162,6 +1267,7 @@ async function handleRequest(req, res) {
         } else {
           lastGlobalJob = completedJob;
         }
+        recordJobHistory(completedJob);
         currentJob = null;
         refreshManifestSafely(true);
       });
@@ -1177,6 +1283,8 @@ async function handleRequest(req, res) {
           running: false,
           log: [...jobLog],
           finishedAt: new Date().toISOString(),
+          diskHeadroom: currentJob?.diskHeadroom ?? null,
+          rawCleanup: currentJob?.rawCleanup ?? null,
         };
         lastJob = failedJob;
         if (failedJob.wiki) {
@@ -1184,6 +1292,7 @@ async function handleRequest(req, res) {
         } else {
           lastGlobalJob = failedJob;
         }
+        recordJobHistory(failedJob);
         currentJob = null;
         refreshManifestSafely(true);
       });

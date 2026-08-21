@@ -38,7 +38,8 @@ const adminUiState = globalThis.__wikiEconAdminState ??= {
   showJobLog: false,
   onboardingWiki: null,
   snapshotVersion: "",
-  snapshotVersionDirty: false
+  snapshotVersionDirty: false,
+  lastKnownRunner: null
 }
 let pollTimer = null
 const SNAPSHOT_VERSION_RE = /^\d{4}-\d{2}$/
@@ -50,6 +51,15 @@ function cliFlags(manifest = initialManifest || {}) {
   const dataDir = manifest?.data_dir || "data"
   const outputDir = manifest?.output_dir || "output"
   return `--data-dir ${dataDir} --output-dir ${outputDir}`
+}
+
+// The server reports its actual runner (compiled binary on Toolforge via
+// WIKI_ECON_BIN, `cargo run --release --` in local dev) via the /status
+// payload, but that hint is shown precisely when the API is unreachable —
+// so we cache the last successfully-observed runner label client-side and
+// fall back to the cargo default only if we've never heard from the server.
+function runnerCommand() {
+  return adminUiState.lastKnownRunner?.label || "cargo run --release --"
 }
 
 function normalizeSnapshotVersion(value) {
@@ -149,6 +159,23 @@ function copyIconButton(getText, label = "Copy output") {
   </button>`
 }
 
+// diskHeadroom/rawCleanup come from admin-server.cjs's trackStageFromChunk,
+// which sniffs them out of the Rust CLI's fetch/ingest log lines (there's
+// no structured event channel) — either can be absent (older job, or the
+// stage hasn't happened yet), so render nothing rather than a false badge.
+function pipelineBadges(diskHeadroom, rawCleanup) {
+  const badges = []
+  if (diskHeadroom) {
+    badges.push(html`<span class="admin-badge ${diskHeadroom.ok ? "ok" : "fail"}" title=${diskHeadroom.message || ""}>
+      ${diskHeadroom.ok ? "Disk headroom OK" : "Disk headroom check failed"}
+    </span>`)
+  }
+  if (rawCleanup?.done) {
+    badges.push(html`<span class="admin-badge ok" title=${rawCleanup.message || ""}>Raw dump cleaned up</span>`)
+  }
+  return badges.length ? html`<div class="admin-pipeline-badges">${badges}</div>` : ""
+}
+
 function adminConnectionHelp() {
   const auth = authState.value || {}
   if (auth.enabled && auth.authenticated === false) {
@@ -183,6 +210,9 @@ async function checkApi() {
       authState.value = data?.auth || {enabled: false, authenticated: true, loginUrl: null, logoutUrl: null, user: null}
       if (data.manifest?.wikis) {
         liveManifest.value = data.manifest
+      }
+      if (data.runner?.label) {
+        adminUiState.lastKnownRunner = data.runner
       }
     } else {
       apiAvailable.value = false
@@ -374,6 +404,18 @@ display(html`<div class="admin-control-strip">
     <strong>${auth?.user?.email || (auth?.enabled ? "Required" : "Local mode")}</strong>
     ${auth?.logoutUrl ? html`<a href=${auth.logoutUrl}>sign out</a>` : ""}
   </div>
+  <div class="admin-control-chip">
+    <span class="admin-control-label">Environment</span>
+    <strong>${job?.environment || "unknown"}</strong>
+  </div>
+  <div class="admin-control-chip">
+    <span class="admin-control-label">Runner</span>
+    <strong>${job?.runner?.mode === "bin" ? "Compiled binary" : "cargo run"}</strong>
+  </div>
+  <div class="admin-control-chip" title="Wikis on the automated Toolforge refresh schedule; all other tracked wikis are manual-only">
+    <span class="admin-control-label">Automated wikis</span>
+    <strong>${(job?.enabledWikis || []).length ? job.enabledWikis.join(", ") : "None"}</strong>
+  </div>
 </div>`)
 ```
 
@@ -394,6 +436,9 @@ topLevelJob
           <div class="admin-progress-fill" style=${"width:" + job.progress.pct + "%"}></div>
         </div>
       </div>` : ""}
+      ${topLevelJob.running
+        ? pipelineBadges(job.progress?.diskHeadroom, job.progress?.rawCleanup)
+        : pipelineBadges(topLevelJob.diskHeadroom, topLevelJob.rawCleanup)}
       ${topLevelJob.running
         ? html`<div class="admin-log-section">
             <div class="admin-log-bar">
@@ -429,6 +474,99 @@ topLevelJob
     </div>`
   : html`<span></span>`
 ```
+
+<!-- ── Scheduled refresh panel ─────────────────────────────── -->
+
+<div class="chart-section">
+
+## Scheduled Refresh
+
+<div class="note">The <code>wiki-econ-refresh</code> Toolforge Job runs the pipeline unattended on a schedule, in a separate pod with no shared memory — this panel only knows what it has written to <code>.refresh-status.json</code>/<code>.refresh-history.jsonl</code> on the shared NFS mount, polled the same way as everything else on this page.</div>
+
+```js
+// TODO(you): decide when an unattended weekly refresh counts as "overdue."
+// `last` is {startedAt, finishedAt, exitCode, wikis, durationSecs} or null
+// (no run has ever written a status file yet — e.g. fresh deploy, or local
+// dev where WIKI_ECON_OUTPUT_DIR isn't the Toolforge NFS mount).
+// `scheduleCron` is the WIKI_ECON_REFRESH_SCHEDULE string (display-only —
+// there's no way to confirm it against Toolforge's actual cron
+// registration from here) — may be null if unset.
+//
+// This is a judgment call: how much slack should there be between the
+// schedule and "no successful run" before it's worth flagging loudly
+// instead of just showing the raw last-run timestamp? A weekly schedule
+// that's 2 days late might be nothing; 3 missed weeks in a row is very
+// different from 1 run that happened to fail once.
+//
+// Return {status: "healthy"|"stale"|"failed"|"unknown", message}.
+function classifyRefreshHealth(last, scheduleCron) {
+  if (!last) return {status: "unknown", message: "No refresh has reported in yet."}
+  if (last.exitCode !== 0) return {status: "failed", message: `Last run exited ${last.exitCode}.`}
+  return {status: "healthy", message: "Last run succeeded."}
+}
+
+const refreshHealthColors = {
+  healthy: "#2e7d32",
+  stale: "#f57f17",
+  failed: "#c62828",
+  unknown: "var(--theme-foreground-muted)"
+}
+
+function formatRefreshTimestamp(iso) {
+  if (!iso) return "—"
+  try { return new Date(iso).toLocaleString() } catch { return iso }
+}
+
+function formatRefreshDuration(secs) {
+  if (secs == null) return "—"
+  const m = Math.floor(secs / 60)
+  const s = secs % 60
+  return m > 0 ? `${m}m ${s}s` : `${s}s`
+}
+```
+
+```js
+const scheduledRefresh = job?.scheduledRefresh || {schedule: null, last: null, history: []}
+const refreshHealth = classifyRefreshHealth(scheduledRefresh.last, scheduledRefresh.schedule)
+const refreshHistoryNewestFirst = [...(scheduledRefresh.history || [])].reverse()
+```
+
+```js
+display(html`<div class="admin-refresh-panel">
+  <div class="admin-control-strip">
+    <div class="admin-control-chip">
+      <span class="admin-control-label">Schedule</span>
+      <strong>${scheduledRefresh.schedule || "Not configured"}</strong>
+    </div>
+    <div class="admin-control-chip">
+      <span class="admin-control-label">Status</span>
+      <strong style=${"color:" + refreshHealthColors[refreshHealth.status]}>${refreshHealth.message}</strong>
+    </div>
+    <div class="admin-control-chip">
+      <span class="admin-control-label">Last run</span>
+      <strong>${formatRefreshTimestamp(scheduledRefresh.last?.finishedAt)}</strong>
+    </div>
+    <div class="admin-control-chip">
+      <span class="admin-control-label">Duration</span>
+      <strong>${formatRefreshDuration(scheduledRefresh.last?.durationSecs)}</strong>
+    </div>
+  </div>
+  ${refreshHistoryNewestFirst.length ? html`<table class="admin-refresh-history">
+    <thead><tr><th>Started</th><th>Finished</th><th>Result</th><th>Duration</th><th>Wikis</th></tr></thead>
+    <tbody>
+      ${refreshHistoryNewestFirst.map(run => html`<tr>
+        <td>${formatRefreshTimestamp(run.startedAt)}</td>
+        <td>${formatRefreshTimestamp(run.finishedAt)}</td>
+        <td style=${"color:" + (run.exitCode === 0 ? "#2e7d32" : "#c62828")}>${run.exitCode === 0 ? "Success" : `Failed (${run.exitCode})`}</td>
+        <td>${formatRefreshDuration(run.durationSecs)}</td>
+        <td>${(run.wikis || []).join(", ") || "—"}</td>
+      </tr>`)}
+    </tbody>
+  </table>` : html`<p class="filter-desc">No scheduled runs recorded yet.</p>`}
+</div>`)
+```
+
+</div>
 
 <!-- ── Pipeline status matrix ─────────────────────────────── -->
 
@@ -843,7 +981,7 @@ html`<div class="admin-fetch-actions">
       }}>Fetch missing</button>
   ${!apiStatus ? html`
       <pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && WIKI_ECON_ADMIN_ENABLED=1 node site/admin-server.cjs</pre>
-      <pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && cargo run --release -- ${cliFlags(currentManifest)} run ${onboardingWiki || "frwiki"}${normalizeSnapshotVersion(snapshotVersion) ? ` --version ${normalizeSnapshotVersion(snapshotVersion)}` : ""}</pre>`
+      <pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && ${runnerCommand()} ${cliFlags(currentManifest)} run ${onboardingWiki || "frwiki"}${normalizeSnapshotVersion(snapshotVersion) ? ` --version ${normalizeSnapshotVersion(snapshotVersion)}` : ""}</pre>`
     : ""}
 </div>`
 ```
@@ -898,7 +1036,7 @@ const selectedWikiRunning = Boolean(job?.running && job?.progress?.wiki === sele
   : html`<div class="warning">No raw dumps found for <strong>${selectedWiki}</strong>.</div>
     ${apiStatus
       ? html`<button class="admin-btn primary" title=${actionTooltipWithApi("fetch", apiStatus)} onclick=${() => runCommand("fetch", {wiki: selectedWiki, version: preferredSnapshotVersion(w)})}>Fetch missing</button>`
-      : html`<pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && cargo run --release -- ${cliFlags(currentManifest)} fetch ${selectedWiki}</pre>`
+      : html`<pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && ${runnerCommand()} ${cliFlags(currentManifest)} fetch ${selectedWiki}</pre>`
     }`
 ```
 
@@ -920,7 +1058,7 @@ const selectedWikiRunning = Boolean(job?.running && job?.progress?.wiki === sele
   : html`<div class="warning">No patrol data found for <strong>${selectedWiki}</strong>.</div>
     ${apiStatus
       ? html`<button class="admin-btn" title=${actionTooltipWithApi("patrol-fetch", apiStatus)} onclick=${() => runCommand("patrol-fetch", selectedWiki)}>Fetch patrol data</button>`
-      : html`<pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && cargo run --release -- ${cliFlags(currentManifest)} patrol-fetch ${selectedWiki}</pre>`
+      : html`<pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && ${runnerCommand()} ${cliFlags(currentManifest)} patrol-fetch ${selectedWiki}</pre>`
     }`
 ```
 
@@ -942,7 +1080,7 @@ const selectedWikiRunning = Boolean(job?.running && job?.progress?.wiki === sele
   : html`<div class="warning">No ingested data for <strong>${selectedWiki}</strong>.</div>
     ${apiStatus
       ? html`<button class="admin-btn" title=${actionTooltipWithApi("ingest", apiStatus)} onclick=${() => runCommand("ingest", selectedWiki)}>Ingest ${selectedWiki}</button>`
-      : html`<pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && cargo run --release -- ${cliFlags(currentManifest)} ingest ${selectedWiki}</pre>`
+      : html`<pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && ${runnerCommand()} ${cliFlags(currentManifest)} ingest ${selectedWiki}</pre>`
     }`
 ```
 
@@ -959,7 +1097,7 @@ const selectedWikiRunning = Boolean(job?.running && job?.progress?.wiki === sele
   : html`<div class="warning">No metrics computed for <strong>${selectedWiki}</strong>.</div>
     ${apiStatus
       ? html`<button class="admin-btn" title=${actionTooltipWithApi("compute", apiStatus)} onclick=${() => runCommand("compute", selectedWiki)}>Compute ${selectedWiki}</button>`
-      : html`<pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && cargo run --release -- ${cliFlags(currentManifest)} compute ${selectedWiki}</pre>`
+      : html`<pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && ${runnerCommand()} ${cliFlags(currentManifest)} compute ${selectedWiki}</pre>`
     }`
 ```
 
@@ -976,7 +1114,7 @@ const selectedWikiRunning = Boolean(job?.running && job?.progress?.wiki === sele
   : html`<div class="warning">No site data found for <strong>${selectedWiki}</strong>.</div>
     ${apiStatus
       ? html`<button class="admin-btn" title=${actionTooltipWithApi("merge", apiStatus)} onclick=${() => runCommand("merge")}>Publish site data</button>`
-      : html`<pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && cargo run --release -- ${cliFlags(currentManifest)} merge</pre>`
+      : html`<pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && ${runnerCommand()} ${cliFlags(currentManifest)} merge</pre>`
     }`
 ```
 
@@ -1547,6 +1685,44 @@ currentManifest.merged.length > 0
   border-radius: 4px;
   background: #1565c0;
   transition: width 0.4s ease;
+}
+.admin-pipeline-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+  padding: 0.5rem 0.8rem 0;
+}
+.admin-badge {
+  font-size: 0.72rem;
+  padding: 0.15rem 0.5rem;
+  border-radius: 999px;
+  border: 1px solid transparent;
+}
+.admin-badge.ok {
+  color: #2e7d32;
+  background: #e8f5e9;
+  border-color: color-mix(in srgb, #2e7d32 30%, transparent);
+}
+.admin-badge.fail {
+  color: #c62828;
+  background: #fbe9e7;
+  border-color: color-mix(in srgb, #c62828 30%, transparent);
+}
+[data-theme="dark"] .admin-badge.ok { background: #1b5e20; color: #c8e6c9; }
+[data-theme="dark"] .admin-badge.fail { background: #b71c1c; color: #ffcdd2; }
+.admin-refresh-panel {
+  display: grid;
+  gap: 0.75rem;
+}
+.admin-refresh-history {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.82rem;
+}
+.admin-refresh-history th, .admin-refresh-history td {
+  padding: 0.4rem 0.6rem;
+  border-bottom: 1px solid var(--theme-foreground-faintest);
+  text-align: left;
 }
 .admin-job-panel.running .admin-progress-fill {
   background: linear-gradient(90deg, #1565c0 0%, #42a5f5 50%, #1565c0 100%);

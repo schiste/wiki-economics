@@ -23,6 +23,34 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
 : "${WIKI_ECON_ENABLED_WIKIS:?Set WIKI_ECON_ENABLED_WIKIS (space or comma separated) in jobs.yaml}"
 
+# Write a status marker + rolling history to the shared NFS output dir on
+# every exit (success, an early `exit 1` artifact check below, or a
+# set -e-triggered failure) so the admin webservice — a separate Toolforge
+# pod with no shared process memory and no Toolforge/Kubernetes API access —
+# has a way to know whether the last scheduled refresh succeeded.
+REFRESH_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+REFRESH_START_EPOCH="$(date +%s)"
+REFRESH_HISTORY_LIMIT=20
+
+write_refresh_status() {
+  local exit_code=$1
+  if [ -z "${WIKI_ECON_OUTPUT_DIR:-}" ]; then
+    return 0
+  fi
+  local finished_at duration wikis_json entry status_file history_file
+  finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  duration=$(( $(date +%s) - REFRESH_START_EPOCH ))
+  wikis_json=$(printf '"%s",' "${wikis[@]:-}" | sed 's/,$//')
+  entry=$(printf '{"startedAt":"%s","finishedAt":"%s","exitCode":%d,"wikis":[%s],"durationSecs":%d}' \
+    "$REFRESH_STARTED_AT" "$finished_at" "$exit_code" "$wikis_json" "$duration")
+  status_file="$WIKI_ECON_OUTPUT_DIR/.refresh-status.json"
+  history_file="$WIKI_ECON_OUTPUT_DIR/.refresh-history.jsonl"
+  echo "$entry" > "$status_file"
+  echo "$entry" >> "$history_file"
+  tail -n "$REFRESH_HISTORY_LIMIT" "$history_file" > "${history_file}.tmp" && mv "${history_file}.tmp" "$history_file"
+}
+trap 'write_refresh_status $?' EXIT
+
 wiki_econ_init_runtime
 wiki_econ_ensure_local_dirs
 
