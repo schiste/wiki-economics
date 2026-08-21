@@ -718,18 +718,22 @@ fn compute_page_weekly_edits(wiki: &str, data_dir: &Path, output_dir: &Path) -> 
         batches = merged_batches.len(),
         "page_weekly_edits: merging partition batches"
     );
-    let weekly_merged = concat_frames(merged_batches)?
+    // The merged batches (~16 frames, already deduplicated per batch) are
+    // cheap to concatenate eagerly, but the group_by-sum across them and
+    // everything downstream (self-join, sort) stays lazy all the way to the
+    // sink below: materializing the ~40M-row deduplicated result as a
+    // DataFrame is itself what exceeded the memory ceiling in earlier
+    // attempts, regardless of how the inputs were pre-merged. The streaming
+    // engine executes this whole chain incrementally instead of building
+    // the full table in memory.
+    let weekly = concat_frames(merged_batches)?
         .lazy()
         .group_by(weekly_group_keys())
-        .agg([col("edits").sum()])
-        .collect()?;
+        .agg([col("edits").sum()]);
     info!(
         wiki = wiki,
-        merged_rows = weekly_merged.height(),
-        estimated_bytes = weekly_merged.estimated_size(),
         "page_weekly_edits: merged partition reductions, starting previous-week join"
     );
-    let weekly = weekly_merged.lazy();
 
     let previous_week = weekly.clone().select([
         col("page_id"),
@@ -795,24 +799,49 @@ fn compute_page_weekly_edits(wiki: &str, data_dir: &Path, output_dir: &Path) -> 
             col("previous_week_edits"),
             col("wow_change"),
             col("wow_rate"),
-        ]);
+            lit(wiki).alias("wiki"),
+        ])
+        .sort(
+            ["page_id", "page_namespace", "page_title", "week_start"],
+            SortMultipleOptions::default(),
+        );
 
+    let wiki_dir = output_dir.join(wiki);
+    fs::create_dir_all(&wiki_dir)?;
+    let path = wiki_dir.join("page_weekly_edits.parquet");
     info!(
         wiki = wiki,
-        "page_weekly_edits: collecting joined result"
+        path = %path.display(),
+        "page_weekly_edits: sinking joined result via the streaming engine"
     );
-    let weekly_df = joined.collect()?;
-    info!(
-        wiki = wiki,
-        rows = weekly_df.height(),
-        "page_weekly_edits: joined result collected, sorting"
-    );
-    let mut weekly_df = sort_frame(
-        weekly_df,
-        ["page_id", "page_namespace", "page_title", "week_start"],
+    let started = Instant::now();
+    // Sink directly to parquet instead of collect() + write_output: the
+    // streaming engine executes the group_by, self-join, and sort
+    // incrementally rather than materializing the full ~40M-row result as a
+    // single in-memory DataFrame, which is what exceeded the memory ceiling
+    // when this pipeline used collect() (verified across multiple prior
+    // attempts, regardless of how the partition merges were batched).
+    let sunk = joined.sink(
+        SinkDestination::File {
+            target: SinkTarget::Path(path.to_string_lossy().as_ref().into()),
+        },
+        FileWriteFormat::Parquet(std::sync::Arc::new(ParquetWriteOptions {
+            compression: ParquetCompression::Zstd(None),
+            ..Default::default()
+        })),
+        UnifiedSinkArgs::default(),
     )?;
-    add_wiki_column(&mut weekly_df, wiki)?;
-    write_output(&mut weekly_df, wiki, "page_weekly_edits", output_dir)
+    sunk.collect_with_engine(Engine::Streaming)?;
+    let bytes = fs::metadata(&path)?.len();
+    info!(
+        wiki = wiki,
+        metric = "page_weekly_edits",
+        bytes = bytes,
+        elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
+        path = %path.display(),
+        "wrote metric output"
+    );
+    Ok(())
 }
 
 /// Write a DataFrame to parquet in the output directory.
