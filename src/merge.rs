@@ -1,10 +1,15 @@
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
 use polars::prelude::*;
+use std::collections::BTreeMap;
 use std::env;
-use std::fs;
-use std::path::Path;
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{info, warn};
+
+use crate::observability::MemorySnapshot;
+
+const MERGE_BATCH_ROWS: usize = 250_000;
 
 /// Merge per-wiki metric parquet files into combined files at the output root.
 /// e.g., output/nlwiki/inequality.parquet + output/dewiki/inequality.parquet
@@ -13,8 +18,7 @@ pub fn merge_outputs(output_dir: &Path) -> Result<()> {
     info!(output_dir = %output_dir.display(), "merging wiki outputs");
 
     // Discover all metric names from subdirectories
-    let mut metric_files: std::collections::HashMap<String, Vec<String>> =
-        std::collections::HashMap::new();
+    let mut metric_files: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
 
     for entry in fs::read_dir(output_dir)? {
         let entry = entry?;
@@ -39,40 +43,133 @@ pub fn merge_outputs(output_dir: &Path) -> Result<()> {
             let path = file_entry.path();
             if path.extension().is_some_and(|e| e == "parquet") {
                 let metric_name = path.file_name().unwrap().to_string_lossy().to_string();
-                metric_files
-                    .entry(metric_name)
-                    .or_default()
-                    .push(path.to_string_lossy().to_string());
+                metric_files.entry(metric_name).or_default().push(path);
             }
         }
     }
 
-    for (metric_name, paths) in &metric_files {
-        let lazy_frames: Vec<LazyFrame> = paths
-            .iter()
-            .map(|p| LazyFrame::scan_parquet(p.as_str().into(), Default::default()))
-            .collect::<PolarsResult<_>>()?;
-        let mut combined = concat(lazy_frames, Default::default())?.collect()?;
-
-        let dest = output_dir.join(metric_name);
-        let mut file = fs::File::create(&dest)?;
-        ParquetWriter::new(&mut file)
-            .with_compression(ParquetCompression::Zstd(None))
-            .finish(&mut combined)?;
-
-        info!(
-            metric = metric_name,
-            path = %dest.display(),
-            wikis = paths.len(),
-            rows = combined.height(),
-            columns = combined.width(),
-            "merged metric output"
-        );
+    for (metric_name, mut paths) in metric_files {
+        paths.sort();
+        let dest = output_dir.join(&metric_name);
+        merge_metric_batched(&metric_name, &paths, &dest, MERGE_BATCH_ROWS)?;
     }
 
     materialize_dashboard_artifacts(output_dir)?;
 
     info!(output_dir = %output_dir.display(), "finished merge");
+    Ok(())
+}
+
+fn merge_metric_batched(
+    metric_name: &str,
+    paths: &[PathBuf],
+    dest: &Path,
+    batch_rows: usize,
+) -> Result<()> {
+    ensure!(
+        !paths.is_empty(),
+        "cannot merge {metric_name} without inputs"
+    );
+    ensure!(batch_rows > 0, "merge batch size must be positive");
+
+    let temp_path = dest.with_file_name(format!(".{metric_name}.merge.tmp"));
+    if temp_path.exists() {
+        fs::remove_file(&temp_path).with_context(|| {
+            format!(
+                "failed to remove abandoned merge output {}",
+                temp_path.display()
+            )
+        })?;
+    }
+
+    let merge_result = (|| -> Result<(usize, usize, u64)> {
+        let first_file = File::open(&paths[0])?;
+        let schema_frame = ParquetReader::new(first_file)
+            .with_slice(Some((0, 0)))
+            .finish()?;
+        let columns = schema_frame.width();
+        let output_file = File::create(&temp_path)?;
+        let writer = ParquetWriter::new(output_file)
+            .with_compression(ParquetCompression::Zstd(None))
+            .with_row_group_size(Some(batch_rows))
+            .set_parallel(false);
+        let mut writer = writer.batched(schema_frame.schema())?;
+        let mut total_rows = 0_usize;
+
+        for (input_index, path) in paths.iter().enumerate() {
+            let mut metadata_reader = ParquetReader::new(File::open(path)?);
+            let input_rows = metadata_reader.num_rows()?;
+            let mut offset = 0_usize;
+            let mut batches = 0_usize;
+
+            while offset < input_rows {
+                let rows = (input_rows - offset).min(batch_rows);
+                let batch = ParquetReader::new(File::open(path)?)
+                    .with_slice(Some((offset, rows)))
+                    .set_low_memory(true)
+                    .read_parallel(ParallelStrategy::None)
+                    .finish()?;
+                ensure!(
+                    batch.height() == rows,
+                    "merge read {} rows from {} at offset {}, expected {}",
+                    batch.height(),
+                    path.display(),
+                    offset,
+                    rows
+                );
+                writer.write_batch(&batch)?;
+                offset += rows;
+                total_rows += rows;
+                batches += 1;
+            }
+
+            let memory = MemorySnapshot::capture();
+            info!(
+                metric = metric_name,
+                input = input_index + 1,
+                total_inputs = paths.len(),
+                path = %path.display(),
+                input_rows,
+                batches,
+                total_rows,
+                rss_bytes = ?memory.rss_bytes,
+                cgroup_current_bytes = ?memory.cgroup_current_bytes,
+                cgroup_peak_bytes = ?memory.cgroup_peak_bytes,
+                cgroup_limit_bytes = ?memory.cgroup_limit_bytes,
+                "merged metric input in bounded batches"
+            );
+        }
+
+        let bytes = writer.finish()?;
+        drop(writer);
+        File::open(&temp_path)?.sync_all()?;
+        Ok((total_rows, columns, bytes))
+    })();
+
+    let (rows, columns, bytes) = match merge_result {
+        Ok(summary) => summary,
+        Err(error) => {
+            let _ = fs::remove_file(&temp_path);
+            return Err(error);
+        }
+    };
+    fs::rename(&temp_path, dest)?;
+
+    let memory = MemorySnapshot::capture();
+    info!(
+        metric = metric_name,
+        path = %dest.display(),
+        wikis = paths.len(),
+        rows,
+        columns,
+        bytes,
+        batch_rows,
+        rss_bytes = ?memory.rss_bytes,
+        cgroup_current_bytes = ?memory.cgroup_current_bytes,
+        cgroup_peak_bytes = ?memory.cgroup_peak_bytes,
+        cgroup_limit_bytes = ?memory.cgroup_limit_bytes,
+        "published merged metric output"
+    );
     Ok(())
 }
 
@@ -188,6 +285,78 @@ mod tests {
         assert_eq!(merged.height(), 2);
 
         Ok(())
+    }
+
+    #[test]
+    fn merge_metric_batched_preserves_deterministic_input_order() -> Result<()> {
+        init_test_tracing();
+        let output_dir = TestDir::new()?;
+        write_metric(output_dir.path(), "frwiki", "metric", 2)?;
+        let enwiki_dir = output_dir.path().join("enwiki");
+        fs::create_dir_all(&enwiki_dir)?;
+        let mut enwiki = df!(
+            "wiki" => &["enwiki", "enwiki", "enwiki"],
+            "value" => &[1_i64, 3, 5]
+        )?;
+        let mut enwiki_file = File::create(enwiki_dir.join("metric.parquet"))?;
+        ParquetWriter::new(&mut enwiki_file).finish(&mut enwiki)?;
+        let paths = vec![
+            output_dir.path().join("enwiki/metric.parquet"),
+            output_dir.path().join("frwiki/metric.parquet"),
+        ];
+        let dest = output_dir.path().join("metric.parquet");
+        let abandoned = output_dir.path().join(".metric.parquet.merge.tmp");
+        fs::write(&abandoned, b"abandoned")?;
+
+        merge_metric_batched("metric.parquet", &paths, &dest, 1)?;
+
+        let merged = ParquetReader::new(File::open(&dest)?).finish()?;
+        assert_eq!(merged.height(), 4);
+        let wikis = merged.column("wiki")?.str()?;
+        assert_eq!(wikis.get(0), Some("enwiki"));
+        assert_eq!(wikis.get(1), Some("enwiki"));
+        assert_eq!(wikis.get(2), Some("enwiki"));
+        assert_eq!(wikis.get(3), Some("frwiki"));
+        assert_eq!(
+            merged
+                .column("value")?
+                .i64()?
+                .into_no_null_iter()
+                .collect::<Vec<_>>(),
+            vec![1, 3, 5, 2]
+        );
+        assert!(!abandoned.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn merge_metric_batched_keeps_existing_output_on_failure() -> Result<()> {
+        init_test_tracing();
+        let output_dir = TestDir::new()?;
+        write_metric(output_dir.path(), "enwiki", "metric", 1)?;
+        let corrupt_dir = output_dir.path().join("frwiki");
+        fs::create_dir_all(&corrupt_dir)?;
+        let corrupt = corrupt_dir.join("metric.parquet");
+        fs::write(&corrupt, b"not parquet")?;
+        let dest = output_dir.path().join("metric.parquet");
+        fs::write(&dest, b"known-good")?;
+        let paths = vec![output_dir.path().join("enwiki/metric.parquet"), corrupt];
+
+        let error = merge_metric_batched("metric.parquet", &paths, &dest, 1)
+            .expect_err("a corrupt later input must fail the merge");
+        assert!(!error.to_string().is_empty());
+        assert_eq!(fs::read(&dest)?, b"known-good");
+        assert!(!output_dir.path().join(".metric.parquet.merge.tmp").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn merge_metric_batched_rejects_missing_inputs_and_zero_batch_size() {
+        let dest = Path::new("unused.parquet");
+        assert!(merge_metric_batched("metric.parquet", &[], dest, 1).is_err());
+        assert!(
+            merge_metric_batched("metric.parquet", &[PathBuf::from("unused")], dest, 0).is_err()
+        );
     }
 
     #[test]
