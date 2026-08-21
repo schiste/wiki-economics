@@ -375,6 +375,8 @@ test("scheduledRefresh surfaces the last run and configured schedule", async (t)
     exitCode: 0,
     wikis: ["nlwiki"],
     durationSecs: 720,
+    memoryPeakBytes: 3_221_225_472,
+    memoryLimitBytes: 6_442_450_944,
   };
   fs.writeFileSync(path.join(outputDir, ".refresh-status.json"), JSON.stringify(entry), "utf8");
   fs.writeFileSync(path.join(outputDir, ".refresh-history.jsonl"), `${JSON.stringify(entry)}\n`, "utf8");

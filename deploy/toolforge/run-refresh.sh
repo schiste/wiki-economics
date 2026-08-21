@@ -32,20 +32,37 @@ REFRESH_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 REFRESH_START_EPOCH="$(date +%s)"
 REFRESH_HISTORY_LIMIT=20
 
+read_cgroup_counter() {
+  local path=$1 value
+  if [ ! -r "$path" ]; then
+    printf 'null'
+    return
+  fi
+  value=$(<"$path")
+  if [[ "$value" =~ ^[0-9]+$ ]]; then
+    printf '%s' "$value"
+  else
+    printf 'null'
+  fi
+}
+
 write_refresh_status() {
   local exit_code=$1
   if [ -z "${WIKI_ECON_OUTPUT_DIR:-}" ]; then
     return 0
   fi
-  local finished_at duration wikis_json entry status_file history_file
+  local finished_at duration wikis_json entry status_file history_file memory_peak memory_limit
   finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   duration=$(( $(date +%s) - REFRESH_START_EPOCH ))
+  memory_peak=$(read_cgroup_counter /sys/fs/cgroup/memory.peak)
+  memory_limit=$(read_cgroup_counter /sys/fs/cgroup/memory.max)
   wikis_json=$(printf '"%s",' "${wikis[@]:-}" | sed 's/,$//')
-  entry=$(printf '{"startedAt":"%s","finishedAt":"%s","exitCode":%d,"wikis":[%s],"durationSecs":%d}' \
-    "$REFRESH_STARTED_AT" "$finished_at" "$exit_code" "$wikis_json" "$duration")
+  entry=$(printf '{"startedAt":"%s","finishedAt":"%s","exitCode":%d,"wikis":[%s],"durationSecs":%d,"memoryPeakBytes":%s,"memoryLimitBytes":%s}' \
+    "$REFRESH_STARTED_AT" "$finished_at" "$exit_code" "$wikis_json" "$duration" "$memory_peak" "$memory_limit")
   status_file="$WIKI_ECON_OUTPUT_DIR/.refresh-status.json"
   history_file="$WIKI_ECON_OUTPUT_DIR/.refresh-history.jsonl"
-  echo "$entry" > "$status_file"
+  echo "$entry" > "${status_file}.tmp"
+  mv "${status_file}.tmp" "$status_file"
   echo "$entry" >> "$history_file"
   tail -n "$REFRESH_HISTORY_LIMIT" "$history_file" > "${history_file}.tmp" && mv "${history_file}.tmp" "$history_file"
 }

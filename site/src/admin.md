@@ -485,7 +485,8 @@ topLevelJob
 
 ```js
 // TODO(you): decide when an unattended weekly refresh counts as "overdue."
-// `last` is {startedAt, finishedAt, exitCode, wikis, durationSecs} or null
+// `last` is {startedAt, finishedAt, exitCode, wikis, durationSecs,
+// memoryPeakBytes, memoryLimitBytes} or null
 // (no run has ever written a status file yet — e.g. fresh deploy, or local
 // dev where WIKI_ECON_OUTPUT_DIR isn't the Toolforge NFS mount).
 // `scheduleCron` is the WIKI_ECON_REFRESH_SCHEDULE string (display-only —
@@ -523,6 +524,12 @@ function formatRefreshDuration(secs) {
   const s = secs % 60
   return m > 0 ? `${m}m ${s}s` : `${s}s`
 }
+
+function formatRefreshBytes(bytes) {
+  if (bytes == null) return "—"
+  const gib = bytes / (1024 ** 3)
+  return `${gib.toFixed(gib >= 10 ? 1 : 2)} GiB`
+}
 ```
 
 ```js
@@ -550,15 +557,20 @@ display(html`<div class="admin-refresh-panel">
       <span class="admin-control-label">Duration</span>
       <strong>${formatRefreshDuration(scheduledRefresh.last?.durationSecs)}</strong>
     </div>
+    <div class="admin-control-chip">
+      <span class="admin-control-label">Peak memory</span>
+      <strong>${formatRefreshBytes(scheduledRefresh.last?.memoryPeakBytes)} / ${formatRefreshBytes(scheduledRefresh.last?.memoryLimitBytes)}</strong>
+    </div>
   </div>
   ${refreshHistoryNewestFirst.length ? html`<table class="admin-refresh-history">
-    <thead><tr><th>Started</th><th>Finished</th><th>Result</th><th>Duration</th><th>Wikis</th></tr></thead>
+    <thead><tr><th>Started</th><th>Finished</th><th>Result</th><th>Duration</th><th>Peak memory</th><th>Wikis</th></tr></thead>
     <tbody>
       ${refreshHistoryNewestFirst.map(run => html`<tr>
         <td>${formatRefreshTimestamp(run.startedAt)}</td>
         <td>${formatRefreshTimestamp(run.finishedAt)}</td>
         <td style=${"color:" + (run.exitCode === 0 ? "#2e7d32" : "#c62828")}>${run.exitCode === 0 ? "Success" : `Failed (${run.exitCode})`}</td>
         <td>${formatRefreshDuration(run.durationSecs)}</td>
+        <td>${formatRefreshBytes(run.memoryPeakBytes)} / ${formatRefreshBytes(run.memoryLimitBytes)}</td>
         <td>${(run.wikis || []).join(", ") || "—"}</td>
       </tr>`)}
     </tbody>

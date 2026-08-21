@@ -13,8 +13,8 @@
 #
 # WIKI_ECON_BIN must also be set tool-wide (`toolforge envvars create
 # WIKI_ECON_BIN /data/project/wiki-economics/app/current/wiki-econ`) before
-# either job below runs. GitHub Actions installs immutable binaries on shared
-# NFS; the buildpack image intentionally does not compile or contain one.
+# either job below runs. Operators install immutable binaries on shared NFS
+# over SSH; the buildpack image intentionally does not compile or contain one.
 # See README.md's binary release runbook.
 #
 # Confirmed in production: despite `continuous: true` below, wiki-econ-admin
@@ -56,7 +56,9 @@
   image: tool-wiki-economics/tool-wiki-economics:latest
   command: deploy/toolforge/run-refresh.sh
   schedule: "0 3 * * 0" # weekly; tighten only after measuring real run time
-  memory: 4Gi
+  # Use Toolforge's per-container ceiling. The Rust process logs cgroup
+  # current, peak, and limit values throughout page_weekly_edits.
+  memory: 6Gi
   cpu: "1"
   envvars:
     WIKI_ECON_DATA_DIR: /data/project/wiki-economics/data
