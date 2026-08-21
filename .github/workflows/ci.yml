@@ -242,7 +242,9 @@ jobs:
         run: |
           file target/release/wiki-econ
           file target/release/wiki-econ | grep -Eq 'ELF 64-bit.*x86-64'
-          if ldd target/release/wiki-econ | grep -F 'not found'; then
+          ldd_output="$(ldd target/release/wiki-econ)"
+          printf '%s\n' "$ldd_output"
+          if grep -F 'not found' <<< "$ldd_output"; then
             echo "Release binary has unresolved shared libraries" >&2
             exit 1
           fi

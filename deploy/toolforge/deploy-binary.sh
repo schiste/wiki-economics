@@ -14,14 +14,10 @@ usage() {
 binary_path=$1
 release_sha=$2
 ssh_target="${TOOLFORGE_SSH_TARGET:?Set TOOLFORGE_SSH_TARGET to user@login.toolforge.org}"
-tool_account="${TOOLFORGE_TOOL_ACCOUNT:-wiki-economics}"
+tool_account=wiki-economics
 app_root="/data/project/$tool_account/app"
 
 [[ "$release_sha" =~ ^[0-9a-f]{40}$ ]] || usage
-[[ "$tool_account" =~ ^[a-z0-9-]+$ ]] || {
-  echo "Invalid Toolforge account name: $tool_account" >&2
-  exit 1
-}
 if [ ! -x "$binary_path" ]; then
   echo "Binary is missing or not executable: $binary_path" >&2
   exit 1
