@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use reqwest::StatusCode;
-use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, HeaderMap, RANGE};
+use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, HeaderMap, RANGE, RETRY_AFTER};
 use reqwest::redirect::Policy;
 use std::ffi::OsStr;
 use std::fs;
@@ -18,6 +18,14 @@ const USER_AGENT: &str = "wiki-econ/0.1 (Wikipedia economic analysis research to
 const FETCH_MAX_PARALLELISM: usize = 4;
 const FETCH_MAX_RETRIES: usize = 3;
 const FETCH_RETRY_BACKOFF_MS: u64 = 500;
+/// Backoff base for 429 (rate-limited) retries when the server didn't send
+/// a `Retry-After` header. Longer than `FETCH_RETRY_BACKOFF_MS`: a 429 means
+/// the server is actively asking us to slow down, which the general-purpose
+/// schedule (used for timeouts/5xx) doesn't respect.
+const FETCH_RATE_LIMIT_BACKOFF_MS: u64 = 4_000;
+/// Maximum delay honored from an upstream `Retry-After` header, so a
+/// slow/misconfigured server value can't stall a retry loop indefinitely.
+const FETCH_RETRY_AFTER_MAX_SECS: u64 = 30;
 const FETCH_MAX_PARALLELISM_ENV: &str = "WIKI_ECON_FETCH_MAX_PARALLELISM";
 /// Extra headroom required beyond the summed remote byte total before a
 /// fetch is allowed to start. Not a tight budget — just enough to fail fast
@@ -442,6 +450,8 @@ struct DownloadPlan {
 struct AttemptError {
     error: anyhow::Error,
     retryable: bool,
+    rate_limited: bool,
+    retry_after: Option<Duration>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -449,11 +459,13 @@ struct TransportHead {
     status: StatusCode,
     content_length: Option<u64>,
     accepts_ranges: bool,
+    retry_after: Option<Duration>,
 }
 
 struct TransportResponse {
     status: StatusCode,
     content_length: Option<u64>,
+    retry_after: Option<Duration>,
     body: Box<dyn Read + Send>,
 }
 
@@ -472,6 +484,8 @@ impl AttemptError {
         Self {
             error,
             retryable: false,
+            rate_limited: false,
+            retry_after: None,
         }
     }
 
@@ -479,6 +493,20 @@ impl AttemptError {
         Self {
             error,
             retryable: true,
+            rate_limited: false,
+            retry_after: None,
+        }
+    }
+
+    /// Retryable error carrying the response status that caused it, so the
+    /// retry loop can honor a 429's `Retry-After` header (or fall back to a
+    /// longer rate-limit-specific backoff) instead of the general schedule.
+    fn retryable_status(status: StatusCode, retry_after: Option<Duration>, error: anyhow::Error) -> Self {
+        Self {
+            error,
+            retryable: true,
+            rate_limited: status == StatusCode::TOO_MANY_REQUESTS,
+            retry_after,
         }
     }
 }
@@ -644,9 +672,11 @@ impl From<reqwest::blocking::Response> for TransportHead {
 
 impl From<reqwest::blocking::Response> for TransportResponse {
     fn from(response: reqwest::blocking::Response) -> Self {
+        let retry_after = parse_retry_after(response.headers());
         build_transport_response(
             response.status(),
             response.content_length(),
+            retry_after,
             Box::new(response),
         )
     }
@@ -669,7 +699,20 @@ fn parse_transport_head(
             .get(ACCEPT_RANGES)
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.eq_ignore_ascii_case("bytes")),
+        retry_after: parse_retry_after(headers),
     }
+}
+
+/// Parses a `Retry-After` header value. Only the delta-seconds form
+/// (`Retry-After: 120`) is handled — the HTTP-date form is uncommon on 429
+/// responses from rate limiters and not worth a date-parsing dependency
+/// here. Clamped to `FETCH_RETRY_AFTER_MAX_SECS`.
+fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let seconds = headers
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())?;
+    Some(Duration::from_secs(seconds.min(FETCH_RETRY_AFTER_MAX_SECS)))
 }
 
 fn build_get_request(
@@ -687,11 +730,13 @@ fn build_get_request(
 fn build_transport_response(
     status: StatusCode,
     content_length: Option<u64>,
+    retry_after: Option<Duration>,
     body: Box<dyn Read + Send>,
 ) -> TransportResponse {
     TransportResponse {
         status,
         content_length,
+        retry_after,
         body,
     }
 }
@@ -726,9 +771,34 @@ fn is_retryable_status(status: StatusCode) -> bool {
         || status.is_server_error()
 }
 
-fn sleep_before_retry(attempt: usize) {
+/// How long to wait before the next retry attempt. Honors the server's
+/// `Retry-After` header when present; otherwise falls back to an
+/// exponential backoff, using a longer base for rate-limited (429)
+/// responses than for other retryable statuses (timeouts, 5xx).
+fn retry_delay(attempt: usize, rate_limited: bool, retry_after: Option<Duration>) -> Duration {
+    if let Some(retry_after) = retry_after {
+        return retry_after;
+    }
+    let base_ms = if rate_limited {
+        FETCH_RATE_LIMIT_BACKOFF_MS
+    } else {
+        FETCH_RETRY_BACKOFF_MS
+    };
     let multiplier = 1_u64 << attempt.saturating_sub(1);
-    std::thread::sleep(Duration::from_millis(FETCH_RETRY_BACKOFF_MS * multiplier));
+    Duration::from_millis(base_ms * multiplier)
+}
+
+fn sleep_before_retry(attempt: usize, rate_limited: bool, retry_after: Option<Duration>) {
+    let delay = retry_delay(attempt, rate_limited, retry_after);
+    if rate_limited {
+        debug!(
+            attempt = attempt,
+            delay_ms = delay.as_millis() as u64,
+            honored_retry_after = retry_after.is_some(),
+            "rate limited; waiting before retry"
+        );
+    }
+    std::thread::sleep(delay);
 }
 
 fn fetch_parallelism(files: usize) -> usize {
@@ -763,6 +833,9 @@ fn probe_remote_file<T: HttpTransport>(transport: &T, url: &str) -> Result<Optio
     let mut last_error = None;
 
     for attempt in 1..=FETCH_MAX_RETRIES {
+        let mut rate_limited = false;
+        let mut retry_after = None;
+
         match transport.head(url) {
             Ok(response) if response.status.is_success() => {
                 return Ok(Some(RemoteFileInfo {
@@ -782,6 +855,8 @@ fn probe_remote_file<T: HttpTransport>(transport: &T, url: &str) -> Result<Optio
                 anyhow::bail!("HTTP {} for {}", response.status, url);
             }
             Ok(response) if is_retryable_status(response.status) => {
+                rate_limited = response.status == StatusCode::TOO_MANY_REQUESTS;
+                retry_after = response.retry_after;
                 last_error = Some(anyhow::anyhow!("HTTP {} for {}", response.status, url));
             }
             Ok(response) => {
@@ -798,7 +873,7 @@ fn probe_remote_file<T: HttpTransport>(transport: &T, url: &str) -> Result<Optio
         }
 
         if attempt < FETCH_MAX_RETRIES {
-            sleep_before_retry(attempt);
+            sleep_before_retry(attempt, rate_limited, retry_after);
         }
     }
 
@@ -918,7 +993,11 @@ fn download_attempt<T: HttpTransport>(
     if !response.status.is_success() {
         let error = anyhow::anyhow!("HTTP {} for {}", response.status, url);
         return if is_retryable_status(response.status) {
-            Err(AttemptError::retryable(error))
+            Err(AttemptError::retryable_status(
+                response.status,
+                response.retry_after,
+                error,
+            ))
         } else {
             Err(AttemptError::fatal(error))
         };
@@ -1022,7 +1101,7 @@ fn download_file_with_transport<T: HttpTransport>(
                     error = %error.error,
                     "download attempt failed; retrying"
                 );
-                sleep_before_retry(attempt);
+                sleep_before_retry(attempt, error.rate_limited, error.retry_after);
                 if plan.accepts_ranges && dest.exists() {
                     plan.resume_from = fs::metadata(dest)?.len();
                 } else {
@@ -1222,6 +1301,7 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use std::thread;
+    use std::time::Instant;
 
     const TEST_URL: &str = "http://example.invalid/dump.tsv.bz2";
     type RequestLog = Arc<Mutex<Vec<String>>>;
@@ -1240,6 +1320,7 @@ mod tests {
             body: Vec<u8>,
             accepts_ranges: bool,
             fail_after: Option<usize>,
+            retry_after: Option<Duration>,
         },
         Error(&'static str),
     }
@@ -1354,6 +1435,7 @@ mod tests {
                     body,
                     accepts_ranges,
                     fail_after,
+                    retry_after,
                 } => {
                     let (status, body) = if let Some(offset) = range_start {
                         if accepts_ranges && status.is_success() {
@@ -1382,6 +1464,7 @@ mod tests {
                     Ok(TransportResponse {
                         status,
                         content_length: Some(content_length),
+                        retry_after,
                         body,
                     })
                 }
@@ -1394,6 +1477,7 @@ mod tests {
             status: StatusCode::OK,
             content_length,
             accepts_ranges,
+            retry_after: None,
         })
     }
 
@@ -1402,6 +1486,16 @@ mod tests {
             status,
             content_length: None,
             accepts_ranges: false,
+            retry_after: None,
+        })
+    }
+
+    fn status_head_with_retry_after(status: StatusCode, retry_after: Duration) -> FakeHeadOutcome {
+        FakeHeadOutcome::Response(TransportHead {
+            status,
+            content_length: None,
+            accepts_ranges: false,
+            retry_after: Some(retry_after),
         })
     }
 
@@ -1411,6 +1505,7 @@ mod tests {
             body: body.to_vec(),
             accepts_ranges,
             fail_after: None,
+            retry_after: None,
         }
     }
 
@@ -1420,6 +1515,17 @@ mod tests {
             body: Vec::new(),
             accepts_ranges: false,
             fail_after: None,
+            retry_after: None,
+        }
+    }
+
+    fn status_get_with_retry_after(status: StatusCode, retry_after: Duration) -> FakeGetOutcome {
+        FakeGetOutcome::Response {
+            status,
+            body: Vec::new(),
+            accepts_ranges: false,
+            fail_after: None,
+            retry_after: Some(retry_after),
         }
     }
 
@@ -1585,6 +1691,34 @@ mod tests {
 
         assert!(err.to_string().contains("HTTP 404"));
         assert!(!dest.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn download_file_honors_retry_after_on_rate_limit() -> Result<()> {
+        init_test_tracing();
+        let temp_dir = TestDir::new()?;
+        let dest = temp_dir.path().join("download.tsv.bz2");
+        let configured_retry_after = Duration::from_millis(100);
+        let transport = FakeTransport::with_outcomes(
+            [ok_head(Some(0), false)],
+            [
+                status_get_with_retry_after(StatusCode::TOO_MANY_REQUESTS, configured_retry_after),
+                status_get_with_retry_after(StatusCode::TOO_MANY_REQUESTS, configured_retry_after),
+                status_get_with_retry_after(StatusCode::TOO_MANY_REQUESTS, configured_retry_after),
+            ],
+        );
+
+        let started = Instant::now();
+        let err = download_file_with_transport(&transport, TEST_URL, &dest, false)
+            .expect_err("exhausted 429 retries should fail");
+        let elapsed = started.elapsed();
+
+        assert!(err.to_string().contains("HTTP 429"));
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "expected Retry-After to be honored instead of the rate-limit backoff, took {elapsed:?}"
+        );
         Ok(())
     }
 
@@ -1899,6 +2033,72 @@ mod tests {
     }
 
     #[test]
+    fn parse_retry_after_reads_delta_seconds() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, "5".parse().expect("retry-after header"));
+
+        assert_eq!(parse_retry_after(&headers), Some(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn parse_retry_after_clamps_to_max() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, "999".parse().expect("retry-after header"));
+
+        assert_eq!(
+            parse_retry_after(&headers),
+            Some(Duration::from_secs(FETCH_RETRY_AFTER_MAX_SECS))
+        );
+    }
+
+    #[test]
+    fn parse_retry_after_ignores_non_numeric_value() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            RETRY_AFTER,
+            "Wed, 21 Oct 2026 07:28:00 GMT"
+                .parse()
+                .expect("retry-after header"),
+        );
+
+        assert_eq!(parse_retry_after(&headers), None);
+    }
+
+    #[test]
+    fn parse_retry_after_returns_none_when_header_missing() {
+        assert_eq!(parse_retry_after(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn retry_delay_honors_retry_after_over_backoff() {
+        assert_eq!(
+            retry_delay(1, true, Some(Duration::from_secs(7))),
+            Duration::from_secs(7)
+        );
+    }
+
+    #[test]
+    fn retry_delay_uses_longer_base_when_rate_limited() {
+        let limited = retry_delay(1, true, None);
+        let unlimited = retry_delay(1, false, None);
+        assert!(limited > unlimited);
+        assert_eq!(limited, Duration::from_millis(FETCH_RATE_LIMIT_BACKOFF_MS));
+        assert_eq!(unlimited, Duration::from_millis(FETCH_RETRY_BACKOFF_MS));
+    }
+
+    #[test]
+    fn retry_delay_doubles_per_attempt() {
+        assert_eq!(
+            retry_delay(2, false, None),
+            Duration::from_millis(FETCH_RETRY_BACKOFF_MS * 2)
+        );
+        assert_eq!(
+            retry_delay(3, false, None),
+            Duration::from_millis(FETCH_RETRY_BACKOFF_MS * 4)
+        );
+    }
+
+    #[test]
     fn build_get_request_sets_range_header() -> Result<()> {
         let transport = build_transport()?;
         let request = build_get_request(&transport.client, TEST_URL, Some(8))?;
@@ -1925,6 +2125,7 @@ mod tests {
         let mut response = build_transport_response(
             StatusCode::PARTIAL_CONTENT,
             Some(5),
+            None,
             Box::new(Cursor::new(b"bytes".to_vec())),
         );
         let mut body = Vec::new();
@@ -2085,6 +2286,30 @@ mod tests {
         ]);
 
         assert_eq!(probe_remote_file(&transport, TEST_URL)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn probe_remote_file_honors_retry_after_on_rate_limit() -> Result<()> {
+        init_test_tracing();
+        let configured_retry_after = Duration::from_millis(100);
+        let transport = FakeTransport::with_head_outcomes([
+            status_head_with_retry_after(StatusCode::TOO_MANY_REQUESTS, configured_retry_after),
+            status_head_with_retry_after(StatusCode::TOO_MANY_REQUESTS, configured_retry_after),
+            status_head_with_retry_after(StatusCode::TOO_MANY_REQUESTS, configured_retry_after),
+        ]);
+
+        let started = Instant::now();
+        assert_eq!(probe_remote_file(&transport, TEST_URL)?, None);
+        let elapsed = started.elapsed();
+
+        // Two inter-attempt sleeps of ~100ms each honoring Retry-After — well
+        // under the 1.5s the default (unlimited-status) backoff schedule
+        // would take for the same two sleeps (500ms + 1000ms).
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "expected Retry-After to be honored instead of the default backoff, took {elapsed:?}"
+        );
         Ok(())
     }
 
@@ -2270,6 +2495,7 @@ mod tests {
                     body: payload.to_vec(),
                     accepts_ranges: true,
                     fail_after: Some(7),
+                    retry_after: None,
                 },
                 ok_get(payload, true),
             ],
@@ -2321,6 +2547,7 @@ mod tests {
                     body: b"BZhpayload-by".to_vec(),
                     accepts_ranges: false,
                     fail_after: Some(7),
+                    retry_after: None,
                 },
                 FakeGetOutcome::Error("connection dropped"),
                 FakeGetOutcome::Error("connection dropped"),
@@ -2382,6 +2609,7 @@ mod tests {
                 body: b"BZhpayload-by".to_vec(),
                 accepts_ranges: false,
                 fail_after: None,
+                retry_after: None,
             }],
         );
 
