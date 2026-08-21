@@ -39,13 +39,19 @@ const _bizFiles = {
   tiers: FileAttachment("data/gdp_activity_tiers.parquet"),
   funnel: FileAttachment("data/business_funnel.parquet"),
 }
-let _bizDb = null
-async function getDb() {
-  if (!_bizDb) {
-    const {DuckDBClient: DDB} = await import("npm:@observablehq/duckdb")
-    _bizDb = await DDB.of(_bizFiles)
+let _bizDbPromise = null
+function getDb() {
+  // Cache the in-flight promise, not the resolved client: several query
+  // cells call getDb() in the same reactive tick, and if we only memoized
+  // the awaited result, they'd all see a null cache and each spin up their
+  // own engine before the first one finished.
+  if (!_bizDbPromise) {
+    _bizDbPromise = (async () => {
+      const {DuckDBClient: DDB} = await import("npm:@observablehq/duckdb")
+      return await DDB.of(_bizFiles)
+    })()
   }
-  return _bizDb
+  return _bizDbPromise
 }
 
 const useDefaults = isDefaultView(filters, defaults)

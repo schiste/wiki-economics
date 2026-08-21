@@ -38,6 +38,26 @@ const {wiki, userTypes, granularity, startPeriod, endPeriod, namespaces, breakdo
 <!-- ── Data processing ────────────────────────────────────────── -->
 
 ```js
+const _gdpFiles = {
+  gdp: FileAttachment("data/gdp.parquet"),
+  typeShare: FileAttachment("data/gdp_user_type_share.parquet"),
+  tiers: FileAttachment("data/gdp_activity_tiers.parquet"),
+}
+let _gdpDbPromise = null
+function getDb() {
+  // Cache the in-flight promise, not the resolved client: several query
+  // cells call getDb() in the same reactive tick, and if we only memoized
+  // the awaited result, they'd all see a null cache and each spin up their
+  // own engine before the first one finished.
+  if (!_gdpDbPromise) {
+    _gdpDbPromise = (async () => {
+      const {DuckDBClient: DDB} = await import("npm:@observablehq/duckdb")
+      return await DDB.of(_gdpFiles)
+    })()
+  }
+  return _gdpDbPromise
+}
+
 const useDefaults = isDefaultView(filters, defaults)
 
 startLoading(useDefaults)
@@ -47,12 +67,7 @@ if (useDefaults) {
   output = defaults.output
   byType = defaults.byType
 } else {
-  const {DuckDBClient: DDB} = await import("npm:@observablehq/duckdb")
-  const db = await DDB.of({
-    gdp: FileAttachment("data/gdp.parquet"),
-    typeShare: FileAttachment("data/gdp_user_type_share.parquet"),
-    tiers: FileAttachment("data/gdp_activity_tiers.parquet"),
-  })
+  const db = await getDb()
   const gdpRaw = await db.sql`SELECT year_month, page_namespace, user_type, gross_bytes_added, net_bytes, total_edits, productive_edits, reverted_edits, unique_editors FROM gdp WHERE wiki = ${wiki}`
   output = await queryGrouped(db, "gdp", {
     sumCols: ["gross_bytes_added", "net_bytes", "total_edits", "productive_edits", "reverted_edits", "unique_editors"],
@@ -269,8 +284,7 @@ try {
 if (useDefaults) {
   tiersAgg = defaults.tiers.map(d => ({...d, activity_tier: d.activity_tier, editors: d.editors, total_edits: d.total_edits, gross_bytes: d.gross_bytes, net_bytes: d.net_bytes}))
 } else {
-  const {DuckDBClient: DDB} = await import("npm:@observablehq/duckdb")
-  const db = await DDB.of({tiers: FileAttachment("data/gdp_activity_tiers.parquet")})
+  const db = await getDb()
   const tiersRaw = Array.from(await db.sql`SELECT * FROM tiers WHERE wiki = ${wiki}`)
   const tiersFiltered = tiersRaw
     .filter(d => userTypes.includes(d.user_type) && d.year_month >= startPeriod && d.year_month <= endPeriod)
@@ -375,8 +389,7 @@ if (useDefaults) {
     })
     .sort((a, b) => d3.ascending(a.period, b.period))
 } else {
-  const {DuckDBClient: DDB} = await import("npm:@observablehq/duckdb")
-  const db = await DDB.of({typeShare: FileAttachment("data/gdp_user_type_share.parquet")})
+  const db = await getDb()
   const shareRaw = await db.sql`SELECT * FROM typeShare WHERE wiki = ${wiki}`
   const shareData = Array.from(shareRaw)
     .filter(d => d.year_month >= startPeriod && d.year_month <= endPeriod)
@@ -437,8 +450,7 @@ if (useDefaults) {
     edits: d.edits, gross_bytes: d.gross_bytes, net_bytes: d.net_bytes
   }))
 } else {
-  const {DuckDBClient: DDB} = await import("npm:@observablehq/duckdb")
-  const db = await DDB.of({gdp: FileAttachment("data/gdp.parquet")})
+  const db = await getDb()
   const gdpRaw = await db.sql`SELECT year_month, page_namespace, user_type, gross_bytes_added, net_bytes, total_edits FROM gdp WHERE wiki = ${wiki}`
   const sectorRows = Array.from(gdpRaw)
     .filter(d => userTypes.includes(d.user_type) && namespaces.includes(d.page_namespace)

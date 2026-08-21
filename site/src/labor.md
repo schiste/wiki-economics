@@ -34,6 +34,26 @@ const {wiki, userTypes, granularity, startPeriod, endPeriod, namespaces} = filte
 ```
 
 ```js
+const _laborFiles = {
+  labor: FileAttachment("data/labor_monthly.parquet"),
+  cohorts: FileAttachment("data/labor_cohorts.parquet"),
+  churn: FileAttachment("data/labor_churn.parquet"),
+}
+let _laborDbPromise = null
+function getDb() {
+  // Cache the in-flight promise, not the resolved client: several query
+  // cells call getDb() in the same reactive tick, and if we only memoized
+  // the awaited result, they'd all see a null cache and each spin up their
+  // own engine before the first one finished.
+  if (!_laborDbPromise) {
+    _laborDbPromise = (async () => {
+      const {DuckDBClient: DDB} = await import("npm:@observablehq/duckdb")
+      return await DDB.of(_laborFiles)
+    })()
+  }
+  return _laborDbPromise
+}
+
 const useDefaults = isDefaultView(filters, defaults)
 const startP = toPeriod(startPeriod, granularity)
 const endP = toPeriod(endPeriod, granularity)
@@ -45,12 +65,7 @@ if (useDefaults) {
   workforce = defaults.workforce
   churnData = defaults.churn
 } else {
-  const {DuckDBClient: DDB} = await import("npm:@observablehq/duckdb")
-  const db = await DDB.of({
-    labor: FileAttachment("data/labor_monthly.parquet"),
-    cohorts: FileAttachment("data/labor_cohorts.parquet"),
-    churn: FileAttachment("data/labor_churn.parquet"),
-  })
+  const db = await getDb()
   workforce = await queryGrouped(db, "labor", {
     sumCols: ["unique_editors", "total_edits", "net_bytes", "reverted_edits"],
     wiki, userTypes, namespaces, startPeriod, endPeriod, granularity
@@ -152,8 +167,7 @@ try {
 if (useDefaults) {
   typeAgg = defaults.byType
 } else {
-  const {DuckDBClient: DDB} = await import("npm:@observablehq/duckdb")
-  const db = await DDB.of({labor: FileAttachment("data/labor_monthly.parquet")})
+  const db = await getDb()
   const laborRaw = await db.sql`SELECT year_month, user_type, page_namespace, unique_editors FROM labor WHERE wiki = ${wiki}`
   const byType = Array.from(laborRaw)
     .filter(d => d.year_month >= startPeriod && d.year_month <= endPeriod && namespaces.includes(d.page_namespace))
@@ -255,8 +269,7 @@ try {
 if (useDefaults) {
   cohortData = defaults.cohorts
 } else {
-  const {DuckDBClient: DDB} = await import("npm:@observablehq/duckdb")
-  const db = await DDB.of({cohorts: FileAttachment("data/labor_cohorts.parquet")})
+  const db = await getDb()
   cohortData = Array.from(await db.sql`SELECT * FROM cohorts WHERE wiki = ${wiki} ORDER BY cohort_year, year`)
 }
 } finally {

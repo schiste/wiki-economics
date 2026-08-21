@@ -23,6 +23,10 @@ export default {
   root: "src",
   output: distDir,
   pager: false,
+  // Framework defaults to a Google Fonts stylesheet (Source Serif 4) for
+  // headings; we use system fonts everywhere, so drop it to avoid the
+  // network fetch.
+  globalStylesheets: [],
   head: `<link rel="stylesheet" href="./style.css">
 ${adminApiScript}
 <script>

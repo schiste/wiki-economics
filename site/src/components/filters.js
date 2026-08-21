@@ -14,6 +14,19 @@ export function toPeriod(ym, granularity) {
 }
 
 /**
+ * Return a wrapped version of fn that only runs after `wait` ms have
+ * passed without another call — collapses a burst of events (e.g. keystrokes)
+ * into a single trailing invocation.
+ */
+export function debounce(fn, wait) {
+  let timer;
+  return (...args) => {
+    clearTimeout(timer);
+    timer = setTimeout(() => fn(...args), wait);
+  };
+}
+
+/**
  * Namespace labels for display.
  */
 export const NS_LABELS = {
@@ -579,9 +592,16 @@ export function createFilterBar({
     container.dispatchEvent(new Event("input", {bubbles: true}));
   };
 
-  // Forward sub-input events to compound dispatch
-  for (const el of [userTypesInput, granularityInput, startInput, endInput].filter(Boolean)) {
+  // Forward sub-input events to compound dispatch. The From/To fields are
+  // free-text typing (not a click), so each keystroke would otherwise trigger
+  // a full re-query (a live DuckDB query on the slow path) until the value
+  // settles — debounce those two so only the pause-after-typing fires.
+  for (const el of [userTypesInput, granularityInput].filter(Boolean)) {
     el.addEventListener("input", dispatch);
+  }
+  const debouncedDispatch = debounce(dispatch, 300);
+  for (const el of [startInput, endInput]) {
+    el.addEventListener("input", debouncedDispatch);
   }
   if (nsInput) nsInput.addEventListener("input", dispatch);
   for (const {input} of extraInputs) input.addEventListener("input", dispatch);

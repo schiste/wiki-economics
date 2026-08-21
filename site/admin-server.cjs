@@ -413,7 +413,7 @@ function renderAuthPage({ title, heading, message, actionUrl, actionLabel, secon
       min-height: 100vh;
       display: grid;
       place-items: center;
-      font-family: "IBM Plex Sans", system-ui, sans-serif;
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
       background:
         radial-gradient(circle at top, rgba(17, 94, 89, 0.16), transparent 45%),
         linear-gradient(180deg, #f5f7fb 0%, #edf1f7 100%);
@@ -444,7 +444,7 @@ function renderAuthPage({ title, heading, message, actionUrl, actionLabel, secon
       padding: 0.15rem 0.35rem;
       border-radius: 0.4rem;
       background: rgba(23,32,42,0.08);
-      font-family: "IBM Plex Mono", ui-monospace, monospace;
+      font-family: ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
     }
   </style>
 </head>
