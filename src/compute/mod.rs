@@ -641,8 +641,14 @@ fn compute_page_weekly_edits(wiki: &str, data_dir: &Path, output_dir: &Path) -> 
     // not the full history. A week that spans a month boundary produces a
     // partial-count row from each of its two partitions here; the merge
     // group_by below sums those back together.
+    info!(
+        wiki = wiki,
+        partitions = partitions.len(),
+        "page_weekly_edits: starting per-partition reduction"
+    );
     let mut weekly_frames = Vec::with_capacity(partitions.len());
-    for partition in &partitions {
+    let mut running_rows: usize = 0;
+    for (idx, partition) in partitions.iter().enumerate() {
         let partition_weekly = warehouse_lazyframe(&partition.dir)?
             .with_column(
                 col("event_timestamp")
@@ -662,10 +668,25 @@ fn compute_page_weekly_edits(wiki: &str, data_dir: &Path, output_dir: &Path) -> 
             ])
             .agg([col("page_id").count().alias("edits")])
             .collect()?;
+        running_rows += partition_weekly.height();
+        info!(
+            wiki = wiki,
+            partition = idx + 1,
+            total_partitions = partitions.len(),
+            year_month = partition.year_month.as_str(),
+            partition_rows = partition_weekly.height(),
+            running_rows = running_rows,
+            "page_weekly_edits: reduced partition"
+        );
         weekly_frames.push(partition_weekly);
     }
 
-    let weekly = concat_frames(weekly_frames)?
+    info!(
+        wiki = wiki,
+        running_rows = running_rows,
+        "page_weekly_edits: concatenating and merging partition reductions"
+    );
+    let weekly_merged = concat_frames(weekly_frames)?
         .lazy()
         .group_by([
             col("page_id"),
@@ -673,7 +694,15 @@ fn compute_page_weekly_edits(wiki: &str, data_dir: &Path, output_dir: &Path) -> 
             col("page_title"),
             col("week_start"),
         ])
-        .agg([col("edits").sum()]);
+        .agg([col("edits").sum()])
+        .collect()?;
+    info!(
+        wiki = wiki,
+        merged_rows = weekly_merged.height(),
+        estimated_bytes = weekly_merged.estimated_size(),
+        "page_weekly_edits: merged partition reductions, starting previous-week join"
+    );
+    let weekly = weekly_merged.lazy();
 
     let previous_week = weekly.clone().select([
         col("page_id"),
@@ -734,7 +763,16 @@ fn compute_page_weekly_edits(wiki: &str, data_dir: &Path, output_dir: &Path) -> 
             col("wow_rate"),
         ]);
 
+    info!(
+        wiki = wiki,
+        "page_weekly_edits: collecting joined result"
+    );
     let weekly_df = joined.collect()?;
+    info!(
+        wiki = wiki,
+        rows = weekly_df.height(),
+        "page_weekly_edits: joined result collected, sorting"
+    );
     let mut weekly_df = sort_frame(
         weekly_df,
         ["page_id", "page_namespace", "page_title", "week_start"],
