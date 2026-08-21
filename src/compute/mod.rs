@@ -3,7 +3,6 @@ pub mod inequality;
 pub mod labor;
 
 use anyhow::{Context, Result};
-use chrono::{Datelike, Duration, NaiveDate};
 use polars::prelude::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
@@ -326,8 +325,8 @@ fn load_partition(dir: &Path) -> Result<DataFrame> {
     analytical_projection(df, &schema)
 }
 
-fn load_warehouse_partition(dir: &Path) -> Result<DataFrame> {
-    let files = storage::collect_parquet_files(dir)?;
+fn warehouse_lazyframe(warehouse_dir: &Path) -> Result<LazyFrame> {
+    let files = storage::collect_parquet_files(warehouse_dir)?;
     let args = ScanArgsParquet {
         cache: true,
         ..Default::default()
@@ -337,15 +336,13 @@ fn load_warehouse_partition(dir: &Path) -> Result<DataFrame> {
         .map(|file| file.to_string_lossy().to_string())
         .collect();
     let parquet_files = file_names.iter().map(|file| file.as_str().into()).collect();
-    LazyFrame::scan_parquet_sources(ScanSources::Paths(parquet_files), args)?
-        .select([
-            col("event_timestamp"),
-            col("page_id"),
-            col("page_title"),
-            col("page_namespace"),
-        ])
-        .collect()
-        .map_err(Into::into)
+    let lf = LazyFrame::scan_parquet_sources(ScanSources::Paths(parquet_files), args)?.select([
+        col("event_timestamp"),
+        col("page_id"),
+        col("page_title"),
+        col("page_namespace"),
+    ]);
+    Ok(lf)
 }
 
 /// Extract year-month string from event_timestamp (format: YYYY-MM-DD HH:MM:SS.0)
@@ -628,114 +625,98 @@ fn compute_page_weekly_edits(wiki: &str, data_dir: &Path, output_dir: &Path) -> 
         return Ok(());
     }
 
-    let mut weekly_counts: HashMap<(i64, String, i32, NaiveDate), u32> = HashMap::new();
+    let event_date_options = StrptimeOptions {
+        format: Some("%Y-%m-%d".into()),
+        strict: true,
+        exact: true,
+        cache: true,
+    };
 
-    for partition in partitions {
-        let df = load_warehouse_partition(&partition.dir)?;
-        let timestamps = df.column("event_timestamp")?.str()?;
-        let page_ids = df.column("page_id")?.i64()?;
-        let page_titles = df.column("page_title")?.str()?;
-        let namespaces = df.column("page_namespace")?.i32()?;
-
-        for idx in 0..df.height() {
-            let (Some(timestamp), Some(page_id), Some(page_namespace)) =
-                (timestamps.get(idx), page_ids.get(idx), namespaces.get(idx))
-            else {
-                continue;
-            };
-
-            let date = match timestamp.get(..10) {
-                Some(prefix) => NaiveDate::parse_from_str(prefix, "%Y-%m-%d")
-                    .with_context(|| format!("invalid event_timestamp: {timestamp}"))?,
-                None => continue,
-            };
-            let week_start =
-                date - Duration::days(i64::from(date.weekday().num_days_from_monday()));
-            let page_title = page_titles.get(idx).unwrap_or("").to_string();
-
-            *weekly_counts
-                .entry((page_id, page_title, page_namespace, week_start))
-                .or_insert(0) += 1;
-        }
-    }
-
-    let mut rows: Vec<_> = weekly_counts
-        .into_iter()
-        .map(
-            |((page_id, page_title, page_namespace, week_start), edits)| {
-                (page_id, page_title, page_namespace, week_start, edits)
-            },
+    let weekly = warehouse_lazyframe(&warehouse_dir)?
+        .with_column(
+            col("event_timestamp")
+                .str()
+                .slice(lit(0), lit(10))
+                .str()
+                .to_date(event_date_options)
+                .dt()
+                .truncate(lit("1w"))
+                .alias("week_start"),
         )
-        .collect();
-    rows.sort_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then_with(|| left.2.cmp(&right.2))
-            .then_with(|| left.1.cmp(&right.1))
-            .then_with(|| left.3.cmp(&right.3))
-    });
+        .group_by([
+            col("page_id"),
+            col("page_namespace"),
+            col("page_title"),
+            col("week_start"),
+        ])
+        .agg([col("page_id").count().alias("edits")]);
 
-    let row_count = rows.len();
-    let count_lookup: HashMap<(i64, i32, String, NaiveDate), u32> = rows
-        .iter()
-        .map(|(page_id, page_title, page_namespace, week_start, edits)| {
-            (
-                (*page_id, *page_namespace, page_title.clone(), *week_start),
-                *edits,
-            )
-        })
-        .collect();
+    let previous_week = weekly.clone().select([
+        col("page_id"),
+        col("page_namespace"),
+        col("page_title"),
+        (col("week_start").cast(DataType::Int32) + lit(7i32))
+            .cast(DataType::Date)
+            .alias("week_start"),
+        col("edits").alias("previous_week_edits"),
+    ]);
 
-    let mut week_start_out = Vec::with_capacity(row_count);
-    let mut iso_year_out = Vec::with_capacity(row_count);
-    let mut iso_week_out = Vec::with_capacity(row_count);
-    let mut page_id_out = Vec::with_capacity(row_count);
-    let mut page_title_out = Vec::with_capacity(row_count);
-    let mut page_namespace_out = Vec::with_capacity(row_count);
-    let mut edits_out = Vec::with_capacity(row_count);
-    let mut previous_week_edits_out = Vec::with_capacity(row_count);
-    let mut wow_change_out = Vec::with_capacity(row_count);
-    let mut wow_rate_out = Vec::with_capacity(row_count);
+    let joined = weekly
+        .join(
+            previous_week,
+            [
+                col("page_id"),
+                col("page_namespace"),
+                col("page_title"),
+                col("week_start"),
+            ],
+            [
+                col("page_id"),
+                col("page_namespace"),
+                col("page_title"),
+                col("week_start"),
+            ],
+            JoinArgs::new(JoinType::Left),
+        )
+        .with_column(col("previous_week_edits").fill_null(lit(0u32)))
+        .with_column(
+            (col("edits").cast(DataType::Int64) - col("previous_week_edits").cast(DataType::Int64))
+                .alias("wow_change"),
+        )
+        .with_column(
+            when(col("previous_week_edits").eq(lit(0u32)))
+                .then(lit(NULL))
+                .otherwise(
+                    col("wow_change").cast(DataType::Float64)
+                        / col("previous_week_edits").cast(DataType::Float64),
+                )
+                .alias("wow_rate"),
+        )
+        .with_columns([
+            col("week_start").dt().iso_year().alias("iso_year"),
+            col("week_start").dt().week().cast(DataType::Int32).alias("iso_week"),
+            col("week_start").dt().to_string("%Y-%m-%d").alias("week_start"),
+        ])
+        .select([
+            col("week_start"),
+            col("iso_year"),
+            col("iso_week"),
+            col("page_id"),
+            col("page_title"),
+            col("page_namespace"),
+            col("edits"),
+            col("previous_week_edits"),
+            col("wow_change"),
+            col("wow_rate"),
+        ]);
 
-    for (page_id, page_title, page_namespace, week_start, edits) in rows {
-        let previous_week = week_start - Duration::days(7);
-        let previous_week_edits = count_lookup
-            .get(&(page_id, page_namespace, page_title.clone(), previous_week))
-            .copied()
-            .unwrap_or(0);
-        let wow_change = i64::from(edits) - i64::from(previous_week_edits);
-        let iso_week = week_start.iso_week();
-
-        week_start_out.push(week_start.format("%Y-%m-%d").to_string());
-        iso_year_out.push(iso_week.year());
-        iso_week_out.push(i32::try_from(iso_week.week()).expect("ISO week fits in i32"));
-        page_id_out.push(page_id);
-        page_title_out.push(page_title);
-        page_namespace_out.push(page_namespace);
-        edits_out.push(edits);
-        previous_week_edits_out.push(previous_week_edits);
-        wow_change_out.push(wow_change);
-        wow_rate_out.push(if previous_week_edits == 0 {
-            None
-        } else {
-            Some(wow_change as f64 / f64::from(previous_week_edits))
-        });
-    }
-
-    let mut weekly = DataFrame::new_infer_height(vec![
-        Column::new("week_start".into(), week_start_out),
-        Column::new("iso_year".into(), iso_year_out),
-        Column::new("iso_week".into(), iso_week_out),
-        Column::new("page_id".into(), page_id_out),
-        Column::new("page_title".into(), page_title_out),
-        Column::new("page_namespace".into(), page_namespace_out),
-        Column::new("edits".into(), edits_out),
-        Column::new("previous_week_edits".into(), previous_week_edits_out),
-        Column::new("wow_change".into(), wow_change_out),
-        Column::new("wow_rate".into(), wow_rate_out),
-    ])?;
-    add_wiki_column(&mut weekly, wiki)?;
-    write_output(&mut weekly, wiki, "page_weekly_edits", output_dir)
+    let weekly_df = joined.collect()?;
+    let mut weekly_df = sort_frame(
+        weekly_df,
+        ["page_id", "page_namespace", "page_title", "week_start"],
+    )?;
+    add_wiki_column(&mut weekly_df, wiki)?;
+    write_output(&mut weekly_df, wiki, "page_weekly_edits", output_dir)
 }
 
 /// Write a DataFrame to parquet in the output directory.
