@@ -15,14 +15,23 @@ use tracing::{debug, info, warn};
 const BASE_URL: &str = "https://dumps.wikimedia.org/other/mediawiki_history";
 pub(crate) const DUMPS_HOST: &str = "dumps.wikimedia.org";
 const USER_AGENT: &str = "wiki-econ/0.1 (Wikipedia economic analysis research tool)";
-const FETCH_MAX_PARALLELISM: usize = 4;
-const FETCH_MAX_RETRIES: usize = 3;
+/// dumps.wikimedia.org kept 429ing this client even after the Retry-After
+/// fix landed, with 4 concurrent HEAD/GET streams in flight. Serialized to 1
+/// so retries (below) get a real chance to land in a quiet window instead of
+/// every worker re-triggering the same rate limit at once.
+const FETCH_MAX_PARALLELISM: usize = 1;
+const FETCH_MAX_RETRIES: usize = 6;
 const FETCH_RETRY_BACKOFF_MS: u64 = 500;
 /// Backoff base for 429 (rate-limited) retries when the server didn't send
 /// a `Retry-After` header. Longer than `FETCH_RETRY_BACKOFF_MS`: a 429 means
 /// the server is actively asking us to slow down, which the general-purpose
 /// schedule (used for timeouts/5xx) doesn't respect.
 const FETCH_RATE_LIMIT_BACKOFF_MS: u64 = 4_000;
+/// Ceiling on the computed exponential backoff (not applied to an honored
+/// `Retry-After` value, which has its own `FETCH_RETRY_AFTER_MAX_SECS`
+/// clamp). Without this, doubling per attempt across `FETCH_MAX_RETRIES`
+/// attempts reaches multi-minute sleeps long before the loop gives up.
+const FETCH_MAX_BACKOFF_MS: u64 = 30_000;
 /// Maximum delay honored from an upstream `Retry-After` header, so a
 /// slow/misconfigured server value can't stall a retry loop indefinitely.
 const FETCH_RETRY_AFTER_MAX_SECS: u64 = 30;
@@ -785,7 +794,7 @@ fn retry_delay(attempt: usize, rate_limited: bool, retry_after: Option<Duration>
         FETCH_RETRY_BACKOFF_MS
     };
     let multiplier = 1_u64 << attempt.saturating_sub(1);
-    Duration::from_millis(base_ms * multiplier)
+    Duration::from_millis(base_ms.saturating_mul(multiplier).min(FETCH_MAX_BACKOFF_MS))
 }
 
 fn sleep_before_retry(attempt: usize, rate_limited: bool, retry_after: Option<Duration>) {
@@ -1702,11 +1711,11 @@ mod tests {
         let configured_retry_after = Duration::from_millis(100);
         let transport = FakeTransport::with_outcomes(
             [ok_head(Some(0), false)],
-            [
+            std::iter::repeat_n(
                 status_get_with_retry_after(StatusCode::TOO_MANY_REQUESTS, configured_retry_after),
-                status_get_with_retry_after(StatusCode::TOO_MANY_REQUESTS, configured_retry_after),
-                status_get_with_retry_after(StatusCode::TOO_MANY_REQUESTS, configured_retry_after),
-            ],
+                FETCH_MAX_RETRIES,
+            )
+            .collect::<Vec<_>>(),
         );
 
         let started = Instant::now();
@@ -1715,8 +1724,12 @@ mod tests {
         let elapsed = started.elapsed();
 
         assert!(err.to_string().contains("HTTP 429"));
+        // FETCH_MAX_RETRIES - 1 inter-attempt sleeps of ~100ms each honoring
+        // Retry-After — well under what the default (unlimited-status)
+        // backoff schedule would take for the same number of sleeps.
+        let retry_after_budget = configured_retry_after * (FETCH_MAX_RETRIES as u32 - 1) * 2;
         assert!(
-            elapsed < Duration::from_millis(800),
+            elapsed < retry_after_budget,
             "expected Retry-After to be honored instead of the rate-limit backoff, took {elapsed:?}"
         );
         Ok(())
@@ -2099,6 +2112,15 @@ mod tests {
     }
 
     #[test]
+    fn retry_delay_caps_computed_backoff() {
+        // With FETCH_MAX_RETRIES raised, later attempts would otherwise
+        // double past several minutes; the cap keeps a single file's retry
+        // loop from stalling the whole (now-serialized) fetch.
+        let uncapped = retry_delay(FETCH_MAX_RETRIES, true, None);
+        assert_eq!(uncapped, Duration::from_millis(FETCH_MAX_BACKOFF_MS));
+    }
+
+    #[test]
     fn build_get_request_sets_range_header() -> Result<()> {
         let transport = build_transport()?;
         let request = build_get_request(&transport.client, TEST_URL, Some(8))?;
@@ -2213,7 +2235,9 @@ mod tests {
         init_test_tracing();
 
         assert_eq!(fetch_parallelism_override(0, None), 1);
-        assert_eq!(fetch_parallelism_override(2, None), 2);
+        // Default is serialized (FETCH_MAX_PARALLELISM == 1) regardless of
+        // file count, unless overridden via WIKI_ECON_FETCH_MAX_PARALLELISM.
+        assert_eq!(fetch_parallelism_override(2, None), FETCH_MAX_PARALLELISM);
         assert_eq!(fetch_parallelism_override(20, None), FETCH_MAX_PARALLELISM);
     }
 
@@ -2279,11 +2303,13 @@ mod tests {
     #[test]
     fn probe_remote_file_returns_none_after_retryable_head_failures() -> Result<()> {
         init_test_tracing();
-        let transport = FakeTransport::with_head_outcomes([
-            status_head(StatusCode::SERVICE_UNAVAILABLE),
-            status_head(StatusCode::SERVICE_UNAVAILABLE),
-            status_head(StatusCode::SERVICE_UNAVAILABLE),
-        ]);
+        let transport = FakeTransport::with_head_outcomes(
+            std::iter::repeat_n(
+                status_head(StatusCode::SERVICE_UNAVAILABLE),
+                FETCH_MAX_RETRIES,
+            )
+            .collect::<Vec<_>>(),
+        );
 
         assert_eq!(probe_remote_file(&transport, TEST_URL)?, None);
         Ok(())
@@ -2293,21 +2319,24 @@ mod tests {
     fn probe_remote_file_honors_retry_after_on_rate_limit() -> Result<()> {
         init_test_tracing();
         let configured_retry_after = Duration::from_millis(100);
-        let transport = FakeTransport::with_head_outcomes([
-            status_head_with_retry_after(StatusCode::TOO_MANY_REQUESTS, configured_retry_after),
-            status_head_with_retry_after(StatusCode::TOO_MANY_REQUESTS, configured_retry_after),
-            status_head_with_retry_after(StatusCode::TOO_MANY_REQUESTS, configured_retry_after),
-        ]);
+        let transport = FakeTransport::with_head_outcomes(
+            std::iter::repeat_n(
+                status_head_with_retry_after(StatusCode::TOO_MANY_REQUESTS, configured_retry_after),
+                FETCH_MAX_RETRIES,
+            )
+            .collect::<Vec<_>>(),
+        );
 
         let started = Instant::now();
         assert_eq!(probe_remote_file(&transport, TEST_URL)?, None);
         let elapsed = started.elapsed();
 
-        // Two inter-attempt sleeps of ~100ms each honoring Retry-After — well
-        // under the 1.5s the default (unlimited-status) backoff schedule
-        // would take for the same two sleeps (500ms + 1000ms).
+        // FETCH_MAX_RETRIES - 1 inter-attempt sleeps of ~100ms each honoring
+        // Retry-After — well under what the default (unlimited-status)
+        // backoff schedule would take for the same number of sleeps.
+        let retry_after_budget = configured_retry_after * (FETCH_MAX_RETRIES as u32 - 1) * 2;
         assert!(
-            elapsed < Duration::from_millis(800),
+            elapsed < retry_after_budget,
             "expected Retry-After to be honored instead of the default backoff, took {elapsed:?}"
         );
         Ok(())
@@ -2539,20 +2568,18 @@ mod tests {
         init_test_tracing();
         let temp_dir = TestDir::new()?;
         let dest = temp_dir.path().join("download.tsv.bz2");
-        let transport = FakeTransport::with_outcomes(
-            [ok_head(Some(13), false)],
-            [
-                FakeGetOutcome::Response {
-                    status: StatusCode::OK,
-                    body: b"BZhpayload-by".to_vec(),
-                    accepts_ranges: false,
-                    fail_after: Some(7),
-                    retry_after: None,
-                },
-                FakeGetOutcome::Error("connection dropped"),
-                FakeGetOutcome::Error("connection dropped"),
-            ],
-        );
+        let mut get_outcomes = vec![FakeGetOutcome::Response {
+            status: StatusCode::OK,
+            body: b"BZhpayload-by".to_vec(),
+            accepts_ranges: false,
+            fail_after: Some(7),
+            retry_after: None,
+        }];
+        get_outcomes.extend(std::iter::repeat_n(
+            FakeGetOutcome::Error("connection dropped"),
+            FETCH_MAX_RETRIES - 1,
+        ));
+        let transport = FakeTransport::with_outcomes([ok_head(Some(13), false)], get_outcomes);
 
         let err = download_file_with_transport(&transport, TEST_URL, &dest, false)
             .expect_err("non-resumable failures should bubble up");
