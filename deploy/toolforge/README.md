@@ -105,6 +105,22 @@ treat this as an operator checklist rather than something already executed:
    Dockerfile, which Toolforge's Build Service cannot consume. Confirm the
    actual `toolforge build start` invocation against current Toolforge
    docs — the CLI surface changes over time.
+
+   **For every rebuild after the first** (i.e. once `jobs.yaml` is loaded
+   and the admin webservice is started per steps 6-7), use
+   `deploy/toolforge/rebuild-image.sh` instead of a bare `toolforge build
+   start`. Pushing a new image under `:latest` does not affect pods already
+   running — Kubernetes env/binaries are fixed at container start — so a
+   rebuild that isn't paired with an explicit restart silently leaves the
+   old binary running indefinitely (this is exactly what caused a `spawn
+   cargo ENOENT` incident: the admin webservice's pod predated
+   `WIKI_ECON_BIN` being set tool-wide, and nothing restarted it after the
+   image that would have fixed the fallback was pushed). The script polls
+   `toolforge build list` for true build completion (working around
+   `toolforge build start`'s own flaky log stream, which can disconnect
+   with `ChunkedEncodingError` and exit 0 mid-build) and then restarts the
+   admin webservice — and defensively, any Toolforge Job actually running
+   as `continuous` — so the new image takes effect everywhere automatically.
 5. **Point scripts at the compiled binary**: the buildpack run image ships
    no Rust toolchain — only the compiled `wiki-econ` binary, at
    `/workspace/target/release/wiki-econ`. `scripts/lib/wiki_econ.sh` (used

@@ -18,11 +18,14 @@
 # --` when it's unset, which fails with `cargo: command not found`. See
 # README.md's Runbook step 5.
 #
-# Confirm the actual continuous-job vs. webservice split against current
-# Toolforge Jobs framework docs before first deploy — this file assumes the
-# admin server runs as a `continuous` job fronted by Toolforge's own
-# ingress, matching the single-process-on-$PORT webservice model described
-# in deploy/toolforge/README.md.
+# Confirmed in production: despite `continuous: true` below, wiki-econ-admin
+# is actually run as a plain `toolforge webservice` (start it with
+# `toolforge webservice buildservice start`, not `toolforge jobs load` for
+# this entry), not loaded as a Toolforge Job — `toolforge jobs list` never
+# shows it. The `continuous: true` block is left here as living
+# documentation of its required image/port/envvars, but restarts must go
+# through `toolforge webservice restart`, which is what
+# deploy/toolforge/rebuild-image.sh does.
 #
 # Top-level must be a bare list, not a `jobs:`-keyed mapping: the installed
 # `toolforge jobs load` (jobs_cli/cli.py's op_load) does `for job in

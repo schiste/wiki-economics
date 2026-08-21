@@ -632,24 +632,48 @@ fn compute_page_weekly_edits(wiki: &str, data_dir: &Path, output_dir: &Path) -> 
         cache: true,
     };
 
-    let weekly = warehouse_lazyframe(&warehouse_dir)?
-        .with_column(
-            col("event_timestamp")
-                .str()
-                .slice(lit(0), lit(10))
-                .str()
-                .to_date(event_date_options)
-                .dt()
-                .truncate(lit("1w"))
-                .alias("week_start"),
-        )
+    // Reduce one warehouse partition (calendar month) at a time instead of
+    // grouping the entire history in a single lazy pipeline: a large wiki's
+    // warehouse can hold tens of millions of revision-level rows, which
+    // exceeds Toolforge's per-container memory ceiling if scanned and
+    // grouped all at once. Each partition is collected immediately after
+    // its own group_by, so peak memory is bounded by one partition's size,
+    // not the full history. A week that spans a month boundary produces a
+    // partial-count row from each of its two partitions here; the merge
+    // group_by below sums those back together.
+    let mut weekly_frames = Vec::with_capacity(partitions.len());
+    for partition in &partitions {
+        let partition_weekly = warehouse_lazyframe(&partition.dir)?
+            .with_column(
+                col("event_timestamp")
+                    .str()
+                    .slice(lit(0), lit(10))
+                    .str()
+                    .to_date(event_date_options.clone())
+                    .dt()
+                    .truncate(lit("1w"))
+                    .alias("week_start"),
+            )
+            .group_by([
+                col("page_id"),
+                col("page_namespace"),
+                col("page_title"),
+                col("week_start"),
+            ])
+            .agg([col("page_id").count().alias("edits")])
+            .collect()?;
+        weekly_frames.push(partition_weekly);
+    }
+
+    let weekly = concat_frames(weekly_frames)?
+        .lazy()
         .group_by([
             col("page_id"),
             col("page_namespace"),
             col("page_title"),
             col("week_start"),
         ])
-        .agg([col("page_id").count().alias("edits")]);
+        .agg([col("edits").sum()]);
 
     let previous_week = weekly.clone().select([
         col("page_id"),

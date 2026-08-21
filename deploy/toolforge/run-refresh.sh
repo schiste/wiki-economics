@@ -75,6 +75,7 @@ for required in \
   labor_churn.parquet \
   labor_cohorts.parquet \
   labor_monthly.parquet \
+  page_weekly_edits.parquet \
   patrol.parquet
 do
   if [ ! -f "$WIKI_ECON_OUTPUT_DIR/$required" ]; then
