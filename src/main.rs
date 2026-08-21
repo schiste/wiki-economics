@@ -7,6 +7,7 @@ mod end_to_end_tests;
 mod fetch;
 mod ingest;
 mod merge;
+mod observability;
 mod patrol;
 mod schema;
 mod storage;

@@ -3,14 +3,16 @@ pub mod inequality;
 pub mod labor;
 
 use anyhow::{Context, Result};
+use chrono::{Duration, NaiveDate};
+use polars::io::parquet::write::BatchedWriter;
 use polars::prelude::*;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs;
-use std::path::Path;
-use std::time::Instant;
+use std::fs::{self, File};
+use std::path::{Path, PathBuf};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tracing::info;
 
-use crate::{schema, storage};
+use crate::{observability::MemorySnapshot, schema, storage};
 
 pub(super) struct ChurnAccumulator {
     period_type: &'static str,
@@ -632,36 +634,26 @@ fn compute_page_weekly_edits(wiki: &str, data_dir: &Path, output_dir: &Path) -> 
         cache: true,
     };
 
-    // Reduce one warehouse partition (calendar month) at a time instead of
-    // grouping the entire history in a single lazy pipeline: a large wiki's
-    // warehouse can hold tens of millions of revision-level rows, which
-    // exceeds Toolforge's per-container memory ceiling if scanned and
-    // grouped all at once. Each partition is collected immediately after
-    // its own group_by, so peak memory during this loop is bounded by one
-    // partition's size, not the full history. A week that spans a month
-    // boundary produces a partial-count row from each of its two
-    // partitions here; the batch and final merges below sum those back
-    // together.
-    //
-    // Merging is done as a two-level tree (partitions -> batches -> final)
-    // rather than collecting all partition frames and concatenating them
-    // once at the end: holding all ~300 partition frames simultaneously
-    // and then group_by-ing the ~40M-row concatenation is itself enough
-    // to exceed the memory ceiling, even though no single partition is
-    // large. Merging in small batches bounds the number of partition
-    // frames held live at once, and the batch-level merges are cheap to
-    // hold and re-merge at the end since they're already deduplicated.
-    const MERGE_BATCH_SIZE: usize = 20;
-
+    // Reduce one calendar-month partition at a time, then route its weekly
+    // rows into stable page buckets on disk. All rows for a page use the same
+    // bucket, so each bucket can later reconcile month-boundary duplicates
+    // and compute previous-week values independently. This bounds the only
+    // hash group_by and sort that span partitions to one bucket instead of
+    // the full ~40M-row nlwiki history.
+    let runs = WeeklyRunDir::new(output_dir, wiki)?;
+    let mut bucket_writers: BTreeMap<usize, BatchedWriter<File>> = BTreeMap::new();
+    let mut bucket_rows = [0usize; WEEKLY_BUCKET_COUNT];
+    let mut total_edits_before = 0i64;
     info!(
         wiki = wiki,
         partitions = partitions.len(),
-        "page_weekly_edits: starting per-partition reduction"
+        buckets = WEEKLY_BUCKET_COUNT,
+        run_dir = %runs.path().display(),
+        "page_weekly_edits: starting disk-backed bucket reduction"
     );
-    let mut batch_frames = Vec::with_capacity(MERGE_BATCH_SIZE);
-    let mut merged_batches = Vec::new();
     let mut running_rows: usize = 0;
     for (idx, partition) in partitions.iter().enumerate() {
+        let started = Instant::now();
         let partition_weekly = warehouse_lazyframe(&partition.dir)?
             .with_column(
                 col("event_timestamp")
@@ -677,82 +669,195 @@ fn compute_page_weekly_edits(wiki: &str, data_dir: &Path, output_dir: &Path) -> 
             .agg([col("page_id").count().alias("edits")])
             .collect()?;
         running_rows += partition_weekly.height();
+        total_edits_before += sum_edits_column(std::slice::from_ref(&partition_weekly))?;
+        runs.stage(&mut bucket_writers, &mut bucket_rows, partition_weekly)?;
+        let memory = MemorySnapshot::capture();
         info!(
             wiki = wiki,
             partition = idx + 1,
             total_partitions = partitions.len(),
             year_month = partition.year_month.as_str(),
-            partition_rows = partition_weekly.height(),
             running_rows = running_rows,
-            "page_weekly_edits: reduced partition"
+            elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
+            rss_bytes = ?memory.rss_bytes,
+            cgroup_current_bytes = ?memory.cgroup_current_bytes,
+            cgroup_peak_bytes = ?memory.cgroup_peak_bytes,
+            cgroup_limit_bytes = ?memory.cgroup_limit_bytes,
+            "page_weekly_edits: reduced and staged partition"
         );
-        batch_frames.push(partition_weekly);
+    }
+    finish_weekly_bucket_writers(bucket_writers)?;
 
-        let is_last_partition = idx + 1 == partitions.len();
-        if batch_frames.len() >= MERGE_BATCH_SIZE || is_last_partition {
-            let batch_merged = concat_frames(std::mem::take(&mut batch_frames))?
-                .lazy()
-                .group_by(weekly_group_keys())
-                .agg([col("edits").sum()])
-                .collect()?;
-            info!(
-                wiki = wiki,
-                batch = merged_batches.len() + 1,
-                batch_rows = batch_merged.height(),
-                "page_weekly_edits: merged partition batch"
-            );
-            merged_batches.push(batch_merged);
+    let final_path = output_dir.join(wiki).join("page_weekly_edits.parquet");
+    let mut output: Option<AtomicBatchedParquetWriter> = None;
+    let mut total_edits_after = 0i64;
+    let mut output_rows = 0usize;
+    let mut min_week_start: Option<i32> = None;
+    let mut max_week_start: Option<i32> = None;
+    info!(
+        wiki = wiki,
+        staged_rows = running_rows,
+        nonempty_buckets = bucket_rows.iter().filter(|&&rows| rows > 0).count(),
+        "page_weekly_edits: reconciling staged buckets"
+    );
+    for (bucket, &staged_rows) in bucket_rows.iter().enumerate() {
+        if staged_rows == 0 {
+            continue;
         }
+        let started = Instant::now();
+        let staged = ParquetReader::new(File::open(runs.bucket_path(bucket))?).finish()?;
+        let actual_staged_rows = staged.height();
+        anyhow::ensure!(
+            actual_staged_rows == staged_rows,
+            "page_weekly_edits bucket {bucket} row count changed: expected {staged_rows}, read {actual_staged_rows}"
+        );
+        let bucket_edits_before = sum_edits_column(std::slice::from_ref(&staged))?;
+        let merged = staged
+            .lazy()
+            .group_by(weekly_group_keys())
+            .agg([col("edits").sum()])
+            .collect()?;
+        let merged = sort_frame(merged, weekly_sort_keys())?;
+        let weeks = merged.column("week_start")?.date()?.physical();
+        min_week_start = min_week_start.into_iter().chain(weeks.min()).min();
+        max_week_start = max_week_start.into_iter().chain(weeks.max()).max();
+        let bucket_edits_after = sum_edits_column(std::slice::from_ref(&merged))?;
+        anyhow::ensure!(
+            bucket_edits_before == bucket_edits_after,
+            "page_weekly_edits bucket {bucket} lost or duplicated edits: {bucket_edits_before} before, {bucket_edits_after} after"
+        );
+        let mut result = add_weekly_change_columns(merged, wiki)?;
+        if output.is_none() {
+            let schema = result.schema();
+            let writer = AtomicBatchedParquetWriter::new(final_path.clone(), schema)?;
+            output = Some(writer);
+        }
+        output
+            .as_mut()
+            .context("page_weekly_edits output writer was not initialized")?
+            .write_batch(&mut result)?;
+        output_rows += result.height();
+        total_edits_after += bucket_edits_after;
+        let memory = MemorySnapshot::capture();
+        info!(
+            wiki = wiki,
+            bucket = bucket,
+            total_buckets = WEEKLY_BUCKET_COUNT,
+            staged_rows = staged_rows,
+            merged_rows = result.height(),
+            output_rows = output_rows,
+            elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
+            rss_bytes = ?memory.rss_bytes,
+            cgroup_current_bytes = ?memory.cgroup_current_bytes,
+            cgroup_peak_bytes = ?memory.cgroup_peak_bytes,
+            cgroup_limit_bytes = ?memory.cgroup_limit_bytes,
+            "page_weekly_edits: reconciled and wrote bucket"
+        );
     }
 
+    anyhow::ensure!(
+        total_edits_before == total_edits_after,
+        "page_weekly_edits lost or duplicated data for {wiki}: {total_edits_before} edits before merge, {total_edits_after} after"
+    );
+    let output = output.context("page_weekly_edits produced no rows from non-empty partitions")?;
+    let bytes = output.finish()?;
+    let memory = MemorySnapshot::capture();
     info!(
         wiki = wiki,
-        batches = merged_batches.len(),
-        "page_weekly_edits: merging partition batches"
+        metric = "page_weekly_edits",
+        rows = output_rows,
+        columns = 11,
+        total_edits = total_edits_after,
+        min_week_start = ?min_week_start.and_then(format_epoch_day),
+        max_week_start = ?max_week_start.and_then(format_epoch_day),
+        largest_bucket_staged_rows = bucket_rows.iter().copied().max().unwrap_or(0),
+        bytes = bytes,
+        path = %final_path.display(),
+        rss_bytes = ?memory.rss_bytes,
+        cgroup_current_bytes = ?memory.cgroup_current_bytes,
+        cgroup_peak_bytes = ?memory.cgroup_peak_bytes,
+        cgroup_limit_bytes = ?memory.cgroup_limit_bytes,
+        "page_weekly_edits: published disk-backed result"
     );
-    let weekly_df = merge_weekly_batches(wiki, merged_batches)?;
-    let weekly_df = sort_frame(weekly_df, weekly_sort_keys())?;
-    info!(
-        wiki = wiki,
-        merged_rows = weekly_df.height(),
-        "page_weekly_edits: merged partition reductions via boundary-carry merge"
-    );
+    Ok(())
+}
 
-    // previous_week_edits compares each row to the row immediately
-    // preceding it in the (page_id, page_namespace, page_title,
-    // week_start)-sorted frame instead of via a self-join: since the frame
-    // is already in that order, a page's previous week (if any) is always
-    // the physically preceding row. A self-join would instead need a hash
-    // table sized for the whole ~40M-row key set, and a second full copy of
-    // the data, which is what earlier attempts also could not fit.
-    let is_continuation = col("prev_page_id")
-        .is_not_null()
-        .and(col("prev_page_id").eq(col("page_id")))
-        .and(col("prev_page_namespace").eq(col("page_namespace")))
-        .and(col("prev_page_title").eq(col("page_title")))
-        .and(
-            (col("week_start").cast(DataType::Int32)
-                - col("prev_week_start").cast(DataType::Int32))
-            .eq(lit(7i32)),
-        );
+const WEEKLY_BUCKET_COUNT: usize = 256;
 
-    let mut result = weekly_df
+fn weekly_group_keys() -> [Expr; 4] {
+    [
+        col("page_id"),
+        col("page_namespace"),
+        col("page_title"),
+        col("week_start"),
+    ]
+}
+
+fn weekly_sort_keys() -> [&'static str; 4] {
+    ["page_id", "page_namespace", "page_title", "week_start"]
+}
+
+fn stable_weekly_bucket(page_id: Option<i64>) -> usize {
+    let mut value = page_id.map_or(u64::MAX, |value| value as u64);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    ((value ^ (value >> 31)) as usize) & (WEEKLY_BUCKET_COUNT - 1)
+}
+
+fn format_epoch_day(day: i32) -> Option<String> {
+    NaiveDate::from_ymd_opt(1970, 1, 1)?
+        .checked_add_signed(Duration::days(i64::from(day)))
+        .map(|date| date.format("%Y-%m-%d").to_string())
+}
+
+fn stage_weekly_partition(
+    runs: &WeeklyRunDir,
+    writers: &mut BTreeMap<usize, BatchedWriter<File>>,
+    bucket_rows: &mut [usize; WEEKLY_BUCKET_COUNT],
+    partition: DataFrame,
+) -> Result<()> {
+    let page_ids = partition.column("page_id")?.i64()?;
+    let mut row_indices: Vec<Vec<IdxSize>> = (0..WEEKLY_BUCKET_COUNT).map(|_| Vec::new()).collect();
+    for row in 0..partition.height() {
+        row_indices[stable_weekly_bucket(page_ids.get(row))].push(row as IdxSize);
+    }
+
+    for (bucket, indices) in row_indices.into_iter().enumerate() {
+        if indices.is_empty() {
+            continue;
+        }
+        let take = IdxCa::from_vec("weekly_bucket_rows".into(), indices);
+        let mut bucket_frame = partition.take(&take)?;
+        bucket_frame.rechunk_mut();
+        let writer = match writers.entry(bucket) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let file = File::create(runs.bucket_path(bucket))?;
+                let writer = ParquetWriter::new(file)
+                    .with_compression(ParquetCompression::Zstd(None))
+                    .batched(bucket_frame.schema())?;
+                entry.insert(writer)
+            }
+        };
+        writer.write_batch(&bucket_frame)?;
+        bucket_rows[bucket] += bucket_frame.height();
+    }
+    Ok(())
+}
+
+fn finish_weekly_bucket_writers(writers: BTreeMap<usize, BatchedWriter<File>>) -> Result<()> {
+    for writer in writers.into_values() {
+        writer.finish()?;
+    }
+    Ok(())
+}
+
+fn add_weekly_change_columns(mut weekly: DataFrame, wiki: &str) -> Result<DataFrame> {
+    let previous_week_edits = previous_week_edits(&weekly)?;
+    let previous_column = Column::new("previous_week_edits".into(), previous_week_edits);
+    weekly.with_column(previous_column)?;
+    weekly
         .lazy()
-        .with_columns([
-            col("page_id").shift(lit(1)).alias("prev_page_id"),
-            col("page_namespace")
-                .shift(lit(1))
-                .alias("prev_page_namespace"),
-            col("page_title").shift(lit(1)).alias("prev_page_title"),
-            col("week_start").shift(lit(1)).alias("prev_week_start"),
-            col("edits").shift(lit(1)).alias("prev_edits"),
-        ])
-        .with_column(
-            when(is_continuation)
-                .then(col("prev_edits"))
-                .otherwise(lit(0u32))
-                .alias("previous_week_edits"),
-        )
         .with_column(
             (col("edits").cast(DataType::Int64) - col("previous_week_edits").cast(DataType::Int64))
                 .alias("wow_change"),
@@ -791,108 +896,169 @@ fn compute_page_weekly_edits(wiki: &str, data_dir: &Path, output_dir: &Path) -> 
             col("wow_rate"),
             lit(wiki).alias("wiki"),
         ])
-        .collect()?;
-
-    write_output(&mut result, wiki, "page_weekly_edits", output_dir)
+        .collect()
+        .map_err(Into::into)
 }
 
-fn weekly_group_keys() -> [Expr; 4] {
-    [
-        col("page_id"),
-        col("page_namespace"),
-        col("page_title"),
-        col("week_start"),
-    ]
-}
+fn previous_week_edits(weekly: &DataFrame) -> Result<Vec<u32>> {
+    let page_ids = weekly.column("page_id")?.i64()?;
+    let namespaces = weekly.column("page_namespace")?.i32()?;
+    let titles = weekly.column("page_title")?.str()?;
+    let weeks = weekly.column("week_start")?.date()?.physical();
+    let edits = weekly.column("edits")?.u32()?;
+    let mut previous = Vec::with_capacity(weekly.height());
 
-fn weekly_sort_keys() -> [&'static str; 4] {
-    ["page_id", "page_namespace", "page_title", "week_start"]
-}
-
-/// Merges batches of already within-batch-deduplicated weekly edit counts
-/// (see `compute_page_weekly_edits`) into one frame, without ever running a
-/// group_by-sum over the full concatenation.
-///
-/// Partitions (calendar months) are processed in chronological order, so
-/// within any one batch only its single most-recent week can still be
-/// missing contributions from the batch that follows it: every earlier week
-/// in the batch is already fully counted. Concatenating all batches and
-/// running one global hash group_by-sum over the full result builds a hash
-/// table sized for the whole dataset, which is what exceeded Toolforge's
-/// memory ceiling. Instead, this carries only that boundary week's rows
-/// forward, reconciles them against the next batch's matching rows with a
-/// small group_by (bounded by one week's worth of pages, not the whole
-/// history), and accumulates everything else with plain vstack, which needs
-/// no hash table at all.
-fn merge_weekly_batches(wiki: &str, batches: Vec<DataFrame>) -> Result<DataFrame> {
-    let total_edits_before = sum_edits_column(&batches)?;
-
-    let mut resolved: Vec<DataFrame> = Vec::with_capacity(batches.len() + 1);
-    let mut carry: Option<DataFrame> = None;
-    for mut batch in batches {
-        if let Some(carry_df) = carry.take() {
-            let carry_week = max_week_start(&carry_df)?;
-            let is_carry_week = col("week_start").eq(lit(carry_week).cast(DataType::Date));
-            let matching = batch
-                .clone()
-                .lazy()
-                .filter(is_carry_week.clone())
-                .collect()?;
-            if matching.height() > 0 {
-                batch = batch.lazy().filter(is_carry_week.not()).collect()?;
-                let mut carry_and_matching = carry_df;
-                carry_and_matching.vstack_mut(&matching)?;
-                let reconciled = carry_and_matching
-                    .lazy()
-                    .group_by(weekly_group_keys())
-                    .agg([col("edits").sum()])
-                    .collect()?;
-                resolved.push(reconciled);
-            } else {
-                // Nothing in this batch touches the carried week, so it
-                // cannot receive any further contributions and is final.
-                resolved.push(carry_df);
-            }
-        }
-
-        if batch.height() == 0 {
+    for row in 0..weekly.height() {
+        if row == 0 {
+            previous.push(0);
             continue;
         }
-        let batch_max_week = max_week_start(&batch)?;
-        let is_boundary = col("week_start").eq(lit(batch_max_week).cast(DataType::Date));
-        let boundary = batch.clone().lazy().filter(is_boundary.clone()).collect()?;
-        let interior = batch.lazy().filter(is_boundary.not()).collect()?;
-        if interior.height() > 0 {
-            resolved.push(interior);
-        }
-        carry = Some(boundary);
+        let prior = row - 1;
+        let same_page = page_ids.get(row) == page_ids.get(prior)
+            && namespaces.get(row) == namespaces.get(prior)
+            && titles.get(row) == titles.get(prior);
+        let current_week = weeks.get(row);
+        let prior_week = weeks.get(prior);
+        anyhow::ensure!(
+            !(same_page && current_week == prior_week),
+            "page_weekly_edits contains a duplicate weekly key at row {row}"
+        );
+        let is_continuation = same_page
+            && current_week
+                .zip(prior_week)
+                .is_some_and(|(current, prior)| current.checked_sub(prior) == Some(7));
+        previous.push(if is_continuation {
+            edits
+                .get(prior)
+                .context("page_weekly_edits contains a null edits value")?
+        } else {
+            0
+        });
     }
-    if let Some(carry_df) = carry {
-        resolved.push(carry_df);
-    }
-
-    let merged = concat_frames(resolved)?;
-    let total_edits_after = sum_edits_column(std::slice::from_ref(&merged))?;
-    anyhow::ensure!(
-        total_edits_before == total_edits_after,
-        "page_weekly_edits merge lost or duplicated data for {wiki}: {total_edits_before} edits before merge, {total_edits_after} after"
-    );
-    info!(
-        wiki = wiki,
-        merged_rows = merged.height(),
-        total_edits = total_edits_after,
-        "page_weekly_edits: boundary-carry merge reconciled batches"
-    );
-    Ok(merged)
+    Ok(previous)
 }
 
-/// The days-since-epoch value of the latest `week_start` in `df`.
-fn max_week_start(df: &DataFrame) -> Result<i32> {
-    df.column("week_start")?
-        .date()?
-        .physical()
-        .max()
-        .context("page_weekly_edits: unexpected empty batch while merging")
+struct WeeklyRunDir {
+    path: PathBuf,
+}
+
+impl WeeklyRunDir {
+    fn new(output_dir: &Path, wiki: &str) -> Result<Self> {
+        let parent = output_dir.join(wiki);
+        fs::create_dir_all(&parent)?;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = parent.join(format!(
+            ".page_weekly_edits-runs-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir(&path)?;
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn bucket_path(&self, bucket: usize) -> PathBuf {
+        self.path.join(format!("bucket-{bucket:03}.parquet"))
+    }
+
+    fn stage(
+        &self,
+        writers: &mut BTreeMap<usize, BatchedWriter<File>>,
+        bucket_rows: &mut [usize; WEEKLY_BUCKET_COUNT],
+        partition: DataFrame,
+    ) -> Result<()> {
+        stage_weekly_partition(self, writers, bucket_rows, partition)
+    }
+}
+
+impl Drop for WeeklyRunDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+struct PendingOutput {
+    final_path: PathBuf,
+    temp_path: PathBuf,
+    published: bool,
+}
+
+impl PendingOutput {
+    fn new(final_path: PathBuf) -> Result<Self> {
+        final_path.parent().map(fs::create_dir_all).transpose()?;
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let file_name = final_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("output path has no UTF-8 file name")?;
+        let temp_path =
+            final_path.with_file_name(format!(".{file_name}.{}-{nonce}.tmp", std::process::id()));
+        Ok(Self {
+            final_path,
+            temp_path,
+            published: false,
+        })
+    }
+
+    fn publish(mut self) -> Result<u64> {
+        File::open(&self.temp_path)?.sync_all()?;
+        let bytes = fs::metadata(&self.temp_path)?.len();
+        fs::rename(&self.temp_path, &self.final_path)?;
+        self.published = true;
+        Ok(bytes)
+    }
+}
+
+impl Drop for PendingOutput {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = fs::remove_file(&self.temp_path);
+        }
+    }
+}
+
+struct AtomicBatchedParquetWriter {
+    pending: PendingOutput,
+    writer: Option<BatchedWriter<File>>,
+}
+
+impl AtomicBatchedParquetWriter {
+    fn new(final_path: PathBuf, schema: &Schema) -> Result<Self> {
+        let pending = PendingOutput::new(final_path)?;
+        let file = File::create(&pending.temp_path)?;
+        let writer = ParquetWriter::new(file)
+            .with_compression(ParquetCompression::Zstd(None))
+            .batched(schema)?;
+        Ok(Self {
+            pending,
+            writer: Some(writer),
+        })
+    }
+
+    fn write_batch(&mut self, df: &mut DataFrame) -> Result<()> {
+        df.rechunk_mut();
+        self.writer
+            .as_mut()
+            .context("page_weekly_edits output writer was already finished")?
+            .write_batch(df)?;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<u64> {
+        self.writer
+            .take()
+            .context("page_weekly_edits output writer was already finished")?
+            .finish()?;
+        self.pending.publish()
+    }
 }
 
 fn sum_edits_column(frames: &[DataFrame]) -> Result<i64> {
@@ -910,14 +1076,15 @@ fn sum_edits_column(frames: &[DataFrame]) -> Result<i64> {
 /// Write a DataFrame to parquet in the output directory.
 pub fn write_output(df: &mut DataFrame, wiki: &str, metric: &str, output_dir: &Path) -> Result<()> {
     let wiki_dir = output_dir.join(wiki);
-    fs::create_dir_all(&wiki_dir)?;
     let path = wiki_dir.join(format!("{metric}.parquet"));
     let started = Instant::now();
-    let mut file = fs::File::create(&path)?;
+    let pending = PendingOutput::new(path.clone())?;
+    let mut file = File::create(&pending.temp_path)?;
     ParquetWriter::new(&mut file)
         .with_compression(ParquetCompression::Zstd(None))
         .finish(df)?;
-    let bytes = fs::metadata(&path)?.len();
+    drop(file);
+    let bytes = pending.publish()?;
     info!(
         wiki = wiki,
         metric = metric,
@@ -1522,7 +1689,42 @@ mod tests {
         Ok(())
     }
 
-    fn weekly_batch_df(rows: &[(i64, i32, &str, i32, u32)]) -> Result<DataFrame> {
+    #[test]
+    fn page_weekly_output_is_byte_deterministic_and_cleans_runs() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let first_output = TestDir::new()?;
+        let second_output = TestDir::new()?;
+        let wiki = "testwiki";
+        write_partitioned_warehouse_parquet(&data_dir, wiki)?;
+
+        compute_page_weekly_edits(wiki, data_dir.path(), first_output.path())?;
+        compute_page_weekly_edits(wiki, data_dir.path(), second_output.path())?;
+        let relative = Path::new(wiki).join("page_weekly_edits.parquet");
+        assert_eq!(
+            fs::read(first_output.path().join(&relative))?,
+            fs::read(second_output.path().join(&relative))?
+        );
+        for output in [first_output.path(), second_output.path()] {
+            assert!(fs::read_dir(output.join(wiki))?.all(|entry| {
+                !entry
+                    .expect("readable output entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".page_weekly_edits-runs-")
+            }));
+        }
+        Ok(())
+    }
+
+    type WeeklyTestRow<'a> = (
+        Option<i64>,
+        Option<i32>,
+        Option<&'a str>,
+        Option<i32>,
+        Option<u32>,
+    );
+
+    fn weekly_batch_df(rows: &[WeeklyTestRow<'_>]) -> Result<DataFrame> {
         df!(
             "page_id" => rows.iter().map(|r| r.0).collect::<Vec<_>>(),
             "page_namespace" => rows.iter().map(|r| r.1).collect::<Vec<_>>(),
@@ -1539,72 +1741,87 @@ mod tests {
     }
 
     #[test]
-    fn merge_weekly_batches_reconciles_boundary_weeks_across_batches() -> Result<()> {
-        // Three batches simulating a week (day 7) that spans batch 1/2 and a
-        // second week (day 14) that has no continuation in batch 3, plus an
-        // unrelated page confined to a single batch.
-        let batch1 = weekly_batch_df(&[
-            (1, 0, "Alpha", 0, 3),
-            (1, 0, "Alpha", 7, 2), // batch 1's max week: carried forward
+    fn weekly_bucket_assignment_is_stable_and_keeps_each_page_together() {
+        assert!(stable_weekly_bucket(Some(1)) < WEEKLY_BUCKET_COUNT);
+        assert_eq!(
+            stable_weekly_bucket(Some(42)),
+            stable_weekly_bucket(Some(42))
+        );
+        assert_eq!(stable_weekly_bucket(None), stable_weekly_bucket(None));
+        assert_eq!(format_epoch_day(0).as_deref(), Some("1970-01-01"));
+    }
+
+    #[test]
+    fn weekly_partition_staging_writes_and_cleans_bucket_runs() -> Result<()> {
+        let output = TestDir::new()?;
+        let runs = WeeklyRunDir::new(output.path(), "testwiki")?;
+        let run_path = runs.path().to_path_buf();
+        let frame = weekly_batch_df(&[
+            (Some(1), Some(0), Some("Alpha"), Some(0), Some(3)),
+            (Some(2), Some(0), Some("Beta"), Some(7), Some(5)),
         ])?;
-        let batch2 = weekly_batch_df(&[
-            (1, 0, "Alpha", 7, 5),  // continuation of batch 1's carry
-            (1, 0, "Alpha", 14, 1), // batch 2's max week: carried forward
-            (2, 0, "Beta", 14, 2),  // unrelated page, same boundary week
-        ])?;
-        let batch3 = weekly_batch_df(&[
-            (1, 0, "Alpha", 21, 4), // no continuation of batch 2's carry
-        ])?;
+        let mut writers = BTreeMap::new();
+        let mut rows = [0usize; WEEKLY_BUCKET_COUNT];
+        stage_weekly_partition(&runs, &mut writers, &mut rows, frame)?;
+        finish_weekly_bucket_writers(writers)?;
 
-        let merged = merge_weekly_batches("testwiki", vec![batch1, batch2, batch3])?;
-        let merged = sort_frame(merged, weekly_sort_keys())?;
-
-        let page_id: Vec<i64> = merged.column("page_id")?.i64()?.iter().flatten().collect();
-        let week_start: Vec<i32> = merged
-            .column("week_start")?
-            .date()?
-            .physical()
-            .iter()
-            .flatten()
-            .collect();
-        let edits: Vec<u32> = merged.column("edits")?.u32()?.iter().flatten().collect();
-
-        assert_eq!(page_id, vec![1, 1, 1, 1, 2]);
-        assert_eq!(week_start, vec![0, 7, 14, 21, 14]);
-        // week 7 reconciles 2 (batch 1) + 5 (batch 2) = 7; the rest pass through unchanged.
-        assert_eq!(edits, vec![3, 7, 1, 4, 2]);
-
+        assert_eq!(rows.iter().sum::<usize>(), 2);
+        assert!(runs.bucket_path(stable_weekly_bucket(Some(1))).exists());
+        drop(runs);
+        assert!(!run_path.exists());
         Ok(())
     }
 
     #[test]
-    fn merge_weekly_batches_skips_batch_fully_consumed_by_carry() -> Result<()> {
-        // batch2 contains only the row that continues batch1's carried week,
-        // so after reconciling it the batch has nothing left to contribute
-        // and must not start a new carry.
-        let batch1 = weekly_batch_df(&[
-            (1, 0, "Alpha", 0, 3),
-            (1, 0, "Alpha", 7, 2), // batch 1's max week: carried forward
+    fn previous_week_scan_is_null_safe_and_rejects_duplicate_keys() -> Result<()> {
+        let null_page = weekly_batch_df(&[
+            (None, Some(0), None, Some(0), Some(3)),
+            (None, Some(0), None, Some(7), Some(5)),
+            (Some(1), Some(0), Some("Alpha"), Some(21), Some(2)),
         ])?;
-        let batch2 = weekly_batch_df(&[
-            (1, 0, "Alpha", 7, 5), // fully consumed reconciling batch 1's carry
+        assert_eq!(previous_week_edits(&null_page)?, vec![0, 3, 0]);
+
+        let duplicate = weekly_batch_df(&[
+            (Some(1), Some(0), Some("Alpha"), Some(7), Some(2)),
+            (Some(1), Some(0), Some("Alpha"), Some(7), Some(3)),
         ])?;
+        assert!(
+            previous_week_edits(&duplicate)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate weekly key")
+        );
 
-        let merged = merge_weekly_batches("testwiki", vec![batch1, batch2])?;
-        let merged = sort_frame(merged, weekly_sort_keys())?;
+        let null_edits = weekly_batch_df(&[
+            (Some(1), Some(0), Some("Alpha"), Some(0), None),
+            (Some(1), Some(0), Some("Alpha"), Some(7), Some(3)),
+        ])?;
+        assert!(
+            previous_week_edits(&null_edits)
+                .unwrap_err()
+                .to_string()
+                .contains("null edits")
+        );
+        Ok(())
+    }
 
-        let week_start: Vec<i32> = merged
-            .column("week_start")?
-            .date()?
-            .physical()
-            .iter()
-            .flatten()
-            .collect();
-        let edits: Vec<u32> = merged.column("edits")?.u32()?.iter().flatten().collect();
+    #[test]
+    fn pending_output_replaces_atomically_and_cleans_abandoned_temp() -> Result<()> {
+        let output = TestDir::new()?;
+        let path = output.path().join("metric.parquet");
+        fs::write(&path, b"old")?;
 
-        assert_eq!(week_start, vec![0, 7]);
-        assert_eq!(edits, vec![3, 7]);
+        let pending = PendingOutput::new(path.clone())?;
+        fs::write(&pending.temp_path, b"new")?;
+        assert_eq!(pending.publish()?, 3);
+        assert_eq!(fs::read(&path)?, b"new");
 
+        let abandoned = PendingOutput::new(path.clone())?;
+        let abandoned_path = abandoned.temp_path.clone();
+        fs::write(&abandoned_path, b"partial")?;
+        drop(abandoned);
+        assert!(!abandoned_path.exists());
+        assert_eq!(fs::read(path)?, b"new");
         Ok(())
     }
 
