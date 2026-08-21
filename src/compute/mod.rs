@@ -658,14 +658,6 @@ fn compute_page_weekly_edits(wiki: &str, data_dir: &Path, output_dir: &Path) -> 
         partitions = partitions.len(),
         "page_weekly_edits: starting per-partition reduction"
     );
-    let weekly_group_keys = || {
-        [
-            col("page_id"),
-            col("page_namespace"),
-            col("page_title"),
-            col("week_start"),
-        ]
-    };
     let mut batch_frames = Vec::with_capacity(MERGE_BATCH_SIZE);
     let mut merged_batches = Vec::new();
     let mut running_rows: usize = 0;
@@ -718,51 +710,50 @@ fn compute_page_weekly_edits(wiki: &str, data_dir: &Path, output_dir: &Path) -> 
         batches = merged_batches.len(),
         "page_weekly_edits: merging partition batches"
     );
-    // The merged batches (~16 frames, already deduplicated per batch) are
-    // cheap to concatenate eagerly, but the group_by-sum across them and
-    // everything downstream (self-join, sort) stays lazy all the way to the
-    // sink below: materializing the ~40M-row deduplicated result as a
-    // DataFrame is itself what exceeded the memory ceiling in earlier
-    // attempts, regardless of how the inputs were pre-merged. The streaming
-    // engine executes this whole chain incrementally instead of building
-    // the full table in memory.
-    let weekly = concat_frames(merged_batches)?
-        .lazy()
-        .group_by(weekly_group_keys())
-        .agg([col("edits").sum()]);
+    let weekly_df = merge_weekly_batches(wiki, merged_batches)?;
+    let weekly_df = sort_frame(
+        weekly_df,
+        ["page_id", "page_namespace", "page_title", "week_start"],
+    )?;
     info!(
         wiki = wiki,
-        "page_weekly_edits: merged partition reductions, starting previous-week join"
+        merged_rows = weekly_df.height(),
+        "page_weekly_edits: merged partition reductions via boundary-carry merge"
     );
 
-    let previous_week = weekly.clone().select([
-        col("page_id"),
-        col("page_namespace"),
-        col("page_title"),
-        (col("week_start").cast(DataType::Int32) + lit(7i32))
-            .cast(DataType::Date)
-            .alias("week_start"),
-        col("edits").alias("previous_week_edits"),
-    ]);
+    // previous_week_edits compares each row to the row immediately
+    // preceding it in the (page_id, page_namespace, page_title,
+    // week_start)-sorted frame instead of via a self-join: since the frame
+    // is already in that order, a page's previous week (if any) is always
+    // the physically preceding row. A self-join would instead need a hash
+    // table sized for the whole ~40M-row key set, and a second full copy of
+    // the data, which is what earlier attempts also could not fit.
+    let is_continuation = col("prev_page_id")
+        .is_not_null()
+        .and(col("prev_page_id").eq(col("page_id")))
+        .and(col("prev_page_namespace").eq(col("page_namespace")))
+        .and(col("prev_page_title").eq(col("page_title")))
+        .and(
+            (col("week_start").cast(DataType::Int32)
+                - col("prev_week_start").cast(DataType::Int32))
+            .eq(lit(7i32)),
+        );
 
-    let joined = weekly
-        .join(
-            previous_week,
-            [
-                col("page_id"),
-                col("page_namespace"),
-                col("page_title"),
-                col("week_start"),
-            ],
-            [
-                col("page_id"),
-                col("page_namespace"),
-                col("page_title"),
-                col("week_start"),
-            ],
-            JoinArgs::new(JoinType::Left),
+    let mut result = weekly_df
+        .lazy()
+        .with_columns([
+            col("page_id").shift(lit(1)).alias("prev_page_id"),
+            col("page_namespace").shift(lit(1)).alias("prev_page_namespace"),
+            col("page_title").shift(lit(1)).alias("prev_page_title"),
+            col("week_start").shift(lit(1)).alias("prev_week_start"),
+            col("edits").shift(lit(1)).alias("prev_edits"),
+        ])
+        .with_column(
+            when(is_continuation)
+                .then(col("prev_edits"))
+                .otherwise(lit(0u32))
+                .alias("previous_week_edits"),
         )
-        .with_column(col("previous_week_edits").fill_null(lit(0u32)))
         .with_column(
             (col("edits").cast(DataType::Int64) - col("previous_week_edits").cast(DataType::Int64))
                 .alias("wow_change"),
@@ -801,52 +792,112 @@ fn compute_page_weekly_edits(wiki: &str, data_dir: &Path, output_dir: &Path) -> 
             col("wow_rate"),
             lit(wiki).alias("wiki"),
         ])
-        .sort(
-            ["page_id", "page_namespace", "page_title", "week_start"],
-            SortMultipleOptions::default(),
-        );
+        .collect()?;
 
-    let wiki_dir = output_dir.join(wiki);
-    fs::create_dir_all(&wiki_dir)?;
-    let path = wiki_dir.join("page_weekly_edits.parquet");
-    info!(
-        wiki = wiki,
-        path = %path.display(),
-        "page_weekly_edits: sinking joined result via the streaming engine"
-    );
-    let started = Instant::now();
-    // Sink directly to parquet instead of collect() + write_output: the
-    // streaming engine executes the group_by, self-join, and sort
-    // incrementally rather than materializing the full ~40M-row result as a
-    // single in-memory DataFrame, which is what exceeded the memory ceiling
-    // when this pipeline used collect() (verified across multiple prior
-    // attempts, regardless of how the partition merges were batched).
-    sink_lazy_frame_to_parquet(joined, &path)?;
-    let bytes = fs::metadata(&path)?.len();
-    info!(
-        wiki = wiki,
-        metric = "page_weekly_edits",
-        bytes = bytes,
-        elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
-        path = %path.display(),
-        "wrote metric output"
-    );
-    Ok(())
+    write_output(&mut result, wiki, "page_weekly_edits", output_dir)
 }
 
-fn sink_lazy_frame_to_parquet(frame: LazyFrame, path: &Path) -> Result<()> {
-    let sunk = frame.sink(
-        SinkDestination::File {
-            target: SinkTarget::Path(path.to_string_lossy().as_ref().into()),
-        },
-        FileWriteFormat::Parquet(std::sync::Arc::new(ParquetWriteOptions {
-            compression: ParquetCompression::Zstd(None),
-            ..Default::default()
-        })),
-        UnifiedSinkArgs::default(),
-    )?;
-    sunk.collect_with_engine(Engine::Streaming)?;
-    Ok(())
+fn weekly_group_keys() -> [Expr; 4] {
+    [
+        col("page_id"),
+        col("page_namespace"),
+        col("page_title"),
+        col("week_start"),
+    ]
+}
+
+/// Merges batches of already within-batch-deduplicated weekly edit counts
+/// (see `compute_page_weekly_edits`) into one frame, without ever running a
+/// group_by-sum over the full concatenation.
+///
+/// Partitions (calendar months) are processed in chronological order, so
+/// within any one batch only its single most-recent week can still be
+/// missing contributions from the batch that follows it: every earlier week
+/// in the batch is already fully counted. Concatenating all batches and
+/// running one global hash group_by-sum over the full result builds a hash
+/// table sized for the whole dataset, which is what exceeded Toolforge's
+/// memory ceiling. Instead, this carries only that boundary week's rows
+/// forward, reconciles them against the next batch's matching rows with a
+/// small group_by (bounded by one week's worth of pages, not the whole
+/// history), and accumulates everything else with plain vstack, which needs
+/// no hash table at all.
+fn merge_weekly_batches(wiki: &str, batches: Vec<DataFrame>) -> Result<DataFrame> {
+    let total_edits_before = sum_edits_column(&batches)?;
+
+    let mut resolved: Vec<DataFrame> = Vec::with_capacity(batches.len() + 1);
+    let mut carry: Option<DataFrame> = None;
+    for mut batch in batches {
+        if let Some(carry_df) = carry.take() {
+            let carry_week = max_week_start(&carry_df)?;
+            let is_carry_week = col("week_start").eq(lit(carry_week).cast(DataType::Date));
+            let matching = batch.clone().lazy().filter(is_carry_week.clone()).collect()?;
+            if matching.height() > 0 {
+                batch = batch.lazy().filter(is_carry_week.not()).collect()?;
+                let mut carry_and_matching = carry_df;
+                carry_and_matching.vstack_mut(&matching)?;
+                let reconciled = carry_and_matching
+                    .lazy()
+                    .group_by(weekly_group_keys())
+                    .agg([col("edits").sum()])
+                    .collect()?;
+                resolved.push(reconciled);
+            } else {
+                // Nothing in this batch touches the carried week, so it
+                // cannot receive any further contributions and is final.
+                resolved.push(carry_df);
+            }
+        }
+
+        if batch.height() == 0 {
+            continue;
+        }
+        let batch_max_week = max_week_start(&batch)?;
+        let is_boundary = col("week_start").eq(lit(batch_max_week).cast(DataType::Date));
+        let boundary = batch.clone().lazy().filter(is_boundary.clone()).collect()?;
+        let interior = batch.lazy().filter(is_boundary.not()).collect()?;
+        if interior.height() > 0 {
+            resolved.push(interior);
+        }
+        carry = Some(boundary);
+    }
+    if let Some(carry_df) = carry {
+        resolved.push(carry_df);
+    }
+
+    let merged = concat_frames(resolved)?;
+    let total_edits_after = sum_edits_column(std::slice::from_ref(&merged))?;
+    anyhow::ensure!(
+        total_edits_before == total_edits_after,
+        "page_weekly_edits merge lost or duplicated data for {wiki}: {total_edits_before} edits before merge, {total_edits_after} after"
+    );
+    info!(
+        wiki = wiki,
+        merged_rows = merged.height(),
+        total_edits = total_edits_after,
+        "page_weekly_edits: boundary-carry merge reconciled batches"
+    );
+    Ok(merged)
+}
+
+/// The days-since-epoch value of the latest `week_start` in `df`.
+fn max_week_start(df: &DataFrame) -> Result<i32> {
+    df.column("week_start")?
+        .date()?
+        .physical()
+        .max()
+        .context("page_weekly_edits: unexpected empty batch while merging")
+}
+
+fn sum_edits_column(frames: &[DataFrame]) -> Result<i64> {
+    frames.iter().try_fold(0i64, |acc, frame| {
+        let sum = frame
+            .column("edits")?
+            .cast(&DataType::Int64)?
+            .i64()?
+            .sum()
+            .unwrap_or(0);
+        Ok(acc + sum)
+    })
 }
 
 /// Write a DataFrame to parquet in the output directory.
@@ -1464,27 +1515,57 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn streaming_parquet_sink_rejects_nested_sinks() {
-        let output_dir = TestDir::new().expect("temporary output directory");
-        let first_path = output_dir.path().join("first.parquet");
-        let second_path = output_dir.path().join("second.parquet");
-        let frame = DataFrame::new_infer_height(vec![Column::new("value".into(), [1_i64])])
-            .expect("valid sink fixture")
-            .lazy();
-        let first_sink = frame
-            .sink(
-                SinkDestination::File {
-                    target: SinkTarget::Path(first_path.to_string_lossy().as_ref().into()),
-                },
-                FileWriteFormat::Parquet(std::sync::Arc::new(ParquetWriteOptions::default())),
-                UnifiedSinkArgs::default(),
-            )
-            .expect("first sink should be accepted");
+    fn weekly_batch_df(rows: &[(i64, i32, &str, i32, u32)]) -> Result<DataFrame> {
+        let df = df!(
+            "page_id" => rows.iter().map(|r| r.0).collect::<Vec<_>>(),
+            "page_namespace" => rows.iter().map(|r| r.1).collect::<Vec<_>>(),
+            "page_title" => rows.iter().map(|r| r.2).collect::<Vec<_>>(),
+            "week_start" => rows.iter().map(|r| r.3).collect::<Vec<_>>(),
+            "edits" => rows.iter().map(|r| r.4).collect::<Vec<_>>(),
+        )?;
+        df.lazy()
+            .with_column(col("week_start").cast(DataType::Date))
+            .collect()
+            .map_err(Into::into)
+    }
 
-        let error = sink_lazy_frame_to_parquet(first_sink, &second_path)
-            .expect_err("Polars must reject a sink layered on another sink");
-        assert!(error.to_string().contains("cannot create a sink"));
+    #[test]
+    fn merge_weekly_batches_reconciles_boundary_weeks_across_batches() -> Result<()> {
+        // Three batches simulating a week (day 7) that spans batch 1/2 and a
+        // second week (day 14) that has no continuation in batch 3, plus an
+        // unrelated page confined to a single batch.
+        let batch1 = weekly_batch_df(&[
+            (1, 0, "Alpha", 0, 3),
+            (1, 0, "Alpha", 7, 2), // batch 1's max week: carried forward
+        ])?;
+        let batch2 = weekly_batch_df(&[
+            (1, 0, "Alpha", 7, 5),  // continuation of batch 1's carry
+            (1, 0, "Alpha", 14, 1), // batch 2's max week: carried forward
+            (2, 0, "Beta", 14, 2),  // unrelated page, same boundary week
+        ])?;
+        let batch3 = weekly_batch_df(&[
+            (1, 0, "Alpha", 21, 4), // no continuation of batch 2's carry
+        ])?;
+
+        let merged = merge_weekly_batches("testwiki", vec![batch1, batch2, batch3])?;
+        let merged = sort_frame(merged, ["page_id", "page_namespace", "page_title", "week_start"])?;
+
+        let page_id: Vec<i64> = merged.column("page_id")?.i64()?.iter().flatten().collect();
+        let week_start: Vec<i32> = merged
+            .column("week_start")?
+            .date()?
+            .physical()
+            .iter()
+            .flatten()
+            .collect();
+        let edits: Vec<u32> = merged.column("edits")?.u32()?.iter().flatten().collect();
+
+        assert_eq!(page_id, vec![1, 1, 1, 1, 2]);
+        assert_eq!(week_start, vec![0, 7, 14, 21, 14]);
+        // week 7 reconciles 2 (batch 1) + 5 (batch 2) = 7; the rest pass through unchanged.
+        assert_eq!(edits, vec![3, 7, 1, 4, 2]);
+
+        Ok(())
     }
 
     #[test]
