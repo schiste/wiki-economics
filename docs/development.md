@@ -96,11 +96,12 @@ GitHub Actions is split into four jobs:
 - `quality`: formatting, clippy, Python patrol script checks, docs
 - `coverage`: `cargo llvm-cov` LCOV export plus `scripts/check_lcov.py` enforcing zero uncovered lines
 - `security`: `cargo-deny` and `cargo-audit`
-- `deploy-toolforge`: after the other jobs pass on `main`, selectively builds
-  and deploys the Rust binary and/or refreshes the Toolforge source image
+- `toolforge-release`: after the other jobs pass on `main`, selectively builds
+  and retains the Linux Rust release artifact for an operator-driven SSH deploy
 
 That split is intentional. Keep fast correctness failures separate from
-coverage drift, dependency-policy drift, and production credentials. The
+coverage drift and dependency-policy drift. GitHub has no production
+credentials; Toolforge deployment remains an explicit operator action. The
 coverage run subsumes the ordinary Rust test suite.
 
 The LCOV check is deliberate. `cargo llvm-cov --summary-only` can under-report line coverage on fully exercised lines because of sub-line region artifacts around `?` and similar expressions. CI treats the exported LCOV file as the source of truth for line coverage.

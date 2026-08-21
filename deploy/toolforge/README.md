@@ -59,32 +59,24 @@ Toolforge entirely.
 
 ## Runbook
 
-### One-time GitHub setup
+### Operator prerequisites
 
-Create a protected GitHub environment named `toolforge`, ideally with a
-required reviewer, and add these environment secrets before merging the
-deployment workflow:
+Production deployment is intentionally operator-driven over SSH. GitHub
+Actions builds and retains the Linux release artifact, but has no Toolforge
+credentials and does not deploy or restart services. The operator needs:
 
-- `TOOLFORGE_SSH_USER`: a Toolforge member's Developer account username.
-- `TOOLFORGE_SSH_PRIVATE_KEY`: a dedicated SSH private key whose public key
-  is registered for that Developer account. Do not reuse a personal default
-  key if a narrowly scoped CI key can be registered.
-- `TOOLFORGE_KNOWN_HOSTS`: the verified `login.toolforge.org` host-key lines.
-  Copy known-good entries from an operator's `~/.ssh/known_hosts`; do not
-  disable strict host-key checking in CI.
-
-The corresponding user must be a member of the `wiki-economics` tool so
-`become wiki-economics` succeeds. GitHub CLI configuration is optional; the
-workflow uses the standard SSH client.
+- an SSH identity registered with Wikimedia and membership in the
+  `wiki-economics` tool, so `become wiki-economics` succeeds;
+- GitHub CLI access to download the release artifact produced for the exact
+  `main` commit being deployed.
 
 ### First cutover
 
-1. Merge only after the `toolforge` environment and all three secrets exist.
-   The main-branch workflow waits for quality, coverage, and security checks,
-   builds the Linux release, installs it on NFS, changes `WIKI_ECON_BIN` to
-   `/data/project/wiki-economics/app/current/wiki-econ`, and restarts the
-   webservice. It then rebuilds the source image at the exact Git SHA; Cargo
-   is skipped in that Toolforge build.
+1. Wait for the main-branch quality, coverage, security, and Toolforge release
+   artifact jobs to pass. Deploy that exact commit using the normal-release
+   commands below. The immutable binary is installed on NFS and
+   `WIKI_ECON_BIN` remains
+   `/data/project/wiki-economics/app/current/wiki-econ`.
 2. Confirm the release and environment from the Toolforge bastion:
 
    ```sh
@@ -99,17 +91,35 @@ workflow uses the standard SSH client.
 
 ### Normal releases
 
-Every push to `main` is classified by changed path after CI passes:
+After CI passes, download and deploy the Linux artifact for the exact main
+commit from an operator workstation:
 
-- Rust inputs (`src/`, Cargo files, toolchain config, or `vendor/`) build and
-  deploy a new binary using a persistent GitHub release cache.
-- Node, site, shared script, `RustConfig`, or Toolforge deployment changes
-  trigger the lightweight Toolforge image build and process restart.
-- Documentation-only and unrelated CI changes perform no deployment work.
+```sh
+release_sha=$(git rev-parse origin/main)
+run_id=$(gh run list --repo schiste/wiki-economics --commit "$release_sha" \
+  --workflow CI --limit 1 --json databaseId --jq '.[0].databaseId')
+release_dir=$(mktemp -d)
+gh run download "$run_id" --repo schiste/wiki-economics \
+  --name "wiki-econ-linux-x86_64-$release_sha" --dir "$release_dir"
+chmod +x "$release_dir/wiki-econ"
+TOOLFORGE_SSH_TARGET=login.toolforge.org \
+  deploy/toolforge/deploy-binary.sh "$release_dir/wiki-econ" "$release_sha"
+```
 
-The release artifact and checksum are retained in GitHub for 30 days. NFS
-release directories are deliberately not auto-deleted; automatic pruning can
-turn a quota issue into the loss of a known-good rollback target.
+When site, Node, shared script, or Toolforge deployment files changed, rebuild
+the lightweight image at the same SHA (Cargo remains skipped):
+
+```sh
+ssh login.toolforge.org \
+  "become wiki-economics bash -s -- 'https://github.com/schiste/wiki-economics.git' '$release_sha'" \
+  < deploy/toolforge/rebuild-image.sh
+```
+
+Reload `deploy/toolforge/jobs.yaml` when the job definition changed, after
+reviewing the dry-run output. The release artifact and checksum are retained
+in GitHub for 30 days. NFS release directories are deliberately not
+auto-deleted; automatic pruning can turn a quota issue into the loss of a
+known-good rollback target.
 
 ### Rollback
 
@@ -130,8 +140,8 @@ ssh login.toolforge.org 'become wiki-economics bash -s -- <40-character-sha>' \
 ssh login.toolforge.org 'become wiki-economics toolforge webservice restart'
 ```
 
-For disaster recovery when GitHub deployment is unavailable, start a manual
-Toolforge build with:
+For disaster recovery when the GitHub release artifact is unavailable, start
+a manual Toolforge build with:
 
 ```sh
 toolforge build start --envvar WIKI_ECON_BUILD_RUST=1 \

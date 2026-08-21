@@ -167,8 +167,8 @@ jobs:
       - name: Vendor patch hygiene
         run: scripts/check_vendor_patches.sh
 
-  deploy-toolforge:
-    name: Build and deploy Toolforge release
+  toolforge-release:
+    name: Build Toolforge release artifact
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs:
       - quality
@@ -176,9 +176,8 @@ jobs:
       - security
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    environment: toolforge
     concurrency:
-      group: toolforge-production
+      group: toolforge-release-build
       cancel-in-progress: false
 
     steps:
@@ -187,14 +186,12 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Classify deployment changes
+      - name: Classify release changes
         id: changes
         env:
           BEFORE_SHA: ${{ github.event.before }}
         run: |
           rust_changed=false
-          image_changed=false
-
           if [[ "$BEFORE_SHA" =~ ^0+$ ]] || ! git cat-file -e "$BEFORE_SHA^{commit}"; then
             changed_files="$(git ls-tree -r --name-only "$GITHUB_SHA")"
           else
@@ -207,17 +204,10 @@ jobs:
                 rust_changed=true
                 ;;
             esac
-            case "$path" in
-              Procfile|package.json|package-lock.json|RustConfig|scripts/*|site/*|deploy/toolforge/*)
-                image_changed=true
-                ;;
-            esac
           done <<< "$changed_files"
 
           echo "rust=$rust_changed" >> "$GITHUB_OUTPUT"
-          echo "image=$image_changed" >> "$GITHUB_OUTPUT"
-          printf 'Rust binary changed: %s\nToolforge image changed: %s\n' \
-            "$rust_changed" "$image_changed"
+          printf 'Rust binary changed: %s\n' "$rust_changed"
 
       - name: Install Rust toolchain
         if: steps.changes.outputs.rust == 'true'
@@ -261,37 +251,3 @@ jobs:
             target/release/wiki-econ.sha256
           if-no-files-found: error
           retention-days: 30
-
-      - name: Configure Toolforge SSH
-        if: steps.changes.outputs.rust == 'true' || steps.changes.outputs.image == 'true'
-        env:
-          SSH_PRIVATE_KEY: ${{ secrets.TOOLFORGE_SSH_PRIVATE_KEY }}
-          SSH_KNOWN_HOSTS: ${{ secrets.TOOLFORGE_KNOWN_HOSTS }}
-          TOOLFORGE_SSH_USER: ${{ secrets.TOOLFORGE_SSH_USER }}
-        run: |
-          test -n "$SSH_PRIVATE_KEY"
-          test -n "$SSH_KNOWN_HOSTS"
-          test -n "$TOOLFORGE_SSH_USER"
-          install -d -m 0700 "$HOME/.ssh"
-          printf '%s\n' "$SSH_PRIVATE_KEY" > "$HOME/.ssh/id_ed25519"
-          printf '%s\n' "$SSH_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
-          chmod 0600 "$HOME/.ssh/id_ed25519" "$HOME/.ssh/known_hosts"
-          ssh -o BatchMode=yes -o StrictHostKeyChecking=yes \
-            "$TOOLFORGE_SSH_USER@login.toolforge.org" true
-
-      - name: Deploy Rust binary
-        if: steps.changes.outputs.rust == 'true'
-        env:
-          TOOLFORGE_SSH_TARGET: ${{ secrets.TOOLFORGE_SSH_USER }}@login.toolforge.org
-        run: deploy/toolforge/deploy-binary.sh target/release/wiki-econ "$GITHUB_SHA"
-
-      - name: Rebuild lightweight Toolforge image
-        if: steps.changes.outputs.image == 'true'
-        env:
-          TOOLFORGE_SSH_TARGET: ${{ secrets.TOOLFORGE_SSH_USER }}@login.toolforge.org
-        run: |
-          ssh -o BatchMode=yes "$TOOLFORGE_SSH_TARGET" \
-            "become wiki-economics test -x /data/project/wiki-economics/app/current/wiki-econ"
-          ssh -o BatchMode=yes "$TOOLFORGE_SSH_TARGET" \
-            "become wiki-economics bash -s -- 'https://github.com/$GITHUB_REPOSITORY.git' '$GITHUB_SHA'" \
-            < deploy/toolforge/rebuild-image.sh
