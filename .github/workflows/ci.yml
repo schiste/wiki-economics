@@ -20,7 +20,7 @@ env:
 
 jobs:
   quality:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       PYTHON_TEST_DEPENDENCIES: pyarrow
@@ -38,11 +38,14 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # @stable as of pin
         with:
-          toolchain: stable
+          toolchain: 1.98.0
           components: rustfmt, clippy
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          workspaces: ". -> target"
+          cache-on-failure: true
 
       - name: Check shell script syntax
         run: bash -n scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh deploy/toolforge/*.sh
@@ -93,7 +96,7 @@ jobs:
         run: cargo doc --no-deps
 
   coverage:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       LLVM_COV_OUTPUT_PATH: /tmp/wiki-economics-target/llvm-cov.info
@@ -105,10 +108,13 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # @stable as of pin
         with:
-          toolchain: stable
+          toolchain: 1.98.0
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          workspaces: ". -> target"
+          cache-on-failure: true
 
       - name: Install coverage tooling
         uses: taiki-e/install-action@51cd0b8c0499559d9a4d75c0f5c67bec3a894ec8  # v2
@@ -129,7 +135,7 @@ jobs:
           if-no-files-found: error
 
   security:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
 
     steps:
@@ -139,10 +145,13 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # @stable as of pin
         with:
-          toolchain: stable
+          toolchain: 1.98.0
 
       - name: Cache cargo artifacts
         uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          workspaces: ". -> target"
+          cache-on-failure: true
 
       - name: Install security tooling
         uses: taiki-e/install-action@51cd0b8c0499559d9a4d75c0f5c67bec3a894ec8  # v2

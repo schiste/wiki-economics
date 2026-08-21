@@ -41,9 +41,9 @@ python3 -m py_compile scripts/fetch_patrol.py scripts/compute_patrol.py scripts/
 python3 -m unittest discover -s scripts -p 'test_*.py'
 ```
 
-Cargo build artifacts are intentionally routed out of the repo via
-`.cargo/config.toml` to `/tmp/wiki-economics-target`. Override with
-`CARGO_TARGET_DIR` if you want a different local cache location.
+Cargo build artifacts use the standard, gitignored `target/` directory. This
+keeps local builds and CI cache paths aligned. Override `CARGO_TARGET_DIR` if
+you need a different local cache location.
 
 Expected bar:
 

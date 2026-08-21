@@ -1,0 +1,4 @@
+# Toolforge's Rust buildpack reads this legacy configuration file rather than
+# rust-toolchain.toml. Keep VERSION synchronized with rust-toolchain.toml.
+VERSION=1.98.0
+RUST_CARGO_BUILD_FLAGS="--release --locked"
