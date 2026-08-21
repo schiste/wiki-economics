@@ -711,10 +711,7 @@ fn compute_page_weekly_edits(wiki: &str, data_dir: &Path, output_dir: &Path) -> 
         "page_weekly_edits: merging partition batches"
     );
     let weekly_df = merge_weekly_batches(wiki, merged_batches)?;
-    let weekly_df = sort_frame(
-        weekly_df,
-        ["page_id", "page_namespace", "page_title", "week_start"],
-    )?;
+    let weekly_df = sort_frame(weekly_df, weekly_sort_keys())?;
     info!(
         wiki = wiki,
         merged_rows = weekly_df.height(),
@@ -743,7 +740,9 @@ fn compute_page_weekly_edits(wiki: &str, data_dir: &Path, output_dir: &Path) -> 
         .lazy()
         .with_columns([
             col("page_id").shift(lit(1)).alias("prev_page_id"),
-            col("page_namespace").shift(lit(1)).alias("prev_page_namespace"),
+            col("page_namespace")
+                .shift(lit(1))
+                .alias("prev_page_namespace"),
             col("page_title").shift(lit(1)).alias("prev_page_title"),
             col("week_start").shift(lit(1)).alias("prev_week_start"),
             col("edits").shift(lit(1)).alias("prev_edits"),
@@ -806,6 +805,10 @@ fn weekly_group_keys() -> [Expr; 4] {
     ]
 }
 
+fn weekly_sort_keys() -> [&'static str; 4] {
+    ["page_id", "page_namespace", "page_title", "week_start"]
+}
+
 /// Merges batches of already within-batch-deduplicated weekly edit counts
 /// (see `compute_page_weekly_edits`) into one frame, without ever running a
 /// group_by-sum over the full concatenation.
@@ -830,7 +833,11 @@ fn merge_weekly_batches(wiki: &str, batches: Vec<DataFrame>) -> Result<DataFrame
         if let Some(carry_df) = carry.take() {
             let carry_week = max_week_start(&carry_df)?;
             let is_carry_week = col("week_start").eq(lit(carry_week).cast(DataType::Date));
-            let matching = batch.clone().lazy().filter(is_carry_week.clone()).collect()?;
+            let matching = batch
+                .clone()
+                .lazy()
+                .filter(is_carry_week.clone())
+                .collect()?;
             if matching.height() > 0 {
                 batch = batch.lazy().filter(is_carry_week.not()).collect()?;
                 let mut carry_and_matching = carry_df;
@@ -1516,17 +1523,19 @@ mod tests {
     }
 
     fn weekly_batch_df(rows: &[(i64, i32, &str, i32, u32)]) -> Result<DataFrame> {
-        let df = df!(
+        df!(
             "page_id" => rows.iter().map(|r| r.0).collect::<Vec<_>>(),
             "page_namespace" => rows.iter().map(|r| r.1).collect::<Vec<_>>(),
             "page_title" => rows.iter().map(|r| r.2).collect::<Vec<_>>(),
             "week_start" => rows.iter().map(|r| r.3).collect::<Vec<_>>(),
             "edits" => rows.iter().map(|r| r.4).collect::<Vec<_>>(),
-        )?;
-        df.lazy()
-            .with_column(col("week_start").cast(DataType::Date))
-            .collect()
-            .map_err(Into::into)
+        )
+        .and_then(|df| {
+            df.lazy()
+                .with_column(col("week_start").cast(DataType::Date))
+                .collect()
+        })
+        .map_err(Into::into)
     }
 
     #[test]
@@ -1548,7 +1557,7 @@ mod tests {
         ])?;
 
         let merged = merge_weekly_batches("testwiki", vec![batch1, batch2, batch3])?;
-        let merged = sort_frame(merged, ["page_id", "page_namespace", "page_title", "week_start"])?;
+        let merged = sort_frame(merged, weekly_sort_keys())?;
 
         let page_id: Vec<i64> = merged.column("page_id")?.i64()?.iter().flatten().collect();
         let week_start: Vec<i32> = merged
@@ -1564,6 +1573,37 @@ mod tests {
         assert_eq!(week_start, vec![0, 7, 14, 21, 14]);
         // week 7 reconciles 2 (batch 1) + 5 (batch 2) = 7; the rest pass through unchanged.
         assert_eq!(edits, vec![3, 7, 1, 4, 2]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn merge_weekly_batches_skips_batch_fully_consumed_by_carry() -> Result<()> {
+        // batch2 contains only the row that continues batch1's carried week,
+        // so after reconciling it the batch has nothing left to contribute
+        // and must not start a new carry.
+        let batch1 = weekly_batch_df(&[
+            (1, 0, "Alpha", 0, 3),
+            (1, 0, "Alpha", 7, 2), // batch 1's max week: carried forward
+        ])?;
+        let batch2 = weekly_batch_df(&[
+            (1, 0, "Alpha", 7, 5), // fully consumed reconciling batch 1's carry
+        ])?;
+
+        let merged = merge_weekly_batches("testwiki", vec![batch1, batch2])?;
+        let merged = sort_frame(merged, weekly_sort_keys())?;
+
+        let week_start: Vec<i32> = merged
+            .column("week_start")?
+            .date()?
+            .physical()
+            .iter()
+            .flatten()
+            .collect();
+        let edits: Vec<u32> = merged.column("edits")?.u32()?.iter().flatten().collect();
+
+        assert_eq!(week_start, vec![0, 7]);
+        assert_eq!(edits, vec![3, 7]);
 
         Ok(())
     }
