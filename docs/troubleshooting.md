@@ -27,6 +27,23 @@ interested in patrol metrics, run `cargo run --release -- compute
 <wiki>` once and ignore the patrol failure mode for now — the rest of
 the pipeline still produces output.
 
+## Patrol Parquets are empty after a successful-looking fetch
+
+Logging dumps can be concatenated multi-member gzip streams. The Rust patrol parser reads every
+member and logs `total_log_items`, `patrol_events`, `rights_events`, and `skipped_events`. It rejects
+a substantial dump when both relevant-event counts are zero, while preserving the preceding
+Parquet outputs.
+
+After correcting patrol ingestion, rebuild only the patrol-dependent artifacts; the historical
+revision pipeline does not need to run again:
+
+```bash
+cargo run --release -- patrol-fetch nlwiki
+cargo run --release -- patrol-compute nlwiki --rebuild
+cargo run --release -- merge
+./scripts/build-site.sh
+```
+
 ## Ingest "marker is valid" skip when you expect a rebuild
 
 Ingest is idempotent based on the marker manifest at

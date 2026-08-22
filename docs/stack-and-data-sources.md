@@ -37,7 +37,11 @@ XML dumps of the `logging` table, fetched from `dumps.wikimedia.org/<wiki>/lates
 - **Patrol events** (`log_type=patrol`) — records of editors reviewing new pages and edits
 - **User rights changes** (`log_type=rights`) — used to reconstruct which editors held autopatrol permissions at any given time
 
-The XML is streamed and parsed on-the-fly without loading the full file into memory.
+The XML is streamed and parsed on-the-fly without loading the full file into memory. Wikimedia
+logging dumps may contain concatenated gzip members, so the Rust reader decodes every member as
+one continuous XML stream. The fetch log reports total log items, recognized patrol events,
+recognized rights events, and skipped events. A substantial dump that produces no relevant events
+is rejected instead of publishing empty Parquet files.
 
 ### MediaWiki API
 
