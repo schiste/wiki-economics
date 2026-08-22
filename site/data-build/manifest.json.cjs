@@ -3,7 +3,6 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
-const duckdb = require("duckdb");
 
 const CORE_METRICS = [
   "business_funnel", "gdp", "gdp_activity_tiers", "gdp_user_type_share",
@@ -147,6 +146,7 @@ function generationSummary(dataDir, wiki) {
 }
 
 function parquetRowCounter() {
+  const duckdb = require("duckdb");
   const database = new duckdb.Database(":memory:");
   return {
     count(file) {
