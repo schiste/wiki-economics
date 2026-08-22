@@ -64,7 +64,7 @@ fn cleanup_written_paths(paths: &[PathBuf]) {
     }
 }
 
-fn ingest_source_id(src: &Path) -> Result<String> {
+pub(crate) fn ingest_source_id(src: &Path) -> Result<String> {
     let source_id = src
         .file_stem()
         .and_then(|stem| stem.to_str())
@@ -435,21 +435,61 @@ fn ingest_wiki_for_snapshot(
     requested_snapshot: Option<&str>,
 ) -> Result<Vec<PathBuf>> {
     let raw_dir = data_dir.join("raw").join(wiki);
-
-    if !raw_dir.exists() {
-        anyhow::bail!("No raw data for {wiki}. Run `fetch` first.");
-    }
-
-    let mut src_files: Vec<PathBuf> = fs::read_dir(&raw_dir)?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| path.extension().is_some_and(|ext| ext == "bz2"))
-        .collect();
+    let mut src_files: Vec<PathBuf> = if raw_dir.exists() {
+        fs::read_dir(&raw_dir)?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().is_some_and(|ext| ext == "bz2"))
+            .collect()
+    } else {
+        Vec::new()
+    };
     src_files.sort();
-    ensure!(
-        !src_files.is_empty(),
-        "No raw .bz2 files for {wiki}. Run `fetch` first."
-    );
-    let (snapshot_version, src_files) = select_ingest_sources(wiki, src_files, requested_snapshot)?;
+
+    let (snapshot_version, src_files) = match requested_snapshot {
+        Some(version) => {
+            storage::validate_snapshot_version(version)?;
+            let roots = IngestRoots::snapshot(data_dir, wiki, version)?;
+            let expected = fetch::build_file_list(wiki, version)?;
+            let by_name: BTreeMap<String, PathBuf> = src_files
+                .into_iter()
+                .filter_map(|path| {
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .map(|name| (name.to_string(), path.clone()))
+                })
+                .collect();
+            let mut selected = Vec::new();
+            let mut missing = Vec::new();
+            for filename in expected {
+                if let Some(path) = by_name.get(&filename) {
+                    selected.push(path.clone());
+                    continue;
+                }
+                let source_id = ingest_source_id(Path::new(&filename))?;
+                if !storage::marker_manifest_is_valid_in(data_dir, &roots.analytical, &source_id)? {
+                    missing.push(filename);
+                }
+            }
+            ensure!(
+                missing.is_empty(),
+                "snapshot {version} for {wiki} is incomplete; missing {} source file(s): {}",
+                missing.len(),
+                missing.join(", ")
+            );
+            (Some(version.to_string()), selected)
+        }
+        None => {
+            ensure!(
+                raw_dir.exists(),
+                "No raw data for {wiki}. Run `fetch` first."
+            );
+            ensure!(
+                !src_files.is_empty(),
+                "No raw .bz2 files for {wiki}. Run `fetch` first."
+            );
+            select_ingest_sources(wiki, src_files, None)?
+        }
+    };
     let roots = match snapshot_version.as_deref() {
         Some(version) => IngestRoots::snapshot(data_dir, wiki, version)?,
         None => IngestRoots::legacy(data_dir, wiki),
@@ -468,8 +508,15 @@ fn ingest_wiki_for_snapshot(
         convert_file_with_chunk_limit(src, wiki, data_dir, &roots, INGEST_CHUNK_BYTES).map(|_| ())
     })?;
 
-    for src in &src_files {
-        let source_id = ingest_source_id(src)?;
+    let sources_to_validate = match snapshot_version.as_deref() {
+        Some(version) => fetch::build_file_list(wiki, version)?
+            .into_iter()
+            .map(PathBuf::from)
+            .collect(),
+        None => src_files.clone(),
+    };
+    for source in &sources_to_validate {
+        let source_id = ingest_source_id(source)?;
         ensure!(
             storage::marker_manifest_is_valid_in(data_dir, &roots.analytical, &source_id)?,
             "snapshot source {source_id} did not produce a valid ingest marker"
@@ -851,6 +898,35 @@ mod tests {
 
         let err = ingest_wiki("emptywiki", temp_dir.path()).expect_err("empty raw dir");
         assert!(err.to_string().contains("No raw .bz2 files"));
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_snapshot_reuses_complete_markers_without_raw_files() -> Result<()> {
+        init_test_tracing();
+        let temp_dir = TestDir::new()?;
+        let wiki = "testwiki";
+        let version = "2026-08";
+        let analytical = storage::snapshot_analytical_wiki_dir(temp_dir.path(), wiki, version)?;
+        let warehouse = storage::snapshot_warehouse_wiki_dir(temp_dir.path(), wiki, version)?;
+        fs::create_dir_all(&warehouse)?;
+        let filename = fetch::build_file_list(wiki, version)?
+            .pop()
+            .expect("all-time source");
+        storage::write_marker_manifest_in(
+            temp_dir.path(),
+            &analytical,
+            &ingest_source_id(Path::new(&filename))?,
+            &storage::MarkerManifest::default(),
+        )?;
+
+        let paths = ingest_wiki_snapshot(wiki, version, temp_dir.path())?;
+
+        assert!(paths.is_empty());
+        assert_eq!(
+            storage::current_snapshot_version(temp_dir.path(), wiki)?.as_deref(),
+            Some(version)
+        );
         Ok(())
     }
 

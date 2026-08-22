@@ -1133,26 +1133,6 @@ fn download_file_with_transport<T: HttpTransport>(
     }
 }
 
-fn fetch_wiki_from_base_with_transport<T: HttpTransport>(
-    transport: &T,
-    base_url: &str,
-    wiki: &str,
-    version: &str,
-    data_dir: &Path,
-) -> Result<Vec<PathBuf>> {
-    let files = build_file_list(wiki, version)?;
-    let parallelism = fetch_parallelism(files.len());
-    fetch_wiki_from_base_with_transport_at_parallelism(
-        transport,
-        base_url,
-        wiki,
-        version,
-        data_dir,
-        files,
-        parallelism,
-    )
-}
-
 fn fetch_wiki_from_base_with_transport_at_parallelism<T: HttpTransport>(
     transport: &T,
     base_url: &str,
@@ -1298,9 +1278,44 @@ fn fetch_wiki_with_transport<T: HttpTransport>(
     version: &str,
     data_dir: &Path,
 ) -> Result<Vec<PathBuf>> {
-    let files = build_file_list(wiki, version)?;
+    let expected = build_file_list(wiki, version)?;
+    let analytical_root = crate::storage::snapshot_analytical_wiki_dir(data_dir, wiki, version)?;
+    let mut files = Vec::new();
+    for filename in expected {
+        let source_id = crate::ingest::ingest_source_id(Path::new(&filename))?;
+        if crate::storage::marker_manifest_is_valid_in(data_dir, &analytical_root, &source_id)? {
+            debug!(
+                wiki = wiki,
+                version = version,
+                source = filename,
+                "skipping download represented by valid ingest marker"
+            );
+        } else {
+            files.push(filename);
+        }
+    }
+    let reused = build_file_list(wiki, version)?.len() - files.len();
+    info!(
+        wiki = wiki,
+        version = version,
+        reused_sources = reused,
+        download_sources = files.len(),
+        "planned snapshot fetch from strict ingest markers"
+    );
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
     check_disk_headroom(transport, base_url, wiki, version, &files, data_dir)?;
-    fetch_wiki_from_base_with_transport(transport, base_url, wiki, version, data_dir)
+    let parallelism = fetch_parallelism(files.len());
+    fetch_wiki_from_base_with_transport_at_parallelism(
+        transport,
+        base_url,
+        wiki,
+        version,
+        data_dir,
+        files,
+        parallelism,
+    )
 }
 
 /// Delete a wiki's downloaded `.bz2` dump files, freeing the on-disk peak
@@ -2252,6 +2267,36 @@ mod tests {
         .expect("an existing dump should pass orchestration without downloading");
 
         assert_eq!(paths, vec![existing]);
+        assert_eq!(transport.get_requests(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn fetch_wiki_skips_sources_covered_by_snapshot_ingest_markers() -> Result<()> {
+        init_test_tracing();
+        let data_dir = TestDir::new()?;
+        let wiki = "simplewiki";
+        let version = "2026-02";
+        let filename = "2026-02.simplewiki.all-time.tsv.bz2";
+        let analytical =
+            crate::storage::snapshot_analytical_wiki_dir(data_dir.path(), wiki, version)?;
+        crate::storage::write_marker_manifest_in(
+            data_dir.path(),
+            &analytical,
+            &crate::ingest::ingest_source_id(Path::new(filename))?,
+            &crate::storage::MarkerManifest::default(),
+        )?;
+        let transport = FakeTransport::default();
+
+        let paths = fetch_wiki_with_transport(
+            &transport,
+            "http://example.invalid",
+            wiki,
+            version,
+            data_dir.path(),
+        )?;
+
+        assert!(paths.is_empty());
         assert_eq!(transport.get_requests(), 0);
         Ok(())
     }
