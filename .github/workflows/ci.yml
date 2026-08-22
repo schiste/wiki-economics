@@ -67,6 +67,7 @@ jobs:
           node --test site/admin-auth.test.cjs
           node --test site/admin-server.test.cjs
           node --test site/build-site.test.cjs
+          node --test scripts/wiki-lifecycle.test.cjs
 
       - name: Check helper CLI entrypoints
         run: |

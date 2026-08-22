@@ -25,6 +25,12 @@ node --test site/admin-auth.test.cjs
 echo "==> node --test site/admin-server.test.cjs"
 node --test site/admin-server.test.cjs
 
+echo "==> node --test site/build-site.test.cjs"
+node --test site/build-site.test.cjs
+
+echo "==> node --test scripts/wiki-lifecycle.test.cjs"
+node --test scripts/wiki-lifecycle.test.cjs
+
 echo "==> ./scripts/build-site.sh --help"
 ./scripts/build-site.sh --help
 
