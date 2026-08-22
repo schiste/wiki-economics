@@ -5,7 +5,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const {after, test} = require("node:test");
-const {buildManifest, generationSummary, safeReceiptOutput} = require("./manifest.json.cjs");
+const {buildManifest, generationSummary, parquetRowCounter, safeReceiptOutput, sqlString} = require("./manifest.json.cjs");
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-manifest-"));
 after(() => fs.rmSync(root, {recursive: true, force: true}));
@@ -62,6 +62,8 @@ function fixture(name) {
   fs.writeFileSync(path.join(patrolDir, "rights.parquet"), "rights");
   fs.mkdirSync(path.join(outputDir, "nlwiki"), {recursive: true});
   fs.mkdirSync(path.join(outputDir, "_stages"), {recursive: true});
+  fs.mkdirSync(path.join(outputDir, ".refresh-lock"), {recursive: true});
+  fs.mkdirSync(path.join(outputDir, "logs"), {recursive: true});
   for (const metric of metrics) {
     fs.writeFileSync(path.join(outputDir, "nlwiki", `${metric}.parquet`), metric);
     fs.writeFileSync(path.join(outputDir, `${metric}.parquet`), metric);
@@ -98,6 +100,27 @@ test("generation readiness follows the pointer and strict ingest receipt without
   assert.equal(manifest.wikis.nlwiki.patrol.event_rows, 10);
   assert.equal(manifest.wikis.nlwiki.patrol.rights_rows, 2);
   assert.equal(manifest.wikis._stages, undefined);
+  assert.equal(manifest.wikis[".refresh-lock"], undefined);
+  assert.equal(manifest.wikis.logs, undefined);
+});
+
+test("the production row counter uses the supported connection query API", async () => {
+  let observedSql = null;
+  let closed = false;
+  const connection = {close() { closed = true; }};
+  const counter = parquetRowCounter({
+    connect() { return connection; },
+    async queryRows(observedConnection, sql) {
+      assert.equal(observedConnection, connection);
+      observedSql = sql;
+      return [{rows: 17}];
+    },
+  });
+  assert.equal(await counter.count("a'file.parquet"), 17);
+  counter.close();
+  assert.match(observedSql, /read_parquet\('a''file\.parquet'\)/);
+  assert.equal(closed, true);
+  assert.equal(sqlString("a'b"), "'a''b'");
 });
 
 test("patrol readiness rejects existing but zero-row parquet files", async () => {

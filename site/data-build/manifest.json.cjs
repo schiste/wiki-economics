@@ -145,19 +145,21 @@ function generationSummary(dataDir, wiki) {
     outputs: validOutputs, bytes, in_progress: inProgress, error};
 }
 
-function parquetRowCounter() {
-  const duckdb = require("duckdb");
-  const database = new duckdb.Database(":memory:");
+function sqlString(value) {
+  return `'${String(value).replaceAll("'", "''")}'`;
+}
+
+function parquetRowCounter(adapter = require("./lib/duckdb-json.cjs")) {
+  const connection = adapter.connect();
   return {
-    count(file) {
-      return new Promise((resolve, reject) => {
-        database.get("SELECT count(*) AS rows FROM read_parquet(?)", file, (error, row) => {
-          if (error) reject(error);
-          else resolve(Number(row.rows));
-        });
-      });
+    async count(file) {
+      const rows = await adapter.queryRows(
+        connection,
+        `SELECT count(*) AS rows FROM read_parquet(${sqlString(file)})`,
+      );
+      return Number(rows[0]?.rows || 0);
     },
-    close() { database.close(); },
+    close() { connection.close(); },
   };
 }
 
@@ -204,7 +206,7 @@ function discoverWikis(dataDir, outputDir, lifecycle) {
     let entries = [];
     try { entries = fs.readdirSync(root, {withFileTypes: true}); } catch { continue; }
     for (const entry of entries) {
-      if (entry.isDirectory() && !entry.name.startsWith("_")) names.add(entry.name);
+      if (entry.isDirectory() && /^[a-z0-9_]+wiki$/i.test(entry.name)) names.add(entry.name);
     }
   }
   return [...names].sort();
@@ -275,4 +277,5 @@ if (require.main === module) {
   });
 }
 
-module.exports = {buildManifest, datasetApplies, discoverWikis, generationSummary, humanBytes, patrolSummary, safeReceiptOutput};
+module.exports = {buildManifest, datasetApplies, discoverWikis, generationSummary, humanBytes, parquetRowCounter,
+  patrolSummary, safeReceiptOutput, sqlString};
