@@ -30,6 +30,8 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 REFRESH_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 REFRESH_START_EPOCH="$(date +%s)"
 REFRESH_HISTORY_LIMIT=20
+WIKI_ECON_RUN_ID="${WIKI_ECON_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
+export WIKI_ECON_RUN_ID
 
 read_cgroup_counter() {
   local path=$1 value
@@ -56,8 +58,8 @@ write_refresh_status() {
   memory_peak=$(read_cgroup_counter /sys/fs/cgroup/memory.peak)
   memory_limit=$(read_cgroup_counter /sys/fs/cgroup/memory.max)
   wikis_json=$(printf '"%s",' "${wikis[@]:-}" | sed 's/,$//')
-  entry=$(printf '{"startedAt":"%s","finishedAt":"%s","exitCode":%d,"wikis":[%s],"durationSecs":%d,"memoryPeakBytes":%s,"memoryLimitBytes":%s}' \
-    "$REFRESH_STARTED_AT" "$finished_at" "$exit_code" "$wikis_json" "$duration" "$memory_peak" "$memory_limit")
+  entry=$(printf '{"runId":"%s","startedAt":"%s","finishedAt":"%s","exitCode":%d,"wikis":[%s],"durationSecs":%d,"memoryPeakBytes":%s,"memoryLimitBytes":%s}' \
+    "$WIKI_ECON_RUN_ID" "$REFRESH_STARTED_AT" "$finished_at" "$exit_code" "$wikis_json" "$duration" "$memory_peak" "$memory_limit")
   status_file="$WIKI_ECON_OUTPUT_DIR/.refresh-status.json"
   history_file="$WIKI_ECON_OUTPUT_DIR/.refresh-history.jsonl"
   echo "$entry" > "${status_file}.tmp"

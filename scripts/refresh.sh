@@ -85,6 +85,9 @@ done
 
 wiki_econ_init_runtime
 wiki_econ_ensure_local_dirs
+WIKI_ECON_RUN_ID="${WIKI_ECON_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
+WIKI_ECON_REQUIRE_PUBLICATION_GATE=1
+export WIKI_ECON_RUN_ID WIKI_ECON_REQUIRE_PUBLICATION_GATE
 
 if [ -n "$WIKIS_FILE" ]; then
   while IFS= read -r wiki; do
@@ -102,6 +105,7 @@ fi
 
 echo "==> Refresh configuration"
 wiki_econ_print_runtime
+echo "Run ID:       $WIKI_ECON_RUN_ID"
 
 if [ "$MERGE_ONLY" -eq 1 ]; then
   wiki_econ_run_cli merge
@@ -112,6 +116,8 @@ else
   fi
   wiki_econ_run_cli "${cmd[@]}"
 fi
+
+wiki_econ_run_cli publication-validate
 
 if [ "$SKIP_SITE_BUILD" -eq 0 ]; then
   "$ROOT/scripts/build-site.sh" \

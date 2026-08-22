@@ -112,16 +112,19 @@ wiki_econ_run_cli() {
       "$WIKI_ECON_BIN"
       --data-dir "$WIKI_ECON_DATA_DIR"
       --output-dir "$WIKI_ECON_OUTPUT_DIR"
-      "$@"
     )
   else
     cmd=(
       cargo run --release --locked --
       --data-dir "$WIKI_ECON_DATA_DIR"
       --output-dir "$WIKI_ECON_OUTPUT_DIR"
-      "$@"
     )
   fi
+
+  if [ -n "${WIKI_ECON_RUN_ID:-}" ]; then
+    cmd+=(--run-id "$WIKI_ECON_RUN_ID")
+  fi
+  cmd+=("$@")
 
   printf '==> %s' "${cmd[0]}"
   for arg in "${cmd[@]:1}"; do

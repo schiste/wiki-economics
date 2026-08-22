@@ -45,6 +45,18 @@ wiki_econ_init_runtime
 wiki_econ_ensure_local_dirs
 wiki_econ_ensure_site_deps
 
+verify_publication_receipt() {
+  if [ "${WIKI_ECON_REQUIRE_PUBLICATION_GATE:-0}" = "1" ]; then
+    if [ -z "${WIKI_ECON_RUN_ID:-}" ]; then
+      echo "Publication gate is required but WIKI_ECON_RUN_ID is empty" >&2
+      exit 1
+    fi
+    wiki_econ_run_cli publication-verify
+  fi
+}
+
+verify_publication_receipt
+
 dist_dir="$WIKI_ECON_SITE_DIST_DIR"
 dist_parent="$(dirname "$dist_dir")"
 dist_name="$(basename "$dist_dir")"
@@ -91,6 +103,10 @@ if [ ! -f "$build_dir/index.html" ]; then
   echo "Observable build did not produce $build_dir/index.html" >&2
   exit 1
 fi
+
+# Close the validation-to-publication race: generators must not change any
+# artifact while Observable is building the staged release.
+verify_publication_receipt
 
 old_release=""
 if [ -L "$dist_dir" ]; then
