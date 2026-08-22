@@ -43,7 +43,6 @@ done
 
 wiki_econ_init_runtime
 wiki_econ_ensure_local_dirs
-wiki_econ_ensure_site_deps
 
 verify_publication_receipt() {
   if [ "${WIKI_ECON_REQUIRE_PUBLICATION_GATE:-0}" = "1" ]; then
@@ -65,6 +64,8 @@ if [ "${WIKI_ECON_REQUIRE_PUBLICATION_GATE:-0}" = "1" ]; then
     exit 0
   fi
 fi
+
+wiki_econ_ensure_site_deps
 
 dist_dir="$WIKI_ECON_SITE_DIST_DIR"
 dist_parent="$(dirname "$dist_dir")"

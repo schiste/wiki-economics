@@ -23,6 +23,9 @@ fs.writeFileSync(
   fakeNpm,
   `#!/bin/sh
 set -eu
+if [ -n "\${FAKE_NPM_LOG:-}" ]; then
+  printf '%s\n' "$*" >> "$FAKE_NPM_LOG"
+fi
 mkdir -p "$WIKI_ECON_SITE_DIST_DIR"
 printf 'new release\\n' > "$WIKI_ECON_SITE_DIST_DIR/index.html"
 if [ "\${FAKE_BUILD_FAIL:-0}" = 1 ]; then
@@ -31,6 +34,9 @@ fi
 `,
   {mode: 0o755},
 );
+
+const fakeWikiEcon = path.join(fakeBin, "wiki-econ");
+fs.writeFileSync(fakeWikiEcon, "#!/bin/sh\nexit 0\n", {mode: 0o755});
 
 after(() => fs.rmSync(fixtureRoot, {recursive: true, force: true}));
 
@@ -76,4 +82,23 @@ test("site builds are switched atomically and failed staging is discarded", () =
 
   const siblings = fs.readdirSync(path.dirname(distDir));
   assert.deepEqual(siblings.sort(), [secondTarget, path.basename(distDir)].sort());
+});
+
+test("a reusable site skips Node dependency installation", () => {
+  const cacheHitSite = path.join(fakeRoot, "cache-hit-site");
+  const npmLog = path.join(fixtureRoot, "cache-hit-npm.log");
+  fs.mkdirSync(cacheHitSite, {recursive: true});
+
+  const result = runBuild({
+    FAKE_NPM_LOG: npmLog,
+    WIKI_ECON_BIN: fakeWikiEcon,
+    WIKI_ECON_REQUIRE_PUBLICATION_GATE: "1",
+    WIKI_ECON_RUN_ID: "cache-hit-run",
+    WIKI_ECON_SITE_DIR: cacheHitSite,
+  });
+
+  assertBuildSucceeded(result);
+  assert.match(result.stdout, /Site inputs unchanged; reusing published site/);
+  assert.equal(fs.existsSync(npmLog), false);
+  assert.equal(fs.existsSync(path.join(cacheHitSite, "node_modules")), false);
 });
