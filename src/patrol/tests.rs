@@ -97,6 +97,15 @@ fn write_gz(path: &Path, content: &str) -> Result<()> {
     Ok(())
 }
 
+fn write_multi_member_gz(path: &Path, members: &[&str]) -> Result<()> {
+    let mut bytes = Vec::new();
+    for member in members {
+        bytes.extend(gzip_bytes(member)?);
+    }
+    fs::write(path, bytes)?;
+    Ok(())
+}
+
 fn write_revision_partition(
     root: &Path,
     wiki: &str,
@@ -604,19 +613,48 @@ autopatrolled,sysop</params>
 }
 
 #[test]
-fn parse_logging_events_handles_cdata_unknown_tags_and_errors() -> Result<()> {
+fn fetch_patrol_rejects_irrelevant_dump_without_replacing_outputs() -> Result<()> {
+    let data_dir = TestDir::new()?;
+    let patrol_dir = data_dir.path().join("patrol").join("testwiki");
+    fs::create_dir_all(&patrol_dir)?;
+    let patrol_path = patrol_dir.join("patrol.parquet");
+    let rights_path = patrol_dir.join("rights.parquet");
+    fs::write(&patrol_path, b"previous patrol")?;
+    fs::write(&rights_path, b"previous rights")?;
+
+    let skipped_item = "<logitem><type>move</type></logitem>";
+    let xml = format!(
+        "<mediawiki>{}</mediawiki>",
+        skipped_item.repeat(SUBSTANTIAL_LOG_ITEMS)
+    );
+    let transport = FakePatrolTransport::new(
+        vec![gzip_bytes(&xml)?],
+        vec![json!({ "query": { "usergroups": [] } })],
+    );
+    let error = fetch_patrol_with_transport("testwiki", data_dir.path(), &transport)
+        .expect_err("a substantial irrelevant dump must be rejected");
+
+    assert!(error.to_string().contains("zero patrol or rights events"));
+    assert_eq!(fs::read(&patrol_path)?, b"previous patrol");
+    assert_eq!(fs::read(&rights_path)?, b"previous rights");
+    assert!(!patrol_path.with_extension("parquet.tmp").exists());
+    assert!(!rights_path.with_extension("parquet.tmp").exists());
+    Ok(())
+}
+
+#[test]
+fn parse_logging_events_reads_all_gzip_members_and_reports_stats() -> Result<()> {
     init_test_tracing();
     let temp_dir = TestDir::new()?;
     let xml_path = temp_dir.path().join("logging.xml.gz");
-    write_gz(
-        &xml_path,
-        r#"<?xml version="1.0"?>
+    let xml = r#"<?xml version="1.0"?>
 <mediawiki xmlns="http://www.mediawiki.org/xml/export-0.11/">
   <!-- comment -->
   <logitem>
     <timestamp>2026-01-01T00:00:00Z</timestamp>
     <type>move</type>
     <comment>ignored</comment>
+    <logitem><type>delete</type></logitem>
   </logitem>
   <logitem>
     <id>2</id>
@@ -628,18 +666,37 @@ fn parse_logging_events_handles_cdata_unknown_tags_and_errors() -> Result<()> {
 200
 1]]></params>
   </logitem>
-</mediawiki>"#,
-    )?;
+  <logitem>
+    <timestamp>2026-01-03T00:00:00Z</timestamp>
+    <type>rights</type>
+    <logtitle>User:Editor</logtitle>
+    <params>editor
+autopatrolled</params>
+  </logitem>
+</mediawiki>"#;
+    let second_member = xml
+        .find("  <logitem>\n    <id>2</id>")
+        .expect("fixture should contain the second log item");
+    write_multi_member_gz(&xml_path, &[&xml[..second_member], &xml[second_member..]])?;
 
     let patrol_path = temp_dir.path().join("patrol.parquet");
     let rights_path = temp_dir.path().join("rights.parquet");
     let mut patrol_writer = PatrolWriter::new_with_batch_rows(&patrol_path, 10)?;
     let mut rights_writer = RightsWriter::new_with_batch_rows(&rights_path, 10)?;
-    let (patrol_count, rights_count) =
-        parse_logging_events(&xml_path, &mut patrol_writer, &mut rights_writer)?;
+    let stats = parse_logging_events(&xml_path, &mut patrol_writer, &mut rights_writer)?;
     patrol_writer.finish()?;
     rights_writer.finish()?;
-    assert_eq!((patrol_count, rights_count), (1, 0));
+    assert_eq!(
+        stats,
+        LoggingParseStats {
+            total_log_items: 3,
+            patrol_events: 1,
+            rights_events: 1,
+            skipped_events: 1,
+        }
+    );
+    assert_eq!(read_parquet_df(&patrol_path, None)?.height(), 1);
+    assert_eq!(read_parquet_df(&rights_path, None)?.height(), 1);
 
     let malformed_path = temp_dir.path().join("malformed.xml.gz");
     write_gz(&malformed_path, "<mediawiki><logitem></mediawikiX>")?;
@@ -654,6 +711,37 @@ fn parse_logging_events_handles_cdata_unknown_tags_and_errors() -> Result<()> {
     )
     .expect_err("malformed XML should fail");
     assert!(!err.to_string().is_empty());
+    Ok(())
+}
+
+#[test]
+fn logging_parse_validation_rejects_substantial_irrelevant_dumps() -> Result<()> {
+    let temp_dir = TestDir::new()?;
+    let small_path = temp_dir.path().join("small.xml.gz");
+    fs::write(&small_path, b"small")?;
+    validate_logging_parse(&small_path, LoggingParseStats::default())?;
+    validate_logging_parse(
+        &small_path,
+        LoggingParseStats {
+            total_log_items: SUBSTANTIAL_LOG_ITEMS,
+            skipped_events: SUBSTANTIAL_LOG_ITEMS,
+            ..Default::default()
+        },
+    )
+    .expect_err("many irrelevant log items must fail validation");
+
+    let large_path = temp_dir.path().join("large.xml.gz");
+    let large_file = File::create(&large_path)?;
+    large_file.set_len(SUBSTANTIAL_LOGGING_DUMP_BYTES)?;
+    validate_logging_parse(&large_path, LoggingParseStats::default())
+        .expect_err("a large dump with no relevant events must fail validation");
+    validate_logging_parse(
+        &large_path,
+        LoggingParseStats {
+            rights_events: 1,
+            ..Default::default()
+        },
+    )?;
     Ok(())
 }
 

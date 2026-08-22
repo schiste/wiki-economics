@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::NaiveDateTime;
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 use polars::prelude::*;
 use quick_xml::Reader;
 use quick_xml::events::Event;
@@ -23,6 +23,8 @@ use crate::storage;
 const USER_AGENT: &str = "wiki-econ/0.1 (Wikipedia economic analysis research tool)";
 const PATROL_DUMP_BASE: &str = "https://dumps.wikimedia.org";
 const PARQUET_BATCH_ROWS: usize = 50_000;
+const SUBSTANTIAL_LOGGING_DUMP_BYTES: u64 = 1024 * 1024;
+const SUBSTANTIAL_LOG_ITEMS: usize = 10_000;
 const REVISION_COLUMNS: &[&str] = &[
     "revision_id",
     "event_timestamp",
@@ -152,6 +154,14 @@ struct LogItem {
     contributor_id: Option<i64>,
     log_title: Option<String>,
     params: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct LoggingParseStats {
+    total_log_items: usize,
+    patrol_events: usize,
+    rights_events: usize,
+    skipped_events: usize,
 }
 
 struct PatrolWriter {
@@ -332,18 +342,43 @@ fn fetch_patrol_with_transport<T: PatrolTransport + ?Sized>(
     }))?;
     fs::write(&meta_path, meta_bytes)?;
 
-    let mut patrol_writer = PatrolWriter::new(&patrol_path)?;
-    let mut rights_writer = RightsWriter::new(&rights_path)?;
-    let (patrol_count, rights_count) =
-        parse_logging_events(&xml_path, &mut patrol_writer, &mut rights_writer)?;
-    patrol_writer.finish()?;
-    rights_writer.finish()?;
+    let patrol_temp_path = patrol_path.with_extension("parquet.tmp");
+    let rights_temp_path = rights_path.with_extension("parquet.tmp");
+    let _ = fs::remove_file(&patrol_temp_path);
+    let _ = fs::remove_file(&rights_temp_path);
+    let parsed = (|| {
+        let mut patrol_writer = PatrolWriter::new(&patrol_temp_path)?;
+        let mut rights_writer = RightsWriter::new(&rights_temp_path)?;
+        let stats = parse_logging_events(&xml_path, &mut patrol_writer, &mut rights_writer)?;
+        info!(
+            wiki = wiki,
+            total_log_items = stats.total_log_items,
+            patrol_events = stats.patrol_events,
+            rights_events = stats.rights_events,
+            skipped_events = stats.skipped_events,
+            "parsed patrol logging XML"
+        );
+        validate_logging_parse(&xml_path, stats)?;
+        patrol_writer.finish()?;
+        rights_writer.finish()?;
+        Ok::<_, anyhow::Error>(stats)
+    })();
+    let stats = match parsed {
+        Ok(stats) => stats,
+        Err(error) => {
+            let _ = fs::remove_file(&patrol_temp_path);
+            let _ = fs::remove_file(&rights_temp_path);
+            return Err(error);
+        }
+    };
+    fs::rename(&patrol_temp_path, &patrol_path)?;
+    fs::rename(&rights_temp_path, &rights_path)?;
 
     info!(
         wiki = wiki,
-        patrol_events = patrol_count,
-        rights_events = rights_count,
-        "parsed patrol logging XML"
+        patrol_events = stats.patrol_events,
+        rights_events = stats.rights_events,
+        "published patrol parquet outputs"
     );
     Ok(())
 }
@@ -622,9 +657,9 @@ fn parse_logging_events(
     xml_path: &Path,
     patrol_writer: &mut PatrolWriter,
     rights_writer: &mut RightsWriter,
-) -> Result<(usize, usize)> {
+) -> Result<LoggingParseStats> {
     let file = File::open(xml_path)?;
-    let decoder = GzDecoder::new(BufReader::new(file));
+    let decoder = MultiGzDecoder::new(BufReader::new(file));
     let mut reader = Reader::from_reader(BufReader::new(decoder));
     reader.config_mut().trim_text(true);
 
@@ -632,8 +667,7 @@ fn parse_logging_events(
     let mut current = None::<LogItem>;
     let mut current_tag = None::<String>;
     let mut in_contributor = false;
-    let mut patrol_count = 0;
-    let mut rights_count = 0;
+    let mut stats = LoggingParseStats::default();
 
     loop {
         match reader.read_event_into(&mut buffer) {
@@ -654,16 +688,19 @@ fn parse_logging_events(
                         current_tag = None;
                     }
                     "logitem" => {
-                        match current.take() {
-                            Some(item) if matches!(item.log_type.as_deref(), Some("patrol")) => {
-                                patrol_writer.add(item.into_patrol_row())?;
-                                patrol_count += 1;
+                        if let Some(item) = current.take() {
+                            stats.total_log_items += 1;
+                            match item {
+                                item if matches!(item.log_type.as_deref(), Some("patrol")) => {
+                                    patrol_writer.add(item.into_patrol_row())?;
+                                    stats.patrol_events += 1;
+                                }
+                                item if matches!(item.log_type.as_deref(), Some("rights")) => {
+                                    rights_writer.add(item.into_rights_row())?;
+                                    stats.rights_events += 1;
+                                }
+                                _ => stats.skipped_events += 1,
                             }
-                            Some(item) if matches!(item.log_type.as_deref(), Some("rights")) => {
-                                rights_writer.add(item.into_rights_row())?;
-                                rights_count += 1;
-                            }
-                            _ => {}
                         }
                         current_tag = None;
                     }
@@ -695,7 +732,22 @@ fn parse_logging_events(
         buffer.clear();
     }
 
-    Ok((patrol_count, rights_count))
+    Ok(stats)
+}
+
+fn validate_logging_parse(xml_path: &Path, stats: LoggingParseStats) -> Result<()> {
+    let compressed_bytes = fs::metadata(xml_path)?.len();
+    let substantial = compressed_bytes >= SUBSTANTIAL_LOGGING_DUMP_BYTES
+        || stats.total_log_items >= SUBSTANTIAL_LOG_ITEMS;
+    anyhow::ensure!(
+        !substantial || stats.patrol_events + stats.rights_events > 0,
+        "substantial logging dump {} produced zero patrol or rights events (compressed_bytes={}, total_log_items={}, skipped_events={})",
+        xml_path.display(),
+        compressed_bytes,
+        stats.total_log_items,
+        stats.skipped_events,
+    );
+    Ok(())
 }
 
 fn local_name(event: &quick_xml::events::BytesStart<'_>) -> String {
