@@ -68,6 +68,11 @@ Toolforge entirely.
   in `.refresh-status.json`, `.refresh-history.jsonl`, and
   `publication-gate.json`; see the [publication gate
   runbook](../../docs/publication-gate.md).
+  Unpinned refreshes resolve the latest completed dump once for all scheduled
+  wikis and reuse deterministic receipts for unchanged stages. The maximum
+  fallback is controlled by `WIKI_ECON_MAX_SNAPSHOT_LAG_MONTHS` (default `2`);
+  exceeding it fails closed. Receipt layout and invalidation rules are
+  documented in [stage fingerprints](../../docs/stage-fingerprints.md).
 
 ## Runbook
 

@@ -156,6 +156,8 @@ The following are live architecture contracts, not incidental implementation det
 - per-wiki metric outputs should include a `wiki` column before merge
 - merge is responsible for refreshing shared dashboard artifacts in `output/` (`manifest.json`, `defaults_*.json`) from the checked-in generator scripts under `site/data-build/`
 - patrol compute also refreshes its merged/default artifacts because it still runs through the Python sidecar pipeline
+- deterministic stage receipts live under `data/stages/` and `output/_stages/`; algorithm changes must increment the owning `*_ALGORITHM_VERSION` constant
+- unpinned fetch/run commands resolve one completed snapshot for the entire run and fail when no dump exists within `WIKI_ECON_MAX_SNAPSHOT_LAG_MONTHS`
 
 If any of these change, update `docs/architecture.md`, tests, and storage helpers together.
 

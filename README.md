@@ -81,10 +81,15 @@ cargo run --release --locked -- merge
 ```
 
 Pass `--version YYYY-MM` to `fetch`, `ingest`, or `run` when you need a
-specific dump snapshot. If omitted, `fetch` and `run` default to the previous
-UTC month, while standalone ingest infers the version from raw filenames.
+specific dump snapshot. If omitted, `fetch` and `run` resolve and pin the latest
+completed Wikimedia snapshot, with a bounded fallback when the preceding UTC
+month is not ready; standalone ingest infers the version from raw filenames.
 Versioned ingest outputs are isolated by snapshot and atomically selected only
 after the complete source set validates.
+
+Successful stages write deterministic content-addressed receipts, so repeated
+runs reuse valid fetch, ingest, compute, merge, and site outputs. See
+[Deterministic Stage Fingerprints](docs/stage-fingerprints.md).
 
 Build the production site against the current local artifacts:
 
