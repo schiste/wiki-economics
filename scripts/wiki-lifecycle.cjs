@@ -7,6 +7,7 @@ const PUBLICATION_STATES = new Set(["published", "hidden", "retired"]);
 const REFRESH_STATES = new Set(["scheduled", "manual", "paused"]);
 const WIKI_NAME = /^[a-z0-9_]+wiki$/;
 const YEAR_MONTH = /^\d{4}-(0[1-9]|1[0-2])$/;
+const DATASET_NAME = /^[a-z][a-z0-9_]*$/;
 
 function lifecyclePath(root = path.resolve(__dirname, ".."), env = process.env) {
   return path.resolve(env.WIKI_ECON_WIKI_LIFECYCLE_FILE || path.join(root, "config", "wiki-lifecycle.json"));
@@ -33,6 +34,10 @@ function validateWikiLifecycle(registry, label = "wiki lifecycle registry") {
   }
   if (!registry.wikis || typeof registry.wikis !== "object" || Array.isArray(registry.wikis)) {
     throw new Error(`${label}.wikis must be a JSON object`);
+  }
+  const datasets = registry.publication_contract?.datasets;
+  if (!datasets || typeof datasets !== "object" || Array.isArray(datasets)) {
+    throw new Error(`${label}.publication_contract.datasets must be a JSON object`);
   }
 
   for (const [wiki, entry] of Object.entries(registry.wikis)) {
@@ -61,6 +66,32 @@ function validateWikiLifecycle(registry, label = "wiki lifecycle registry") {
     }
     if (entry.refresh === "scheduled" && entry.freshness_sla_days == null) {
       throw new Error(`${label}.wikis.${wiki} is scheduled but has no freshness_sla_days`);
+    }
+  }
+
+  const published = new Set(wikisWithState(registry, "publication", "published"));
+  for (const [dataset, contract] of Object.entries(datasets)) {
+    if (!DATASET_NAME.test(dataset)) throw new Error(`${label} has invalid dataset name ${dataset}`);
+    if (!contract || typeof contract !== "object" || Array.isArray(contract)) {
+      throw new Error(`${label}.publication_contract.datasets.${dataset} must be a JSON object`);
+    }
+    const allPublished = contract.coverage === "all_published";
+    const explicitWikis = Array.isArray(contract.wikis);
+    if (allPublished === explicitWikis) {
+      throw new Error(`${label}.publication_contract.datasets.${dataset} must set exactly one of coverage=all_published or wikis`);
+    }
+    if (explicitWikis) {
+      if (!contract.wikis.length || new Set(contract.wikis).size !== contract.wikis.length) {
+        throw new Error(`${label}.publication_contract.datasets.${dataset}.wikis must be non-empty and unique`);
+      }
+      for (const wiki of contract.wikis) {
+        if (!published.has(wiki)) {
+          throw new Error(`${label}.publication_contract.datasets.${dataset} contains non-published wiki ${wiki}`);
+        }
+      }
+    }
+    if (!Number.isSafeInteger(contract.minimum_rows_per_wiki) || contract.minimum_rows_per_wiki <= 0) {
+      throw new Error(`${label}.publication_contract.datasets.${dataset}.minimum_rows_per_wiki must be a positive safe integer`);
     }
   }
   return registry;

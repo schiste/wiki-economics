@@ -1,5 +1,19 @@
 {
   "schema_version": 1,
+  "publication_contract": {
+    "datasets": {
+      "business_funnel": { "coverage": "all_published", "minimum_rows_per_wiki": 20 },
+      "gdp": { "coverage": "all_published", "minimum_rows_per_wiki": 5000 },
+      "gdp_activity_tiers": { "coverage": "all_published", "minimum_rows_per_wiki": 1000 },
+      "gdp_user_type_share": { "coverage": "all_published", "minimum_rows_per_wiki": 500 },
+      "inequality": { "coverage": "all_published", "minimum_rows_per_wiki": 300 },
+      "labor_churn": { "coverage": "all_published", "minimum_rows_per_wiki": 300 },
+      "labor_cohorts": { "coverage": "all_published", "minimum_rows_per_wiki": 200 },
+      "labor_monthly": { "coverage": "all_published", "minimum_rows_per_wiki": 5000 },
+      "page_weekly_edits": { "wikis": ["nlwiki"], "minimum_rows_per_wiki": 30000000 },
+      "patrol": { "wikis": ["frwiki", "nlwiki"], "minimum_rows_per_wiki": 5000 }
+    }
+  },
   "wikis": {
     "elwiki": {
       "publication": "published",

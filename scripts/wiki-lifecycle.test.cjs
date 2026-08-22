@@ -21,6 +21,12 @@ const REGISTRY = path.join(__dirname, "..", "config", "wiki-lifecycle.json");
 function validRegistry() {
   return {
     schema_version: 1,
+    publication_contract: {
+      datasets: {
+        gdp: { coverage: "all_published", minimum_rows_per_wiki: 1 },
+        patrol: { wikis: ["nlwiki"], minimum_rows_per_wiki: 1 },
+      },
+    },
     wikis: {
       frwiki: {
         publication: "published",
@@ -76,24 +82,45 @@ test("refresh overrides are backward compatible but fail closed on disagreement"
 });
 
 test("registry validation rejects invalid lifecycle states and metadata", () => {
+  const contract = { publication_contract: { datasets: {} } };
   const invalid = [
     [null, /must be a JSON object/],
     [{ schema_version: 2, wikis: {} }, /unsupported schema_version/],
     [{ schema_version: 1, wikis: [] }, /wikis must be a JSON object/],
-    [{ schema_version: 1, wikis: { "bad-name": {} } }, /invalid wiki name/],
-    [{ schema_version: 1, wikis: { nlwiki: null } }, /must be a JSON object/],
-    [{ schema_version: 1, wikis: { nlwiki: { publication: "gone" } } }, /invalid publication/],
-    [{ schema_version: 1, wikis: { nlwiki: { publication: "published", refresh: "never" } } }, /invalid refresh/],
-    [{ schema_version: 1, wikis: { nlwiki: { publication: "retired", refresh: "manual" } } }, /refresh=paused/],
-    [{ schema_version: 1, wikis: { nlwiki: { publication: "published", refresh: "paused", provenance: "" } } }, /provenance/],
-    [{ schema_version: 1, wikis: { nlwiki: { publication: "published", refresh: "paused", provenance: "x", imported_cutoff: "2026-13" } } }, /YYYY-MM/],
-    [{ schema_version: 1, wikis: { nlwiki: { publication: "published", refresh: "paused", provenance: "x", freshness_sla_days: 0 } } }, /positive integer/],
-    [{ schema_version: 1, wikis: { nlwiki: { publication: "published", refresh: "scheduled", provenance: "x" } } }, /no freshness_sla_days/],
+    [{ schema_version: 1, wikis: { "bad-name": {} }, ...contract }, /invalid wiki name/],
+    [{ schema_version: 1, wikis: { nlwiki: null }, ...contract }, /must be a JSON object/],
+    [{ schema_version: 1, wikis: { nlwiki: { publication: "gone" } }, ...contract }, /invalid publication/],
+    [{ schema_version: 1, wikis: { nlwiki: { publication: "published", refresh: "never" } }, ...contract }, /invalid refresh/],
+    [{ schema_version: 1, wikis: { nlwiki: { publication: "retired", refresh: "manual" } }, ...contract }, /refresh=paused/],
+    [{ schema_version: 1, wikis: { nlwiki: { publication: "published", refresh: "paused", provenance: "" } }, ...contract }, /provenance/],
+    [{ schema_version: 1, wikis: { nlwiki: { publication: "published", refresh: "paused", provenance: "x", imported_cutoff: "2026-13" } }, ...contract }, /YYYY-MM/],
+    [{ schema_version: 1, wikis: { nlwiki: { publication: "published", refresh: "paused", provenance: "x", freshness_sla_days: 0 } }, ...contract }, /positive integer/],
+    [{ schema_version: 1, wikis: { nlwiki: { publication: "published", refresh: "scheduled", provenance: "x" } }, ...contract }, /no freshness_sla_days/],
   ];
   for (const [registry, expected] of invalid) {
     assert.throws(() => validateWikiLifecycle(registry, "fixture"), expected);
   }
   assert.equal(validateWikiLifecycle(validRegistry()).schema_version, 1);
+});
+
+test("registry validation rejects invalid publication dataset contracts", () => {
+  const base = validRegistry();
+  const invalid = [
+    [{ "Bad-Name": { coverage: "all_published", minimum_rows_per_wiki: 1 } }, /invalid dataset name/],
+    [{ gdp: null }, /must be a JSON object/],
+    [{ gdp: { coverage: "all_published", wikis: ["nlwiki"], minimum_rows_per_wiki: 1 } }, /exactly one/],
+    [{ gdp: { minimum_rows_per_wiki: 1 } }, /exactly one/],
+    [{ gdp: { wikis: [], minimum_rows_per_wiki: 1 } }, /non-empty and unique/],
+    [{ gdp: { wikis: ["nlwiki", "nlwiki"], minimum_rows_per_wiki: 1 } }, /non-empty and unique/],
+    [{ gdp: { wikis: ["testwiki"], minimum_rows_per_wiki: 1 } }, /non-published/],
+    [{ gdp: { coverage: "all_published", minimum_rows_per_wiki: 0 } }, /positive safe integer/],
+  ];
+  for (const [datasets, expected] of invalid) {
+    assert.throws(
+      () => validateWikiLifecycle({ ...base, publication_contract: { datasets } }),
+      expected,
+    );
+  }
 });
 
 test("CLI validates and lists lifecycle selections", () => {
