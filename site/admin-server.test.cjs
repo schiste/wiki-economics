@@ -421,3 +421,25 @@ test("scheduledRefresh surfaces the last run and configured schedule", async (t)
   assert.equal(body.scheduledRefresh.history.length, 1);
   assert.deepEqual(body.scheduledRefresh.history[0], entry);
 });
+
+test("scheduledRefresh surfaces an in-progress schema-v2 heartbeat", async (t) => {
+  const {module, host, outputDir} = await startServer(t, LOCAL_ENV);
+  const live = {
+    schemaVersion: 2,
+    state: "running",
+    runId: "live-run",
+    startedAt: "2026-08-22T03:00:00Z",
+    finishedAt: null,
+    heartbeatAt: "2026-08-22T03:05:00Z",
+    exitCode: null,
+    currentStage: "compute",
+    currentWiki: "nlwiki",
+    selectedSnapshot: "2026-07",
+  };
+  fs.writeFileSync(path.join(outputDir, ".refresh-status.json"), JSON.stringify(live), "utf8");
+
+  const response = await invoke(module, {url: "/api/status", headers: {host}});
+  const body = JSON.parse(response.text());
+  assert.deepEqual(body.scheduledRefresh.last, live);
+  assert.deepEqual(body.scheduledRefresh.history, []);
+});

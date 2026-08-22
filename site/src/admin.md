@@ -487,9 +487,9 @@ topLevelJob
 <div class="note">The <code>wiki-econ-refresh</code> Toolforge Job runs the pipeline unattended on a schedule, in a separate pod with no shared memory — this panel only knows what it has written to <code>.refresh-status.json</code>/<code>.refresh-history.jsonl</code> on the shared NFS mount, polled the same way as everything else on this page.</div>
 
 ```js
-// TODO(you): decide when an unattended weekly refresh counts as "overdue."
-// `last` is {startedAt, finishedAt, exitCode, wikis, durationSecs,
-// memoryPeakBytes, memoryLimitBytes} or null
+// `last` is the live run record. Starting/running records carry a heartbeat
+// and current stage; terminal records also carry exit status, stage timings,
+// provenance, resources, publication aggregates, and site generation.
 // (no run has ever written a status file yet — e.g. fresh deploy, or local
 // dev where WIKI_ECON_OUTPUT_DIR isn't the Toolforge NFS mount).
 // `scheduleCron` is the WIKI_ECON_REFRESH_SCHEDULE string (display-only —
@@ -505,7 +505,16 @@ topLevelJob
 // Return {status: "healthy"|"stale"|"failed"|"unknown", message}.
 function classifyRefreshHealth(last, scheduleCron) {
   if (!last) return {status: "unknown", message: "No refresh has reported in yet."}
-  if (last.exitCode !== 0) return {status: "failed", message: `Last run exited ${last.exitCode}.`}
+  if (["starting", "running"].includes(last.state)) {
+    const heartbeatAge = Date.now() - new Date(last.heartbeatAt || last.startedAt).getTime()
+    if (!Number.isFinite(heartbeatAge) || heartbeatAge > 5 * 60 * 1000) {
+      return {status: "stale", message: `Run heartbeat is stale${last.currentStage ? ` at ${last.currentStage}` : ""}.`}
+    }
+    return {status: "healthy", message: `Running${last.currentStage ? `: ${last.currentStage}` : ""}.`}
+  }
+  if (last.state === "failed" || last.exitCode !== 0) {
+    return {status: "failed", message: `Last run failed${last.failingStage ? ` at ${last.failingStage}` : ""}.`}
+  }
   return {status: "healthy", message: "Last run succeeded."}
 }
 
@@ -553,8 +562,8 @@ display(html`<div class="admin-refresh-panel">
       <strong style=${"color:" + refreshHealthColors[refreshHealth.status]}>${refreshHealth.message}</strong>
     </div>
     <div class="admin-control-chip">
-      <span class="admin-control-label">Last run</span>
-      <strong>${formatRefreshTimestamp(scheduledRefresh.last?.finishedAt)}</strong>
+      <span class="admin-control-label">Heartbeat</span>
+      <strong>${formatRefreshTimestamp(scheduledRefresh.last?.heartbeatAt || scheduledRefresh.last?.finishedAt)}</strong>
     </div>
     <div class="admin-control-chip">
       <span class="admin-control-label">Duration</span>
@@ -571,7 +580,7 @@ display(html`<div class="admin-refresh-panel">
       ${refreshHistoryNewestFirst.map(run => html`<tr>
         <td>${formatRefreshTimestamp(run.startedAt)}</td>
         <td>${formatRefreshTimestamp(run.finishedAt)}</td>
-        <td style=${"color:" + (run.exitCode === 0 ? "#2e7d32" : "#c62828")}>${run.exitCode === 0 ? "Success" : `Failed (${run.exitCode})`}</td>
+        <td style=${"color:" + (run.state === "succeeded" || run.exitCode === 0 ? "#2e7d32" : "#c62828")}>${run.state === "succeeded" || run.exitCode === 0 ? "Success" : `Failed (${run.exitCode})`}</td>
         <td>${formatRefreshDuration(run.durationSecs)}</td>
         <td>${formatRefreshBytes(run.memoryPeakBytes)} / ${formatRefreshBytes(run.memoryLimitBytes)}</td>
         <td>${(run.wikis || []).join(", ") || "—"}</td>
