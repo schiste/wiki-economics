@@ -26,8 +26,14 @@ set -euo pipefail
 
 REPO_URL="${1:-${WIKI_ECON_REPO_URL:-https://github.com/schiste/wiki-economics.git}}"
 SOURCE_REF="${2:-${WIKI_ECON_SOURCE_REF:-main}}"
+SOURCE_COMMIT="${3:-${WIKI_ECON_IMAGE_SOURCE_COMMIT:-}}"
 POLL_INTERVAL_SECS="${WIKI_ECON_BUILD_POLL_INTERVAL:-20}"
 POLL_TIMEOUT_SECS="${WIKI_ECON_BUILD_POLL_TIMEOUT:-1800}"
+
+if [[ ! "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+  echo "rebuild-image.sh requires the exact 40-character source commit as its third argument" >&2
+  exit 2
+fi
 
 echo "==> Starting build for $REPO_URL at $SOURCE_REF"
 # Detached JSON output gives us the exact build ID. This avoids both the
@@ -59,6 +65,10 @@ if [ "$build_status" != "ok" ]; then
   echo "Inspect with: toolforge build logs $build_id" >&2
   exit 1
 fi
+
+echo "==> Recording image provenance"
+toolforge envvars create WIKI_ECON_IMAGE_SOURCE_REF "$SOURCE_REF"
+toolforge envvars create WIKI_ECON_IMAGE_SOURCE_COMMIT "$SOURCE_COMMIT"
 
 echo "==> Restarting wiki-econ-admin webservice"
 toolforge webservice restart

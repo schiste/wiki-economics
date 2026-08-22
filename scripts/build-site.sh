@@ -43,6 +43,9 @@ done
 
 wiki_econ_init_runtime
 wiki_econ_ensure_local_dirs
+SITE_STAGE_STARTED_EPOCH="$(date +%s)"
+SITE_STAGE_FINISHED=0
+wiki_econ_record_stage_event started site
 
 verify_publication_receipt() {
   if [ "${WIKI_ECON_REQUIRE_PUBLICATION_GATE:-0}" = "1" ]; then
@@ -60,6 +63,9 @@ if [ "${WIKI_ECON_REQUIRE_PUBLICATION_GATE:-0}" = "1" ]; then
   if wiki_econ_run_cli site-fingerprint-check \
     --site-dir "$WIKI_ECON_SITE_DIR" \
     --dist-dir "$WIKI_ECON_SITE_DIST_DIR"; then
+    wiki_econ_record_stage_event reused site
+    wiki_econ_record_stage_event completed site "" "$(( ($(date +%s) - SITE_STAGE_STARTED_EPOCH) * 1000 ))"
+    SITE_STAGE_FINISHED=1
     echo "==> Site inputs unchanged; reusing published site"
     exit 0
   fi
@@ -85,7 +91,7 @@ rm -f -- "$next_link"
 legacy_dir="$dist_parent/.${dist_name}.previous.$$"
 
 cleanup_site_build() {
-  local current_target=""
+  local exit_code=$? current_target=""
 
   rm -f -- "$next_link"
   if [ -L "$dist_dir" ]; then
@@ -96,6 +102,11 @@ cleanup_site_build() {
   fi
   if [ -d "$legacy_dir" ] && [ ! -e "$dist_dir" ] && [ ! -L "$dist_dir" ]; then
     mv -- "$legacy_dir" "$dist_dir"
+  fi
+  if [ "$exit_code" -ne 0 ] && [ "$SITE_STAGE_FINISHED" -eq 0 ]; then
+    wiki_econ_record_stage_event failed site "" \
+      "$(( ($(date +%s) - SITE_STAGE_STARTED_EPOCH) * 1000 ))" \
+      "site build exited with status $exit_code"
   fi
 }
 trap cleanup_site_build EXIT
@@ -157,4 +168,6 @@ if [ "${WIKI_ECON_REQUIRE_PUBLICATION_GATE:-0}" = "1" ]; then
     --dist-dir "$WIKI_ECON_SITE_DIST_DIR"
 fi
 
+wiki_econ_record_stage_event completed site "" "$(( ($(date +%s) - SITE_STAGE_STARTED_EPOCH) * 1000 ))"
+SITE_STAGE_FINISHED=1
 echo "==> Site build complete: $dist_dir -> $(readlink "$dist_dir")"

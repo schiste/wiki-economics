@@ -12,11 +12,17 @@ const fakeSite = path.join(fakeRoot, "site");
 const fakeBin = path.join(fixtureRoot, "bin");
 const outputDir = path.join(fakeRoot, "output");
 const distDir = path.join(fixtureRoot, "published", "site-dist");
+const stageEvents = path.join(fixtureRoot, "site-stage-events.jsonl");
 
 fs.mkdirSync(path.join(fakeSite, "node_modules"), {recursive: true});
+fs.mkdirSync(path.join(fakeRoot, "deploy", "toolforge"), {recursive: true});
 fs.mkdirSync(fakeBin, {recursive: true});
 fs.mkdirSync(distDir, {recursive: true});
 fs.writeFileSync(path.join(distDir, "index.html"), "old release\n");
+fs.copyFileSync(
+  path.join(repoRoot, "deploy", "toolforge", "run-record.cjs"),
+  path.join(fakeRoot, "deploy", "toolforge", "run-record.cjs"),
+);
 
 const fakeNpm = path.join(fakeBin, "npm");
 fs.writeFileSync(
@@ -51,6 +57,7 @@ function runBuild(extraEnv = {}) {
         ...process.env,
         PATH: `${fakeBin}${path.delimiter}${process.env.PATH}`,
         WIKI_ECON_ROOT: fakeRoot,
+        WIKI_ECON_RUN_EVENTS_FILE: stageEvents,
         WIKI_ECON_SITE_DIR: fakeSite,
         ...extraEnv,
       },
@@ -82,6 +89,11 @@ test("site builds are switched atomically and failed staging is discarded", () =
 
   const siblings = fs.readdirSync(path.dirname(distDir));
   assert.deepEqual(siblings.sort(), [secondTarget, path.basename(distDir)].sort());
+  const events = fs.readFileSync(stageEvents, "utf8").trim().split("\n").map(JSON.parse);
+  assert.equal(events.filter((event) => event.event === "started").length, 3);
+  assert.equal(events.filter((event) => event.event === "completed").length, 2);
+  assert.equal(events.filter((event) => event.event === "failed").length, 1);
+  assert.equal(events.at(-1).stage, "site");
 });
 
 test("a reusable site skips Node dependency installation", () => {
@@ -101,4 +113,7 @@ test("a reusable site skips Node dependency installation", () => {
   assert.match(result.stdout, /Site inputs unchanged; reusing published site/);
   assert.equal(fs.existsSync(npmLog), false);
   assert.equal(fs.existsSync(path.join(cacheHitSite, "node_modules")), false);
+  const events = fs.readFileSync(stageEvents, "utf8").trim().split("\n").map(JSON.parse);
+  assert.equal(events.at(-2).event, "reused");
+  assert.equal(events.at(-1).event, "completed");
 });

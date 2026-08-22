@@ -133,3 +133,12 @@ wiki_econ_run_cli() {
   printf '\n'
   "${cmd[@]}"
 }
+
+wiki_econ_record_stage_event() {
+  local event=$1 stage=$2 wiki=${3:-} duration_ms=${4:-} error=${5:-}
+  if [ -z "${WIKI_ECON_RUN_EVENTS_FILE:-}" ]; then
+    return 0
+  fi
+  node "${WIKI_ECON_RUN_RECORD_HELPER:-$WIKI_ECON_ROOT/deploy/toolforge/run-record.cjs}" \
+    event "$event" "$stage" "$wiki" "$duration_ms" "$error"
+}

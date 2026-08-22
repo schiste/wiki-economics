@@ -22,14 +22,13 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 # shellcheck disable=SC1091
 . "$ROOT/scripts/lib/wiki_econ.sh"
 
-# Write a status marker + rolling history to the shared NFS output dir on
-# every exit (success, an early `exit 1` artifact check below, or a
-# set -e-triggered failure) so the admin webservice — a separate Toolforge
-# pod with no shared process memory and no Toolforge/Kubernetes API access —
-# has a way to know whether the last scheduled refresh succeeded.
+# Publish a live run record + bounded terminal history to the shared NFS
+# output dir so the admin webservice — a separate Toolforge pod with no shared
+# process memory and no Toolforge/Kubernetes API access — can distinguish a
+# running or hung refresh from the preceding success.
 REFRESH_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 REFRESH_START_EPOCH="$(date +%s)"
-REFRESH_HISTORY_LIMIT=20
+REFRESH_HISTORY_LIMIT="${WIKI_ECON_REFRESH_HISTORY_LIMIT:-104}"
 WIKI_ECON_RUN_ID="${WIKI_ECON_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 export WIKI_ECON_RUN_ID
 REFRESH_LOCK_HEARTBEAT_SECS="${WIKI_ECON_REFRESH_LOCK_HEARTBEAT_SECS:-60}"
@@ -42,6 +41,9 @@ REFRESH_LOCK_DIR=""
 REFRESH_LOCK_HEARTBEAT_PID=""
 REFRESH_LOCK_OWNED=0
 SELECTED_SNAPSHOT=""
+REFRESH_FAILURE_ERROR=""
+REFRESH_FAILURE_STAGE=""
+RUN_RECORD_HELPER="$ROOT/deploy/toolforge/run-record.cjs"
 
 validate_lock_integer() {
   local name=$1 value=$2 allow_zero=${3:-0}
@@ -152,7 +154,11 @@ start_refresh_lock_heartbeat() {
     while sleep "$REFRESH_LOCK_HEARTBEAT_SECS"; do
       [ -f owner-token ] || exit 0
       [ "$(<owner-token)" = "$REFRESH_LOCK_TOKEN" ] || exit 0
-      write_refresh_lock_metadata || exit 0
+      if ! write_refresh_lock_metadata || ! node "$RUN_RECORD_HELPER" write; then
+        echo "Refresh heartbeat publication failed; terminating run $WIKI_ECON_RUN_ID" >&2
+        kill -TERM "$$"
+        exit 1
+      fi
     done
   ) &
   REFRESH_LOCK_HEARTBEAT_PID=$!
@@ -179,7 +185,6 @@ acquire_refresh_lock() {
         return 1
       fi
       REFRESH_LOCK_OWNED=1
-      start_refresh_lock_heartbeat
       echo "==> Acquired refresh lock: $REFRESH_LOCK_DIR"
       return 0
     fi
@@ -224,13 +229,18 @@ set_refresh_lock_snapshot() {
     write_refresh_lock_metadata
   )
   SELECTED_SNAPSHOT=$snapshot
+  printf '%s\n' running > "$REFRESH_LOCK_DIR/run-state"
 }
 
-release_refresh_lock() {
+stop_refresh_lock_heartbeat() {
   if [ -n "$REFRESH_LOCK_HEARTBEAT_PID" ]; then
     kill "$REFRESH_LOCK_HEARTBEAT_PID" 2>/dev/null || true
     wait "$REFRESH_LOCK_HEARTBEAT_PID" 2>/dev/null || true
   fi
+  REFRESH_LOCK_HEARTBEAT_PID=""
+}
+
+release_refresh_lock() {
   if [ "$REFRESH_LOCK_OWNED" -eq 1 ] &&
      [ -f "$REFRESH_LOCK_DIR/owner-token" ] &&
      [ "$(<"$REFRESH_LOCK_DIR/owner-token")" = "$REFRESH_LOCK_TOKEN" ]; then
@@ -240,50 +250,84 @@ release_refresh_lock() {
   REFRESH_LOCK_OWNED=0
 }
 
-read_cgroup_counter() {
-  local path=$1 value
-  if [ ! -r "$path" ]; then
-    printf 'null'
+detect_source_commit() {
+  local target candidate
+  if [ -n "${WIKI_ECON_SOURCE_COMMIT:-}" ]; then
+    printf '%s\n' "$WIKI_ECON_SOURCE_COMMIT"
     return
   fi
-  value=$(<"$path")
-  if [[ "$value" =~ ^[0-9]+$ ]]; then
-    printf '%s' "$value"
+  if [ -n "${WIKI_ECON_BIN:-}" ] && [ -L "$(dirname "$WIKI_ECON_BIN")" ]; then
+    target="$(readlink "$(dirname "$WIKI_ECON_BIN")")"
+    candidate="$(basename "$target")"
+    if [[ "$candidate" =~ ^[0-9a-f]{40}$ ]]; then
+      printf '%s\n' "$candidate"
+      return
+    fi
+  fi
+  git -C "$ROOT" rev-parse HEAD 2>/dev/null || true
+}
+
+binary_sha256() {
+  if [ -z "${WIKI_ECON_BIN:-}" ] || [ ! -f "$WIKI_ECON_BIN" ]; then
+    return
+  fi
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$WIKI_ECON_BIN" | awk '{print $1}'
   else
-    printf 'null'
+    shasum -a 256 "$WIKI_ECON_BIN" | awk '{print $1}'
   fi
 }
 
-write_refresh_status() {
-  local exit_code=$1
-  if [ -z "${WIKI_ECON_OUTPUT_DIR:-}" ]; then
-    return 0
+initialize_refresh_run_record() {
+  WIKI_ECON_RUN_EVENTS_FILE="$REFRESH_LOCK_DIR/stage-events.jsonl"
+  WIKI_ECON_RUN_RECORD_HELPER="$RUN_RECORD_HELPER"
+  WIKI_ECON_RUN_STATE_FILE="$REFRESH_LOCK_DIR/run-state"
+  WIKI_ECON_RUN_SNAPSHOT_FILE="$REFRESH_LOCK_DIR/selected-snapshot"
+  WIKI_ECON_RUN_STATUS_FILE="$WIKI_ECON_OUTPUT_DIR/.refresh-status.json"
+  WIKI_ECON_RUN_HISTORY_FILE="$WIKI_ECON_OUTPUT_DIR/.refresh-history.jsonl"
+  WIKI_ECON_RUN_PUBLICATION_FILE="$WIKI_ECON_OUTPUT_DIR/publication-gate.json"
+  WIKI_ECON_RUN_STARTED_AT="$REFRESH_STARTED_AT"
+  WIKI_ECON_RUN_START_EPOCH="$REFRESH_START_EPOCH"
+  WIKI_ECON_RUN_WIKIS_JSON="$(node -e 'process.stdout.write(JSON.stringify(process.argv.slice(1)))' "${wikis[@]}")"
+  WIKI_ECON_SOURCE_COMMIT="$(detect_source_commit)"
+  WIKI_ECON_BINARY_SHA256="$(binary_sha256)"
+  WIKI_ECON_REFRESH_HISTORY_LIMIT="$REFRESH_HISTORY_LIMIT"
+  export WIKI_ECON_RUN_EVENTS_FILE WIKI_ECON_RUN_RECORD_HELPER WIKI_ECON_RUN_STATE_FILE
+  export WIKI_ECON_RUN_SNAPSHOT_FILE WIKI_ECON_RUN_STATUS_FILE
+  export WIKI_ECON_RUN_HISTORY_FILE WIKI_ECON_RUN_PUBLICATION_FILE
+  export WIKI_ECON_RUN_STARTED_AT WIKI_ECON_RUN_START_EPOCH WIKI_ECON_RUN_WIKIS_JSON
+  export WIKI_ECON_SOURCE_COMMIT WIKI_ECON_BINARY_SHA256
+  export WIKI_ECON_IMAGE_SOURCE_REF WIKI_ECON_IMAGE_SOURCE_COMMIT
+  export WIKI_ECON_REFRESH_HISTORY_LIMIT WIKI_ECON_SITE_DIST_DIR WIKI_ECON_OUTPUT_DIR
+  : > "$WIKI_ECON_RUN_EVENTS_FILE"
+  printf '%s\n' starting > "$WIKI_ECON_RUN_STATE_FILE"
+  node "$RUN_RECORD_HELPER" write
+}
+
+capture_refresh_error() {
+  local exit_code=$1 command=$2
+  if [ -z "$REFRESH_FAILURE_ERROR" ]; then
+    REFRESH_FAILURE_ERROR="command exited $exit_code: $command"
   fi
-  local finished_at duration wikis_json entry status_file history_file memory_peak memory_limit snapshot_json
-  finished_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-  duration=$(( $(date +%s) - REFRESH_START_EPOCH ))
-  memory_peak=$(read_cgroup_counter /sys/fs/cgroup/memory.peak)
-  memory_limit=$(read_cgroup_counter /sys/fs/cgroup/memory.max)
-  snapshot_json=null
-  if [ -n "$SELECTED_SNAPSHOT" ]; then
-    snapshot_json="\"$SELECTED_SNAPSHOT\""
-  fi
-  wikis_json=$(printf '"%s",' "${wikis[@]:-}" | sed 's/,$//')
-  entry=$(printf '{"runId":"%s","startedAt":"%s","finishedAt":"%s","exitCode":%d,"wikis":[%s],"selectedSnapshot":%s,"durationSecs":%d,"memoryPeakBytes":%s,"memoryLimitBytes":%s}' \
-    "$WIKI_ECON_RUN_ID" "$REFRESH_STARTED_AT" "$finished_at" "$exit_code" "$wikis_json" "$snapshot_json" "$duration" "$memory_peak" "$memory_limit")
-  status_file="$WIKI_ECON_OUTPUT_DIR/.refresh-status.json"
-  history_file="$WIKI_ECON_OUTPUT_DIR/.refresh-history.jsonl"
-  echo "$entry" > "${status_file}.tmp"
-  mv "${status_file}.tmp" "$status_file"
-  echo "$entry" >> "$history_file"
-  tail -n "$REFRESH_HISTORY_LIMIT" "$history_file" > "${history_file}.tmp" && mv "${history_file}.tmp" "$history_file"
 }
 
 finish_refresh() {
   local exit_code=$1
-  trap - EXIT INT TERM
+  trap - EXIT ERR INT TERM
   set +e
-  write_refresh_status "$exit_code"
+  stop_refresh_lock_heartbeat
+  if [ "$exit_code" -ne 0 ] && [ -z "$REFRESH_FAILURE_ERROR" ]; then
+    REFRESH_FAILURE_ERROR="refresh exited with status $exit_code"
+  fi
+  WIKI_ECON_RUN_ERROR="$REFRESH_FAILURE_ERROR"
+  WIKI_ECON_RUN_FAILING_STAGE="$REFRESH_FAILURE_STAGE"
+  export WIKI_ECON_RUN_ERROR WIKI_ECON_RUN_FAILING_STAGE
+  if ! node "$RUN_RECORD_HELPER" finish "$exit_code"; then
+    echo "Unable to publish terminal refresh run record" >&2
+    if [ "$exit_code" -eq 0 ]; then
+      exit_code=1
+    fi
+  fi
   release_refresh_lock
   exit "$exit_code"
 }
@@ -305,8 +349,12 @@ if ! acquire_refresh_lock; then
   exit 75
 fi
 trap 'finish_refresh $?' EXIT
+trap 'capture_refresh_error "$?" "$BASH_COMMAND"' ERR
 trap 'exit 130' INT
 trap 'exit 143' TERM
+
+initialize_refresh_run_record
+start_refresh_lock_heartbeat
 
 if [ -z "${WIKI_ECON_BIN:-}" ]; then
   echo "Toolforge refresh requires WIKI_ECON_BIN for snapshot resolution" >&2
@@ -332,6 +380,8 @@ echo "==> Toolforge refresh: ${wikis[*]} (snapshot $SELECTED_SNAPSHOT)"
 refresh_driver="${WIKI_ECON_REFRESH_DRIVER:-$ROOT/scripts/refresh.sh}"
 "$refresh_driver" --version "$SELECTED_SNAPSHOT" "${wikis[@]}"
 
+ARTIFACT_CHECK_STARTED_EPOCH="$(date +%s)"
+wiki_econ_record_stage_event started artifact_check
 for required in \
   manifest.json \
   defaults_business.json \
@@ -352,6 +402,11 @@ for required in \
   patrol.parquet
 do
   if [ ! -f "$WIKI_ECON_OUTPUT_DIR/$required" ]; then
+    REFRESH_FAILURE_STAGE=artifact_check
+    REFRESH_FAILURE_ERROR="required artifact is missing: $required"
+    wiki_econ_record_stage_event failed artifact_check "" \
+      "$(( ($(date +%s) - ARTIFACT_CHECK_STARTED_EPOCH) * 1000 ))" \
+      "$REFRESH_FAILURE_ERROR"
     echo "Refresh succeeded but required artifact is missing: $WIKI_ECON_OUTPUT_DIR/$required" >&2
     exit 1
   fi
@@ -359,9 +414,16 @@ done
 
 for page in index.html business.html gdp.html inequality.html labor.html patrol.html edit-variation.html; do
   if [ ! -f "$WIKI_ECON_SITE_DIST_DIR/$page" ]; then
+    REFRESH_FAILURE_STAGE=artifact_check
+    REFRESH_FAILURE_ERROR="published site page is missing: $page"
+    wiki_econ_record_stage_event failed artifact_check "" \
+      "$(( ($(date +%s) - ARTIFACT_CHECK_STARTED_EPOCH) * 1000 ))" \
+      "$REFRESH_FAILURE_ERROR"
     echo "Site build is missing required page: $WIKI_ECON_SITE_DIST_DIR/$page" >&2
     exit 1
   fi
 done
 
+wiki_econ_record_stage_event completed artifact_check "" \
+  "$(( ($(date +%s) - ARTIFACT_CHECK_STARTED_EPOCH) * 1000 ))"
 echo "==> Toolforge refresh complete"

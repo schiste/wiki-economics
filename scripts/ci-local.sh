@@ -28,6 +28,9 @@ node --test site/admin-server.test.cjs
 echo "==> node --test site/build-site.test.cjs"
 node --test site/build-site.test.cjs
 
+echo "==> node --test deploy/toolforge/run-record.test.cjs"
+node --test deploy/toolforge/run-record.test.cjs
+
 echo "==> node --test deploy/toolforge/run-refresh.test.cjs"
 node --test deploy/toolforge/run-refresh.test.cjs
 

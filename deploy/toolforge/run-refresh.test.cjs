@@ -7,6 +7,7 @@ const {after, test} = require("node:test");
 
 const repoRoot = path.resolve(__dirname, "../..");
 const wrapper = path.join(repoRoot, "deploy", "toolforge", "run-refresh.sh");
+const runRecordHelper = path.join(repoRoot, "deploy", "toolforge", "run-record.cjs");
 const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-refresh-lock-"));
 
 after(() => fs.rmSync(fixtureRoot, {recursive: true, force: true}));
@@ -42,6 +43,7 @@ esac
     fakeDriver,
     `#!/bin/sh
 set -eu
+node "$FAKE_RUN_RECORD_HELPER" event started fake_pipeline "" "" ""
 if [ -n "\${FAKE_DRIVER_ARGS:-}" ]; then
   printf '%s\n' "$*" > "$FAKE_DRIVER_ARGS"
 fi
@@ -52,6 +54,7 @@ while [ -n "\${FAKE_DRIVER_RELEASE:-}" ] && [ ! -f "$FAKE_DRIVER_RELEASE" ]; do
   sleep 0.05
 done
 if [ "\${FAKE_REFRESH_EXIT:-0}" -ne 0 ]; then
+  node "$FAKE_RUN_RECORD_HELPER" event failed fake_pipeline "" 10 "fake pipeline failure"
   exit "$FAKE_REFRESH_EXIT"
 fi
 mkdir -p "$WIKI_ECON_OUTPUT_DIR" "$WIKI_ECON_SITE_DIST_DIR"
@@ -67,6 +70,7 @@ done
 for page in index.html business.html gdp.html inequality.html labor.html patrol.html edit-variation.html; do
   : > "$WIKI_ECON_SITE_DIST_DIR/$page"
 done
+node "$FAKE_RUN_RECORD_HELPER" event completed fake_pipeline "" 10 ""
 `,
   );
 
@@ -75,6 +79,8 @@ done
     WIKI_ECON_BIN: fakeBinary,
     WIKI_ECON_DATA_DIR: path.join(root, "data"),
     WIKI_ECON_ENV: "test",
+    WIKI_ECON_IMAGE_SOURCE_COMMIT: "b".repeat(40),
+    WIKI_ECON_IMAGE_SOURCE_REF: "main",
     WIKI_ECON_JOB_IDENTITY: "test-toolforge-job",
     WIKI_ECON_PROCESS_IDENTITY: "test-toolforge-process",
     WIKI_ECON_OUTPUT_DIR: output,
@@ -85,7 +91,9 @@ done
     WIKI_ECON_ROOT: root,
     WIKI_ECON_SITE_DIST_DIR: siteDist,
     WIKI_ECON_SITE_DIR: path.join(root, "site"),
+    WIKI_ECON_SOURCE_COMMIT: "a".repeat(40),
     WIKI_ECON_WIKI_LIFECYCLE_FILE: path.join(repoRoot, "config", "wiki-lifecycle.json"),
+    FAKE_RUN_RECORD_HELPER: runRecordHelper,
   };
   return {driverArgs, env, output, ready, release};
 }
@@ -104,6 +112,19 @@ async function waitForFile(file, timeoutMs = 5000) {
     assert.ok(Date.now() < deadline, `timed out waiting for ${file}`);
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
+}
+
+async function waitForStatus(output, predicate, timeoutMs = 5000) {
+  const statusFile = path.join(output, ".refresh-status.json");
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      const status = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+      if (predicate(status)) return status;
+    } catch {}
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+  assert.fail(`timed out waiting for matching status in ${statusFile}`);
 }
 
 function collectChild(child) {
@@ -141,10 +162,21 @@ test("an active refresh owns metadata, rejects overlap, and releases cleanly", a
   assert.equal(owner.pid, first.pid);
   assert.match(owner.started_at, /^\d{4}-\d{2}-\d{2}T/);
 
+  const liveStatus = await waitForStatus(
+    fixture.output,
+    (status) => status.selectedSnapshot === "2026-07" && status.currentStage === "fake_pipeline",
+  );
+  assert.equal(liveStatus.state, "running");
+  assert.equal(liveStatus.runId, "active-run");
+  assert.equal(liveStatus.exitCode, null);
+  assert.match(liveStatus.heartbeatAt, /^\d{4}-\d{2}-\d{2}T/);
+
   const second = runFixture(fixture, {WIKI_ECON_RUN_ID: "overlapping-run"});
   assert.equal(second.status, 75, `${second.stdout}\n${second.stderr}`);
   assert.match(second.stderr, /Another wiki-economics refresh is already running/);
-  assert.equal(fs.existsSync(path.join(fixture.output, ".refresh-status.json")), false);
+  const statusAfterOverlap = JSON.parse(fs.readFileSync(path.join(fixture.output, ".refresh-status.json"), "utf8"));
+  assert.equal(statusAfterOverlap.runId, "active-run");
+  assert.equal(statusAfterOverlap.state, "running");
 
   fs.writeFileSync(fixture.release, "release\n");
   const completed = await firstResult;
@@ -154,6 +186,10 @@ test("an active refresh owns metadata, rejects overlap, and releases cleanly", a
   assert.equal(status.runId, "active-run");
   assert.equal(status.selectedSnapshot, "2026-07");
   assert.equal(status.exitCode, 0);
+  assert.equal(status.state, "succeeded");
+  assert.equal(status.currentStage, null);
+  assert.equal(status.stageDurationsMs.fake_pipeline, 10);
+  assert.equal(status.provenance.sourceCommit, "a".repeat(40));
   assert.equal(
     fs.readFileSync(fixture.driverArgs, "utf8").trim(),
     "--version 2026-07 nlwiki",
@@ -212,4 +248,7 @@ test("failure records status and never strands the owned lock", () => {
   assert.equal(status.runId, "failed-run");
   assert.equal(status.selectedSnapshot, "2026-07");
   assert.equal(status.exitCode, 9);
+  assert.equal(status.state, "failed");
+  assert.equal(status.failingStage, "fake_pipeline");
+  assert.equal(status.error, "fake pipeline failure");
 });
