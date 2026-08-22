@@ -645,6 +645,18 @@ fn snapshot_month_index(value: &str) -> Result<i32> {
     Ok(year * 12 + month)
 }
 
+fn validate_snapshot_cutoff(wiki: &str, snapshot: &str, cutoff: &str) -> Result<()> {
+    // MediaWiki history generations can contain the partial calendar month after
+    // their version label. Permit that bounded lead, while still rejecting data
+    // from a later generation or a cutoff more than two months behind.
+    let lag = snapshot_month_index(snapshot)? - snapshot_month_index(cutoff)?;
+    ensure!(
+        (-1..=2).contains(&lag),
+        "{wiki} cutoff {cutoff} is not plausible for snapshot {snapshot}"
+    );
+    Ok(())
+}
+
 fn validate_snapshots(
     data_dir: &Path,
     registry: &LifecycleRegistry,
@@ -689,11 +701,7 @@ fn validate_snapshots(
                     "selected snapshot for {wiki} does not match requested snapshot"
                 );
             }
-            let lag = snapshot_month_index(&snapshot)? - snapshot_month_index(cutoff)?;
-            ensure!(
-                (0..=2).contains(&lag),
-                "{wiki} cutoff {cutoff} is not plausible for snapshot {snapshot}"
-            );
+            validate_snapshot_cutoff(wiki, &snapshot, cutoff)?;
             let pointer = storage::snapshot_pointer_path(data_dir, wiki);
             let age_days =
                 now_unix()?.saturating_sub(artifact_record(&pointer)?.modified_secs) / 86_400;
@@ -1106,6 +1114,9 @@ mod tests {
         assert!(validate_date("bad", "year_month").is_err());
         assert_eq!(snapshot_month_index("2026-03")?, 2026 * 12 + 3);
         assert!(snapshot_month_index("2026-13").is_err());
+        assert!(validate_snapshot_cutoff("nlwiki", "2026-07", "2026-08").is_ok());
+        assert!(validate_snapshot_cutoff("nlwiki", "2026-07", "2026-09").is_err());
+        assert!(validate_snapshot_cutoff("nlwiki", "2026-07", "2026-04").is_err());
         for (kind, dtype) in [
             (Kind::String, DataType::String),
             (Kind::I32, DataType::Int32),
