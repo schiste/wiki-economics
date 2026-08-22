@@ -154,6 +154,7 @@ python3 -m unittest discover -s scripts -p 'test_*.py'
 - [Security Model](docs/security.md)
 - [Stack and Data Sources](docs/stack-and-data-sources.md)
 - [Troubleshooting](docs/troubleshooting.md)
+- [Wiki Lifecycle Management](docs/wiki-lifecycle.md)
 
 ## Platform Notes
 

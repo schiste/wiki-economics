@@ -82,12 +82,18 @@ refresh Job (repeat `toolforge envvars create` to update an existing value):
 
 ```sh
 become wiki-economics toolforge envvars create WIKI_ECON_BIN /data/project/wiki-economics/app/current/wiki-econ
-become wiki-economics toolforge envvars create WIKI_ECON_ENABLED_WIKIS nlwiki
+become wiki-economics toolforge envvars create WIKI_ECON_REFRESH_WIKIS nlwiki
 become wiki-economics toolforge envvars create WIKI_ECON_DATA_DIR /data/project/wiki-economics/data
 become wiki-economics toolforge envvars create WIKI_ECON_OUTPUT_DIR /data/project/wiki-economics/output
 become wiki-economics toolforge envvars create WIKI_ECON_SITE_DIST_DIR /data/project/wiki-economics/site-dist
 become wiki-economics toolforge envvars create WIKI_ECON_REFRESH_SCHEDULE '0 3 * * 0'
 ```
+
+`WIKI_ECON_REFRESH_WIKIS` is an optional operational override and must agree
+with `config/wiki-lifecycle.json`. If it is absent, the scheduled entries in
+that registry are used. The legacy `WIKI_ECON_ENABLED_WIKIS` name remains a
+backward-compatible alias. Paused imported wikis remain published and are not
+cleanup candidates; see [wiki lifecycle management](../../docs/wiki-lifecycle.md).
 
 ### First cutover
 

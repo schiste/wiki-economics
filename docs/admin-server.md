@@ -54,6 +54,7 @@ refuses to start with `WIKI_ECON_ADMIN_AUTH_MODE=none`.
 | `WIKI_ECON_ADMIN_MEDIAWIKI_HOST` | `https://meta.wikimedia.org` | Base URL of the MediaWiki OAuth2 host. |
 | `WIKI_ECON_ADMIN_MEDIAWIKI_CLIENT_ID` | empty | OAuth2 consumer client ID, from `Special:OAuthConsumerRegistration`. |
 | `WIKI_ECON_ADMIN_MEDIAWIKI_CLIENT_SECRET` | empty | OAuth2 consumer client secret. |
+| `WIKI_ECON_WIKI_LIFECYCLE_FILE` | `config/wiki-lifecycle.json` | Validated publication/refresh lifecycle registry. |
 | `WIKI_ECON_ADMIN_PUBLIC_ORIGIN` | unset | Optional canonical external origin. If unset, the server derives it from `X-Forwarded-*` headers. |
 
 ## Routes

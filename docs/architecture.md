@@ -136,6 +136,14 @@ Do not hardcode:
 
 Use the helper functions instead. Earlier versions of the code duplicated path logic across modules, which made refactors brittle.
 
+## Wiki lifecycle
+
+Refresh scheduling does not define dataset ownership or retention. The
+checked-in lifecycle registry independently records publication and refresh
+states; see [Wiki lifecycle management](wiki-lifecycle.md). Merge filters on
+publication state, while deployment orchestration filters on refresh state.
+Paused imported datasets therefore remain published and retained.
+
 ## Logging
 
 Runtime logging uses `tracing`, configured in [src/main.rs](../src/main.rs).
