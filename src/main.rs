@@ -47,6 +47,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Resolve the latest complete dump snapshot shared by every wiki
+    SnapshotResolve {
+        /// Wiki database names
+        wikis: Vec<String>,
+    },
+
     /// Download dump files from Wikimedia
     Fetch {
         /// Wiki database names (e.g., nlwiki frwiki dewiki)
@@ -318,6 +324,13 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
     let run_id = cli.run_id;
 
     match cli.command {
+        Commands::SnapshotResolve { wikis } => {
+            let version = run_timed_stage("snapshot_resolve", None, || {
+                ops.resolve_snapshot(&wikis, Utc::now())
+            })?;
+            println!("{version}");
+        }
+
         Commands::Fetch { wikis, version } => {
             let version = match version {
                 Some(version) => version,
@@ -693,6 +706,11 @@ mod tests {
     }
 
     impl Ops for RecordingOps {
+        fn resolve_snapshot(&self, wikis: &[String], _now: DateTime<Utc>) -> Result<String> {
+            self.record(format!("resolve_snapshot:{}", wikis.join(",")));
+            Ok("2026-07".to_string())
+        }
+
         fn fetch_wiki(&self, wiki: &str, version: &str, data_dir: &Path) -> Result<()> {
             self.record(format!("fetch:{wiki}:{version}:{}", data_dir.display()));
             Ok(())
@@ -879,6 +897,21 @@ mod tests {
                 "fetch:dewiki:2026-02:fixtures/data",
                 "fetch_patrol:dewiki:fixtures/data",
             ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn run_with_ops_dispatches_snapshot_resolution() -> Result<()> {
+        init_test_tracing();
+        let cli = Cli::try_parse_from(["wiki-econ", "snapshot-resolve", "frwiki", "dewiki"])?;
+        let ops = RecordingOps::default();
+
+        run_with_ops(cli, &ops)?;
+
+        assert_eq!(
+            ops.calls.into_inner(),
+            vec!["resolve_snapshot:frwiki,dewiki"]
         );
         Ok(())
     }
