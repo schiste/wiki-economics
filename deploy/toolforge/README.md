@@ -74,6 +74,41 @@ Toolforge entirely.
   exceeding it fails closed. Receipt layout and invalidation rules are
   documented in [stage fingerprints](../../docs/stage-fingerprints.md).
 
+### Refresh single-flight lock
+
+Every scheduled or manual Toolforge refresh must enter through
+`deploy/toolforge/run-refresh.sh`. The wrapper acquires an atomic NFS
+directory lock at `$WIKI_ECON_OUTPUT_DIR/.refresh-lock` before it resolves or
+downloads a snapshot. A second refresh exits with status `75`; importantly,
+that rejected run does not replace `.refresh-status.json`, so monitoring keeps
+reporting the last pipeline run that actually owned the publication path.
+
+The lock's `owner.json` records the run ID, UTC start time, PID, Toolforge job
+identity, pod/process identity, selected snapshot, owner token, and heartbeat.
+Snapshot resolution happens once after acquisition, and the resulting version
+is written into the lock before the pipeline is invoked with an explicit
+`--version`. This makes both the lock record and the whole refresh refer to the
+same immutable input generation.
+
+The heartbeat is updated every 60 seconds. A lock from another pod is eligible
+for recovery only after six hours without a heartbeat, is observed stale a
+second time, and retains the same owner token across both observations. A lock
+owned in the current process scope also uses `kill(pid, 0)` to detect an exited
+owner immediately. Missing or malformed metadata fails closed until the lock
+directory itself exceeds the stale threshold. Inspect a live owner with:
+
+```sh
+become wiki-economics jq . /data/project/wiki-economics/output/.refresh-lock/owner.json
+```
+
+The safety windows can be tuned with
+`WIKI_ECON_REFRESH_LOCK_HEARTBEAT_SECS`,
+`WIKI_ECON_REFRESH_LOCK_STALE_SECS`, and
+`WIKI_ECON_REFRESH_LOCK_RECHECK_SECS`. `WIKI_ECON_REFRESH_LOCK_DIR` is useful
+only for isolated tests; production runs should share the default path.
+`WIKI_ECON_JOB_IDENTITY` may provide a human-readable job label, while
+`WIKI_ECON_PROCESS_IDENTITY` should remain unique to a pod or host if set.
+
 ## Runbook
 
 ### Operator prerequisites
