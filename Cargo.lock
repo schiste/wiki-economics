@@ -3509,6 +3509,7 @@ dependencies = [
  "rayon",
  "regex",
  "reqwest",
+ "serde",
  "serde_json",
  "tracing",
  "tracing-subscriber",

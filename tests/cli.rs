@@ -14,18 +14,20 @@ fn instrumented_binary() -> Command {
 }
 
 #[test]
-fn binary_entrypoint_runs_merge_command() {
+fn binary_entrypoint_rejects_incomplete_merge_inputs() {
     init_test_tracing();
     let output_dir = TestDir::new().expect("temp dir");
 
-    let status = instrumented_binary()
+    let output = instrumented_binary()
         .arg("--output-dir")
         .arg(output_dir.path())
         .arg("merge")
-        .status()
+        .output()
         .expect("binary should run");
 
-    assert!(status.success());
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("dashboard artifact generator"));
 }
 
 #[test]

@@ -29,18 +29,23 @@ const DASHBOARD_GENERATORS: [&str; 12] = [
 /// Merge per-wiki metric parquet files into combined files at the output root.
 /// e.g., output/nlwiki/inequality.parquet + output/dewiki/inequality.parquet
 ///     → output/inequality.parquet (with wiki column distinguishing them)
-pub fn merge_outputs(output_dir: &Path) -> Result<()> {
+pub fn merge_outputs(output_dir: &Path, run_id: Option<&str>) -> Result<()> {
     let generator_dir = env::var("WIKI_ECON_GENERATOR_DIR")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| Path::new("site").join("data-build"));
-    merge_outputs_from_dir(output_dir, &generator_dir)
+    merge_outputs_from_dir(output_dir, &generator_dir, run_id)
 }
 
-fn merge_outputs_from_dir(output_dir: &Path, generator_dir: &Path) -> Result<()> {
+fn merge_outputs_from_dir(
+    output_dir: &Path,
+    generator_dir: &Path,
+    run_id: Option<&str>,
+) -> Result<()> {
     info!(output_dir = %output_dir.display(), "merging wiki outputs");
     let lifecycle_path = env::var_os("WIKI_ECON_WIKI_LIFECYCLE_FILE").map(PathBuf::from);
     let published_wikis = wiki_lifecycle::published_wikis(lifecycle_path.as_deref())?;
     let metric_files = collect_metric_files(output_dir, published_wikis.as_ref())?;
+    let mut artifact_names: Vec<String> = metric_files.keys().cloned().collect();
 
     for (metric_name, mut paths) in metric_files {
         paths.sort();
@@ -49,6 +54,12 @@ fn merge_outputs_from_dir(output_dir: &Path, generator_dir: &Path) -> Result<()>
     }
 
     materialize_dashboard_artifacts_from_dir(output_dir, generator_dir)?;
+    artifact_names.extend(DASHBOARD_GENERATORS.iter().map(|name| {
+        name.trim_end_matches(".sh")
+            .trim_end_matches(".cjs")
+            .to_string()
+    }));
+    crate::publication::record_candidate(output_dir, run_id, &artifact_names)?;
 
     info!(output_dir = %output_dir.display(), "finished merge");
     Ok(())
@@ -321,7 +332,7 @@ mod tests {
         write_metric(output_dir.path(), "enwiki", "metric", 1)?;
         write_metric(output_dir.path(), "frwiki", "metric", 2)?;
 
-        merge_outputs_from_dir(output_dir.path(), generator_dir.path())?;
+        merge_outputs_from_dir(output_dir.path(), generator_dir.path(), None)?;
 
         let merged_path = output_dir.path().join("metric.parquet");
         let merged_path = merged_path.to_string_lossy().to_string();
@@ -471,7 +482,7 @@ mod tests {
         let mut sidecar_file = fs::File::create(sidecar.join("strange.parquet"))?;
         ParquetWriter::new(&mut sidecar_file).finish(&mut sidecar_df)?;
 
-        merge_outputs_from_dir(output_dir.path(), generator_dir.path())?;
+        merge_outputs_from_dir(output_dir.path(), generator_dir.path(), None)?;
 
         let merged = output_dir.path().join("metric.parquet");
         let merged_path = merged.to_string_lossy().to_string();
@@ -496,7 +507,7 @@ mod tests {
         fs::create_dir_all(&wiki_dir)?;
         fs::write(wiki_dir.join("notes.txt"), b"not parquet")?;
 
-        merge_outputs_from_dir(output_dir.path(), generator_dir.path())?;
+        merge_outputs_from_dir(output_dir.path(), generator_dir.path(), None)?;
 
         assert!(!output_dir.path().join("notes.txt").exists());
         assert!(!output_dir.path().join("README.txt.parquet").exists());
@@ -546,10 +557,8 @@ mod tests {
         let generator_dir = TestDir::new()?;
         write_generators(generator_dir.path())?;
         let failing = generator_dir.path().join("defaults_gdp.json.cjs");
-        fs::write(
-            &failing,
-            "process.stderr.write('broken input')\nprocess.exit(1)\n",
-        )?;
+        let failing_script = "process.stderr.write('broken input')\nprocess.exit(1)\n";
+        fs::write(&failing, failing_script)?;
         let previous = output_dir.path().join("defaults_gdp.json");
         fs::write(&previous, "{\"old\":true}")?;
 
@@ -598,15 +607,32 @@ mod tests {
         assert!(missing.to_string().contains("required dashboard"));
 
         write_generators(generator_dir.path())?;
-        fs::write(
-            generator_dir.path().join("defaults_business.json.cjs"),
-            "process.stdout.write('not json')\n",
-        )?;
+        let invalid_script = generator_dir.path().join("defaults_business.json.cjs");
+        fs::write(invalid_script, "process.stdout.write('not json')\n")?;
         let invalid =
             materialize_dashboard_artifacts_from_dir(output_dir.path(), generator_dir.path())
                 .expect_err("invalid JSON must fail");
         assert!(invalid.to_string().contains("invalid JSON"));
         assert!(!output_dir.path().join("defaults_business.json").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn materialize_dashboard_artifacts_cleans_failed_atomic_write() -> Result<()> {
+        let output_dir = TestDir::new()?;
+        let generator_dir = TestDir::new()?;
+        write_generators(generator_dir.path())?;
+        let blocked_temp = output_dir
+            .path()
+            .join(".defaults_business.json.generator.tmp");
+        fs::create_dir(&blocked_temp)?;
+
+        let error =
+            materialize_dashboard_artifacts_from_dir(output_dir.path(), generator_dir.path())
+                .expect_err("a blocked temporary path must fail");
+
+        assert!(error.to_string().contains("failed to publish"));
+        assert!(blocked_temp.is_dir());
         Ok(())
     }
 }

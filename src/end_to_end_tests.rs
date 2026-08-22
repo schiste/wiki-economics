@@ -207,11 +207,34 @@ fn pipeline_ingests_computes_and_merges_a_tinywiki_fixture() -> Result<()> {
     assert_eq!(churn_by_month.get("2024-02").copied(), Some((1, 0, 1)));
     assert_eq!(churn_by_month.get("2024-03").copied(), Some((1, 1, 1)));
 
-    // Merge step: combines the per-wiki outputs to root-level files and
-    // (best-effort) materializes dashboard JSON artifacts. We assert only
-    // on the combined parquet outputs, since the artifact generators are
-    // shell scripts whose presence depends on the working directory.
-    merge::merge_outputs(&output_dir)?;
+    // Supply the patrol metric normally produced by the patrol compute stage;
+    // this fixture focuses on core ingest/compute, but merge now correctly
+    // requires every dashboard input and generator to succeed.
+    let mut patrol = DataFrame::new_infer_height(vec![
+        Column::new("year_month".into(), ["2024-03"]),
+        Column::new("wiki".into(), ["tinywiki"]),
+        Column::new("page_namespace".into(), [0_i32]),
+        Column::new("user_type".into(), ["registered"]),
+        Column::new("total_patrols".into(), [1_i64]),
+        Column::new("unique_patrollers".into(), [1_i32]),
+        Column::new("patrol_new_pages".into(), [1_i64]),
+        Column::new("patrol_diffs".into(), [0_i64]),
+        Column::new("median_latency_hours".into(), [1_f64]),
+        Column::new("p90_latency_hours".into(), [1_f64]),
+        Column::new("patrolled_revisions".into(), [1_i64]),
+        Column::new("autopatrolled_revisions".into(), [0_i64]),
+        Column::new("total_revisions".into(), [1_i64]),
+        Column::new("patrol_coverage_pct".into(), [100_f64]),
+        Column::new("adjusted_coverage_pct".into(), [100_f64]),
+        Column::new("top1_pct".into(), [100_f64]),
+        Column::new("min_patrollers_50pct".into(), [1_i32]),
+    ])?;
+    ParquetWriter::new(File::create(output_dir.join("tinywiki/patrol.parquet"))?)
+        .finish(&mut patrol)?;
+
+    // Merge step combines per-wiki outputs and materializes every critical
+    // dashboard JSON artifact before returning success.
+    merge::merge_outputs(&output_dir, None)?;
     for metric in [
         "labor_monthly",
         "labor_churn",

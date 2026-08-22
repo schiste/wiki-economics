@@ -9,15 +9,17 @@ mod ingest;
 mod merge;
 mod observability;
 mod patrol;
+mod publication;
 mod schema;
 mod storage;
 #[cfg(test)]
 mod test_support;
 mod wiki_lifecycle;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Utc};
 use clap::{Parser, Subcommand};
+use std::env;
 use std::path::PathBuf;
 use std::time::Instant;
 use tracing::info;
@@ -33,6 +35,10 @@ struct Cli {
     /// Output directory for computed metrics
     #[arg(long, default_value = "output")]
     output_dir: PathBuf,
+
+    /// Unique publication run identifier used by the fail-closed gate
+    #[arg(long)]
+    run_id: Option<String>,
 
     #[command(subcommand)]
     command: Commands,
@@ -68,6 +74,12 @@ enum Commands {
 
     /// Merge per-wiki outputs into combined parquet files
     Merge,
+
+    /// Validate a merged artifact set and issue its publication receipt
+    PublicationValidate,
+
+    /// Verify that the publication receipt still matches every artifact
+    PublicationVerify,
 
     /// Retire non-current snapshot generations after successful publication
     SnapshotFinalize {
@@ -157,7 +169,7 @@ trait Ops {
         iterations: usize,
         keep_outputs: bool,
     ) -> Result<()>;
-    fn merge_outputs(&self, output_dir: &std::path::Path) -> Result<()>;
+    fn merge_outputs(&self, output_dir: &std::path::Path, run_id: Option<&str>) -> Result<()>;
     fn finalize_snapshot(&self, wiki: &str, data_dir: &std::path::Path) -> Result<()>;
 }
 
@@ -227,8 +239,8 @@ impl Ops for RealOps {
         )
     }
 
-    fn merge_outputs(&self, output_dir: &std::path::Path) -> Result<()> {
-        merge::merge_outputs(output_dir)
+    fn merge_outputs(&self, output_dir: &std::path::Path, run_id: Option<&str>) -> Result<()> {
+        merge::merge_outputs(output_dir, run_id)
     }
 
     fn finalize_snapshot(&self, wiki: &str, data_dir: &std::path::Path) -> Result<()> {
@@ -277,6 +289,7 @@ fn default_snapshot_version() -> String {
 fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
     let data_dir = cli.data_dir;
     let output_dir = cli.output_dir;
+    let run_id = cli.run_id;
 
     match cli.command {
         Commands::Fetch { wikis, version } => {
@@ -308,11 +321,37 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
                     ops.compute_patrol(wiki, &data_dir, &output_dir, false, None)
                 })?;
             }
-            run_timed_stage("merge", None, || ops.merge_outputs(&output_dir))?;
+            run_timed_stage("merge", None, || {
+                ops.merge_outputs(&output_dir, run_id.as_deref())
+            })?;
         }
 
         Commands::Merge => {
-            run_timed_stage("merge", None, || ops.merge_outputs(&output_dir))?;
+            publication::begin_run(&output_dir, run_id.as_deref(), &[], None)?;
+            run_timed_stage("merge", None, || {
+                ops.merge_outputs(&output_dir, run_id.as_deref())
+            })?;
+        }
+
+        Commands::PublicationValidate => {
+            let run_id = run_id
+                .as_deref()
+                .context("publication validation requires --run-id")?;
+            let lifecycle = env::var_os("WIKI_ECON_WIKI_LIFECYCLE_FILE")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("config/wiki-lifecycle.json"));
+            run_timed_stage("publication_validate", None, || {
+                publication::validate(&data_dir, &output_dir, &lifecycle, run_id)
+            })?;
+        }
+
+        Commands::PublicationVerify => {
+            let run_id = run_id
+                .as_deref()
+                .context("publication verification requires --run-id")?;
+            run_timed_stage("publication_verify", None, || {
+                publication::verify(&output_dir, run_id)
+            })?;
         }
 
         Commands::SnapshotFinalize { wikis } => {
@@ -363,6 +402,7 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
 
         Commands::Run { wikis, version } => {
             let version = version.unwrap_or_else(default_snapshot_version);
+            publication::begin_run(&output_dir, run_id.as_deref(), &wikis, Some(&version))?;
             for wiki in &wikis {
                 info!(wiki = wiki, "running full pipeline");
                 run_timed_stage("fetch", Some(wiki), || {
@@ -384,7 +424,9 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
                     ops.compute_patrol(wiki, &data_dir, &output_dir, false, None)
                 })?;
             }
-            run_timed_stage("merge", None, || ops.merge_outputs(&output_dir))?;
+            run_timed_stage("merge", None, || {
+                ops.merge_outputs(&output_dir, run_id.as_deref())
+            })?;
         }
     }
 
@@ -673,7 +715,7 @@ mod tests {
             Ok(())
         }
 
-        fn merge_outputs(&self, output_dir: &Path) -> Result<()> {
+        fn merge_outputs(&self, output_dir: &Path, _run_id: Option<&str>) -> Result<()> {
             self.record(format!("merge:{}", output_dir.display()));
             Ok(())
         }
@@ -749,7 +791,7 @@ mod tests {
             Ok(())
         }
 
-        fn merge_outputs(&self, _output_dir: &Path) -> Result<()> {
+        fn merge_outputs(&self, _output_dir: &Path, _run_id: Option<&str>) -> Result<()> {
             if self.fail_stage == "merge" {
                 anyhow::bail!("merge failed");
             }
@@ -878,6 +920,57 @@ mod tests {
         run_with_ops(cli, &ops)?;
 
         assert_eq!(ops.calls.into_inner(), vec!["merge:combined"]);
+        Ok(())
+    }
+
+    #[test]
+    fn publication_commands_require_run_ids_and_reach_their_validators() -> Result<()> {
+        let ops = RecordingOps::default();
+        for command in ["publication-validate", "publication-verify"] {
+            let cli = Cli::try_parse_from(["wiki-econ", command])?;
+            let error = run_with_ops(cli, &ops).expect_err("run ID is mandatory");
+            assert!(error.to_string().contains("requires --run-id"));
+
+            let temp = TestDir::new()?;
+            let data = temp.path().join("data");
+            let output = temp.path().join("output");
+            fs::create_dir_all(&data)?;
+            fs::create_dir_all(&output)?;
+            let cli = Cli::try_parse_from([
+                "wiki-econ",
+                "--data-dir",
+                data.to_str().context("UTF-8 data path")?,
+                "--output-dir",
+                output.to_str().context("UTF-8 output path")?,
+                "--run-id",
+                "test-run",
+                command,
+            ])
+            .expect("publication command should parse");
+            let error = run_with_ops(cli, &ops).expect_err("missing publication state must fail");
+            assert!(error.to_string().contains("failed to read"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn run_id_initializes_context_for_merge_and_full_run() -> Result<()> {
+        let ops = RecordingOps::default();
+        for command in [vec!["merge"], vec!["run", "nlwiki", "--version", "2026-03"]] {
+            let output = TestDir::new()?;
+            let mut args = vec![
+                "wiki-econ",
+                "--output-dir",
+                output.path().to_str().context("UTF-8 output path")?,
+                "--run-id",
+                "test-run",
+            ];
+            args.extend(command);
+            run_with_ops(Cli::try_parse_from(args)?, &ops)?;
+            let context: Value =
+                serde_json::from_slice(&fs::read(output.path().join(".publication-run.json"))?)?;
+            assert_eq!(context["run_id"], "test-run");
+        }
         Ok(())
     }
 
@@ -1160,9 +1253,12 @@ mod tests {
         let mut df = DataFrame::new_infer_height(columns)?;
         ParquetWriter::new(&mut file).finish(&mut df)?;
 
-        ops.merge_outputs(output_dir.path())?;
+        let error = ops
+            .merge_outputs(output_dir.path(), None)
+            .expect_err("real generators reject an incomplete metric fixture");
 
         assert!(output_dir.path().join("metric.parquet").exists());
+        assert!(!error.to_string().is_empty());
         Ok(())
     }
 
@@ -1332,7 +1428,7 @@ mod tests {
         ops.compute_all("frwiki", data_dir, output_dir)?;
         ops.compute_patrol("frwiki", data_dir, output_dir, false, None)?;
         ops.benchmark(&wikis, data_dir, output_dir, 0, 1, false)?;
-        ops.merge_outputs(output_dir)?;
+        ops.merge_outputs(output_dir, None)?;
         ops.finalize_snapshot("frwiki", data_dir)?;
         Ok(())
     }

@@ -58,7 +58,7 @@ pub fn snapshot_warehouse_wiki_dir(
         .join(snapshot_version))
 }
 
-fn snapshot_pointer_path(data_dir: &Path, wiki: &str) -> PathBuf {
+pub(crate) fn snapshot_pointer_path(data_dir: &Path, wiki: &str) -> PathBuf {
     data_dir
         .join(SNAPSHOT_STATE_DIRNAME)
         .join(wiki)
