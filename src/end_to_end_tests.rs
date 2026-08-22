@@ -236,3 +236,65 @@ fn pipeline_ingests_computes_and_merges_a_tinywiki_fixture() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+fn snapshot_rollover_computes_only_the_new_generation() -> Result<()> {
+    init_test_tracing();
+    let temp = TestDir::new()?;
+    let data_dir = temp.path().join("data");
+    let output_dir = temp.path().join("output");
+    let raw_dir = data_dir.join("raw").join("tinywiki");
+    fs::create_dir_all(&raw_dir)?;
+
+    let july_source = raw_dir.join("2026-07.tinywiki.all-time.tsv.bz2");
+    write_bz2(
+        &july_source,
+        &[
+            fixture_row("2024-01-01 12:00:00.0", "1", "100"),
+            fixture_row("2024-01-08 12:00:00.0", "1", "101"),
+        ],
+    )?;
+    ingest::ingest_wiki_snapshot("tinywiki", "2026-07", &data_dir)?;
+    assert_eq!(
+        storage::current_snapshot_version(&data_dir, "tinywiki")?.as_deref(),
+        Some("2026-07")
+    );
+
+    fs::remove_file(july_source)?;
+    let august_source = raw_dir.join("2026-08.tinywiki.all-time.tsv.bz2");
+    write_bz2(
+        &august_source,
+        &[
+            fixture_row("2024-01-01 12:00:00.0", "1", "200"),
+            fixture_row("2024-01-08 12:00:00.0", "1", "201"),
+            fixture_row("2024-01-15 12:00:00.0", "1", "202"),
+        ],
+    )?;
+    ingest::ingest_wiki_snapshot("tinywiki", "2026-08", &data_dir)?;
+
+    assert_eq!(
+        storage::current_snapshot_version(&data_dir, "tinywiki")?.as_deref(),
+        Some("2026-08")
+    );
+    assert!(
+        storage::snapshot_warehouse_wiki_dir(&data_dir, "tinywiki", "2026-07")?.exists(),
+        "the previous generation remains available until publication succeeds"
+    );
+    compute::compute_all("tinywiki", &data_dir, &output_dir)?;
+
+    let weekly = read_parquet(&output_dir.join("tinywiki/page_weekly_edits.parquet"))?;
+    let total_edits: u32 = weekly.column("edits")?.u32()?.into_no_null_iter().sum();
+    assert_eq!(weekly.height(), 3);
+    assert_eq!(
+        total_edits, 3,
+        "July and August histories must not be added together"
+    );
+
+    assert_eq!(
+        storage::retire_inactive_snapshots(&data_dir, "tinywiki")?,
+        2
+    );
+    assert!(!storage::snapshot_warehouse_wiki_dir(&data_dir, "tinywiki", "2026-07")?.exists());
+    assert!(storage::snapshot_warehouse_wiki_dir(&data_dir, "tinywiki", "2026-08")?.exists());
+    Ok(())
+}

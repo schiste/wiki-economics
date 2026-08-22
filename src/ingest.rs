@@ -1,8 +1,8 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use bzip2::read::BzDecoder;
 use polars::prelude::*;
 use rayon::prelude::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 #[cfg(test)]
 use std::io::Write;
@@ -12,9 +12,31 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
-use crate::{schema, storage};
+use crate::{fetch, schema, storage};
 
 const INGEST_CHUNK_BYTES: usize = 32 * 1024 * 1024;
+
+#[derive(Clone, Debug)]
+struct IngestRoots {
+    analytical: PathBuf,
+    warehouse: PathBuf,
+}
+
+impl IngestRoots {
+    fn legacy(data_dir: &Path, wiki: &str) -> Self {
+        Self {
+            analytical: storage::analytical_wiki_dir(data_dir, wiki),
+            warehouse: storage::warehouse_wiki_dir(data_dir, wiki),
+        }
+    }
+
+    fn snapshot(data_dir: &Path, wiki: &str, snapshot_version: &str) -> Result<Self> {
+        Ok(Self {
+            analytical: storage::snapshot_analytical_wiki_dir(data_dir, wiki, snapshot_version)?,
+            warehouse: storage::snapshot_warehouse_wiki_dir(data_dir, wiki, snapshot_version)?,
+        })
+    }
+}
 
 fn warehouse_select_exprs() -> Vec<Expr> {
     schema::WAREHOUSE_COLUMNS
@@ -174,14 +196,11 @@ fn write_parquet(df: &mut DataFrame, dest: &Path) -> Result<()> {
 
 fn write_partitioned_frames(
     normalized: &DataFrame,
-    data_dir: &Path,
-    wiki: &str,
+    roots: &IngestRoots,
     source_id: &str,
     chunk_idx: usize,
 ) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     let partition_index = build_partition_index(normalized)?;
-    let analytical_root = storage::analytical_wiki_dir(data_dir, wiki);
-    let warehouse_root = storage::warehouse_wiki_dir(data_dir, wiki);
 
     let mut analytical_paths = Vec::new();
     let mut warehouse_paths = Vec::new();
@@ -190,13 +209,13 @@ fn write_partitioned_frames(
         let take_idx = UInt32Chunked::from_vec("idx".into(), row_indices);
         let partition_df = normalized.take(&take_idx)?;
 
-        let partition_dir = storage::month_partition_dir(&warehouse_root, year, &year_month);
+        let partition_dir = storage::month_partition_dir(&roots.warehouse, year, &year_month);
         let warehouse_path = partition_dir.join(format!("{source_id}.part-{chunk_idx:05}.parquet"));
         let mut warehouse_df = partition_df.clone();
         write_parquet(&mut warehouse_df, &warehouse_path)?;
         warehouse_paths.push(warehouse_path);
 
-        let partition_dir = storage::month_partition_dir(&analytical_root, year, &year_month);
+        let partition_dir = storage::month_partition_dir(&roots.analytical, year, &year_month);
         let analytical_path =
             partition_dir.join(format!("{source_id}.part-{chunk_idx:05}.parquet"));
         let mut analytical_df = partition_df.select(schema::ANALYTICAL_COLUMNS.iter().copied())?;
@@ -209,8 +228,7 @@ fn write_partitioned_frames(
 
 fn flush_chunk(
     chunk_bytes: &mut Vec<u8>,
-    data_dir: &Path,
-    wiki: &str,
+    roots: &IngestRoots,
     source_id: &str,
     chunk_idx: usize,
 ) -> Result<(usize, Vec<PathBuf>, Vec<PathBuf>)> {
@@ -227,30 +245,38 @@ fn flush_chunk(
     }
 
     let (analytical_paths, warehouse_paths) =
-        write_partitioned_frames(&normalized, data_dir, wiki, source_id, chunk_idx)?;
+        write_partitioned_frames(&normalized, roots, source_id, chunk_idx)?;
     Ok((rows, analytical_paths, warehouse_paths))
 }
 
 /// Convert a single TSV.bz2 dump file into partitioned Parquet layers.
+#[cfg(test)]
 fn convert_file(src: &Path, wiki: &str, data_dir: &Path) -> Result<Vec<PathBuf>> {
-    convert_file_with_chunk_limit(src, wiki, data_dir, INGEST_CHUNK_BYTES)
+    convert_file_with_chunk_limit(
+        src,
+        wiki,
+        data_dir,
+        &IngestRoots::legacy(data_dir, wiki),
+        INGEST_CHUNK_BYTES,
+    )
 }
 
 fn convert_file_with_chunk_limit(
     src: &Path,
     wiki: &str,
     data_dir: &Path,
+    roots: &IngestRoots,
     chunk_limit: usize,
 ) -> Result<Vec<PathBuf>> {
     let source_id = ingest_source_id(src)?;
-    let marker = storage::marker_path(data_dir, wiki, &source_id);
-    if storage::marker_manifest_is_valid(data_dir, wiki, &source_id)? {
+    let marker = storage::marker_path_in(&roots.analytical, &source_id);
+    if storage::marker_manifest_is_valid_in(data_dir, &roots.analytical, &source_id)? {
         debug!(
             source = %src.display(),
             marker = %marker.display(),
             "skipping already ingested source"
         );
-        return storage::collect_parquet_files(&storage::analytical_wiki_dir(data_dir, wiki));
+        return storage::collect_parquet_files(&roots.analytical);
     }
 
     let started = Instant::now();
@@ -278,7 +304,7 @@ fn convert_file_with_chunk_limit(
             chunk_bytes.extend_from_slice(&line);
             if chunk_bytes.len() >= chunk_limit {
                 let (rows, analytical, warehouse) =
-                    flush_chunk(&mut chunk_bytes, data_dir, wiki, &source_id, chunk_idx)?;
+                    flush_chunk(&mut chunk_bytes, roots, &source_id, chunk_idx)?;
                 total_rows += rows;
                 analytical_paths.extend(analytical);
                 warehouse_paths.extend(warehouse);
@@ -288,7 +314,7 @@ fn convert_file_with_chunk_limit(
 
         if !chunk_bytes.is_empty() {
             let (rows, analytical, warehouse) =
-                flush_chunk(&mut chunk_bytes, data_dir, wiki, &source_id, chunk_idx)?;
+                flush_chunk(&mut chunk_bytes, roots, &source_id, chunk_idx)?;
             total_rows += rows;
             analytical_paths.extend(analytical);
             warehouse_paths.extend(warehouse);
@@ -300,7 +326,7 @@ fn convert_file_with_chunk_limit(
             analytical_paths: analytical_paths.clone(),
             warehouse_paths: warehouse_paths.clone(),
         };
-        storage::write_marker_manifest(data_dir, wiki, &source_id, &manifest)?;
+        storage::write_marker_manifest_in(data_dir, &roots.analytical, &source_id, &manifest)?;
         Ok(())
     })();
 
@@ -335,13 +361,80 @@ fn convert_file_with_chunk_limit(
     Ok(analytical_paths)
 }
 
-/// Ingest all raw dump files for a wiki into partitioned Parquet.
-pub fn ingest_wiki(wiki: &str, data_dir: &Path) -> Result<Vec<PathBuf>> {
+fn snapshot_version_from_filename<'a>(filename: &'a str, wiki: &str) -> Option<&'a str> {
+    let snapshot_version = filename.get(..7)?;
+    let separator = filename.get(7..)?.strip_prefix('.')?;
+    separator.strip_prefix(wiki)?.strip_prefix('.')?;
+    storage::validate_snapshot_version(snapshot_version)
+        .ok()
+        .map(|_| snapshot_version)
+}
+
+fn select_ingest_sources(
+    wiki: &str,
+    src_files: Vec<PathBuf>,
+    requested_snapshot: Option<&str>,
+) -> Result<(Option<String>, Vec<PathBuf>)> {
+    let discovered: BTreeSet<String> = src_files
+        .iter()
+        .filter_map(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .and_then(|name| snapshot_version_from_filename(name, wiki))
+                .map(str::to_string)
+        })
+        .collect();
+    let snapshot_version = match requested_snapshot {
+        Some(version) => {
+            storage::validate_snapshot_version(version)?;
+            Some(version.to_string())
+        }
+        None if discovered.is_empty() => None,
+        None => {
+            ensure!(
+                discovered.len() == 1,
+                "raw dump directory for {wiki} contains multiple snapshots: {discovered:?}"
+            );
+            discovered.into_iter().next()
+        }
+    };
+
+    let Some(snapshot_version) = snapshot_version else {
+        return Ok((None, src_files));
+    };
+    let expected = fetch::build_file_list(wiki, &snapshot_version)?;
+    let by_name: BTreeMap<String, PathBuf> = src_files
+        .into_iter()
+        .filter_map(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| (name.to_string(), path.clone()))
+        })
+        .collect();
+    let missing: Vec<&str> = expected
+        .iter()
+        .map(String::as_str)
+        .filter(|filename| !by_name.contains_key(*filename))
+        .collect();
+    ensure!(
+        missing.is_empty(),
+        "snapshot {snapshot_version} for {wiki} is incomplete; missing {} source file(s): {}",
+        missing.len(),
+        missing.join(", ")
+    );
+    let selected = expected
+        .into_iter()
+        .filter_map(|filename| by_name.get(&filename).cloned())
+        .collect();
+    Ok((Some(snapshot_version), selected))
+}
+
+fn ingest_wiki_for_snapshot(
+    wiki: &str,
+    data_dir: &Path,
+    requested_snapshot: Option<&str>,
+) -> Result<Vec<PathBuf>> {
     let raw_dir = data_dir.join("raw").join(wiki);
-    let analytical_dir = storage::analytical_wiki_dir(data_dir, wiki);
-    let warehouse_dir = storage::warehouse_wiki_dir(data_dir, wiki);
-    fs::create_dir_all(&analytical_dir)?;
-    fs::create_dir_all(&warehouse_dir)?;
 
     if !raw_dir.exists() {
         anyhow::bail!("No raw data for {wiki}. Run `fetch` first.");
@@ -352,26 +445,66 @@ pub fn ingest_wiki(wiki: &str, data_dir: &Path) -> Result<Vec<PathBuf>> {
         .filter(|path| path.extension().is_some_and(|ext| ext == "bz2"))
         .collect();
     src_files.sort();
+    ensure!(
+        !src_files.is_empty(),
+        "No raw .bz2 files for {wiki}. Run `fetch` first."
+    );
+    let (snapshot_version, src_files) = select_ingest_sources(wiki, src_files, requested_snapshot)?;
+    let roots = match snapshot_version.as_deref() {
+        Some(version) => IngestRoots::snapshot(data_dir, wiki, version)?,
+        None => IngestRoots::legacy(data_dir, wiki),
+    };
+    fs::create_dir_all(&roots.analytical)?;
+    fs::create_dir_all(&roots.warehouse)?;
 
     info!(
         wiki = wiki,
+        snapshot_version = snapshot_version.as_deref().unwrap_or("legacy"),
         files = src_files.len(),
         "ingesting raw dump files"
     );
 
-    src_files
-        .par_iter()
-        .try_for_each(|src| convert_file(src, wiki, data_dir).map(|_| ()))?;
+    src_files.par_iter().try_for_each(|src| {
+        convert_file_with_chunk_limit(src, wiki, data_dir, &roots, INGEST_CHUNK_BYTES).map(|_| ())
+    })?;
 
-    let analytical_paths = storage::collect_parquet_files(&analytical_dir)?;
+    for src in &src_files {
+        let source_id = ingest_source_id(src)?;
+        ensure!(
+            storage::marker_manifest_is_valid_in(data_dir, &roots.analytical, &source_id)?,
+            "snapshot source {source_id} did not produce a valid ingest marker"
+        );
+    }
+
+    if let Some(snapshot_version) = snapshot_version.as_deref() {
+        storage::publish_current_snapshot(data_dir, wiki, snapshot_version)?;
+    }
+
+    let analytical_paths = storage::collect_parquet_files(&roots.analytical)?;
     info!(
         wiki = wiki,
+        snapshot_version = snapshot_version.as_deref().unwrap_or("legacy"),
         files = analytical_paths.len(),
-        analytical_dir = %analytical_dir.display(),
-        warehouse_dir = %warehouse_dir.display(),
+        analytical_dir = %roots.analytical.display(),
+        warehouse_dir = %roots.warehouse.display(),
         "finished ingest"
     );
     Ok(analytical_paths)
+}
+
+/// Ingest all raw dump files for a wiki into partitioned Parquet. Standard
+/// Wikimedia snapshot filenames are isolated into an immutable generation;
+/// legacy/test filenames retain the historical direct-directory layout.
+pub fn ingest_wiki(wiki: &str, data_dir: &Path) -> Result<Vec<PathBuf>> {
+    ingest_wiki_for_snapshot(wiki, data_dir, None)
+}
+
+pub fn ingest_wiki_snapshot(
+    wiki: &str,
+    snapshot_version: &str,
+    data_dir: &Path,
+) -> Result<Vec<PathBuf>> {
+    ingest_wiki_for_snapshot(wiki, data_dir, Some(snapshot_version))
 }
 
 #[cfg(test)]
@@ -518,16 +651,16 @@ mod tests {
     fn flush_chunk_returns_zero_for_empty_and_filtered_chunks() -> Result<()> {
         init_test_tracing();
         let temp_dir = TestDir::new()?;
+        let roots = IngestRoots::legacy(temp_dir.path(), "testwiki");
 
-        let empty = flush_chunk(&mut Vec::new(), temp_dir.path(), "testwiki", "source", 0)?;
+        let empty = flush_chunk(&mut Vec::new(), &roots, "source", 0)?;
         assert_eq!(empty.0, 0);
         assert!(empty.1.is_empty());
         assert!(empty.2.is_empty());
 
         let filtered_row = sample_row("2024-01-01 00:00:00.0", "42", "100", "page", "create");
         let mut filtered_bytes = filtered_row.into_bytes();
-        let root = temp_dir.path();
-        let filtered = flush_chunk(&mut filtered_bytes, root, "testwiki", "source", 1)?;
+        let filtered = flush_chunk(&mut filtered_bytes, &roots, "source", 1)?;
         assert_eq!(filtered.0, 0);
         assert!(filtered.1.is_empty());
         assert!(filtered.2.is_empty());
@@ -579,7 +712,8 @@ mod tests {
         ];
         write_bz2_dump(&src, &rows)?;
 
-        let outputs = convert_file_with_chunk_limit(&src, wiki, temp_dir.path(), 128)?;
+        let roots = IngestRoots::legacy(temp_dir.path(), wiki);
+        let outputs = convert_file_with_chunk_limit(&src, wiki, temp_dir.path(), &roots, 128)?;
 
         assert_eq!(outputs.len(), 2);
         assert!(storage::marker_path(temp_dir.path(), wiki, "source").exists());
@@ -637,12 +771,86 @@ mod tests {
     }
 
     #[test]
+    fn source_selection_infers_one_snapshot_and_ignores_stale_files_when_requested() -> Result<()> {
+        let july = PathBuf::from("2026-07.testwiki.all-time.tsv.bz2");
+        let august = PathBuf::from("2026-08.testwiki.all-time.tsv.bz2");
+        let unversioned = PathBuf::from("notes.tsv.bz2");
+
+        let (version, selected) = select_ingest_sources(
+            "testwiki",
+            vec![july.clone(), august.clone(), unversioned],
+            Some("2026-08"),
+        )
+        .expect("requested snapshot should select its exact source");
+        assert_eq!(version.as_deref(), Some("2026-08"));
+        assert_eq!(selected, vec![august]);
+
+        let (inferred, inferred_sources) =
+            select_ingest_sources("testwiki", vec![selected[0].clone()], None)?;
+        assert_eq!(inferred.as_deref(), Some("2026-08"));
+        assert_eq!(inferred_sources, selected);
+
+        let error = select_ingest_sources("testwiki", vec![july, selected[0].clone()], None)
+            .expect_err("mixed snapshots require an explicit selection");
+        assert!(error.to_string().contains("multiple snapshots"));
+        assert_eq!(
+            snapshot_version_from_filename("notes.tsv.bz2", "testwiki"),
+            None
+        );
+        assert_eq!(
+            snapshot_version_from_filename("2026-08.otherwiki.all-time.tsv.bz2", "testwiki"),
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn source_selection_rejects_invalid_or_incomplete_requested_snapshot() {
+        assert!(
+            select_ingest_sources("testwiki", Vec::new(), Some("invalid"))
+                .unwrap_err()
+                .to_string()
+                .contains("invalid snapshot")
+        );
+        let error = select_ingest_sources(
+            "frwiki",
+            vec![PathBuf::from("2026-08.frwiki.2001.tsv.bz2")],
+            Some("2026-08"),
+        )
+        .expect_err("yearly snapshot must contain every expected source");
+        assert!(error.to_string().contains("missing 25 source file"));
+    }
+
+    #[test]
+    fn source_selection_preserves_legacy_files() -> Result<()> {
+        let files = vec![
+            PathBuf::from("part1.tsv.bz2"),
+            PathBuf::from("part2.tsv.bz2"),
+        ];
+        let (version, selected) = select_ingest_sources("testwiki", files.clone(), None)?;
+        assert_eq!(version, None);
+        assert_eq!(selected, files);
+        Ok(())
+    }
+
+    #[test]
     fn ingest_wiki_errors_when_raw_dir_is_missing() -> Result<()> {
         init_test_tracing();
         let temp_dir = TestDir::new()?;
 
         let err = ingest_wiki("missingwiki", temp_dir.path()).expect_err("missing raw dir");
         assert!(err.to_string().contains("Run `fetch` first"));
+        Ok(())
+    }
+
+    #[test]
+    fn ingest_wiki_errors_when_raw_dir_is_empty() -> Result<()> {
+        init_test_tracing();
+        let temp_dir = TestDir::new()?;
+        fs::create_dir_all(temp_dir.path().join("raw").join("emptywiki"))?;
+
+        let err = ingest_wiki("emptywiki", temp_dir.path()).expect_err("empty raw dir");
+        assert!(err.to_string().contains("No raw .bz2 files"));
         Ok(())
     }
 

@@ -1,11 +1,17 @@
-use anyhow::Result;
+use anyhow::{Context, Result, ensure};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::fs;
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 pub const ANALYTICAL_DIRNAME: &str = "parquet";
 pub const WAREHOUSE_DIRNAME: &str = "warehouse";
 const MARKERS_DIRNAME: &str = "_markers";
+const SNAPSHOTS_DIRNAME: &str = "_snapshots";
+const SNAPSHOT_STATE_DIRNAME: &str = "snapshots";
+const CURRENT_SNAPSHOT_FILENAME: &str = "current-snapshot.json";
+const SNAPSHOT_POINTER_SCHEMA_VERSION: u64 = 1;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct PartitionSpec {
@@ -30,19 +36,195 @@ pub fn warehouse_wiki_dir(data_dir: &Path, wiki: &str) -> PathBuf {
     data_dir.join(WAREHOUSE_DIRNAME).join(wiki)
 }
 
+pub fn snapshot_analytical_wiki_dir(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot_version: &str,
+) -> Result<PathBuf> {
+    validate_snapshot_version(snapshot_version)?;
+    Ok(analytical_wiki_dir(data_dir, wiki)
+        .join(SNAPSHOTS_DIRNAME)
+        .join(snapshot_version))
+}
+
+pub fn snapshot_warehouse_wiki_dir(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot_version: &str,
+) -> Result<PathBuf> {
+    validate_snapshot_version(snapshot_version)?;
+    Ok(warehouse_wiki_dir(data_dir, wiki)
+        .join(SNAPSHOTS_DIRNAME)
+        .join(snapshot_version))
+}
+
+fn snapshot_pointer_path(data_dir: &Path, wiki: &str) -> PathBuf {
+    data_dir
+        .join(SNAPSHOT_STATE_DIRNAME)
+        .join(wiki)
+        .join(CURRENT_SNAPSHOT_FILENAME)
+}
+
+pub(crate) fn validate_snapshot_version(snapshot_version: &str) -> Result<()> {
+    let bytes = snapshot_version.as_bytes();
+    ensure!(
+        bytes.len() == 7
+            && bytes[0..4].iter().all(u8::is_ascii_digit)
+            && bytes[4] == b'-'
+            && bytes[5..7].iter().all(u8::is_ascii_digit),
+        "invalid snapshot version {snapshot_version:?}; expected YYYY-MM"
+    );
+    let month: u8 = snapshot_version[5..7].parse()?;
+    ensure!(
+        (1..=12).contains(&month),
+        "invalid snapshot month in {snapshot_version:?}"
+    );
+    Ok(())
+}
+
+pub fn current_snapshot_version(data_dir: &Path, wiki: &str) -> Result<Option<String>> {
+    let pointer = snapshot_pointer_path(data_dir, wiki);
+    if !pointer.exists() {
+        return Ok(None);
+    }
+    let value: Value = serde_json::from_slice(
+        &fs::read(&pointer)
+            .with_context(|| format!("failed to read snapshot pointer {}", pointer.display()))?,
+    )
+    .with_context(|| format!("invalid snapshot pointer JSON in {}", pointer.display()))?;
+    ensure!(
+        value.get("schema_version").and_then(Value::as_u64)
+            == Some(SNAPSHOT_POINTER_SCHEMA_VERSION),
+        "unsupported snapshot pointer schema in {}",
+        pointer.display()
+    );
+    ensure!(
+        value.get("wiki").and_then(Value::as_str) == Some(wiki),
+        "snapshot pointer wiki mismatch in {}",
+        pointer.display()
+    );
+    let snapshot_version = value
+        .get("snapshot_version")
+        .and_then(Value::as_str)
+        .context("snapshot pointer is missing snapshot_version")?;
+    validate_snapshot_version(snapshot_version)?;
+    Ok(Some(snapshot_version.to_string()))
+}
+
+pub fn active_analytical_wiki_dir(data_dir: &Path, wiki: &str) -> Result<PathBuf> {
+    match current_snapshot_version(data_dir, wiki)? {
+        Some(snapshot_version) => snapshot_analytical_wiki_dir(data_dir, wiki, &snapshot_version),
+        None => Ok(analytical_wiki_dir(data_dir, wiki)),
+    }
+}
+
+pub fn active_warehouse_wiki_dir(data_dir: &Path, wiki: &str) -> Result<PathBuf> {
+    match current_snapshot_version(data_dir, wiki)? {
+        Some(snapshot_version) => snapshot_warehouse_wiki_dir(data_dir, wiki, &snapshot_version),
+        None => Ok(warehouse_wiki_dir(data_dir, wiki)),
+    }
+}
+
+pub fn publish_current_snapshot(data_dir: &Path, wiki: &str, snapshot_version: &str) -> Result<()> {
+    validate_snapshot_version(snapshot_version)?;
+    let analytical = snapshot_analytical_wiki_dir(data_dir, wiki, snapshot_version)?;
+    let warehouse = snapshot_warehouse_wiki_dir(data_dir, wiki, snapshot_version)?;
+    ensure!(
+        analytical.is_dir() && warehouse.is_dir(),
+        "cannot publish incomplete snapshot {snapshot_version} for {wiki}"
+    );
+
+    let pointer = snapshot_pointer_path(data_dir, wiki);
+    let parent = pointer.parent().context("snapshot pointer has no parent")?;
+    fs::create_dir_all(parent)?;
+    let temp = parent.join(format!(
+        ".{CURRENT_SNAPSHOT_FILENAME}.{}.tmp",
+        std::process::id()
+    ));
+    let bytes = serde_json::to_vec_pretty(&json!({
+        "schema_version": SNAPSHOT_POINTER_SCHEMA_VERSION,
+        "wiki": wiki,
+        "snapshot_version": snapshot_version,
+    }))?;
+    let write_result = (|| -> Result<()> {
+        let mut file = File::create(&temp)?;
+        file.write_all(&bytes)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        fs::rename(&temp, &pointer)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    write_result
+}
+
+pub fn retire_inactive_snapshots(data_dir: &Path, wiki: &str) -> Result<usize> {
+    let Some(active) = current_snapshot_version(data_dir, wiki)? else {
+        return Ok(0);
+    };
+    let mut removed = 0;
+    for layer_root in [
+        analytical_wiki_dir(data_dir, wiki),
+        warehouse_wiki_dir(data_dir, wiki),
+    ] {
+        let snapshots_root = layer_root.join(SNAPSHOTS_DIRNAME);
+        for entry in fs::read_dir(&snapshots_root)? {
+            let entry = entry?;
+            if entry.file_type()?.is_dir() && entry.file_name() != active.as_str() {
+                fs::remove_dir_all(entry.path())?;
+                removed += 1;
+            }
+        }
+        for entry in fs::read_dir(&layer_root)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if entry.file_type()?.is_dir() && (name == MARKERS_DIRNAME || name.starts_with("year="))
+            {
+                fs::remove_dir_all(entry.path())?;
+                removed += 1;
+            }
+        }
+    }
+    Ok(removed)
+}
+
+#[cfg(test)]
 pub fn marker_path(data_dir: &Path, wiki: &str, source_id: &str) -> PathBuf {
-    analytical_wiki_dir(data_dir, wiki)
+    marker_path_in(&analytical_wiki_dir(data_dir, wiki), source_id)
+}
+
+pub fn marker_path_in(analytical_root: &Path, source_id: &str) -> PathBuf {
+    analytical_root
         .join(MARKERS_DIRNAME)
         .join(format!("{source_id}.done"))
 }
 
+#[cfg(test)]
 pub fn write_marker_manifest(
     data_dir: &Path,
     wiki: &str,
     source_id: &str,
     manifest: &MarkerManifest,
 ) -> Result<PathBuf> {
-    let marker = marker_path(data_dir, wiki, source_id);
+    write_marker_manifest_in(
+        data_dir,
+        &analytical_wiki_dir(data_dir, wiki),
+        source_id,
+        manifest,
+    )
+}
+
+pub fn write_marker_manifest_in(
+    data_dir: &Path,
+    analytical_root: &Path,
+    source_id: &str,
+    manifest: &MarkerManifest,
+) -> Result<PathBuf> {
+    let marker = marker_path_in(analytical_root, source_id);
     marker.parent().map(fs::create_dir_all).transpose()?;
 
     let mut lines = Vec::new();
@@ -72,12 +254,21 @@ pub fn write_marker_manifest(
     Ok(marker)
 }
 
+#[cfg(test)]
 pub fn read_marker_manifest(
     data_dir: &Path,
     wiki: &str,
     source_id: &str,
 ) -> Result<Option<MarkerManifest>> {
-    let marker = marker_path(data_dir, wiki, source_id);
+    read_marker_manifest_in(data_dir, &analytical_wiki_dir(data_dir, wiki), source_id)
+}
+
+pub fn read_marker_manifest_in(
+    data_dir: &Path,
+    analytical_root: &Path,
+    source_id: &str,
+) -> Result<Option<MarkerManifest>> {
+    let marker = marker_path_in(analytical_root, source_id);
     if !marker.exists() {
         return Ok(None);
     }
@@ -99,8 +290,17 @@ pub fn read_marker_manifest(
     Ok(Some(manifest))
 }
 
+#[cfg(test)]
 pub fn marker_manifest_is_valid(data_dir: &Path, wiki: &str, source_id: &str) -> Result<bool> {
-    let Some(manifest) = read_marker_manifest(data_dir, wiki, source_id)? else {
+    marker_manifest_is_valid_in(data_dir, &analytical_wiki_dir(data_dir, wiki), source_id)
+}
+
+pub fn marker_manifest_is_valid_in(
+    data_dir: &Path,
+    analytical_root: &Path,
+    source_id: &str,
+) -> Result<bool> {
+    let Some(manifest) = read_marker_manifest_in(data_dir, analytical_root, source_id)? else {
         return Ok(false);
     };
     if manifest.rows == 0 {
@@ -140,7 +340,7 @@ fn collect_parquet_files_recursive(root: &Path, files: &mut Vec<PathBuf>) -> Res
             if path
                 .file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name == MARKERS_DIRNAME)
+                .is_some_and(|name| name.starts_with('_'))
             {
                 continue;
             }
@@ -225,8 +425,14 @@ mod tests {
         let temp_dir = TestDir::new()?;
         let root = temp_dir.path();
         fs::create_dir_all(root.join("_markers"))?;
+        fs::create_dir_all(root.join("_snapshots").join("2026-07"))?;
         fs::create_dir_all(root.join("year=2024").join("year_month=2024-01"))?;
         fs::write(root.join("_markers").join("skip.parquet"), b"")?;
+        fs::write(
+            root.join("_snapshots").join("2026-07").join("skip.parquet"),
+            b"",
+        )
+        .expect("snapshot fixture should be writable");
         let parquet_path = root
             .join("year=2024")
             .join("year_month=2024-01")
@@ -236,6 +442,117 @@ mod tests {
         let files = collect_parquet_files(root)?;
         assert_eq!(files.len(), 1);
         assert!(files[0].ends_with("part-0.parquet"));
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_pointer_atomically_selects_generation_and_rejects_incomplete_publish() -> Result<()>
+    {
+        let temp_dir = TestDir::new()?;
+        let root = temp_dir.path();
+        let wiki = "nlwiki";
+        assert_eq!(current_snapshot_version(root, wiki)?, None);
+        assert_eq!(
+            active_analytical_wiki_dir(root, wiki)?,
+            analytical_wiki_dir(root, wiki)
+        );
+        assert_eq!(
+            active_warehouse_wiki_dir(root, wiki)?,
+            warehouse_wiki_dir(root, wiki)
+        );
+        assert!(snapshot_analytical_wiki_dir(root, wiki, "2026/07").is_err());
+        assert!(snapshot_warehouse_wiki_dir(root, wiki, "2026-13").is_err());
+
+        let analytical = snapshot_analytical_wiki_dir(root, wiki, "2026-07")?;
+        fs::create_dir_all(&analytical)?;
+        assert!(publish_current_snapshot(root, wiki, "2026-07").is_err());
+        let warehouse = snapshot_warehouse_wiki_dir(root, wiki, "2026-07")?;
+        fs::create_dir_all(&warehouse)?;
+
+        publish_current_snapshot(root, wiki, "2026-07")?;
+
+        assert_eq!(
+            current_snapshot_version(root, wiki)?.as_deref(),
+            Some("2026-07")
+        );
+        assert_eq!(active_analytical_wiki_dir(root, wiki)?, analytical);
+        assert_eq!(active_warehouse_wiki_dir(root, wiki)?, warehouse);
+        let pointer = fs::read_to_string(snapshot_pointer_path(root, wiki))?;
+        assert!(pointer.ends_with('\n'));
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_pointer_validation_fails_closed() -> Result<()> {
+        let temp_dir = TestDir::new()?;
+        let root = temp_dir.path();
+        let wiki = "nlwiki";
+        let pointer = snapshot_pointer_path(root, wiki);
+        pointer.parent().map(fs::create_dir_all).transpose()?;
+
+        for invalid in [
+            "not json",
+            r#"{"schema_version":2,"wiki":"nlwiki","snapshot_version":"2026-07"}"#,
+            r#"{"schema_version":1,"wiki":"frwiki","snapshot_version":"2026-07"}"#,
+            r#"{"schema_version":1,"wiki":"nlwiki"}"#,
+            r#"{"schema_version":1,"wiki":"nlwiki","snapshot_version":"2026-00"}"#,
+        ] {
+            fs::write(&pointer, invalid)?;
+            assert!(current_snapshot_version(root, wiki).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn failed_snapshot_pointer_write_cleans_temporary_file() -> Result<()> {
+        let temp_dir = TestDir::new()?;
+        let root = temp_dir.path();
+        let wiki = "nlwiki";
+        fs::create_dir_all(snapshot_analytical_wiki_dir(root, wiki, "2026-07")?)?;
+        fs::create_dir_all(snapshot_warehouse_wiki_dir(root, wiki, "2026-07")?)?;
+        let pointer = snapshot_pointer_path(root, wiki);
+        let parent = pointer.parent().context("pointer parent")?;
+        fs::create_dir_all(parent)?;
+        let temp = parent.join(format!(
+            ".{CURRENT_SNAPSHOT_FILENAME}.{}.tmp",
+            std::process::id()
+        ));
+        fs::create_dir(&temp)?;
+
+        assert!(publish_current_snapshot(root, wiki, "2026-07").is_err());
+        assert!(temp.is_dir());
+        assert!(!pointer.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn retire_inactive_snapshots_preserves_current_and_removes_legacy_data() -> Result<()> {
+        let temp_dir = TestDir::new()?;
+        let root = temp_dir.path();
+        let wiki = "nlwiki";
+        assert_eq!(retire_inactive_snapshots(root, wiki)?, 0);
+
+        for version in ["2026-06", "2026-07"] {
+            fs::create_dir_all(snapshot_analytical_wiki_dir(root, wiki, version)?)?;
+            fs::create_dir_all(snapshot_warehouse_wiki_dir(root, wiki, version)?)?;
+        }
+        for layer in [
+            analytical_wiki_dir(root, wiki),
+            warehouse_wiki_dir(root, wiki),
+        ] {
+            fs::create_dir_all(layer.join("year=2025"))?;
+            fs::create_dir_all(layer.join(MARKERS_DIRNAME))?;
+            fs::write(layer.join("keep.txt"), b"not snapshot data")?;
+        }
+        publish_current_snapshot(root, wiki, "2026-07")?;
+
+        assert_eq!(retire_inactive_snapshots(root, wiki)?, 6);
+        assert!(snapshot_analytical_wiki_dir(root, wiki, "2026-07")?.is_dir());
+        assert!(snapshot_warehouse_wiki_dir(root, wiki, "2026-07")?.is_dir());
+        assert!(!snapshot_analytical_wiki_dir(root, wiki, "2026-06")?.exists());
+        assert!(!snapshot_warehouse_wiki_dir(root, wiki, "2026-06")?.exists());
+        assert!(analytical_wiki_dir(root, wiki).join("keep.txt").is_file());
+        assert!(warehouse_wiki_dir(root, wiki).join("keep.txt").is_file());
         Ok(())
     }
 

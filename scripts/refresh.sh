@@ -119,4 +119,11 @@ if [ "$SKIP_SITE_BUILD" -eq 0 ]; then
     --dist-dir "$WIKI_ECON_SITE_DIST_DIR"
 fi
 
+# The previous warehouse generation is the rollback source until every
+# downstream artifact, including the site, has published successfully. Only
+# then is it safe to reclaim its NFS space.
+if [ "$MERGE_ONLY" -eq 0 ] && [ "$SKIP_SITE_BUILD" -eq 0 ]; then
+  wiki_econ_run_cli snapshot-finalize "${WIKIS[@]}"
+fi
+
 echo "==> Refresh flow complete"

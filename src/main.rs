@@ -53,6 +53,10 @@ enum Commands {
     Ingest {
         /// Wiki database names
         wikis: Vec<String>,
+
+        /// Dump snapshot version (YYYY-MM); inferred from filenames when omitted
+        #[arg(long)]
+        version: Option<String>,
     },
 
     /// Compute economic metrics from Parquet data
@@ -63,6 +67,12 @@ enum Commands {
 
     /// Merge per-wiki outputs into combined parquet files
     Merge,
+
+    /// Retire non-current snapshot generations after successful publication
+    SnapshotFinalize {
+        /// Wiki database names
+        wikis: Vec<String>,
+    },
 
     /// Download and parse patrol logging data
     PatrolFetch {
@@ -116,7 +126,12 @@ enum Commands {
 trait Ops {
     fn fetch_wiki(&self, wiki: &str, version: &str, data_dir: &std::path::Path) -> Result<()>;
     fn fetch_patrol(&self, wiki: &str, data_dir: &std::path::Path) -> Result<()>;
-    fn ingest_wiki(&self, wiki: &str, data_dir: &std::path::Path) -> Result<()>;
+    fn ingest_wiki(
+        &self,
+        wiki: &str,
+        version: Option<&str>,
+        data_dir: &std::path::Path,
+    ) -> Result<()>;
     fn cleanup_raw_dump(&self, wiki: &str, data_dir: &std::path::Path) -> Result<()>;
     fn compute_all(
         &self,
@@ -142,6 +157,7 @@ trait Ops {
         keep_outputs: bool,
     ) -> Result<()>;
     fn merge_outputs(&self, output_dir: &std::path::Path) -> Result<()>;
+    fn finalize_snapshot(&self, wiki: &str, data_dir: &std::path::Path) -> Result<()>;
 }
 
 struct RealOps;
@@ -155,8 +171,16 @@ impl Ops for RealOps {
         patrol::fetch_patrol(wiki, data_dir)
     }
 
-    fn ingest_wiki(&self, wiki: &str, data_dir: &std::path::Path) -> Result<()> {
-        ingest::ingest_wiki(wiki, data_dir).map(|_| ())
+    fn ingest_wiki(
+        &self,
+        wiki: &str,
+        version: Option<&str>,
+        data_dir: &std::path::Path,
+    ) -> Result<()> {
+        match version {
+            Some(version) => ingest::ingest_wiki_snapshot(wiki, version, data_dir).map(|_| ()),
+            None => ingest::ingest_wiki(wiki, data_dir).map(|_| ()),
+        }
     }
 
     fn cleanup_raw_dump(&self, wiki: &str, data_dir: &std::path::Path) -> Result<()> {
@@ -204,6 +228,15 @@ impl Ops for RealOps {
 
     fn merge_outputs(&self, output_dir: &std::path::Path) -> Result<()> {
         merge::merge_outputs(output_dir)
+    }
+
+    fn finalize_snapshot(&self, wiki: &str, data_dir: &std::path::Path) -> Result<()> {
+        let removed = storage::retire_inactive_snapshots(data_dir, wiki)?;
+        info!(
+            wiki = wiki,
+            removed, "retired inactive snapshot generations"
+        );
+        Ok(())
     }
 }
 
@@ -257,9 +290,11 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             }
         }
 
-        Commands::Ingest { wikis } => {
+        Commands::Ingest { wikis, version } => {
             for wiki in &wikis {
-                run_timed_stage("ingest", Some(wiki), || ops.ingest_wiki(wiki, &data_dir))?;
+                run_timed_stage("ingest", Some(wiki), || {
+                    ops.ingest_wiki(wiki, version.as_deref(), &data_dir)
+                })?;
             }
         }
 
@@ -277,6 +312,14 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
 
         Commands::Merge => {
             run_timed_stage("merge", None, || ops.merge_outputs(&output_dir))?;
+        }
+
+        Commands::SnapshotFinalize { wikis } => {
+            for wiki in &wikis {
+                run_timed_stage("snapshot_finalize", Some(wiki), || {
+                    ops.finalize_snapshot(wiki, &data_dir)
+                })?;
+            }
         }
 
         Commands::PatrolFetch { wikis } => {
@@ -327,7 +370,9 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
                 run_timed_stage("patrol_fetch", Some(wiki), || {
                     ops.fetch_patrol(wiki, &data_dir)
                 })?;
-                run_timed_stage("ingest", Some(wiki), || ops.ingest_wiki(wiki, &data_dir))?;
+                run_timed_stage("ingest", Some(wiki), || {
+                    ops.ingest_wiki(wiki, Some(&version), &data_dir)
+                })?;
                 run_timed_stage("cleanup_raw", Some(wiki), || {
                     ops.cleanup_raw_dump(wiki, &data_dir)
                 })?;
@@ -567,8 +612,12 @@ mod tests {
             Ok(())
         }
 
-        fn ingest_wiki(&self, wiki: &str, data_dir: &Path) -> Result<()> {
-            self.record(format!("ingest:{wiki}:{}", data_dir.display()));
+        fn ingest_wiki(&self, wiki: &str, version: Option<&str>, data_dir: &Path) -> Result<()> {
+            self.record(format!(
+                "ingest:{wiki}:{}:{}",
+                version.unwrap_or("_"),
+                data_dir.display()
+            ));
             Ok(())
         }
 
@@ -627,6 +676,11 @@ mod tests {
             self.record(format!("merge:{}", output_dir.display()));
             Ok(())
         }
+
+        fn finalize_snapshot(&self, wiki: &str, data_dir: &Path) -> Result<()> {
+            self.record(format!("snapshot_finalize:{wiki}:{}", data_dir.display()));
+            Ok(())
+        }
     }
 
     impl Ops for FailingOps {
@@ -644,7 +698,7 @@ mod tests {
             Ok(())
         }
 
-        fn ingest_wiki(&self, _wiki: &str, _data_dir: &Path) -> Result<()> {
+        fn ingest_wiki(&self, _wiki: &str, _version: Option<&str>, _data_dir: &Path) -> Result<()> {
             if self.fail_stage == "ingest" {
                 anyhow::bail!("ingest failed");
             }
@@ -700,6 +754,13 @@ mod tests {
             }
             Ok(())
         }
+
+        fn finalize_snapshot(&self, _wiki: &str, _data_dir: &Path) -> Result<()> {
+            if self.fail_stage == "snapshot_finalize" {
+                anyhow::bail!("snapshot finalize failed");
+            }
+            Ok(())
+        }
     }
 
     #[test]
@@ -739,7 +800,41 @@ mod tests {
 
         run_with_ops(cli, &ops)?;
 
-        assert_eq!(ops.calls.into_inner(), vec!["ingest:frwiki:data"]);
+        assert_eq!(ops.calls.into_inner(), vec!["ingest:frwiki:_:data"]);
+        Ok(())
+    }
+
+    #[test]
+    fn run_with_ops_dispatches_versioned_ingest_and_snapshot_finalize() -> Result<()> {
+        init_test_tracing();
+        let ingest_cli = Cli::try_parse_from([
+            "wiki-econ",
+            "--data-dir",
+            "dataset",
+            "ingest",
+            "nlwiki",
+            "--version",
+            "2026-07",
+        ])?;
+        let finalize_cli = Cli::try_parse_from([
+            "wiki-econ",
+            "--data-dir",
+            "dataset",
+            "snapshot-finalize",
+            "nlwiki",
+        ])?;
+        let ops = RecordingOps::default();
+
+        run_with_ops(ingest_cli, &ops)?;
+        run_with_ops(finalize_cli, &ops)?;
+
+        assert_eq!(
+            ops.calls.into_inner(),
+            vec![
+                "ingest:nlwiki:2026-07:dataset",
+                "snapshot_finalize:nlwiki:dataset",
+            ]
+        );
         Ok(())
     }
 
@@ -906,7 +1001,7 @@ mod tests {
             vec![
                 "fetch:frwiki:2025-12:dataset",
                 "fetch_patrol:frwiki:dataset",
-                "ingest:frwiki:dataset",
+                "ingest:frwiki:2025-12:dataset",
                 "cleanup_raw:frwiki:dataset",
                 "compute:frwiki:dataset:results",
                 "compute_patrol:frwiki:dataset:results:false:_",
@@ -926,14 +1021,17 @@ mod tests {
         let raw_ingest_dir = data_dir.path().join("raw").join("ingestwiki");
         fs::create_dir_all(&raw_ingest_dir)?;
         write_bz2_dump(&raw_ingest_dir.join("2026-02.ingestwiki.all-time.tsv.bz2"))?;
-        ops.ingest_wiki("ingestwiki", data_dir.path())?;
-        assert!(
-            !crate::storage::collect_parquet_files(&crate::storage::analytical_wiki_dir(
-                data_dir.path(),
-                "ingestwiki"
-            ))?
-            .is_empty()
-        );
+        ops.ingest_wiki("ingestwiki", Some("2026-02"), data_dir.path())?;
+        assert!({
+            let active = crate::storage::active_analytical_wiki_dir(data_dir.path(), "ingestwiki")?;
+            !crate::storage::collect_parquet_files(&active)?.is_empty()
+        });
+        ops.finalize_snapshot("ingestwiki", data_dir.path())?;
+
+        let raw_legacy_dir = data_dir.path().join("raw").join("legacywiki");
+        fs::create_dir_all(&raw_legacy_dir)?;
+        write_bz2_dump(&raw_legacy_dir.join("legacy.tsv.bz2"))?;
+        ops.ingest_wiki("legacywiki", None, data_dir.path())?;
 
         ops.cleanup_raw_dump("ingestwiki", data_dir.path())?;
         assert!(
@@ -1228,12 +1326,28 @@ mod tests {
 
         ops.fetch_wiki("frwiki", "2026-02", data_dir)?;
         ops.fetch_patrol("frwiki", data_dir)?;
-        ops.ingest_wiki("frwiki", data_dir)?;
+        ops.ingest_wiki("frwiki", None, data_dir)?;
         ops.cleanup_raw_dump("frwiki", data_dir)?;
         ops.compute_all("frwiki", data_dir, output_dir)?;
         ops.compute_patrol("frwiki", data_dir, output_dir, false, None)?;
         ops.benchmark(&wikis, data_dir, output_dir, 0, 1, false)?;
         ops.merge_outputs(output_dir)?;
+        ops.finalize_snapshot("frwiki", data_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn run_with_ops_propagates_snapshot_finalize_errors() -> Result<()> {
+        init_test_tracing();
+        let cli = Cli::try_parse_from(["wiki-econ", "snapshot-finalize", "frwiki"])?;
+        let err = run_with_ops(
+            cli,
+            &FailingOps {
+                fail_stage: "snapshot_finalize",
+            },
+        )
+        .expect_err("snapshot finalization failure should propagate");
+        assert!(err.to_string().contains("snapshot finalize failed"));
         Ok(())
     }
 

@@ -359,7 +359,7 @@ pub fn compute_patrol(
     let patrol_path = patrol_dir.join("patrol.parquet");
     let rights_path = patrol_dir.join("rights.parquet");
     let meta_path = patrol_dir.join("autopatrol_groups.json");
-    let revision_store_dir = storage::warehouse_wiki_dir(data_dir, wiki);
+    let revision_store_dir = storage::active_warehouse_wiki_dir(data_dir, wiki)?;
 
     if !patrol_path.exists() {
         anyhow::bail!("No patrol data for {wiki}. Run `patrol-fetch` first.");

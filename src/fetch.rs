@@ -525,7 +525,7 @@ impl AttemptError {
 }
 
 /// Determine the file list for a given wiki and snapshot version.
-fn build_file_list(wiki: &str, version: &str) -> Result<Vec<String>> {
+pub(crate) fn build_file_list(wiki: &str, version: &str) -> Result<Vec<String>> {
     if MONTHLY_WIKIS.contains(&wiki) {
         anyhow::bail!(
             "Monthly-partitioned wikis (enwiki, etc.) are not yet supported. Use yearly wikis."

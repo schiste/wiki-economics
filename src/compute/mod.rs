@@ -183,7 +183,7 @@ fn analytical_select_exprs() -> Vec<Expr> {
 }
 
 fn analytical_lazyframe(wiki: &str, data_dir: &Path) -> Result<LazyFrame> {
-    let parquet_dir = storage::analytical_wiki_dir(data_dir, wiki);
+    let parquet_dir = storage::active_analytical_wiki_dir(data_dir, wiki)?;
     if !parquet_dir.exists() {
         anyhow::bail!("No parquet data for {wiki}. Run `ingest` first.");
     }
@@ -617,7 +617,7 @@ fn finalize_labor_cohorts(
 }
 
 fn compute_page_weekly_edits(wiki: &str, data_dir: &Path, output_dir: &Path) -> Result<()> {
-    let warehouse_dir = storage::warehouse_wiki_dir(data_dir, wiki);
+    let warehouse_dir = storage::active_warehouse_wiki_dir(data_dir, wiki)?;
     let partitions = storage::collect_partition_specs(&warehouse_dir)?;
     if partitions.is_empty() {
         info!(
@@ -1099,7 +1099,7 @@ pub fn write_output(df: &mut DataFrame, wiki: &str, metric: &str, output_dir: &P
 }
 
 fn compute_all_incremental(wiki: &str, data_dir: &Path, output_dir: &Path) -> Result<()> {
-    let analytical_dir = storage::analytical_wiki_dir(data_dir, wiki);
+    let analytical_dir = storage::active_analytical_wiki_dir(data_dir, wiki)?;
     let partitions = storage::collect_partition_specs(&analytical_dir)?;
     if partitions.is_empty() {
         let base = load_wiki(wiki, data_dir)?;
