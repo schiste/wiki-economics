@@ -295,15 +295,22 @@ fn run_timed_stage<T>(
     action: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
     let started = Instant::now();
+    observability::record_stage_started(stage, wiki);
     info!(stage = stage, wiki = wiki.unwrap_or("-"), "starting stage");
     let result = action();
-    if result.is_ok() {
-        info!(
-            stage = stage,
-            wiki = wiki.unwrap_or("-"),
-            elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
-            "completed stage"
-        );
+    let duration = started.elapsed();
+    let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
+    match &result {
+        Ok(_) => {
+            observability::record_stage_completed(stage, wiki, duration_ms);
+            info!(
+                stage = stage,
+                wiki = wiki.unwrap_or("-"),
+                elapsed_ms = duration.as_secs_f64() * 1_000.0,
+                "completed stage"
+            );
+        }
+        Err(error) => observability::record_stage_failed(stage, wiki, duration_ms, error),
     }
     result
 }
@@ -411,6 +418,7 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
                 fingerprint::site_is_reusable(&output_dir, &site_dir, &dist_dir)?,
                 "site stage fingerprint changed"
             );
+            observability::record_stage_reused("site", None);
             info!(path = %dist_dir.display(), "reusing deterministic site stage");
         }
 

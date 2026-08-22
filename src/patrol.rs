@@ -438,6 +438,7 @@ pub fn compute_patrol(
         info!(wiki = wiki, "no patrol months require recomputation");
         let final_path = output_dir.join(wiki).join("patrol.parquet");
         if final_path.is_file() {
+            crate::observability::record_stage_reused("patrol_compute", Some(wiki));
             info!(
                 wiki = wiki,
                 path = %final_path.display(),

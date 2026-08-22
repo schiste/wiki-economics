@@ -1258,6 +1258,7 @@ pub fn compute_all(wiki: &str, data_dir: &Path, output_dir: &Path) -> Result<()>
         algorithm_version: COMPUTE_ALGORITHM_VERSION,
     };
     if fingerprint::reusable(&receipt_path, spec, &inputs, &outputs)? {
+        crate::observability::record_stage_reused("compute", Some(wiki));
         info!(
             wiki,
             snapshot = snapshot.as_deref().unwrap_or("legacy"),

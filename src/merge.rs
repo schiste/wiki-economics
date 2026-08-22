@@ -118,6 +118,7 @@ fn merge_outputs_from_dir(
         algorithm_version: MERGE_ALGORITHM_VERSION,
     };
     if fingerprint::reusable(&receipt_path, spec, &inputs, &outputs)? {
+        crate::observability::record_stage_reused("merge", None);
         crate::publication::record_candidate(output_dir, run_id, &artifact_names)?;
         info!(
             receipt = %receipt_path.display(),

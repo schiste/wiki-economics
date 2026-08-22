@@ -450,6 +450,7 @@ fn ingest_wiki_for_snapshot(
         };
         if !outputs.is_empty() && fingerprint::outputs_reusable(&receipt_path, spec, &outputs)? {
             storage::publish_current_snapshot(data_dir, wiki, version)?;
+            crate::observability::record_stage_reused("ingest", Some(wiki));
             info!(
                 wiki,
                 snapshot_version = version,

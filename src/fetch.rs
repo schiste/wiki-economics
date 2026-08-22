@@ -1432,6 +1432,7 @@ fn fetch_wiki_with_transport<T: HttpTransport>(
         "planned snapshot fetch from strict ingest markers"
     );
     if files.is_empty() {
+        crate::observability::record_stage_reused("fetch", Some(wiki));
         record_fetch_stage(data_dir, wiki, version, &expected)?;
         return Ok(Vec::new());
     }
