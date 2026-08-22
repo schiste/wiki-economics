@@ -11,15 +11,12 @@ In national economics, **[GDP](https://en.wikipedia.org/wiki/Gross_domestic_prod
 </div>
 
 ```js
-import {queryGrouped, toPeriod, nsLabel, fmtNum, fmtBytes, createFilterBar, isDefaultView, parseDefaultsMeta, startLoading, doneLoading} from "./components/filters.js"
+import {queryGrouped, filterRows, makeRowsLoader, makeJsonLoader, toPeriod, nsLabel, fmtNum, fmtBytes, createFilterBar, isDefaultView, parseDefaultsMeta, startLoading, doneLoading} from "./components/filters.js"
 import {withExport, pageExportBar} from "./components/exports.js"
 
-const defaults = await FileAttachment("data/defaults_gdp.json").json()
-const {wikis, nsByWiki, rangeByWiki, defaultWiki, maxMonth} = parseDefaultsMeta(defaults)
-```
-
-```js
-const _preload = setTimeout(() => import("npm:@observablehq/duckdb"), 1)
+const meta = await FileAttachment("data/meta_gdp.json").json()
+const {wikis, nsByWiki, rangeByWiki, defaultWiki, maxMonth} = parseDefaultsMeta(meta)
+const loadDefaults = makeJsonLoader(FileAttachment("data/defaults_gdp.json"))
 ```
 
 <!-- ── Filters ────────────────────────────────────────────────── -->
@@ -38,43 +35,29 @@ const {wiki, userTypes, granularity, startPeriod, endPeriod, namespaces, breakdo
 <!-- ── Data processing ────────────────────────────────────────── -->
 
 ```js
-const _gdpFiles = {
+const loadGdpRows = makeRowsLoader({
   gdp: FileAttachment("data/gdp.parquet"),
   typeShare: FileAttachment("data/gdp_user_type_share.parquet"),
   tiers: FileAttachment("data/gdp_activity_tiers.parquet"),
-}
-let _gdpDbPromise = null
-function getDb() {
-  // Cache the in-flight promise, not the resolved client: several query
-  // cells call getDb() in the same reactive tick, and if we only memoized
-  // the awaited result, they'd all see a null cache and each spin up their
-  // own engine before the first one finished.
-  if (!_gdpDbPromise) {
-    _gdpDbPromise = (async () => {
-      const {DuckDBClient: DDB} = await import("npm:@observablehq/duckdb")
-      return await DDB.of(_gdpFiles)
-    })()
-  }
-  return _gdpDbPromise
-}
+})
 
-const useDefaults = isDefaultView(filters, defaults)
+const useDefaults = isDefaultView(filters, meta)
 
 startLoading(useDefaults)
 let output, byType
 try {
 if (useDefaults) {
+  const defaults = await loadDefaults()
   output = defaults.output
   byType = defaults.byType
 } else {
-  const db = await getDb()
-  const gdpRaw = await db.sql`SELECT year_month, page_namespace, user_type, gross_bytes_added, net_bytes, total_edits, productive_edits, reverted_edits, unique_editors FROM gdp WHERE wiki = ${wiki}`
-  output = await queryGrouped(db, "gdp", {
+  const {gdp: gdpRaw} = await loadGdpRows()
+  output = queryGrouped(gdpRaw, {
     sumCols: ["gross_bytes_added", "net_bytes", "total_edits", "productive_edits", "reverted_edits", "unique_editors"],
     wiki, userTypes, namespaces, startPeriod, endPeriod, granularity
   })
-  const byTypeRows = Array.from(gdpRaw)
-    .filter(d => userTypes.includes(d.user_type) && namespaces.includes(d.page_namespace)
+  const byTypeRows = gdpRaw
+    .filter(d => d.wiki === wiki && userTypes.includes(d.user_type) && namespaces.includes(d.page_namespace)
       && d.year_month >= startPeriod && d.year_month <= endPeriod)
     .map(d => ({...d, period: toPeriod(d.year_month, granularity)}))
   byType = d3.rollups(byTypeRows, v => ({
@@ -282,12 +265,12 @@ startLoading(useDefaults)
 let tiersAgg
 try {
 if (useDefaults) {
+  const defaults = await loadDefaults()
   tiersAgg = defaults.tiers.map(d => ({...d, activity_tier: d.activity_tier, editors: d.editors, total_edits: d.total_edits, gross_bytes: d.gross_bytes, net_bytes: d.net_bytes}))
 } else {
-  const db = await getDb()
-  const tiersRaw = Array.from(await db.sql`SELECT * FROM tiers WHERE wiki = ${wiki}`)
+  const {tiers: tiersRaw} = await loadGdpRows()
   const tiersFiltered = tiersRaw
-    .filter(d => userTypes.includes(d.user_type) && d.year_month >= startPeriod && d.year_month <= endPeriod)
+    .filter(d => d.wiki === wiki && userTypes.includes(d.user_type) && d.year_month >= startPeriod && d.year_month <= endPeriod)
     .map(d => ({...d, period: toPeriod(d.year_month, granularity)}))
   tiersAgg = d3.rollups(tiersFiltered, v => ({
       editors: d3.sum(v, d => d.editors),
@@ -381,6 +364,7 @@ let shareAgg
 try {
 if (useDefaults) {
   // Compute shares from pre-aggregated type share data
+  const defaults = await loadDefaults()
   const shareGrouped = d3.rollups(defaults.typeShare, v => d3.sum(v, d => d.edits), d => d.period, d => d.user_type)
   shareAgg = shareGrouped
     .flatMap(([period, types]) => {
@@ -389,10 +373,9 @@ if (useDefaults) {
     })
     .sort((a, b) => d3.ascending(a.period, b.period))
 } else {
-  const db = await getDb()
-  const shareRaw = await db.sql`SELECT * FROM typeShare WHERE wiki = ${wiki}`
-  const shareData = Array.from(shareRaw)
-    .filter(d => d.year_month >= startPeriod && d.year_month <= endPeriod)
+  const {typeShare: shareRaw} = await loadGdpRows()
+  const shareData = shareRaw
+    .filter(d => d.wiki === wiki && d.year_month >= startPeriod && d.year_month <= endPeriod)
     .map(d => ({...d, period: toPeriod(d.year_month, granularity)}))
   shareAgg = d3.rollups(shareData, v => d3.sum(v, d => d.edits), d => d.period, d => d.user_type)
     .flatMap(([period, types]) => {
@@ -445,15 +428,15 @@ let sectorAgg
 try {
 if (useDefaults) {
   // Default view has only ns 0, so sectoral is just one sector
+  const defaults = await loadDefaults()
   sectorAgg = defaults.byNamespace.map(d => ({
     period: d.period, ns_label: nsLabel(d.page_namespace),
     edits: d.edits, gross_bytes: d.gross_bytes, net_bytes: d.net_bytes
   }))
 } else {
-  const db = await getDb()
-  const gdpRaw = await db.sql`SELECT year_month, page_namespace, user_type, gross_bytes_added, net_bytes, total_edits FROM gdp WHERE wiki = ${wiki}`
-  const sectorRows = Array.from(gdpRaw)
-    .filter(d => userTypes.includes(d.user_type) && namespaces.includes(d.page_namespace)
+  const {gdp: gdpRaw} = await loadGdpRows()
+  const sectorRows = gdpRaw
+    .filter(d => d.wiki === wiki && userTypes.includes(d.user_type) && namespaces.includes(d.page_namespace)
       && d.year_month >= startPeriod && d.year_month <= endPeriod)
     .map(d => ({...d, period: toPeriod(d.year_month, granularity), ns_label: nsLabel(d.page_namespace)}))
   sectorAgg = d3.rollups(sectorRows, v => ({

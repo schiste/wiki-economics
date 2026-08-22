@@ -9,15 +9,12 @@ How evenly are edits distributed among Wikipedia editors? This page tracks four 
 </p>
 
 ```js
-import {queryGrouped, fmtNum, createFilterBar, isDefaultView, parseDefaultsMeta, startLoading, doneLoading} from "./components/filters.js"
+import {queryGrouped, makeRowsLoader, makeJsonLoader, fmtNum, createFilterBar, isDefaultView, parseDefaultsMeta, startLoading, doneLoading} from "./components/filters.js"
 import {withExport, pageExportBar} from "./components/exports.js"
 
-const defaults = await FileAttachment("data/defaults_inequality.json").json()
-const {wikis, rangeByWiki, defaultWiki, maxMonth} = parseDefaultsMeta(defaults)
-```
-
-```js
-const _preload = setTimeout(() => import("npm:@observablehq/duckdb"), 1)
+const meta = await FileAttachment("data/meta_inequality.json").json()
+const {wikis, rangeByWiki, defaultWiki, maxMonth} = parseDefaultsMeta(meta)
+const loadDefaults = makeJsonLoader(FileAttachment("data/defaults_inequality.json"))
 ```
 
 <!-- ── Sticky filter bar ─────────────────────────────────── -->
@@ -33,16 +30,18 @@ const {wiki, userTypes, granularity, startPeriod, endPeriod} = filters
 <!-- ── Data pipeline ─────────────────────────────────────── -->
 
 ```js
-const useDefaults = isDefaultView(filters, defaults, {defaultNamespaces: null})
+const loadIneqRows = makeRowsLoader({inequality: FileAttachment("data/inequality.parquet")})
+
+const useDefaults = isDefaultView(filters, meta, {defaultNamespaces: null})
 startLoading(useDefaults)
 let ineqData
 try {
 if (useDefaults) {
+  const defaults = await loadDefaults()
   ineqData = defaults.data
 } else {
-  const {DuckDBClient: DDB} = await import("npm:@observablehq/duckdb")
-  const db = await DDB.of({inequality: FileAttachment("data/inequality.parquet")})
-  ineqData = await queryGrouped(db, "inequality", {
+  const {inequality} = await loadIneqRows()
+  ineqData = queryGrouped(inequality, {
     sumCols: ["total_editors", "total_edits", "min_editors_50pct"],
     avgCols: ["gini", "theil", "palma"],
     wiki, userTypes, namespaces: null, startPeriod, endPeriod, granularity

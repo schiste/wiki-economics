@@ -47,36 +47,103 @@ export function nsLabel(n) {
 }
 
 /**
- * Filter rows by user types, namespaces, and period range, then add a `period` key.
- * If namespaces is null/undefined, skip namespace filtering (for data without page_namespace).
+ * Convert an Arrow row to a plain object, coercing BigInt fields (Arrow's
+ * representation of Parquet INT64 columns) to Number — toJSON() alone
+ * leaves them as BigInt, which throws when summed against a Number
+ * accumulator in aggregateByPeriod.
  */
-export function filterRows(rows, {userTypes, namespaces, startPeriod, endPeriod, granularity}) {
-  return Array.from(rows)
+function arrowRowToObject(row) {
+  const obj = row.toJSON();
+  for (const key in obj) {
+    if (typeof obj[key] === "bigint") obj[key] = Number(obj[key]);
+  }
+  return obj;
+}
+
+/**
+ * Lazily load a set of Parquet FileAttachments into arrays of plain row objects.
+ * Returns a function that, when called, resolves to {key: rows[], ...}.
+ *
+ * Caches the in-flight promise, not the resolved value: several query cells
+ * can call the returned loader in the same reactive tick, and if we only
+ * memoized the awaited result, they'd all see a null cache and each decode
+ * their own copy of the Parquet files before the first one finished.
+ */
+export function makeRowsLoader(files) {
+  let promise = null;
+  return function loadRows() {
+    if (!promise) {
+      promise = (async () => {
+        const entries = await Promise.all(
+          Object.entries(files).map(async ([key, file]) => {
+            const table = await file.parquet();
+            return [key, Array.from(table, arrowRowToObject)];
+          })
+        );
+        return Object.fromEntries(entries);
+      })();
+    }
+    return promise;
+  };
+}
+
+/**
+ * Lazily load a single JSON FileAttachment, memoizing the in-flight promise
+ * so multiple cells that need it in the same tick share one fetch.
+ */
+export function makeJsonLoader(file) {
+  let promise = null;
+  return function loadJson() {
+    if (!promise) promise = file.json();
+    return promise;
+  };
+}
+
+/**
+ * Filter rows by wiki, user types, namespaces, and period range, then add a
+ * `period` key. A null/empty userTypes or namespaces skips that filter
+ * (shows everything); wiki is always matched exactly when provided.
+ */
+export function filterRows(rows, {wiki, userTypes, namespaces, startPeriod, endPeriod, granularity}) {
+  return rows
     .filter(d =>
-      userTypes.includes(d.user_type) &&
+      (wiki == null || d.wiki === wiki) &&
+      (!userTypes?.length || userTypes.includes(d.user_type)) &&
       d.year_month >= startPeriod &&
       d.year_month <= endPeriod &&
-      (namespaces == null || namespaces.includes(d.page_namespace))
+      (!namespaces?.length || namespaces.includes(d.page_namespace))
     )
     .map(d => ({...d, period: toPeriod(d.year_month, granularity)}));
 }
 
 /**
- * Aggregate filtered rows by period, summing the given numeric columns.
+ * Aggregate filtered rows by period: SUM the given sumCols, AVG the given
+ * avgCols (skipping nulls in the average, matching SQL AVG semantics).
  */
-export function aggregateByPeriod(rows, sumCols) {
+export function aggregateByPeriod(rows, {sumCols = [], avgCols = []} = {}) {
   const map = new Map();
   for (const row of rows) {
     const key = row.period;
     if (!map.has(key)) {
       const entry = {period: key};
       for (const c of sumCols) entry[c] = 0;
+      for (const c of avgCols) entry[c] = {sum: 0, count: 0};
       map.set(key, entry);
     }
     const entry = map.get(key);
     for (const c of sumCols) entry[c] += (row[c] ?? 0);
+    for (const c of avgCols) {
+      if (row[c] != null) {
+        entry[c].sum += row[c];
+        entry[c].count += 1;
+      }
+    }
   }
-  return Array.from(map.values()).sort((a, b) => a.period < b.period ? -1 : 1);
+  const result = Array.from(map.values()).sort((a, b) => a.period < b.period ? -1 : 1);
+  for (const entry of result) {
+    for (const c of avgCols) entry[c] = entry[c].count > 0 ? entry[c].sum / entry[c].count : null;
+  }
+  return result;
 }
 
 /**
@@ -102,9 +169,9 @@ export function fmtNum(n) {
  * loading indicator stuck until the tab regains visibility.
  *
  * The progress bar's stage reflects the actual code path a caller is about
- * to take (`useDefaults`), not a fake timer: the "engine" stage only shows
- * when a cell is really about to cold-start DuckDB-WASM, which is the one
- * step (~8s) that dominates load time on the slow path.
+ * to take (`useDefaults`), not a fake timer: "start" for precomputed
+ * defaults (fast), "query" when a cell instead has to decode the full
+ * Parquet dataset and aggregate it in-browser.
  */
 let _loadingCount = 0;
 let _loadingTimer = 0;
@@ -112,7 +179,7 @@ let _progressEls = null;
 
 const STAGES = {
   start: {pct: 15, text: "Loading…", trickle: false},
-  engine: {pct: 40, text: "Initializing query engine (first load, ~8s)…", trickle: true},
+  query: {pct: 40, text: "Loading data…", trickle: true},
   done: {pct: 100, text: "", trickle: false},
 };
 
@@ -141,13 +208,13 @@ function setStage(stage) {
 
 /**
  * @param {boolean} useDefaults - whether this load will use precomputed
- *   defaults (fast) or run a live DuckDB query (slow, cold-starts the engine).
+ *   defaults (fast) or run a live in-browser query over Parquet data (slower).
  */
 export function startLoading(useDefaults = true) {
   _loadingCount++;
   clearTimeout(_loadingTimer);
   document.body.classList.add("wk-loading");
-  setStage(useDefaults ? "start" : "engine");
+  setStage(useDefaults ? "start" : "query");
 }
 
 export function doneLoading() {
@@ -304,54 +371,28 @@ export function describeFilters({wiki, userTypes, granularity, startPeriod, endP
 }
 
 /**
- * Execute a grouped aggregation query entirely in DuckDB SQL.
- * Replaces the SELECT * → filterRows() → aggregateByPeriod() pattern.
- * Pushes all filtering, period grouping, and aggregation into SQL so DuckDB
- * can leverage column pruning on parquet (reads only needed column chunks)
- * and avoids serializing raw rows to the JS main thread.
+ * Grouped aggregation over an array of already-loaded rows: filters by wiki,
+ * user types, namespaces, and period range (see filterRows), buckets by
+ * period at the requested granularity, and sums/averages the given columns.
  *
- * @param {DuckDBClient} db
- * @param {string} table - Table name (must match DuckDBClient.of key)
+ * @param {object[]} rows - Plain row objects (e.g. from makeRowsLoader)
  * @param {Object} opts
  * @param {string[]} [opts.sumCols] - Columns to SUM
  * @param {string[]} [opts.avgCols] - Columns to AVG (e.g. gini, theil)
  * @param {string} opts.wiki
  * @param {string[]} opts.userTypes
- * @param {number[]|null} opts.namespaces - null to skip namespace filter
+ * @param {number[]|null} opts.namespaces - null/empty to skip namespace filter
  * @param {string} opts.startPeriod
  * @param {string} opts.endPeriod
  * @param {string} opts.granularity - "month" | "quarter" | "year"
  */
-export async function queryGrouped(db, table, {
+export function queryGrouped(rows, {
   sumCols = [],
   avgCols = [],
   wiki, userTypes, namespaces, startPeriod, endPeriod, granularity
 }) {
-  const periodExpr = granularity === "year" ? "LEFT(year_month, 4)"
-    : granularity === "quarter"
-      ? "LEFT(year_month, 4) || '-Q' || CAST(CEIL(CAST(SUBSTRING(year_month, 6, 2) AS INTEGER) / 3.0) AS INTEGER)"
-    : "year_month"
-
-  const selects = [`${periodExpr} as period`]
-  for (const c of sumCols) selects.push(`CAST(SUM("${c}") AS DOUBLE) as "${c}"`)
-  for (const c of avgCols) selects.push(`CAST(AVG("${c}") AS DOUBLE) as "${c}"`)
-
-  // SQL is built by string interpolation deliberately. This runs against an
-  // in-browser DuckDB-WASM database loaded from the user's own session — the
-  // sandbox boundary is the user's tab, not a shared backend. If you ever
-  // copy this pattern into a server-side context (Node admin, edge worker,
-  // anywhere a value can travel between users), replace the interpolation
-  // with parameterized queries first; the inputs here are not validated.
-  const conditions = [`wiki = '${wiki}'`]
-  if (userTypes?.length)
-    conditions.push(`user_type IN (${userTypes.map(t => `'${t}'`).join(",")})`)
-  if (namespaces?.length)
-    conditions.push(`page_namespace IN (${namespaces.join(",")})`)
-  conditions.push(`year_month >= '${startPeriod}'`)
-  conditions.push(`year_month <= '${endPeriod}'`)
-
-  const sql = `SELECT ${selects.join(", ")} FROM "${table}" WHERE ${conditions.join(" AND ")} GROUP BY 1 ORDER BY 1`
-  return Array.from(await db.query(sql))
+  const filtered = filterRows(rows, {wiki, userTypes, namespaces, startPeriod, endPeriod, granularity});
+  return aggregateByPeriod(filtered, {sumCols, avgCols});
 }
 
 /**
@@ -594,8 +635,8 @@ export function createFilterBar({
 
   // Forward sub-input events to compound dispatch. The From/To fields are
   // free-text typing (not a click), so each keystroke would otherwise trigger
-  // a full re-query (a live DuckDB query on the slow path) until the value
-  // settles — debounce those two so only the pause-after-typing fires.
+  // a full re-query (a live in-browser aggregation on the slow path) until
+  // the value settles — debounce those two so only the pause-after-typing fires.
   for (const el of [userTypesInput, granularityInput].filter(Boolean)) {
     el.addEventListener("input", dispatch);
   }

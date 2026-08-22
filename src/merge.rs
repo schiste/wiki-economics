@@ -215,6 +215,11 @@ where
         "defaults_inequality.json.cjs",
         "defaults_labor.json.cjs",
         "defaults_patrol.json.cjs",
+        "meta_business.json.cjs",
+        "meta_gdp.json.cjs",
+        "meta_inequality.json.cjs",
+        "meta_labor.json.cjs",
+        "meta_patrol.json.cjs",
         "manifest.json.sh",
     ] {
         let script_path = generator_dir.join(script_name);

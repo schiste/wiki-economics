@@ -11,15 +11,12 @@ Wikipedia as a **[Knowledge-as-a-Service](https://en.wikipedia.org/wiki/As_a_ser
 </div>
 
 ```js
-import {queryGrouped, toPeriod, fmtNum, fmtBytes, createFilterBar, isDefaultView, parseDefaultsMeta, startLoading, doneLoading} from "./components/filters.js"
+import {queryGrouped, filterRows, makeRowsLoader, makeJsonLoader, toPeriod, fmtNum, fmtBytes, createFilterBar, isDefaultView, parseDefaultsMeta, startLoading, doneLoading} from "./components/filters.js"
 import {withExport, pageExportBar} from "./components/exports.js"
 
-const defaults = await FileAttachment("data/defaults_business.json").json()
-const {wikis, nsByWiki, rangeByWiki, defaultWiki, maxMonth} = parseDefaultsMeta(defaults)
-```
-
-```js
-const _preload = setTimeout(() => import("npm:@observablehq/duckdb"), 1)
+const meta = await FileAttachment("data/meta_business.json").json()
+const {wikis, nsByWiki, rangeByWiki, defaultWiki, maxMonth} = parseDefaultsMeta(meta)
+const loadDefaults = makeJsonLoader(FileAttachment("data/defaults_business.json"))
 ```
 
 ```js
@@ -31,30 +28,16 @@ const {wiki, userTypes, granularity, startPeriod, endPeriod, namespaces} = filte
 ```
 
 ```js
-const _bizFiles = {
+const loadBizRows = makeRowsLoader({
   labor: FileAttachment("data/labor_monthly.parquet"),
   churn: FileAttachment("data/labor_churn.parquet"),
   cohorts: FileAttachment("data/labor_cohorts.parquet"),
   gdp: FileAttachment("data/gdp.parquet"),
   tiers: FileAttachment("data/gdp_activity_tiers.parquet"),
   funnel: FileAttachment("data/business_funnel.parquet"),
-}
-let _bizDbPromise = null
-function getDb() {
-  // Cache the in-flight promise, not the resolved client: several query
-  // cells call getDb() in the same reactive tick, and if we only memoized
-  // the awaited result, they'd all see a null cache and each spin up their
-  // own engine before the first one finished.
-  if (!_bizDbPromise) {
-    _bizDbPromise = (async () => {
-      const {DuckDBClient: DDB} = await import("npm:@observablehq/duckdb")
-      return await DDB.of(_bizFiles)
-    })()
-  }
-  return _bizDbPromise
-}
+})
 
-const useDefaults = isDefaultView(filters, defaults)
+const useDefaults = isDefaultView(filters, meta)
 ```
 
 <!-- ── Data pipelines ─────────────────────────────────── -->
@@ -67,10 +50,11 @@ const endP = toPeriod(endPeriod, granularity)
 let churnData
 try {
 if (useDefaults) {
+  const defaults = await loadDefaults()
   churnData = defaults.churn
 } else {
-  const churnRaw = Array.from(await (await getDb()).sql`SELECT period, period_type, active_editors, arrivals, departures, arrival_rate, departure_rate FROM churn WHERE wiki = ${wiki}`)
-  churnData = churnRaw.filter(d => d.period_type === granularity && d.period >= startP && d.period <= endP)
+  const {churn: churnRaw} = await loadBizRows()
+  churnData = churnRaw.filter(d => d.wiki === wiki && d.period_type === granularity && d.period >= startP && d.period <= endP)
 }
 } finally {
   doneLoading()
@@ -83,11 +67,12 @@ startLoading(useDefaults)
 let tierAgg
 try {
 if (useDefaults) {
+  const defaults = await loadDefaults()
   tierAgg = defaults.tiers
 } else {
-  const tiersRaw = Array.from(await (await getDb()).sql`SELECT year_month, user_type, activity_tier, editors, total_edits, gross_bytes, net_bytes FROM tiers WHERE wiki = ${wiki}`)
+  const {tiers: tiersRaw} = await loadBizRows()
   const tierFiltered = tiersRaw
-    .filter(d => userTypes.includes(d.user_type) && d.year_month >= startPeriod && d.year_month <= endPeriod)
+    .filter(d => d.wiki === wiki && userTypes.includes(d.user_type) && d.year_month >= startPeriod && d.year_month <= endPeriod)
     .map(d => ({...d, period: toPeriod(d.year_month, granularity)}))
   tierAgg = d3.rollups(tierFiltered, v => ({
     editors: d3.sum(v, d => d.editors),
@@ -111,13 +96,15 @@ startLoading(useDefaults)
 let survivalByPeriod, gdpRaw
 try {
 if (useDefaults) {
+  const defaults = await loadDefaults()
   survivalByPeriod = defaults.survival.map(d => ({
     ...d,
     survival_rate: d.total_edits > 0 ? (d.total_edits - d.reverted_edits) / d.total_edits : 0
   }))
   gdpRaw = null
 } else {
-  gdpRaw = Array.from(await (await getDb()).sql`SELECT year_month, page_namespace, user_type, net_bytes, total_edits, reverted_edits, unique_editors FROM gdp WHERE wiki = ${wiki}`)
+  const {gdp} = await loadBizRows()
+  gdpRaw = gdp.filter(d => d.wiki === wiki)
   const gdpFiltered = gdpRaw
     .filter(d => userTypes.includes(d.user_type) && namespaces.includes(d.page_namespace) && d.year_month >= startPeriod && d.year_month <= endPeriod)
     .map(d => ({...d, period: toPeriod(d.year_month, granularity)}))
@@ -144,6 +131,7 @@ let eqByPeriod
 try {
 if (useDefaults) {
   // defaults.equilibrium has per-period per-namespace aggregates
+  const defaults = await loadDefaults()
   const eqGrouped = d3.rollups(defaults.equilibrium, v => {
     const talkEdits = d3.sum(v.filter(d => talkNs.includes(d.page_namespace)), d => d.total_edits)
     const contentReverts = d3.sum(v.filter(d => contentNs.includes(d.page_namespace)), d => d.reverted_edits)
@@ -177,13 +165,17 @@ startLoading(useDefaults)
 let cohortData, yearlyBytesPerEditor
 try {
 if (useDefaults) {
+  const defaults = await loadDefaults()
   cohortData = defaults.cohorts
   yearlyBytesPerEditor = defaults.yearlyBytesPerEditor.map(d => ({
     year: d.year,
     bytesPerEditor: d.unique_editors > 0 ? d.net_bytes / d.unique_editors : 0
   }))
 } else {
-  cohortData = Array.from(await (await getDb()).sql`SELECT * FROM cohorts WHERE wiki = ${wiki} ORDER BY cohort_year, year`)
+  const {cohorts} = await loadBizRows()
+  cohortData = cohorts
+    .filter(d => d.wiki === wiki)
+    .sort((a, b) => d3.ascending(a.cohort_year, b.cohort_year) || d3.ascending(a.year, b.year))
   yearlyBytesPerEditor = d3.rollups(
     gdpRaw.filter(d => userTypes.includes(d.user_type) && d.page_namespace === 0),
     v => {
@@ -322,15 +314,20 @@ Each period, every editor matching the selected user types is placed into one bu
 startLoading(useDefaults)
 let funnelData
 try {
-  funnelData = useDefaults
-    ? defaults.funnel
-    : Array.from(await (await getDb()).sql`SELECT * FROM funnel WHERE wiki = ${wiki}`)
-    .map(d => ({
-      ...d,
-      pct_5: d.cohort_size > 0 ? d.reached_5 / d.cohort_size : 0,
-      pct_25: d.cohort_size > 0 ? d.reached_25 / d.cohort_size : 0,
-      pct_100: d.cohort_size > 0 ? d.reached_100 / d.cohort_size : 0,
-    }))
+  if (useDefaults) {
+    const defaults = await loadDefaults()
+    funnelData = defaults.funnel
+  } else {
+    const {funnel} = await loadBizRows()
+    funnelData = funnel
+      .filter(d => d.wiki === wiki)
+      .map(d => ({
+        ...d,
+        pct_5: d.cohort_size > 0 ? d.reached_5 / d.cohort_size : 0,
+        pct_25: d.cohort_size > 0 ? d.reached_25 / d.cohort_size : 0,
+        pct_100: d.cohort_size > 0 ? d.reached_100 / d.cohort_size : 0,
+      }))
+  }
 } finally {
   doneLoading()
 }

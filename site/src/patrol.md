@@ -17,15 +17,12 @@ Patrol metrics on this page are currently **informative and under active work**.
 </div>
 
 ```js
-import {queryGrouped, fmtNum, createFilterBar, isDefaultView, parseDefaultsMeta, startLoading, doneLoading} from "./components/filters.js"
+import {queryGrouped, makeRowsLoader, makeJsonLoader, fmtNum, createFilterBar, isDefaultView, parseDefaultsMeta, startLoading, doneLoading} from "./components/filters.js"
 import {withExport, pageExportBar} from "./components/exports.js"
 
-const defaults = await FileAttachment("data/defaults_patrol.json").json()
-const {wikis, nsByWiki, rangeByWiki, defaultWiki, maxMonth} = parseDefaultsMeta(defaults)
-```
-
-```js
-const _preload = setTimeout(() => import("npm:@observablehq/duckdb"), 1)
+const meta = await FileAttachment("data/meta_patrol.json").json()
+const {wikis, nsByWiki, rangeByWiki, defaultWiki, maxMonth} = parseDefaultsMeta(meta)
+const loadDefaults = makeJsonLoader(FileAttachment("data/defaults_patrol.json"))
 ```
 
 ```js
@@ -37,18 +34,18 @@ const {wiki, userTypes, granularity, startPeriod, endPeriod, namespaces} = filte
 ```
 
 ```js
-const useDefaults = isDefaultView(filters, defaults)
+const loadPatrolRows = makeRowsLoader({patrol: FileAttachment("data/patrol.parquet")})
+
+const useDefaults = isDefaultView(filters, meta)
 startLoading(useDefaults)
 let data
 try {
 if (useDefaults) {
+  const defaults = await loadDefaults()
   data = defaults.patrol
 } else {
-  const {DuckDBClient: DDB} = await import("npm:@observablehq/duckdb")
-  const db = await DDB.of({
-    patrol: FileAttachment("data/patrol.parquet"),
-  })
-  data = await queryGrouped(db, "patrol", {
+  const {patrol} = await loadPatrolRows()
+  data = queryGrouped(patrol, {
     sumCols: ["total_patrols", "unique_patrollers", "patrol_new_pages", "patrol_diffs",
               "patrolled_revisions", "autopatrolled_revisions", "total_revisions", "min_patrollers_50pct"],
     avgCols: ["median_latency_hours", "p90_latency_hours", "patrol_coverage_pct", "adjusted_coverage_pct", "top1_pct"],

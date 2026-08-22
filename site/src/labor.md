@@ -14,15 +14,12 @@ whose size and composition shift over time. This page tracks active editors, the
 </div>
 
 ```js
-import {queryGrouped, toPeriod, fmtNum, fmtBytes, createFilterBar, isDefaultView, parseDefaultsMeta, startLoading, doneLoading} from "./components/filters.js"
+import {queryGrouped, filterRows, makeRowsLoader, makeJsonLoader, toPeriod, fmtNum, fmtBytes, createFilterBar, isDefaultView, parseDefaultsMeta, startLoading, doneLoading} from "./components/filters.js"
 import {withExport, pageExportBar} from "./components/exports.js"
 
-const defaults = await FileAttachment("data/defaults_labor.json").json()
-const {wikis, nsByWiki, rangeByWiki, defaultWiki, maxMonth} = parseDefaultsMeta(defaults)
-```
-
-```js
-const _preload = setTimeout(() => import("npm:@observablehq/duckdb"), 1)
+const meta = await FileAttachment("data/meta_labor.json").json()
+const {wikis, nsByWiki, rangeByWiki, defaultWiki, maxMonth} = parseDefaultsMeta(meta)
+const loadDefaults = makeJsonLoader(FileAttachment("data/defaults_labor.json"))
 ```
 
 ```js
@@ -34,27 +31,13 @@ const {wiki, userTypes, granularity, startPeriod, endPeriod, namespaces} = filte
 ```
 
 ```js
-const _laborFiles = {
+const loadLaborRows = makeRowsLoader({
   labor: FileAttachment("data/labor_monthly.parquet"),
   cohorts: FileAttachment("data/labor_cohorts.parquet"),
   churn: FileAttachment("data/labor_churn.parquet"),
-}
-let _laborDbPromise = null
-function getDb() {
-  // Cache the in-flight promise, not the resolved client: several query
-  // cells call getDb() in the same reactive tick, and if we only memoized
-  // the awaited result, they'd all see a null cache and each spin up their
-  // own engine before the first one finished.
-  if (!_laborDbPromise) {
-    _laborDbPromise = (async () => {
-      const {DuckDBClient: DDB} = await import("npm:@observablehq/duckdb")
-      return await DDB.of(_laborFiles)
-    })()
-  }
-  return _laborDbPromise
-}
+})
 
-const useDefaults = isDefaultView(filters, defaults)
+const useDefaults = isDefaultView(filters, meta)
 const startP = toPeriod(startPeriod, granularity)
 const endP = toPeriod(endPeriod, granularity)
 
@@ -62,16 +45,16 @@ startLoading(useDefaults)
 let workforce, churnData
 try {
 if (useDefaults) {
+  const defaults = await loadDefaults()
   workforce = defaults.workforce
   churnData = defaults.churn
 } else {
-  const db = await getDb()
-  workforce = await queryGrouped(db, "labor", {
+  const {labor: laborRaw, churn: churnRaw} = await loadLaborRows()
+  workforce = queryGrouped(laborRaw, {
     sumCols: ["unique_editors", "total_edits", "net_bytes", "reverted_edits"],
     wiki, userTypes, namespaces, startPeriod, endPeriod, granularity
   })
-  const churnRaw = Array.from(await db.sql`SELECT * FROM churn WHERE wiki = ${wiki}`)
-  churnData = churnRaw.filter(d => d.period_type === granularity && d.period >= startP && d.period <= endP)
+  churnData = churnRaw.filter(d => d.wiki === wiki && d.period_type === granularity && d.period >= startP && d.period <= endP)
 }
 } finally {
   doneLoading()
@@ -165,12 +148,12 @@ startLoading(useDefaults)
 let typeAgg
 try {
 if (useDefaults) {
+  const defaults = await loadDefaults()
   typeAgg = defaults.byType
 } else {
-  const db = await getDb()
-  const laborRaw = await db.sql`SELECT year_month, user_type, page_namespace, unique_editors FROM labor WHERE wiki = ${wiki}`
-  const byType = Array.from(laborRaw)
-    .filter(d => d.year_month >= startPeriod && d.year_month <= endPeriod && namespaces.includes(d.page_namespace))
+  const {labor: laborRaw} = await loadLaborRows()
+  const byType = laborRaw
+    .filter(d => d.wiki === wiki && d.year_month >= startPeriod && d.year_month <= endPeriod && namespaces.includes(d.page_namespace))
     .map(d => ({...d, period: toPeriod(d.year_month, granularity)}))
   typeAgg = d3.rollups(byType, v => d3.sum(v, d => d.unique_editors), d => d.period, d => d.user_type)
     .flatMap(([period, types]) => types.map(([user_type, editors]) => ({period, user_type, editors})))
@@ -267,10 +250,13 @@ startLoading(useDefaults)
 let cohortData
 try {
 if (useDefaults) {
+  const defaults = await loadDefaults()
   cohortData = defaults.cohorts
 } else {
-  const db = await getDb()
-  cohortData = Array.from(await db.sql`SELECT * FROM cohorts WHERE wiki = ${wiki} ORDER BY cohort_year, year`)
+  const {cohorts} = await loadLaborRows()
+  cohortData = cohorts
+    .filter(d => d.wiki === wiki)
+    .sort((a, b) => d3.ascending(a.cohort_year, b.cohort_year) || d3.ascending(a.year, b.year))
 }
 } finally {
   doneLoading()
