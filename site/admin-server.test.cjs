@@ -28,7 +28,11 @@ const HOSTED_ENV = {
   WIKI_ECON_ADMIN_SECURE_COOKIES: "0",
 };
 
-function loadAdminServer(envOverrides, wikiLifecycle = { schema_version: 1, wikis: {} }) {
+function loadAdminServer(envOverrides, wikiLifecycle = {
+  schema_version: 1,
+  publication_contract: { datasets: {} },
+  wikis: {},
+}) {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-admin-test-"));
   const dataDir = path.join(tempRoot, "data");
   const outputDir = path.join(tempRoot, "output");
@@ -315,6 +319,7 @@ test("status distinguishes scheduled refresh wikis from paused published wikis",
     WIKI_ECON_ENABLED_WIKIS: "nlwiki",
   }, {
     schema_version: 1,
+    publication_contract: { datasets: {} },
     wikis: {
       frwiki: {
         publication: "published",
