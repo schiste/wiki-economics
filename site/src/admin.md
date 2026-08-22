@@ -342,6 +342,9 @@ const job = jobStatus
 const auth = authState
 const currentManifest = liveManifest || initialManifest || {generated_at: "unknown", wikis: {}, merged: []}
 const currentWikis = currentManifest.wikis || {}
+const lifecycleStates = job?.wikiStates || currentManifest.lifecycle?.wikis || {}
+const refreshWikis = job?.refreshWikis || Object.entries(lifecycleStates).filter(([, state]) => state.refresh === "scheduled").map(([wiki]) => wiki)
+const publishedWikis = job?.publishedWikis || Object.entries(lifecycleStates).filter(([, state]) => state.publication === "published").map(([wiki]) => wiki)
 const wikiJobMap = job?.wikiJobs || {}
 const globalJob = job?.globalJob || null
 const supportedWikis = Array.from(new Set(job?.supportedWikis || [])).sort((a, b) => a.localeCompare(b))
@@ -412,9 +415,9 @@ display(html`<div class="admin-control-strip">
     <span class="admin-control-label">Runner</span>
     <strong>${job?.runner?.mode === "bin" ? "Compiled binary" : "cargo run"}</strong>
   </div>
-  <div class="admin-control-chip" title="Wikis on the automated Toolforge refresh schedule; all other tracked wikis are manual-only">
-    <span class="admin-control-label">Automated wikis</span>
-    <strong>${(job?.enabledWikis || []).length ? job.enabledWikis.join(", ") : "None"}</strong>
+  <div class="admin-control-chip" title="Publication and refresh scheduling are independent lifecycle states">
+    <span class="admin-control-label">Scheduled / published</span>
+    <strong>${refreshWikis.length} / ${publishedWikis.length}</strong>
   </div>
 </div>`)
 ```
@@ -727,6 +730,8 @@ display(html`<div class="admin-pipeline-board">
           const statusKey = isRunning ? "running" : w.status
           const runningProgress = isRunning ? inlineRunningJob.progress : null
           const rowJob = isRunning ? inlineRunningJob : wikiJobMap[name] || null
+          const lifecycle = lifecycleStates[name] || null
+          const lifecycleColor = lifecycle?.refresh === "scheduled" ? "#2e7d32" : lifecycle?.refresh === "paused" ? "#795548" : "#546e7a"
           return html`<article class="pipeline-card status-${statusKey} ${isRunning ? "running" : ""}">
             <div class="pipeline-card-top">
               <div class="pipeline-card-title">
@@ -734,6 +739,9 @@ display(html`<div class="admin-pipeline-board">
                   <strong>${name}</strong>
                   ${!w.tracked ? html`<span class="pipeline-ghost-badge">Not tracked yet</span>` : ""}
                   <span class="admin-badge" style="background:${statusColors[statusKey]}">${statusLabels[statusKey]}</span>
+                  ${lifecycle ? html`<span class="admin-badge" style=${`background:${lifecycleColor}`}>${lifecycle.refresh}</span>` : ""}
+                  ${lifecycle?.imported_cutoff ? html`<span class="pipeline-inline-meta">historical cutoff <code>${lifecycle.imported_cutoff}</code></span>` : ""}
+                  ${lifecycle?.freshness && lifecycle.refresh === "scheduled" ? html`<span class="pipeline-inline-meta">freshness ${lifecycle.freshness}</span>` : ""}
                   ${w.raw.version ? html`<span class="pipeline-inline-meta">dump <code>${w.raw.version}</code></span>` : ""}
                   ${w.raw.size && w.raw.size !== "0" ? html`<span class="pipeline-inline-meta">raw ${w.raw.size}</span>` : ""}
                   ${w.parquet.size && w.parquet.size !== "0 B" ? html`<span class="pipeline-inline-meta">parquet ${w.parquet.size}</span>` : ""}
