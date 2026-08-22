@@ -1650,5 +1650,13 @@ fn compute_patrol_reports_missing_inputs_and_executes_rebuild_lookup_and_no_pend
         after, before,
         "a no-op patrol refresh must preserve all published artifacts"
     );
+
+    fs::remove_file(&wiki_output)?;
+    fs::remove_file(&dashboard_output)?;
+    fs::remove_file(&defaults_output)?;
+    compute_patrol("testwiki", &data_dir, &output_dir, false, None)?;
+    assert!(wiki_output.exists());
+    assert!(dashboard_output.exists());
+    assert!(defaults_output.exists());
     Ok(())
 }
