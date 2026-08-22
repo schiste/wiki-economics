@@ -264,22 +264,47 @@ fn receipt_fingerprint(receipt: &StageReceipt) -> Result<String> {
 
 fn paths_match(records: &[ArtifactIdentity], paths: &[TrackedPath]) -> Result<bool> {
     if records.len() != paths.len() {
+        info!(
+            expected = records.len(),
+            observed = paths.len(),
+            "stage artifact count changed"
+        );
         return Ok(false);
     }
     let mut sorted = paths.to_vec();
     sorted.sort_by(|left, right| left.identity.cmp(&right.identity));
     for (record, path) in records.iter().zip(sorted) {
         if record.identity != path.identity || !path.path.is_file() {
+            info!(
+                expected_identity = record.identity,
+                observed_identity = path.identity,
+                path = %path.path.display(),
+                exists = path.path.is_file(),
+                "stage artifact identity changed"
+            );
             return Ok(false);
         }
         let metadata = fs::metadata(&path.path)?;
         if metadata.len() != record.bytes {
+            info!(
+                identity = record.identity,
+                expected_bytes = record.bytes,
+                observed_bytes = metadata.len(),
+                "stage artifact size changed"
+            );
             return Ok(false);
         }
-        if modified_nanos(&path.path)? != record.observed_modified_unix_nanos
-            && sha256_file(&path.path)? != record.sha256
-        {
-            return Ok(false);
+        if modified_nanos(&path.path)? != record.observed_modified_unix_nanos {
+            let observed_sha256 = sha256_file(&path.path)?;
+            if observed_sha256 != record.sha256 {
+                info!(
+                    identity = record.identity,
+                    expected_sha256 = record.sha256,
+                    observed_sha256,
+                    "stage artifact content changed"
+                );
+                return Ok(false);
+            }
         }
     }
     Ok(true)
@@ -311,9 +336,31 @@ pub fn reusable(
     };
     let metadata_matches = receipt_matches_spec(&receipt, spec)?;
     if !metadata_matches {
+        info!(
+            stage = spec.stage,
+            scope = spec.scope,
+            receipt = %receipt_path.display(),
+            "stage receipt metadata changed"
+        );
         return Ok(false);
     }
-    Ok(paths_match(&receipt.inputs, inputs)? && paths_match(&receipt.outputs, outputs)?)
+    if !paths_match(&receipt.inputs, inputs)? {
+        info!(
+            stage = spec.stage,
+            scope = spec.scope,
+            "stage inputs changed"
+        );
+        return Ok(false);
+    }
+    if !paths_match(&receipt.outputs, outputs)? {
+        info!(
+            stage = spec.stage,
+            scope = spec.scope,
+            "stage outputs changed"
+        );
+        return Ok(false);
+    }
+    Ok(true)
 }
 
 fn receipt_matches_spec(receipt: &StageReceipt, spec: StageSpec<'_>) -> Result<bool> {
