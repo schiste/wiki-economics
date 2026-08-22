@@ -56,6 +56,14 @@ The admin status API exposes:
 
 The generated manifest also embeds the lifecycle registry.
 
+`publication_contract.datasets` defines which published wikis each metric must
+contain and its conservative `minimum_rows_per_wiki`. Use
+`coverage=all_published` for core datasets and an explicit `wikis` array for a
+specialized dataset such as patrol. The Rust
+[publication gate](publication-gate.md) enforces this registry before the site
+can switch, so lifecycle activation and dataset readiness stay one reviewed
+contract.
+
 ## Safe transitions
 
 ### Reactivate an imported or paused wiki

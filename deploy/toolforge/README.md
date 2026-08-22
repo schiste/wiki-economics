@@ -63,6 +63,11 @@ Toolforge entirely.
   preflights available disk space against the summed remote dump size
   before downloading anything, so an undersized quota (e.g. frwiki's ~31GB
   peak) fails fast instead of after partially downloading a large dump.
+  Every refresh also carries a unique run ID through merge, semantic
+  validation, and the two pre-publication receipt checks. The run ID is stored
+  in `.refresh-status.json`, `.refresh-history.jsonl`, and
+  `publication-gate.json`; see the [publication gate
+  runbook](../../docs/publication-gate.md).
 
 ## Runbook
 

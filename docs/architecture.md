@@ -119,6 +119,8 @@ Important decisions:
 - merge only reads per-wiki metric files from `output/<wiki>/`
 - merged outputs are written to `output/<metric>.parquet`
 - merge also materializes the shared dashboard JSON artifacts (`defaults_*.json`, `manifest.json`) from the checked-in generators under `site/data-build/` so the site does not rely on stale Observable cache loaders
+- every declared JSON generator is critical: output is parsed and atomically
+  replaced, and any missing, malformed, or failed generator stops merge
 - merge assumes every per-wiki metric output already includes a `wiki` column
 
 If a new metric omits the `wiki` column, merge will still concatenate files, but the combined output will be much less useful. Keep the `wiki` column in per-wiki outputs.
@@ -143,6 +145,15 @@ checked-in lifecycle registry independently records publication and refresh
 states; see [Wiki lifecycle management](wiki-lifecycle.md). Merge filters on
 publication state, while deployment orchestration filters on refresh state.
 Paused imported datasets therefore remain published and retained.
+
+## Publication gate
+
+Script-driven refreshes use a run-scoped, fail-closed validation boundary
+between merge and site build. Rust verifies schemas, lifecycle coverage,
+plausibility thresholds, dates, snapshot selection, patrol sources, and row/
+edit conservation before issuing `output/publication-gate.json`. The site
+builder rechecks that receipt before its atomic switch. See
+[Publication gate](publication-gate.md) for the artifact protocol and runbook.
 
 ## Logging
 

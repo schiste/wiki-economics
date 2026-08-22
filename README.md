@@ -151,6 +151,7 @@ python3 -m unittest discover -s scripts -p 'test_*.py'
 - [Benchmarking](docs/benchmarking.md)
 - [Dependencies and Licenses](docs/dependencies-and-licenses.md)
 - [Publishing](docs/release.md)
+- [Publication Gate](docs/publication-gate.md)
 - [Security Model](docs/security.md)
 - [Stack and Data Sources](docs/stack-and-data-sources.md)
 - [Troubleshooting](docs/troubleshooting.md)
