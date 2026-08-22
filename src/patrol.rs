@@ -436,6 +436,15 @@ pub fn compute_patrol(
 
     if pending_months.is_empty() {
         info!(wiki = wiki, "no patrol months require recomputation");
+        let final_path = output_dir.join(wiki).join("patrol.parquet");
+        if final_path.is_file() {
+            info!(
+                wiki = wiki,
+                path = %final_path.display(),
+                "reusing existing patrol metric output"
+            );
+            return Ok(());
+        }
         let merged_path = merge_wiki_patrol_parts(output_dir, wiki)?;
         refresh_patrol_dashboard_artifacts(output_dir, merged_path.as_deref())?;
         return Ok(());

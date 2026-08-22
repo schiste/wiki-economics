@@ -1631,6 +1631,24 @@ fn compute_patrol_reports_missing_inputs_and_executes_rebuild_lookup_and_no_pend
     assert!(output_dir.join("testwiki").join("patrol.parquet").exists());
     assert!(output_dir.join("defaults_patrol.json").exists());
 
+    let wiki_output = output_dir.join("testwiki").join("patrol.parquet");
+    let dashboard_output = output_dir.join("patrol.parquet");
+    let defaults_output = output_dir.join("defaults_patrol.json");
+    let before = [
+        fs::metadata(&wiki_output)?.modified()?,
+        fs::metadata(&dashboard_output)?.modified()?,
+        fs::metadata(&defaults_output)?.modified()?,
+    ];
+    std::thread::sleep(std::time::Duration::from_millis(10));
     compute_patrol("testwiki", &data_dir, &output_dir, false, None)?;
+    let after = [
+        fs::metadata(&wiki_output)?.modified()?,
+        fs::metadata(&dashboard_output)?.modified()?,
+        fs::metadata(&defaults_output)?.modified()?,
+    ];
+    assert_eq!(
+        after, before,
+        "a no-op patrol refresh must preserve all published artifacts"
+    );
     Ok(())
 }
