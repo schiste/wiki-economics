@@ -693,7 +693,8 @@ mod tests {
         )
         .expect("gate fixture should be written");
         fs::write(site.join("src/nested/index.md"), "# Site")?;
-        fs::write(site.join("src/.observablehq/cache/generated.js"), "transient")?;
+        let generated_cache = site.join("src/.observablehq/cache/generated.js");
+        fs::write(generated_cache, "transient")?;
         fs::write(site.join("data-build/manifest.sh"), "true")?;
         fs::write(site.join("observablehq.config.js"), "export default {}")?;
         fs::write(site.join("package.json"), "{}")?;
