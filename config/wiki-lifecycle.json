@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "wikis": {
+    "elwiki": {
+      "publication": "published",
+      "refresh": "paused",
+      "provenance": "local-import",
+      "imported_cutoff": "2026-03"
+    },
+    "frwiki": {
+      "publication": "published",
+      "refresh": "paused",
+      "provenance": "local-import",
+      "imported_cutoff": "2026-03"
+    },
+    "nlwiki": {
+      "publication": "published",
+      "refresh": "scheduled",
+      "provenance": "toolforge",
+      "freshness_sla_days": 10
+    },
+    "ptwiki": {
+      "publication": "published",
+      "refresh": "paused",
+      "provenance": "local-import",
+      "imported_cutoff": "2026-03"
+    },
+    "svwiki": {
+      "publication": "published",
+      "refresh": "paused",
+      "provenance": "local-import",
+      "imported_cutoff": "2026-03"
+    }
+  }
+}

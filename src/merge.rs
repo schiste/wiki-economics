@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, ensure};
 use polars::prelude::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -8,6 +8,7 @@ use std::process::Command;
 use tracing::{info, warn};
 
 use crate::observability::MemorySnapshot;
+use crate::wiki_lifecycle;
 
 const MERGE_BATCH_ROWS: usize = 250_000;
 
@@ -16,8 +17,26 @@ const MERGE_BATCH_ROWS: usize = 250_000;
 ///     → output/inequality.parquet (with wiki column distinguishing them)
 pub fn merge_outputs(output_dir: &Path) -> Result<()> {
     info!(output_dir = %output_dir.display(), "merging wiki outputs");
+    let lifecycle_path = env::var_os("WIKI_ECON_WIKI_LIFECYCLE_FILE").map(PathBuf::from);
+    let published_wikis = wiki_lifecycle::published_wikis(lifecycle_path.as_deref())?;
+    let metric_files = collect_metric_files(output_dir, published_wikis.as_ref())?;
 
-    // Discover all metric names from subdirectories
+    for (metric_name, mut paths) in metric_files {
+        paths.sort();
+        let dest = output_dir.join(&metric_name);
+        merge_metric_batched(&metric_name, &paths, &dest, MERGE_BATCH_ROWS)?;
+    }
+
+    materialize_dashboard_artifacts(output_dir)?;
+
+    info!(output_dir = %output_dir.display(), "finished merge");
+    Ok(())
+}
+
+fn collect_metric_files(
+    output_dir: &Path,
+    published_wikis: Option<&BTreeSet<String>>,
+) -> Result<BTreeMap<String, Vec<PathBuf>>> {
     let mut metric_files: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
 
     for entry in fs::read_dir(output_dir)? {
@@ -37,6 +56,11 @@ pub fn merge_outputs(output_dir: &Path) -> Result<()> {
         {
             continue;
         }
+        let wiki = entry.file_name().to_string_lossy().to_string();
+        if published_wikis.is_some_and(|published| !published.contains(&wiki)) {
+            info!(wiki, "excluding non-published wiki from merged outputs");
+            continue;
+        }
         let wiki_dir = entry.path();
         for file_entry in fs::read_dir(&wiki_dir)? {
             let file_entry = file_entry?;
@@ -47,17 +71,7 @@ pub fn merge_outputs(output_dir: &Path) -> Result<()> {
             }
         }
     }
-
-    for (metric_name, mut paths) in metric_files {
-        paths.sort();
-        let dest = output_dir.join(&metric_name);
-        merge_metric_batched(&metric_name, &paths, &dest, MERGE_BATCH_ROWS)?;
-    }
-
-    materialize_dashboard_artifacts(output_dir)?;
-
-    info!(output_dir = %output_dir.display(), "finished merge");
-    Ok(())
+    Ok(metric_files)
 }
 
 fn merge_metric_batched(
@@ -273,6 +287,35 @@ mod tests {
             LazyFrame::scan_parquet(merged_path.as_str().into(), Default::default())?.collect()?;
         assert_eq!(merged.height(), 2);
 
+        Ok(())
+    }
+
+    #[test]
+    fn metric_discovery_includes_only_published_lifecycle_entries() -> Result<()> {
+        let output_dir = TestDir::new()?;
+        write_metric(output_dir.path(), "nlwiki", "metric", 1)?;
+        write_metric(output_dir.path(), "frwiki", "metric", 2)?;
+        write_metric(output_dir.path(), "hiddenwiki", "metric", 3)?;
+        let published = BTreeSet::from(["frwiki".to_string(), "nlwiki".to_string()]);
+
+        let files = collect_metric_files(output_dir.path(), Some(&published))?;
+        let metric = files.get("metric.parquet").expect("metric should exist");
+        assert_eq!(metric.len(), 2);
+        assert!(
+            metric
+                .iter()
+                .any(|path| path.starts_with(output_dir.path().join("frwiki")))
+        );
+        assert!(
+            metric
+                .iter()
+                .any(|path| path.starts_with(output_dir.path().join("nlwiki")))
+        );
+        assert!(
+            !metric
+                .iter()
+                .any(|path| path.to_string_lossy().contains("hiddenwiki"))
+        );
         Ok(())
     }
 

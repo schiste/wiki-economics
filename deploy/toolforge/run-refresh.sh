@@ -22,8 +22,6 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 # shellcheck disable=SC1091
 . "$ROOT/scripts/lib/wiki_econ.sh"
 
-: "${WIKI_ECON_ENABLED_WIKIS:?Set WIKI_ECON_ENABLED_WIKIS (space or comma separated) with toolforge envvars create}"
-
 # Write a status marker + rolling history to the shared NFS output dir on
 # every exit (success, an early `exit 1` artifact check below, or a
 # set -e-triggered failure) so the admin webservice — a separate Toolforge
@@ -72,7 +70,15 @@ trap 'write_refresh_status $?' EXIT
 wiki_econ_init_runtime
 wiki_econ_ensure_local_dirs
 
-IFS=', ' read -r -a wikis <<< "$WIKI_ECON_ENABLED_WIKIS"
+refresh_wikis=$(node "$ROOT/scripts/wiki-lifecycle.cjs" refresh-wikis)
+wikis=()
+while IFS= read -r wiki; do
+  [ -n "$wiki" ] && wikis+=("$wiki")
+done <<< "$refresh_wikis"
+if [ "${#wikis[@]}" -eq 0 ]; then
+  echo "Wiki lifecycle registry selected no scheduled refresh wikis" >&2
+  exit 1
+fi
 
 echo "==> Toolforge refresh: ${wikis[*]}"
 "$ROOT/scripts/refresh.sh" "${wikis[@]}"

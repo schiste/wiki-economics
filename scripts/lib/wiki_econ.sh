@@ -24,6 +24,7 @@ wiki_econ_init_runtime() {
   WIKI_ECON_DATA_DIR="$(wiki_econ_abs_path "$WIKI_ECON_ROOT" "${WIKI_ECON_DATA_DIR:-data}")"
   WIKI_ECON_OUTPUT_DIR="$(wiki_econ_abs_path "$WIKI_ECON_ROOT" "${WIKI_ECON_OUTPUT_DIR:-output}")"
   WIKI_ECON_GENERATOR_DIR="$(wiki_econ_abs_path "$WIKI_ECON_ROOT" "${WIKI_ECON_GENERATOR_DIR:-site/data-build}")"
+  WIKI_ECON_WIKI_LIFECYCLE_FILE="$(wiki_econ_abs_path "$WIKI_ECON_ROOT" "${WIKI_ECON_WIKI_LIFECYCLE_FILE:-config/wiki-lifecycle.json}")"
   WIKI_ECON_SITE_DIR="$(wiki_econ_abs_path "$WIKI_ECON_ROOT" "${WIKI_ECON_SITE_DIR:-site}")"
   WIKI_ECON_SITE_DIST_DIR="$(wiki_econ_abs_path "$WIKI_ECON_ROOT" "${WIKI_ECON_SITE_DIST_DIR:-site/dist}")"
   WIKI_ECON_SITE_PORT="${WIKI_ECON_SITE_PORT:-3000}"
@@ -34,6 +35,7 @@ wiki_econ_init_runtime() {
   export WIKI_ECON_DATA_DIR
   export WIKI_ECON_OUTPUT_DIR
   export WIKI_ECON_GENERATOR_DIR
+  export WIKI_ECON_WIKI_LIFECYCLE_FILE
   export WIKI_ECON_SITE_DIR
   export WIKI_ECON_SITE_DIST_DIR
   export WIKI_ECON_SITE_PORT
@@ -47,6 +49,7 @@ Repo root:    $WIKI_ECON_ROOT
 Data dir:     $WIKI_ECON_DATA_DIR
 Output dir:   $WIKI_ECON_OUTPUT_DIR
 Generators:   $WIKI_ECON_GENERATOR_DIR
+Wiki registry: $WIKI_ECON_WIKI_LIFECYCLE_FILE
 Site dir:     $WIKI_ECON_SITE_DIR
 Site dist:    $WIKI_ECON_SITE_DIST_DIR
 EOF

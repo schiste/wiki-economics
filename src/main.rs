@@ -13,6 +13,7 @@ mod schema;
 mod storage;
 #[cfg(test)]
 mod test_support;
+mod wiki_lifecycle;
 
 use anyhow::Result;
 use chrono::{DateTime, Datelike, Utc};
