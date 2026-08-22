@@ -9,7 +9,7 @@ use std::time::UNIX_EPOCH;
 use tracing::{info, warn};
 
 const RECEIPT_SCHEMA_VERSION: u32 = 1;
-const SITE_ALGORITHM_VERSION: &str = "observable-static-site-v2";
+const SITE_ALGORITHM_VERSION: &str = "observable-static-site-v3-source-only";
 const DATE_COLUMNS: [&str; 6] = [
     "week_start",
     "year_month",
@@ -487,7 +487,9 @@ fn site_stage_inputs(output_dir: &Path, site_dir: &Path) -> Result<Vec<TrackedPa
             output_dir.join(name),
         ));
     }
-    inputs.extend(collect_tracked_files(&site_dir.join("src"), "site/src")?);
+    let mut site_sources = collect_tracked_files(&site_dir.join("src"), "site/src")?;
+    site_sources.retain(|source| !source.identity.starts_with("site/src/.observablehq/"));
+    inputs.extend(site_sources);
     let data_build = collect_tracked_files(&site_dir.join("data-build"), "site/data-build")?;
     inputs.extend(data_build);
     for name in [
@@ -561,6 +563,7 @@ mod tests {
         let second = record(&receipt_path, spec, &inputs, &outputs)?;
         assert_eq!(first.fingerprint, second.fingerprint);
 
+        std::thread::sleep(std::time::Duration::from_millis(10));
         fs::write(&output, "change")?;
         assert!(!reusable(&receipt_path, spec, &inputs, &outputs)?);
         let missing_reusable = reusable(&dir.path().join("missing.json"), spec, &inputs, &outputs)
@@ -670,6 +673,7 @@ mod tests {
         let dist = dir.path().join("dist");
         fs::create_dir_all(site.join("src"))?;
         fs::create_dir_all(site.join("src/nested"))?;
+        fs::create_dir_all(site.join("src/.observablehq/cache"))?;
         fs::create_dir_all(site.join("data-build"))?;
         fs::create_dir_all(&dist)?;
         fs::create_dir_all(&output)?;
@@ -685,6 +689,10 @@ mod tests {
         )
         .expect("gate fixture should be written");
         fs::write(site.join("src/nested/index.md"), "# Site")?;
+        fs::write(
+            site.join("src/.observablehq/cache/generated.js"),
+            "transient",
+        )?;
         fs::write(site.join("data-build/manifest.sh"), "true")?;
         fs::write(site.join("observablehq.config.js"), "export default {}")?;
         fs::write(site.join("package.json"), "{}")?;
@@ -693,6 +701,14 @@ mod tests {
 
         let receipt = record_site(&output, &site, &dist)?;
         assert_eq!(receipt.selected_snapshot.as_deref(), Some("nlwiki=2026-07"));
+        assert!(
+            receipt
+                .inputs
+                .iter()
+                .all(|input| !input.identity.starts_with("site/src/.observablehq/"))
+        );
+        assert!(site_is_reusable(&output, &site, &dist)?);
+        fs::remove_dir_all(site.join("src/.observablehq"))?;
         assert!(site_is_reusable(&output, &site, &dist)?);
 
         fs::write(site.join("src/nested/index.md"), "# Changed")?;
