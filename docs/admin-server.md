@@ -71,6 +71,10 @@ refuses to start with `WIKI_ECON_ADMIN_AUTH_MODE=none`.
 
 ### API routes
 
+`GET /health/freshness.json` is a public, read-only machine endpoint. It does
+not expose logs or credentials and remains accessible when hosted admin auth is
+enabled so an external scheduled monitor can detect a stalled refresh.
+
 The server accepts both the legacy local prefix and the hosted prefix:
 
 - local/dev: `/api/*`
@@ -80,7 +84,7 @@ Supported endpoints:
 
 | Method | Path suffix | Purpose |
 | --- | --- | --- |
-| `GET` | `/status` | Returns current job state, logs, manifest age, auth state, and supported wiki list. |
+| `GET` | `/status` | Returns current job state, logs, manifest age, freshness evaluation, auth state, and supported wiki list. |
 | `POST` | `/fetch` | Run `wiki-econ fetch <wiki>`. |
 | `POST` | `/ingest` | Run `wiki-econ ingest <wiki>`. |
 | `POST` | `/compute` | Run `wiki-econ compute <wiki>`. |

@@ -25,6 +25,7 @@ const {
   resolveRefreshWikis,
   wikisWithState,
 } = require("../scripts/wiki-lifecycle.cjs");
+const {evaluateFreshness} = require("./freshness.cjs");
 
 const ROOT = path.resolve(__dirname, "..");
 const RUNTIME_ENV = process.env.WIKI_ECON_ENV || "local";
@@ -48,6 +49,7 @@ const ADMIN_LOGIN_PATH = "/admin/login";
 const ADMIN_LOGOUT_PATH = "/admin/logout";
 const ADMIN_OAUTH_START_PATH = "/admin/oauth/start";
 const ADMIN_OAUTH_CALLBACK_PATH = "/admin/oauth/callback";
+const FRESHNESS_STATUS_PATH = "/health/freshness.json";
 const ADMIN_AUTH_MODE = process.env.WIKI_ECON_ADMIN_AUTH_MODE || "none";
 const AUTH_ENABLED = ADMIN_AUTH_MODE !== "none";
 const ADMIN_ALLOWED_USERNAMES = parseAllowedUsernames(process.env.WIKI_ECON_ADMIN_ALLOWED_USERNAMES || "");
@@ -1012,6 +1014,7 @@ function wikiLifecycleStatus(now = Date.now()) {
 
 function buildStatusPayload(req, session) {
   const progress = getProgress();
+  const scheduledRefresh = readRefreshStatus();
   const effectiveJob = currentJob
     ? {
         command: currentJob.command,
@@ -1050,7 +1053,8 @@ function buildStatusPayload(req, session) {
     wikiLifecycle: WIKI_LIFECYCLE,
     wikiStates: wikiLifecycleStatus(),
     runner: runnerInfo(),
-    scheduledRefresh: readRefreshStatus(),
+    scheduledRefresh,
+    freshness: evaluateFreshness({...scheduledRefresh, lifecycle: WIKI_LIFECYCLE}),
     auth: authStatus(session, req),
   };
 }
@@ -1067,6 +1071,11 @@ async function handleRequest(req, res) {
 
   const url = new URL(req.url, `http://localhost:${PORT}`);
   const session = AUTH_ENABLED ? readSession(req) : null;
+
+  if (req.method === "GET" && url.pathname === FRESHNESS_STATUS_PATH) {
+    writeJson(res, 200, evaluateFreshness({...readRefreshStatus(), lifecycle: WIKI_LIFECYCLE}));
+    return;
+  }
 
   if (req.method === "GET" && (url.pathname === ADMIN_PAGE_PATH || url.pathname === `${ADMIN_PAGE_PATH}.html`)) {
     if (AUTH_ENABLED && !session) {
@@ -1389,6 +1398,7 @@ if (require.main === module) {
 
 module.exports = {
   ADMIN_PAGE_PATH,
+  FRESHNESS_STATUS_PATH,
   PROXY_API_PREFIX,
   createServer,
   handleRequest,

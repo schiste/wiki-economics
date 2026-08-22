@@ -61,15 +61,20 @@ jobs:
         run: |
           node --check site/admin-auth.cjs
           node --check site/admin-server.cjs
+          node --check site/freshness.cjs
           node --check site/observablehq.config.js
+          node --check scripts/check-freshness.cjs
 
       - name: Run Node unit tests
         run: |
           node --test site/admin-auth.test.cjs
           node --test site/admin-server.test.cjs
           node --test site/build-site.test.cjs
+          node --test site/data-build/manifest.test.cjs
+          node --test site/freshness.test.cjs
           node --test deploy/toolforge/run-record.test.cjs
           node --test deploy/toolforge/run-refresh.test.cjs
+          node --test scripts/check-freshness.test.cjs
           node --test scripts/wiki-lifecycle.test.cjs
 
       - name: Check helper CLI entrypoints

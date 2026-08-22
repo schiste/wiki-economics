@@ -443,3 +443,45 @@ test("scheduledRefresh surfaces an in-progress schema-v2 heartbeat", async (t) =
   assert.deepEqual(body.scheduledRefresh.last, live);
   assert.deepEqual(body.scheduledRefresh.history, []);
 });
+
+test("public freshness status is machine-readable without an admin session", async (t) => {
+  const {module, host, outputDir} = await startServer(t, HOSTED_ENV, {
+    schema_version: 1,
+    publication_contract: {datasets: {}},
+    wikis: {
+      nlwiki: {
+        publication: "published",
+        refresh: "scheduled",
+        freshness_sla_days: 10,
+        provenance: "toolforge",
+      },
+    },
+  });
+  const now = new Date().toISOString();
+  const record = {
+    schemaVersion: 2,
+    state: "succeeded",
+    exitCode: 0,
+    runId: "healthy-run",
+    startedAt: now,
+    finishedAt: now,
+    selectedSnapshot: "2026-07",
+    memoryPeakBytes: 2 * 1024 ** 3,
+    memoryLimitBytes: 6 * 1024 ** 3,
+    diskFreeBytes: 100 * 1024 ** 3,
+    publication: {
+      selectedSnapshots: {nlwiki: "2026-07"},
+      cutoffDates: {nlwiki: "2026-08"},
+      metrics: {patrol: {rows: 100}},
+      patrolSources: {nlwiki: {patrol_events: 1000, rights_events: 10}},
+    },
+  };
+  fs.writeFileSync(path.join(outputDir, ".refresh-status.json"), JSON.stringify(record), "utf8");
+
+  const health = await invoke(module, {url: "/health/freshness.json", headers: {host}});
+  assert.equal(health.statusCode, 200);
+  assert.equal(JSON.parse(health.text()).status, "healthy");
+
+  const admin = await invoke(module, {url: "/admin-api/status", headers: {host}});
+  assert.equal(admin.statusCode, 401);
+});

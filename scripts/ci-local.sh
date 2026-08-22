@@ -13,6 +13,10 @@ node --check site/admin-auth.cjs
 echo "==> node --check site/admin-server.cjs"
 node --check site/admin-server.cjs
 
+echo "==> node --check site/freshness.cjs scripts/check-freshness.cjs"
+node --check site/freshness.cjs
+node --check scripts/check-freshness.cjs
+
 echo "==> node --check site/observablehq.config.js"
 node --check site/observablehq.config.js
 
@@ -28,11 +32,18 @@ node --test site/admin-server.test.cjs
 echo "==> node --test site/build-site.test.cjs"
 node --test site/build-site.test.cjs
 
+echo "==> node --test site/data-build/manifest.test.cjs site/freshness.test.cjs"
+node --test site/data-build/manifest.test.cjs
+node --test site/freshness.test.cjs
+
 echo "==> node --test deploy/toolforge/run-record.test.cjs"
 node --test deploy/toolforge/run-record.test.cjs
 
 echo "==> node --test deploy/toolforge/run-refresh.test.cjs"
 node --test deploy/toolforge/run-refresh.test.cjs
+
+echo "==> node --test scripts/check-freshness.test.cjs"
+node --test scripts/check-freshness.test.cjs
 
 echo "==> node --test scripts/wiki-lifecycle.test.cjs"
 node --test scripts/wiki-lifecycle.test.cjs
