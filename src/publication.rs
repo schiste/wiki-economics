@@ -564,9 +564,14 @@ fn validate_date(value: &str, column: &str) -> Result<()> {
     let valid = if column == "week_start" {
         chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok()
     } else if column == "period" {
-        (value.len() == 7
-            && value.as_bytes().get(4) == Some(&b'-')
-            && matches!(&value[5..], "Q1" | "Q2" | "Q3" | "Q4"))
+        let bytes = value.as_bytes();
+        let valid_year =
+            |year: &[u8]| year.len() == 4 && year.iter().all(u8::is_ascii_digit) && year != b"0000";
+        valid_year(bytes)
+            || (bytes.len() == 7
+                && valid_year(&bytes[..4])
+                && &bytes[4..6] == b"-Q"
+                && matches!(bytes[6], b'1'..=b'4'))
             || storage::validate_snapshot_version(value).is_ok()
     } else {
         storage::validate_snapshot_version(value).is_ok()
@@ -981,7 +986,8 @@ mod tests {
     fn string_value(name: &str) -> &str {
         match name {
             "wiki" => "nlwiki",
-            "year_month" | "period" => "2026-03",
+            "year_month" => "2026-03",
+            "period" => "2001",
             "week_start" => "2026-03-02",
             "cohort_year" | "year" => "2026",
             _ => "value",
@@ -1092,7 +1098,10 @@ mod tests {
     #[test]
     fn contract_and_date_helpers_fail_closed() -> Result<()> {
         assert!(validate_date("2026-03-02", "week_start").is_ok());
+        assert!(validate_date("2001", "period").is_ok());
         assert!(validate_date("2026-Q1", "period").is_ok());
+        assert!(validate_date("0000", "period").is_err());
+        assert!(validate_date("2026-Q5", "period").is_err());
         assert!(validate_date("2026-03", "year_month").is_ok());
         assert!(validate_date("bad", "year_month").is_err());
         assert_eq!(snapshot_month_index("2026-03")?, 2026 * 12 + 3);
