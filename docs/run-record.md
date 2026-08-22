@@ -39,10 +39,25 @@ The live/final record includes:
   cutoff dates, and patrol/rights source counts copied from the current run's
   `publication-gate.json`;
 - the currently published site symlink generation; and
+- the run-scoped log filename; and
 - terminal exit code, failing stage, and a bounded single-line error.
 
 The publication summary is accepted only when its run ID matches the live run,
 so an old successful receipt cannot contaminate a failed record.
+
+## Freshness alerts
+
+`GET /health/freshness.json` is deliberately public and read-only. It evaluates
+the atomic status and history records against the lifecycle registry and emits
+`healthy`, `warning`, or `critical` plus machine-readable alerts. Checks cover
+the last-success SLA, unpublished newer snapshots, cutoffs that fail to advance,
+zero patrol data, stale heartbeat/stage runtime, memory pressure at 75%/80%, and
+less than 20 GiB of filesystem headroom. The authenticated admin status embeds
+the same evaluation under `freshness`.
+
+`.github/workflows/freshness.yml` reads that endpoint every six hours. It has
+read-only repository permissions and no Toolforge or SSH secret; it alerts by
+failing the check and never starts, retries, or deploys the production job.
 
 ## Stage event protocol
 
@@ -60,6 +75,12 @@ Only terminal records enter `output/.refresh-history.jsonl`. The writer keeps
 the bounded file atomically. Set `WIKI_ECON_REFRESH_HISTORY_LIMIT` to a value
 from 52 through 104 to retain between one and two years; out-of-range values
 are clamped.
+
+Toolforge logs are separated under `output/logs/refresh/<run-id>.log`, with the
+same 52–104 retention bound. Each file has explicit run delimiters and terminal
+JSON Lines summaries for every stage and the overall run. The wrapper disables
+ANSI color and Observable telemetry (`OBSERVABLE_TELEMETRY_DISABLE=true`), and
+the Rust tracing span adds `run_id` to every application event.
 
 Inspect the current record with:
 

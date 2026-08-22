@@ -31,6 +31,10 @@ REFRESH_START_EPOCH="$(date +%s)"
 REFRESH_HISTORY_LIMIT="${WIKI_ECON_REFRESH_HISTORY_LIMIT:-104}"
 WIKI_ECON_RUN_ID="${WIKI_ECON_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$$}"
 export WIKI_ECON_RUN_ID
+export CARGO_TERM_COLOR=never
+export NO_COLOR=1
+export OBSERVABLE_TELEMETRY_DISABLE=true
+export WIKI_ECON_LOG_ANSI=0
 REFRESH_LOCK_HEARTBEAT_SECS="${WIKI_ECON_REFRESH_LOCK_HEARTBEAT_SECS:-60}"
 REFRESH_LOCK_STALE_SECS="${WIKI_ECON_REFRESH_LOCK_STALE_SECS:-21600}"
 REFRESH_LOCK_RECHECK_SECS="${WIKI_ECON_REFRESH_LOCK_RECHECK_SECS:-2}"
@@ -44,6 +48,20 @@ SELECTED_SNAPSHOT=""
 REFRESH_FAILURE_ERROR=""
 REFRESH_FAILURE_STAGE=""
 RUN_RECORD_HELPER="$ROOT/deploy/toolforge/run-record.cjs"
+REFRESH_LOG_DIR=""
+REFRESH_LOG_FILE=""
+
+initialize_refresh_logging() {
+  REFRESH_LOG_DIR="${WIKI_ECON_REFRESH_LOG_DIR:-$WIKI_ECON_OUTPUT_DIR/logs/refresh}"
+  REFRESH_LOG_FILE="$REFRESH_LOG_DIR/$WIKI_ECON_RUN_ID.log"
+  node "$RUN_RECORD_HELPER" rotate-logs "$REFRESH_LOG_DIR" "$REFRESH_HISTORY_LIMIT"
+  if [ "${WIKI_ECON_REFRESH_LOG_TEE:-1}" = "1" ]; then
+    exec > >(tee -a "$REFRESH_LOG_FILE") 2>&1
+  else
+    exec >> "$REFRESH_LOG_FILE" 2>&1
+  fi
+  echo "=== wiki-economics refresh start run_id=$WIKI_ECON_RUN_ID at=$REFRESH_STARTED_AT ==="
+}
 
 validate_lock_integer() {
   local name=$1 value=$2 allow_zero=${3:-0}
@@ -299,6 +317,8 @@ initialize_refresh_run_record() {
   export WIKI_ECON_SOURCE_COMMIT WIKI_ECON_BINARY_SHA256
   export WIKI_ECON_IMAGE_SOURCE_REF WIKI_ECON_IMAGE_SOURCE_COMMIT
   export WIKI_ECON_REFRESH_HISTORY_LIMIT WIKI_ECON_SITE_DIST_DIR WIKI_ECON_OUTPUT_DIR
+  WIKI_ECON_RUN_LOG_FILE="$REFRESH_LOG_FILE"
+  export WIKI_ECON_RUN_LOG_FILE
   : > "$WIKI_ECON_RUN_EVENTS_FILE"
   printf '%s\n' starting > "$WIKI_ECON_RUN_STATE_FILE"
   node "$RUN_RECORD_HELPER" write
@@ -328,12 +348,14 @@ finish_refresh() {
       exit_code=1
     fi
   fi
+  echo "=== wiki-economics refresh end run_id=$WIKI_ECON_RUN_ID exit_code=$exit_code at=$(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
   release_refresh_lock
   exit "$exit_code"
 }
 
 wiki_econ_init_runtime
 wiki_econ_ensure_local_dirs
+initialize_refresh_logging
 
 refresh_wikis=$(node "$ROOT/scripts/wiki-lifecycle.cjs" refresh-wikis)
 wikis=()
@@ -346,6 +368,7 @@ if [ "${#wikis[@]}" -eq 0 ]; then
 fi
 
 if ! acquire_refresh_lock; then
+  echo "=== wiki-economics refresh end run_id=$WIKI_ECON_RUN_ID exit_code=75 at=$(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
   exit 75
 fi
 trap 'finish_refresh $?' EXIT

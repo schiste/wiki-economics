@@ -59,19 +59,32 @@ fn stage_events(path: &Path) -> Vec<serde_json::Value> {
 
 #[test]
 fn binary_entrypoint_records_successful_and_failed_stage_events() {
-    init_test_tracing();
     let data_dir = TestDir::new().expect("temp dir");
     let events = data_dir.path().join("run-events.jsonl");
 
     let success = instrumented_binary()
         .env("WIKI_ECON_RUN_EVENTS_FILE", &events)
+        .env("WIKI_ECON_LOG_ANSI", "0")
+        .env("RUST_LOG", "info")
         .arg("--data-dir")
         .arg(data_dir.path())
+        .arg("--run-id")
+        .arg("production-test-run")
         .arg("snapshot-finalize")
         .arg("nlwiki")
         .output()
         .expect("binary should run");
     assert!(success.status.success());
+    let success_log = format!(
+        "{}{}",
+        String::from_utf8_lossy(&success.stdout),
+        String::from_utf8_lossy(&success.stderr)
+    );
+    assert!(
+        success_log.contains("run_id=production-test-run"),
+        "log did not contain the run ID: {success_log}"
+    );
+    assert!(!success_log.contains("\u{1b}["));
 
     let failure = instrumented_binary()
         .env("WIKI_ECON_RUN_EVENTS_FILE", &events)

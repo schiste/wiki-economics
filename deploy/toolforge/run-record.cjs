@@ -172,6 +172,7 @@ function publicationSummary(gate, runId) {
     };
   }
   return {
+    selectedSnapshots: gate.selected_snapshot_versions || {},
     cutoffDates: gate.cutoff_dates || {},
     metrics,
     patrolSources: gate.patrol_sources || {},
@@ -249,6 +250,7 @@ function buildRecord(environment, finalExitCode = null) {
     memoryLimitBytes: finiteCounter("/sys/fs/cgroup/memory.max"),
     disk: diskSpace(environment.WIKI_ECON_OUTPUT_DIR),
     publishedSiteGeneration,
+    logFile: environment.WIKI_ECON_RUN_LOG_FILE ? path.basename(environment.WIKI_ECON_RUN_LOG_FILE) : null,
   };
 }
 
@@ -272,6 +274,7 @@ function compactHistoryEntry(record) {
     memoryLimitBytes: record.memoryLimitBytes,
     diskFreeBytes: record.disk.freeBytes,
     publishedSiteGeneration: record.publishedSiteGeneration,
+    logFile: record.logFile,
     publication: record.publication,
   };
 }
@@ -310,6 +313,48 @@ function writeRunRecord(environment, finalExitCode = null) {
   return record;
 }
 
+function structuredSummaries(record) {
+  const stages = record.stages.map((stage) => JSON.stringify({
+    type: "wiki_econ_stage_summary",
+    runId: record.runId,
+    stage: stage.stage,
+    wiki: stage.wiki,
+    state: stage.state,
+    durationMs: stage.durationMs,
+    reused: stage.reused,
+    skipped: stage.skipped,
+    error: stage.error,
+  }));
+  stages.push(JSON.stringify({
+    type: "wiki_econ_run_summary",
+    runId: record.runId,
+    state: record.state,
+    durationSecs: record.durationSecs,
+    selectedSnapshot: record.selectedSnapshot,
+    reusedStages: record.reusedStages,
+    skippedStages: record.skippedStages,
+    failingStage: record.failingStage,
+    error: record.error,
+    memoryPeakBytes: record.memoryPeakBytes,
+    memoryLimitBytes: record.memoryLimitBytes,
+    diskFreeBytes: record.disk.freeBytes,
+    publishedSiteGeneration: record.publishedSiteGeneration,
+  }));
+  return stages;
+}
+
+function rotateLogs(directory, limit = DEFAULT_HISTORY_LIMIT) {
+  fs.mkdirSync(directory, {recursive: true});
+  const retained = historyLimit(limit);
+  const logs = fs.readdirSync(directory, {withFileTypes: true})
+    .filter((entry) => entry.isFile() && /^[A-Za-z0-9._-]+\.log$/.test(entry.name))
+    .map((entry) => entry.name)
+    .sort();
+  for (const name of logs.slice(0, Math.max(0, logs.length - retained))) {
+    fs.unlinkSync(path.join(directory, name));
+  }
+}
+
 if (require.main === module) {
   const command = process.argv[2];
   if (command === "write") {
@@ -317,7 +362,8 @@ if (require.main === module) {
   } else if (command === "finish") {
     const exitCode = Number(process.argv[3]);
     if (!Number.isInteger(exitCode)) throw new Error("finish requires an integer exit code");
-    writeRunRecord(process.env, exitCode);
+    const record = writeRunRecord(process.env, exitCode);
+    process.stdout.write(`${structuredSummaries(record).join("\n")}\n`);
   } else if (command === "event") {
     const durationMs = process.argv[6] === "" ? null : Number(process.argv[6]);
     appendEvent(
@@ -328,8 +374,10 @@ if (require.main === module) {
       durationMs,
       process.argv[7] || null,
     );
+  } else if (command === "rotate-logs") {
+    rotateLogs(process.argv[3], process.argv[4]);
   } else {
-    throw new Error("usage: node run-record.cjs write|finish|event ...");
+    throw new Error("usage: node run-record.cjs write|finish|event|rotate-logs ...");
   }
 }
 
@@ -345,6 +393,8 @@ module.exports = {
   historyLimit,
   publicationSummary,
   readEvents,
+  rotateLogs,
   siteGeneration,
+  structuredSummaries,
   writeRunRecord,
 };

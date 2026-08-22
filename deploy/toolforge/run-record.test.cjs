@@ -13,6 +13,8 @@ const {
   historyLimit,
   publicationSummary,
   readEvents,
+  rotateLogs,
+  structuredSummaries,
   writeRunRecord,
 } = require("./run-record.cjs");
 
@@ -39,6 +41,7 @@ function fixture(name) {
     WIKI_ECON_RUN_EVENTS_FILE: path.join(lock, "stage-events.jsonl"),
     WIKI_ECON_RUN_HISTORY_FILE: path.join(output, ".refresh-history.jsonl"),
     WIKI_ECON_RUN_ID: `${name}-run`,
+    WIKI_ECON_RUN_LOG_FILE: path.join(output, "logs", `${name}-run.log`),
     WIKI_ECON_RUN_PUBLICATION_FILE: path.join(output, "publication-gate.json"),
     WIKI_ECON_RUN_SNAPSHOT_FILE: path.join(lock, "selected-snapshot"),
     WIKI_ECON_RUN_STARTED_AT: "2026-08-22T03:00:00Z",
@@ -97,6 +100,7 @@ test("live and final records combine provenance, resources, publication, and sit
   appendEvent(environment.WIKI_ECON_RUN_EVENTS_FILE, "completed", "compute", "nlwiki", 800);
   fs.writeFileSync(environment.WIKI_ECON_RUN_PUBLICATION_FILE, JSON.stringify({
     run_id: environment.WIKI_ECON_RUN_ID,
+    selected_snapshot_versions: {nlwiki: "2026-07"},
     cutoff_dates: {nlwiki: "2026-08"},
     patrol_sources: {nlwiki: {patrol_events: 10, rights_events: 2}},
     metrics: {
@@ -111,9 +115,11 @@ test("live and final records combine provenance, resources, publication, and sit
   assert.equal(final.state, "succeeded");
   assert.equal(final.currentStage, null);
   assert.equal(final.publishedSiteGeneration, ".site-dist.build.abc123");
+  assert.equal(final.logFile, "complete-run.log");
   assert.equal(final.publication.metrics.page_weekly_edits.rows, 40);
   assert.equal(final.publication.metrics.page_weekly_edits.edits, 70);
   assert.equal(final.publication.metrics.page_weekly_edits.maximumDate, "2026-07-27");
+  assert.equal(final.publication.selectedSnapshots.nlwiki, "2026-07");
 });
 
 test("failed records prefer the Rust stage error and reject another run's publication", () => {
@@ -163,4 +169,25 @@ test("parsers and bounds fail safely", () => {
   assert.equal(historyLimit("1000"), 104);
   assert.equal(historyLimit("bad"), 104);
   assert.equal(publicationSummary({run_id: "other"}, "current"), null);
+});
+
+test("structured summaries are log-safe and per-run logs retain 104 files", () => {
+  const {environment, output} = fixture("structured-logs");
+  appendEvent(environment.WIKI_ECON_RUN_EVENTS_FILE, "started", "compute", "nlwiki");
+  appendEvent(environment.WIKI_ECON_RUN_EVENTS_FILE, "completed", "compute", "nlwiki", 25);
+  const summaries = structuredSummaries(buildRecord(environment, 0)).map(JSON.parse);
+  assert.equal(summaries[0].type, "wiki_econ_stage_summary");
+  assert.equal(summaries[0].durationMs, 25);
+  assert.equal(summaries.at(-1).type, "wiki_econ_run_summary");
+
+  const logs = path.join(output, "logs");
+  fs.mkdirSync(logs);
+  for (let index = 0; index < 110; index += 1) {
+    fs.writeFileSync(path.join(logs, `run-${String(index).padStart(3, "0")}.log`), "log\n");
+  }
+  fs.writeFileSync(path.join(logs, "README.txt"), "keep\n");
+  rotateLogs(logs, 104);
+  assert.equal(fs.readdirSync(logs).filter((name) => name.endsWith(".log")).length, 104);
+  assert.equal(fs.existsSync(path.join(logs, "run-000.log")), false);
+  assert.equal(fs.existsSync(path.join(logs, "README.txt")), true);
 });

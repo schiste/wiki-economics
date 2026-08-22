@@ -88,6 +88,7 @@ node "$FAKE_RUN_RECORD_HELPER" event completed fake_pipeline "" 10 ""
     WIKI_ECON_REFRESH_LOCK_HEARTBEAT_SECS: "1",
     WIKI_ECON_REFRESH_LOCK_RECHECK_SECS: "0",
     WIKI_ECON_REFRESH_LOCK_STALE_SECS: "3600",
+    WIKI_ECON_REFRESH_LOG_TEE: "0",
     WIKI_ECON_ROOT: root,
     WIKI_ECON_SITE_DIST_DIR: siteDist,
     WIKI_ECON_SITE_DIR: path.join(root, "site"),
@@ -173,7 +174,10 @@ test("an active refresh owns metadata, rejects overlap, and releases cleanly", a
 
   const second = runFixture(fixture, {WIKI_ECON_RUN_ID: "overlapping-run"});
   assert.equal(second.status, 75, `${second.stdout}\n${second.stderr}`);
-  assert.match(second.stderr, /Another wiki-economics refresh is already running/);
+  assert.match(
+    fs.readFileSync(path.join(fixture.output, "logs", "refresh", "overlapping-run.log"), "utf8"),
+    /Another wiki-economics refresh is already running/,
+  );
   const statusAfterOverlap = JSON.parse(fs.readFileSync(path.join(fixture.output, ".refresh-status.json"), "utf8"));
   assert.equal(statusAfterOverlap.runId, "active-run");
   assert.equal(statusAfterOverlap.state, "running");
@@ -190,6 +194,13 @@ test("an active refresh owns metadata, rejects overlap, and releases cleanly", a
   assert.equal(status.currentStage, null);
   assert.equal(status.stageDurationsMs.fake_pipeline, 10);
   assert.equal(status.provenance.sourceCommit, "a".repeat(40));
+  assert.equal(status.logFile, "active-run.log");
+  const runLog = fs.readFileSync(path.join(fixture.output, "logs", "refresh", "active-run.log"), "utf8");
+  assert.match(runLog, /refresh start run_id=active-run/);
+  assert.match(runLog, /"type":"wiki_econ_stage_summary"/);
+  assert.match(runLog, /"type":"wiki_econ_run_summary"/);
+  assert.match(runLog, /refresh end run_id=active-run exit_code=0/);
+  assert.doesNotMatch(runLog, /\u001b\[/);
   assert.equal(
     fs.readFileSync(fixture.driverArgs, "utf8").trim(),
     "--version 2026-07 nlwiki",
@@ -220,7 +231,10 @@ test("a demonstrably stale cross-job lock is recovered", () => {
     WIKI_ECON_RUN_ID: "recovery-run",
   });
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
-  assert.match(result.stderr, /Recovered demonstrably stale refresh lock/);
+  assert.match(
+    fs.readFileSync(path.join(fixture.output, "logs", "refresh", "recovery-run.log"), "utf8"),
+    /Recovered demonstrably stale refresh lock/,
+  );
   assert.equal(fs.existsSync(lockDir), false);
 });
 
@@ -231,7 +245,10 @@ test("a recent malformed lock fails closed instead of being stolen", () => {
 
   const result = runFixture(fixture, {WIKI_ECON_RUN_ID: "blocked-run"});
   assert.equal(result.status, 75, `${result.stdout}\n${result.stderr}`);
-  assert.match(result.stderr, /Active lock has no readable owner metadata/);
+  assert.match(
+    fs.readFileSync(path.join(fixture.output, "logs", "refresh", "blocked-run.log"), "utf8"),
+    /Active lock has no readable owner metadata/,
+  );
   assert.equal(fs.existsSync(lockDir), true);
   assert.equal(fs.existsSync(path.join(fixture.output, ".refresh-status.json")), false);
 });

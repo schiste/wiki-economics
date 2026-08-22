@@ -21,10 +21,16 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Utc};
 use clap::{Parser, Subcommand};
 use std::env;
+use std::fmt;
 use std::path::PathBuf;
 use std::time::Instant;
-use tracing::info;
+use tracing::{Event, Subscriber, info};
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::FmtContext;
+use tracing_subscriber::fmt::format::{
+    Compact, DefaultFields, Format, FormatEvent, FormatFields, Writer,
+};
+use tracing_subscriber::registry::LookupSpan;
 
 #[derive(Parser)]
 #[command(name = "wiki-econ", about = "Wikipedia economic analysis toolkit")]
@@ -503,18 +509,88 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
 }
 
 fn main() -> Result<()> {
-    init_tracing();
-    run_with_ops(Cli::parse(), &RealOps)
+    let cli = Cli::parse();
+    let run_id = logging_run_id(&cli);
+    init_tracing(&run_id);
+    run_with_ops(cli, &RealOps)
 }
 
-fn init_tracing() {
+#[derive(Clone, Debug)]
+struct RunIdEventFormat {
+    run_id: String,
+    inner: Format<Compact, ()>,
+}
+
+impl RunIdEventFormat {
+    fn new(run_id: &str, ansi: bool) -> Self {
+        Self {
+            run_id: run_id
+                .chars()
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() || "._-".contains(character) {
+                        character
+                    } else {
+                        '_'
+                    }
+                })
+                .collect(),
+            inner: tracing_subscriber::fmt::format()
+                .without_time()
+                .with_target(false)
+                .with_ansi(ansi)
+                .compact(),
+        }
+    }
+}
+
+impl<S, N> FormatEvent<S, N> for RunIdEventFormat
+where
+    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+    N: for<'writer> FormatFields<'writer> + 'static,
+{
+    fn format_event(
+        &self,
+        context: &FmtContext<'_, S, N>,
+        mut writer: Writer<'_>,
+        event: &Event<'_>,
+    ) -> fmt::Result {
+        write!(writer, "run_id={} ", self.run_id)?;
+        self.inner.format_event(context, writer, event)
+    }
+}
+
+fn init_tracing(run_id: &str) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
-        .with_target(false)
-        .without_time()
-        .compact()
+        .fmt_fields(DefaultFields::new())
+        .event_format(RunIdEventFormat::new(run_id, log_ansi_enabled()))
         .try_init();
+}
+
+fn logging_run_id(cli: &Cli) -> String {
+    let environment_run_id = env::var("WIKI_ECON_RUN_ID").ok();
+    resolve_logging_run_id(
+        cli.run_id.as_deref(),
+        environment_run_id.as_deref(),
+        std::process::id(),
+    )
+}
+
+fn log_ansi_enabled() -> bool {
+    let configured = env::var("WIKI_ECON_LOG_ANSI").ok();
+    log_ansi_enabled_from(configured.as_deref())
+}
+
+fn resolve_logging_run_id(cli: Option<&str>, environment: Option<&str>, pid: u32) -> String {
+    cli.filter(|value| !value.is_empty())
+        .or_else(|| environment.filter(|value| !value.is_empty()))
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("standalone-{pid}"))
+}
+
+fn log_ansi_enabled_from(value: Option<&str>) -> bool {
+    !value.is_some_and(|value| matches!(value, "0" | "false" | "no"))
 }
 
 #[cfg(test)]
@@ -1354,12 +1430,31 @@ mod tests {
     #[test]
     fn tracing_helpers_initialize_and_time_stages() -> Result<()> {
         init_test_tracing();
-        init_tracing();
+        init_tracing("unit-test");
 
         let value = run_timed_stage("unit", None, || Ok::<_, anyhow::Error>(7_u8))?;
 
         assert_eq!(value, 7);
         Ok(())
+    }
+
+    #[test]
+    fn logging_context_prefers_explicit_run_ids_and_controls_ansi() {
+        assert_eq!(
+            resolve_logging_run_id(Some("cli-run"), Some("env-run"), 42),
+            "cli-run"
+        );
+        assert_eq!(resolve_logging_run_id(None, Some("env-run"), 42), "env-run");
+        assert_eq!(resolve_logging_run_id(None, None, 42), "standalone-42");
+        assert_eq!(
+            RunIdEventFormat::new("run id\n42", false).run_id,
+            "run_id_42"
+        );
+        assert!(log_ansi_enabled_from(None));
+        assert!(log_ansi_enabled_from(Some("1")));
+        assert!(!log_ansi_enabled_from(Some("0")));
+        assert!(!log_ansi_enabled_from(Some("false")));
+        assert!(!log_ansi_enabled_from(Some("no")));
     }
 
     #[test]

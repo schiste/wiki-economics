@@ -76,6 +76,13 @@ Toolforge entirely.
 - `run-record.cjs` — the single atomic writer for live refresh status and the
   bounded terminal history. It folds Rust/site stage events together with
   cgroup, disk, deployment provenance, and publication-gate data.
+- Each refresh writes `output/logs/refresh/<run-id>.log`, disables ANSI and
+  Observable telemetry, and ends with structured per-stage/run JSON summaries.
+  Logs and terminal history retain 104 weekly entries by default.
+- `/health/freshness.json` exposes a credential-free health assessment. A
+  read-only GitHub schedule checks it every six hours; deployments and full
+  refreshes remain manual SSH/Toolforge operations and are never retried by
+  that workflow.
 
 ### Refresh single-flight lock
 

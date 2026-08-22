@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+export OBSERVABLE_TELEMETRY_DISABLE="${OBSERVABLE_TELEMETRY_DISABLE:-true}"
 # shellcheck disable=SC1091
 . "$ROOT/scripts/lib/wiki_econ.sh"
 
