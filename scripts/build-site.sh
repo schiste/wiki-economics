@@ -57,6 +57,15 @@ verify_publication_receipt() {
 
 verify_publication_receipt
 
+if [ "${WIKI_ECON_REQUIRE_PUBLICATION_GATE:-0}" = "1" ]; then
+  if wiki_econ_run_cli site-fingerprint-check \
+    --site-dir "$WIKI_ECON_SITE_DIR" \
+    --dist-dir "$WIKI_ECON_SITE_DIST_DIR"; then
+    echo "==> Site inputs unchanged; reusing published site"
+    exit 0
+  fi
+fi
+
 dist_dir="$WIKI_ECON_SITE_DIST_DIR"
 dist_parent="$(dirname "$dist_dir")"
 dist_name="$(basename "$dist_dir")"
@@ -140,5 +149,11 @@ case "$old_release" in
     rm -rf -- "${dist_parent:?}/${old_release:?}"
     ;;
 esac
+
+if [ "${WIKI_ECON_REQUIRE_PUBLICATION_GATE:-0}" = "1" ]; then
+  wiki_econ_run_cli site-fingerprint-record \
+    --site-dir "$WIKI_ECON_SITE_DIR" \
+    --dist-dir "$WIKI_ECON_SITE_DIST_DIR"
+fi
 
 echo "==> Site build complete: $dist_dir -> $(readlink "$dist_dir")"

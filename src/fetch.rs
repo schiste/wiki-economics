@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
+use crate::fingerprint::{self, StageSpec, TrackedPath};
+
 const BASE_URL: &str = "https://dumps.wikimedia.org/other/mediawiki_history";
 pub(crate) const DUMPS_HOST: &str = "dumps.wikimedia.org";
 const USER_AGENT: &str = "wiki-econ/0.1 (Wikipedia economic analysis research tool)";
@@ -38,6 +40,7 @@ const FETCH_RETRY_AFTER_MAX_SECS: u64 = 30;
 const FETCH_MAX_PARALLELISM_ENV: &str = "WIKI_ECON_FETCH_MAX_PARALLELISM";
 const SNAPSHOT_MAX_LAG_ENV: &str = "WIKI_ECON_MAX_SNAPSHOT_LAG_MONTHS";
 const DEFAULT_SNAPSHOT_MAX_LAG_MONTHS: u32 = 2;
+const FETCH_ALGORITHM_VERSION: &str = "wikimedia-history-fetch-v2-marker-aware";
 /// Extra headroom required beyond the summed remote byte total before a
 /// fetch is allowed to start. Not a tight budget — just enough to fail fast
 /// on a clearly undersized quota (e.g. frwiki's ~31GB transient peak against
@@ -514,6 +517,14 @@ fn snapshot_max_lag_months(value: Option<&OsStr>) -> Result<u32> {
 }
 
 fn snapshot_source_exists<T: HttpTransport>(transport: &T, url: &str) -> Result<bool> {
+    snapshot_source_exists_with_sleep(transport, url, sleep_before_retry)
+}
+
+fn snapshot_source_exists_with_sleep<T, F>(transport: &T, url: &str, mut sleep: F) -> Result<bool>
+where
+    T: HttpTransport,
+    F: FnMut(usize, bool, Option<Duration>),
+{
     let mut last_error = None;
     for attempt in 1..=FETCH_MAX_RETRIES {
         let mut rate_limited = false;
@@ -534,7 +545,7 @@ fn snapshot_source_exists<T: HttpTransport>(transport: &T, url: &str) -> Result<
             Err(error) => last_error = Some(error),
         }
         if attempt < FETCH_MAX_RETRIES {
-            sleep_before_retry(attempt, rate_limited, retry_after);
+            sleep(attempt, rate_limited, retry_after);
         }
     }
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("metadata probe failed for {url}")))
@@ -1399,8 +1410,8 @@ fn fetch_wiki_with_transport<T: HttpTransport>(
     let expected = build_file_list(wiki, version)?;
     let analytical_root = crate::storage::snapshot_analytical_wiki_dir(data_dir, wiki, version)?;
     let mut files = Vec::new();
-    for filename in expected {
-        let source_id = crate::ingest::ingest_source_id(Path::new(&filename))?;
+    for filename in &expected {
+        let source_id = crate::ingest::ingest_source_id(Path::new(filename))?;
         if crate::storage::marker_manifest_is_valid_in(data_dir, &analytical_root, &source_id)? {
             debug!(
                 wiki = wiki,
@@ -1409,10 +1420,10 @@ fn fetch_wiki_with_transport<T: HttpTransport>(
                 "skipping download represented by valid ingest marker"
             );
         } else {
-            files.push(filename);
+            files.push(filename.clone());
         }
     }
-    let reused = build_file_list(wiki, version)?.len() - files.len();
+    let reused = expected.len() - files.len();
     info!(
         wiki = wiki,
         version = version,
@@ -1421,6 +1432,7 @@ fn fetch_wiki_with_transport<T: HttpTransport>(
         "planned snapshot fetch from strict ingest markers"
     );
     if files.is_empty() {
+        record_fetch_stage(data_dir, wiki, version, &expected)?;
         return Ok(Vec::new());
     }
     check_disk_headroom(transport, base_url, wiki, version, &files, data_dir)?;
@@ -1434,6 +1446,48 @@ fn fetch_wiki_with_transport<T: HttpTransport>(
         files,
         parallelism,
     )
+    .and_then(|paths| {
+        record_fetch_stage(data_dir, wiki, version, &expected)?;
+        Ok(paths)
+    })
+}
+
+fn record_fetch_stage(
+    data_dir: &Path,
+    wiki: &str,
+    version: &str,
+    expected: &[String],
+) -> Result<()> {
+    let analytical_root = crate::storage::snapshot_analytical_wiki_dir(data_dir, wiki, version)?;
+    let raw_root = data_dir.join("raw").join(wiki);
+    let mut sources = Vec::with_capacity(expected.len());
+    for filename in expected {
+        let source_id = crate::ingest::ingest_source_id(Path::new(filename))?;
+        let marker = crate::storage::marker_path_in(&analytical_root, &source_id);
+        let (identity, path) =
+            if crate::storage::marker_manifest_is_valid_in(data_dir, &analytical_root, &source_id)?
+            {
+                (format!("ingest-marker/{source_id}"), marker)
+            } else {
+                (
+                    format!("remote/{version}/{wiki}/{filename}"),
+                    raw_root.join(filename),
+                )
+            };
+        sources.push(TrackedPath::new(identity, path));
+    }
+    fingerprint::record(
+        &fingerprint::data_stage_receipt_path(data_dir, wiki, version, "fetch"),
+        StageSpec {
+            stage: "fetch",
+            scope: wiki,
+            selected_snapshot: Some(version),
+            algorithm_version: FETCH_ALGORITHM_VERSION,
+        },
+        &sources,
+        &sources,
+    )
+    .map(|_| ())
 }
 
 /// Delete a wiki's downloaded `.bz2` dump files, freeing the on-disk peak
@@ -2404,7 +2458,8 @@ mod tests {
             &analytical,
             &crate::ingest::ingest_source_id(Path::new(filename))?,
             &crate::storage::MarkerManifest::default(),
-        )?;
+        )
+        .expect("covered source marker should be written");
         let transport = FakeTransport::default();
 
         let paths = fetch_wiki_with_transport(
@@ -2413,7 +2468,8 @@ mod tests {
             wiki,
             version,
             data_dir.path(),
-        )?;
+        )
+        .expect("covered snapshot should skip network work");
 
         assert!(paths.is_empty());
         assert_eq!(transport.get_requests(), 0);
@@ -2435,7 +2491,8 @@ mod tests {
             &["simplewiki".to_string()],
             now,
             2,
-        )?;
+        )
+        .expect("bounded fallback should resolve");
 
         assert_eq!(selected, "2026-06");
         assert_eq!(snapshot_version_at_lag(now, 8), "2025-12");
@@ -2501,6 +2558,46 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_completion_probe_retries_and_reports_exhaustion_without_waiting() -> Result<()> {
+        let retrying = FakeTransport::with_head_outcomes([
+            status_head_with_retry_after(StatusCode::TOO_MANY_REQUESTS, Duration::from_secs(1)),
+            ok_head(Some(42), false),
+        ]);
+        let mut sleeps = Vec::new();
+        let exists = snapshot_source_exists_with_sleep(
+            &retrying,
+            TEST_URL,
+            |attempt, limited, retry_after| sleeps.push((attempt, limited, retry_after)),
+        )
+        .expect("retry should recover");
+        assert!(exists);
+        assert_eq!(sleeps, vec![(1, true, Some(Duration::from_secs(1)))]);
+
+        let failing = FakeTransport::with_head_outcomes(
+            (0..FETCH_MAX_RETRIES).map(|_| FakeHeadOutcome::Error("offline")),
+        );
+        let error = snapshot_source_exists_with_sleep(&failing, TEST_URL, |_, _, _| {})
+            .expect_err("persistent transport failure must fail closed");
+        assert!(error.to_string().contains("offline"));
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_resolution_selects_expected_previous_month_without_warning() -> Result<()> {
+        let now = Utc.with_ymd_and_hms(2026, 8, 22, 0, 0, 0).unwrap();
+        let selected = resolve_latest_completed_snapshot_with_transport(
+            &FakeTransport::with_head_outcomes([ok_head(Some(42), false)]),
+            "http://example.invalid",
+            &["simplewiki".to_string()],
+            now,
+            2,
+        )
+        .expect("previous month is complete");
+        assert_eq!(selected, "2026-07");
+        Ok(())
+    }
+
+    #[test]
     fn fetch_parallelism_defaults_when_env_is_unset() {
         init_test_tracing();
 
@@ -2560,6 +2657,42 @@ mod tests {
         assert_eq!(paths.len(), 2);
         assert!(paths.iter().all(|path| path.exists()));
         assert_eq!(transport.get_requests(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn fetch_wiki_downloads_only_years_missing_valid_markers() -> Result<()> {
+        init_test_tracing();
+        let data_dir = TestDir::new()?;
+        let wiki = "frwiki";
+        let version = "2002-01";
+        let analytical =
+            crate::storage::snapshot_analytical_wiki_dir(data_dir.path(), wiki, version)?;
+        let covered = "2002-01.frwiki.2001.tsv.bz2";
+        crate::storage::write_marker_manifest_in(
+            data_dir.path(),
+            &analytical,
+            &crate::ingest::ingest_source_id(Path::new(covered))?,
+            &crate::storage::MarkerManifest::default(),
+        )
+        .expect("covered year marker should be written");
+        let transport = FakeTransport::with_outcomes(
+            [ok_head(Some(13), false), ok_head(Some(13), false)],
+            [ok_get(b"BZhpayload-by", false)],
+        );
+
+        let paths = fetch_wiki_with_transport(
+            &transport,
+            "http://example.invalid",
+            wiki,
+            version,
+            data_dir.path(),
+        )
+        .expect("only the uncovered year should download");
+
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("2002-01.frwiki.2002.tsv.bz2"));
+        assert_eq!(transport.get_requests(), 1);
         Ok(())
     }
 

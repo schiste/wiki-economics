@@ -12,7 +12,20 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tracing::info;
 
-use crate::{observability::MemorySnapshot, schema, storage};
+use crate::{fingerprint, observability::MemorySnapshot, schema, storage};
+
+const COMPUTE_ALGORITHM_VERSION: &str = "core-metrics-v3-disk-bucket-reduction";
+const CORE_METRICS: [&str; 9] = [
+    "business_funnel",
+    "gdp",
+    "gdp_activity_tiers",
+    "gdp_user_type_share",
+    "inequality",
+    "labor_churn",
+    "labor_cohorts",
+    "labor_monthly",
+    "page_weekly_edits",
+];
 
 pub(super) struct ChurnAccumulator {
     period_type: &'static str,
@@ -1179,13 +1192,88 @@ fn compute_all_incremental(wiki: &str, data_dir: &Path, output_dir: &Path) -> Re
     Ok(())
 }
 
+fn compute_stage_inputs(wiki: &str, data_dir: &Path) -> Result<Vec<fingerprint::TrackedPath>> {
+    let analytical = storage::active_analytical_wiki_dir(data_dir, wiki)?;
+    let warehouse = storage::active_warehouse_wiki_dir(data_dir, wiki)?;
+    let mut generation_outputs = Vec::new();
+    for (prefix, root) in [("analytical", &analytical), ("warehouse", &warehouse)] {
+        for path in storage::collect_parquet_files(root)? {
+            let relative = path.strip_prefix(root)?;
+            generation_outputs.push(fingerprint::TrackedPath::new(
+                format!("{prefix}/{}", relative.to_string_lossy()),
+                path,
+            ));
+        }
+    }
+    if let Some(snapshot) = storage::current_snapshot_version(data_dir, wiki)? {
+        let receipt = fingerprint::data_stage_receipt_path(data_dir, wiki, &snapshot, "ingest");
+        let spec = fingerprint::StageSpec {
+            stage: "ingest",
+            scope: wiki,
+            selected_snapshot: Some(&snapshot),
+            algorithm_version: crate::ingest::INGEST_ALGORITHM_VERSION,
+        };
+        if fingerprint::outputs_reusable(&receipt, spec, &generation_outputs)? {
+            return Ok(vec![fingerprint::TrackedPath::new(
+                format!("stage/ingest/{wiki}/{snapshot}"),
+                receipt,
+            )]);
+        }
+    }
+    let mut inputs = generation_outputs;
+    inputs.sort_by(|left, right| left.identity.cmp(&right.identity));
+    Ok(inputs)
+}
+
+fn compute_stage_outputs(wiki: &str, output_dir: &Path) -> Vec<fingerprint::TrackedPath> {
+    CORE_METRICS
+        .iter()
+        .map(|metric| {
+            fingerprint::TrackedPath::new(
+                format!("output/{wiki}/{metric}.parquet"),
+                output_dir.join(wiki).join(format!("{metric}.parquet")),
+            )
+        })
+        .filter(|output| output.path.is_file())
+        .collect()
+}
+
+fn compute_stage_receipt(output_dir: &Path, wiki: &str) -> PathBuf {
+    output_dir
+        .join("_stages")
+        .join("compute")
+        .join(format!("{wiki}.json"))
+}
+
 /// Run all metric families for a wiki.
 pub fn compute_all(wiki: &str, data_dir: &Path, output_dir: &Path) -> Result<()> {
+    let snapshot = storage::current_snapshot_version(data_dir, wiki)?;
+    let inputs = compute_stage_inputs(wiki, data_dir)?;
+    let outputs = compute_stage_outputs(wiki, output_dir);
+    let receipt_path = compute_stage_receipt(output_dir, wiki);
+    let spec = fingerprint::StageSpec {
+        stage: "compute",
+        scope: wiki,
+        selected_snapshot: snapshot.as_deref(),
+        algorithm_version: COMPUTE_ALGORITHM_VERSION,
+    };
+    if fingerprint::reusable(&receipt_path, spec, &inputs, &outputs)? {
+        info!(
+            wiki,
+            snapshot = snapshot.as_deref().unwrap_or("legacy"),
+            receipt = %receipt_path.display(),
+            "reusing deterministic compute stage"
+        );
+        return Ok(());
+    }
+
     info!(wiki = wiki, "computing metrics");
     let started = Instant::now();
 
     compute_all_incremental(wiki, data_dir, output_dir)?;
     compute_page_weekly_edits(wiki, data_dir, output_dir)?;
+    let outputs = compute_stage_outputs(wiki, output_dir);
+    fingerprint::record(&receipt_path, spec, &inputs, &outputs)?;
 
     info!(
         wiki = wiki,
@@ -1626,6 +1714,60 @@ mod tests {
             .collect();
         assert!(user_types.iter().any(|user_type| user_type == "temporary"));
 
+        Ok(())
+    }
+
+    #[test]
+    fn compute_all_reuses_matching_stage_fingerprint() -> Result<()> {
+        init_test_tracing();
+        let data_dir = TestDir::new()?;
+        let output_dir = TestDir::new()?;
+        let wiki = "testwiki";
+        write_input_parquet(&data_dir, wiki)?;
+        write_partitioned_warehouse_parquet(&data_dir, wiki)?;
+
+        compute_all(wiki, data_dir.path(), output_dir.path())?;
+        let metric = output_dir.path().join(wiki).join("gdp.parquet");
+        let before = fs::metadata(&metric)?.modified()?;
+        let receipt = compute_stage_receipt(output_dir.path(), wiki);
+        let receipt_before = fs::read(&receipt)?;
+
+        compute_all(wiki, data_dir.path(), output_dir.path())?;
+
+        assert_eq!(fs::metadata(metric)?.modified()?, before);
+        assert_eq!(fs::read(receipt)?, receipt_before);
+        Ok(())
+    }
+
+    #[test]
+    fn versioned_compute_falls_back_when_ingest_receipt_is_missing() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let wiki = "testwiki";
+        write_input_parquet(&data_dir, wiki)?;
+        write_partitioned_warehouse_parquet(&data_dir, wiki)?;
+        let version = "2026-08";
+        let analytical = storage::snapshot_analytical_wiki_dir(data_dir.path(), wiki, version)?;
+        let warehouse = storage::snapshot_warehouse_wiki_dir(data_dir.path(), wiki, version)?;
+        for (source, destination) in [
+            (
+                storage::analytical_wiki_dir(data_dir.path(), wiki),
+                &analytical,
+            ),
+            (
+                storage::warehouse_wiki_dir(data_dir.path(), wiki),
+                &warehouse,
+            ),
+        ] {
+            for path in storage::collect_parquet_files(&source)? {
+                let target = destination.join(path.strip_prefix(&source)?);
+                target.parent().map(fs::create_dir_all).transpose()?;
+                fs::copy(path, target)?;
+            }
+        }
+        storage::publish_current_snapshot(data_dir.path(), wiki, version)?;
+
+        let inputs = compute_stage_inputs(wiki, data_dir.path())?;
+        assert!(inputs.len() > 1);
         Ok(())
     }
 

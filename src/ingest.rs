@@ -12,9 +12,11 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
+use crate::fingerprint::{self, StageSpec, TrackedPath};
 use crate::{fetch, schema, storage};
 
 const INGEST_CHUNK_BYTES: usize = 32 * 1024 * 1024;
+pub(crate) const INGEST_ALGORITHM_VERSION: &str = "history-tsv-to-generation-parquet-v2";
 
 #[derive(Clone, Debug)]
 struct IngestRoots {
@@ -435,6 +437,28 @@ fn ingest_wiki_for_snapshot(
     requested_snapshot: Option<&str>,
 ) -> Result<Vec<PathBuf>> {
     let raw_dir = data_dir.join("raw").join(wiki);
+    if let Some(version) = requested_snapshot {
+        storage::validate_snapshot_version(version)?;
+        let roots = IngestRoots::snapshot(data_dir, wiki, version)?;
+        let outputs = ingest_stage_outputs(data_dir, &roots)?;
+        let receipt_path = fingerprint::data_stage_receipt_path(data_dir, wiki, version, "ingest");
+        let spec = StageSpec {
+            stage: "ingest",
+            scope: wiki,
+            selected_snapshot: Some(version),
+            algorithm_version: INGEST_ALGORITHM_VERSION,
+        };
+        if !outputs.is_empty() && fingerprint::outputs_reusable(&receipt_path, spec, &outputs)? {
+            storage::publish_current_snapshot(data_dir, wiki, version)?;
+            info!(
+                wiki,
+                snapshot_version = version,
+                receipt = %receipt_path.display(),
+                "reusing deterministic ingest stage"
+            );
+            return storage::collect_parquet_files(&roots.analytical);
+        }
+    }
     let mut src_files: Vec<PathBuf> = if raw_dir.exists() {
         fs::read_dir(&raw_dir)?
             .filter_map(|entry| entry.ok().map(|entry| entry.path()))
@@ -525,6 +549,19 @@ fn ingest_wiki_for_snapshot(
 
     if let Some(snapshot_version) = snapshot_version.as_deref() {
         storage::publish_current_snapshot(data_dir, wiki, snapshot_version)?;
+        let inputs = ingest_stage_inputs(data_dir, &roots, &src_files)?;
+        let outputs = ingest_stage_outputs(data_dir, &roots)?;
+        fingerprint::record(
+            &fingerprint::data_stage_receipt_path(data_dir, wiki, snapshot_version, "ingest"),
+            StageSpec {
+                stage: "ingest",
+                scope: wiki,
+                selected_snapshot: Some(snapshot_version),
+                algorithm_version: INGEST_ALGORITHM_VERSION,
+            },
+            &inputs,
+            &outputs,
+        )?;
     }
 
     let analytical_paths = storage::collect_parquet_files(&roots.analytical)?;
@@ -537,6 +574,47 @@ fn ingest_wiki_for_snapshot(
         "finished ingest"
     );
     Ok(analytical_paths)
+}
+
+fn ingest_stage_outputs(_data_dir: &Path, roots: &IngestRoots) -> Result<Vec<TrackedPath>> {
+    let mut outputs = Vec::new();
+    for (prefix, root) in [
+        ("analytical", &roots.analytical),
+        ("warehouse", &roots.warehouse),
+    ] {
+        for path in storage::collect_parquet_files(root)? {
+            let relative = path.strip_prefix(root)?;
+            outputs.push(TrackedPath::new(
+                format!("{prefix}/{}", relative.to_string_lossy()),
+                path,
+            ));
+        }
+    }
+    if outputs.is_empty() {
+        outputs = fingerprint::collect_tracked_files(
+            &roots.analytical.join("_markers"),
+            "ingest-marker",
+        )?;
+    }
+    outputs.sort_by(|left, right| left.identity.cmp(&right.identity));
+    Ok(outputs)
+}
+
+fn ingest_stage_inputs(
+    _data_dir: &Path,
+    roots: &IngestRoots,
+    raw_sources: &[PathBuf],
+) -> Result<Vec<TrackedPath>> {
+    let mut inputs = Vec::new();
+    for source in raw_sources {
+        let source_id = ingest_source_id(source)?;
+        inputs.push(TrackedPath::new(format!("raw/{source_id}"), source));
+    }
+    if inputs.is_empty() {
+        let marker_root = roots.analytical.join("_markers");
+        inputs = fingerprint::collect_tracked_files(&marker_root, "ingest-marker")?;
+    }
+    Ok(inputs)
 }
 
 /// Ingest all raw dump files for a wiki into partitioned Parquet. Standard
@@ -918,15 +996,72 @@ mod tests {
             &analytical,
             &ingest_source_id(Path::new(&filename))?,
             &storage::MarkerManifest::default(),
-        )?;
+        )
+        .expect("zero-row marker should be written");
 
         let paths = ingest_wiki_snapshot(wiki, version, temp_dir.path())?;
+        let receipt =
+            fingerprint::data_stage_receipt_path(temp_dir.path(), wiki, version, "ingest");
+        let receipt_before = fs::read(&receipt)?;
+        let reused = ingest_wiki_snapshot(wiki, version, temp_dir.path())?;
 
         assert!(paths.is_empty());
+        assert!(reused.is_empty());
+        assert_eq!(fs::read(receipt)?, receipt_before);
         assert_eq!(
             storage::current_snapshot_version(temp_dir.path(), wiki)?.as_deref(),
             Some(version)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_snapshot_rejects_sources_missing_from_raw_and_markers() -> Result<()> {
+        let temp_dir = TestDir::new()?;
+        let error = ingest_wiki_snapshot("testwiki", "2026-08", temp_dir.path())
+            .expect_err("an uncovered source must require fetching");
+        assert!(error.to_string().contains("missing 1 source file"));
+        Ok(())
+    }
+
+    #[test]
+    fn ingest_stage_fails_when_marker_inventory_cannot_be_read() -> Result<()> {
+        let temp_dir = TestDir::new()?;
+        let roots = IngestRoots::snapshot(temp_dir.path(), "testwiki", "2026-08")?;
+        fs::create_dir_all(&roots.analytical)?;
+        fs::write(roots.analytical.join("_markers"), "not-a-directory")?;
+        assert!(ingest_stage_outputs(temp_dir.path(), &roots).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn versioned_ingest_propagates_stage_receipt_publication_failure() -> Result<()> {
+        let temp_dir = TestDir::new()?;
+        let wiki = "testwiki";
+        let version = "2026-08";
+        let raw = temp_dir.path().join("raw").join(wiki);
+        fs::create_dir_all(&raw)?;
+        let filename = fetch::build_file_list(wiki, version)?
+            .pop()
+            .expect("all-time source");
+        write_bz2_dump(
+            &raw.join(filename),
+            &[sample_row(
+                "2024-01-01 00:00:00.0",
+                "42",
+                "100",
+                "revision",
+                "create",
+            )],
+        )
+        .expect("versioned raw fixture should be written");
+        let receipt =
+            fingerprint::data_stage_receipt_path(temp_dir.path(), wiki, version, "ingest");
+        fs::create_dir_all(&receipt)?;
+
+        let error = ingest_wiki_snapshot(wiki, version, temp_dir.path())
+            .expect_err("receipt rename failure must fail the ingest stage");
+        assert!(!error.to_string().is_empty());
         Ok(())
     }
 

@@ -5,6 +5,7 @@ mod compute;
 #[cfg(test)]
 mod end_to_end_tests;
 mod fetch;
+mod fingerprint;
 mod ingest;
 mod merge;
 mod observability;
@@ -85,6 +86,28 @@ enum Commands {
     SnapshotFinalize {
         /// Wiki database names
         wikis: Vec<String>,
+    },
+
+    /// Exit successfully only when the published site stage is reusable
+    SiteFingerprintCheck {
+        /// Observable project directory
+        #[arg(long, default_value = "site")]
+        site_dir: PathBuf,
+
+        /// Published site distribution directory
+        #[arg(long, default_value = "site/dist")]
+        dist_dir: PathBuf,
+    },
+
+    /// Record the successfully published site stage
+    SiteFingerprintRecord {
+        /// Observable project directory
+        #[arg(long, default_value = "site")]
+        site_dir: PathBuf,
+
+        /// Published site distribution directory
+        #[arg(long, default_value = "site/dist")]
+        dist_dir: PathBuf,
     },
 
     /// Download and parse patrol logging data
@@ -368,6 +391,18 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
                     ops.finalize_snapshot(wiki, &data_dir)
                 })?;
             }
+        }
+
+        Commands::SiteFingerprintCheck { site_dir, dist_dir } => {
+            anyhow::ensure!(
+                fingerprint::site_is_reusable(&output_dir, &site_dir, &dist_dir)?,
+                "site stage fingerprint changed"
+            );
+            info!(path = %dist_dir.display(), "reusing deterministic site stage");
+        }
+
+        Commands::SiteFingerprintRecord { site_dir, dist_dir } => {
+            fingerprint::record_site(&output_dir, &site_dir, &dist_dir)?;
         }
 
         Commands::PatrolFetch { wikis } => {
@@ -1305,6 +1340,73 @@ mod tests {
             .single()
             .expect("valid timestamp");
         assert_eq!(snapshot_version_for(january), "2025-12");
+    }
+
+    #[test]
+    fn run_with_ops_records_checks_and_invalidates_site_fingerprint() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let output_dir = TestDir::new()?;
+        let site_dir = TestDir::new()?;
+        let dist_dir = TestDir::new()?;
+        fs::create_dir_all(site_dir.path().join("src"))?;
+        fs::create_dir_all(site_dir.path().join("data-build"))?;
+        fs::write(output_dir.path().join("metric.json"), "{}")?;
+        fs::write(
+            output_dir.path().join(".publication-candidate.json"),
+            r#"{"artifacts":[{"name":"metric.json"}]}"#,
+        )
+        .expect("candidate fixture should be written");
+        fs::write(
+            output_dir.path().join(publication::RECEIPT_FILE),
+            r#"{"selected_snapshot_versions":{"nlwiki":"2026-07"}}"#,
+        )
+        .expect("gate fixture should be written");
+        fs::write(site_dir.path().join("src/index.md"), "# Site")?;
+        fs::write(site_dir.path().join("data-build/manifest.sh"), "true")?;
+        fs::write(
+            site_dir.path().join("observablehq.config.js"),
+            "export default {}",
+        )
+        .expect("site config fixture should be written");
+        fs::write(site_dir.path().join("package.json"), "{}")?;
+        fs::write(site_dir.path().join("package-lock.json"), "{}")?;
+        fs::write(dist_dir.path().join("index.html"), "published")?;
+        let command = |command| Cli {
+            data_dir: data_dir.path().to_path_buf(),
+            output_dir: output_dir.path().to_path_buf(),
+            run_id: None,
+            command,
+        };
+
+        run_with_ops(
+            command(Commands::SiteFingerprintRecord {
+                site_dir: site_dir.path().to_path_buf(),
+                dist_dir: dist_dir.path().to_path_buf(),
+            }),
+            &RecordingOps::default(),
+        )
+        .expect("site fingerprint should record");
+        run_with_ops(
+            command(Commands::SiteFingerprintCheck {
+                site_dir: site_dir.path().to_path_buf(),
+                dist_dir: dist_dir.path().to_path_buf(),
+            }),
+            &RecordingOps::default(),
+        )
+        .expect("unchanged site should be reusable");
+
+        fs::write(site_dir.path().join("src/index.md"), "# Changed")?;
+        assert!(
+            run_with_ops(
+                command(Commands::SiteFingerprintCheck {
+                    site_dir: site_dir.path().to_path_buf(),
+                    dist_dir: dist_dir.path().to_path_buf(),
+                }),
+                &RecordingOps::default(),
+            )
+            .is_err()
+        );
+        Ok(())
     }
 
     #[test]

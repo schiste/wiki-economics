@@ -7,10 +7,12 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::info;
 
+use crate::fingerprint::{self, StageSpec, TrackedPath};
 use crate::observability::MemorySnapshot;
 use crate::wiki_lifecycle;
 
 const MERGE_BATCH_ROWS: usize = 250_000;
+const MERGE_ALGORITHM_VERSION: &str = "merged-metrics-v2-bounded-atomic";
 const DASHBOARD_GENERATORS: [&str; 12] = [
     "defaults_business.json.cjs",
     "defaults_edit_variation.json.cjs",
@@ -47,6 +49,83 @@ fn merge_outputs_from_dir(
     let metric_files = collect_metric_files(output_dir, published_wikis.as_ref())?;
     let mut artifact_names: Vec<String> = metric_files.keys().cloned().collect();
 
+    artifact_names.extend(DASHBOARD_GENERATORS.iter().map(|name| {
+        name.trim_end_matches(".sh")
+            .trim_end_matches(".cjs")
+            .to_string()
+    }));
+    artifact_names.sort();
+    let mut inputs = Vec::new();
+    for paths in metric_files.values() {
+        for path in paths {
+            let wiki = path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .context("metric input has no wiki directory")?;
+            let filename = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("metric input has no filename")?;
+            inputs.push(TrackedPath::new(
+                format!("wiki-output/{wiki}/{filename}"),
+                path,
+            ));
+        }
+    }
+    for generator in DASHBOARD_GENERATORS {
+        inputs.push(TrackedPath::new(
+            format!("generator/{generator}"),
+            generator_dir.join(generator),
+        ));
+    }
+    let lifecycle_file = lifecycle_path
+        .clone()
+        .unwrap_or_else(|| PathBuf::from("config/wiki-lifecycle.json"));
+    inputs.push(TrackedPath::new(
+        "config/wiki-lifecycle.json",
+        lifecycle_file,
+    ));
+    let outputs: Vec<_> = artifact_names
+        .iter()
+        .map(|name| TrackedPath::new(format!("merged/{name}"), output_dir.join(name)))
+        .collect();
+    let compute_receipts = output_dir.join("_stages").join("compute");
+    let mut snapshots = Vec::new();
+    if compute_receipts.is_dir() {
+        for entry in fs::read_dir(&compute_receipts)? {
+            let path = entry?.path();
+            if path
+                .extension()
+                .is_some_and(|extension| extension == "json")
+                && let Ok(receipt) = fingerprint::read_receipt(&path)
+                && published_wikis
+                    .as_ref()
+                    .is_none_or(|published| published.contains(&receipt.scope))
+                && let Some(snapshot) = receipt.selected_snapshot
+            {
+                snapshots.push(format!("{}={snapshot}", receipt.scope));
+            }
+        }
+    }
+    snapshots.sort();
+    let selected_snapshot = (!snapshots.is_empty()).then(|| snapshots.join(","));
+    let receipt_path = output_dir.join("_stages").join("merge.json");
+    let spec = StageSpec {
+        stage: "merge",
+        scope: "published-wikis",
+        selected_snapshot: selected_snapshot.as_deref(),
+        algorithm_version: MERGE_ALGORITHM_VERSION,
+    };
+    if fingerprint::reusable(&receipt_path, spec, &inputs, &outputs)? {
+        crate::publication::record_candidate(output_dir, run_id, &artifact_names)?;
+        info!(
+            receipt = %receipt_path.display(),
+            "reusing deterministic merge stage"
+        );
+        return Ok(());
+    }
+
     for (metric_name, mut paths) in metric_files {
         paths.sort();
         let dest = output_dir.join(&metric_name);
@@ -54,11 +133,7 @@ fn merge_outputs_from_dir(
     }
 
     materialize_dashboard_artifacts_from_dir(output_dir, generator_dir)?;
-    artifact_names.extend(DASHBOARD_GENERATORS.iter().map(|name| {
-        name.trim_end_matches(".sh")
-            .trim_end_matches(".cjs")
-            .to_string()
-    }));
+    fingerprint::record(&receipt_path, spec, &inputs, &outputs)?;
     crate::publication::record_candidate(output_dir, run_id, &artifact_names)?;
 
     info!(output_dir = %output_dir.display(), "finished merge");
@@ -340,6 +415,56 @@ mod tests {
             LazyFrame::scan_parquet(merged_path.as_str().into(), Default::default())?.collect()?;
         assert_eq!(merged.height(), 2);
 
+        Ok(())
+    }
+
+    #[test]
+    fn merge_reuses_content_but_reissues_candidate_for_current_run() -> Result<()> {
+        init_test_tracing();
+        let output_dir = TestDir::new()?;
+        let generator_dir = TestDir::new()?;
+        write_generators(generator_dir.path())?;
+        write_metric(output_dir.path(), "testwiki", "metric", 1)?;
+        let metric_input = output_dir.path().join("testwiki/metric.parquet");
+        fingerprint::record(
+            &output_dir.path().join("_stages/compute/testwiki.json"),
+            StageSpec {
+                stage: "compute",
+                scope: "testwiki",
+                selected_snapshot: Some("2026-08"),
+                algorithm_version: "fixture-v1",
+            },
+            &[],
+            &[TrackedPath::new(
+                "output/testwiki/metric.parquet",
+                metric_input,
+            )],
+        )
+        .expect("compute fixture receipt should be recorded");
+        crate::publication::begin_run(
+            output_dir.path(),
+            Some("run-one"),
+            &["testwiki".to_string()],
+            Some("2026-08"),
+        )
+        .expect("first publication run should begin");
+        merge_outputs_from_dir(output_dir.path(), generator_dir.path(), Some("run-one"))?;
+        let merged = output_dir.path().join("metric.parquet");
+        let modified = fs::metadata(&merged)?.modified()?;
+
+        crate::publication::begin_run(
+            output_dir.path(),
+            Some("run-two"),
+            &["testwiki".to_string()],
+            Some("2026-08"),
+        )
+        .expect("second publication run should begin");
+        merge_outputs_from_dir(output_dir.path(), generator_dir.path(), Some("run-two"))?;
+
+        assert_eq!(fs::metadata(merged)?.modified()?, modified);
+        let candidate_bytes = fs::read(output_dir.path().join(".publication-candidate.json"))?;
+        let candidate: serde_json::Value = serde_json::from_slice(&candidate_bytes)?;
+        assert_eq!(candidate["run_id"], "run-two");
         Ok(())
     }
 
