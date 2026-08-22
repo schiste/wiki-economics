@@ -10,14 +10,6 @@ done
 DATA_DIR="${WIKI_ECON_DATA_DIR:-$ROOT/data}"
 OUTPUT_DIR="${WIKI_ECON_OUTPUT_DIR:-$ROOT/output}"
 LIFECYCLE_JSON=$(node "$ROOT/scripts/wiki-lifecycle.cjs" json)
-GENERATED_AT=$(node -e '
-const fs = require("node:fs");
-const manifest = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
-if (typeof manifest.generated_at !== "string" || manifest.generated_at.length === 0) {
-  throw new Error("pipeline manifest is missing generated_at");
-}
-process.stdout.write(manifest.generated_at);
-' "$OUTPUT_DIR/manifest.json")
 
 json_file_list() {
   local glob_root="$1"
@@ -48,7 +40,7 @@ done
 ALL_WIKIS=$(echo "$ALL_WIKIS" | tr ' ' '\n' | sort -u | grep -v '^$')
 
 echo "{"
-printf '  "generated_at": "%s",\n' "$GENERATED_AT"
+printf '  "generated_at": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 printf '  "data_dir": "%s",\n' "$DATA_DIR"
 printf '  "output_dir": "%s",\n' "$OUTPUT_DIR"
 printf '  "lifecycle": %s,\n' "$LIFECYCLE_JSON"
