@@ -564,6 +564,10 @@ mod tests {
         assert_eq!(first.fingerprint, second.fingerprint);
 
         std::thread::sleep(std::time::Duration::from_millis(10));
+        fs::write(&input, "input")?;
+        assert!(reusable(&receipt_path, spec, &inputs, &outputs)?);
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
         fs::write(&output, "change")?;
         assert!(!reusable(&receipt_path, spec, &inputs, &outputs)?);
         let missing_reusable = reusable(&dir.path().join("missing.json"), spec, &inputs, &outputs)
@@ -689,10 +693,7 @@ mod tests {
         )
         .expect("gate fixture should be written");
         fs::write(site.join("src/nested/index.md"), "# Site")?;
-        fs::write(
-            site.join("src/.observablehq/cache/generated.js"),
-            "transient",
-        )?;
+        fs::write(site.join("src/.observablehq/cache/generated.js"), "transient")?;
         fs::write(site.join("data-build/manifest.sh"), "true")?;
         fs::write(site.join("observablehq.config.js"), "export default {}")?;
         fs::write(site.join("package.json"), "{}")?;
