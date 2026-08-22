@@ -95,13 +95,15 @@ DuckDB serves two roles:
 ```
 data/
   raw/<wiki>/              ← downloaded .tsv.bz2 dumps
-  warehouse/<wiki>/        ← wide normalized Parquet (for future metrics)
+  warehouse/<wiki>/_snapshots/<snapshot>/
     year=YYYY/
-      year_month=YYYY-MM/
-  parquet/<wiki>/           ← slim analytical Parquet (compute input)
+      year_month=YYYY-MM/   ← wide normalized Parquet
+  parquet/<wiki>/_snapshots/<snapshot>/
     year=YYYY/
-      year_month=YYYY-MM/
-    _markers/               ← ingest completion markers
+      year_month=YYYY-MM/   ← slim analytical Parquet
+    _markers/               ← generation-scoped ingest markers
+  snapshots/<wiki>/
+    current-snapshot.json   ← atomically selected generation
 
 output/
   <wiki>/                   ← per-wiki metric Parquet files

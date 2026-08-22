@@ -53,9 +53,13 @@ Toolforge entirely.
   keeps the on-disk transient peak lower — the raw dump doesn't linger
   through the rest of that wiki's own compute/patrol stages, through every
   other wiki's full pipeline, and through the final merge. It's safe because
-  `src/storage.rs::marker_manifest_is_valid` only checks that the
-  warehouse/analytical parquet outputs exist, never the raw source file —
-  later refreshes stay idempotent without it. `wiki-econ fetch` also
+  generation-scoped ingest markers validate warehouse/analytical outputs,
+  never the raw source file — later refreshes stay idempotent without it.
+  A new monthly snapshot is written beside the active generation and selected
+  atomically; the previous generation is retained through compute, merge, and
+  site publication, then `snapshot-finalize` removes it. This intentionally
+  creates a short-lived two-generation storage peak during rollover.
+  `wiki-econ fetch` also
   preflights available disk space against the summed remote dump size
   before downloading anything, so an undersized quota (e.g. frwiki's ~31GB
   peak) fails fast instead of after partially downloading a large dump.

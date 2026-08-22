@@ -30,9 +30,20 @@ the pipeline still produces output.
 ## Ingest "marker is valid" skip when you expect a rebuild
 
 Ingest is idempotent based on the marker manifest at
-`data/parquet/<wiki>/_markers/<source>.done`. To force a rebuild, delete
-the relevant marker file (or the whole `_markers/` directory) and rerun
-ingest. The architecture document has more on this contract.
+`data/parquet/<wiki>/_snapshots/<snapshot>/_markers/<source>.done` for
+versioned dumps. To force a rebuild, delete the relevant marker inside that
+snapshot generation and rerun ingest with the same `--version`. Older local
+fixtures may still use the legacy `data/parquet/<wiki>/_markers/` location
+until their first versioned ingest. The architecture document has more on
+this contract.
+
+## Ingest reports multiple or incomplete snapshots
+
+Standalone ingest refuses to guess when `data/raw/<wiki>/` contains multiple
+snapshot versions, and it will not publish a generation missing an expected
+yearly shard. Pass the intended `--version YYYY-MM` after fetch completes.
+Explicit selection ignores older abandoned raw files; successful refresh
+cleanup removes them afterward.
 
 ## `cargo llvm-cov` reports an uncovered line
 

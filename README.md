@@ -75,12 +75,16 @@ Expanded equivalent:
 
 ```sh
 cargo run --release --locked -- fetch frwiki
-cargo run --release --locked -- ingest frwiki
+cargo run --release --locked -- ingest frwiki --version YYYY-MM
 cargo run --release --locked -- compute frwiki
 cargo run --release --locked -- merge
 ```
 
-Pass `--version YYYY-MM` to `fetch` or `run` when you need a specific dump snapshot. If omitted, the CLI defaults to the previous UTC month.
+Pass `--version YYYY-MM` to `fetch`, `ingest`, or `run` when you need a
+specific dump snapshot. If omitted, `fetch` and `run` default to the previous
+UTC month, while standalone ingest infers the version from raw filenames.
+Versioned ingest outputs are isolated by snapshot and atomically selected only
+after the complete source set validates.
 
 Build the production site against the current local artifacts:
 

@@ -9,10 +9,10 @@ The project has five distinct data layers rooted under `data/` and `output/`:
 1. `data/raw/<wiki>/...tsv.bz2`
    Wikimedia MediaWiki History dump shards fetched from `dumps.wikimedia.org`.
 
-2. `data/warehouse/<wiki>/year=<YYYY>/year_month=<YYYY-MM>/*.parquet`
+2. `data/warehouse/<wiki>/_snapshots/<snapshot>/year=<YYYY>/year_month=<YYYY-MM>/*.parquet`
    Filtered and normalized revision-create rows with a wider set of columns.
 
-3. `data/parquet/<wiki>/year=<YYYY>/year_month=<YYYY-MM>/*.parquet`
+3. `data/parquet/<wiki>/_snapshots/<snapshot>/year=<YYYY>/year_month=<YYYY-MM>/*.parquet`
    Ultra-slim analytical layer used by the compute pipeline.
 
 4. `output/<wiki>/*.parquet`
@@ -27,11 +27,17 @@ the checked-in scripts.
 
 The online-facing layer should use `output/`. The compute pipeline should use `data/parquet/`. The `data/warehouse/` layer exists for future metric work that needs more than the analytical columns.
 
-There is also an operational location that matters during ingest:
+Two operational locations matter during ingest:
 
-- `data/parquet/<wiki>/_markers/<source>.done`
+- `data/parquet/<wiki>/_snapshots/<snapshot>/_markers/<source>.done`
+- `data/snapshots/<wiki>/current-snapshot.json`
 
-Those marker files are the ingest completion contract for a source dump. They are written only after both analytical and warehouse parquet outputs complete successfully.
+Marker files are the ingest completion contract for a source dump. The current
+snapshot pointer is atomically replaced only after every expected source for a
+generation has valid analytical and warehouse outputs. Compute resolves that
+pointer and therefore never scans two full monthly snapshots together. The
+older generation remains a rollback source until the site build succeeds;
+`snapshot-finalize` then removes it and any pre-generation legacy partitions.
 
 ## Fetching
 
@@ -54,10 +60,13 @@ Important decisions:
 
 - Ingest now filters to `event_entity = revision` and `event_type = create` before writing parquet. This is the single biggest storage reduction in the local pipeline.
 - Ingest no longer writes a full temporary TSV to disk. It decompresses `bz2` into in-memory CSV chunks, parses them with Polars, and writes parquet partitions directly.
-- Source files are tracked by marker files under `parquet/<wiki>/_markers/`. Reruns skip a source only when the marker still validates both the analytical and warehouse outputs for that source.
+- Source files are tracked by marker files inside their immutable snapshot generation. Reruns skip a source only when the marker still validates both the analytical and warehouse outputs for that source.
+- Versioned Wikimedia filenames must form one complete expected snapshot before `current-snapshot.json` is published. Explicit `run --version` and `ingest --version` selections ignore abandoned raw files from older snapshots.
+- Readers retain a legacy-layout fallback only until the first generation pointer is published. Underscore-prefixed staging/generation directories are never recursively scanned as ordinary data.
 - Output is partitioned by `year=` and `year_month=` because the downstream metrics are monthly. This keeps month-scoped compute exact without loading an entire wiki.
 - The slim analytical layer is intentionally duplicated from the warehouse layer. This trades some disk space for much lower compute-time scan and memory cost.
 - Ingest failure cleanup must stay symmetric: if a source fails partway through, both analytical and warehouse partial outputs are removed and the marker is not left behind.
+- Snapshot retirement happens only after compute, merge, and the atomic site publication all succeed. `--skip-site-build` deliberately retains the prior generation.
 
 Schema contracts live in [src/schema.rs](../src/schema.rs):
 
