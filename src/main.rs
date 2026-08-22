@@ -137,6 +137,9 @@ enum Commands {
 }
 
 trait Ops {
+    fn resolve_snapshot(&self, _wikis: &[String], now: DateTime<Utc>) -> Result<String> {
+        Ok(snapshot_version_for(now))
+    }
     fn fetch_wiki(&self, wiki: &str, version: &str, data_dir: &std::path::Path) -> Result<()>;
     fn fetch_patrol(&self, wiki: &str, data_dir: &std::path::Path) -> Result<()>;
     fn ingest_wiki(
@@ -176,6 +179,10 @@ trait Ops {
 struct RealOps;
 
 impl Ops for RealOps {
+    fn resolve_snapshot(&self, wikis: &[String], now: DateTime<Utc>) -> Result<String> {
+        fetch::resolve_latest_completed_snapshot(wikis, now)
+    }
+
     fn fetch_wiki(&self, wiki: &str, version: &str, data_dir: &std::path::Path) -> Result<()> {
         fetch::fetch_wiki(wiki, version, data_dir).map(|_| ())
     }
@@ -282,10 +289,6 @@ fn snapshot_version_for(now: DateTime<Utc>) -> String {
     format!("{year:04}-{month:02}")
 }
 
-fn default_snapshot_version() -> String {
-    snapshot_version_for(Utc::now())
-}
-
 fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
     let data_dir = cli.data_dir;
     let output_dir = cli.output_dir;
@@ -293,7 +296,12 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
 
     match cli.command {
         Commands::Fetch { wikis, version } => {
-            let version = version.unwrap_or_else(default_snapshot_version);
+            let version = match version {
+                Some(version) => version,
+                None => run_timed_stage("snapshot_resolve", None, || {
+                    ops.resolve_snapshot(&wikis, Utc::now())
+                })?,
+            };
             for wiki in &wikis {
                 run_timed_stage("fetch", Some(wiki), || {
                     ops.fetch_wiki(wiki, &version, &data_dir)
@@ -401,7 +409,12 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
         }
 
         Commands::Run { wikis, version } => {
-            let version = version.unwrap_or_else(default_snapshot_version);
+            let version = match version {
+                Some(version) => version,
+                None => run_timed_stage("snapshot_resolve", None, || {
+                    ops.resolve_snapshot(&wikis, Utc::now())
+                })?,
+            };
             publication::begin_run(&output_dir, run_id.as_deref(), &wikis, Some(&version))?;
             for wiki in &wikis {
                 info!(wiki = wiki, "running full pipeline");

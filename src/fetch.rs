@@ -36,6 +36,8 @@ const FETCH_MAX_BACKOFF_MS: u64 = 30_000;
 /// slow/misconfigured server value can't stall a retry loop indefinitely.
 const FETCH_RETRY_AFTER_MAX_SECS: u64 = 30;
 const FETCH_MAX_PARALLELISM_ENV: &str = "WIKI_ECON_FETCH_MAX_PARALLELISM";
+const SNAPSHOT_MAX_LAG_ENV: &str = "WIKI_ECON_MAX_SNAPSHOT_LAG_MONTHS";
+const DEFAULT_SNAPSHOT_MAX_LAG_MONTHS: u32 = 2;
 /// Extra headroom required beyond the summed remote byte total before a
 /// fetch is allowed to start. Not a tight budget — just enough to fail fast
 /// on a clearly undersized quota (e.g. frwiki's ~31GB transient peak against
@@ -481,6 +483,122 @@ struct TransportResponse {
 trait HttpTransport: Sync {
     fn head(&self, url: &str) -> Result<TransportHead>;
     fn get(&self, url: &str, range_start: Option<u64>) -> Result<TransportResponse>;
+}
+
+fn snapshot_version_at_lag(now: chrono::DateTime<chrono::Utc>, lag_months: u32) -> String {
+    use chrono::Datelike;
+
+    let current = i64::from(now.year()) * 12 + i64::from(now.month0());
+    let target = current - i64::from(lag_months);
+    let year = target.div_euclid(12);
+    let month = target.rem_euclid(12) + 1;
+    format!("{year:04}-{month:02}")
+}
+
+fn snapshot_max_lag_months(value: Option<&OsStr>) -> Result<u32> {
+    match value {
+        None => Ok(DEFAULT_SNAPSHOT_MAX_LAG_MONTHS),
+        Some(value) => {
+            let parsed = value
+                .to_str()
+                .context(format!("{SNAPSHOT_MAX_LAG_ENV} is not valid UTF-8"))?
+                .parse::<u32>()
+                .with_context(|| format!("{SNAPSHOT_MAX_LAG_ENV} must be a positive integer"))?;
+            anyhow::ensure!(
+                parsed > 0,
+                "{SNAPSHOT_MAX_LAG_ENV} must be at least 1 month"
+            );
+            Ok(parsed)
+        }
+    }
+}
+
+fn snapshot_source_exists<T: HttpTransport>(transport: &T, url: &str) -> Result<bool> {
+    let mut last_error = None;
+    for attempt in 1..=FETCH_MAX_RETRIES {
+        let mut rate_limited = false;
+        let mut retry_after = None;
+        match transport.head(url) {
+            Ok(response) if response.status.is_success() => return Ok(true),
+            Ok(response) if response.status == StatusCode::NOT_FOUND => return Ok(false),
+            Ok(response) if is_retryable_status(response.status) => {
+                rate_limited = response.status == StatusCode::TOO_MANY_REQUESTS;
+                retry_after = response.retry_after;
+                last_error = Some(anyhow::anyhow!("HTTP {} for {}", response.status, url));
+            }
+            Ok(response) => anyhow::bail!(
+                "cannot determine dump completion: HTTP {} for {}",
+                response.status,
+                url
+            ),
+            Err(error) => last_error = Some(error),
+        }
+        if attempt < FETCH_MAX_RETRIES {
+            sleep_before_retry(attempt, rate_limited, retry_after);
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow::anyhow!("metadata probe failed for {url}")))
+}
+
+fn snapshot_is_complete<T: HttpTransport>(
+    transport: &T,
+    base_url: &str,
+    wikis: &[String],
+    version: &str,
+) -> Result<bool> {
+    for wiki in wikis {
+        let mut files = build_file_list(wiki, version)?;
+        files.reverse();
+        for filename in files {
+            let url = format!("{base_url}/{version}/{wiki}/{filename}");
+            if !snapshot_source_exists(transport, &url)? {
+                info!(wiki, version, source = filename, "snapshot is not complete");
+                return Ok(false);
+            }
+        }
+    }
+    Ok(true)
+}
+
+fn resolve_latest_completed_snapshot_with_transport<T: HttpTransport>(
+    transport: &T,
+    base_url: &str,
+    wikis: &[String],
+    now: chrono::DateTime<chrono::Utc>,
+    max_lag_months: u32,
+) -> Result<String> {
+    anyhow::ensure!(
+        !wikis.is_empty(),
+        "snapshot resolution requires at least one wiki"
+    );
+    anyhow::ensure!(max_lag_months > 0, "maximum snapshot lag must be positive");
+    for lag_months in 1..=max_lag_months {
+        let version = snapshot_version_at_lag(now, lag_months);
+        if snapshot_is_complete(transport, base_url, wikis, &version)? {
+            if lag_months > 1 {
+                warn!(
+                    version,
+                    lag_months, "latest expected snapshot is incomplete; using bounded fallback"
+                );
+            }
+            info!(version, lag_months, "selected completed Wikimedia snapshot");
+            return Ok(version);
+        }
+    }
+    anyhow::bail!(
+        "no completed Wikimedia snapshot found for {} within the configured {} month lag",
+        wikis.join(","),
+        max_lag_months
+    )
+}
+
+pub fn resolve_latest_completed_snapshot(
+    wikis: &[String],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<String> {
+    let max_lag = snapshot_max_lag_months(std::env::var_os(SNAPSHOT_MAX_LAG_ENV).as_deref())?;
+    let transport = build_transport()?;
+    resolve_latest_completed_snapshot_with_transport(&transport, BASE_URL, wikis, now, max_lag)
 }
 
 #[derive(Clone)]
@@ -1353,6 +1471,7 @@ pub fn cleanup_raw_dump(wiki: &str, data_dir: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::test_support::{TestDir, init_test_tracing};
+    use chrono::{TimeZone, Utc};
     use std::collections::VecDeque;
     use std::io::{BufRead, BufReader, Cursor, ErrorKind};
     use std::net::TcpListener;
@@ -2299,6 +2418,86 @@ mod tests {
         assert!(paths.is_empty());
         assert_eq!(transport.get_requests(), 0);
         Ok(())
+    }
+
+    #[test]
+    fn snapshot_resolution_uses_latest_complete_bounded_fallback() -> Result<()> {
+        init_test_tracing();
+        let transport = FakeTransport::with_head_outcomes([
+            status_head(StatusCode::NOT_FOUND),
+            ok_head(Some(42), false),
+        ]);
+        let now = Utc.with_ymd_and_hms(2026, 8, 22, 0, 0, 0).unwrap();
+
+        let selected = resolve_latest_completed_snapshot_with_transport(
+            &transport,
+            "http://example.invalid",
+            &["simplewiki".to_string()],
+            now,
+            2,
+        )?;
+
+        assert_eq!(selected, "2026-06");
+        assert_eq!(snapshot_version_at_lag(now, 8), "2025-12");
+        assert_eq!(snapshot_max_lag_months(None)?, 2);
+        assert_eq!(snapshot_max_lag_months(Some(OsStr::new("4")))?, 4);
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_resolution_fails_closed_on_configuration_or_stale_dumps() {
+        let now = Utc.with_ymd_and_hms(2026, 8, 22, 0, 0, 0).unwrap();
+        assert!(snapshot_max_lag_months(Some(OsStr::new("0"))).is_err());
+        assert!(snapshot_max_lag_months(Some(OsStr::new("old"))).is_err());
+        assert!(
+            resolve_latest_completed_snapshot_with_transport(
+                &FakeTransport::default(),
+                "http://example.invalid",
+                &[],
+                now,
+                2,
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_latest_completed_snapshot_with_transport(
+                &FakeTransport::default(),
+                "http://example.invalid",
+                &["simplewiki".to_string()],
+                now,
+                0,
+            )
+            .is_err()
+        );
+        let missing = FakeTransport::with_head_outcomes([
+            status_head(StatusCode::NOT_FOUND),
+            status_head(StatusCode::NOT_FOUND),
+        ]);
+        let error = resolve_latest_completed_snapshot_with_transport(
+            &missing,
+            "http://example.invalid",
+            &["simplewiki".to_string()],
+            now,
+            2,
+        )
+        .expect_err("old snapshots must not be silently selected");
+        assert!(
+            error
+                .to_string()
+                .contains("no completed Wikimedia snapshot")
+        );
+    }
+
+    #[test]
+    fn snapshot_completion_probe_rejects_indeterminate_http_status() {
+        let transport = FakeTransport::with_head_outcomes([status_head(StatusCode::FORBIDDEN)]);
+        let error = snapshot_source_exists(&transport, TEST_URL)
+            .expect_err("completion requires an authoritative status");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot determine dump completion")
+        );
     }
 
     #[test]
