@@ -12,7 +12,8 @@ use crate::observability::MemorySnapshot;
 use crate::wiki_lifecycle;
 
 const MERGE_BATCH_ROWS: usize = 250_000;
-const MERGE_ALGORITHM_VERSION: &str = "merged-metrics-v2-bounded-atomic";
+const MERGE_ALGORITHM_VERSION: &str = "merged-metrics-v3-generation-readiness";
+const GENERATOR_DEPENDENCIES: [&str; 1] = ["manifest.json.cjs"];
 const DASHBOARD_GENERATORS: [&str; 12] = [
     "defaults_business.json.cjs",
     "defaults_edit_variation.json.cjs",
@@ -77,6 +78,12 @@ fn merge_outputs_from_dir(
         inputs.push(TrackedPath::new(
             format!("generator/{generator}"),
             generator_dir.join(generator),
+        ));
+    }
+    for dependency in GENERATOR_DEPENDENCIES {
+        inputs.push(TrackedPath::new(
+            format!("generator/{dependency}"),
+            generator_dir.join(dependency),
         ));
     }
     let lifecycle_file = lifecycle_path
@@ -395,6 +402,13 @@ mod tests {
                 "#!/bin/sh\nprintf '{\"ok\":true}'\n"
             };
             fs::write(generator_dir.join(script_name), body)?;
+        }
+        for dependency in GENERATOR_DEPENDENCIES {
+            fs::write(
+                generator_dir.join(dependency),
+                "// fingerprint dependency\n",
+            )
+            .expect("generator dependency fixture should be writable");
         }
         Ok(())
     }

@@ -119,8 +119,14 @@ Important decisions:
 - merge only reads per-wiki metric files from `output/<wiki>/`
 - merged outputs are written to `output/<metric>.parquet`
 - merge also materializes the shared dashboard JSON artifacts (`defaults_*.json`, `manifest.json`) from the checked-in generators under `site/data-build/` so the site does not rely on stale Observable cache loaders
+- manifest readiness follows `current-snapshot.json` and its matching ingest
+  receipt; deleted raw transport files are diagnostic only and never make a
+  completed generation look unfetched. Patrol readiness counts Parquet rows,
+  so a header-only or zero-row file cannot appear ready.
 - every declared JSON generator is critical: output is parsed and atomically
   replaced, and any missing, malformed, or failed generator stops merge
+- generator implementations are deterministic merge-fingerprint inputs, so a
+  readiness-code change invalidates reuse and regenerates the published JSON
 - merge assumes every per-wiki metric output already includes a `wiki` column
 
 If a new metric omits the `wiki` column, merge will still concatenate files, but the combined output will be much less useful. Keep the `wiki` column in per-wiki outputs.

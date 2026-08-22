@@ -97,7 +97,8 @@ function wikipediaProjectSearchText(wiki) {
 }
 
 function preferredSnapshotVersion(wikiStatus = null) {
-  return validSnapshotVersion(wikiStatus?.raw?.version)
+  return validSnapshotVersion(wikiStatus?.snapshot?.version)
+    ?? validSnapshotVersion(wikiStatus?.raw?.version)
     ?? validSnapshotVersion(adminUiState.snapshotVersion)
     ?? validSnapshotVersion(jobStatus.value?.suggestedVersion)
     ?? null
@@ -646,11 +647,11 @@ function stageStateForWiki(wiki, stageKey, isRunning, runningProgress) {
 
   switch (stageKey) {
     case "fetch":
-      return wiki.raw.files > 0 ? "done" : "todo"
+      return wiki.snapshot?.ready || wiki.raw.files > 0 ? "done" : "todo"
     case "patrol_fetch":
-      return wiki.patrol?.source_ready ? "done" : (wiki.raw.files > 0 ? "todo" : "blocked")
+      return wiki.patrol?.source_ready ? "done" : (wiki.snapshot?.ready || wiki.raw.files > 0 ? "todo" : "blocked")
     case "ingest":
-      return wiki.parquet.done > 0 && wiki.parquet.done >= wiki.parquet.total && wiki.parquet.in_progress === 0
+      return wiki.snapshot?.ready || (wiki.parquet.done > 0 && wiki.parquet.done >= wiki.parquet.total && wiki.parquet.in_progress === 0)
         ? "done"
         : wiki.raw.files > 0
         ? "todo"
@@ -659,7 +660,7 @@ function stageStateForWiki(wiki, stageKey, isRunning, runningProgress) {
       const coreMetricCount = (wiki.metrics || []).filter((metric) => metric.name !== "patrol").length
       return coreMetricCount >= 8
         ? "done"
-        : wiki.parquet.done > 0
+        : wiki.snapshot?.ready || wiki.parquet.done > 0
         ? "todo"
         : "blocked"
     }
@@ -675,11 +676,13 @@ function stageStateForWiki(wiki, stageKey, isRunning, runningProgress) {
 function stageCaption(wiki, stageKey) {
   switch (stageKey) {
     case "fetch":
-      return wiki.raw.files > 0 ? `${wiki.raw.files} files` : "Missing"
+      return wiki.snapshot?.ready
+        ? `Snapshot ${wiki.snapshot.version || "ready"}`
+        : wiki.raw.files > 0 ? `${wiki.raw.files} files` : "Missing"
     case "patrol_fetch":
       return `${Number(wiki.patrol?.xml || 0) + Number(wiki.patrol?.events || 0) + Number(wiki.patrol?.rights || 0) + Number(wiki.patrol?.groups || 0)}/4 ready`
     case "ingest":
-      return `${wiki.parquet.done}/${wiki.parquet.total || 0}`
+      return wiki.snapshot?.ready ? `${wiki.ingest?.rows || 0} rows` : `${wiki.parquet.done}/${wiki.parquet.total || 0}`
     case "compute":
       return `${(wiki.metrics || []).filter((metric) => metric.name !== "patrol").length}/8`
     case "patrol_compute":
@@ -1062,7 +1065,10 @@ const selectedWikiRunning = Boolean(job?.running && job?.progress?.wiki === sele
       header: {file: "File", size: "Size", downloaded: "Downloaded"},
       sort: "file", rows: 15
     })}`
-  : html`<div class="warning">No raw dumps found for <strong>${selectedWiki}</strong>.</div>
+  : w.snapshot?.ready
+  ? html`<p>The raw transport files were cleaned after validating snapshot <code>${w.snapshot.version}</code>.
+      The immutable ingest generation remains ready with <strong>${w.ingest?.rows || 0}</strong> rows.</p>`
+  : html`<div class="warning">No raw dumps or validated snapshot found for <strong>${selectedWiki}</strong>.</div>
     ${apiStatus
       ? html`<button class="admin-btn primary" title=${actionTooltipWithApi("fetch", apiStatus)} onclick=${() => runCommand("fetch", {wiki: selectedWiki, version: preferredSnapshotVersion(w)})}>Fetch missing</button>`
       : html`<pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && ${runnerCommand()} ${cliFlags(currentManifest)} fetch ${selectedWiki}</pre>`

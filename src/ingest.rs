@@ -549,7 +549,6 @@ fn ingest_wiki_for_snapshot(
     }
 
     if let Some(snapshot_version) = snapshot_version.as_deref() {
-        storage::publish_current_snapshot(data_dir, wiki, snapshot_version)?;
         let inputs = ingest_stage_inputs(data_dir, &roots, &src_files)?;
         let outputs = ingest_stage_outputs(data_dir, &roots)?;
         fingerprint::record(
@@ -563,6 +562,7 @@ fn ingest_wiki_for_snapshot(
             &inputs,
             &outputs,
         )?;
+        storage::publish_current_snapshot(data_dir, wiki, snapshot_version)?;
     }
 
     let analytical_paths = storage::collect_parquet_files(&roots.analytical)?;
