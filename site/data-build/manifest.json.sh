@@ -9,6 +9,7 @@ done
 
 DATA_DIR="${WIKI_ECON_DATA_DIR:-$ROOT/data}"
 OUTPUT_DIR="${WIKI_ECON_OUTPUT_DIR:-$ROOT/output}"
+LIFECYCLE_JSON=$(node "$ROOT/scripts/wiki-lifecycle.cjs" json)
 
 json_file_list() {
   local glob_root="$1"
@@ -42,6 +43,7 @@ echo "{"
 printf '  "generated_at": "%s",\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 printf '  "data_dir": "%s",\n' "$DATA_DIR"
 printf '  "output_dir": "%s",\n' "$OUTPUT_DIR"
+printf '  "lifecycle": %s,\n' "$LIFECYCLE_JSON"
 
 echo '  "wikis": {'
 first_wiki=true

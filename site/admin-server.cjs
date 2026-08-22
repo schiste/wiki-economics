@@ -19,6 +19,12 @@ const {
   signJsonToken,
   verifyJsonToken,
 } = require("./admin-auth.cjs");
+const {
+  lifecyclePath,
+  loadWikiLifecycle,
+  resolveRefreshWikis,
+  wikisWithState,
+} = require("../scripts/wiki-lifecycle.cjs");
 
 const ROOT = path.resolve(__dirname, "..");
 const RUNTIME_ENV = process.env.WIKI_ECON_ENV || "local";
@@ -59,10 +65,10 @@ const ALLOWED_ORIGINS = resolveAllowedOrigins();
 // (no Kubernetes/Toolforge API credentials in the pod), so the configured
 // schedule is sourced from tool-wide config, not confirmed against Toolforge.
 const REFRESH_SCHEDULE = process.env.WIKI_ECON_REFRESH_SCHEDULE || null;
-const ENABLED_WIKIS = (process.env.WIKI_ECON_ENABLED_WIKIS || "")
-  .split(/[,\s]+/)
-  .map((entry) => entry.trim())
-  .filter(Boolean);
+const WIKI_LIFECYCLE_PATH = lifecyclePath(ROOT);
+const WIKI_LIFECYCLE = loadWikiLifecycle(ROOT);
+const REFRESH_WIKIS = resolveRefreshWikis(WIKI_LIFECYCLE);
+const PUBLISHED_WIKIS = wikisWithState(WIKI_LIFECYCLE, "publication", "published");
 
 let currentJob = null;
 let jobLog = [];
@@ -757,6 +763,7 @@ function refreshManifest(force = false) {
       WIKI_ECON_DATA_DIR: DATA_DIR,
       WIKI_ECON_OUTPUT_DIR: OUTPUT_DIR,
       WIKI_ECON_GENERATOR_DIR: GENERATOR_DIR,
+      WIKI_ECON_WIKI_LIFECYCLE_FILE: WIKI_LIFECYCLE_PATH,
     },
   });
   manifestCache = JSON.parse(output);
@@ -977,6 +984,32 @@ function matchApiPath(pathname) {
   return null;
 }
 
+function wikiLifecycleStatus(now = Date.now()) {
+  return Object.fromEntries(Object.entries(WIKI_LIFECYCLE.wikis).map(([wiki, entry]) => {
+    const metricPath = path.join(OUTPUT_DIR, wiki, "gdp.parquet");
+    let lastPublishedAt = null;
+    try {
+      lastPublishedAt = fs.statSync(metricPath).mtime.toISOString();
+    } catch (error) {
+      if (error.code !== "ENOENT") throw error;
+    }
+    let freshness = entry.refresh === "paused" ? "paused" : "manual";
+    if (entry.refresh === "scheduled") {
+      if (!lastPublishedAt) freshness = "missing";
+      else {
+        const ageDays = (now - Date.parse(lastPublishedAt)) / (24 * 60 * 60 * 1000);
+        freshness = ageDays > entry.freshness_sla_days ? "overdue" : "current";
+      }
+    }
+    return [wiki, {
+      ...entry,
+      imported_cutoff: entry.imported_cutoff ?? null,
+      last_published_at: lastPublishedAt,
+      freshness,
+    }];
+  }));
+}
+
 function buildStatusPayload(req, session) {
   const progress = getProgress();
   const effectiveJob = currentJob
@@ -1011,7 +1044,11 @@ function buildStatusPayload(req, session) {
     adminEnabled: ADMIN_ENABLED,
     adminPort: PORT,
     environment: RUNTIME_ENV,
-    enabledWikis: ENABLED_WIKIS,
+    enabledWikis: REFRESH_WIKIS,
+    refreshWikis: REFRESH_WIKIS,
+    publishedWikis: PUBLISHED_WIKIS,
+    wikiLifecycle: WIKI_LIFECYCLE,
+    wikiStates: wikiLifecycleStatus(),
     runner: runnerInfo(),
     scheduledRefresh: readRefreshStatus(),
     auth: authStatus(session, req),
@@ -1227,6 +1264,7 @@ async function handleRequest(req, res) {
           WIKI_ECON_DATA_DIR: DATA_DIR,
           WIKI_ECON_OUTPUT_DIR: OUTPUT_DIR,
           WIKI_ECON_GENERATOR_DIR: GENERATOR_DIR,
+          WIKI_ECON_WIKI_LIFECYCLE_FILE: WIKI_LIFECYCLE_PATH,
           WIKI_ECON_SITE_DIST_DIR: SITE_DIST_DIR,
         },
       });

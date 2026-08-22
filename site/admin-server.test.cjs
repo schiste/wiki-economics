@@ -28,7 +28,7 @@ const HOSTED_ENV = {
   WIKI_ECON_ADMIN_SECURE_COOKIES: "0",
 };
 
-function loadAdminServer(envOverrides) {
+function loadAdminServer(envOverrides, wikiLifecycle = { schema_version: 1, wikis: {} }) {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-admin-test-"));
   const dataDir = path.join(tempRoot, "data");
   const outputDir = path.join(tempRoot, "output");
@@ -36,6 +36,8 @@ function loadAdminServer(envOverrides) {
   fs.mkdirSync(dataDir, { recursive: true });
   fs.mkdirSync(outputDir, { recursive: true });
   fs.mkdirSync(distDir, { recursive: true });
+  const lifecyclePath = path.join(tempRoot, "wiki-lifecycle.json");
+  fs.writeFileSync(lifecyclePath, JSON.stringify(wikiLifecycle), "utf8");
   fs.writeFileSync(
     path.join(distDir, "admin.html"),
     "<!doctype html><html><body><h1>Admin Test Page</h1></body></html>",
@@ -46,6 +48,7 @@ function loadAdminServer(envOverrides) {
     WIKI_ECON_DATA_DIR: dataDir,
     WIKI_ECON_OUTPUT_DIR: outputDir,
     WIKI_ECON_SITE_DIST_DIR: distDir,
+    WIKI_ECON_WIKI_LIFECYCLE_FILE: lifecyclePath,
     ...envOverrides,
   };
 
@@ -67,8 +70,8 @@ function loadAdminServer(envOverrides) {
   return { module, tempRoot };
 }
 
-async function startServer(t, envOverrides) {
-  const { module, tempRoot } = loadAdminServer(envOverrides);
+async function startServer(t, envOverrides, wikiLifecycle) {
+  const { module, tempRoot } = loadAdminServer(envOverrides, wikiLifecycle);
   t.after(() => {
     delete require.cache[SERVER_MODULE_PATH];
     fs.rmSync(tempRoot, { recursive: true, force: true });
@@ -306,11 +309,29 @@ test("static fallback refuses to escape SITE_DIST_DIR via path traversal", async
   assert.equal(response.statusCode, 404);
 });
 
-test("status reports the resolved runner, environment, and enabled wikis", async (t) => {
-  const { module, host } = await startServer(t, {
+test("status distinguishes scheduled refresh wikis from paused published wikis", async (t) => {
+  const { module, host, outputDir } = await startServer(t, {
     ...LOCAL_ENV,
-    WIKI_ECON_ENABLED_WIKIS: "nlwiki, frwiki",
+    WIKI_ECON_ENABLED_WIKIS: "nlwiki",
+  }, {
+    schema_version: 1,
+    wikis: {
+      frwiki: {
+        publication: "published",
+        refresh: "paused",
+        provenance: "local-import",
+        imported_cutoff: "2026-03",
+      },
+      nlwiki: {
+        publication: "published",
+        refresh: "scheduled",
+        provenance: "toolforge",
+        freshness_sla_days: 10,
+      },
+    },
   });
+  fs.mkdirSync(path.join(outputDir, "nlwiki"), { recursive: true });
+  fs.writeFileSync(path.join(outputDir, "nlwiki", "gdp.parquet"), "published", "utf8");
   // resolveRunner() reads WIKI_ECON_BIN from process.env at request time
   // (not module-load time, unlike DATA_DIR/OUTPUT_DIR/ENABLED_WIKIS), so it
   // must be set around the request rather than via startServer()'s
@@ -327,7 +348,14 @@ test("status reports the resolved runner, environment, and enabled wikis", async
   const body = JSON.parse(response.text());
   assert.equal(body.runner.mode, "bin");
   assert.match(body.runner.label, /wiki-econ/);
-  assert.deepEqual(body.enabledWikis, ["nlwiki", "frwiki"]);
+  assert.deepEqual(body.enabledWikis, ["nlwiki"]);
+  assert.deepEqual(body.refreshWikis, ["nlwiki"]);
+  assert.deepEqual(body.publishedWikis, ["frwiki", "nlwiki"]);
+  assert.equal(body.wikiLifecycle.wikis.frwiki.refresh, "paused");
+  assert.equal(body.wikiStates.frwiki.freshness, "paused");
+  assert.equal(body.wikiStates.frwiki.imported_cutoff, "2026-03");
+  assert.equal(body.wikiStates.nlwiki.freshness, "current");
+  assert.match(body.wikiStates.nlwiki.last_published_at, /^\d{4}-\d{2}-\d{2}T/);
 });
 
 test("status falls back to the cargo runner and no enabled wikis when unset", async (t) => {
