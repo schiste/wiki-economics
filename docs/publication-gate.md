@@ -66,6 +66,8 @@ wiki-econ --output-dir "$WIKI_ECON_OUTPUT_DIR" \
 
 On Toolforge, `.refresh-status.json` and `.refresh-history.jsonl` include the
 same `runId`, so a failed job can be correlated with the candidate or receipt.
+The live status copies validated row/edit/date summaries only from a gate whose
+run ID matches; see the [refresh run record](run-record.md).
 Do not copy an old receipt forward or edit its run ID; fix the failing source,
 rerun merge/validation, and let the pipeline issue a new receipt.
 

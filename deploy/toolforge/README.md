@@ -73,6 +73,9 @@ Toolforge entirely.
   fallback is controlled by `WIKI_ECON_MAX_SNAPSHOT_LAG_MONTHS` (default `2`);
   exceeding it fails closed. Receipt layout and invalidation rules are
   documented in [stage fingerprints](../../docs/stage-fingerprints.md).
+- `run-record.cjs` — the single atomic writer for live refresh status and the
+  bounded terminal history. It folds Rust/site stage events together with
+  cgroup, disk, deployment provenance, and publication-gate data.
 
 ### Refresh single-flight lock
 
@@ -108,6 +111,13 @@ The safety windows can be tuned with
 only for isolated tests; production runs should share the default path.
 `WIKI_ECON_JOB_IDENTITY` may provide a human-readable job label, while
 `WIKI_ECON_PROCESS_IDENTITY` should remain unique to a pod or host if set.
+
+The same heartbeat publishes a schema-versioned live run record immediately
+after lock acquisition, including current stage, resource/provenance data, and
+the selected snapshot. Terminal records add validated data summaries, failure
+context, and the published site generation; 104 compact weekly entries are
+retained by default. See the [refresh run record](../../docs/run-record.md) for
+the field contract and operator checks.
 
 ## Runbook
 
@@ -184,7 +194,7 @@ and after the build when pinning it to a release:
 ```sh
 test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$release_sha"
 ssh login.toolforge.org \
-  "become wiki-economics bash -s -- 'https://github.com/schiste/wiki-economics.git' main" \
+  "become wiki-economics bash -s -- 'https://github.com/schiste/wiki-economics.git' main '$release_sha'" \
   < deploy/toolforge/rebuild-image.sh
 test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$release_sha"
 ```
