@@ -117,7 +117,7 @@ test("the production row counter uses the supported connection query API", async
     },
   });
   assert.equal(await counter.count("a'file.parquet"), 17);
-  counter.close();
+  await counter.close();
   assert.match(observedSql, /read_parquet\('a''file\.parquet'\)/);
   assert.equal(closed, true);
   assert.equal(sqlString("a'b"), "'a''b'");

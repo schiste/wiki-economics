@@ -150,16 +150,21 @@ function sqlString(value) {
 }
 
 function parquetRowCounter(adapter = require("./lib/duckdb-json.cjs")) {
-  const connection = adapter.connect();
+  const connection = Promise.resolve(adapter.connect());
   return {
     async count(file) {
+      const resolvedConnection = await connection;
       const rows = await adapter.queryRows(
-        connection,
+        resolvedConnection,
         `SELECT count(*) AS rows FROM read_parquet(${sqlString(file)})`,
       );
       return Number(rows[0]?.rows || 0);
     },
-    close() { connection.close(); },
+    async close() {
+      const resolvedConnection = await connection;
+      if (typeof adapter.closeConnection === "function") adapter.closeConnection(resolvedConnection);
+      else resolvedConnection.close?.();
+    },
   };
 }
 
@@ -261,7 +266,7 @@ async function buildManifest(options = {}) {
         status,
       };
     }
-  } finally { rowCounter.close?.(); }
+  } finally { await rowCounter.close?.(); }
   return {schema_version: 2, generated_at: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
     data_dir: dataDir, output_dir: outputDir, lifecycle, wikis, merged};
 }

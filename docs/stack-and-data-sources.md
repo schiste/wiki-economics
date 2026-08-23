@@ -91,7 +91,7 @@ Key frontend patterns:
 
 DuckDB serves two roles:
 
-1. **Build-time / merge-time** (Node scripts) — the `site/data-build/*.cjs` generators use the `duckdb` npm package's Node bindings to aggregate Parquet files into pre-computed JSON defaults. They're invoked both by `site/admin-server.cjs` and, during the Rust merge stage (`src/merge.rs`), as `node <script>.cjs` subprocesses
+1. **Build-time / merge-time** (Node scripts) — the `site/data-build/*.cjs` generators use the pinned `@duckdb/node-api` client and its prebuilt native binding to aggregate Parquet files into pre-computed JSON defaults. They're invoked both by `site/admin-server.cjs` and, during the Rust merge stage (`src/merge.rs`), as `node <script>.cjs` subprocesses
 2. **Client-side** (browser) — DuckDB-WASM runs SQL queries on Parquet files when users apply non-default filters, enabling interactive exploration without a backend server
 
 ### Storage layout

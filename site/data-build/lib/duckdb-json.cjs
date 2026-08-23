@@ -1,7 +1,7 @@
 "use strict";
 
 const path = require("node:path");
-const duckdb = require("duckdb");
+const {DuckDBInstance} = require("@duckdb/node-api");
 
 // DuckDB's Node binding returns BIGINT columns as JS BigInt and DATE columns
 // as JS Date (UTC midnight). The DuckDB CLI's `-json` mode instead emits
@@ -24,18 +24,19 @@ function outputDir() {
   return process.env.WIKI_ECON_OUTPUT_DIR || path.resolve(__dirname, "..", "..", "..", "output");
 }
 
-function connect() {
-  const db = new duckdb.Database(":memory:");
-  return db.connect();
+async function connect() {
+  const instance = await DuckDBInstance.create(":memory:");
+  return instance.connect();
 }
 
-function queryRows(con, sql) {
-  return new Promise((resolve, reject) => {
-    con.all(sql, (err, rows) => {
-      if (err) return reject(err);
-      resolve(rows.map(toJSONSafe));
-    });
-  });
+async function queryRows(con, sql) {
+  const reader = await con.runAndReadAll(sql);
+  return reader.getRowObjectsJS().map(toJSONSafe);
+}
+
+function closeConnection(con) {
+  if (typeof con?.closeSync === "function") con.closeSync();
+  else con?.close?.();
 }
 
 async function scalar(con, sql) {
@@ -50,12 +51,16 @@ async function scalar(con, sql) {
 // matching the exit-code/stdout contract src/merge.rs expects from the
 // bash generators (0 + JSON on stdout, non-zero + stderr on failure).
 function run(main) {
-  const con = connect();
   const DIR = outputDir();
   Promise.resolve()
-    .then(() => main(con, DIR))
-    .then((result) => {
-      process.stdout.write(JSON.stringify(result));
+    .then(async () => {
+      const con = await connect();
+      try {
+        const result = await main(con, DIR);
+        process.stdout.write(JSON.stringify(result));
+      } finally {
+        closeConnection(con);
+      }
     })
     .catch((err) => {
       process.stderr.write(`${err && err.stack ? err.stack : err}\n`);
@@ -63,4 +68,4 @@ function run(main) {
     });
 }
 
-module.exports = { connect, queryRows, scalar, run, toJSONSafe, outputDir };
+module.exports = {closeConnection, connect, outputDir, queryRows, run, scalar, toJSONSafe};

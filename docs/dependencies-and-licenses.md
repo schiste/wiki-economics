@@ -52,7 +52,7 @@ That gives the project a deliberately permissive software-license posture.
 | Polars | Dataframe engine for ingest and compute | `MIT` |
 | vendored `polars-utils` patch | In-tree patch carried under `vendor/polars-utils` | `MIT` |
 | Observable Framework | Dashboard build/runtime framework | `ISC` |
-| `duckdb` npm package | Browser-side, Node-binding build-time, and merge-time (Rust-invoked) query support | `MIT` |
+| DuckDB Node API and DuckDB-WASM | Prebuilt Node query binding plus browser-side analytical engine | `MIT` |
 
 ## Direct Rust Dependencies
 
@@ -96,12 +96,14 @@ The dashboard has a very small direct JavaScript dependency surface.
 | Package | Version spec | Role | License |
 |---------|--------------|------|---------|
 | `@observablehq/framework` | `^1.13.4` | site generation and client framework | `ISC` |
-| `duckdb` | `^1.4.4` | build-time, browser, and merge-time query engine | `MIT` |
+| `@duckdb/node-api` | `1.5.5-r.4` | build-time and merge-time query engine | `MIT` |
 
 The checked-in `site/data-build/*.cjs` generators (invoked both by
 `site/admin-server.cjs` and by the Rust merge pipeline in `src/merge.rs`) use
-this same npm package's Node bindings rather than a separately installed
-DuckDB CLI, so no DuckDB CLI binary needs to be installed on the host.
+DuckDB's primary Node API and its platform-specific prebuilt binding rather
+than the legacy `duckdb` package or a separately installed DuckDB CLI. This
+avoids the legacy `node-gyp`/`tar` source-build dependency chain and pins the
+query engine exactly so generated JSON stays deterministic.
 
 ## Python Sidecar
 
