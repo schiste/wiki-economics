@@ -168,6 +168,7 @@ python3 -m unittest discover -s scripts -p 'test_*.py'
 - [Benchmarking](docs/benchmarking.md)
 - [Dependencies and Licenses](docs/dependencies-and-licenses.md)
 - [Deterministic Builds](docs/deterministic-builds.md)
+- [Frontend Scalability](docs/frontend-scalability.md)
 - [Legal, Licensing & Attribution](docs/legal.md)
 - [Publishing](docs/release.md)
 - [Publication Gate](docs/publication-gate.md)

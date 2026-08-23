@@ -36,6 +36,8 @@ node --check scripts/release-bundle.cjs
 node --check scripts/verify-runtime.cjs
 node --check scripts/verify-site-dependencies.cjs
 node --check scripts/verify-site-reproducibility.cjs
+node --check scripts/publish-browser-data.cjs
+node --check scripts/browser-performance.cjs
 
 echo "==> node --check site/observablehq.config.js"
 node --check site/observablehq.config.js
@@ -91,6 +93,9 @@ node --test scripts/generate-stack-reference.test.cjs
 node --test scripts/release-bundle.test.cjs
 node --test scripts/verify-site-dependencies.test.cjs
 node --test scripts/verify-site-reproducibility.test.cjs
+node --test scripts/publish-browser-data.test.cjs
+node --test scripts/browser-performance.test.cjs
+node --test site/browser-cache.test.mjs
 
 echo "==> node --test scripts/wiki-lifecycle.test.cjs"
 node --test scripts/wiki-lifecycle.test.cjs
@@ -115,6 +120,15 @@ cargo run --locked -- --output-dir "$SITE_FIXTURE_ROOT/data" site-fixture
 node scripts/verify-site-reproducibility.cjs \
   --data-dir "$SITE_FIXTURE_ROOT/data" \
   --work-dir "$SITE_FIXTURE_ROOT/reproducibility"
+
+echo "==> Build deterministic nlwiki/ptwiki/frwiki fixture and enforce browser budgets"
+cargo run --locked -- --output-dir "$SITE_FIXTURE_ROOT/performance-data" browser-performance-fixture
+node scripts/build-site-fixture.cjs \
+  --data-dir "$SITE_FIXTURE_ROOT/performance-data" \
+  --dist-dir "$SITE_FIXTURE_ROOT/performance-dist"
+node scripts/browser-performance.cjs \
+  --dist-dir "$SITE_FIXTURE_ROOT/performance-dist" \
+  --report "$SITE_FIXTURE_ROOT/browser-performance.json"
 
 echo "==> cargo doc --locked --no-deps"
 cargo doc --locked --no-deps

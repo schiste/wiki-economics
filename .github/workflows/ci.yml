@@ -87,6 +87,8 @@ jobs:
           node --check scripts/verify-runtime.cjs
           node --check scripts/verify-site-dependencies.cjs
           node --check scripts/verify-site-reproducibility.cjs
+          node --check scripts/publish-browser-data.cjs
+          node --check scripts/browser-performance.cjs
 
       - name: Run Node unit tests
         run: |
@@ -111,6 +113,9 @@ jobs:
           node --test scripts/release-bundle.test.cjs
           node --test scripts/verify-site-dependencies.test.cjs
           node --test scripts/verify-site-reproducibility.test.cjs
+          node --test scripts/publish-browser-data.test.cjs
+          node --test scripts/browser-performance.test.cjs
+          node --test site/browser-cache.test.mjs
           node --test scripts/wiki-lifecycle.test.cjs
 
       - name: Check helper CLI entrypoints
@@ -181,6 +186,28 @@ jobs:
           node scripts/verify-site-reproducibility.cjs
           --data-dir "$RUNNER_TEMP/wiki-econ-site-data"
           --work-dir "$RUNNER_TEMP/wiki-econ-site-reproducibility"
+
+      - name: Generate deterministic browser scalability fixture
+        run: cargo run --locked -- --output-dir "$RUNNER_TEMP/wiki-econ-browser-data" browser-performance-fixture
+
+      - name: Build browser scalability fixture offline
+        run: >-
+          node scripts/build-site-fixture.cjs
+          --data-dir "$RUNNER_TEMP/wiki-econ-browser-data"
+          --dist-dir "$RUNNER_TEMP/wiki-econ-browser-dist"
+
+      - name: Enforce browser performance budgets
+        run: >-
+          node scripts/browser-performance.cjs
+          --dist-dir "$RUNNER_TEMP/wiki-econ-browser-dist"
+          --report "$RUNNER_TEMP/browser-performance.json"
+
+      - name: Retain browser performance evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          name: browser-performance
+          path: ${{ runner.temp }}/browser-performance.json
+          if-no-files-found: error
 
   coverage:
     runs-on: ubuntu-24.04

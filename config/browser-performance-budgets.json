@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "reference_device": {
+    "javascript_heap_limit_mib": 512,
+    "minimum_memory_headroom_ratio": 0.25
+  },
+  "indexeddb": {
+    "maximum_bytes": 100663296
+  },
+  "custom_query": {
+    "maximum_duration_ms": 5000,
+    "maximum_duration_ms_per_1000_rows": 500
+  },
+  "artifacts": {
+    "maximum_javascript_chunk_bytes": 1572864,
+    "maximum_wasm_chunk_bytes": 7340032,
+    "maximum_wasm_chunks": 1
+  },
+  "fixtures": {
+    "nlwiki": {"rows_per_metric": 6000},
+    "ptwiki": {"rows_per_metric": 3000},
+    "frwiki": {"rows_per_metric": 21000}
+  }
+}
