@@ -1061,6 +1061,22 @@ mod tests {
             1
         );
         assert_eq!(receipt["patrol_sources"]["nlwiki"]["rights_events"], 1);
+
+        begin_run(fixture.output.path(), Some("run-merge-only"), &[], None)?;
+        let merge_candidate = record_candidate(
+            fixture.output.path(),
+            Some("run-merge-only"),
+            &fixture.names(),
+        );
+        merge_candidate?;
+        let merge_validation = validate(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "run-merge-only",
+        );
+        merge_validation?;
+
         let registry = load_lifecycle(&fixture.lifecycle_path)?;
         let merge_only = RunContext {
             schema_version: 1,
