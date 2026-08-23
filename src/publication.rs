@@ -670,9 +670,24 @@ fn validate_snapshots(
         .map(|(wiki, _)| wiki.clone())
         .collect();
     ensure!(
-        context.refresh_wikis.is_empty() || context.refresh_wikis == scheduled,
-        "full publication run must refresh every scheduled wiki"
+        context.refresh_wikis.is_empty() || scheduled.is_subset(&context.refresh_wikis),
+        "full publication run must include every scheduled wiki"
     );
+    for wiki in &context.refresh_wikis {
+        let lifecycle = registry
+            .wikis
+            .get(wiki)
+            .with_context(|| format!("refresh run contains unregistered wiki {wiki}"))?;
+        ensure!(
+            lifecycle.publication == "published",
+            "refresh run contains non-published wiki {wiki}"
+        );
+        ensure!(
+            lifecycle.refresh == "scheduled" || lifecycle.refresh == "manual",
+            "refresh run contains {wiki}, whose lifecycle state is {}",
+            lifecycle.refresh
+        );
+    }
     let mut selected = BTreeMap::new();
     for (wiki, lifecycle) in &registry.wikis {
         if lifecycle.publication != "published" {
@@ -692,9 +707,11 @@ fn validate_snapshots(
             );
             continue;
         }
-        if lifecycle.refresh == "scheduled" {
+        let refreshed_manual =
+            lifecycle.refresh == "manual" && context.refresh_wikis.contains(wiki);
+        if lifecycle.refresh == "scheduled" || refreshed_manual {
             let snapshot = storage::current_snapshot_version(data_dir, wiki)?
-                .with_context(|| format!("scheduled wiki {wiki} has no selected snapshot"))?;
+                .with_context(|| format!("managed wiki {wiki} has no selected snapshot"))?;
             if context.refresh_wikis.contains(wiki) {
                 ensure!(
                     context.requested_snapshot_version.as_deref() == Some(snapshot.as_str()),
@@ -705,13 +722,15 @@ fn validate_snapshots(
             let pointer = storage::snapshot_pointer_path(data_dir, wiki);
             let age_days =
                 now_unix()?.saturating_sub(artifact_record(&pointer)?.modified_secs) / 86_400;
-            let sla = lifecycle
-                .freshness_sla_days
-                .context("scheduled wiki has no freshness SLA")?;
-            ensure!(
-                age_days <= sla,
-                "selected snapshot pointer for {wiki} is {age_days} days old (SLA {sla})"
-            );
+            if lifecycle.refresh == "scheduled" || lifecycle.freshness_sla_days.is_some() {
+                let sla = lifecycle
+                    .freshness_sla_days
+                    .context("scheduled wiki has no freshness SLA")?;
+                ensure!(
+                    age_days <= sla,
+                    "selected snapshot pointer for {wiki} is {age_days} days old (SLA {sla})"
+                );
+            }
             selected.insert(wiki.clone(), snapshot);
         }
     }
@@ -831,10 +850,11 @@ pub fn validate(
     let patrol_wikis = expected_wikis(&registry, patrol_contract)?;
     let mut patrol_sources = BTreeMap::new();
     for wiki in patrol_wikis.into_iter().filter(|wiki| {
-        registry
-            .wikis
-            .get(wiki)
-            .is_some_and(|lifecycle| lifecycle.refresh == "scheduled")
+        context.refresh_wikis.contains(wiki)
+            || registry
+                .wikis
+                .get(wiki)
+                .is_some_and(|lifecycle| lifecycle.refresh == "scheduled")
     }) {
         let patrol_path = data_dir.join("patrol").join(&wiki).join("patrol.parquet");
         let rights_path = data_dir.join("patrol").join(&wiki).join("rights.parquet");
@@ -1245,6 +1265,32 @@ mod tests {
         let data = TestDir::new()?;
         assert!(validate_snapshots(data.path(), &registry, &context, &cutoffs)?.is_empty());
         assert!(validate_snapshots(data.path(), &registry, &context, &BTreeMap::new()).is_err());
+
+        let analytical =
+            storage::snapshot_analytical_wiki_dir(data.path(), "manualwiki", "2026-03")?;
+        let warehouse = storage::snapshot_warehouse_wiki_dir(data.path(), "manualwiki", "2026-03")?;
+        fs::create_dir_all(analytical)?;
+        fs::create_dir_all(warehouse)?;
+        storage::publish_current_snapshot(data.path(), "manualwiki", "2026-03")?;
+        let manual_context = RunContext {
+            schema_version: 1,
+            run_id: "manual".to_string(),
+            started_at_unix: now_unix()?,
+            refresh_wikis: BTreeSet::from(["manualwiki".to_string()]),
+            requested_snapshot_version: Some("2026-03".to_string()),
+        };
+        assert_eq!(
+            validate_snapshots(data.path(), &registry, &manual_context, &cutoffs)?
+                .get("manualwiki")
+                .map(String::as_str),
+            Some("2026-03")
+        );
+
+        let paused_context = RunContext {
+            refresh_wikis: BTreeSet::from(["frwiki".to_string()]),
+            ..manual_context
+        };
+        assert!(validate_snapshots(data.path(), &registry, &paused_context, &cutoffs).is_err());
         Ok(())
     }
 

@@ -114,11 +114,15 @@ function resolveRefreshWikis(registry, env = process.env) {
   if (preferred.length && legacy.length && preferred.join("\n") !== legacy.join("\n")) {
     throw new Error("WIKI_ECON_REFRESH_WIKIS and legacy WIKI_ECON_ENABLED_WIKIS disagree");
   }
+  const explicitlySelected = preferred.length > 0 || legacy.length > 0;
   const selected = preferred.length ? preferred : legacy.length ? legacy : wikisWithState(registry, "refresh", "scheduled");
   for (const wiki of selected) {
     const entry = registry.wikis[wiki];
     if (!entry) throw new Error(`Refresh list contains unregistered wiki ${wiki}`);
-    if (entry.refresh !== "scheduled") {
+    if (entry.publication !== "published") {
+      throw new Error(`Refresh list contains ${wiki}, whose publication state is ${entry.publication}`);
+    }
+    if (entry.refresh !== "scheduled" && !(explicitlySelected && entry.refresh === "manual")) {
       throw new Error(`Refresh list contains ${wiki}, whose lifecycle refresh state is ${entry.refresh}`);
     }
   }

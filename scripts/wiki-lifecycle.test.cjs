@@ -78,6 +78,16 @@ test("refresh overrides are backward compatible but fail closed on disagreement"
     () => resolveRefreshWikis(registry, { WIKI_ECON_REFRESH_WIKIS: "frwiki" }),
     /refresh state is paused/,
   );
+  registry.wikis.testwiki.publication = "published";
+  assert.deepEqual(
+    resolveRefreshWikis(registry, { WIKI_ECON_REFRESH_WIKIS: "nlwiki testwiki" }),
+    ["nlwiki", "testwiki"],
+  );
+  registry.wikis.testwiki.publication = "hidden";
+  assert.throws(
+    () => resolveRefreshWikis(registry, { WIKI_ECON_REFRESH_WIKIS: "testwiki" }),
+    /publication state is hidden/,
+  );
   assert.deepEqual(splitWikiList(" nlwiki, frwiki\nptwiki "), ["nlwiki", "frwiki", "ptwiki"]);
 });
 

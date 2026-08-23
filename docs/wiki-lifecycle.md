@@ -37,9 +37,11 @@ order:
 2. legacy `WIKI_ECON_ENABLED_WIKIS`, for backward compatibility;
 3. entries whose registry refresh state is `scheduled`.
 
-An environment override must agree with the registry. It cannot silently
-activate an unknown, manual, or paused wiki. If both environment variables are
-set, they must agree.
+An environment override must agree with the registry. It may explicitly select
+a published `manual` wiki for a deliberate one-off run, but it cannot activate
+an unknown, hidden, retired, or paused wiki. A full publication run that adds a
+manual wiki must still include every scheduled wiki. If both environment
+variables are set, they must agree.
 
 The Rust merge reads `WIKI_ECON_WIKI_LIFECYCLE_FILE` and excludes `hidden` and
 `retired` wiki directories. `scripts/lib/wiki_econ.sh` exports the checked-in
