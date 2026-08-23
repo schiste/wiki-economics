@@ -35,7 +35,7 @@ fi
 temporary_link="$app_root/.current.tmp.$$"
 trap 'rm -f "$temporary_link"' EXIT
 ln -s "releases/$release_sha" "$temporary_link"
-mv -Tf "$temporary_link" "$app_root/current"
+node -e 'require("node:fs").renameSync(process.argv[1], process.argv[2])' "$temporary_link" "$app_root/current"
 
 echo "Rolled back wiki-econ to $release_sha"
 echo "Restart the webservice so it picks up the selected release."
