@@ -96,7 +96,6 @@ The dashboard has a very small direct JavaScript dependency surface.
 | Package | Version spec | Role | License |
 |---------|--------------|------|---------|
 | `@observablehq/framework` | `^1.13.4` | site generation and client framework | `ISC` |
-| `@duckdb/node-api` | `1.5.5-r.4` | build-time and merge-time query engine | `MIT` |
 
 The checked-in `site/data-build/*.cjs` generators (invoked both by
 `site/admin-server.cjs` and by the Rust merge pipeline in `src/merge.rs`) use

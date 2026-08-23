@@ -83,16 +83,13 @@ The interactive dashboard is built with [Observable Framework](https://observabl
 
 Key frontend patterns:
 
-- **Pre-computed defaults** — checked-in generator scripts under `site/data-build/` run DuckDB queries at build time to produce ~80 KB JSON files for the default view of each page. This makes initial page load instant
+- **Pre-computed defaults** — the Rust merge stage uses Polars to produce deterministic JSON files for the default view of each page. This makes initial page load instant without a native Node database dependency
 - **DuckDB WASM** — when a user changes filters, [DuckDB compiled to WebAssembly](https://duckdb.org/docs/api/wasm/overview) queries Parquet files directly in the browser. The ~34 MB DuckDB runtime is lazy-loaded only when needed
 - **Shared filter bar** — a single `filters.js` component provides consistent wiki, user type, namespace, date range, and granularity controls across all pages
 
-### DuckDB — query layer
+### DuckDB — browser query layer
 
-DuckDB serves two roles:
-
-1. **Build-time / merge-time** (Node scripts) — the `site/data-build/*.cjs` generators use the pinned `@duckdb/node-api` client and its prebuilt native binding to aggregate Parquet files into pre-computed JSON defaults. They're invoked both by `site/admin-server.cjs` and, during the Rust merge stage (`src/merge.rs`), as `node <script>.cjs` subprocesses
-2. **Client-side** (browser) — DuckDB-WASM runs SQL queries on Parquet files when users apply non-default filters, enabling interactive exploration without a backend server
+DuckDB-WASM runs SQL queries on Parquet files when users apply non-default filters, enabling interactive exploration without a backend server. Server-side default generation is implemented in Rust and Polars; Node does not install or load native DuckDB bindings.
 
 ### Storage layout
 

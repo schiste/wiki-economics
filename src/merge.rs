@@ -12,22 +12,9 @@ use crate::observability::MemorySnapshot;
 use crate::wiki_lifecycle;
 
 const MERGE_BATCH_ROWS: usize = 250_000;
-const MERGE_ALGORITHM_VERSION: &str = "merged-metrics-v3-generation-readiness";
+const MERGE_ALGORITHM_VERSION: &str = "merged-metrics-v4-rust-dashboard-defaults";
 const GENERATOR_DEPENDENCIES: [&str; 1] = ["manifest.json.cjs"];
-const DASHBOARD_GENERATORS: [&str; 12] = [
-    "defaults_business.json.cjs",
-    "defaults_edit_variation.json.cjs",
-    "defaults_gdp.json.cjs",
-    "defaults_inequality.json.cjs",
-    "defaults_labor.json.cjs",
-    "defaults_patrol.json.cjs",
-    "meta_business.json.cjs",
-    "meta_gdp.json.cjs",
-    "meta_inequality.json.cjs",
-    "meta_labor.json.cjs",
-    "meta_patrol.json.cjs",
-    "manifest.json.sh",
-];
+const MANIFEST_GENERATOR: &str = "manifest.json.sh";
 
 /// Merge per-wiki metric parquet files into combined files at the output root.
 /// e.g., output/nlwiki/inequality.parquet + output/dewiki/inequality.parquet
@@ -50,11 +37,12 @@ fn merge_outputs_from_dir(
     let metric_files = collect_metric_files(output_dir, published_wikis.as_ref())?;
     let mut artifact_names: Vec<String> = metric_files.keys().cloned().collect();
 
-    artifact_names.extend(DASHBOARD_GENERATORS.iter().map(|name| {
-        name.trim_end_matches(".sh")
-            .trim_end_matches(".cjs")
-            .to_string()
-    }));
+    artifact_names.extend(
+        crate::dashboard::ARTIFACTS
+            .iter()
+            .map(|name| (*name).to_string()),
+    );
+    artifact_names.push("manifest.json".to_string());
     artifact_names.sort();
     let mut inputs = Vec::new();
     for paths in metric_files.values() {
@@ -74,12 +62,10 @@ fn merge_outputs_from_dir(
             ));
         }
     }
-    for generator in DASHBOARD_GENERATORS {
-        inputs.push(TrackedPath::new(
-            format!("generator/{generator}"),
-            generator_dir.join(generator),
-        ));
-    }
+    inputs.push(TrackedPath::new(
+        format!("generator/{MANIFEST_GENERATOR}"),
+        generator_dir.join(MANIFEST_GENERATOR),
+    ));
     for dependency in GENERATOR_DEPENDENCIES {
         inputs.push(TrackedPath::new(
             format!("generator/{dependency}"),
@@ -140,7 +126,8 @@ fn merge_outputs_from_dir(
         merge_metric_batched(&metric_name, &paths, &dest, MERGE_BATCH_ROWS)?;
     }
 
-    materialize_dashboard_artifacts_from_dir(output_dir, generator_dir)?;
+    crate::dashboard::materialize(output_dir)?;
+    materialize_manifest_from_dir(output_dir, generator_dir)?;
     fingerprint::record(&receipt_path, spec, &inputs, &outputs)?;
     crate::publication::record_candidate(output_dir, run_id, &artifact_names)?;
 
@@ -291,87 +278,106 @@ fn merge_metric_batched(
     Ok(())
 }
 
-fn materialize_dashboard_artifacts_from_dir(output_dir: &Path, generator_dir: &Path) -> Result<()> {
-    materialize_dashboard_artifacts_with_runner(
-        output_dir,
-        generator_dir,
-        |interpreter, script_path, output_dir| {
-            Command::new(interpreter)
-                .arg(script_path)
-                .env("WIKI_ECON_OUTPUT_DIR", output_dir)
-                .output()
-        },
-    )
+fn manifest_row_counts(output_dir: &Path) -> Result<BTreeMap<String, usize>> {
+    let data_dir = env::var("WIKI_ECON_DATA_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("data"));
+    let mut paths = Vec::new();
+    for (root, names) in [
+        (
+            data_dir.join("patrol"),
+            &["patrol.parquet", "rights.parquet"][..],
+        ),
+        (output_dir.to_path_buf(), &["patrol.parquet"][..]),
+    ] {
+        if !root.is_dir() {
+            continue;
+        }
+        for entry in fs::read_dir(root)? {
+            let directory = entry?.path();
+            if !directory.is_dir() {
+                continue;
+            }
+            for name in names {
+                let path = directory.join(name);
+                if path.is_file() {
+                    paths.push(path);
+                }
+            }
+        }
+    }
+    paths.sort();
+    let mut counts = BTreeMap::new();
+    for path in paths {
+        let rows = ParquetReader::new(File::open(&path)?).num_rows()?;
+        counts.insert(path.to_string_lossy().into_owned(), rows);
+    }
+    Ok(counts)
 }
 
-fn materialize_dashboard_artifacts_with_runner<F>(
+fn materialize_manifest_from_dir(output_dir: &Path, generator_dir: &Path) -> Result<()> {
+    materialize_manifest_with_runner(output_dir, generator_dir, |script_path, counts_path| {
+        Command::new("bash")
+            .arg(script_path)
+            .env("WIKI_ECON_OUTPUT_DIR", output_dir)
+            .env("WIKI_ECON_PARQUET_ROW_COUNTS_FILE", counts_path)
+            .output()
+    })
+}
+
+fn materialize_manifest_with_runner<F>(
     output_dir: &Path,
     generator_dir: &Path,
     mut run: F,
 ) -> Result<()>
 where
-    F: FnMut(&str, &Path, &Path) -> std::io::Result<std::process::Output>,
+    F: FnMut(&Path, &Path) -> std::io::Result<std::process::Output>,
 {
-    for script_name in DASHBOARD_GENERATORS {
-        let script_path = generator_dir.join(script_name);
-        ensure!(
-            script_path.is_file(),
-            "required dashboard artifact generator is missing: {}",
+    let script_path = generator_dir.join(MANIFEST_GENERATOR);
+    ensure!(
+        script_path.is_file(),
+        "required manifest generator is missing: {}",
+        script_path.display()
+    );
+    let counts_path = output_dir.join(format!(".manifest-row-counts.{}.json", std::process::id()));
+    fs::write(
+        &counts_path,
+        serde_json::to_vec(&manifest_row_counts(output_dir)?)?,
+    )?;
+    let run_result = run(&script_path, &counts_path);
+    let _ = fs::remove_file(&counts_path);
+    let output = run_result.with_context(|| {
+        format!(
+            "failed to spawn manifest generator {}",
             script_path.display()
-        );
-        let interpreter = if script_name.ends_with(".cjs") {
-            "node"
-        } else {
-            "bash"
-        };
-        let output = run(interpreter, &script_path, output_dir).with_context(|| {
-            format!(
-                "failed to spawn dashboard artifact generator {}",
-                script_path.display()
-            )
-        })?;
-        ensure!(
-            output.status.success(),
-            "dashboard artifact generator {} failed: {}",
-            script_path.display(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-        serde_json::from_slice::<serde_json::Value>(&output.stdout).with_context(|| {
-            format!(
-                "dashboard artifact generator {} emitted invalid JSON",
-                script_path.display()
-            )
-        })?;
-        let json_path =
-            output_dir.join(script_name.trim_end_matches(".sh").trim_end_matches(".cjs"));
-        let temp_path = json_path.with_file_name(format!(
-            ".{}.generator.tmp",
-            json_path
-                .file_name()
-                .context("dashboard artifact path has no filename")?
-                .to_string_lossy()
-        ));
-        let write_result = (|| -> Result<()> {
-            fs::write(&temp_path, output.stdout)?;
-            File::open(&temp_path)?.sync_all()?;
-            fs::rename(&temp_path, &json_path)?;
-            Ok(())
-        })();
-        if let Err(error) = write_result {
-            let _ = fs::remove_file(&temp_path);
-            return Err(error).with_context(|| {
-                format!(
-                    "failed to publish dashboard artifact {}",
-                    json_path.display()
-                )
-            });
-        }
-        info!(
-            script = %script_path.display(),
-            path = %json_path.display(),
-            "materialized dashboard artifact"
-        );
+        )
+    })?;
+    ensure!(
+        output.status.success(),
+        "manifest generator {} failed: {}",
+        script_path.display(),
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    serde_json::from_slice::<serde_json::Value>(&output.stdout).with_context(|| {
+        format!(
+            "manifest generator {} emitted invalid JSON",
+            script_path.display()
+        )
+    })?;
+    let json_path = output_dir.join("manifest.json");
+    let temp_path = output_dir.join(".manifest.json.generator.tmp");
+    let write_result = (|| -> Result<()> {
+        fs::write(&temp_path, output.stdout)?;
+        File::open(&temp_path)?.sync_all()?;
+        fs::rename(&temp_path, &json_path)?;
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error)
+            .with_context(|| format!("failed to publish manifest {}", json_path.display()));
     }
+    info!(script = %script_path.display(), path = %json_path.display(), "materialized manifest");
     Ok(())
 }
 
@@ -395,14 +401,10 @@ mod tests {
     }
 
     fn write_generators(generator_dir: &Path) -> Result<()> {
-        for script_name in DASHBOARD_GENERATORS {
-            let body = if script_name.ends_with(".cjs") {
-                "process.stdout.write(JSON.stringify({ok:true}))\n"
-            } else {
-                "#!/bin/sh\nprintf '{\"ok\":true}'\n"
-            };
-            fs::write(generator_dir.join(script_name), body)?;
-        }
+        fs::write(
+            generator_dir.join(MANIFEST_GENERATOR),
+            "#!/bin/sh\nprintf '{\"ok\":true}'\n",
+        )?;
         for dependency in GENERATOR_DEPENDENCIES {
             fs::write(
                 generator_dir.join(dependency),
@@ -413,12 +415,17 @@ mod tests {
         Ok(())
     }
 
+    fn write_dashboard_fixture(output_dir: &Path) -> Result<()> {
+        crate::dashboard::write_site_fixture(output_dir)
+    }
+
     #[test]
     fn merge_outputs_combines_per_wiki_metrics() -> Result<()> {
         init_test_tracing();
         let output_dir = TestDir::new()?;
         let generator_dir = TestDir::new()?;
         write_generators(generator_dir.path())?;
+        write_dashboard_fixture(output_dir.path())?;
         write_metric(output_dir.path(), "enwiki", "metric", 1)?;
         write_metric(output_dir.path(), "frwiki", "metric", 2)?;
 
@@ -439,6 +446,7 @@ mod tests {
         let output_dir = TestDir::new()?;
         let generator_dir = TestDir::new()?;
         write_generators(generator_dir.path())?;
+        write_dashboard_fixture(output_dir.path())?;
         write_metric(output_dir.path(), "testwiki", "metric", 1)?;
         let metric_input = output_dir.path().join("testwiki/metric.parquet");
         fingerprint::record(
@@ -610,6 +618,7 @@ mod tests {
         let output_dir = TestDir::new()?;
         let generator_dir = TestDir::new()?;
         write_generators(generator_dir.path())?;
+        write_dashboard_fixture(output_dir.path())?;
         write_metric(output_dir.path(), "frwiki", "metric", 1)?;
         // Sidecar dir mimicking _patrol_parts at the wiki-output root level.
         // Without the underscore filter, merge would walk it and try to
@@ -642,6 +651,7 @@ mod tests {
         let output_dir = TestDir::new()?;
         let generator_dir = TestDir::new()?;
         write_generators(generator_dir.path())?;
+        write_dashboard_fixture(output_dir.path())?;
         fs::write(output_dir.path().join("README.txt"), b"not a wiki dir")?;
         let wiki_dir = output_dir.path().join("enwiki");
         fs::create_dir_all(&wiki_dir)?;
@@ -655,7 +665,7 @@ mod tests {
     }
 
     #[test]
-    fn materialize_dashboard_artifacts_runs_json_generators() -> Result<()> {
+    fn materialize_manifest_runs_generator() -> Result<()> {
         init_test_tracing();
         let output_dir = TestDir::new()?;
         let generator_dir = TestDir::new()?;
@@ -663,7 +673,7 @@ mod tests {
         let script = generator_dir.path().join("manifest.json.sh");
         fs::write(&script, "#!/bin/sh\nprintf '{\"ok\":true}'\n")?;
 
-        materialize_dashboard_artifacts_from_dir(output_dir.path(), generator_dir.path())?;
+        materialize_manifest_from_dir(output_dir.path(), generator_dir.path())?;
 
         assert_eq!(
             fs::read_to_string(output_dir.path().join("manifest.json"))?,
@@ -673,38 +683,19 @@ mod tests {
     }
 
     #[test]
-    fn materialize_dashboard_artifacts_runs_node_generators() -> Result<()> {
+    fn materialize_manifest_fails_closed_and_preserves_previous_json() -> Result<()> {
         init_test_tracing();
         let output_dir = TestDir::new()?;
         let generator_dir = TestDir::new()?;
         write_generators(generator_dir.path())?;
-        let script = generator_dir.path().join("defaults_gdp.json.cjs");
-        fs::write(&script, "process.stdout.write(JSON.stringify({ok:true}))\n")?;
-
-        materialize_dashboard_artifacts_from_dir(output_dir.path(), generator_dir.path())?;
-
-        assert_eq!(
-            fs::read_to_string(output_dir.path().join("defaults_gdp.json"))?,
-            "{\"ok\":true}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn materialize_dashboard_artifacts_fails_closed_and_preserves_previous_json() -> Result<()> {
-        init_test_tracing();
-        let output_dir = TestDir::new()?;
-        let generator_dir = TestDir::new()?;
-        write_generators(generator_dir.path())?;
-        let failing = generator_dir.path().join("defaults_gdp.json.cjs");
-        let failing_script = "process.stderr.write('broken input')\nprocess.exit(1)\n";
+        let failing = generator_dir.path().join(MANIFEST_GENERATOR);
+        let failing_script = "#!/bin/sh\nprintf 'broken input' >&2\nexit 1\n";
         fs::write(&failing, failing_script)?;
-        let previous = output_dir.path().join("defaults_gdp.json");
+        let previous = output_dir.path().join("manifest.json");
         fs::write(&previous, "{\"old\":true}")?;
 
-        let error =
-            materialize_dashboard_artifacts_from_dir(output_dir.path(), generator_dir.path())
-                .expect_err("a critical generator failure must stop publication");
+        let error = materialize_manifest_from_dir(output_dir.path(), generator_dir.path())
+            .expect_err("a critical generator failure must stop publication");
 
         assert!(error.to_string().contains("broken input"));
         assert_eq!(fs::read_to_string(previous)?, "{\"old\":true}");
@@ -712,25 +703,22 @@ mod tests {
     }
 
     #[test]
-    fn materialize_dashboard_artifacts_propagates_spawn_failures() -> Result<()> {
+    fn materialize_manifest_propagates_spawn_failures() -> Result<()> {
         init_test_tracing();
         let output_dir = TestDir::new()?;
         let generator_dir = TestDir::new()?;
         write_generators(generator_dir.path())?;
         let mut attempts = 0;
 
-        let error = materialize_dashboard_artifacts_with_runner(
-            output_dir.path(),
-            generator_dir.path(),
-            |_, _, _| {
+        let error =
+            materialize_manifest_with_runner(output_dir.path(), generator_dir.path(), |_, _| {
                 attempts += 1;
                 Err(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     "injected missing interpreter",
                 ))
-            },
-        )
-        .expect_err("spawn failures must fail publication");
+            })
+            .expect_err("spawn failures must fail publication");
 
         assert_eq!(attempts, 1);
         assert!(error.to_string().contains("failed to spawn"));
@@ -738,38 +726,33 @@ mod tests {
     }
 
     #[test]
-    fn materialize_dashboard_artifacts_rejects_missing_and_invalid_generators() -> Result<()> {
+    fn materialize_manifest_rejects_missing_and_invalid_generators() -> Result<()> {
         let output_dir = TestDir::new()?;
         let generator_dir = TestDir::new()?;
-        let missing =
-            materialize_dashboard_artifacts_from_dir(output_dir.path(), generator_dir.path())
-                .expect_err("missing required generator must fail");
-        assert!(missing.to_string().contains("required dashboard"));
+        let missing = materialize_manifest_from_dir(output_dir.path(), generator_dir.path())
+            .expect_err("missing required generator must fail");
+        assert!(missing.to_string().contains("required manifest"));
 
         write_generators(generator_dir.path())?;
-        let invalid_script = generator_dir.path().join("defaults_business.json.cjs");
-        fs::write(invalid_script, "process.stdout.write('not json')\n")?;
-        let invalid =
-            materialize_dashboard_artifacts_from_dir(output_dir.path(), generator_dir.path())
-                .expect_err("invalid JSON must fail");
+        let invalid_script = generator_dir.path().join(MANIFEST_GENERATOR);
+        fs::write(invalid_script, "#!/bin/sh\nprintf 'not json'\n")?;
+        let invalid = materialize_manifest_from_dir(output_dir.path(), generator_dir.path())
+            .expect_err("invalid JSON must fail");
         assert!(invalid.to_string().contains("invalid JSON"));
-        assert!(!output_dir.path().join("defaults_business.json").exists());
+        assert!(!output_dir.path().join("manifest.json").exists());
         Ok(())
     }
 
     #[test]
-    fn materialize_dashboard_artifacts_cleans_failed_atomic_write() -> Result<()> {
+    fn materialize_manifest_cleans_failed_atomic_write() -> Result<()> {
         let output_dir = TestDir::new()?;
         let generator_dir = TestDir::new()?;
         write_generators(generator_dir.path())?;
-        let blocked_temp = output_dir
-            .path()
-            .join(".defaults_business.json.generator.tmp");
+        let blocked_temp = output_dir.path().join(".manifest.json.generator.tmp");
         fs::create_dir(&blocked_temp)?;
 
-        let error =
-            materialize_dashboard_artifacts_from_dir(output_dir.path(), generator_dir.path())
-                .expect_err("a blocked temporary path must fail");
+        let error = materialize_manifest_from_dir(output_dir.path(), generator_dir.path())
+            .expect_err("a blocked temporary path must fail");
 
         assert!(error.to_string().contains("failed to publish"));
         assert!(blocked_temp.is_dir());

@@ -145,26 +145,21 @@ function generationSummary(dataDir, wiki) {
     outputs: validOutputs, bytes, in_progress: inProgress, error};
 }
 
-function sqlString(value) {
-  return `'${String(value).replaceAll("'", "''")}'`;
-}
-
-function parquetRowCounter(adapter = require("./lib/duckdb-json.cjs")) {
-  const connection = Promise.resolve(adapter.connect());
+function parquetRowCounter(countsFile = process.env.WIKI_ECON_PARQUET_ROW_COUNTS_FILE) {
+  if (!countsFile) throw new Error("WIKI_ECON_PARQUET_ROW_COUNTS_FILE is required");
+  const counts = readJson(countsFile);
+  if (!counts || Array.isArray(counts) || typeof counts !== "object") {
+    throw new Error(`invalid Rust Parquet row-count map: ${countsFile}`);
+  }
   return {
     async count(file) {
-      const resolvedConnection = await connection;
-      const rows = await adapter.queryRows(
-        resolvedConnection,
-        `SELECT count(*) AS rows FROM read_parquet(${sqlString(file)})`,
-      );
-      return Number(rows[0]?.rows || 0);
+      const rows = counts[file];
+      if (!Number.isSafeInteger(rows) || rows < 0) {
+        throw new Error(`Rust row-count map has no valid entry for ${file}`);
+      }
+      return rows;
     },
-    async close() {
-      const resolvedConnection = await connection;
-      if (typeof adapter.closeConnection === "function") adapter.closeConnection(resolvedConnection);
-      else resolvedConnection.close?.();
-    },
+    async close() {},
   };
 }
 
@@ -283,4 +278,4 @@ if (require.main === module) {
 }
 
 module.exports = {buildManifest, datasetApplies, discoverWikis, generationSummary, humanBytes, parquetRowCounter,
-  patrolSummary, safeReceiptOutput, sqlString};
+  patrolSummary, safeReceiptOutput};

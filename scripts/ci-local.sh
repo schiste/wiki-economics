@@ -21,8 +21,8 @@ node --check scripts/check-npm-advisories.cjs
 echo "==> node --check site/observablehq.config.js"
 node --check site/observablehq.config.js
 
-echo "==> node --check site/data-build/*.cjs site/data-build/lib/*.cjs"
-for f in site/data-build/*.cjs site/data-build/lib/*.cjs; do node --check "$f"; done
+echo "==> node --check site/data-build/*.cjs"
+for f in site/data-build/*.cjs; do node --check "$f"; done
 
 echo "==> node --test site/admin-auth.test.cjs"
 node --test site/admin-auth.test.cjs
@@ -34,8 +34,6 @@ echo "==> node --test site/build-site.test.cjs"
 node --test site/build-site.test.cjs
 
 echo "==> node --test site/data-build/manifest.test.cjs site/freshness.test.cjs"
-node --test site/data-build/determinism.test.cjs
-node --test site/data-build/lib/duckdb-json.test.cjs
 node --test site/data-build/manifest.test.cjs
 node --test site/freshness.test.cjs
 

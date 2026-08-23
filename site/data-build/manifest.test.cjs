@@ -5,7 +5,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const {after, test} = require("node:test");
-const {buildManifest, generationSummary, parquetRowCounter, safeReceiptOutput, sqlString} = require("./manifest.json.cjs");
+const {buildManifest, generationSummary, parquetRowCounter, safeReceiptOutput} = require("./manifest.json.cjs");
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-manifest-"));
 after(() => fs.rmSync(root, {recursive: true, force: true}));
@@ -104,23 +104,13 @@ test("generation readiness follows the pointer and strict ingest receipt without
   assert.equal(manifest.wikis.logs, undefined);
 });
 
-test("the production row counter uses the supported connection query API", async () => {
-  let observedSql = null;
-  let closed = false;
-  const connection = {close() { closed = true; }};
-  const counter = parquetRowCounter({
-    connect() { return connection; },
-    async queryRows(observedConnection, sql) {
-      assert.equal(observedConnection, connection);
-      observedSql = sql;
-      return [{rows: 17}];
-    },
-  });
+test("the production row counter consumes the validated Rust footer map", async () => {
+  const countsFile = path.join(root, "row-counts.json");
+  fs.writeFileSync(countsFile, JSON.stringify({"a'file.parquet": 17}));
+  const counter = parquetRowCounter(countsFile);
   assert.equal(await counter.count("a'file.parquet"), 17);
+  await assert.rejects(counter.count("missing.parquet"), /no valid entry/);
   await counter.close();
-  assert.match(observedSql, /read_parquet\('a''file\.parquet'\)/);
-  assert.equal(closed, true);
-  assert.equal(sqlString("a'b"), "'a''b'");
 });
 
 test("patrol readiness rejects existing but zero-row parquet files", async () => {

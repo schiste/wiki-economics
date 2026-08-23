@@ -8,7 +8,6 @@
     "build": "observable build"
   },
   "dependencies": {
-    "@duckdb/node-api": "1.5.5-r.4",
     "@observablehq/framework": "^1.13.4"
   }
 }

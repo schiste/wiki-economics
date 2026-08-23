@@ -12,6 +12,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage)'] }
 clap = { version = "4", features = ["derive"] }
 polars = { version = "0.55.2", default-features = false, features = [
     "lazy",
+    "streaming",
     "csv",
     "parquet",
     "strings",

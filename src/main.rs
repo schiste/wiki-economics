@@ -2,6 +2,7 @@
 
 mod bench;
 mod compute;
+mod dashboard;
 #[cfg(test)]
 mod end_to_end_tests;
 mod fetch;
@@ -53,6 +54,14 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Regenerate dashboard JSON from already-merged Parquet inputs
+    #[command(hide = true)]
+    DashboardMaterialize,
+
+    /// Write the deterministic minimal data fixture used by real site CI
+    #[command(hide = true)]
+    SiteFixture,
+
     /// Resolve the latest complete dump snapshot shared by every wiki
     SnapshotResolve {
         /// Wiki database names
@@ -337,6 +346,9 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
     let run_id = cli.run_id;
 
     match cli.command {
+        Commands::DashboardMaterialize => dashboard::materialize(&output_dir)?,
+        Commands::SiteFixture => dashboard::write_site_fixture(&output_dir)?,
+
         Commands::SnapshotResolve { wikis } => {
             let version = run_timed_stage("snapshot_resolve", None, || {
                 ops.resolve_snapshot(&wikis, Utc::now())
