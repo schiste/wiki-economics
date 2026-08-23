@@ -58,6 +58,8 @@ build or browser dependency.
 | `d3` | `7.9.0` | browser transforms and scales | `ISC` |
 | `htl` | `1.0.0` | safe browser HTML templates | `ISC` |
 | `parquet-wasm` | `0.7.2` | browser Parquet decoding | `MIT OR Apache-2.0` |
+| `react` | `19.2.8` | exact Observable client JSX runtime resolution | `MIT` |
+| `react-dom` | `19.2.8` | exact Observable client JSX renderer resolution | `MIT` |
 
 ## Published wiki lifecycle
 

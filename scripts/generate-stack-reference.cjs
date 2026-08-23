@@ -38,6 +38,8 @@ const FRONTEND_ROLES = {
   d3: "browser transforms and scales",
   htl: "safe browser HTML templates",
   "parquet-wasm": "browser Parquet decoding",
+  react: "exact Observable client JSX runtime resolution",
+  "react-dom": "exact Observable client JSX renderer resolution",
 };
 
 const VERSION_LABELS = [
