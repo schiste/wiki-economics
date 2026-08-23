@@ -62,3 +62,49 @@ For meaningful benchmark comparisons:
 - prefer `compute_all` when making claims about real pipeline speed
 
 If a change affects ingest, storage layout, or Polars behavior, benchmark with data produced by the current ingest pipeline rather than mixing old and new parquet layouts.
+
+## Toolforge capacity qualification
+
+`frwiki` must remain `refresh: paused` until three independent one-off jobs
+qualify its full imported warehouse under Toolforge's 6 GiB cgroup. Run each
+bucket count in a fresh container so `memory.peak` is isolated per variant:
+
+First obtain the tool-specific NFS quota from a Toolforge administrator and
+set `WIKI_ECON_NFS_QUOTA_BYTES` tool-wide. `df` reports shared mount capacity
+and is not acceptable evidence. The wrapper fails before computation when the
+confirmed quota variable is absent.
+
+```sh
+toolforge jobs run --image tool-wiki-economics/tool-wiki-economics:latest \
+  --command 'deploy/toolforge/run-capacity-benchmark.sh frwiki 256' \
+  --filelog --mount all --mem 6Gi --cpu 1 wiki-econ-frwiki-capacity-256
+toolforge jobs run --image tool-wiki-economics/tool-wiki-economics:latest \
+  --command 'deploy/toolforge/run-capacity-benchmark.sh frwiki 512' \
+  --filelog --mount all --mem 6Gi --cpu 1 wiki-econ-frwiki-capacity-512
+toolforge jobs run --image tool-wiki-economics/tool-wiki-economics:latest \
+  --command 'deploy/toolforge/run-capacity-benchmark.sh frwiki 1024' \
+  --filelog --mount all --mem 6Gi --cpu 1 wiki-econ-frwiki-capacity-1024
+```
+
+Reports are written atomically below
+`/data/project/wiki-economics/capacity/reports/frwiki/`. Each report records:
+
+- reduction, reconciliation, and final RSS/cgroup memory;
+- peak disk-backed scratch bytes and the configured scratch root;
+- current analytical plus warehouse generation bytes;
+- confirmed tool quota, current charged-root usage, and remaining allowance;
+- the estimated additional rollover requirement: 31 GiB raw transient, one
+  replacement generation, peak scratch, and the weekly output;
+- available filesystem bytes and pass/fail storage status;
+- rows, edits, date range, largest bucket, output bytes, and SHA-256; and
+- a fail-closed memory gate requiring at least 25% peak headroom.
+
+Compare all three reports. Rows, edit conservation, and date ranges must be
+identical. Repeat the chosen configuration once and require the same output
+SHA-256 to prove byte determinism. Do not choose solely by runtime: prefer the
+smallest bucket count that sustains at least 25% headroom, then use larger
+counts only if they materially improve the measured maximum bucket or memory.
+
+The scratch root is explicit for capacity jobs. Normal compute may set
+`WIKI_ECON_SCRATCH_DIR`; the Toolforge refresh wrapper passes that root to
+safe stale-artifact cleanup after acquiring the single-flight lock.
