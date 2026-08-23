@@ -5,6 +5,12 @@
 
 /* ── Design Tokens ──────────────────────────────────────── */
 :root {
+  /* Framework caps the whole page (body, header, main, TOC) at this width
+     and centers it, which wastes most of the screen on wide monitors.
+     Let the page use the full viewport instead — #observablehq-center's own
+     margin still keeps sensible breathing room on the sides. */
+  --observablehq-max-width: 100vw;
+
   /* System font stacks — no network fetch, no font-swap layout shift.
      Chosen to echo the IBM Plex family's proportions: a humanist sans,
      an old-style serif, and a code-native mono. */
