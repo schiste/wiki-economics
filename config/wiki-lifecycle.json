@@ -35,7 +35,7 @@
     },
     "ptwiki": {
       "publication": "published",
-      "refresh": "manual",
+      "refresh": "scheduled",
       "provenance": "toolforge",
       "freshness_sla_days": 10
     },

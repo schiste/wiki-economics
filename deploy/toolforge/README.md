@@ -11,10 +11,9 @@ systemd, no persistent VM. Containers run as Kubernetes Jobs/webservices,
 and storage is NFS-backed under `/data/project/<tool>`. Toolforge's shared NFS
 currently has no per-tool quota; its free space is shared capacity, not a
 private reservation. Measure live headroom and keep reproducible data bounded.
-nlwiki is the established workload and ptwiki is qualified separately before
-joining its schedule. frwiki (steady-state ≈9.8GB, rollover estimate ≈31GB)
-still requires a measured capacity qualification. enwiki is out of scope for
-Toolforge entirely.
+nlwiki and ptwiki are established scheduled workloads. frwiki (steady-state
+≈9.8GB, rollover estimate ≈31GB) still requires a measured capacity
+qualification. enwiki is out of scope for Toolforge entirely.
 
 ## Files
 
@@ -153,7 +152,6 @@ refresh Job (repeat `toolforge envvars create` to update an existing value):
 
 ```sh
 become wiki-economics toolforge envvars create WIKI_ECON_BIN /data/project/wiki-economics/app/current/wiki-econ
-become wiki-economics toolforge envvars create WIKI_ECON_REFRESH_WIKIS nlwiki
 become wiki-economics toolforge envvars create WIKI_ECON_DATA_DIR /data/project/wiki-economics/data
 become wiki-economics toolforge envvars create WIKI_ECON_OUTPUT_DIR /data/project/wiki-economics/output
 become wiki-economics toolforge envvars create WIKI_ECON_SITE_DIST_DIR /data/project/wiki-economics/site-dist
@@ -165,6 +163,27 @@ with `config/wiki-lifecycle.json`. If it is absent, the scheduled entries in
 that registry are used. The legacy `WIKI_ECON_ENABLED_WIKIS` name remains a
 backward-compatible alias. Paused imported wikis remain published and are not
 cleanup candidates; see [wiki lifecycle management](../../docs/wiki-lifecycle.md).
+
+### ptwiki production qualification
+
+ptwiki joined the weekly schedule after the 2026-08-23 qualification against
+snapshot `2026-07` completed under the normal 6 GiB / one-CPU Toolforge job:
+
+- the complete refresh, publication gate, Observable build, and snapshot
+  finalization succeeded in 75m30s with no OOM or OOM-kill event;
+- `page_weekly_edits` produced 40,092,138 rows and conserved 72,037,971 edits
+  from 2001-06-04 through 2026-07-27; its largest stable bucket was 169,249
+  rows;
+- patrol parsing produced 11,356,093 patrol events and 10,347 rights events;
+  the computed patrol metric contained 11,519 rows through 2026-08;
+- the cache-controlled release separately hashed the 6.35 GB snapshot and
+  parsed the 781 MB multi-member patrol gzip inside a 1 GiB qualification pod,
+  then ingested the largest 5,299,634-row yearly source inside another 1 GiB
+  pod. Both jobs exited successfully with zero memory-pressure events.
+
+The lifecycle registry is the production selector. Do not retain a duplicate
+`WIKI_ECON_REFRESH_WIKIS` or legacy `WIKI_ECON_ENABLED_WIKIS` value unless an
+operator is intentionally running a one-off subset.
 
 ### First cutover
 
