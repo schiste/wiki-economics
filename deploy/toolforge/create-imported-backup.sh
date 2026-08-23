@@ -42,7 +42,7 @@ mkdir -p "$staging/data"
 for wiki in "${wikis[@]}"; do
   source="$output_dir/$wiki"
   [ -d "$source" ] || { echo "Imported dataset is missing: $source" >&2; exit 1; }
-  cp -a -- "$source" "$staging/data/$wiki"
+  cp -R -- "$source" "$staging/data/$wiki"
 done
 if find "$staging/data" -type l -print -quit | grep -q .; then
   echo "Imported backup refuses symbolic links" >&2

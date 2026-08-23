@@ -26,7 +26,15 @@ test("imported backups are complete, checksummed, restorable, and tamper-evident
     nlwiki: {publication: "published", provenance: "toolforge"},
   }}));
   const archive = path.join(root, "imported.tar.gz");
-  const environment = {...process.env, WIKI_ECON_OUTPUT_DIR: output, WIKI_ECON_WIKI_LIFECYCLE_FILE: lifecycle};
+  const fakeBin = path.join(root, "bin");
+  fs.mkdirSync(fakeBin);
+  fs.writeFileSync(path.join(fakeBin, "cp"), '#!/bin/sh\n[ "$1" != "-a" ] || exit 77\nexec /bin/cp "$@"\n', {mode: 0o755});
+  const environment = {
+    ...process.env,
+    PATH: `${fakeBin}:${process.env.PATH}`,
+    WIKI_ECON_OUTPUT_DIR: output,
+    WIKI_ECON_WIKI_LIFECYCLE_FILE: lifecycle,
+  };
   let result = spawnSync("bash", [create, archive], {encoding: "utf8", env: environment});
   assert.equal(result.status, 0, result.stderr);
   result = spawnSync("bash", [verify, archive], {encoding: "utf8"});
