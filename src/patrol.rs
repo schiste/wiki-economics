@@ -512,10 +512,13 @@ pub fn compute_patrol(
 
 fn read_parquet_df(path: &Path, columns: Option<Vec<String>>) -> Result<DataFrame> {
     let file = File::open(path)?;
-    ParquetReader::new(file)
+    storage::prepare_sequential_read(&file);
+    let result = ParquetReader::new(file)
         .with_columns(columns)
         .finish()
-        .map_err(Into::into)
+        .map_err(Into::into);
+    storage::discard_path_cache(path);
+    result
 }
 
 fn projection(columns: &[&str]) -> Vec<String> {

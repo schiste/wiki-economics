@@ -9,6 +9,7 @@ use tracing::info;
 
 use crate::fingerprint::{self, StageSpec, TrackedPath};
 use crate::observability::MemorySnapshot;
+use crate::storage;
 use crate::wiki_lifecycle;
 
 const MERGE_BATCH_ROWS: usize = 250_000;
@@ -238,6 +239,7 @@ fn merge_metric_batched(
                 total_rows += rows;
                 batches += 1;
             }
+            storage::discard_path_cache(path);
 
             let memory = MemorySnapshot::capture();
             info!(

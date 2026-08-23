@@ -644,6 +644,27 @@ pub(crate) fn discard_file_cache(file: &File, offset: u64, length: u64) {
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn discard_file_cache(_file: &File, _offset: u64, _length: u64) {}
 
+/// Release cache pages for a file that has already been fully consumed.
+/// Opening a second descriptor is intentional: readers such as Polars take
+/// ownership of their `File`, so the original descriptor is no longer
+/// available after materialization. Cache advice remains best-effort and can
+/// never turn a successful data operation into a failure.
+pub(crate) fn discard_path_cache(path: &Path) {
+    if let Ok(file) = File::open(path) {
+        let length = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        discard_file_cache(&file, 0, length);
+    }
+}
+
+/// Release completed Parquet input pages below a partition directory.
+pub(crate) fn discard_parquet_cache_in_dir(dir: &Path) {
+    if let Ok(files) = collect_parquet_files(dir) {
+        for path in files {
+            discard_path_cache(&path);
+        }
+    }
+}
+
 #[cfg(test)]
 pub fn read_marker_manifest(
     data_dir: &Path,

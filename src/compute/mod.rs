@@ -799,6 +799,7 @@ fn compute_page_weekly_edits(
             config.bucket_count,
         );
         stage_result?;
+        storage::discard_parquet_cache_in_dir(&partition.dir);
         let memory = MemorySnapshot::capture();
         reduction_peak.observe(memory, None);
         info!(
@@ -1310,6 +1311,7 @@ fn compute_all_incremental(wiki: &str, data_dir: &Path, output_dir: &Path) -> Re
         gdp_tier_frames.push(gdp_activity_tiers_frame(&base)?);
         labor_monthly_frames.push(labor_monthly_frame(&base)?);
         registered_state.observe_partition(&base, partition.year, year_month_key)?;
+        storage::discard_parquet_cache_in_dir(&partition.dir);
     }
 
     let mut inequality_out = concat_frames(inequality_frames)?;
