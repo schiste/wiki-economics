@@ -28,6 +28,19 @@ output_dir="$capacity_root/output/$run_id"
 scratch_dir="$capacity_root/scratch/$run_id"
 report_path="$capacity_root/reports/$wiki/$run_id.json"
 
+case "$capacity_root" in
+  ""|/) echo "Refusing unsafe capacity root: $capacity_root" >&2; exit 1 ;;
+esac
+[[ "$run_id" =~ ^capacity-[A-Za-z0-9._-]+$ ]] || {
+  echo "Refusing unsafe capacity run ID: $run_id" >&2
+  exit 1
+}
+
+cleanup_capacity_staging() {
+  rm -rf -- "$output_dir" "$scratch_dir"
+}
+trap cleanup_capacity_staging EXIT
+
 mkdir -p "$output_dir" "$scratch_dir" "$(dirname "$report_path")"
 export WIKI_ECON_RUN_ID="$run_id"
 export WIKI_ECON_LOG_ANSI=0
@@ -49,7 +62,7 @@ echo "=== wiki-economics capacity benchmark start run_id=$run_id wiki=$wiki buck
   --scratch-dir "$scratch_dir" \
   --report "$report_path" \
   --raw-transient-bytes "${WIKI_ECON_FRWIKI_RAW_TRANSIENT_BYTES:-33285996544}" \
-  "${quota_args[@]}" \
+  ${quota_args[@]+"${quota_args[@]}"} \
   --storage-reserve-bytes "${WIKI_ECON_CAPACITY_STORAGE_RESERVE_BYTES:-53687091200}" \
   --quota-root /data/project/wiki-economics \
   --minimum-memory-headroom-percent "${WIKI_ECON_CAPACITY_MIN_HEADROOM_PERCENT:-25}"
