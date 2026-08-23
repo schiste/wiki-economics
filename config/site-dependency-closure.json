@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "vendored_cache_sha256": "fe3670116046fb377261f056c1b216ac70399bf8c1a03f665689df2f957f5c9e",
+  "vendored_cache_sha256": "d0fb7412b86bf9b9ed72cef16562364105de89eaf09456f096db3a3e97bbf0b7",
   "build_tools": {
     "@observablehq/framework": "1.13.4",
     "esbuild": "0.28.2"

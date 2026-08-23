@@ -93,7 +93,11 @@ function verifySiteDependencies(distDir, options = {}) {
         throw new Error(`unexpected WASM asset in vendored cache: ${normalized}`);
       }
       const identity = packageIdentity(normalized);
-      if (identity && closure.generated_packages[identity.name] !== identity.version) {
+      const reviewedVersion = identity && (
+        closure.generated_packages[identity.name]
+        || closure.direct_browser_packages[identity.name]
+      );
+      if (identity && reviewedVersion !== identity.version) {
         throw new Error(`undeclared vendored browser package: ${identity.name}@${identity.version}`);
       }
     }

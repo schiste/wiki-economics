@@ -5,7 +5,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const {afterEach, test} = require("node:test");
-const {packageIdentity, runtimeRemoteReferences, verifySiteDependencies} = require("./verify-site-dependencies.cjs");
+const {packageIdentity, runtimeRemoteReferences, treeSha256, verifySiteDependencies} = require("./verify-site-dependencies.cjs");
 
 const roots = [];
 afterEach(() => {
@@ -51,6 +51,22 @@ test("package identities support scoped and unscoped generated paths", () => {
 
 test("the exact generated closure accepts ordinary hyperlinks", () => {
   const current = fixture();
+  assert.deepEqual(verifySiteDependencies(current.dist, current).packages, {d3: "7.9.0"});
+});
+
+test("the vendored resolver cache may pin a direct package that is tree-shaken from output", () => {
+  const current = fixture();
+  current.vendorCacheDir = path.join(path.dirname(current.dist), "vendor");
+  fs.mkdirSync(path.join(current.vendorCacheDir, "_npm", "react-dom@19.2.8"), {recursive: true});
+  fs.writeFileSync(path.join(current.vendorCacheDir, "_npm", "react-dom@19.2.8", "resolution-only.txt"), "pinned\n");
+  const closure = JSON.parse(fs.readFileSync(current.closureFile));
+  closure.direct_browser_packages["react-dom"] = "19.2.8";
+  closure.vendored_cache_sha256 = treeSha256(current.vendorCacheDir);
+  fs.writeFileSync(current.closureFile, JSON.stringify(closure));
+  fs.writeFileSync(current.siteManifestFile, JSON.stringify({dependencies: {d3: "7.9.0", "react-dom": "19.2.8"}}));
+  const lock = JSON.parse(fs.readFileSync(current.lockFile));
+  lock.packages["node_modules/react-dom"] = {version: "19.2.8"};
+  fs.writeFileSync(current.lockFile, JSON.stringify(lock));
   assert.deepEqual(verifySiteDependencies(current.dist, current).packages, {d3: "7.9.0"});
 });
 

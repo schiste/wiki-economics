@@ -1,0 +1,1 @@
+This exact version directory pins Observable's implicit React resolver offline.
