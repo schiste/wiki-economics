@@ -9,6 +9,9 @@ trap 'rm -rf -- "$SITE_FIXTURE_ROOT"' EXIT
 echo "==> node scripts/verify-runtime.cjs"
 node scripts/verify-runtime.cjs
 
+echo "==> node scripts/generate-stack-reference.cjs --check"
+node scripts/generate-stack-reference.cjs --check
+
 echo "==> bash -n scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh deploy/toolforge/*.sh"
 bash -n scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh deploy/toolforge/*.sh
 
@@ -28,6 +31,7 @@ node --check scripts/deny-network.cjs
 node --check scripts/prepare-site-source.cjs
 node --check scripts/release-provenance.cjs
 node --check scripts/generate-sboms.cjs
+node --check scripts/generate-stack-reference.cjs
 node --check scripts/release-bundle.cjs
 node --check scripts/verify-runtime.cjs
 node --check scripts/verify-site-dependencies.cjs
@@ -83,6 +87,7 @@ echo "==> dependency closure and reproducibility unit tests"
 node --test scripts/prepare-site-source.test.cjs
 node --test scripts/release-provenance.test.cjs
 node --test scripts/generate-sboms.test.cjs
+node --test scripts/generate-stack-reference.test.cjs
 node --test scripts/release-bundle.test.cjs
 node --test scripts/verify-site-dependencies.test.cjs
 node --test scripts/verify-site-reproducibility.test.cjs
