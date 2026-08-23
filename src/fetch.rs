@@ -1335,6 +1335,31 @@ fn check_disk_headroom<T: HttpTransport>(
     files: &[String],
     data_dir: &Path,
 ) -> Result<()> {
+    check_disk_headroom_with_available(
+        transport,
+        base_url,
+        wiki,
+        version,
+        files,
+        data_dir,
+        |path| fs4::available_space(path),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn check_disk_headroom_with_available<T, F>(
+    transport: &T,
+    base_url: &str,
+    wiki: &str,
+    version: &str,
+    files: &[String],
+    data_dir: &Path,
+    available_space: F,
+) -> Result<()>
+where
+    T: HttpTransport,
+    F: FnOnce(&Path) -> std::io::Result<u64>,
+{
     let raw_dir = data_dir.join("raw").join(wiki);
     let mut needed_bytes: u64 = 0;
     let mut unknown_files = 0usize;
@@ -1363,7 +1388,7 @@ fn check_disk_headroom<T: HttpTransport>(
         return Ok(());
     }
 
-    let available_bytes = match fs4::available_space(data_dir) {
+    let available_bytes = match available_space(data_dir) {
         Ok(bytes) => bytes,
         Err(error) => {
             warn!(
@@ -1375,7 +1400,24 @@ fn check_disk_headroom<T: HttpTransport>(
         }
     };
 
-    let required_bytes = needed_bytes + FETCH_DISK_HEADROOM_MARGIN_BYTES;
+    ensure_disk_headroom(wiki, data_dir, needed_bytes, available_bytes)?;
+
+    info!(
+        wiki = wiki,
+        needed_bytes = needed_bytes,
+        available_bytes = available_bytes,
+        "disk headroom check passed"
+    );
+    Ok(())
+}
+
+fn ensure_disk_headroom(
+    wiki: &str,
+    data_dir: &Path,
+    needed_bytes: u64,
+    available_bytes: u64,
+) -> Result<()> {
+    let required_bytes = needed_bytes.saturating_add(FETCH_DISK_HEADROOM_MARGIN_BYTES);
     if available_bytes < required_bytes {
         anyhow::bail!(
             "insufficient disk space to fetch {wiki}: need ~{needed_bytes} bytes \
@@ -1385,12 +1427,6 @@ fn check_disk_headroom<T: HttpTransport>(
         );
     }
 
-    info!(
-        wiki = wiki,
-        needed_bytes = needed_bytes,
-        available_bytes = available_bytes,
-        "disk headroom check passed"
-    );
     Ok(())
 }
 
@@ -2676,7 +2712,7 @@ mod tests {
         )
         .expect("covered year marker should be written");
         let transport = FakeTransport::with_outcomes(
-            [ok_head(Some(13), false), ok_head(Some(13), false)],
+            [ok_head(None, false), ok_head(Some(13), false)],
             [ok_get(b"BZhpayload-by", false)],
         );
 
@@ -2789,15 +2825,15 @@ mod tests {
     fn check_disk_headroom_passes_when_space_is_sufficient() -> Result<()> {
         init_test_tracing();
         let temp_dir = TestDir::new()?;
-        let transport = FakeTransport::with_head_outcomes([ok_head(Some(1024), true)]);
-
-        check_disk_headroom(
+        let transport = FakeTransport::with_head_outcomes([ok_head(Some(1_024), true)]);
+        check_disk_headroom_with_available(
             &transport,
             "http://example.invalid",
             "testwiki",
             "2026-02",
             &["2026-02.testwiki.all-time.tsv.bz2".to_string()],
             temp_dir.path(),
+            |_| Ok(FETCH_DISK_HEADROOM_MARGIN_BYTES + 1_024),
         )
         .expect("headroom check should pass");
         Ok(())
