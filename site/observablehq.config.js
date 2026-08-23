@@ -1,4 +1,5 @@
 import path from "node:path";
+import { siteFooter } from "./site-footer.js";
 
 const isDev = process.argv.some(a => a === "preview" || a === "dev");
 const distDir = process.env.WIKI_ECON_SITE_DIST_DIR
@@ -48,27 +49,7 @@ export default {
   // headings; we use system fonts everywhere, so drop it to avoid the
   // network fetch.
   globalStylesheets: [],
-  footer: `<div class="site-footer">
-<div class="site-footer-vision">
-<h3>About</h3>
-<p><strong>Wiki Economics</strong> applies economic indicators — GDP, labor statistics, inequality metrics, quality control — to Wikipedia activity data, surfacing structural patterns that are hard to see in raw edit logs. An independent project created by Christophe Henner.</p>
-</div>
-<div class="site-footer-links">
-<h3>Links</h3>
-<a href="https://meta.wikimedia.org/wiki/Next_25/Wiki_Economics">Project page on Meta-Wiki</a>
-<a href="https://github.com/schiste/wiki-economics">Source on GitHub</a>
-<a href="/legal">MIT license</a>
-</div>
-<div class="site-footer-privacy">
-<h3>Privacy</h3>
-<span class="privacy-pill">No tracking</span>
-<p>No analytics, cookies, or trackers. Runs entirely on <a href="https://wikitech.wikimedia.org/wiki/Portal:Toolforge">Wikimedia Toolforge</a>, computed from public Wikimedia data dumps.</p>
-</div>
-</div>
-<div class="legal-footer">
-<span>Wiki Economics · <a href="/legal">MIT licensed</a></span>
-<span>Uses public <a href="https://dumps.wikimedia.org/">Wikimedia data</a> · Independent and not endorsed by the Wikimedia Foundation</span>
-</div>`,
+  footer: siteFooter,
   head: ({ path }) => `<link rel="stylesheet" href="./style.css">
 ${adminApiScript}
 ${path === "/index" ? speculationRulesScript : ""}
