@@ -29,8 +29,8 @@ The public repo should contain:
 - repository policy/config files such as `.github/`, `.cargo/`, `Cargo.toml`,
   `Cargo.lock`, `deny.toml`, `.editorconfig`, `.gitattributes`, and `.gitignore`
 - community and legal files such as `README.md`, `CONTRIBUTING.md`,
-  `CODE_OF_CONDUCT.md`, `SECURITY.md`, `LICENSE`, `LICENSE-MIT`,
-  and `LICENSE-APACHE`
+  `CODE_OF_CONDUCT.md`, `SECURITY.md`, `LICENSE`, `LICENSES/`, and
+  `REUSE.toml`
 
 ## Verification Before A Release-Oriented Push
 
@@ -52,7 +52,7 @@ When preparing a release-oriented change, stage publishable source explicitly:
 git add .cargo .github deploy docs scripts site src tests vendor
 git add .editorconfig .gitattributes .gitignore
 git add CODE_OF_CONDUCT.md CONTRIBUTING.md SECURITY.md README.md
-git add LICENSE LICENSE-MIT LICENSE-APACHE
+git add LICENSE LICENSES REUSE.toml
 git add Cargo.toml Cargo.lock deny.toml rust-toolchain.toml package.json
 git status --short
 ```

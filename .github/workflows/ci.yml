@@ -233,6 +233,12 @@ jobs:
         with:
           tool: cargo-deny,cargo-audit
 
+      - name: Install REUSE compliance tooling
+        run: python3 -m pip install --disable-pip-version-check 'reuse[charset-normalizer]==6.2.0'
+
+      - name: REUSE lint
+        run: reuse --no-multiprocessing lint
+
       - name: cargo-deny
         run: cargo deny check advisories bans licenses sources
 

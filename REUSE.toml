@@ -1,0 +1,27 @@
+version = 1
+
+# Project-owned code, documentation, configuration, site content, fixtures,
+# and generated-support sources are released under MIT. `closest` preserves a
+# more specific SPDX header when one is present in an individual file.
+[[annotations]]
+path = "**"
+precedence = "closest"
+SPDX-FileCopyrightText = "2026 Christophe Henner"
+SPDX-License-Identifier = "MIT"
+
+# These directories mirror upstream projects and retain their upstream
+# copyright and licensing. Local patches do not relicense the copied work.
+[[annotations]]
+path = "vendor/object-store/**"
+precedence = "closest"
+SPDX-FileCopyrightText = "2020-2024 The Apache Software Foundation"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = "vendor/polars-utils/**"
+precedence = "closest"
+SPDX-FileCopyrightText = [
+    "2025 Ritchie Vink",
+    "2024 NVIDIA CORPORATION & AFFILIATES",
+]
+SPDX-License-Identifier = "MIT"

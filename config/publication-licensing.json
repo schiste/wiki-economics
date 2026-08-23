@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "project_name": "Wiki Economics",
+  "project_url": "https://github.com/schiste/wiki-economics",
+  "license": {
+    "spdx_identifier": "MIT",
+    "name": "MIT License",
+    "url": "https://github.com/schiste/wiki-economics/blob/main/LICENSE",
+    "applies_to": [
+      "project-owned software",
+      "project-owned documentation",
+      "project-owned site prose and graphics",
+      "generated aggregate datasets"
+    ]
+  },
+  "attribution": "Wiki Economics uses data from Wikimedia projects.",
+  "independence_notice": "Wiki Economics is independently developed and is not affiliated with, sponsored by, or endorsed by the Wikimedia Foundation.",
+  "legal_url": "/legal",
+  "source_datasets": [
+    {
+      "id": "mediawiki_history",
+      "name": "Wikimedia MediaWiki History dumps",
+      "url": "https://dumps.wikimedia.org/other/mediawiki_history/",
+      "terms_url": "https://dumps.wikimedia.org/legal.html"
+    },
+    {
+      "id": "mediawiki_logging",
+      "name": "Wikimedia MediaWiki logging XML dumps",
+      "url": "https://dumps.wikimedia.org/",
+      "terms_url": "https://dumps.wikimedia.org/legal.html"
+    },
+    {
+      "id": "mediawiki_action_api",
+      "name": "MediaWiki Action API siteinfo",
+      "url": "https://www.mediawiki.org/wiki/API:Main_page",
+      "terms_url": "https://foundation.wikimedia.org/wiki/Policy:Terms_of_Use"
+    }
+  ],
+  "trademark": {
+    "owner": "Wikimedia Foundation",
+    "status": "No trademark license is recorded; the project uses only descriptive references to Wikimedia projects and the generic project name Wiki Economics.",
+    "policy_url": "https://foundation.wikimedia.org/wiki/Trademark_policy"
+  },
+  "privacy": {
+    "notice": "Copyright licensing does not replace privacy or data-protection obligations.",
+    "policy_url": "https://foundation.wikimedia.org/wiki/Policy:Privacy_policy"
+  },
+  "toolforge": {
+    "open_source_license_spdx": "MIT",
+    "open_data_license_spdx": "MIT",
+    "compliance_statement": "Project source and generated aggregate datasets are openly licensed under MIT.",
+    "terms_url": "https://wikitech.wikimedia.org/wiki/Help:Toolforge/Terms_and_conditions"
+  }
+}

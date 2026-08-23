@@ -155,6 +155,7 @@ python3 -m unittest discover -s scripts -p 'test_*.py'
 - [Development](docs/development.md)
 - [Benchmarking](docs/benchmarking.md)
 - [Dependencies and Licenses](docs/dependencies-and-licenses.md)
+- [Legal, Licensing & Attribution](docs/legal.md)
 - [Publishing](docs/release.md)
 - [Publication Gate](docs/publication-gate.md)
 - [Security Model](docs/security.md)
@@ -182,4 +183,7 @@ If you need small permanent fixtures for tests, add them deliberately rather tha
 
 ## License
 
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or [MIT license](LICENSE-MIT), at your option.
+Project-owned software, documentation, site content, and generated aggregate
+datasets are licensed under the [MIT license](LICENSE). Wikimedia source data,
+trademarks, and privacy obligations remain governed by their respective
+upstream terms; see [Legal, Licensing & Attribution](docs/legal.md).

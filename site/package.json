@@ -2,7 +2,7 @@
   "name": "wiki-economics-dashboard",
   "version": "0.1.0",
   "type": "module",
-  "license": "(MIT OR Apache-2.0)",
+  "license": "MIT",
   "scripts": {
     "dev": "observable preview",
     "build": "observable build"

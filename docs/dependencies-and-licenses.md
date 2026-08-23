@@ -12,10 +12,13 @@ remain the checked-in manifests and lockfiles:
 - `package-lock.json`
 - `site/package.json`
 - `vendor/polars-utils/`
+- `THIRD_PARTY_NOTICES.md`
+- `REUSE.toml`
 
 ## Scope
 
-- The repository's own code is dual-licensed under `MIT OR Apache-2.0`.
+- Project-owned code, documentation, site content, and generated aggregate
+  datasets are licensed under `MIT`.
 - This document covers the main software dependencies that power the Rust
   pipeline, Python sidecar workflow, dashboard, and local build/query stack.
 - Wikimedia dump content is separate from software licensing. The reuse terms
@@ -30,6 +33,11 @@ remain the checked-in manifests and lockfiles:
 ## License Policy
 
 Rust dependency licensing is enforced in CI with `cargo deny`.
+Project file copyright and licensing declarations are enforced with the REUSE
+3.3 specification and `reuse lint`. The canonical public publication policy is
+`config/publication-licensing.json`; every downloadable artifact record carries
+an SPDX `license_spdx` field, while each manifest also records provenance,
+attribution, source datasets, and the Wikimedia trademark status.
 
 The current allow-list in [`deny.toml`](../deny.toml) is:
 
@@ -49,7 +57,7 @@ That gives the project a deliberately permissive software-license posture.
 
 | Component | Role | License |
 |-----------|------|---------|
-| `wiki-econ` | Rust CLI workspace in this repository | `MIT OR Apache-2.0` |
+| `wiki-econ` | Rust CLI workspace in this repository | `MIT` |
 | Polars | Dataframe engine for ingest and compute | `MIT` |
 | vendored `polars-utils` patch | In-tree patch carried under `vendor/polars-utils` | `MIT` |
 | Observable Framework | Dashboard build/runtime framework | `ISC` |
