@@ -166,6 +166,14 @@ is non-zero on every ingest run and the threat is hypothetical.
 - `cargo deny check advisories bans licenses sources` runs on every CI
   push.
 - `cargo audit -D warnings` runs on every CI push.
+- `scripts/check-npm-advisories.cjs` audits both checked-in npm lockfiles on
+  every CI push. Moderate, high, and critical advisories always fail. Low
+  advisories also fail unless their package and GHSA are explicitly listed in
+  the script.
+- The only current npm exception is `GHSA-g7r4-m6w7-qqqr` in esbuild, inherited
+  through Observable Framework 1.13.4. It affects the Windows development
+  server; production builds and Toolforge run on Linux and do not expose that
+  server. Remove the exception as soon as Observable accepts a patched esbuild.
 - Third-party GitHub Actions are pinned to commit SHAs (see
   [`ci.yml`](../.github/workflows/ci.yml)). Refresh the SHAs
   deliberately; do not switch back to floating `@v4` tags.

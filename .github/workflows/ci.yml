@@ -36,6 +36,9 @@ jobs:
           node-version: 22
           package-manager-cache: false
 
+      - name: Install Node dependencies
+        run: npm ci
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # @stable as of pin
         with:
@@ -63,6 +66,8 @@ jobs:
           node --check site/admin-server.cjs
           node --check site/freshness.cjs
           node --check site/observablehq.config.js
+          node --check site/data-build/lib/duckdb-json.cjs
+          node --check scripts/check-npm-advisories.cjs
           node --check scripts/check-freshness.cjs
 
       - name: Run Node unit tests
@@ -70,10 +75,13 @@ jobs:
           node --test site/admin-auth.test.cjs
           node --test site/admin-server.test.cjs
           node --test site/build-site.test.cjs
+          node --test site/data-build/determinism.test.cjs
+          node --test site/data-build/lib/duckdb-json.test.cjs
           node --test site/data-build/manifest.test.cjs
           node --test site/freshness.test.cjs
           node --test deploy/toolforge/run-record.test.cjs
           node --test deploy/toolforge/run-refresh.test.cjs
+          node --test scripts/check-npm-advisories.test.cjs
           node --test scripts/check-freshness.test.cjs
           node --test scripts/wiki-lifecycle.test.cjs
 
@@ -161,6 +169,12 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
 
+      - name: Install Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
+        with:
+          node-version: 22
+          package-manager-cache: false
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # @stable as of pin
         with:
@@ -182,6 +196,9 @@ jobs:
 
       - name: cargo-audit
         run: cargo audit -D warnings
+
+      - name: npm advisory policy
+        run: node scripts/check-npm-advisories.cjs
 
       - name: Vendor patch hygiene
         run: scripts/check_vendor_patches.sh

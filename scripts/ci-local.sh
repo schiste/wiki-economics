@@ -16,6 +16,7 @@ node --check site/admin-server.cjs
 echo "==> node --check site/freshness.cjs scripts/check-freshness.cjs"
 node --check site/freshness.cjs
 node --check scripts/check-freshness.cjs
+node --check scripts/check-npm-advisories.cjs
 
 echo "==> node --check site/observablehq.config.js"
 node --check site/observablehq.config.js
@@ -33,6 +34,8 @@ echo "==> node --test site/build-site.test.cjs"
 node --test site/build-site.test.cjs
 
 echo "==> node --test site/data-build/manifest.test.cjs site/freshness.test.cjs"
+node --test site/data-build/determinism.test.cjs
+node --test site/data-build/lib/duckdb-json.test.cjs
 node --test site/data-build/manifest.test.cjs
 node --test site/freshness.test.cjs
 
@@ -44,6 +47,9 @@ node --test deploy/toolforge/run-refresh.test.cjs
 
 echo "==> node --test scripts/check-freshness.test.cjs"
 node --test scripts/check-freshness.test.cjs
+
+echo "==> node --test scripts/check-npm-advisories.test.cjs"
+node --test scripts/check-npm-advisories.test.cjs
 
 echo "==> node --test scripts/wiki-lifecycle.test.cjs"
 node --test scripts/wiki-lifecycle.test.cjs
@@ -77,6 +83,9 @@ cargo deny check advisories bans licenses sources
 
 echo "==> cargo audit -D warnings"
 cargo audit -D warnings
+
+echo "==> node scripts/check-npm-advisories.cjs"
+node scripts/check-npm-advisories.cjs
 
 echo "==> scripts/check_vendor_patches.sh"
 scripts/check_vendor_patches.sh
