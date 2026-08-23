@@ -944,8 +944,13 @@ body.wk-loading .wk-progress-status {
 /* ── Sidebar refinements ────────────────────────────────── */
 
 #observablehq-sidebar {
+  /* Framework grows this to keep sidebar content aligned with the centered
+     main column on wide viewports, but that also inflates the sidebar's own
+     background well past its content — pin it to 0 so the sidebar stays a
+     fixed-width rail flush against the left edge instead. */
+  --observablehq-sidebar-padding-left: 0px;
   font-family: var(--wk-sans);
-  width: calc(200px + var(--observablehq-sidebar-padding-left, 0px));
+  width: 200px;
   left: -200px;
 }
 
@@ -967,7 +972,7 @@ body.wk-loading .wk-progress-status {
 .sidebar-bottom {
   position: absolute;
   bottom: 0;
-  left: var(--observablehq-sidebar-padding-left, 0px);
+  left: 0;
   right: 0;
   padding: 0.75rem 1rem;
   border-top: 1px solid var(--wk-border, var(--theme-foreground-faintest));
