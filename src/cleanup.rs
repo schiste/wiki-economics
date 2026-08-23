@@ -11,6 +11,7 @@ pub struct CleanupReport {
     pub merge_temporaries: usize,
     pub site_builds: usize,
     pub run_staging_directories: usize,
+    pub weekly_scratch_directories: usize,
     pub snapshot_generations: usize,
     pub removed: Vec<String>,
 }
@@ -19,6 +20,7 @@ pub fn clean_abandoned(
     data_dir: &Path,
     output_dir: &Path,
     site_dist_dir: &Path,
+    scratch_dir: Option<&Path>,
     wikis: &[String],
     current_run_id: Option<&str>,
     minimum_age: Duration,
@@ -28,6 +30,9 @@ pub fn clean_abandoned(
     clean_merge_temporaries(output_dir, current_run_id, minimum_age, now, &mut report)?;
     clean_site_builds(site_dist_dir, current_run_id, minimum_age, now, &mut report)?;
     clean_run_staging(output_dir, current_run_id, minimum_age, now, &mut report)?;
+    if let Some(scratch_dir) = scratch_dir {
+        clean_weekly_scratch(scratch_dir, current_run_id, minimum_age, now, &mut report)?;
+    }
     for wiki in wikis {
         report.snapshot_generations += storage::clean_stale_inactive_snapshots(
             data_dir,
@@ -39,6 +44,41 @@ pub fn clean_abandoned(
     }
     report.removed.sort();
     Ok(report)
+}
+
+fn clean_weekly_scratch(
+    scratch_root: &Path,
+    current_run_id: Option<&str>,
+    minimum_age: Duration,
+    now: SystemTime,
+    report: &mut CleanupReport,
+) -> Result<()> {
+    for wiki_entry in read_dir_if_present(scratch_root)? {
+        let wiki_entry = wiki_entry?;
+        if !wiki_entry.file_type()?.is_dir() {
+            continue;
+        }
+        for entry in read_dir_if_present(&wiki_entry.path())? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(owner) = name.strip_prefix(".page_weekly_edits-runs-") else {
+                continue;
+            };
+            if owner.is_empty()
+                || !owner.bytes().all(is_safe_id_byte)
+                || current_run_id.is_some_and(|run_id| owner.starts_with(&format!("{run_id}-")))
+                || !is_expired(&entry.path(), minimum_age, now)?
+            {
+                continue;
+            }
+            remove_dir(entry.path(), &mut report.removed)?;
+            report.weekly_scratch_directories += 1;
+        }
+    }
+    Ok(())
 }
 
 fn clean_merge_temporaries(
@@ -217,6 +257,7 @@ mod tests {
             &data,
             &output,
             &dist,
+            None,
             &[],
             Some("current-run"),
             Duration::ZERO,
@@ -257,6 +298,7 @@ mod tests {
             &data,
             &output,
             &dist,
+            None,
             &["nlwiki".to_string()],
             Some("current-run"),
             Duration::ZERO,
@@ -306,6 +348,7 @@ mod tests {
             &root.path().join("missing-data"),
             &output,
             &dist,
+            None,
             &[],
             Some("current-run"),
             Duration::from_secs(86_400),
@@ -378,6 +421,51 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_removes_only_expired_non_current_weekly_scratch() -> Result<()> {
+        let root = TestDir::new()?;
+        let data = root.path().join("data");
+        let output = root.path().join("output");
+        let dist = root.path().join("site/dist");
+        let scratch = root.path().join("scratch/frwiki");
+        fs::create_dir_all(&output)?;
+        fs::create_dir_all(dist.parent().context("site parent")?)?;
+        for name in [
+            ".page_weekly_edits-runs-dead-run-10-1",
+            ".page_weekly_edits-runs-current-run-11-2",
+            ".unowned-weekly-scratch",
+        ] {
+            fs::create_dir_all(scratch.join(name))?;
+        }
+        fs::write(root.path().join("scratch/not-a-wiki"), b"owned file")?;
+        fs::write(scratch.join("not-a-run-directory"), b"owned file")?;
+
+        let report = clean_abandoned(
+            &data,
+            &output,
+            &dist,
+            Some(root.path().join("scratch").as_path()),
+            &[],
+            Some("current-run"),
+            Duration::ZERO,
+        )
+        .expect("owned expired scratch should clean safely");
+
+        assert_eq!(report.weekly_scratch_directories, 1);
+        assert!(
+            !scratch
+                .join(".page_weekly_edits-runs-dead-run-10-1")
+                .exists()
+        );
+        assert!(
+            scratch
+                .join(".page_weekly_edits-runs-current-run-11-2")
+                .exists()
+        );
+        assert!(scratch.join(".unowned-weekly-scratch").exists());
+        Ok(())
+    }
+
+    #[test]
     fn cleanup_propagates_an_invalid_snapshot_pointer() -> Result<()> {
         let root = TestDir::new()?;
         let data = root.path().join("data");
@@ -394,6 +482,7 @@ mod tests {
                 &data,
                 &output,
                 &dist,
+                None,
                 &["nlwiki".to_string()],
                 Some("current-run"),
                 Duration::ZERO,

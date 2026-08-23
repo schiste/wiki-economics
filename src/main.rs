@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod bench;
+mod capacity;
 mod cleanup;
 mod compute;
 mod dashboard;
@@ -24,7 +25,7 @@ use chrono::{DateTime, Datelike, Utc};
 use clap::{Parser, Subcommand};
 use std::env;
 use std::fmt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use std::time::Instant;
 use tracing::{Event, Subscriber, info};
@@ -74,6 +75,10 @@ enum Commands {
         /// Minimum artifact age before removal
         #[arg(long, default_value_t = 21_600)]
         minimum_age_secs: u64,
+
+        /// Optional root containing pipeline-owned weekly aggregation scratch
+        #[arg(long)]
+        scratch_dir: Option<PathBuf>,
 
         /// Wiki database names whose abandoned snapshot generations may be retired
         wikis: Vec<String>,
@@ -186,6 +191,40 @@ enum Commands {
         keep_outputs: bool,
     },
 
+    /// Benchmark full-history weekly aggregation under an explicit capacity gate
+    CapacityBench {
+        /// Wiki database name; lifecycle state is not changed by this command
+        wiki: String,
+
+        /// Stable disk-bucket count to benchmark
+        #[arg(long, value_parser = clap::value_parser!(usize))]
+        weekly_buckets: usize,
+
+        /// Dedicated scratch root for disk-backed aggregation runs
+        #[arg(long)]
+        scratch_dir: PathBuf,
+
+        /// Atomic JSON report path
+        #[arg(long)]
+        report: Option<PathBuf>,
+
+        /// Estimated raw transient requirement during a snapshot rollover
+        #[arg(long, default_value_t = 33_285_996_544_u64)]
+        raw_transient_bytes: u64,
+
+        /// Confirmed tool-specific NFS quota; shared filesystem free space is insufficient
+        #[arg(long)]
+        nfs_quota_bytes: u64,
+
+        /// Root whose current usage is charged against the confirmed quota
+        #[arg(long)]
+        quota_root: Option<PathBuf>,
+
+        /// Required cgroup memory headroom at the observed peak
+        #[arg(long, default_value_t = 25_u8)]
+        minimum_memory_headroom_percent: u8,
+    },
+
     /// Run the full pipeline: fetch → ingest → compute → merge
     Run {
         /// Wiki database names
@@ -232,6 +271,20 @@ trait Ops {
         warmup: usize,
         iterations: usize,
         keep_outputs: bool,
+    ) -> Result<()>;
+    #[allow(clippy::too_many_arguments)]
+    fn capacity_benchmark(
+        &self,
+        wiki: &str,
+        data_dir: &std::path::Path,
+        output_dir: &std::path::Path,
+        scratch_dir: &std::path::Path,
+        report_path: &std::path::Path,
+        weekly_buckets: usize,
+        raw_transient_bytes: u64,
+        nfs_quota_bytes: u64,
+        quota_root: &std::path::Path,
+        minimum_memory_headroom_percent: u8,
     ) -> Result<()>;
     fn merge_outputs(&self, output_dir: &std::path::Path, run_id: Option<&str>) -> Result<()>;
     fn finalize_snapshot(&self, wiki: &str, data_dir: &std::path::Path) -> Result<()>;
@@ -307,6 +360,34 @@ impl Ops for RealOps {
         )
     }
 
+    fn capacity_benchmark(
+        &self,
+        wiki: &str,
+        data_dir: &std::path::Path,
+        output_dir: &std::path::Path,
+        scratch_dir: &std::path::Path,
+        report_path: &std::path::Path,
+        weekly_buckets: usize,
+        raw_transient_bytes: u64,
+        nfs_quota_bytes: u64,
+        quota_root: &std::path::Path,
+        minimum_memory_headroom_percent: u8,
+    ) -> Result<()> {
+        execute_capacity_benchmark(capacity::CapacityBenchmarkOptions {
+            wiki,
+            data_dir,
+            output_dir,
+            scratch_root: scratch_dir,
+            quota_root,
+            report_path,
+            bucket_count: weekly_buckets,
+            raw_transient_requirement_bytes: raw_transient_bytes,
+            nfs_quota_bytes,
+            minimum_memory_headroom_percent,
+            telemetry_override: None,
+        })
+    }
+
     fn merge_outputs(&self, output_dir: &std::path::Path, run_id: Option<&str>) -> Result<()> {
         merge::merge_outputs(output_dir, run_id)
     }
@@ -319,6 +400,12 @@ impl Ops for RealOps {
         );
         Ok(())
     }
+}
+
+fn execute_capacity_benchmark(options: capacity::CapacityBenchmarkOptions<'_>) -> Result<()> {
+    let result = capacity::run(options)?;
+    println!("{}", serde_json::to_string(&result)?);
+    Ok(())
 }
 
 fn run_timed_stage<T>(
@@ -368,12 +455,14 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
         Commands::CleanupStale {
             site_dist_dir,
             minimum_age_secs,
+            scratch_dir,
             wikis,
         } => {
             let report = cleanup::clean_abandoned(
                 &data_dir,
                 &output_dir,
                 &site_dist_dir,
+                scratch_dir.as_deref(),
                 &wikis,
                 run_id.as_deref(),
                 Duration::from_secs(minimum_age_secs),
@@ -510,6 +599,48 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
                     warmup,
                     iterations,
                     keep_outputs,
+                )
+            })?;
+        }
+
+        Commands::CapacityBench {
+            wiki,
+            weekly_buckets,
+            scratch_dir,
+            report,
+            raw_transient_bytes,
+            nfs_quota_bytes,
+            quota_root,
+            minimum_memory_headroom_percent,
+        } => {
+            let report_path = report.unwrap_or_else(|| {
+                output_dir
+                    .join("capacity")
+                    .join(&wiki)
+                    .join(format!("weekly-buckets-{weekly_buckets}.json"))
+            });
+            let benchmark_output = output_dir
+                .join("capacity")
+                .join(&wiki)
+                .join(format!("weekly-buckets-{weekly_buckets}"));
+            let quota_root = quota_root.unwrap_or_else(|| {
+                data_dir
+                    .parent()
+                    .map(Path::to_path_buf)
+                    .unwrap_or_else(|| data_dir.clone())
+            });
+            run_timed_stage("capacity_benchmark", Some(&wiki), || {
+                ops.capacity_benchmark(
+                    &wiki,
+                    &data_dir,
+                    &benchmark_output,
+                    &scratch_dir,
+                    &report_path,
+                    weekly_buckets,
+                    raw_transient_bytes,
+                    nfs_quota_bytes,
+                    &quota_root,
+                    minimum_memory_headroom_percent,
                 )
             })?;
         }
@@ -909,6 +1040,30 @@ mod tests {
             Ok(())
         }
 
+        fn capacity_benchmark(
+            &self,
+            wiki: &str,
+            data_dir: &Path,
+            output_dir: &Path,
+            scratch_dir: &Path,
+            report_path: &Path,
+            weekly_buckets: usize,
+            raw_transient_bytes: u64,
+            nfs_quota_bytes: u64,
+            quota_root: &Path,
+            minimum_memory_headroom_percent: u8,
+        ) -> Result<()> {
+            self.record(format!(
+                "capacity:{wiki}:{}:{}:{}:{}:{weekly_buckets}:{raw_transient_bytes}:{nfs_quota_bytes}:{}:{minimum_memory_headroom_percent}",
+                data_dir.display(),
+                output_dir.display(),
+                scratch_dir.display(),
+                report_path.display(),
+                quota_root.display(),
+            ));
+            Ok(())
+        }
+
         fn merge_outputs(&self, output_dir: &Path, _run_id: Option<&str>) -> Result<()> {
             self.record(format!("merge:{}", output_dir.display()));
             Ok(())
@@ -981,6 +1136,25 @@ mod tests {
         ) -> Result<()> {
             if self.fail_stage == "bench" {
                 anyhow::bail!("bench failed");
+            }
+            Ok(())
+        }
+
+        fn capacity_benchmark(
+            &self,
+            _wiki: &str,
+            _data_dir: &Path,
+            _output_dir: &Path,
+            _scratch_dir: &Path,
+            _report_path: &Path,
+            _weekly_buckets: usize,
+            _raw_transient_bytes: u64,
+            _nfs_quota_bytes: u64,
+            _quota_root: &Path,
+            _minimum_memory_headroom_percent: u8,
+        ) -> Result<()> {
+            if self.fail_stage == "capacity" {
+                anyhow::bail!("capacity benchmark failed");
             }
             Ok(())
         }
@@ -1277,6 +1451,138 @@ mod tests {
         assert_eq!(
             ops.calls.into_inner(),
             vec!["bench:frwiki,dewiki:dataset:bench-out:2:4:true"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn capacity_bench_cli_requires_explicit_bucket_and_scratch_configuration() -> Result<()> {
+        let cli = Cli::try_parse_from([
+            "wiki-econ",
+            "capacity-bench",
+            "frwiki",
+            "--weekly-buckets",
+            "512",
+            "--scratch-dir",
+            "/scratch",
+            "--report",
+            "/reports/frwiki-512.json",
+            "--nfs-quota-bytes",
+            "100000000000",
+            "--quota-root",
+            "/tool-root",
+        ])?;
+        assert!(matches!(
+            cli.command,
+            Commands::CapacityBench {
+                wiki,
+                weekly_buckets: 512,
+                scratch_dir,
+                report,
+                raw_transient_bytes: 33_285_996_544,
+                nfs_quota_bytes: 100_000_000_000,
+                quota_root,
+                minimum_memory_headroom_percent: 25,
+            } if wiki == "frwiki"
+                && scratch_dir == Path::new("/scratch")
+                && report.as_deref() == Some(Path::new("/reports/frwiki-512.json"))
+                && quota_root.as_deref() == Some(Path::new("/tool-root"))
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn real_capacity_benchmark_serializes_isolated_evidence() -> Result<()> {
+        let data = TestDir::new()?;
+        let output = TestDir::new()?;
+        let scratch = TestDir::new()?;
+        let reports = TestDir::new()?;
+        let partition = crate::storage::month_partition_dir(
+            &crate::storage::warehouse_wiki_dir(data.path(), "frwiki"),
+            2026,
+            "2026-01",
+        );
+        fs::create_dir_all(&partition)?;
+        let mut frame = DataFrame::new_infer_height(vec![
+            Column::new("event_timestamp".into(), ["2026-01-05 00:00:00.0"]),
+            Column::new("page_id".into(), [42_i64]),
+            Column::new("page_namespace".into(), [0_i32]),
+            Column::new("page_title".into(), ["Capacity"]),
+        ])
+        .expect("capacity command fixture");
+        ParquetWriter::new(fs::File::create(partition.join("part.parquet"))?).finish(&mut frame)?;
+        let report_path = reports.path().join("frwiki.json");
+
+        execute_capacity_benchmark(capacity::CapacityBenchmarkOptions {
+            wiki: "frwiki",
+            data_dir: data.path(),
+            output_dir: output.path(),
+            scratch_root: scratch.path(),
+            quota_root: data.path(),
+            report_path: &report_path,
+            bucket_count: 256,
+            raw_transient_requirement_bytes: 0,
+            nfs_quota_bytes: 1_000_000_000,
+            minimum_memory_headroom_percent: 25,
+            telemetry_override: Some(observability::MemorySnapshot {
+                rss_bytes: Some(25),
+                cgroup_current_bytes: Some(50),
+                cgroup_peak_bytes: Some(50),
+                cgroup_limit_bytes: Some(100),
+            }),
+        })?;
+        assert!(report_path.is_file());
+
+        let native_output = output.path().join("native");
+        let native_report = reports.path().join("native.json");
+        let _ = RealOps.capacity_benchmark(
+            "frwiki",
+            data.path(),
+            &native_output,
+            scratch.path(),
+            &native_report,
+            256,
+            0,
+            1_000_000_000,
+            data.path(),
+            25,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn run_with_ops_dispatches_capacity_benchmark() -> Result<()> {
+        init_test_tracing();
+        let cli = Cli::try_parse_from([
+            "wiki-econ",
+            "--data-dir",
+            "dataset",
+            "--output-dir",
+            "capacity-out",
+            "capacity-bench",
+            "frwiki",
+            "--weekly-buckets",
+            "1024",
+            "--scratch-dir",
+            "scratch",
+            "--raw-transient-bytes",
+            "31000000000",
+            "--nfs-quota-bytes",
+            "100000000000",
+            "--quota-root",
+            "tool-root",
+            "--minimum-memory-headroom-percent",
+            "30",
+        ])?;
+        let ops = RecordingOps::default();
+
+        run_with_ops(cli, &ops)?;
+
+        assert_eq!(
+            ops.calls.into_inner(),
+            vec![
+                "capacity:frwiki:dataset:capacity-out/capacity/frwiki/weekly-buckets-1024:scratch:capacity-out/capacity/frwiki/weekly-buckets-1024.json:1024:31000000000:100000000000:tool-root:30"
+            ]
         );
         Ok(())
     }
@@ -1630,6 +1936,7 @@ mod tests {
                 command: Commands::CleanupStale {
                     site_dist_dir: site_dist,
                     minimum_age_secs: 0,
+                    scratch_dir: None,
                     wikis: Vec::new(),
                 },
             },
@@ -1660,6 +1967,7 @@ mod tests {
                 command: Commands::CleanupStale {
                     site_dist_dir: site_dist,
                     minimum_age_secs: 0,
+                    scratch_dir: None,
                     wikis: vec!["nlwiki".to_string()],
                 },
             },
@@ -1727,6 +2035,31 @@ mod tests {
         )
         .expect_err("compute failure should propagate");
         assert!(err.to_string().contains("compute failed"));
+        Ok(())
+    }
+
+    #[test]
+    fn run_with_ops_propagates_capacity_benchmark_errors() -> Result<()> {
+        init_test_tracing();
+        let cli = Cli::try_parse_from([
+            "wiki-econ",
+            "capacity-bench",
+            "frwiki",
+            "--weekly-buckets",
+            "256",
+            "--scratch-dir",
+            "scratch",
+            "--nfs-quota-bytes",
+            "100000000000",
+        ])?;
+        let error = run_with_ops(
+            cli,
+            &FailingOps {
+                fail_stage: "capacity",
+            },
+        )
+        .expect_err("capacity failure should propagate");
+        assert!(error.to_string().contains("capacity benchmark failed"));
         Ok(())
     }
 
@@ -1804,6 +2137,19 @@ mod tests {
         ops.compute_all("frwiki", data_dir, output_dir)?;
         ops.compute_patrol("frwiki", data_dir, output_dir, false, None)?;
         ops.benchmark(&wikis, data_dir, output_dir, 0, 1, false)?;
+        ops.capacity_benchmark(
+            "frwiki",
+            data_dir,
+            output_dir,
+            Path::new("scratch"),
+            Path::new("report.json"),
+            256,
+            0,
+            1,
+            data_dir,
+            25,
+        )
+        .expect("non-matching failing ops stage");
         ops.merge_outputs(output_dir, None)?;
         ops.finalize_snapshot("frwiki", data_dir)?;
         Ok(())

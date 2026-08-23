@@ -394,8 +394,11 @@ declare -a cleanup_cmd=(
   cleanup-stale
   --site-dist-dir "$WIKI_ECON_SITE_DIST_DIR"
   --minimum-age-secs "${WIKI_ECON_STALE_ARTIFACT_SECS:-21600}"
-  "${wikis[@]}"
 )
+if [ -n "${WIKI_ECON_SCRATCH_DIR:-}" ]; then
+  cleanup_cmd+=(--scratch-dir "$WIKI_ECON_SCRATCH_DIR")
+fi
+cleanup_cmd+=("${wikis[@]}")
 if ! cleanup_summary="$(RUST_LOG=error "${cleanup_cmd[@]}")"; then
   REFRESH_FAILURE_STAGE=cleanup_stale
   REFRESH_FAILURE_ERROR="safe abandoned-artifact cleanup failed"
