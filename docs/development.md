@@ -37,6 +37,7 @@ python3 scripts/check_lcov.py target/llvm-cov.info
 cargo deny check advisories bans licenses sources
 cargo audit -D warnings
 node scripts/check-npm-advisories.cjs
+node scripts/check-npm-licenses.cjs
 scripts/check_vendor_patches.sh
 python3 -m py_compile scripts/check_lcov.py scripts/test_check_lcov.py
 python3 -m unittest discover -s scripts -p 'test_*.py'
@@ -99,9 +100,11 @@ GitHub Actions is split into five jobs:
   deterministic fixture, and real Observable production build with page and
   attachment verification
 - `coverage`: `cargo llvm-cov` LCOV export plus `scripts/check_lcov.py` enforcing zero uncovered lines
-- `security`: `cargo-deny`, `cargo-audit`, and the fail-closed npm advisory policy
+- `security`: `cargo-deny`, `cargo-audit`, fail-closed npm advisory and license
+  policies, REUSE, and registered vendored-patch validation
 - `toolforge-release`: after the other jobs pass on `main`, selectively builds
-  and retains the Linux Rust release artifact for an operator-driven SSH deploy
+  and retains the attested Linux release envelope, three SBOMs, checksums,
+  provenance, and complete notices for an operator-driven SSH deploy
 
 That split is intentional. Keep fast correctness failures separate from
 coverage drift and dependency-policy drift. GitHub has no production

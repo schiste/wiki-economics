@@ -30,15 +30,19 @@ qualification. enwiki is out of scope for Toolforge entirely.
   source tree and run with network APIs disabled.
 - `.github/workflows/ci.yml` builds the release binary on an x86-64 Ubuntu
   24.04 runner after quality, coverage, and security jobs pass. It validates
-  the ELF format, dynamic libraries, and `--help`, uploads a 30-day artifact,
-  and leaves deployment to an operator using the Toolforge SSH bastion.
-- `deploy-binary.sh` uploads to a staging path and calls
+  the ELF format, dynamic libraries, and `--help`, produces three CycloneDX
+  SBOMs, notices, checksums, provenance and a GitHub artifact attestation,
+  uploads the sealed 30-day artifact, and leaves deployment to an operator
+  using the Toolforge SSH bastion.
+- `deploy-binary.sh` verifies the GitHub attestation and sealed release locally,
+  uploads its single archive to a staging path, and calls
   `install-binary.sh` as the tool account. Releases live at
   `/data/project/wiki-economics/app/releases/<git-sha>/wiki-econ`; the stable
   runtime path is `/data/project/wiki-economics/app/current/wiki-econ`.
-  Each immutable release also contains `release-provenance.json`, tying the
-  binary checksum to exact Node, npm, Rust, browser-package, lockfile, OS, and
-  shared-library versions observed by CI.
+  Each immutable release also retains its SBOMs, complete notices,
+  `SHA256SUMS`, and `release-provenance.json`, tying all identities to exact
+  Node, npm, Rust, browser-package, lockfile, OS, and shared-library versions
+  observed by CI.
   `prune-releases.sh` verifies checksums and smoke tests before retaining the
   live release plus two known-good rollback releases. It also removes exact-SHA
   interrupted uploads after 24 hours. Both limits are configurable with
@@ -236,12 +240,11 @@ run_id=$(gh run list --repo schiste/wiki-economics --commit "$release_sha" \
 release_dir=$(mktemp -d)
 gh run download "$run_id" --repo schiste/wiki-economics \
   --name "wiki-econ-linux-x86_64-$release_sha" --dir "$release_dir"
-chmod +x "$release_dir/wiki-econ"
 TOOLFORGE_SSH_TARGET=login.toolforge.org \
   deploy/toolforge/deploy-binary.sh \
-    "$release_dir/wiki-econ" \
+    "$release_dir/wiki-econ-release-$release_sha.tar.gz" \
     "$release_sha" \
-    "$release_dir/release-provenance.json"
+    "$release_dir/wiki-econ-release-$release_sha.tar.gz.sha256"
 ```
 
 When site, Node, shared script, or Toolforge deployment files changed, rebuild
@@ -261,7 +264,7 @@ Reload `deploy/toolforge/jobs.yaml` when the job definition changes. The file
 uses the field names emitted by Toolforge CLI 0.3.9's `jobs dump`; inspect a
 fresh dump when upgrading the CLI. The release artifact and checksum are
 retained in GitHub for 30 days. NFS storage is bounded to three
-checksum-verified, smoke-tested releases by default: the live target and two
+attestation- and envelope-verified, smoke-tested releases by default: the live target and two
 rollback candidates. Cleanup fails closed if the live symlink is malformed or
 incomplete and ignores every directory that is not an exact 40-character
 commit SHA.

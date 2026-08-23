@@ -166,19 +166,30 @@ is non-zero on every ingest run and the threat is hypothetical.
 - `cargo deny check advisories bans licenses sources` runs on every CI
   push.
 - `cargo audit -D warnings` runs on every CI push.
-- `scripts/check-npm-advisories.cjs` audits the checked-in npm workspace lockfile on
-  every CI push. Moderate, high, and critical advisories always fail. Low
-  advisories also fail unless their package and GHSA are explicitly listed in
-  `config/npm-audit-exceptions.json`; malformed, duplicate, or expired
-  exceptions fail closed.
-- The only current npm exception is `GHSA-g7r4-m6w7-qqqr` in esbuild, inherited
-  through Observable Framework 1.13.4. It affects the Windows development
-  server; production builds and Toolforge run on Linux and do not expose that
-  server. Remove the exception as soon as Observable accepts a patched esbuild.
+- `scripts/check-npm-advisories.cjs` audits the checked-in npm workspace lockfile
+  on every CI push. Every unapproved severity fails. The current exception list
+  is empty: Observable Framework remains pinned at the latest 1.13.4 release,
+  while the root dependency closure securely overrides its esbuild edge to the
+  fixed 0.28.2 release.
+- Future advisory exceptions require an expiry and at least 30 days of warning
+  headroom. CI fails when an exception enters that warning window, rather than
+  waiting for the expiry date to pass.
+- `scripts/check-npm-licenses.cjs` applies the exact SPDX-expression allowlist
+  in `config/npm-license-policy.json` to every package in `package-lock.json`
+  and every module in the generated Observable browser closure. Missing license
+  metadata, a new expression, or a browser package absent from the lock fails
+  closed.
 - Third-party GitHub Actions are pinned to commit SHAs (see
   [`ci.yml`](../.github/workflows/ci.yml)). Refresh the SHAs
   deliberately; do not switch back to floating `@v4` tags.
-- Every crate under `vendor/` carries a `PATCHES.md` register describing
-  its pinned upstream version and local security delta. The
-  `scripts/check_vendor_patches.sh` step in CI fails when a register is
-  missing or does not name its upstream version.
+- Every crate under `vendor/` carries a `PATCHES.md` register describing its
+  pinned upstream version, crates.io checksum, and local security delta.
+  `config/vendor-patches.json` is the machine-readable register; CI proves that
+  it exactly matches `[patch.crates-io]`, each local manifest, Cargo's resolved
+  path, and the human patch note.
+- Main-branch release envelopes contain three CycloneDX 1.6 SBOMs, complete
+  machine-readable and human-readable notices, checksums, and schema-versioned
+  provenance. GitHub creates a Sigstore-backed artifact attestation over the
+  final archive. Manual deployment verifies the attestation locally and the
+  complete checksum/provenance/SBOM graph again on Toolforge before switching
+  the live symlink.
