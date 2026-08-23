@@ -10,13 +10,19 @@ use crate::compute::{
 };
 use crate::{observability::MemorySnapshot, storage};
 
-const REPORT_SCHEMA_VERSION: u32 = 2;
+const REPORT_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct CapacityBenchmarkReport {
     pub schema_version: u32,
+    pub run_id: Option<String>,
+    pub source_commit: Option<String>,
+    pub generated_at_unix: u64,
     pub wiki: String,
+    pub selected_snapshot: String,
     pub bucket_count: usize,
+    pub rayon_threads: usize,
+    pub polars_threads: usize,
     pub scratch_root: String,
     pub raw_transient_requirement_bytes: u64,
     pub current_generation_bytes: u64,
@@ -24,6 +30,9 @@ pub struct CapacityBenchmarkReport {
     pub storage_capacity_source: String,
     pub nfs_quota_bytes: Option<u64>,
     pub quota_root_bytes: u64,
+    pub quota_root_bytes_after: u64,
+    pub persistent_storage_peak_bytes: u64,
+    pub persistent_storage_growth_peak_bytes: u64,
     pub quota_available_bytes: Option<u64>,
     pub filesystem_available_bytes: u64,
     pub storage_reserve_bytes: u64,
@@ -94,6 +103,8 @@ pub fn run(options: CapacityBenchmarkOptions<'_>) -> Result<CapacityBenchmarkRep
     let effective_available_bytes =
         capacity_available_bytes.saturating_sub(options.storage_reserve_bytes);
     let current_generation_bytes = active_generation_bytes(options.data_dir, options.wiki)?;
+    let selected_snapshot = storage::current_snapshot_version(options.data_dir, options.wiki)?
+        .context("capacity benchmark requires an active snapshot pointer")?;
 
     let mut aggregation =
         benchmark_page_weekly_edits(options.wiki, options.data_dir, options.output_dir, &config)?;
@@ -105,6 +116,11 @@ pub fn run(options: CapacityBenchmarkOptions<'_>) -> Result<CapacityBenchmarkRep
         .join(options.wiki)
         .join("page_weekly_edits.parquet");
     let (_, output_sha256) = storage::sha256_file(&output_path)?;
+    let quota_root_bytes_after = directory_bytes(options.quota_root)?;
+    let persistent_storage_growth_peak_bytes = aggregation.working_storage_peak_bytes;
+    let persistent_storage_peak_bytes = quota_root_bytes
+        .checked_add(persistent_storage_growth_peak_bytes)
+        .context("persistent storage peak byte count overflow")?;
     let estimated_rollover_additional_bytes = options
         .raw_transient_requirement_bytes
         .checked_add(current_generation_bytes)
@@ -125,8 +141,14 @@ pub fn run(options: CapacityBenchmarkOptions<'_>) -> Result<CapacityBenchmarkRep
 
     let report = CapacityBenchmarkReport {
         schema_version: REPORT_SCHEMA_VERSION,
+        run_id: std::env::var("WIKI_ECON_RUN_ID").ok(),
+        source_commit: std::env::var("WIKI_ECON_SOURCE_COMMIT").ok(),
+        generated_at_unix: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
         wiki: options.wiki.to_string(),
+        selected_snapshot,
         bucket_count: options.bucket_count,
+        rayon_threads: configured_threads("RAYON_NUM_THREADS"),
+        polars_threads: configured_threads("POLARS_MAX_THREADS"),
         scratch_root: options.scratch_root.to_string_lossy().into_owned(),
         raw_transient_requirement_bytes: options.raw_transient_requirement_bytes,
         current_generation_bytes,
@@ -134,6 +156,9 @@ pub fn run(options: CapacityBenchmarkOptions<'_>) -> Result<CapacityBenchmarkRep
         storage_capacity_source,
         nfs_quota_bytes: options.nfs_quota_bytes,
         quota_root_bytes,
+        quota_root_bytes_after,
+        persistent_storage_peak_bytes,
+        persistent_storage_growth_peak_bytes,
         quota_available_bytes,
         filesystem_available_bytes,
         storage_reserve_bytes: options.storage_reserve_bytes,
@@ -162,6 +187,13 @@ pub fn run(options: CapacityBenchmarkOptions<'_>) -> Result<CapacityBenchmarkRep
         report.minimum_memory_headroom_percent
     );
     Ok(report)
+}
+
+fn configured_threads(name: &str) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1)
 }
 
 fn observed_memory_peak(report: &WeeklyAggregationReport) -> Result<u64> {
@@ -259,6 +291,10 @@ mod tests {
     use polars::prelude::*;
 
     fn write_weekly_fixture(data_dir: &Path, wiki: &str) -> Result<()> {
+        let snapshot_version = "2026-01";
+        let warehouse = storage::snapshot_warehouse_wiki_dir(data_dir, wiki, snapshot_version)?;
+        let analytical = storage::snapshot_analytical_wiki_dir(data_dir, wiki, snapshot_version)?;
+        fs::create_dir_all(&analytical)?;
         for (month, timestamps) in [
             (
                 "2026-01",
@@ -266,9 +302,8 @@ mod tests {
             ),
             ("2026-02", vec!["2026-02-02 00:00:00.0"]),
         ] {
-            let directory = data_dir
-                .join("warehouse")
-                .join(wiki)
+            let directory = warehouse
+                .clone()
                 .join("year=2026")
                 .join(format!("year_month={month}"));
             fs::create_dir_all(&directory)?;
@@ -282,6 +317,7 @@ mod tests {
             .expect("capacity fixture frame");
             ParquetWriter::new(File::create(directory.join("part.parquet"))?).finish(&mut frame)?;
         }
+        storage::publish_current_snapshot(data_dir, wiki, snapshot_version)?;
         Ok(())
     }
 

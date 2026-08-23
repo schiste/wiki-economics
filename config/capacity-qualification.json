@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "memory_limit_bytes": 6442450944,
+  "minimum_memory_headroom_percent": 25,
+  "minimum_storage_reserve_bytes": 53687091200,
+  "cpu": 1,
+  "wikis": {
+    "nlwiki": {
+      "raw_transient_requirement_bytes": 8589934592,
+      "required_bucket_counts": [256]
+    },
+    "ptwiki": {
+      "raw_transient_requirement_bytes": 9663676416,
+      "required_bucket_counts": [256]
+    },
+    "frwiki": {
+      "raw_transient_requirement_bytes": 33285996544,
+      "required_bucket_counts": [256, 512, 1024]
+    }
+  }
+}

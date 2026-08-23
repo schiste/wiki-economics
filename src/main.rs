@@ -141,6 +141,16 @@ enum Commands {
         wikis: Vec<String>,
     },
 
+    /// Repair a missing/corrupt generation pointer after strict marker validation
+    SnapshotRepair {
+        /// Wiki database name
+        wiki: String,
+
+        /// Existing immutable generation to validate and select
+        #[arg(long)]
+        version: String,
+    },
+
     /// Exit successfully only when the published site stage is reusable
     SiteFingerprintCheck {
         /// Observable project directory
@@ -574,6 +584,14 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
                     ops.finalize_snapshot(wiki, &data_dir)
                 })?;
             }
+        }
+
+        Commands::SnapshotRepair { wiki, version } => {
+            run_timed_stage("snapshot_repair", Some(&wiki), || {
+                let markers = storage::repair_current_snapshot(&data_dir, &wiki, &version)?;
+                info!(wiki, version, markers, "repaired current snapshot pointer");
+                Ok(())
+            })?;
         }
 
         Commands::SiteFingerprintCheck { site_dir, dist_dir } => {
@@ -1541,17 +1559,66 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_repair_cli_requires_an_explicit_generation() -> Result<()> {
+        let cli = Cli::try_parse_from([
+            "wiki-econ",
+            "snapshot-repair",
+            "nlwiki",
+            "--version",
+            "2026-07",
+        ])?;
+        assert!(matches!(
+            cli.command,
+            Commands::SnapshotRepair { wiki, version }
+                if wiki == "nlwiki" && version == "2026-07"
+        ));
+        assert!(Cli::try_parse_from(["wiki-econ", "snapshot-repair", "nlwiki"]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_repair_command_validates_and_selects_the_generation() -> Result<()> {
+        let data = TestDir::new()?;
+        let output = TestDir::new()?;
+        let wiki = "nlwiki";
+        let version = "2026-07";
+        let analytical = crate::storage::snapshot_analytical_wiki_dir(data.path(), wiki, version)?;
+        crate::storage::write_test_marker_in(data.path(), &analytical, "2026-07.nlwiki.2001")?;
+        run_with_ops(
+            Cli {
+                data_dir: data.path().to_path_buf(),
+                output_dir: output.path().to_path_buf(),
+                run_id: None,
+                command: Commands::SnapshotRepair {
+                    wiki: wiki.to_string(),
+                    version: version.to_string(),
+                },
+            },
+            &RecordingOps::default(),
+        )
+        .expect("snapshot repair command should succeed");
+        assert_eq!(
+            crate::storage::current_snapshot_version(data.path(), wiki)?.as_deref(),
+            Some(version)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn real_capacity_benchmark_serializes_isolated_evidence() -> Result<()> {
         let data = TestDir::new()?;
         let output = TestDir::new()?;
         let scratch = TestDir::new()?;
         let reports = TestDir::new()?;
-        let partition = crate::storage::month_partition_dir(
-            &crate::storage::warehouse_wiki_dir(data.path(), "frwiki"),
-            2026,
-            "2026-01",
-        );
+        let snapshot = "2026-01";
+        let warehouse =
+            crate::storage::snapshot_warehouse_wiki_dir(data.path(), "frwiki", snapshot)?;
+        let partition = crate::storage::month_partition_dir(&warehouse, 2026, "2026-01");
         fs::create_dir_all(&partition)?;
+        let analytical =
+            crate::storage::snapshot_analytical_wiki_dir(data.path(), "frwiki", snapshot)
+                .expect("capacity analytical generation should resolve");
+        fs::create_dir_all(analytical).expect("capacity analytical generation should be created");
         let mut frame = DataFrame::new_infer_height(vec![
             Column::new("event_timestamp".into(), ["2026-01-05 00:00:00.0"]),
             Column::new("page_id".into(), [42_i64]),
@@ -1560,6 +1627,7 @@ mod tests {
         ])
         .expect("capacity command fixture");
         ParquetWriter::new(fs::File::create(partition.join("part.parquet"))?).finish(&mut frame)?;
+        crate::storage::publish_current_snapshot(data.path(), "frwiki", snapshot)?;
         let report_path = reports.path().join("frwiki.json");
 
         execute_capacity_benchmark(capacity::CapacityBenchmarkOptions {

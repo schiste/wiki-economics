@@ -112,12 +112,16 @@ pub(crate) struct WeeklyAggregationReport {
     pub total_edits: i64,
     pub minimum_week_start: Option<String>,
     pub maximum_week_start: Option<String>,
+    pub bucket_staged_rows: Vec<usize>,
     pub largest_bucket_staged_rows: usize,
     pub output_bytes: u64,
     pub scratch_peak_bytes: u64,
+    pub working_storage_peak_bytes: u64,
     pub reduction_peak: ResourcePeak,
     pub reconciliation_peak: ResourcePeak,
     pub final_memory: MemorySnapshot,
+    pub reduction_elapsed_ms: u64,
+    pub reconciliation_elapsed_ms: u64,
     pub elapsed_ms: u64,
 }
 
@@ -766,6 +770,7 @@ fn compute_page_weekly_edits(
     let mut total_edits_before = 0i64;
     let mut reduction_peak = ResourcePeak::default();
     let mut reconciliation_peak = ResourcePeak::default();
+    let reduction_started = Instant::now();
     info!(
         wiki = wiki,
         partitions = partitions.len(),
@@ -817,7 +822,9 @@ fn compute_page_weekly_edits(
         );
     }
     finish_weekly_bucket_writers(bucket_writers)?;
+    let reduction_elapsed_ms = reduction_started.elapsed().as_millis() as u64;
     let scratch_peak_bytes = runs.size_bytes()?;
+    let mut working_storage_peak_bytes = scratch_peak_bytes;
     reduction_peak.scratch_bytes = Some(scratch_peak_bytes);
     reconciliation_peak.scratch_bytes = Some(scratch_peak_bytes);
 
@@ -827,6 +834,7 @@ fn compute_page_weekly_edits(
     let mut output_rows = 0usize;
     let mut min_week_start: Option<i32> = None;
     let mut max_week_start: Option<i32> = None;
+    let reconciliation_started = Instant::now();
     info!(
         wiki = wiki,
         staged_rows = running_rows,
@@ -872,6 +880,16 @@ fn compute_page_weekly_edits(
             .write_batch(&mut result)?;
         output_rows += result.height();
         total_edits_after += bucket_edits_after;
+        let working_bytes = runs
+            .size_bytes()?
+            .checked_add(
+                output
+                    .as_ref()
+                    .context("page_weekly_edits output writer was not initialized")?
+                    .current_bytes()?,
+            )
+            .context("page_weekly_edits working storage byte count overflow")?;
+        working_storage_peak_bytes = working_storage_peak_bytes.max(working_bytes);
         fs::remove_file(bucket_path)?;
         let memory = MemorySnapshot::capture();
         reconciliation_peak.observe(memory, None);
@@ -897,6 +915,8 @@ fn compute_page_weekly_edits(
     );
     let output = output.context("page_weekly_edits produced no rows from non-empty partitions")?;
     let bytes = output.finish()?;
+    working_storage_peak_bytes = working_storage_peak_bytes.max(bytes);
+    let reconciliation_elapsed_ms = reconciliation_started.elapsed().as_millis() as u64;
     let memory = MemorySnapshot::capture();
     let minimum_week_start = min_week_start.and_then(format_epoch_day);
     let maximum_week_start = max_week_start.and_then(format_epoch_day);
@@ -926,12 +946,16 @@ fn compute_page_weekly_edits(
         total_edits: total_edits_after,
         minimum_week_start,
         maximum_week_start,
+        bucket_staged_rows: bucket_rows.clone(),
         largest_bucket_staged_rows: bucket_rows.iter().copied().max().unwrap_or(0),
         output_bytes: bytes,
         scratch_peak_bytes,
+        working_storage_peak_bytes,
         reduction_peak,
         reconciliation_peak,
         final_memory: memory,
+        reduction_elapsed_ms,
+        reconciliation_elapsed_ms,
         elapsed_ms: aggregation_started.elapsed().as_millis() as u64,
     }))
 }
@@ -1227,6 +1251,10 @@ impl AtomicBatchedParquetWriter {
             .context("page_weekly_edits output writer was already finished")?
             .write_batch(df)?;
         Ok(())
+    }
+
+    fn current_bytes(&self) -> Result<u64> {
+        Ok(fs::metadata(&self.pending.temp_path)?.len())
     }
 
     fn finish(mut self) -> Result<u64> {

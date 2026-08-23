@@ -201,6 +201,74 @@ pub fn publish_current_snapshot(data_dir: &Path, wiki: &str, snapshot_version: &
     write_result
 }
 
+/// Repair a missing or corrupt current-generation pointer only after the
+/// immutable generation's complete marker/output inventory validates.
+pub fn repair_current_snapshot(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot_version: &str,
+) -> Result<usize> {
+    validate_snapshot_version(snapshot_version)?;
+    let analytical = snapshot_analytical_wiki_dir(data_dir, wiki, snapshot_version)?;
+    let warehouse = snapshot_warehouse_wiki_dir(data_dir, wiki, snapshot_version)?;
+    ensure!(
+        analytical.is_dir() && warehouse.is_dir(),
+        "cannot repair incomplete snapshot {snapshot_version} for {wiki}"
+    );
+    let markers = analytical.join(MARKERS_DIRNAME);
+    ensure!(
+        markers.is_dir(),
+        "snapshot {snapshot_version} for {wiki} has no marker inventory"
+    );
+    let mut marker_count = 0usize;
+    let mut analytical_allowlist = std::collections::BTreeSet::new();
+    let mut warehouse_allowlist = std::collections::BTreeSet::new();
+    for entry in fs::read_dir(&markers)? {
+        let entry = entry?;
+        ensure!(
+            entry.file_type()?.is_file(),
+            "snapshot marker inventory contains a non-file: {}",
+            entry.path().display()
+        );
+        let name = entry.file_name();
+        let source_id = name
+            .to_str()
+            .and_then(|value| value.strip_suffix(".done"))
+            .filter(|value| !value.is_empty())
+            .with_context(|| {
+                format!(
+                    "unexpected snapshot marker name: {}",
+                    entry.path().display()
+                )
+            })?;
+        ensure!(
+            marker_manifest_is_valid_in(data_dir, &analytical, source_id)?,
+            "snapshot marker is invalid: {}",
+            entry.path().display()
+        );
+        let stored =
+            read_stored_marker(&entry.path())?.context("validated snapshot marker disappeared")?;
+        for output in stored.analytical_outputs {
+            analytical_allowlist.insert(checked_stored_path(data_dir, &output.path)?);
+        }
+        for output in stored.warehouse_outputs {
+            warehouse_allowlist.insert(checked_stored_path(data_dir, &output.path)?);
+        }
+        marker_count += 1;
+    }
+    ensure!(marker_count > 0, "snapshot marker inventory is empty");
+    let actual_analytical: std::collections::BTreeSet<_> =
+        collect_parquet_files(&analytical)?.into_iter().collect();
+    let actual_warehouse: std::collections::BTreeSet<_> =
+        collect_parquet_files(&warehouse)?.into_iter().collect();
+    ensure!(
+        actual_analytical == analytical_allowlist && actual_warehouse == warehouse_allowlist,
+        "snapshot marker inventory does not exactly account for generation Parquet files"
+    );
+    publish_current_snapshot(data_dir, wiki, snapshot_version)?;
+    Ok(marker_count)
+}
+
 pub fn retire_inactive_snapshots(data_dir: &Path, wiki: &str) -> Result<usize> {
     let Some(active) = current_snapshot_version(data_dir, wiki)? else {
         return Ok(0);
@@ -1124,6 +1192,49 @@ mod tests {
         assert_eq!(active_warehouse_wiki_dir(root, wiki)?, warehouse);
         let pointer = fs::read_to_string(snapshot_pointer_path(root, wiki))?;
         assert!(pointer.ends_with('\n'));
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_repair_validates_the_complete_generation_before_repointing() -> Result<()> {
+        let temp_dir = TestDir::new()?;
+        let root = temp_dir.path();
+        let wiki = "nlwiki";
+        let version = "2026-07";
+        let analytical = snapshot_analytical_wiki_dir(root, wiki, version)?;
+        write_test_marker_in(root, &analytical, "2026-07.nlwiki.2001")?;
+
+        fs::create_dir_all(
+            snapshot_pointer_path(root, wiki)
+                .parent()
+                .expect("pointer parent"),
+        )
+        .expect("pointer parent should be created");
+        fs::write(snapshot_pointer_path(root, wiki), b"{truncated")?;
+        assert_eq!(repair_current_snapshot(root, wiki, version)?, 1);
+        assert_eq!(
+            current_snapshot_version(root, wiki)?.as_deref(),
+            Some(version)
+        );
+
+        let marker_dir = analytical.join(MARKERS_DIRNAME);
+        fs::create_dir(marker_dir.join("unexpected-directory"))?;
+        assert!(repair_current_snapshot(root, wiki, version).is_err());
+        fs::remove_dir(marker_dir.join("unexpected-directory"))?;
+        fs::write(marker_dir.join("unexpected-name"), b"not-a-marker")?;
+        assert!(repair_current_snapshot(root, wiki, version).is_err());
+        fs::remove_file(marker_dir.join("unexpected-name"))?;
+
+        let stray = analytical.join("year=2026/year_month=2026-01/stray.parquet");
+        fs::copy(collect_parquet_files(&analytical)?.remove(0), &stray)?;
+        assert!(repair_current_snapshot(root, wiki, version).is_err());
+        fs::remove_file(stray)?;
+        fs::write(
+            marker_path_in(&analytical, "2026-07.nlwiki.2001"),
+            b"{truncated",
+        )
+        .expect("marker corruption fixture should be written");
+        assert!(repair_current_snapshot(root, wiki, version).is_err());
         Ok(())
     }
 
