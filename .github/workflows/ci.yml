@@ -67,6 +67,7 @@ jobs:
           node --check site/freshness.cjs
           node --check site/observablehq.config.js
           node --check scripts/check-npm-advisories.cjs
+          node --check scripts/build-site-fixture.cjs
           node --check scripts/check-freshness.cjs
 
       - name: Run Node unit tests
@@ -79,6 +80,7 @@ jobs:
           node --test deploy/toolforge/run-record.test.cjs
           node --test deploy/toolforge/run-refresh.test.cjs
           node --test scripts/check-npm-advisories.test.cjs
+          node --test scripts/build-site-fixture.test.cjs
           node --test scripts/check-freshness.test.cjs
           node --test scripts/wiki-lifecycle.test.cjs
 
@@ -109,6 +111,47 @@ jobs:
 
       - name: Check docs
         run: cargo doc --locked --no-deps
+
+  site:
+    name: Build production site fixture
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+      - name: Install Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - name: Clean-install workspace dependencies
+        run: npm ci
+
+      - name: Enforce npm advisory policy
+        run: node scripts/check-npm-advisories.cjs
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # @stable as of pin
+        with:
+          toolchain: 1.98.0
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          workspaces: ". -> target"
+          cache-on-failure: true
+
+      - name: Generate deterministic site fixture
+        run: cargo run --locked -- --output-dir "$RUNNER_TEMP/wiki-econ-site-data" site-fixture
+
+      - name: Build and verify Observable production site
+        run: >-
+          node scripts/build-site-fixture.cjs
+          --data-dir "$RUNNER_TEMP/wiki-econ-site-data"
+          --dist-dir "$RUNNER_TEMP/wiki-econ-site-dist"
 
   coverage:
     runs-on: ubuntu-24.04
@@ -205,6 +248,7 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs:
       - quality
+      - site
       - coverage
       - security
     runs-on: ubuntu-24.04

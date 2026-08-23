@@ -2,6 +2,7 @@
 "use strict";
 
 const path = require("node:path");
+const fs = require("node:fs");
 const {spawnSync} = require("node:child_process");
 
 const SEVERITY = new Map([
@@ -12,18 +13,45 @@ const SEVERITY = new Map([
   ["critical", 4],
 ]);
 
-// Observable Framework 1.13.4 currently resolves esbuild 0.27.x. Its only
-// remaining advisory is local to the Windows development server; production
-// builds and Toolforge run on Linux and do not expose that server. Keep this
-// allowlist exact so a new advisory, package, or severity fails closed.
-const ALLOWED_LOW_PACKAGES = new Set(["@observablehq/framework", "esbuild"]);
-const ALLOWED_LOW_ADVISORIES = new Set(["GHSA-g7r4-m6w7-qqqr"]);
+const DEFAULT_EXCEPTIONS_FILE = path.resolve(__dirname, "..", "config", "npm-audit-exceptions.json");
 
 function advisoryId(url) {
   return typeof url === "string" ? url.match(/GHSA-[a-z0-9-]+$/i)?.[0] || null : null;
 }
 
-function validateAuditReport(report, label) {
+function loadExceptions(file = process.env.WIKI_ECON_NPM_AUDIT_EXCEPTIONS || DEFAULT_EXCEPTIONS_FILE, today = new Date()) {
+  const document = JSON.parse(fs.readFileSync(file, "utf8"));
+  if (document?.schema_version !== 1 || !Array.isArray(document.exceptions)) {
+    throw new Error(`${file}: invalid npm audit exception document`);
+  }
+  const advisories = new Map();
+  const packages = new Set();
+  const todayString = today.toISOString().slice(0, 10);
+  for (const exception of document.exceptions) {
+    if (!/^GHSA-[a-z0-9-]+$/i.test(exception?.advisory || "")
+        || !SEVERITY.has(exception?.severity)
+        || !Array.isArray(exception?.packages)
+        || exception.packages.length === 0
+        || !exception.packages.every((name) => typeof name === "string" && name.length > 0)
+        || !/^\d{4}-\d{2}-\d{2}$/.test(exception?.expires_on || "")
+        || typeof exception?.reason !== "string"
+        || exception.reason.trim().length < 20) {
+      throw new Error(`${file}: malformed exception for ${exception?.advisory || "unknown advisory"}`);
+    }
+    if (exception.expires_on < todayString) {
+      throw new Error(`${file}: exception ${exception.advisory} expired on ${exception.expires_on}`);
+    }
+    if (advisories.has(exception.advisory)) {
+      throw new Error(`${file}: duplicate exception ${exception.advisory}`);
+    }
+    const normalized = {...exception, packages: new Set(exception.packages)};
+    advisories.set(exception.advisory, normalized);
+    for (const name of exception.packages) packages.add(name);
+  }
+  return {advisories, packages};
+}
+
+function validateAuditReport(report, label, policy = loadExceptions()) {
   if (report?.auditReportVersion !== 2 || !report.vulnerabilities || !report.metadata?.vulnerabilities) {
     throw new Error(`${label}: npm did not return an audit report`);
   }
@@ -41,7 +69,7 @@ function validateAuditReport(report, label) {
       errors.push(`${name}: ${vulnerability.severity} advisory is not allowed`);
       continue;
     }
-    if (rank === SEVERITY.get("low") && !ALLOWED_LOW_PACKAGES.has(name)) {
+    if (rank === SEVERITY.get("low") && !policy.packages.has(name)) {
       errors.push(`${name}: low advisory is not explicitly allowed`);
     }
     for (const via of vulnerability.via || []) {
@@ -50,7 +78,8 @@ function validateAuditReport(report, label) {
         continue;
       }
       const id = advisoryId(via.url);
-      if (!id || !ALLOWED_LOW_ADVISORIES.has(id)) {
+      const exception = id ? policy.advisories.get(id) : null;
+      if (!exception || !exception.packages.has(name) || exception.severity !== vulnerability.severity) {
         errors.push(`${name}: advisory ${id || via.url || via.title || "unknown"} is not explicitly allowed`);
       }
     }
@@ -60,7 +89,7 @@ function validateAuditReport(report, label) {
   return {label, allowedLow: names};
 }
 
-function auditGraph(directory, label, runner = spawnSync) {
+function auditGraph(directory, label, runner = spawnSync, policy = loadExceptions()) {
   const result = runner("npm", ["audit", "--json"], {
     cwd: directory,
     encoding: "utf8",
@@ -73,12 +102,12 @@ function auditGraph(directory, label, runner = spawnSync) {
   } catch {
     throw new Error(`${label}: npm audit returned invalid JSON: ${result.stderr || result.stdout}`);
   }
-  return validateAuditReport(report, label);
+  return validateAuditReport(report, label, policy);
 }
 
 function main() {
   const root = path.resolve(__dirname, "..");
-  const summaries = [auditGraph(root, "root"), auditGraph(path.join(root, "site"), "site")];
+  const summaries = [auditGraph(root, "workspace")];
   for (const summary of summaries) {
     const detail = summary.allowedLow.length > 0 ? summary.allowedLow.join(", ") : "none";
     process.stdout.write(`${summary.label}: no moderate-or-higher advisories; accepted low packages: ${detail}\n`);
@@ -94,4 +123,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = {advisoryId, auditGraph, validateAuditReport};
+module.exports = {advisoryId, auditGraph, loadExceptions, validateAuditReport};

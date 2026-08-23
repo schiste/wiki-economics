@@ -4,7 +4,7 @@
 // - VPS mode: authenticated /admin page plus authenticated /admin-api/* routes.
 
 const http = require("http");
-const { execFileSync, spawn } = require("child_process");
+const {spawn} = require("child_process");
 const path = require("path");
 const fs = require("fs");
 const {
@@ -756,19 +756,7 @@ function refreshManifest(force = false) {
     return manifestCache;
   }
 
-  const manifestScript = path.join(GENERATOR_DIR, "manifest.json.sh");
-  const output = execFileSync("/bin/bash", [manifestScript], {
-    cwd: ROOT,
-    encoding: "utf8",
-    env: {
-      ...process.env,
-      WIKI_ECON_DATA_DIR: DATA_DIR,
-      WIKI_ECON_OUTPUT_DIR: OUTPUT_DIR,
-      WIKI_ECON_GENERATOR_DIR: GENERATOR_DIR,
-      WIKI_ECON_WIKI_LIFECYCLE_FILE: WIKI_LIFECYCLE_PATH,
-    },
-  });
-  manifestCache = JSON.parse(output);
+  manifestCache = JSON.parse(fs.readFileSync(path.join(OUTPUT_DIR, "manifest.json"), "utf8"));
   manifestCacheAt = now;
   return manifestCache;
 }

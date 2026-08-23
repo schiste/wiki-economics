@@ -28,7 +28,7 @@ fn binary_entrypoint_rejects_incomplete_merge_inputs() {
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("dashboard artifact generator"));
+    assert!(stderr.contains("missing merged dashboard input"));
 }
 
 #[test]

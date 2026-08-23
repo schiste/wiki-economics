@@ -3,6 +3,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+SITE_FIXTURE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/wiki-econ-site-ci.XXXXXX")"
+trap 'rm -rf -- "$SITE_FIXTURE_ROOT"' EXIT
 
 echo "==> bash -n scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh deploy/toolforge/*.sh"
 bash -n scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh deploy/toolforge/*.sh
@@ -49,6 +51,9 @@ node --test scripts/check-freshness.test.cjs
 echo "==> node --test scripts/check-npm-advisories.test.cjs"
 node --test scripts/check-npm-advisories.test.cjs
 
+echo "==> node --test scripts/build-site-fixture.test.cjs"
+node --test scripts/build-site-fixture.test.cjs
+
 echo "==> node --test scripts/wiki-lifecycle.test.cjs"
 node --test scripts/wiki-lifecycle.test.cjs
 
@@ -66,6 +71,12 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 
 echo "==> cargo test --locked --all-targets --all-features"
 cargo test --locked --all-targets --all-features
+
+echo "==> Generate fixture and build the real Observable production site"
+cargo run --locked -- --output-dir "$SITE_FIXTURE_ROOT/data" site-fixture
+node scripts/build-site-fixture.cjs \
+  --data-dir "$SITE_FIXTURE_ROOT/data" \
+  --dist-dir "$SITE_FIXTURE_ROOT/dist"
 
 echo "==> cargo doc --locked --no-deps"
 cargo doc --locked --no-deps

@@ -1558,6 +1558,30 @@ mod tests {
     }
 
     #[test]
+    fn run_with_ops_materializes_site_fixture_and_dashboard_json() -> Result<()> {
+        let output_dir = TestDir::new()?;
+        let command = |command| Cli {
+            data_dir: PathBuf::from("unused"),
+            output_dir: output_dir.path().to_path_buf(),
+            run_id: None,
+            command,
+        };
+
+        run_with_ops(command(Commands::SiteFixture), &RecordingOps::default())?;
+        let first = fs::read(output_dir.path().join("defaults_gdp.json"))?;
+        run_with_ops(
+            command(Commands::DashboardMaterialize),
+            &RecordingOps::default(),
+        )
+        .expect("dashboard fixture should rematerialize");
+        assert_eq!(
+            fs::read(output_dir.path().join("defaults_gdp.json"))?,
+            first
+        );
+        Ok(())
+    }
+
+    #[test]
     fn run_with_ops_propagates_fetch_errors() -> Result<()> {
         init_test_tracing();
         let cli = Cli::try_parse_from(["wiki-econ", "fetch", "frwiki"])?;

@@ -4,6 +4,9 @@ const isDev = process.argv.some(a => a === "preview" || a === "dev");
 const distDir = process.env.WIKI_ECON_SITE_DIST_DIR
   ? path.resolve(process.env.WIKI_ECON_SITE_DIST_DIR)
   : "dist";
+const sourceDir = process.env.WIKI_ECON_SITE_SOURCE_DIR
+  ? path.resolve(process.env.WIKI_ECON_SITE_SOURCE_DIR)
+  : "src";
 const adminPort = process.env.WIKI_ECON_ADMIN_PORT || "3001";
 const adminApiBase = process.env.WIKI_ECON_ADMIN_API_BASE
   ? process.env.WIKI_ECON_ADMIN_API_BASE
@@ -20,7 +23,7 @@ window.__wikiEconAdminApiBase=${JSON.stringify(adminApiBase)};
 
 export default {
   title: "Wikipedia Economics",
-  root: "src",
+  root: sourceDir,
   output: distDir,
   pager: false,
   // Framework defaults to a Google Fonts stylesheet (Source Serif 4) for

@@ -404,7 +404,8 @@ mod tests {
         fs::write(
             generator_dir.join(MANIFEST_GENERATOR),
             "#!/bin/sh\nprintf '{\"ok\":true}'\n",
-        )?;
+        )
+        .expect("manifest generator fixture should be writable");
         for dependency in GENERATOR_DEPENDENCIES {
             fs::write(
                 generator_dir.join(dependency),
@@ -412,6 +413,31 @@ mod tests {
             )
             .expect("generator dependency fixture should be writable");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_row_counts_skips_non_directory_roots() -> Result<()> {
+        let output = TestDir::new()?;
+        let file = output.path().join("not-a-directory");
+        fs::write(&file, "fixture")?;
+        manifest_row_counts(&file)?;
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_materialization_reports_row_count_staging_failures() -> Result<()> {
+        let output = TestDir::new()?;
+        let generators = TestDir::new()?;
+        write_generators(generators.path())?;
+        fs::create_dir(
+            output
+                .path()
+                .join(format!(".manifest-row-counts.{}.json", std::process::id())),
+        )
+        .expect("the row-count staging collision fixture can be created");
+
+        assert!(materialize_manifest_from_dir(output.path(), generators.path()).is_err());
         Ok(())
     }
 

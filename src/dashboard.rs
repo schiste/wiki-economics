@@ -170,12 +170,7 @@ fn string(df: &DataFrame, column: &str, row: usize) -> Result<Option<String>> {
 fn integer(df: &DataFrame, column: &str, row: usize) -> Result<Option<i64>> {
     let value = match df.column(column)?.get(row)? {
         AnyValue::Null => return Ok(None),
-        AnyValue::UInt8(value) => i64::from(value),
-        AnyValue::UInt16(value) => i64::from(value),
         AnyValue::UInt32(value) => i64::from(value),
-        AnyValue::UInt64(value) => i64::try_from(value)?,
-        AnyValue::Int8(value) => i64::from(value),
-        AnyValue::Int16(value) => i64::from(value),
         AnyValue::Int32(value) => i64::from(value),
         AnyValue::Int64(value) => value,
         value => bail!("expected integer in {column}, found {value:?}"),
@@ -186,14 +181,8 @@ fn integer(df: &DataFrame, column: &str, row: usize) -> Result<Option<i64>> {
 fn float(df: &DataFrame, column: &str, row: usize) -> Result<Option<f64>> {
     let value = match df.column(column)?.get(row)? {
         AnyValue::Null => return Ok(None),
-        AnyValue::Float32(value) => f64::from(value),
         AnyValue::Float64(value) => value,
-        AnyValue::UInt8(value) => f64::from(value),
-        AnyValue::UInt16(value) => f64::from(value),
         AnyValue::UInt32(value) => f64::from(value),
-        AnyValue::UInt64(value) => value as f64,
-        AnyValue::Int8(value) => f64::from(value),
-        AnyValue::Int16(value) => f64::from(value),
         AnyValue::Int32(value) => f64::from(value),
         AnyValue::Int64(value) => value as f64,
         value => bail!("expected number in {column}, found {value:?}"),
@@ -219,20 +208,10 @@ fn any_json(df: &DataFrame, column: &str, row: usize) -> Result<Value> {
         AnyValue::Boolean(value) => Ok(json!(value)),
         AnyValue::String(value) => Ok(json!(value)),
         AnyValue::StringOwned(value) => Ok(json!(value.as_str())),
-        AnyValue::UInt8(value) => Ok(json!(value)),
-        AnyValue::UInt16(value) => Ok(json!(value)),
         AnyValue::UInt32(value) => Ok(json!(value)),
-        AnyValue::UInt64(value) => Ok(json!(value)),
-        AnyValue::Int8(value) => Ok(json!(value)),
-        AnyValue::Int16(value) => Ok(json!(value)),
         AnyValue::Int32(value) => Ok(json!(value)),
         AnyValue::Int64(value) => Ok(json!(value)),
-        AnyValue::Float32(value) => Ok(number(f64::from(value))),
         AnyValue::Float64(value) => Ok(number(value)),
-        AnyValue::Date(days) => {
-            let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).context("invalid epoch")?;
-            Ok(json!((epoch + Duration::days(i64::from(days))).to_string()))
-        }
         value => bail!("unsupported dashboard JSON value {value:?} in {column}"),
     }
 }
@@ -256,9 +235,22 @@ fn wiki_set(df: &DataFrame) -> Result<BTreeSet<String>> {
 }
 
 fn common_meta(range_frame: &DataFrame, namespace_frame: Option<&DataFrame>) -> Result<CommonMeta> {
+    common_meta_with_overrides(
+        range_frame,
+        namespace_frame,
+        env::var("DEFAULT_WIKI").ok(),
+        env::var("MAX_MONTH").ok(),
+    )
+}
+
+fn common_meta_with_overrides(
+    range_frame: &DataFrame,
+    namespace_frame: Option<&DataFrame>,
+    default_wiki: Option<String>,
+    max_month: Option<String>,
+) -> Result<CommonMeta> {
     let wiki_names = wiki_set(range_frame)?;
-    let default_wiki = env::var("DEFAULT_WIKI")
-        .ok()
+    let default_wiki = default_wiki
         .or_else(|| wiki_names.first().cloned())
         .context("dashboard input contains no wiki")?;
     let observed_max = (0..range_frame.height())
@@ -267,7 +259,7 @@ fn common_meta(range_frame: &DataFrame, namespace_frame: Option<&DataFrame>) -> 
         .into_iter()
         .max()
         .context("dashboard input contains no year_month")?;
-    let max_month = env::var("MAX_MONTH").unwrap_or(observed_max);
+    let max_month = max_month.unwrap_or(observed_max);
     ensure!(
         max_month.len() == 7 && max_month.as_bytes()[4] == b'-',
         "MAX_MONTH must use YYYY-MM"
@@ -631,6 +623,15 @@ fn sort_two_strings(values: &mut [Value], first: &str, second: &str) {
     });
 }
 
+fn compare_optional_i64(left: Option<i64>, right: Option<i64>) -> Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => left.cmp(&right),
+        (Some(_), None) => Ordering::Less,
+        (None, Some(_)) => Ordering::Greater,
+        (None, None) => Ordering::Equal,
+    }
+}
+
 fn business_artifacts(frames: &Frames) -> Result<(Value, Value)> {
     let meta = common_meta(&frames.labor, Some(&frames.gdp))?;
     let max_quarter = quarter(&meta.max_month)?;
@@ -740,15 +741,10 @@ fn business_artifacts(frames: &Frames) -> Result<(Value, Value)> {
         string_field(left, "period")
             .cmp(string_field(right, "period"))
             .then_with(|| {
-                match (
+                compare_optional_i64(
                     left["page_namespace"].as_i64(),
                     right["page_namespace"].as_i64(),
-                ) {
-                    (Some(left), Some(right)) => left.cmp(&right),
-                    (Some(_), None) => Ordering::Less,
-                    (None, Some(_)) => Ordering::Greater,
-                    (None, None) => Ordering::Equal,
-                }
+                )
             })
     });
 
@@ -1012,40 +1008,38 @@ fn write_parquet(output_dir: &Path, name: &str, mut frame: DataFrame) -> Result<
 
 pub fn write_site_fixture(output_dir: &Path) -> Result<()> {
     fs::create_dir_all(output_dir)?;
-    write_parquet(
-        output_dir,
+    let fixtures = [
+        (
         "business_funnel",
         df!(
-            "cohort_year" => &["2025", "2025"],
-            "cohort_size" => &[10_u32, 8],
-            "reached_5" => &[7_u32, 6],
-            "reached_25" => &[3_u32, 2],
-            "reached_100" => &[1_u32, 1],
-            "wiki" => &["awiki", "zwiki"],
-        )?,
-    )?;
-    write_parquet(
-        output_dir,
+            "cohort_year" => &["2025", "2024", "2025"],
+            "cohort_size" => &[10_u32, 4, 8],
+            "reached_5" => &[7_u32, 3, 6],
+            "reached_25" => &[3_u32, 1, 2],
+            "reached_100" => &[1_u32, 0, 1],
+            "wiki" => &["awiki", "awiki", "zwiki"],
+        )
+        .expect("static fixture columns have equal lengths")),
+        (
         "gdp",
         df!(
-            "year_month" => &["2025-12", "2026-01", "2026-01"],
-            "page_namespace" => &[0_i32, 0, 0],
-            "user_type" => &["registered", "registered", "registered"],
-            "gross_bytes_added" => &[100_i64, 120, 80],
-            "net_bytes" => &[80_i64, 90, 60],
-            "total_edits" => &[10_u32, 12, 8],
-            "productive_edits" => &[8_u32, 10, 6],
-            "reverted_edits" => &[2_u32, 2, 2],
-            "unique_editors" => &[5_u32, 6, 4],
-            "minor_edits" => &[1_u32, 1, 1],
-            "bytes_per_edit" => &[10.0_f64, 10.0, 10.0],
-            "bytes_per_editor" => &[20.0_f64, 20.0, 20.0],
-            "revert_rate" => &[0.2_f64, 1.0 / 6.0, 0.25],
-            "wiki" => &["awiki", "awiki", "zwiki"],
-        )?,
-    )?;
-    write_parquet(
-        output_dir,
+            "year_month" => &["2025-12", "2026-01", "2026-01", "2026-01", "2026-01"],
+            "page_namespace" => &[Some(0_i32), Some(0), Some(0), None, Some(1)],
+            "user_type" => &["registered", "registered", "registered", "registered", "registered"],
+            "gross_bytes_added" => &[100_i64, 120, 80, 0, 2],
+            "net_bytes" => &[80_i64, 90, 60, 0, 1],
+            "total_edits" => &[10_u32, 12, 8, 0, 1],
+            "productive_edits" => &[8_u32, 10, 6, 0, 1],
+            "reverted_edits" => &[2_u32, 2, 2, 0, 0],
+            "unique_editors" => &[5_u32, 6, 4, 0, 1],
+            "minor_edits" => &[1_u32, 1, 1, 0, 0],
+            "bytes_per_edit" => &[10.0_f64, 10.0, 10.0, 0.0, 2.0],
+            "bytes_per_editor" => &[20.0_f64, 20.0, 20.0, 0.0, 2.0],
+            "revert_rate" => &[0.2_f64, 1.0 / 6.0, 0.25, 0.0, 0.0],
+            "wiki" => &["awiki", "awiki", "zwiki", "awiki", "awiki"],
+        )
+        .expect("static fixture columns have equal lengths")),
+        (
         "gdp_activity_tiers",
         df!(
             "year_month" => &["2026-01", "2026-01"],
@@ -1056,10 +1050,9 @@ pub fn write_site_fixture(output_dir: &Path) -> Result<()> {
             "net_bytes" => &[90_i64, 60],
             "gross_bytes" => &[120_i64, 80],
             "wiki" => &["awiki", "zwiki"],
-        )?,
-    )?;
-    write_parquet(
-        output_dir,
+        )
+        .expect("static fixture columns have equal lengths")),
+        (
         "gdp_user_type_share",
         df!(
             "year_month" => &["2026-01", "2026-01"],
@@ -1068,10 +1061,9 @@ pub fn write_site_fixture(output_dir: &Path) -> Result<()> {
             "net_bytes" => &[90_i64, 60],
             "editors" => &[6_u32, 4],
             "wiki" => &["awiki", "zwiki"],
-        )?,
-    )?;
-    write_parquet(
-        output_dir,
+        )
+        .expect("static fixture columns have equal lengths")),
+        (
         "inequality",
         df!(
             "year_month" => &["2026-01", "2026-01"],
@@ -1083,49 +1075,45 @@ pub fn write_site_fixture(output_dir: &Path) -> Result<()> {
             "total_editors" => &[6_u32, 4],
             "total_edits" => &[12_u32, 8],
             "wiki" => &["awiki", "zwiki"],
-        )?,
-    )?;
-    write_parquet(
-        output_dir,
+        )
+        .expect("static fixture columns have equal lengths")),
+        (
         "labor_churn",
         df!(
-            "period" => &["2026-01", "2026-Q1", "2026-01", "2026-Q1"],
-            "active_editors" => &[6_u32, 6, 4, 4],
-            "arrivals" => &[2_u32, 2, 1, 1],
-            "departures" => &[1_u32, 1, 1, 1],
-            "period_type" => &["month", "quarter", "month", "quarter"],
-            "arrival_rate" => &[0.3_f64, 0.3, 0.25, 0.25],
-            "departure_rate" => &[0.1_f64, 0.1, 0.25, 0.25],
-            "wiki" => &["awiki", "awiki", "zwiki", "zwiki"],
-        )?,
-    )?;
-    write_parquet(
-        output_dir,
+            "period" => &["2026-01", "2026-Q1", "2025-12", "2025-Q4", "2026-01", "2026-Q1"],
+            "active_editors" => &[6_u32, 6, 5, 5, 4, 4],
+            "arrivals" => &[2_u32, 2, 1, 1, 1, 1],
+            "departures" => &[1_u32, 1, 1, 1, 1, 1],
+            "period_type" => &["month", "quarter", "month", "quarter", "month", "quarter"],
+            "arrival_rate" => &[0.3_f64, 0.3, 0.2, 0.2, 0.25, 0.25],
+            "departure_rate" => &[0.1_f64, 0.1, 0.2, 0.2, 0.25, 0.25],
+            "wiki" => &["awiki", "awiki", "awiki", "awiki", "zwiki", "zwiki"],
+        )
+        .expect("static fixture columns have equal lengths")),
+        (
         "labor_cohorts",
         df!(
-            "cohort_year" => &["2025", "2025"],
-            "year" => &["2026", "2026"],
-            "survived_editors" => &[5_u32, 3],
-            "initial_editors" => &[10_u32, 8],
-            "wiki" => &["awiki", "zwiki"],
-        )?,
-    )?;
-    write_parquet(
-        output_dir,
+            "cohort_year" => &["2025", "2024", "2025"],
+            "year" => &["2026", "2025", "2026"],
+            "survived_editors" => &[5_u32, 2, 3],
+            "initial_editors" => &[10_u32, 4, 8],
+            "wiki" => &["awiki", "awiki", "zwiki"],
+        )
+        .expect("static fixture columns have equal lengths")),
+        (
         "labor_monthly",
         df!(
-            "year_month" => &["2025-12", "2026-01", "2026-01"],
-            "page_namespace" => &[0_i32, 0, 0],
-            "user_type" => &["registered", "registered", "registered"],
-            "unique_editors" => &[5_u32, 6, 4],
-            "total_edits" => &[10_u32, 12, 8],
-            "net_bytes" => &[80_i64, 90, 60],
-            "reverted_edits" => &[2_u32, 2, 2],
-            "wiki" => &["awiki", "awiki", "zwiki"],
-        )?,
-    )?;
-    write_parquet(
-        output_dir,
+            "year_month" => &["2025-12", "2026-01", "2026-01", "2026-01", "2026-01", "2026-01"],
+            "page_namespace" => &[Some(0_i32), Some(0), Some(0), None, Some(0), Some(1)],
+            "user_type" => &["registered", "registered", "registered", "registered", "anonymous", "registered"],
+            "unique_editors" => &[5_u32, 6, 4, 0, 1, 1],
+            "total_edits" => &[10_u32, 12, 8, 0, 1, 1],
+            "net_bytes" => &[80_i64, 90, 60, 0, 1, 1],
+            "reverted_edits" => &[2_u32, 2, 2, 0, 0, 0],
+            "wiki" => &["awiki", "awiki", "zwiki", "awiki", "awiki", "awiki"],
+        )
+        .expect("static fixture columns have equal lengths")),
+        (
         "page_weekly_edits",
         df!(
             "week_start" => &["2026-01-05", "2026-01-12", "2026-01-05"],
@@ -1139,10 +1127,9 @@ pub fn write_site_fixture(output_dir: &Path) -> Result<()> {
             "wow_change" => &[5_i64, 4, 4],
             "wow_rate" => &[None, Some(0.8_f64), None],
             "wiki" => &["awiki", "awiki", "zwiki"],
-        )?,
-    )?;
-    write_parquet(
-        output_dir,
+        )
+        .expect("static fixture columns have equal lengths")),
+        (
         "patrol",
         df!(
             "year_month" => &["2026-01", "2026-01"],
@@ -1162,8 +1149,12 @@ pub fn write_site_fixture(output_dir: &Path) -> Result<()> {
             "adjusted_coverage_pct" => &[85.0_f64, 80.0],
             "top1_pct" => &[40.0_f64, 45.0],
             "min_patrollers_50pct" => &[2_i32, 1],
-        )?,
-    )?;
+        )
+        .expect("static fixture columns have equal lengths")),
+    ];
+    for (name, frame) in fixtures {
+        write_parquet(output_dir, name, frame)?;
+    }
     materialize(output_dir)?;
     publish_json_set(
         output_dir,
@@ -1227,8 +1218,10 @@ mod tests {
         write_parquet(
             output.path(),
             "page_weekly_edits",
-            DataFrame::new(0, vec![Column::new_empty("wiki".into(), &DataType::String)])?,
-        )?;
+            DataFrame::new(0, vec![Column::new_empty("wiki".into(), &DataType::String)])
+                .expect("empty fixture schema is valid"),
+        )
+        .expect("the empty fixture is written to a valid temporary directory");
 
         let previous = fs::read(output.path().join("defaults_edit_variation.json"))?;
         let error = materialize(output.path()).expect_err("an empty metric must fail publication");
@@ -1241,6 +1234,165 @@ mod tests {
             fs::read(output.path().join("defaults_edit_variation.json"))?,
             previous
         );
+        Ok(())
+    }
+
+    #[test]
+    fn scalar_conversion_helpers_cover_supported_and_invalid_types() -> Result<()> {
+        let frame = DataFrame::new(
+            1,
+            vec![
+                Column::new("null".into(), &[None::<i64>]),
+                Column::new("boolean".into(), &[true]),
+                Column::new("string".into(), &["value"]),
+                Column::new("u32".into(), &[7_u32]),
+                Column::new("u64".into(), &[11_u64]),
+                Column::new("i32".into(), &[-3_i32]),
+                Column::new("i64".into(), &[-9_i64]),
+                Column::new("f64".into(), &[1.5_f64]),
+            ],
+        )
+        .expect("scalar fixture columns have equal lengths");
+
+        assert_eq!(string(&frame, "null", 0)?, None);
+        assert!(string(&frame, "u32", 0).is_err());
+        assert_eq!(integer(&frame, "null", 0)?, None);
+        assert_eq!(integer(&frame, "u32", 0)?, Some(7));
+        assert_eq!(integer(&frame, "i32", 0)?, Some(-3));
+        assert_eq!(integer(&frame, "i64", 0)?, Some(-9));
+        assert!(integer(&frame, "string", 0).is_err());
+        assert!(integer(&frame, "u64", 0).is_err());
+        assert_eq!(float(&frame, "null", 0)?, None);
+        assert_eq!(float(&frame, "u32", 0)?, Some(7.0));
+        assert_eq!(float(&frame, "i32", 0)?, Some(-3.0));
+        assert_eq!(float(&frame, "i64", 0)?, Some(-9.0));
+        assert_eq!(float(&frame, "f64", 0)?, Some(1.5));
+        assert!(float(&frame, "string", 0).is_err());
+        assert!(float(&frame, "u64", 0).is_err());
+
+        assert_eq!(any_json(&frame, "null", 0)?, Value::Null);
+        assert_eq!(any_json(&frame, "boolean", 0)?, json!(true));
+        assert_eq!(any_json(&frame, "string", 0)?, json!("value"));
+        assert_eq!(any_json(&frame, "u32", 0)?, json!(7));
+        assert_eq!(any_json(&frame, "i32", 0)?, json!(-3));
+        assert_eq!(any_json(&frame, "i64", 0)?, json!(-9));
+        assert_eq!(any_json(&frame, "f64", 0)?, json!(1.5));
+        assert!(any_json(&frame, "u64", 0).is_err());
+
+        assert_eq!(number(f64::NAN), Value::Null);
+        assert_eq!(number(4.0), json!(4));
+        assert_eq!(number(1.25), json!(1.25));
+        let mut average = Average::default();
+        assert_eq!(average.value(), Value::Null);
+        average.add(None);
+        average.add(Some(3.0));
+        assert_eq!(average.value(), json!(3));
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_date_and_sort_helpers_cover_edge_cases() -> Result<()> {
+        let range = df!(
+            "wiki" => &[Some("awiki"), Some("awiki"), Some("awiki"), None, Some("awiki")],
+            "year_month" => &[Some("2026-02"), Some("2026-01"), Some("2026-03"), Some("2026-01"), None],
+            "page_namespace" => &[Some(0_i32), None, Some(1), Some(2), Some(3)],
+        )
+        .expect("metadata fixture columns have equal lengths");
+        let meta = common_meta(&range, Some(&range))?;
+        assert_eq!(meta.default_wiki, "awiki");
+        assert_eq!(
+            meta.ranges,
+            vec![json!({"wiki":"awiki", "mn":"2026-01", "mx":"2026-03"})]
+        );
+        assert!(
+            meta.namespaces
+                .contains(&json!({"wiki":"awiki", "page_namespace": Value::Null}))
+        );
+        let bounded = common_meta_with_overrides(
+            &range,
+            None,
+            Some("awiki".to_string()),
+            Some("2026-02".to_string()),
+        )
+        .expect("the fixture contains a valid bounded range");
+        assert_eq!(bounded.ranges[0]["mx"], "2026-02");
+        assert!(
+            common_meta_with_overrides(&range, None, None, Some("invalid".to_string())).is_err()
+        );
+        let empty = df!(
+            "wiki" => &[None::<&str>],
+            "year_month" => &[None::<&str>],
+        )
+        .expect("empty metadata fixture columns have equal lengths");
+        assert!(common_meta_with_overrides(&empty, None, None, None).is_err());
+
+        assert!(year("20").is_err());
+        assert!(quarter("2026").is_err());
+        assert!(quarter("2026-00").is_err());
+        assert_eq!(quarter("2026-12")?, "2026-Q4");
+        assert_eq!(compare_optional_i64(Some(1), Some(2)), Ordering::Less);
+        assert_eq!(compare_optional_i64(Some(1), None), Ordering::Less);
+        assert_eq!(compare_optional_i64(None, Some(1)), Ordering::Greater);
+        assert_eq!(compare_optional_i64(None, None), Ordering::Equal);
+
+        let mut values = vec![json!({"a":"z", "b":"a"}), json!({"a":"a"})];
+        sort_two_strings(&mut values, "a", "b");
+        assert_eq!(string_field(&values[0], "missing"), "");
+        assert_eq!(values[0]["a"], "a");
+        Ok(())
+    }
+
+    #[test]
+    fn atomic_json_publication_cleans_staged_files_on_rename_failure() -> Result<()> {
+        let output = TestDir::new()?;
+        fs::create_dir(output.path().join("blocked.json"))?;
+        let artifacts = BTreeMap::from([
+            ("blocked.json", json!({"blocked": true})),
+            ("later.json", json!({"later": true})),
+        ]);
+
+        let error = publish_json_set(output.path(), &artifacts)
+            .expect_err("a directory cannot be replaced by a staged JSON file");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to publish dashboard artifact")
+        );
+        assert!(
+            !output
+                .path()
+                .join(format!(".later.json.{}.tmp", std::process::id()))
+                .exists()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_queries_propagate_malformed_input_errors() -> Result<()> {
+        let output = TestDir::new()?;
+        write_site_fixture(output.path())?;
+
+        let mut labor_frames = Frames::read(output.path())?;
+        labor_frames.churn.drop_in_place("period")?;
+        assert!(labor_artifacts(&labor_frames).is_err());
+
+        let mut business_churn_frames = Frames::read(output.path())?;
+        business_churn_frames.churn.drop_in_place("period")?;
+        assert!(business_artifacts(&business_churn_frames).is_err());
+
+        let mut business_funnel_frames = Frames::read(output.path())?;
+        business_funnel_frames
+            .business_funnel
+            .drop_in_place("cohort_size")?;
+        assert!(business_artifacts(&business_funnel_frames).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn fixture_writer_reports_parquet_publication_failures() -> Result<()> {
+        let output = TestDir::new()?;
+        fs::create_dir(output.path().join("business_funnel.parquet"))?;
+        assert!(write_site_fixture(output.path()).is_err());
         Ok(())
     }
 }

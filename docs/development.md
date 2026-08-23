@@ -92,9 +92,12 @@ call those shared scripts rather than reimplementing pipeline steps.
 
 ## CI Structure
 
-GitHub Actions is split into four jobs:
+GitHub Actions is split into five jobs:
 
 - `quality`: formatting, clippy, Python patrol script checks, docs
+- `site`: a clean npm workspace install, advisory check, Rust-generated
+  deterministic fixture, and real Observable production build with page and
+  attachment verification
 - `coverage`: `cargo llvm-cov` LCOV export plus `scripts/check_lcov.py` enforcing zero uncovered lines
 - `security`: `cargo-deny`, `cargo-audit`, and the fail-closed npm advisory policy
 - `toolforge-release`: after the other jobs pass on `main`, selectively builds
@@ -104,6 +107,9 @@ That split is intentional. Keep fast correctness failures separate from
 coverage drift and dependency-policy drift. GitHub has no production
 credentials; Toolforge deployment remains an explicit operator action. The
 coverage run subsumes the ordinary Rust test suite.
+
+Dependabot checks Cargo, npm, and pinned GitHub Actions weekly using
+`.github/dependabot.yml`; its pull requests must still pass all five jobs.
 
 The LCOV check is deliberate. `cargo llvm-cov --summary-only` can under-report line coverage on fully exercised lines because of sub-line region artifacts around `?` and similar expressions. CI treats the exported LCOV file as the source of truth for line coverage.
 

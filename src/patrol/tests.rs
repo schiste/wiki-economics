@@ -1181,7 +1181,7 @@ fn aggregate_stats_and_row_metrics_cover_edge_branches() -> Result<()> {
 }
 
 #[test]
-fn artifact_helpers_cover_bootstrap_merge_refresh_and_defaults() -> Result<()> {
+fn artifact_helpers_cover_bootstrap_merge_and_refresh() -> Result<()> {
     init_test_tracing();
     let temp_dir = TestDir::new()?;
     assert!(load_cached_autopatrol_groups(&temp_dir.path().join("missing.json"))?.is_empty());
@@ -1249,7 +1249,7 @@ fn artifact_helpers_cover_bootstrap_merge_refresh_and_defaults() -> Result<()> {
     assert_eq!(merged.as_deref(), Some(final_path.as_path()));
     refresh_patrol_dashboard_artifacts(&output_dir, merged.as_deref())?;
     assert!(output_dir.join("patrol.parquet").exists());
-    assert!(output_dir.join("defaults_patrol.json").exists());
+    assert!(!output_dir.join("defaults_patrol.json").exists());
     Ok(())
 }
 
@@ -1489,22 +1489,19 @@ fn compute_patrol_reports_missing_inputs_and_executes_rebuild_lookup_and_no_pend
             .exists()
     );
     assert!(output_dir.join("testwiki").join("patrol.parquet").exists());
-    assert!(output_dir.join("defaults_patrol.json").exists());
+    assert!(!output_dir.join("defaults_patrol.json").exists());
 
     let wiki_output = output_dir.join("testwiki").join("patrol.parquet");
     let dashboard_output = output_dir.join("patrol.parquet");
-    let defaults_output = output_dir.join("defaults_patrol.json");
     let before = [
         fs::metadata(&wiki_output)?.modified()?,
         fs::metadata(&dashboard_output)?.modified()?,
-        fs::metadata(&defaults_output)?.modified()?,
     ];
     std::thread::sleep(std::time::Duration::from_millis(10));
     compute_patrol("testwiki", &data_dir, &output_dir, false, None)?;
     let after = [
         fs::metadata(&wiki_output)?.modified()?,
         fs::metadata(&dashboard_output)?.modified()?,
-        fs::metadata(&defaults_output)?.modified()?,
     ];
     assert_eq!(
         after, before,
@@ -1513,10 +1510,9 @@ fn compute_patrol_reports_missing_inputs_and_executes_rebuild_lookup_and_no_pend
 
     fs::remove_file(&wiki_output)?;
     fs::remove_file(&dashboard_output)?;
-    fs::remove_file(&defaults_output)?;
     compute_patrol("testwiki", &data_dir, &output_dir, false, None)?;
     assert!(wiki_output.exists());
     assert!(dashboard_output.exists());
-    assert!(defaults_output.exists());
+    assert!(!output_dir.join("defaults_patrol.json").exists());
     Ok(())
 }

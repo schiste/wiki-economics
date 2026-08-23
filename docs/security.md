@@ -169,7 +169,8 @@ is non-zero on every ingest run and the threat is hypothetical.
 - `scripts/check-npm-advisories.cjs` audits the checked-in npm workspace lockfile on
   every CI push. Moderate, high, and critical advisories always fail. Low
   advisories also fail unless their package and GHSA are explicitly listed in
-  the script.
+  `config/npm-audit-exceptions.json`; malformed, duplicate, or expired
+  exceptions fail closed.
 - The only current npm exception is `GHSA-g7r4-m6w7-qqqr` in esbuild, inherited
   through Observable Framework 1.13.4. It affects the Windows development
   server; production builds and Toolforge run on Linux and do not expose that
