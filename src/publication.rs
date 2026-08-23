@@ -13,7 +13,8 @@ use crate::{licensing, storage};
 const RUN_CONTEXT_FILE: &str = ".publication-run.json";
 const CANDIDATE_FILE: &str = ".publication-candidate.json";
 pub const RECEIPT_FILE: &str = "publication-gate.json";
-const JSON_ARTIFACTS: [&str; 12] = [
+const JSON_ARTIFACTS: [&str; 13] = [
+    crate::browser_data::INDEX_FILENAME,
     "defaults_business.json",
     "defaults_edit_variation.json",
     "defaults_gdp.json",
@@ -859,6 +860,13 @@ pub fn validate(
             },
         );
     }
+    let published_wikis: BTreeSet<_> = registry
+        .wikis
+        .iter()
+        .filter(|(_, lifecycle)| lifecycle.publication == "published")
+        .map(|(wiki, _)| wiki.clone())
+        .collect();
+    crate::browser_data::validate(output_dir, Some(&published_wikis))?;
     let selected_snapshots = validate_snapshots(data_dir, &registry, &context, &cutoffs)?;
     let patrol_contract = registry
         .publication_contract
@@ -1020,7 +1028,15 @@ mod tests {
                 let root_path = output.path().join(format!("{}.parquet", spec.name));
                 write_metric(&root_path, spec, "nlwiki")?;
             }
-            for name in JSON_ARTIFACTS {
+            crate::browser_data::materialize(
+                output.path(),
+                Some(&BTreeSet::from(["nlwiki".to_string()])),
+            )
+            .expect("publication fixture browser index is valid");
+            for name in JSON_ARTIFACTS
+                .into_iter()
+                .filter(|name| *name != crate::browser_data::INDEX_FILENAME)
+            {
                 fs::write(output.path().join(name), b"{\"ok\":true}\n")?;
             }
             Ok(Self {

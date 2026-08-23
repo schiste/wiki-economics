@@ -30,7 +30,7 @@ const {wiki, userTypes, granularity, startPeriod, endPeriod} = filters
 <!-- ── Data pipeline ─────────────────────────────────────── -->
 
 ```js
-const loadIneqRows = makeRowsLoader({inequality: FileAttachment("data/inequality.parquet")})
+const loadIneqRows = makeRowsLoader({inequality: "inequality"})
 
 const useDefaults = isDefaultView(filters, meta, {defaultNamespaces: null})
 startLoading(useDefaults)
@@ -40,7 +40,7 @@ if (useDefaults) {
   const defaults = await loadDefaults()
   ineqData = defaults.data
 } else {
-  const {inequality} = await loadIneqRows()
+  const {inequality} = await loadIneqRows(wiki)
   ineqData = queryGrouped(inequality, {
     sumCols: ["total_editors", "total_edits", "min_editors_50pct"],
     avgCols: ["gini", "theil", "palma"],

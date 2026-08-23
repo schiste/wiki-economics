@@ -13,7 +13,7 @@ use crate::storage;
 use crate::wiki_lifecycle;
 
 const MERGE_BATCH_ROWS: usize = 250_000;
-const MERGE_ALGORITHM_VERSION: &str = "merged-metrics-v4-rust-dashboard-defaults";
+const MERGE_ALGORITHM_VERSION: &str = "merged-metrics-v5-partitioned-browser-data";
 const GENERATOR_DEPENDENCIES: [&str; 1] = ["manifest.json.cjs"];
 const MANIFEST_GENERATOR: &str = "manifest.json.sh";
 
@@ -44,6 +44,7 @@ fn merge_outputs_from_dir(
             .map(|name| (*name).to_string()),
     );
     artifact_names.push("manifest.json".to_string());
+    artifact_names.push(crate::browser_data::INDEX_FILENAME.to_string());
     artifact_names.sort();
     let mut inputs = Vec::new();
     for paths in metric_files.values() {
@@ -128,6 +129,7 @@ fn merge_outputs_from_dir(
     }
 
     crate::dashboard::materialize(output_dir)?;
+    crate::browser_data::materialize(output_dir, published_wikis.as_ref())?;
     materialize_manifest_from_dir(output_dir, generator_dir)?;
     fingerprint::record(&receipt_path, spec, &inputs, &outputs)?;
     crate::publication::record_candidate(output_dir, run_id, &artifact_names)?;

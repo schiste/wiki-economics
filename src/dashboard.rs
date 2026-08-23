@@ -1019,7 +1019,7 @@ pub fn write_site_fixture(output_dir: &Path) -> Result<()> {
             "reached_5" => &[7_u32, 3, 6],
             "reached_25" => &[3_u32, 1, 2],
             "reached_100" => &[1_u32, 0, 1],
-            "wiki" => &["awiki", "awiki", "zwiki"],
+            "wiki" => &["nlwiki", "nlwiki", "ptwiki"],
         )
         .expect("static fixture columns have equal lengths")),
         (
@@ -1038,7 +1038,7 @@ pub fn write_site_fixture(output_dir: &Path) -> Result<()> {
             "bytes_per_edit" => &[10.0_f64, 10.0, 10.0, 0.0, 2.0],
             "bytes_per_editor" => &[20.0_f64, 20.0, 20.0, 0.0, 2.0],
             "revert_rate" => &[0.2_f64, 1.0 / 6.0, 0.25, 0.0, 0.0],
-            "wiki" => &["awiki", "awiki", "zwiki", "awiki", "awiki"],
+            "wiki" => &["nlwiki", "nlwiki", "ptwiki", "nlwiki", "nlwiki"],
         )
         .expect("static fixture columns have equal lengths")),
         (
@@ -1051,7 +1051,7 @@ pub fn write_site_fixture(output_dir: &Path) -> Result<()> {
             "total_edits" => &[12_u32, 8],
             "net_bytes" => &[90_i64, 60],
             "gross_bytes" => &[120_i64, 80],
-            "wiki" => &["awiki", "zwiki"],
+            "wiki" => &["nlwiki", "ptwiki"],
         )
         .expect("static fixture columns have equal lengths")),
         (
@@ -1062,7 +1062,7 @@ pub fn write_site_fixture(output_dir: &Path) -> Result<()> {
             "edits" => &[12_u32, 8],
             "net_bytes" => &[90_i64, 60],
             "editors" => &[6_u32, 4],
-            "wiki" => &["awiki", "zwiki"],
+            "wiki" => &["nlwiki", "ptwiki"],
         )
         .expect("static fixture columns have equal lengths")),
         (
@@ -1076,7 +1076,7 @@ pub fn write_site_fixture(output_dir: &Path) -> Result<()> {
             "min_editors_50pct" => &[2_u32, 2],
             "total_editors" => &[6_u32, 4],
             "total_edits" => &[12_u32, 8],
-            "wiki" => &["awiki", "zwiki"],
+            "wiki" => &["nlwiki", "ptwiki"],
         )
         .expect("static fixture columns have equal lengths")),
         (
@@ -1089,7 +1089,7 @@ pub fn write_site_fixture(output_dir: &Path) -> Result<()> {
             "period_type" => &["month", "quarter", "month", "quarter", "month", "quarter"],
             "arrival_rate" => &[0.3_f64, 0.3, 0.2, 0.2, 0.25, 0.25],
             "departure_rate" => &[0.1_f64, 0.1, 0.2, 0.2, 0.25, 0.25],
-            "wiki" => &["awiki", "awiki", "awiki", "awiki", "zwiki", "zwiki"],
+            "wiki" => &["nlwiki", "nlwiki", "nlwiki", "nlwiki", "ptwiki", "ptwiki"],
         )
         .expect("static fixture columns have equal lengths")),
         (
@@ -1099,7 +1099,7 @@ pub fn write_site_fixture(output_dir: &Path) -> Result<()> {
             "year" => &["2026", "2025", "2026"],
             "survived_editors" => &[5_u32, 2, 3],
             "initial_editors" => &[10_u32, 4, 8],
-            "wiki" => &["awiki", "awiki", "zwiki"],
+            "wiki" => &["nlwiki", "nlwiki", "ptwiki"],
         )
         .expect("static fixture columns have equal lengths")),
         (
@@ -1112,7 +1112,7 @@ pub fn write_site_fixture(output_dir: &Path) -> Result<()> {
             "total_edits" => &[10_u32, 12, 8, 0, 1, 1],
             "net_bytes" => &[80_i64, 90, 60, 0, 1, 1],
             "reverted_edits" => &[2_u32, 2, 2, 0, 0, 0],
-            "wiki" => &["awiki", "awiki", "zwiki", "awiki", "awiki", "awiki"],
+            "wiki" => &["nlwiki", "nlwiki", "ptwiki", "nlwiki", "nlwiki", "nlwiki"],
         )
         .expect("static fixture columns have equal lengths")),
         (
@@ -1128,14 +1128,14 @@ pub fn write_site_fixture(output_dir: &Path) -> Result<()> {
             "previous_week_edits" => &[0_u32, 5, 0],
             "wow_change" => &[5_i64, 4, 4],
             "wow_rate" => &[None, Some(0.8_f64), None],
-            "wiki" => &["awiki", "awiki", "zwiki"],
+            "wiki" => &["nlwiki", "nlwiki", "ptwiki"],
         )
         .expect("static fixture columns have equal lengths")),
         (
         "patrol",
         df!(
             "year_month" => &["2026-01", "2026-01"],
-            "wiki" => &["awiki", "zwiki"],
+            "wiki" => &["nlwiki", "ptwiki"],
             "page_namespace" => &[0_i32, 0],
             "user_type" => &["registered", "registered"],
             "total_patrols" => &[10_i64, 8],
@@ -1154,6 +1154,31 @@ pub fn write_site_fixture(output_dir: &Path) -> Result<()> {
         )
         .expect("static fixture columns have equal lengths")),
     ];
+    for (name, source_frame) in &fixtures {
+        let frwiki = source_frame
+            .clone()
+            .lazy()
+            .filter(col("wiki").eq(lit("nlwiki")))
+            .with_columns([lit("frwiki").alias("wiki")])
+            .collect()?;
+        let mut frame = source_frame.clone();
+        frame.vstack_mut(&frwiki)?;
+        for wiki in wiki_set(&frame)? {
+            let wiki_dir = output_dir.join(&wiki);
+            fs::create_dir_all(&wiki_dir)?;
+            let partition = frame
+                .clone()
+                .lazy()
+                .filter(col("wiki").eq(lit(wiki.as_str())))
+                .collect()?;
+            write_parquet(&wiki_dir, name, partition)?;
+        }
+        write_parquet(output_dir, name, frame)?;
+    }
+    crate::browser_data::materialize(output_dir, None)?;
+    materialize(output_dir)?;
+    let browser_index =
+        crate::browser_data::read_index(&output_dir.join(crate::browser_data::INDEX_FILENAME))?;
     let downloadable_artifacts: Vec<Value> = fixtures
         .iter()
         .map(|(name, _)| {
@@ -1170,11 +1195,22 @@ pub fn write_site_fixture(output_dir: &Path) -> Result<()> {
                 "media_type": "application/json",
             })
         }))
+        .chain(std::iter::once(json!({
+            "name": crate::browser_data::INDEX_FILENAME,
+            "license_spdx": licensing::ARTIFACT_LICENSE_SPDX,
+            "media_type": "application/json",
+        })))
+        .chain(browser_index.entries.iter().map(|entry| {
+            json!({
+                "name": entry.file,
+                "license_spdx": licensing::ARTIFACT_LICENSE_SPDX,
+                "media_type": "application/vnd.apache.parquet",
+                "rows": entry.rows,
+                "bytes": entry.bytes,
+                "sha256": entry.sha256,
+            })
+        }))
         .collect();
-    for (name, frame) in fixtures {
-        write_parquet(output_dir, name, frame)?;
-    }
-    materialize(output_dir)?;
     let policy = licensing::publication_policy()?;
     let root_package: Value = serde_json::from_str(include_str!("../package.json"))?;
     let site_package: Value = serde_json::from_str(include_str!("../site/package.json"))?;
@@ -1198,7 +1234,7 @@ pub fn write_site_fixture(output_dir: &Path) -> Result<()> {
                     "run_id": "site-fixture",
                     "generating_commit": licensing::generating_commit(),
                     "generated_at": "2026-01-31T00:00:00Z",
-                    "selected_snapshot_versions": {"awiki": "2026-01", "zwiki": "2026-01"},
+                    "selected_snapshot_versions": {"frwiki": "2026-01", "nlwiki": "2026-01", "ptwiki": "2026-01"},
                     "release_environment": {
                         "schema_version": 1,
                         "source": "deterministic-site-fixture",
@@ -1217,12 +1253,72 @@ pub fn write_site_fixture(output_dir: &Path) -> Result<()> {
                 "data_dir": "fixture",
                 "output_dir": "fixture",
                 "lifecycle": {"wikis": {}},
-                "wikis": {"awiki": {"status": "complete"}, "zwiki": {"status": "complete"}},
+                "wikis": {"frwiki": {"status": "complete"}, "nlwiki": {"status": "complete"}, "ptwiki": {"status": "complete"}},
                 "merged": [],
+                "browser_data": browser_index,
                 "downloadable_artifacts": downloadable_artifacts,
             }),
         )]),
     )
+}
+
+pub fn write_browser_performance_fixture(output_dir: &Path) -> Result<()> {
+    write_site_fixture(output_dir)?;
+    for (wiki, target_rows) in [
+        ("nlwiki", 6_000_usize),
+        ("ptwiki", 3_000),
+        ("frwiki", 21_000),
+    ] {
+        for (metric, _) in crate::browser_data::BROWSER_METRICS {
+            let path = output_dir.join(wiki).join(format!("{metric}.parquet"));
+            let frame = ParquetReader::new(File::open(&path)?)
+                .set_low_memory(true)
+                .read_parallel(ParallelStrategy::None)
+                .finish()?;
+            ensure!(frame.height() > 0, "performance fixture source is empty");
+            let indices = (0..target_rows)
+                .map(|index| (index % frame.height()) as IdxSize)
+                .collect();
+            let expanded = frame.take(&IdxCa::from_vec("fixture_rows".into(), indices))?;
+            write_parquet(&output_dir.join(wiki), metric, expanded)?;
+        }
+    }
+    crate::browser_data::materialize(output_dir, None)?;
+    refresh_fixture_browser_manifest(output_dir)
+}
+
+fn refresh_fixture_browser_manifest(output_dir: &Path) -> Result<()> {
+    let index =
+        crate::browser_data::read_index(&output_dir.join(crate::browser_data::INDEX_FILENAME))?;
+    let manifest_path = output_dir.join("manifest.json");
+    let mut manifest: Value = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    let downloads = manifest
+        .get_mut("downloadable_artifacts")
+        .and_then(Value::as_array_mut)
+        .context("fixture manifest has no downloadable artifact list")?;
+    downloads.retain(|artifact| {
+        artifact["name"].as_str().is_none_or(|name| {
+            name != crate::browser_data::INDEX_FILENAME && !name.starts_with("browser-data/")
+        })
+    });
+    downloads.push(json!({
+        "name": crate::browser_data::INDEX_FILENAME,
+        "license_spdx": licensing::ARTIFACT_LICENSE_SPDX,
+        "media_type": "application/json",
+    }));
+    downloads.extend(index.entries.iter().map(|entry| {
+        json!({
+            "name": entry.file,
+            "license_spdx": licensing::ARTIFACT_LICENSE_SPDX,
+            "media_type": "application/vnd.apache.parquet",
+            "rows": entry.rows,
+            "bytes": entry.bytes,
+            "sha256": entry.sha256,
+        })
+    }));
+    downloads.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+    manifest["browser_data"] = serde_json::to_value(index)?;
+    publish_json_set(output_dir, &BTreeMap::from([("manifest.json", manifest)]))
 }
 
 #[cfg(test)]
@@ -1249,7 +1345,7 @@ mod tests {
             serde_json::from_slice::<Value>(&first_bytes)?;
         }
         let gdp = read_json(&first.path().join("defaults_gdp.json"))?;
-        assert_eq!(gdp["defaultWiki"], "awiki");
+        assert_eq!(gdp["defaultWiki"], "frwiki");
         assert_eq!(gdp["maxMonth"], "2026-01");
         assert_eq!(gdp["output"][1]["total_edits"], 12);
 
@@ -1262,11 +1358,39 @@ mod tests {
         assert_eq!(manifest["generated_at"], "2026-01-31T00:00:00Z");
         assert_eq!(manifest["license"]["spdx_identifier"], "MIT");
         assert_eq!(manifest["provenance"]["run_id"], "site-fixture");
+        assert_eq!(manifest["browser_data"]["schema_version"], 1);
         assert_eq!(manifest["downloadable_artifacts"][0]["license_spdx"], "MIT");
         assert_eq!(
             manifest["toolforge_open_licensing"]["open_data_license_spdx"],
             "MIT"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn browser_performance_fixture_has_deterministic_nl_pt_and_fr_profiles() -> Result<()> {
+        let first = TestDir::new()?;
+        let second = TestDir::new()?;
+        write_browser_performance_fixture(first.path())?;
+        write_browser_performance_fixture(second.path())?;
+        let first_index = crate::browser_data::read_index(
+            &first.path().join(crate::browser_data::INDEX_FILENAME),
+        )
+        .expect("first performance fixture index is valid");
+        let second_index = crate::browser_data::read_index(
+            &second.path().join(crate::browser_data::INDEX_FILENAME),
+        )
+        .expect("second performance fixture index is valid");
+        assert_eq!(first_index, second_index);
+        for (wiki, expected) in [("nlwiki", 6_000), ("ptwiki", 3_000), ("frwiki", 21_000)] {
+            assert!(
+                first_index
+                    .entries
+                    .iter()
+                    .filter(|entry| entry.wiki == wiki)
+                    .all(|entry| entry.rows == expected)
+            );
+        }
         Ok(())
     }
 

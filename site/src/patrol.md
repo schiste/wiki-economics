@@ -34,7 +34,7 @@ const {wiki, userTypes, granularity, startPeriod, endPeriod, namespaces} = filte
 ```
 
 ```js
-const loadPatrolRows = makeRowsLoader({patrol: FileAttachment("data/patrol.parquet")})
+const loadPatrolRows = makeRowsLoader({patrol: "patrol"})
 
 const useDefaults = isDefaultView(filters, meta)
 startLoading(useDefaults)
@@ -44,7 +44,7 @@ if (useDefaults) {
   const defaults = await loadDefaults()
   data = defaults.patrol
 } else {
-  const {patrol} = await loadPatrolRows()
+  const {patrol} = await loadPatrolRows(wiki)
   data = queryGrouped(patrol, {
     sumCols: ["total_patrols", "unique_patrollers", "patrol_new_pages", "patrol_diffs",
               "patrolled_revisions", "autopatrolled_revisions", "total_revisions", "min_patrollers_50pct"],

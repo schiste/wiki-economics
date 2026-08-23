@@ -1,4 +1,5 @@
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -22,6 +23,19 @@ fs.writeFileSync(
 );
 fs.mkdirSync(path.join(fakeRoot, "deploy", "toolforge"), {recursive: true});
 fs.mkdirSync(fakeBin, {recursive: true});
+fs.mkdirSync(path.join(outputDir, "nlwiki"), {recursive: true});
+const browserSource = path.join(outputDir, "nlwiki", "gdp.parquet");
+fs.writeFileSync(browserSource, "browser-data");
+const browserBytes = fs.statSync(browserSource).size;
+const browserSha256 = crypto.createHash("sha256").update(fs.readFileSync(browserSource)).digest("hex");
+fs.writeFileSync(path.join(outputDir, "browser-data-index.json"), JSON.stringify({
+  schema_version: 1,
+  cache_schema_version: 1,
+  generation: "a".repeat(64),
+  license_spdx: "MIT",
+  entries: [{metric: "gdp", wiki: "nlwiki", minimum_date: "2026-01", maximum_date: "2026-07",
+    file: "browser-data/gdp/nlwiki.parquet", rows: 1, bytes: browserBytes, sha256: browserSha256}],
+}));
 fs.mkdirSync(distDir, {recursive: true});
 fs.writeFileSync(path.join(distDir, "index.html"), "old release\n");
 fs.copyFileSync(

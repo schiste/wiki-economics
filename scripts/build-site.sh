@@ -143,9 +143,11 @@ if [ "${WIKI_ECON_VERIFY_SITE_CLOSURE:-1}" = "1" ]; then
     WIKI_ECON_SITE_SOURCE_DIR="$source_dir" \
     WIKI_ECON_SITE_DIST_DIR="$build_dir" \
     npm --workspace site run build)
+  node "$ROOT/scripts/publish-browser-data.cjs" "$WIKI_ECON_OUTPUT_DIR" "$build_dir"
   node "$ROOT/scripts/verify-site-dependencies.cjs" "$build_dir"
 else
   (cd "$WIKI_ECON_ROOT" && WIKI_ECON_SITE_DIST_DIR="$build_dir" npm --workspace site run build)
+  node "$ROOT/scripts/publish-browser-data.cjs" "$WIKI_ECON_OUTPUT_DIR" "$build_dir"
 fi
 
 if [ ! -f "$build_dir/index.html" ]; then

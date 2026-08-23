@@ -32,9 +32,9 @@ const {wiki, userTypes, granularity, startPeriod, endPeriod, namespaces} = filte
 
 ```js
 const loadLaborRows = makeRowsLoader({
-  labor: FileAttachment("data/labor_monthly.parquet"),
-  cohorts: FileAttachment("data/labor_cohorts.parquet"),
-  churn: FileAttachment("data/labor_churn.parquet"),
+  labor: "labor_monthly",
+  cohorts: "labor_cohorts",
+  churn: "labor_churn",
 })
 
 const useDefaults = isDefaultView(filters, meta)
@@ -49,7 +49,7 @@ if (useDefaults) {
   workforce = defaults.workforce
   churnData = defaults.churn
 } else {
-  const {labor: laborRaw, churn: churnRaw} = await loadLaborRows()
+  const {labor: laborRaw, churn: churnRaw} = await loadLaborRows(wiki)
   workforce = queryGrouped(laborRaw, {
     sumCols: ["unique_editors", "total_edits", "net_bytes", "reverted_edits"],
     wiki, userTypes, namespaces, startPeriod, endPeriod, granularity
@@ -151,7 +151,7 @@ if (useDefaults) {
   const defaults = await loadDefaults()
   typeAgg = defaults.byType
 } else {
-  const {labor: laborRaw} = await loadLaborRows()
+  const {labor: laborRaw} = await loadLaborRows(wiki)
   const byType = laborRaw
     .filter(d => d.wiki === wiki && d.year_month >= startPeriod && d.year_month <= endPeriod && namespaces.includes(d.page_namespace))
     .map(d => ({...d, period: toPeriod(d.year_month, granularity)}))
@@ -253,7 +253,7 @@ if (useDefaults) {
   const defaults = await loadDefaults()
   cohortData = defaults.cohorts
 } else {
-  const {cohorts} = await loadLaborRows()
+  const {cohorts} = await loadLaborRows(wiki)
   cohortData = cohorts
     .filter(d => d.wiki === wiki)
     .sort((a, b) => d3.ascending(a.cohort_year, b.cohort_year) || d3.ascending(a.year, b.year))

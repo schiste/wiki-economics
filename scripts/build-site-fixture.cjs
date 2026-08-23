@@ -2,10 +2,12 @@
 "use strict";
 
 const fs = require("node:fs");
+const crypto = require("node:crypto");
 const os = require("node:os");
 const path = require("node:path");
 const {spawnSync} = require("node:child_process");
 const {prepareSiteSource} = require("./prepare-site-source.cjs");
+const {publishBrowserData} = require("./publish-browser-data.cjs");
 const {verifySiteDependencies} = require("./verify-site-dependencies.cjs");
 
 const REQUIRED_PAGES = [
@@ -20,27 +22,18 @@ const REQUIRED_PAGES = [
   "patrol.html",
 ];
 const REQUIRED_ATTACHMENTS = [
-  "business_funnel.parquet",
   "defaults_business.json",
   "defaults_edit_variation.json",
   "defaults_gdp.json",
   "defaults_inequality.json",
   "defaults_labor.json",
   "defaults_patrol.json",
-  "gdp.parquet",
-  "gdp_activity_tiers.parquet",
-  "gdp_user_type_share.parquet",
-  "inequality.parquet",
-  "labor_churn.parquet",
-  "labor_cohorts.parquet",
-  "labor_monthly.parquet",
   "manifest.json",
   "meta_business.json",
   "meta_gdp.json",
   "meta_inequality.json",
   "meta_labor.json",
   "meta_patrol.json",
-  "patrol.parquet",
 ];
 
 function parseArguments(argv) {
@@ -90,6 +83,25 @@ function verifyBuild(distDir) {
       throw new Error(`Observable build is missing data attachment ${attachment}`);
     }
   }
+  const browserIndexPath = path.join(distDir, "browser-data", "index.json");
+  const browserIndex = JSON.parse(fs.readFileSync(browserIndexPath, "utf8"));
+  if (browserIndex?.schema_version !== 1 || browserIndex?.cache_schema_version !== 1
+      || !Array.isArray(browserIndex?.entries) || browserIndex.entries.length === 0) {
+    throw new Error("Observable build has an invalid browser data index");
+  }
+  for (const entry of browserIndex.entries) {
+    const artifact = path.join(distDir, ...entry.file.split("/"));
+    const stat = fs.statSync(artifact, {throwIfNoEntry: false});
+    const hash = stat?.isFile()
+      ? crypto.createHash("sha256").update(fs.readFileSync(artifact)).digest("hex")
+      : null;
+    if (stat?.size !== entry.bytes || hash !== entry.sha256) {
+      throw new Error(`Observable build has an invalid browser partition ${entry.file}`);
+    }
+  }
+  if (files.some(file => /(?:^|[/\\])_file[/\\]data[/\\].*\.parquet$/.test(file))) {
+    throw new Error("Observable build still embeds a combined Parquet attachment");
+  }
   const manifestPath = files.find((file) => /(?:^|[/\\])manifest\.[a-f0-9]+\.json$/.test(file));
   const manifest = JSON.parse(fs.readFileSync(path.join(distDir, manifestPath), "utf8"));
   if (manifest?.schema_version !== 3
@@ -109,9 +121,11 @@ function verifyBuild(distDir) {
   const licensedDownloads = new Set((manifest.downloadable_artifacts || [])
     .filter((artifact) => artifact?.license_spdx === "MIT")
     .map((artifact) => artifact.name));
-  if (REQUIRED_ATTACHMENTS
-    .filter((attachment) => attachment !== "manifest.json")
-    .some((attachment) => !licensedDownloads.has(attachment))) {
+  const licensedNames = ["browser-data-index.json", ...browserIndex.entries.map(entry => entry.file)];
+  if ([
+    ...REQUIRED_ATTACHMENTS.filter((attachment) => attachment !== "manifest.json"),
+    ...licensedNames,
+  ].some((attachment) => !licensedDownloads.has(attachment))) {
     throw new Error("Observable build has a downloadable artifact without a discoverable MIT license");
   }
   return files;
@@ -147,6 +161,7 @@ function buildFixture({dataDir, distDir, root = path.resolve(__dirname, ".."), r
     if (result.status !== 0) {
       throw new Error(`Observable build failed\n${result.stdout || ""}${result.stderr || ""}`);
     }
+    publishBrowserData({dataDir, distDir});
     const files = verifyBuild(distDir);
     verifySiteDependencies(distDir);
     return files;

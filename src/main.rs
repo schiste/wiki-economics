@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod bench;
+mod browser_data;
 mod capacity;
 mod cleanup;
 mod compute;
@@ -65,6 +66,10 @@ enum Commands {
     /// Write the deterministic minimal data fixture used by real site CI
     #[command(hide = true)]
     SiteFixture,
+
+    /// Write deterministic nlwiki/ptwiki/frwiki browser scalability fixtures
+    #[command(hide = true)]
+    BrowserPerformanceFixture,
 
     /// Remove only expired, pipeline-owned staging artifacts
     #[command(hide = true)]
@@ -464,6 +469,9 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
     match cli.command {
         Commands::DashboardMaterialize => dashboard::materialize(&output_dir)?,
         Commands::SiteFixture => dashboard::write_site_fixture(&output_dir)?,
+        Commands::BrowserPerformanceFixture => {
+            dashboard::write_browser_performance_fixture(&output_dir)?
+        }
         Commands::CleanupStale {
             site_dist_dir,
             minimum_age_secs,
@@ -1959,6 +1967,19 @@ mod tests {
         assert_eq!(
             fs::read(output_dir.path().join("defaults_gdp.json"))?,
             first
+        );
+        run_with_ops(
+            command(Commands::BrowserPerformanceFixture),
+            &RecordingOps::default(),
+        )
+        .expect("browser performance fixture should materialize");
+        let browser_index =
+            browser_data::read_index(&output_dir.path().join(browser_data::INDEX_FILENAME))?;
+        assert!(
+            browser_index
+                .entries
+                .iter()
+                .any(|entry| entry.wiki == "frwiki" && entry.rows == 21_000)
         );
         Ok(())
     }

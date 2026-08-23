@@ -1,5 +1,6 @@
 import * as Inputs from "npm:@observablehq/inputs";
 import {html} from "npm:htl@1.0.0";
+export {makeRowsLoader} from "./browser-data.js";
 
 /**
  * Convert a YYYY-MM string to a period key based on granularity.
@@ -47,116 +48,6 @@ export function nsLabel(n) {
 }
 
 /**
- * Convert an Arrow row to a plain object, coercing BigInt fields (Arrow's
- * representation of Parquet INT64 columns) to Number — toJSON() alone
- * leaves them as BigInt, which throws when summed against a Number
- * accumulator in aggregateByPeriod.
- */
-function arrowRowToObject(row) {
-  const obj = row.toJSON();
-  for (const key in obj) {
-    if (typeof obj[key] === "bigint") obj[key] = Number(obj[key]);
-  }
-  return obj;
-}
-
-/**
- * IndexedDB-backed cache for decoded FileAttachment contents, so a repeat
- * page load can skip re-fetching and re-decoding Parquet/JSON that hasn't
- * changed. Keyed by the file's stable logical `name` (e.g. "gdp.parquet"),
- * storing the resolved `href` alongside the data: Observable Framework's
- * production build fingerprints that href with a content hash, so "is my
- * cached copy still good?" is just `entry.href === file.href` — a single
- * local IndexedDB read, no network round trip. A `put` for a given name
- * overwrites the single record for that name, so a new hash automatically
- * evicts the stale version (dev preview serves unhashed hrefs, so caching
- * there is effectively a no-op that always re-fetches — fine, it's not what
- * ships).
- */
-const CACHE_DB_NAME = "wiki-econ-file-cache";
-const CACHE_STORE_NAME = "files";
-
-let cacheDbPromise = null;
-
-function openCacheDb() {
-  if (cacheDbPromise) return cacheDbPromise;
-  cacheDbPromise = new Promise(resolve => {
-    if (typeof indexedDB === "undefined") return resolve(null);
-    let request;
-    try {
-      request = indexedDB.open(CACHE_DB_NAME, 1);
-    } catch {
-      return resolve(null);
-    }
-    request.onupgradeneeded = () => {
-      request.result.createObjectStore(CACHE_STORE_NAME, {keyPath: "name"});
-    };
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => resolve(null);
-  });
-  return cacheDbPromise;
-}
-
-async function getCachedFile(name, href) {
-  const db = await openCacheDb();
-  if (!db) return undefined;
-  return new Promise(resolve => {
-    try {
-      const req = db.transaction(CACHE_STORE_NAME, "readonly").objectStore(CACHE_STORE_NAME).get(name);
-      req.onsuccess = () => {
-        const entry = req.result;
-        resolve(entry && entry.href === href ? entry.data : undefined);
-      };
-      req.onerror = () => resolve(undefined);
-    } catch {
-      resolve(undefined);
-    }
-  });
-}
-
-function putCachedFile(name, href, data) {
-  openCacheDb().then(db => {
-    if (!db) return;
-    try {
-      db.transaction(CACHE_STORE_NAME, "readwrite").objectStore(CACHE_STORE_NAME).put({name, href, data});
-    } catch {
-      // Ignore cache write failures (quota exceeded, private-mode restrictions, etc).
-    }
-  });
-}
-
-/**
- * Lazily load a set of Parquet FileAttachments into arrays of plain row objects.
- * Returns a function that, when called, resolves to {key: rows[], ...}.
- *
- * Caches the in-flight promise, not the resolved value: several query cells
- * can call the returned loader in the same reactive tick, and if we only
- * memoized the awaited result, they'd all see a null cache and each decode
- * their own copy of the Parquet files before the first one finished.
- */
-export function makeRowsLoader(files) {
-  let promise = null;
-  return function loadRows() {
-    if (!promise) {
-      promise = (async () => {
-        const entries = await Promise.all(
-          Object.entries(files).map(async ([key, file]) => {
-            const cached = await getCachedFile(file.name, file.href);
-            if (cached) return [key, cached];
-            const table = await file.parquet();
-            const rows = Array.from(table, arrowRowToObject);
-            putCachedFile(file.name, file.href, rows);
-            return [key, rows];
-          })
-        );
-        return Object.fromEntries(entries);
-      })();
-    }
-    return promise;
-  };
-}
-
-/**
  * Lazily load a single JSON FileAttachment, memoizing the in-flight promise
  * so multiple cells that need it in the same tick share one fetch.
  */
@@ -164,13 +55,7 @@ export function makeJsonLoader(file) {
   let promise = null;
   return function loadJson() {
     if (!promise) {
-      promise = (async () => {
-        const cached = await getCachedFile(file.name, file.href);
-        if (cached) return cached;
-        const data = await file.json();
-        putCachedFile(file.name, file.href, data);
-        return data;
-      })();
+      promise = file.json();
     }
     return promise;
   };

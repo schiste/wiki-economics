@@ -3,6 +3,7 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
+const crypto = require("node:crypto");
 
 const CORE_METRICS = [
   "business_funnel", "gdp", "gdp_activity_tiers", "gdp_user_type_share",
@@ -14,6 +15,7 @@ const PUBLIC_JSON_ARTIFACTS = [
   "meta_business", "meta_gdp", "meta_inequality", "meta_labor", "meta_patrol",
 ];
 const ARTIFACT_LICENSE_SPDX = "MIT";
+const BROWSER_INDEX = "browser-data-index.json";
 
 function findRoot(start = __dirname) {
   let current = path.resolve(start);
@@ -117,6 +119,56 @@ function fileList(directory, extension = ".parquet") {
       })
       .sort((left, right) => left.name.localeCompare(right.name));
   } catch { return []; }
+}
+
+function browserDataSummary(outputDir) {
+  const indexPath = path.join(outputDir, BROWSER_INDEX);
+  const index = readJson(indexPath);
+  if (index?.schema_version !== 1
+      || index?.cache_schema_version !== 1
+      || !/^[0-9a-f]{64}$/.test(index?.generation || "")
+      || index?.license_spdx !== ARTIFACT_LICENSE_SPDX
+      || !Array.isArray(index?.entries)
+      || index.entries.length === 0) {
+    throw new Error(`invalid browser data index: ${indexPath}`);
+  }
+  const identities = new Set();
+  const artifacts = index.entries.map((entry) => {
+    if (!/^[a-z0-9_]+$/.test(entry?.metric || "")
+        || !/^[a-z0-9_]+wiki$/.test(entry?.wiki || "")
+        || entry.file !== `browser-data/${entry.metric}/${entry.wiki}.parquet`
+        || typeof entry.minimum_date !== "string"
+        || typeof entry.maximum_date !== "string"
+        || !Number.isSafeInteger(entry.rows) || entry.rows <= 0
+        || !Number.isSafeInteger(entry.bytes) || entry.bytes <= 0
+        || !/^[0-9a-f]{64}$/.test(entry.sha256 || "")) {
+      throw new Error(`invalid browser data entry: ${JSON.stringify(entry)}`);
+    }
+    const identity = `${entry.metric}/${entry.wiki}`;
+    if (identities.has(identity)) throw new Error(`duplicate browser data entry: ${identity}`);
+    identities.add(identity);
+    const source = path.join(outputDir, entry.wiki, `${entry.metric}.parquet`);
+    const stat = statFile(source);
+    if (!stat || stat.size !== entry.bytes) throw new Error(`browser source size mismatch: ${source}`);
+    const sha256 = crypto.createHash("sha256").update(fs.readFileSync(source)).digest("hex");
+    if (sha256 !== entry.sha256) throw new Error(`browser source hash mismatch: ${source}`);
+    return {
+      name: entry.file,
+      size_kb: Math.floor(entry.bytes / 1024),
+      bytes: entry.bytes,
+      rows: entry.rows,
+      sha256: entry.sha256,
+      license_spdx: ARTIFACT_LICENSE_SPDX,
+      media_type: "application/vnd.apache.parquet",
+    };
+  });
+  artifacts.push({
+    name: BROWSER_INDEX,
+    size_kb: Math.floor(fs.statSync(indexPath).size / 1024),
+    license_spdx: ARTIFACT_LICENSE_SPDX,
+    media_type: "application/json",
+  });
+  return {index, artifacts};
 }
 
 function humanBytes(bytes) {
@@ -305,9 +357,11 @@ async function buildManifest(options = {}) {
   const merged = fileList(outputDir);
   const dashboardJson = fileList(outputDir, ".json")
     .filter((artifact) => PUBLIC_JSON_ARTIFACTS.includes(artifact.name));
+  const browserData = browserDataSummary(outputDir);
   const downloadableArtifacts = [
     ...merged.map((artifact) => ({...artifact, name: `${artifact.name}.parquet`, media_type: "application/vnd.apache.parquet"})),
     ...dashboardJson.map((artifact) => ({...artifact, name: `${artifact.name}.json`, media_type: "application/json"})),
+    ...browserData.artifacts,
   ].sort((left, right) => left.name.localeCompare(right.name));
   const mergedNames = new Set(merged.map((entry) => entry.name));
   const wikis = {};
@@ -375,6 +429,7 @@ async function buildManifest(options = {}) {
     lifecycle,
     wikis,
     merged,
+    browser_data: browserData.index,
     downloadable_artifacts: downloadableArtifacts,
   };
 }
@@ -390,5 +445,5 @@ if (require.main === module) {
   });
 }
 
-module.exports = {buildManifest, datasetApplies, discoverWikis, generationSummary, humanBytes, parquetRowCounter,
+module.exports = {BROWSER_INDEX, browserDataSummary, buildManifest, datasetApplies, discoverWikis, generationSummary, humanBytes, parquetRowCounter,
   patrolSummary, publicationLicensing, releaseProvenance, repositoryRuntimeProvenance, safeReceiptOutput};

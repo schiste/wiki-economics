@@ -29,12 +29,12 @@ const {wiki, userTypes, granularity, startPeriod, endPeriod, namespaces} = filte
 
 ```js
 const loadBizRows = makeRowsLoader({
-  labor: FileAttachment("data/labor_monthly.parquet"),
-  churn: FileAttachment("data/labor_churn.parquet"),
-  cohorts: FileAttachment("data/labor_cohorts.parquet"),
-  gdp: FileAttachment("data/gdp.parquet"),
-  tiers: FileAttachment("data/gdp_activity_tiers.parquet"),
-  funnel: FileAttachment("data/business_funnel.parquet"),
+  labor: "labor_monthly",
+  churn: "labor_churn",
+  cohorts: "labor_cohorts",
+  gdp: "gdp",
+  tiers: "gdp_activity_tiers",
+  funnel: "business_funnel",
 })
 
 const useDefaults = isDefaultView(filters, meta)
@@ -53,7 +53,7 @@ if (useDefaults) {
   const defaults = await loadDefaults()
   churnData = defaults.churn
 } else {
-  const {churn: churnRaw} = await loadBizRows()
+  const {churn: churnRaw} = await loadBizRows(wiki)
   churnData = churnRaw.filter(d => d.wiki === wiki && d.period_type === granularity && d.period >= startP && d.period <= endP)
 }
 } finally {
@@ -70,7 +70,7 @@ if (useDefaults) {
   const defaults = await loadDefaults()
   tierAgg = defaults.tiers
 } else {
-  const {tiers: tiersRaw} = await loadBizRows()
+  const {tiers: tiersRaw} = await loadBizRows(wiki)
   const tierFiltered = tiersRaw
     .filter(d => d.wiki === wiki && userTypes.includes(d.user_type) && d.year_month >= startPeriod && d.year_month <= endPeriod)
     .map(d => ({...d, period: toPeriod(d.year_month, granularity)}))
@@ -103,7 +103,7 @@ if (useDefaults) {
   }))
   gdpRaw = null
 } else {
-  const {gdp} = await loadBizRows()
+  const {gdp} = await loadBizRows(wiki)
   gdpRaw = gdp.filter(d => d.wiki === wiki)
   const gdpFiltered = gdpRaw
     .filter(d => userTypes.includes(d.user_type) && namespaces.includes(d.page_namespace) && d.year_month >= startPeriod && d.year_month <= endPeriod)
@@ -172,7 +172,7 @@ if (useDefaults) {
     bytesPerEditor: d.unique_editors > 0 ? d.net_bytes / d.unique_editors : 0
   }))
 } else {
-  const {cohorts} = await loadBizRows()
+  const {cohorts} = await loadBizRows(wiki)
   cohortData = cohorts
     .filter(d => d.wiki === wiki)
     .sort((a, b) => d3.ascending(a.cohort_year, b.cohort_year) || d3.ascending(a.year, b.year))
@@ -318,7 +318,7 @@ try {
     const defaults = await loadDefaults()
     funnelData = defaults.funnel
   } else {
-    const {funnel} = await loadBizRows()
+    const {funnel} = await loadBizRows(wiki)
     funnelData = funnel
       .filter(d => d.wiki === wiki)
       .map(d => ({

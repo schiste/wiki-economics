@@ -20,6 +20,7 @@ const dashboardJson = [
   "defaults_labor", "defaults_patrol", "meta_business", "meta_gdp", "meta_inequality",
   "meta_labor", "meta_patrol",
 ];
+const browserMetrics = metrics.filter((metric) => metric !== "page_weekly_edits");
 
 function lifecycle() {
   return {
@@ -77,6 +78,17 @@ function fixture(name) {
   for (const artifact of dashboardJson) {
     fs.writeFileSync(path.join(outputDir, `${artifact}.json`), "{}");
   }
+  const browserEntries = browserMetrics.map((metric) => {
+    const source = path.join(outputDir, "nlwiki", `${metric}.parquet`);
+    const bytes = fs.statSync(source).size;
+    const sha256 = require("node:crypto").createHash("sha256").update(fs.readFileSync(source)).digest("hex");
+    return {metric, wiki: "nlwiki", minimum_date: "2026-01", maximum_date: "2026-07",
+      file: `browser-data/${metric}/nlwiki.parquet`, rows: 5, bytes, sha256};
+  });
+  fs.writeFileSync(path.join(outputDir, "browser-data-index.json"), JSON.stringify({
+    schema_version: 1, cache_schema_version: 1, generation: "a".repeat(64), license_spdx: "MIT",
+    entries: browserEntries,
+  }));
   return {analytical, dataDir, outputDir};
 }
 
@@ -112,12 +124,13 @@ test("generation readiness follows the pointer and strict ingest receipt without
   assert.equal(manifest.provenance.release_environment.runtime.npm, "11.12.1");
   assert.equal(manifest.provenance.release_environment.runtime.rust, "1.98.0");
   assert.equal(manifest.provenance.release_environment.browser_packages.direct["apache-arrow"], "21.2.0");
+  assert.equal(manifest.browser_data.entries.length, browserMetrics.length);
   assert.equal(manifest.source_datasets.length, 3);
   assert.match(manifest.attribution, /Wikimedia/);
   assert.match(manifest.trademark.status, /No trademark license is recorded/);
   assert.equal(manifest.toolforge_open_licensing.open_data_license_spdx, "MIT");
   assert.equal(manifest.merged.every((artifact) => artifact.license_spdx === "MIT"), true);
-  assert.equal(manifest.downloadable_artifacts.length, metrics.length + dashboardJson.length);
+  assert.equal(manifest.downloadable_artifacts.length, metrics.length + dashboardJson.length + browserMetrics.length + 1);
   assert.equal(manifest.downloadable_artifacts.every((artifact) => artifact.license_spdx === "MIT"), true);
   assert.equal(manifest.downloadable_artifacts.some((artifact) => artifact.name === "defaults_gdp.json"), true);
   assert.equal(manifest.downloadable_artifacts.some((artifact) => artifact.name === "gdp.parquet"), true);
