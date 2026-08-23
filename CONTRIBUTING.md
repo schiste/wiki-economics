@@ -22,7 +22,7 @@ This project favors reproducible pipeline changes, explicit storage contracts, a
 ## Commit Hygiene
 
 - Do not commit generated data under `data/` or `output/`.
-- Do not commit `site/node_modules`, `site/dist`, or local caches.
+- Do not commit root `node_modules`, `site/dist`, or local caches.
 - Keep vendored dependency changes narrowly scoped and documented.
 
 ## Review Focus

@@ -242,11 +242,11 @@ ensure_cargo_tool() {
 }
 
 install_site_dependencies() {
-  if [ -d "$WIKI_ECON_SITE_DIR/node_modules" ]; then
+  if [ -x "$WIKI_ECON_ROOT/node_modules/.bin/observable" ]; then
     celebrate "Dashboard dependencies are already installed."
   else
     say "Installing dashboard dependencies."
-    (cd "$WIKI_ECON_SITE_DIR" && npm ci)
+    (cd "$WIKI_ECON_ROOT" && npm ci)
     celebrate "Dashboard dependencies are installed."
   fi
 }

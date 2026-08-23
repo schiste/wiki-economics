@@ -2,6 +2,9 @@
   "name": "wiki-economics",
   "private": true,
   "license": "(MIT OR Apache-2.0)",
+  "workspaces": [
+    "site"
+  ],
   "scripts": {
     "rust-build": "cargo build --release --locked",
     "build:site": "scripts/build-site.sh",
@@ -10,8 +13,5 @@
     "setup": "scripts/setup.sh",
     "dev": "scripts/dev.sh",
     "start": "scripts/dev.sh"
-  },
-  "dependencies": {
-    "@observablehq/framework": "^1.13.4"
   }
 }

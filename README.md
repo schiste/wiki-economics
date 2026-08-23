@@ -176,7 +176,7 @@ python3 -m unittest discover -s scripts -p 'test_*.py'
 - `data/` is fetched or generated locally and is intentionally not committed.
 - `output/` is generated locally and feeds the dashboard via `site/src/data -> ../../output`.
 - `site/data-build/` contains the checked-in generator scripts that materialize `manifest.json` and `defaults_*.json` into the active output directory.
-- `site/dist/` and `site/node_modules/` are build artifacts and local dependencies.
+- `site/dist/` and root `node_modules/` are build artifacts and local dependencies.
 
 If you need small permanent fixtures for tests, add them deliberately rather than checking in ad hoc working data.
 

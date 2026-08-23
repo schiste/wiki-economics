@@ -166,7 +166,7 @@ is non-zero on every ingest run and the threat is hypothetical.
 - `cargo deny check advisories bans licenses sources` runs on every CI
   push.
 - `cargo audit -D warnings` runs on every CI push.
-- `scripts/check-npm-advisories.cjs` audits both checked-in npm lockfiles on
+- `scripts/check-npm-advisories.cjs` audits the checked-in npm workspace lockfile on
   every CI push. Moderate, high, and critical advisories always fail. Low
   advisories also fail unless their package and GHSA are explicitly listed in
   the script.

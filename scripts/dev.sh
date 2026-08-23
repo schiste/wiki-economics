@@ -38,7 +38,7 @@ ADMIN_PID=$!
 
 # 4. Start Observable dev server (port 3000)
 echo "==> Starting Observable dev server on :${WIKI_ECON_SITE_PORT}..."
-(cd site && npm run dev -- --host 127.0.0.1 --port "$WIKI_ECON_SITE_PORT") &
+(npm --workspace site run dev -- --host 127.0.0.1 --port "$WIKI_ECON_SITE_PORT") &
 SITE_PID=$!
 
 echo ""

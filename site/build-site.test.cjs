@@ -14,7 +14,12 @@ const outputDir = path.join(fakeRoot, "output");
 const distDir = path.join(fixtureRoot, "published", "site-dist");
 const stageEvents = path.join(fixtureRoot, "site-stage-events.jsonl");
 
-fs.mkdirSync(path.join(fakeSite, "node_modules"), {recursive: true});
+fs.mkdirSync(path.join(fakeRoot, "node_modules", ".bin"), {recursive: true});
+fs.writeFileSync(
+  path.join(fakeRoot, "node_modules", ".bin", "observable"),
+  "#!/bin/sh\nexit 0\n",
+  {mode: 0o755},
+);
 fs.mkdirSync(path.join(fakeRoot, "deploy", "toolforge"), {recursive: true});
 fs.mkdirSync(fakeBin, {recursive: true});
 fs.mkdirSync(distDir, {recursive: true});
@@ -116,4 +121,21 @@ test("a reusable site skips Node dependency installation", () => {
   const events = fs.readFileSync(stageEvents, "utf8").trim().split("\n").map(JSON.parse);
   assert.equal(events.at(-2).event, "reused");
   assert.equal(events.at(-1).event, "completed");
+});
+
+test("production refuses a network dependency install when the image is incomplete", () => {
+  const incompleteRoot = path.join(fixtureRoot, "incomplete-image");
+  const npmLog = path.join(fixtureRoot, "incomplete-image-npm.log");
+  fs.mkdirSync(incompleteRoot, {recursive: true});
+
+  const result = runBuild({
+    FAKE_NPM_LOG: npmLog,
+    WIKI_ECON_ENV: "production",
+    WIKI_ECON_ROOT: incompleteRoot,
+    WIKI_ECON_RUN_RECORD_HELPER: path.join(fakeRoot, "deploy", "toolforge", "run-record.cjs"),
+  });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /dependencies are missing from the production image/);
+  assert.equal(fs.existsSync(npmLog), false);
 });

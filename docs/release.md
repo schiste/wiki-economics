@@ -9,7 +9,7 @@ Keep these locally. Do not commit them:
 
 - `data/`
 - generated `output/` artifacts such as `*.parquet`, `manifest.json`, and `defaults_*.json`
-- `site/node_modules/`
+- `node_modules/`
 - `site/dist/`
 - local cache directories such as `site/src/.observablehq/`
 
@@ -57,7 +57,7 @@ git add Cargo.toml Cargo.lock deny.toml rust-toolchain.toml package.json
 git status --short
 ```
 
-Before committing, verify that `data/`, generated `output/`, `site/node_modules/`,
+Before committing, verify that `data/`, generated `output/`, `node_modules/`,
 and `site/dist/` are not staged.
 
 ## GitHub Repo Controls

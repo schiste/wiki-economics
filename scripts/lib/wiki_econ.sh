@@ -91,9 +91,14 @@ wiki_econ_ensure_local_dirs() {
 }
 
 wiki_econ_ensure_site_deps() {
-  if [ ! -d "$WIKI_ECON_SITE_DIR/node_modules" ]; then
-    (cd "$WIKI_ECON_SITE_DIR" && npm ci)
+  if [ -x "$WIKI_ECON_ROOT/node_modules/.bin/observable" ]; then
+    return 0
   fi
+  if [ "$WIKI_ECON_ENV" = "production" ]; then
+    echo "Observable dependencies are missing from the production image; rebuild the Toolforge image instead of installing during refresh." >&2
+    return 1
+  fi
+  (cd "$WIKI_ECON_ROOT" && npm ci)
 }
 
 wiki_econ_cli_label() {

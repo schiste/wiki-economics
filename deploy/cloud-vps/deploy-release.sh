@@ -26,7 +26,7 @@ export CARGO_TARGET_DIR="$WIKI_ECON_CARGO_TARGET_DIR"
 (cd "$release_dir" && cargo build --release --locked)
 mkdir -p "$release_dir/target/release"
 install -m 0755 "$CARGO_TARGET_DIR/release/wiki-econ" "$release_dir/target/release/wiki-econ"
-(cd "$release_dir/site" && npm ci)
+(cd "$release_dir" && npm ci)
 
 wiki_econ_cloud_switch_symlink "$WIKI_ECON_APP_CURRENT" "$release_dir"
 

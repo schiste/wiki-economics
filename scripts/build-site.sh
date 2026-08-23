@@ -119,7 +119,7 @@ echo "    output dir: $WIKI_ECON_OUTPUT_DIR"
 echo "    dist dir:   $WIKI_ECON_SITE_DIST_DIR"
 echo "    staging:    $build_dir"
 
-(cd "$WIKI_ECON_SITE_DIR" && WIKI_ECON_SITE_DIST_DIR="$build_dir" npm run build)
+(cd "$WIKI_ECON_ROOT" && WIKI_ECON_SITE_DIST_DIR="$build_dir" npm --workspace site run build)
 
 if [ ! -f "$build_dir/index.html" ]; then
   echo "Observable build did not produce $build_dir/index.html" >&2

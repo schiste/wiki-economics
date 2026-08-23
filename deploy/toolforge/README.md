@@ -18,10 +18,12 @@ Toolforge entirely.
 ## Files
 
 - No Dockerfile: Toolforge's Build Service still builds the Node runtime,
-  npm dependencies, repository scripts, and `Procfile` into its supported
+  the single root npm workspace and lockfile, repository scripts, and `Procfile` into its supported
   Cloud Native Buildpack image. `RustConfig` sets `RUST_SKIP_BUILD=1`, so the
   detected Rust buildpack does not repeat the expensive Cargo build. Set the
   build-only variable `WIKI_ECON_BUILD_RUST=1` for an emergency manual build.
+  Refresh jobs reuse the image's root `node_modules`; production deliberately
+  fails instead of running `npm ci` over the network.
 - `.github/workflows/ci.yml` builds the release binary on an x86-64 Ubuntu
   24.04 runner after quality, coverage, and security jobs pass. It validates
   the ELF format, dynamic libraries, and `--help`, uploads a 30-day artifact,
