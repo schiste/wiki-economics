@@ -151,6 +151,34 @@ test("production manifest generation requires valid observed release provenance"
     WIKI_ECON_ENV: "production",
     WIKI_ECON_RELEASE_PROVENANCE_FILE: file,
   }), /invalid or mismatched release provenance/);
+
+  const packageManifest = JSON.parse(fs.readFileSync(path.join(repositoryRoot, "package.json")));
+  const siteManifest = JSON.parse(fs.readFileSync(path.join(repositoryRoot, "site", "package.json")));
+  const closure = JSON.parse(fs.readFileSync(path.join(repositoryRoot, "config", "site-dependency-closure.json")));
+  const validFile = path.join(root, "valid-release.json");
+  const commit = "a".repeat(40);
+  fs.writeFileSync(validFile, JSON.stringify({
+    schema_version: 2,
+    source_commit: commit,
+    binary: {sha256: "b".repeat(64)},
+    runtime: {node: "24.15.0", npm: "11.12.1", rust: "1.98.0"},
+    browser_packages: {
+      build_tools: packageManifest.dependencies,
+      direct: siteManifest.dependencies,
+      generated: closure.generated_packages,
+    },
+    system: {packages: {libc6: "fixture"}},
+    supply_chain: {
+      sbom_format: "CycloneDX 1.6",
+      sboms: {rust_binary: {}, toolforge_site_image: {}, published_browser_bundle: {}},
+      notices: {machine_readable: {sha256: "c".repeat(64)}, human_readable: {sha256: "d".repeat(64)}},
+    },
+  }));
+  assert.equal(releaseProvenance(repositoryRoot, {
+    WIKI_ECON_ENV: "production",
+    WIKI_ECON_SOURCE_COMMIT: commit,
+    WIKI_ECON_RELEASE_PROVENANCE_FILE: validFile,
+  }).source_commit, commit);
 });
 
 test("the production row counter consumes the validated Rust footer map", async () => {

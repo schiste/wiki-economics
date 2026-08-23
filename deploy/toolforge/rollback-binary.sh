@@ -22,6 +22,14 @@ if [ ! -x "$release_binary" ] || [ ! -f "$checksum_file" ]; then
 fi
 
 (cd "$release_dir" && sha256sum --check --status wiki-econ.sha256)
+if [ -f "$release_dir/release-provenance.json" ]; then
+  if [ "$(jq -er '.schema_version' "$release_dir/release-provenance.json")" != "2" ] || \
+    [ "$(jq -er '.source_commit' "$release_dir/release-provenance.json")" != "$release_sha" ] || \
+    ! (cd "$release_dir" && sha256sum --check --strict --status SHA256SUMS); then
+    echo "Release supply-chain envelope is incomplete or changed: $release_sha" >&2
+    exit 1
+  fi
+fi
 "$release_binary" --help >/dev/null
 
 temporary_link="$app_root/.current.tmp.$$"

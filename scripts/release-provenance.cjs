@@ -119,20 +119,25 @@ function systemVersions(binary) {
   };
 }
 
-function buildReleaseProvenance({binary, sourceCommit, sourceDateEpoch, repositoryRoot = root}) {
+function buildReleaseProvenance({binary, supplyChainDir, sourceCommit, sourceDateEpoch, repositoryRoot = root}) {
   if (!/^[0-9a-f]{40}$/.test(sourceCommit || "")) throw new Error("WIKI_ECON_BUILD_COMMIT must be an exact 40-character commit");
   if (!/^\d+$/.test(String(sourceDateEpoch || ""))) throw new Error("SOURCE_DATE_EPOCH is required for deterministic provenance");
   if (!fs.statSync(binary, {throwIfNoEntry: false})?.isFile()) throw new Error(`release binary is missing: ${binary}`);
   const runtime = verifyCurrentRuntime(expectedVersions());
   const browser = browserVersions(repositoryRoot);
+  const binarySha256 = sha256(binary);
+  const supplyChain = supplyChainArtifacts(supplyChainDir, sourceCommit);
+  if (supplyChain.sboms.rust_binary.artifact_sha256 !== binarySha256) {
+    throw new Error("Rust binary SBOM does not identify the release binary");
+  }
   return {
-    schema_version: 1,
+    schema_version: 2,
     source_commit: sourceCommit,
     generated_at: new Date(Number(sourceDateEpoch) * 1000).toISOString(),
     binary: {
       name: path.basename(binary),
       bytes: fs.statSync(binary).size,
-      sha256: sha256(binary),
+      sha256: binarySha256,
     },
     runtime,
     browser_packages: browser,
@@ -140,7 +145,11 @@ function buildReleaseProvenance({binary, sourceCommit, sourceDateEpoch, reposito
       cargo_lock_sha256: sha256(path.join(repositoryRoot, "Cargo.lock")),
       npm_lock_sha256: sha256(path.join(repositoryRoot, "package-lock.json")),
       browser_closure_sha256: sha256(path.join(repositoryRoot, "config", "site-dependency-closure.json")),
+      npm_license_policy_sha256: sha256(path.join(repositoryRoot, "config", "npm-license-policy.json")),
+      npm_advisory_policy_sha256: sha256(path.join(repositoryRoot, "config", "npm-audit-exceptions.json")),
+      vendor_patch_registry_sha256: sha256(path.join(repositoryRoot, "config", "vendor-patches.json")),
     },
+    supply_chain: supplyChain,
     system: systemVersions(binary),
   };
 }
@@ -155,13 +164,16 @@ function writeAtomic(file, value) {
 function main() {
   const binaryIndex = process.argv.indexOf("--binary");
   const outputIndex = process.argv.indexOf("--output");
-  if (binaryIndex < 0 || outputIndex < 0 || !process.argv[binaryIndex + 1] || !process.argv[outputIndex + 1]) {
-    throw new Error("usage: release-provenance.cjs --binary PATH --output PATH");
+  const supplyChainIndex = process.argv.indexOf("--supply-chain-dir");
+  if (binaryIndex < 0 || outputIndex < 0 || supplyChainIndex < 0 || !process.argv[binaryIndex + 1]
+      || !process.argv[outputIndex + 1] || !process.argv[supplyChainIndex + 1]) {
+    throw new Error("usage: release-provenance.cjs --binary PATH --supply-chain-dir PATH --output PATH");
   }
   const binary = path.resolve(process.argv[binaryIndex + 1]);
   const output = path.resolve(process.argv[outputIndex + 1]);
   const provenance = buildReleaseProvenance({
     binary,
+    supplyChainDir: path.resolve(process.argv[supplyChainIndex + 1]),
     sourceCommit: process.env.WIKI_ECON_BUILD_COMMIT,
     sourceDateEpoch: process.env.SOURCE_DATE_EPOCH,
   });
@@ -178,4 +190,4 @@ if (require.main === module) {
   }
 }
 
-module.exports = {browserVersions, buildReleaseProvenance, lockedVersion, sha256, systemVersions, writeAtomic};
+module.exports = {browserVersions, buildReleaseProvenance, lockedVersion, sbomProperty, sha256, supplyChainArtifacts, systemVersions, writeAtomic};

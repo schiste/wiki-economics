@@ -54,6 +54,7 @@ function repositoryRuntimeProvenance(root) {
     source: "repository-pins",
     runtime: {node: packageManifest?.engines?.node, npm: packageManifest?.engines?.npm, rust},
     browser_packages: {
+      build_tools: packageManifest?.dependencies || {},
       direct: siteManifest?.dependencies || {},
       generated: closure?.generated_packages || {},
     },
@@ -74,17 +75,22 @@ function releaseProvenance(root, environment) {
   }
   const pins = repositoryRuntimeProvenance(root);
   const expectedCommit = environment.WIKI_ECON_SOURCE_COMMIT || environment.WIKI_ECON_BUILD_COMMIT;
-  if (provenance.schema_version !== 1
+  if (provenance.schema_version !== 2
       || !/^[0-9a-f]{40}$/.test(provenance.source_commit || "")
       || (expectedCommit && provenance.source_commit !== expectedCommit)
       || !/^[0-9a-f]{64}$/.test(provenance.binary?.sha256 || "")
       || provenance.runtime?.node !== pins.runtime.node
       || provenance.runtime?.npm !== pins.runtime.npm
       || provenance.runtime?.rust !== pins.runtime.rust
+      || JSON.stringify(provenance.browser_packages?.build_tools) !== JSON.stringify(pins.browser_packages.build_tools)
       || JSON.stringify(provenance.browser_packages?.direct) !== JSON.stringify(pins.browser_packages.direct)
       || JSON.stringify(provenance.browser_packages?.generated) !== JSON.stringify(pins.browser_packages.generated)
       || !provenance.system?.packages
-      || Object.keys(provenance.system.packages).length === 0) {
+      || Object.keys(provenance.system.packages).length === 0
+      || provenance.supply_chain?.sbom_format !== "CycloneDX 1.6"
+      || Object.keys(provenance.supply_chain?.sboms || {}).length !== 3
+      || !provenance.supply_chain?.notices?.machine_readable?.sha256
+      || !provenance.supply_chain?.notices?.human_readable?.sha256) {
     throw new Error(`invalid or mismatched release provenance: ${file}`);
   }
   return provenance;

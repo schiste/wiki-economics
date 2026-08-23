@@ -4,6 +4,9 @@ Wiki Economics incorporates open-source dependencies that retain their own
 copyrights and licenses. This notice is informational and does not replace the
 license text or notices supplied by each upstream project. Exact resolved
 dependency identities are recorded in `Cargo.lock` and `package-lock.json`.
+Each main-branch release also contains `third-party-notices.json` with the full
+transitive Rust, Toolforge-image npm, and published-browser inventories, plus
+three CycloneDX 1.6 SBOMs bound to the release commit and artifact hashes.
 
 ## Distributed Rust components
 
@@ -48,7 +51,7 @@ components:
 
 | Component | Resolved version | License |
 |---|---:|---|
-| Observable Framework | 1.13.4 | ISC |
+| Observable Framework build tool | 1.13.4 | ISC |
 | Observable Inputs | 0.12.0 | ISC |
 | Observable Inspector | 5.0.1 | ISC |
 | Observable Runtime | 6.0.0 | ISC |

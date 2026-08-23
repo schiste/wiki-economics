@@ -22,9 +22,13 @@ echo "==> node --check site/freshness.cjs scripts/check-freshness.cjs"
 node --check site/freshness.cjs
 node --check scripts/check-freshness.cjs
 node --check scripts/check-npm-advisories.cjs
+node --check scripts/check-npm-licenses.cjs
+node --check scripts/check-vendor-patches.cjs
 node --check scripts/deny-network.cjs
 node --check scripts/prepare-site-source.cjs
 node --check scripts/release-provenance.cjs
+node --check scripts/generate-sboms.cjs
+node --check scripts/release-bundle.cjs
 node --check scripts/verify-runtime.cjs
 node --check scripts/verify-site-dependencies.cjs
 node --check scripts/verify-site-reproducibility.cjs
@@ -57,6 +61,9 @@ node --test deploy/toolforge/run-refresh.test.cjs
 echo "==> node --test deploy/toolforge/prune-releases.test.cjs"
 node --test deploy/toolforge/prune-releases.test.cjs
 
+echo "==> node --test deploy/toolforge/install-binary.test.cjs"
+node --test deploy/toolforge/install-binary.test.cjs
+
 echo "==> node --test deploy/toolforge/run-capacity-benchmark.test.cjs"
 node --test deploy/toolforge/run-capacity-benchmark.test.cjs
 
@@ -66,12 +73,17 @@ node --test scripts/check-freshness.test.cjs
 echo "==> node --test scripts/check-npm-advisories.test.cjs"
 node --test scripts/check-npm-advisories.test.cjs
 
+echo "==> node --test scripts/check-npm-licenses.test.cjs"
+node --test scripts/check-npm-licenses.test.cjs
+
 echo "==> node --test scripts/build-site-fixture.test.cjs"
 node --test scripts/build-site-fixture.test.cjs
 
 echo "==> dependency closure and reproducibility unit tests"
 node --test scripts/prepare-site-source.test.cjs
 node --test scripts/release-provenance.test.cjs
+node --test scripts/generate-sboms.test.cjs
+node --test scripts/release-bundle.test.cjs
 node --test scripts/verify-site-dependencies.test.cjs
 node --test scripts/verify-site-reproducibility.test.cjs
 
@@ -116,6 +128,9 @@ cargo audit -D warnings
 
 echo "==> node scripts/check-npm-advisories.cjs"
 node scripts/check-npm-advisories.cjs
+
+echo "==> node scripts/check-npm-licenses.cjs"
+node scripts/check-npm-licenses.cjs
 
 echo "==> scripts/check_vendor_patches.sh"
 scripts/check_vendor_patches.sh

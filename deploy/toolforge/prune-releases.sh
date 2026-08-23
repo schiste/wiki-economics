@@ -28,7 +28,7 @@ current_link="$app_root/current"
 current_sha=""
 
 release_is_valid() {
-  local directory=$1 expected filename actual
+  local directory=$1 expected filename actual sha
   [ -x "$directory/wiki-econ" ] && [ -f "$directory/wiki-econ.sha256" ] || return 1
   read -r expected filename < "$directory/wiki-econ.sha256" || return 1
   [[ "$expected" =~ ^[0-9a-f]{64}$ ]] && [ "$filename" = "wiki-econ" ] || return 1
@@ -37,7 +37,19 @@ release_is_valid() {
   else
     actual="$(shasum -a 256 "$directory/wiki-econ" | awk '{print $1}')"
   fi
-  [ "$actual" = "$expected" ] && "$directory/wiki-econ" --help >/dev/null 2>&1
+  [ "$actual" = "$expected" ] && "$directory/wiki-econ" --help >/dev/null 2>&1 || return 1
+  if [ -f "$directory/release-provenance.json" ]; then
+    for filename in SHA256SUMS THIRD_PARTY_NOTICES.md third-party-notices.json \
+      wiki-econ-browser-bundle.cdx.json wiki-econ-rust-binary.cdx.json \
+      wiki-econ-toolforge-site-image.cdx.json; do
+      [ -f "$directory/$filename" ] && [ ! -L "$directory/$filename" ] || return 1
+    done
+    sha="$(basename "$directory")"
+    [ "$(jq -er '.schema_version' "$directory/release-provenance.json" 2>/dev/null)" = "2" ] || return 1
+    [ "$(jq -er '.source_commit' "$directory/release-provenance.json" 2>/dev/null)" = "$sha" ] || return 1
+    (cd "$directory" && sha256sum --check --strict --status SHA256SUMS) || return 1
+  fi
+  return 0
 }
 
 if [ -e "$current_link" ] || [ -d "$releases_root" ]; then
@@ -102,7 +114,7 @@ if [ -d "$incoming_root" ]; then
   for candidate in "$incoming_root"/*.part; do
     [ -f "$candidate" ] && [ ! -L "$candidate" ] || continue
     name="$(basename "$candidate")"
-    [[ "$name" =~ ^[0-9a-f]{40}(\.provenance)?\.part$ ]] || continue
+    [[ "$name" =~ ^[0-9a-f]{40}(\.provenance|\.release\.tar\.gz)?\.part$ ]] || continue
     modified_epoch="$(mtime_epoch "$candidate")"
     age=$((now_epoch - modified_epoch))
     [ "$age" -ge "$incoming_stale_secs" ] || continue

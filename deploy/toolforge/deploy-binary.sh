@@ -1,70 +1,89 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Uploads a GitHub-built binary through the Toolforge SSH bastion. The remote
-# installer performs all validation before changing the stable release link.
+# Uploads one attested GitHub release envelope through the Toolforge SSH
+# bastion. Both this workstation and the remote installer verify it before the
+# stable release link can change.
 
 usage() {
-  echo "Usage: deploy-binary.sh <linux-x86_64-binary> <40-character-git-sha> <release-provenance.json>" >&2
+  echo "Usage: deploy-binary.sh <wiki-econ-release-SHA.tar.gz> <40-character-git-sha> <archive.sha256>" >&2
   exit 2
 }
 
 [ "$#" -eq 3 ] || usage
 
-binary_path=$1
+bundle_path=$1
 release_sha=$2
-provenance_path=$3
+bundle_checksum_path=$3
 ssh_target="${TOOLFORGE_SSH_TARGET:?Set TOOLFORGE_SSH_TARGET to user@login.toolforge.org}"
+github_repository="${WIKI_ECON_GITHUB_REPOSITORY:-schiste/wiki-economics}"
 tool_account=wiki-economics
 app_root="/data/project/$tool_account/app"
+expected_bundle_name="wiki-econ-release-$release_sha.tar.gz"
 
 [[ "$release_sha" =~ ^[0-9a-f]{40}$ ]] || usage
-if [ ! -x "$binary_path" ]; then
-  echo "Binary is missing or not executable: $binary_path" >&2
+[ -f "$bundle_path" ] || { echo "Release archive is missing: $bundle_path" >&2; exit 1; }
+[ -f "$bundle_checksum_path" ] || { echo "Release archive checksum is missing: $bundle_checksum_path" >&2; exit 1; }
+[ "$(basename "$bundle_path")" = "$expected_bundle_name" ] || {
+  echo "Unexpected release archive name; expected $expected_bundle_name" >&2
   exit 1
-fi
-if [ ! -f "$provenance_path" ]; then
-  echo "Release provenance is missing: $provenance_path" >&2
-  exit 1
-fi
+}
+for command in gh jq node tar; do
+  command -v "$command" >/dev/null 2>&1 || { echo "Required deployment command is missing: $command" >&2; exit 1; }
+done
 
-file_description="$(file -b "$binary_path")"
+read -r expected_bundle_checksum checksum_name < "$bundle_checksum_path" || {
+  echo "Cannot read release archive checksum" >&2
+  exit 1
+}
+[[ "$expected_bundle_checksum" =~ ^[0-9a-f]{64}$ ]] && [ "$checksum_name" = "$expected_bundle_name" ] || {
+  echo "Release archive checksum document is malformed" >&2
+  exit 1
+}
+if command -v sha256sum >/dev/null 2>&1; then
+  actual_bundle_checksum="$(sha256sum "$bundle_path" | awk '{print $1}')"
+else
+  actual_bundle_checksum="$(shasum -a 256 "$bundle_path" | awk '{print $1}')"
+fi
+[ "$actual_bundle_checksum" = "$expected_bundle_checksum" ] || {
+  echo "Release archive checksum mismatch" >&2
+  exit 1
+}
+
+local_extract="$(mktemp -d "${TMPDIR:-/tmp}/wiki-econ-release-verify.XXXXXX")"
+cleanup() {
+  rm -rf -- "$local_extract"
+}
+trap cleanup EXIT
+
+entry_count=0
+while IFS= read -r entry; do
+  case "$entry" in
+    SHA256SUMS|THIRD_PARTY_NOTICES.md|release-provenance.json|third-party-notices.json|wiki-econ|wiki-econ-browser-bundle.cdx.json|wiki-econ-rust-binary.cdx.json|wiki-econ-toolforge-site-image.cdx.json) ;;
+    *) echo "Release archive contains an unexpected path: $entry" >&2; exit 1 ;;
+  esac
+  entry_count=$((entry_count + 1))
+done < <(tar -tzf "$bundle_path")
+[ "$entry_count" -eq 8 ] || { echo "Release archive must contain exactly eight files" >&2; exit 1; }
+tar -xzf "$bundle_path" -C "$local_extract"
+node "$(dirname "$0")/../../scripts/release-bundle.cjs" --verify "$local_extract" "$release_sha"
+file_description="$(file -b "$local_extract/wiki-econ")"
 case "$file_description" in
   *ELF*64-bit*x86-64*) ;;
-  *)
-    echo "Expected a 64-bit x86-64 ELF binary, got: $file_description" >&2
-    exit 1
-    ;;
+  *) echo "Expected a 64-bit x86-64 ELF binary, got: $file_description" >&2; exit 1 ;;
 esac
 
-if command -v sha256sum >/dev/null 2>&1; then
-  checksum="$(sha256sum "$binary_path" | awk '{print $1}')"
-else
-  checksum="$(shasum -a 256 "$binary_path" | awk '{print $1}')"
-fi
-if command -v sha256sum >/dev/null 2>&1; then
-  provenance_checksum="$(sha256sum "$provenance_path" | awk '{print $1}')"
-else
-  provenance_checksum="$(shasum -a 256 "$provenance_path" | awk '{print $1}')"
-fi
+# Verify GitHub's Sigstore-backed attestation against the repository identity
+# and exact archive digest before any SSH upload.
+gh attestation verify "$bundle_path" --repo "$github_repository" >/dev/null
 
-if [ "$(jq -er '.schema_version' "$provenance_path")" != "1" ] || \
-   [ "$(jq -er '.source_commit' "$provenance_path")" != "$release_sha" ] || \
-   [ "$(jq -er '.binary.sha256' "$provenance_path")" != "$checksum" ]; then
-  echo "Release provenance does not match the commit and binary" >&2
-  exit 1
-fi
-
-staged_binary="$app_root/incoming/$release_sha.part"
-staged_provenance="$app_root/incoming/$release_sha.provenance.part"
+staged_bundle="$app_root/incoming/$release_sha.release.tar.gz.part"
 ssh -o BatchMode=yes "$ssh_target" \
   "become $tool_account mkdir -p '$app_root/incoming' '$app_root/releases'"
 ssh -o BatchMode=yes "$ssh_target" \
-  "become $tool_account tee '$staged_binary'" < "$binary_path" >/dev/null
+  "become $tool_account tee '$staged_bundle'" < "$bundle_path" >/dev/null
 ssh -o BatchMode=yes "$ssh_target" \
-  "become $tool_account tee '$staged_provenance'" < "$provenance_path" >/dev/null
-ssh -o BatchMode=yes "$ssh_target" \
-  "become $tool_account bash -s -- '$release_sha' '$checksum' '$staged_binary' '$provenance_checksum' '$staged_provenance'" \
+  "become $tool_account bash -s -- '$release_sha' '$expected_bundle_checksum' '$staged_bundle'" \
   < "$(dirname "$0")/install-binary.sh"
 
 if ! ssh -o BatchMode=yes "$ssh_target" \
@@ -79,4 +98,4 @@ ssh -o BatchMode=yes "$ssh_target" \
 ssh -o BatchMode=yes "$ssh_target" \
   "become $tool_account toolforge webservice restart"
 
-echo "Deployed $release_sha to $stable_binary"
+echo "Deployed attested release $release_sha to $stable_binary"

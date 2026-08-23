@@ -71,11 +71,15 @@ jobs:
           node --check site/freshness.cjs
           node --check site/observablehq.config.js
           node --check scripts/check-npm-advisories.cjs
+          node --check scripts/check-npm-licenses.cjs
+          node --check scripts/check-vendor-patches.cjs
           node --check scripts/build-site-fixture.cjs
           node --check scripts/deny-network.cjs
           node --check scripts/check-freshness.cjs
           node --check scripts/prepare-site-source.cjs
           node --check scripts/release-provenance.cjs
+          node --check scripts/generate-sboms.cjs
+          node --check scripts/release-bundle.cjs
           node --check scripts/verify-runtime.cjs
           node --check scripts/verify-site-dependencies.cjs
           node --check scripts/verify-site-reproducibility.cjs
@@ -89,13 +93,17 @@ jobs:
           node --test site/freshness.test.cjs
           node --test deploy/toolforge/run-record.test.cjs
           node --test deploy/toolforge/run-refresh.test.cjs
+          node --test deploy/toolforge/install-binary.test.cjs
           node --test deploy/toolforge/prune-releases.test.cjs
           node --test deploy/toolforge/run-capacity-benchmark.test.cjs
           node --test scripts/check-npm-advisories.test.cjs
+          node --test scripts/check-npm-licenses.test.cjs
           node --test scripts/build-site-fixture.test.cjs
           node --test scripts/check-freshness.test.cjs
           node --test scripts/prepare-site-source.test.cjs
           node --test scripts/release-provenance.test.cjs
+          node --test scripts/generate-sboms.test.cjs
+          node --test scripts/release-bundle.test.cjs
           node --test scripts/verify-site-dependencies.test.cjs
           node --test scripts/verify-site-reproducibility.test.cjs
           node --test scripts/wiki-lifecycle.test.cjs
@@ -268,6 +276,9 @@ jobs:
       - name: npm advisory policy
         run: node scripts/check-npm-advisories.cjs
 
+      - name: npm license policy
+        run: node scripts/check-npm-licenses.cjs
+
       - name: Vendor patch hygiene
         run: scripts/check_vendor_patches.sh
 
@@ -281,6 +292,10 @@ jobs:
       - security
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     concurrency:
       group: toolforge-release-build
       cancel-in-progress: false
@@ -299,6 +314,9 @@ jobs:
 
       - name: Install pinned npm
         run: npm install --global npm@11.12.1
+
+      - name: Install exact Node dependency closure
+        run: npm ci
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # @stable as of pin
@@ -326,22 +344,58 @@ jobs:
             exit 1
           fi
           target/release/wiki-econ --help >/dev/null
-          sha256sum target/release/wiki-econ > target/release/wiki-econ.sha256
+          mkdir -p "$RUNNER_TEMP/wiki-econ-release"
+          install -m 0755 target/release/wiki-econ "$RUNNER_TEMP/wiki-econ-release/wiki-econ"
+
+      - name: Build the attested browser artifact offline
+        run: |
+          target/release/wiki-econ --output-dir "$RUNNER_TEMP/wiki-econ-release-site-data" site-fixture
+          node scripts/build-site-fixture.cjs \
+            --data-dir "$RUNNER_TEMP/wiki-econ-release-site-data" \
+            --dist-dir "$RUNNER_TEMP/wiki-econ-release-browser"
+
+      - name: Generate release SBOMs and complete notices
+        run: |
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$GITHUB_SHA")"
+          cp THIRD_PARTY_NOTICES.md "$RUNNER_TEMP/wiki-econ-release/THIRD_PARTY_NOTICES.md"
+          node scripts/generate-sboms.cjs \
+            --binary "$RUNNER_TEMP/wiki-econ-release/wiki-econ" \
+            --browser-dist "$RUNNER_TEMP/wiki-econ-release-browser" \
+            --output-dir "$RUNNER_TEMP/wiki-econ-release"
 
       - name: Record release dependency and platform provenance
         run: |
           export SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$GITHUB_SHA")"
           node scripts/release-provenance.cjs \
-            --binary target/release/wiki-econ \
-            --output target/release/release-provenance.json
+            --binary "$RUNNER_TEMP/wiki-econ-release/wiki-econ" \
+            --supply-chain-dir "$RUNNER_TEMP/wiki-econ-release" \
+            --output "$RUNNER_TEMP/wiki-econ-release/release-provenance.json"
+
+      - name: Seal deterministic release envelope
+        run: |
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$GITHUB_SHA")"
+          archive="target/release/wiki-econ-release-$GITHUB_SHA.tar.gz"
+          node scripts/release-bundle.cjs --write "$RUNNER_TEMP/wiki-econ-release" "$GITHUB_SHA"
+          tar --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner \
+            -czf "$archive" -C "$RUNNER_TEMP/wiki-econ-release" \
+            SHA256SUMS THIRD_PARTY_NOTICES.md release-provenance.json third-party-notices.json \
+            wiki-econ wiki-econ-browser-bundle.cdx.json wiki-econ-rust-binary.cdx.json \
+            wiki-econ-toolforge-site-image.cdx.json
+          sha256sum "$archive" | sed 's#target/release/##' > "$archive.sha256"
+
+      - name: Attest release envelope
+        id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: target/release/wiki-econ-release-${{ github.sha }}.tar.gz
 
       - name: Upload release artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
         with:
           name: wiki-econ-linux-x86_64-${{ github.sha }}
           path: |
-            target/release/wiki-econ
-            target/release/wiki-econ.sha256
-            target/release/release-provenance.json
+            target/release/wiki-econ-release-${{ github.sha }}.tar.gz
+            target/release/wiki-econ-release-${{ github.sha }}.tar.gz.sha256
+            ${{ steps.attest.outputs.bundle-path }}
           if-no-files-found: error
           retention-days: 30
