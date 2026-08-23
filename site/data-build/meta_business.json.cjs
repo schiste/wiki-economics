@@ -25,7 +25,7 @@ run(async (con, DIR) => {
       `SELECT wiki, MIN(year_month) as mn, MAX(year_month) as mx
        FROM '${DIR}/labor_monthly.parquet'
        WHERE year_month <= '${MAX_MONTH}'
-       GROUP BY wiki`
+       GROUP BY wiki ORDER BY wiki`
     ),
   ]);
 
