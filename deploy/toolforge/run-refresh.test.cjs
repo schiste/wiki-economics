@@ -209,7 +209,7 @@ test("an active refresh owns metadata, rejects overlap, and releases cleanly", a
   assert.doesNotMatch(runLog, /\u001b\[/);
   assert.equal(
     fs.readFileSync(fixture.driverArgs, "utf8").trim(),
-    "--version 2026-07 nlwiki",
+    "--version 2026-07 nlwiki ptwiki",
   );
   assert.equal(fs.readFileSync(fixture.driverEnv, "utf8"), "1\n1\n");
 });
