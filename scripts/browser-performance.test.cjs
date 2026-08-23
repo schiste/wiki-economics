@@ -4,8 +4,9 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
+const {EventEmitter} = require("node:events");
 const {afterEach, test} = require("node:test");
-const {parseArguments, validateProfile, validateStaticBudgets} = require("./browser-performance.cjs");
+const {parseArguments, terminateChild, validateProfile, validateStaticBudgets} = require("./browser-performance.cjs");
 
 const budgets = JSON.parse(fs.readFileSync(path.resolve(__dirname, "../config/browser-performance-budgets.json")));
 const roots = [];
@@ -40,4 +41,18 @@ test("argument parser requires a distribution directory", () => {
 test("IndexedDB implementation and performance policy share one byte ceiling", async () => {
   const cache = await import("../site/src/components/browser-cache.js");
   assert.equal(cache.DEFAULT_CACHE_MAX_BYTES, budgets.indexeddb.maximum_bytes);
+});
+
+test("browser teardown escalates to SIGKILL and waits for process exit", async () => {
+  const child = new EventEmitter();
+  child.exitCode = null;
+  child.signalCode = null;
+  const signals = [];
+  child.kill = signal => {
+    signals.push(signal);
+    if (signal === "SIGKILL") process.nextTick(() => { child.signalCode = signal; child.emit("exit"); });
+    return true;
+  };
+  await terminateChild(child, 1);
+  assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
 });

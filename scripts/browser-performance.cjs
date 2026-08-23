@@ -161,6 +161,17 @@ async function navigate(cdp, url) {
   await waitFor(cdp, "document.body && document.body.dataset.wkStage === 'done'");
 }
 
+async function terminateChild(child, graceMs = 2000) {
+  if (child.exitCode !== null || child.signalCode !== null) return;
+  const exited = new Promise(resolve => child.once("exit", resolve));
+  child.kill("SIGTERM");
+  await Promise.race([exited, new Promise(resolve => setTimeout(resolve, graceMs))]);
+  if (child.exitCode === null && child.signalCode === null) {
+    child.kill("SIGKILL");
+    await exited;
+  }
+}
+
 async function runBrowserPerformance({distDir, budgets}) {
   const browserIndex = JSON.parse(fs.readFileSync(path.join(distDir, "browser-data", "index.json"), "utf8"));
   const staticArtifacts = validateStaticBudgets(distDir, budgets);
@@ -237,9 +248,9 @@ async function runBrowserPerformance({distDir, budgets}) {
       warm_indexeddb: {wiki: "nlwiki", cache_hits: warmLoad.cacheHits, parquet_requests: warmRequests.length}, profiles};
   } finally {
     cdp?.close();
-    chrome.kill("SIGTERM");
-    server.close();
-    fs.rmSync(userData, {recursive: true, force: true});
+    await terminateChild(chrome);
+    await new Promise(resolve => server.close(resolve));
+    fs.rmSync(userData, {recursive: true, force: true, maxRetries: 5, retryDelay: 100});
   }
 }
 
@@ -267,4 +278,4 @@ async function main() {
 
 if (require.main === module) main().catch(error => { console.error(error.stack || error.message); process.exitCode = 1; });
 
-module.exports = {listFiles, parseArguments, runBrowserPerformance, validateProfile, validateStaticBudgets};
+module.exports = {listFiles, parseArguments, runBrowserPerformance, terminateChild, validateProfile, validateStaticBudgets};
