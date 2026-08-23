@@ -86,7 +86,14 @@ case "$dist_name" in
 esac
 
 mkdir -p "$dist_parent"
-build_dir="$(mktemp -d "$dist_parent/.${dist_name}.build.XXXXXX")"
+site_build_run_id="${WIKI_ECON_RUN_ID:-local-$$}"
+case "$site_build_run_id" in
+  *[!A-Za-z0-9._-]*|'')
+    echo "Refusing unsafe site build run ID: $site_build_run_id" >&2
+    exit 1
+    ;;
+esac
+build_dir="$(mktemp -d "$dist_parent/.${dist_name}.build.${site_build_run_id}.XXXXXX")"
 next_link="$(mktemp "$dist_parent/.${dist_name}.next.XXXXXX")"
 rm -f -- "$next_link"
 legacy_dir="$dist_parent/.${dist_name}.previous.$$"

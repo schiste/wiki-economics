@@ -33,6 +33,7 @@ function createFixture(name) {
     `#!/bin/sh
 set -eu
 case " $* " in
+  *" cleanup-stale "*) printf '%s\\n' '{"removed":[]}' ;;
   *" snapshot-resolve "*) printf '%s\\n' "\${FAKE_SNAPSHOT:-2026-07}" ;;
   *) echo "unexpected fake wiki-econ invocation: $*" >&2; exit 2 ;;
 esac

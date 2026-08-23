@@ -123,7 +123,7 @@ fn merge_outputs_from_dir(
     for (metric_name, mut paths) in metric_files {
         paths.sort();
         let dest = output_dir.join(&metric_name);
-        merge_metric_batched(&metric_name, &paths, &dest, MERGE_BATCH_ROWS)?;
+        merge_metric_batched(&metric_name, &paths, &dest, MERGE_BATCH_ROWS, run_id)?;
     }
 
     crate::dashboard::materialize(output_dir)?;
@@ -181,6 +181,7 @@ fn merge_metric_batched(
     paths: &[PathBuf],
     dest: &Path,
     batch_rows: usize,
+    run_id: Option<&str>,
 ) -> Result<()> {
     ensure!(
         !paths.is_empty(),
@@ -188,7 +189,17 @@ fn merge_metric_batched(
     );
     ensure!(batch_rows > 0, "merge batch size must be positive");
 
-    let temp_path = dest.with_file_name(format!(".{metric_name}.merge.tmp"));
+    let run_id = run_id
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("local-{}", std::process::id()));
+    ensure!(
+        !run_id.is_empty()
+            && run_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')),
+        "unsafe merge run ID {run_id:?}"
+    );
+    let temp_path = dest.with_file_name(format!(".{metric_name}.merge.{run_id}.tmp"));
     if temp_path.exists() {
         fs::remove_file(&temp_path)
             .with_context(|| format!("failed to remove abandoned merge output {temp_path:?}"))?;
@@ -563,10 +574,10 @@ mod tests {
             output_dir.path().join("frwiki/metric.parquet"),
         ];
         let dest = output_dir.path().join("metric.parquet");
-        let abandoned = output_dir.path().join(".metric.parquet.merge.tmp");
+        let abandoned = output_dir.path().join(".metric.parquet.merge.test-run.tmp");
         fs::write(&abandoned, b"abandoned")?;
 
-        merge_metric_batched("metric.parquet", &paths, &dest, 1)?;
+        merge_metric_batched("metric.parquet", &paths, &dest, 1, Some("test-run"))?;
 
         let merged = ParquetReader::new(File::open(&dest)?).finish()?;
         assert_eq!(merged.height(), 4);
@@ -600,11 +611,16 @@ mod tests {
         fs::write(&dest, b"known-good")?;
         let paths = vec![output_dir.path().join("enwiki/metric.parquet"), corrupt];
 
-        let error = merge_metric_batched("metric.parquet", &paths, &dest, 1)
+        let error = merge_metric_batched("metric.parquet", &paths, &dest, 1, Some("test-run"))
             .expect_err("a corrupt later input must fail the merge");
         assert!(!error.to_string().is_empty());
         assert_eq!(fs::read(&dest)?, b"known-good");
-        assert!(!output_dir.path().join(".metric.parquet.merge.tmp").exists());
+        assert!(
+            !output_dir
+                .path()
+                .join(".metric.parquet.merge.test-run.tmp")
+                .exists()
+        );
         Ok(())
     }
 
@@ -613,7 +629,7 @@ mod tests {
         let output_dir = TestDir::new()?;
         write_metric(output_dir.path(), "enwiki", "metric", 1)?;
         let dest = output_dir.path().join("metric.parquet");
-        let abandoned = output_dir.path().join(".metric.parquet.merge.tmp");
+        let abandoned = output_dir.path().join(".metric.parquet.merge.test-run.tmp");
         fs::create_dir(&abandoned)?;
 
         let error = merge_metric_batched(
@@ -621,6 +637,7 @@ mod tests {
             &[output_dir.path().join("enwiki/metric.parquet")],
             &dest,
             1,
+            Some("test-run"),
         )
         .expect_err("a directory cannot be removed as an abandoned output file");
 
@@ -632,9 +649,10 @@ mod tests {
     #[test]
     fn merge_metric_batched_rejects_missing_inputs_and_zero_batch_size() {
         let dest = Path::new("unused.parquet");
-        assert!(merge_metric_batched("metric.parquet", &[], dest, 1).is_err());
+        assert!(merge_metric_batched("metric.parquet", &[], dest, 1, None).is_err());
         assert!(
-            merge_metric_batched("metric.parquet", &[PathBuf::from("unused")], dest, 0).is_err()
+            merge_metric_batched("metric.parquet", &[PathBuf::from("unused")], dest, 0, None)
+                .is_err()
         );
     }
 

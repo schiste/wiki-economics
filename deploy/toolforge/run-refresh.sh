@@ -14,9 +14,10 @@ set -euo pipefail
 # scripts/refresh.sh) deletes each wiki's raw .bz2 files itself immediately
 # after that wiki's ingest stage succeeds, rather than waiting for every
 # wiki in the batch plus the site build to finish. That's safe because
-# src/storage.rs::marker_manifest_is_valid only checks that
-# warehouse/analytical parquet outputs exist, never the raw .bz2 source —
-# later runs stay idempotent without it.
+# src/storage.rs::marker_manifest_is_valid verifies the durable source identity
+# recorded at ingest plus every warehouse/analytical Parquet footer and row
+# count. The raw .bz2 may be removed after that receipt commits, so later runs
+# remain idempotent without weakening output validation.
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 # shellcheck disable=SC1091
@@ -383,6 +384,29 @@ if [ -z "${WIKI_ECON_BIN:-}" ]; then
   echo "Toolforge refresh requires WIKI_ECON_BIN for snapshot resolution" >&2
   exit 1
 fi
+CLEANUP_STARTED_EPOCH="$(date +%s)"
+wiki_econ_record_stage_event started cleanup_stale
+declare -a cleanup_cmd=(
+  "$WIKI_ECON_BIN"
+  --data-dir "$WIKI_ECON_DATA_DIR"
+  --output-dir "$WIKI_ECON_OUTPUT_DIR"
+  --run-id "$WIKI_ECON_RUN_ID"
+  cleanup-stale
+  --site-dist-dir "$WIKI_ECON_SITE_DIST_DIR"
+  --minimum-age-secs "${WIKI_ECON_STALE_ARTIFACT_SECS:-21600}"
+  "${wikis[@]}"
+)
+if ! cleanup_summary="$(RUST_LOG=error "${cleanup_cmd[@]}")"; then
+  REFRESH_FAILURE_STAGE=cleanup_stale
+  REFRESH_FAILURE_ERROR="safe abandoned-artifact cleanup failed"
+  wiki_econ_record_stage_event failed cleanup_stale "" \
+    "$(( ($(date +%s) - CLEANUP_STARTED_EPOCH) * 1000 ))" \
+    "$REFRESH_FAILURE_ERROR"
+  exit 1
+fi
+wiki_econ_record_stage_event completed cleanup_stale "" \
+  "$(( ($(date +%s) - CLEANUP_STARTED_EPOCH) * 1000 ))"
+echo "==> Abandoned artifact cleanup: $cleanup_summary"
 declare -a resolve_cmd=(
   "$WIKI_ECON_BIN"
   --data-dir "$WIKI_ECON_DATA_DIR"

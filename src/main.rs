@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 mod bench;
+mod cleanup;
 mod compute;
 mod dashboard;
 #[cfg(test)]
@@ -24,6 +25,7 @@ use clap::{Parser, Subcommand};
 use std::env;
 use std::fmt;
 use std::path::PathBuf;
+use std::time::Duration;
 use std::time::Instant;
 use tracing::{Event, Subscriber, info};
 use tracing_subscriber::EnvFilter;
@@ -61,6 +63,21 @@ enum Commands {
     /// Write the deterministic minimal data fixture used by real site CI
     #[command(hide = true)]
     SiteFixture,
+
+    /// Remove only expired, pipeline-owned staging artifacts
+    #[command(hide = true)]
+    CleanupStale {
+        /// Published site distribution symlink
+        #[arg(long, default_value = "site/dist")]
+        site_dist_dir: PathBuf,
+
+        /// Minimum artifact age before removal
+        #[arg(long, default_value_t = 21_600)]
+        minimum_age_secs: u64,
+
+        /// Wiki database names whose abandoned snapshot generations may be retired
+        wikis: Vec<String>,
+    },
 
     /// Resolve the latest complete dump snapshot shared by every wiki
     SnapshotResolve {
@@ -348,6 +365,21 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
     match cli.command {
         Commands::DashboardMaterialize => dashboard::materialize(&output_dir)?,
         Commands::SiteFixture => dashboard::write_site_fixture(&output_dir)?,
+        Commands::CleanupStale {
+            site_dist_dir,
+            minimum_age_secs,
+            wikis,
+        } => {
+            let report = cleanup::clean_abandoned(
+                &data_dir,
+                &output_dir,
+                &site_dist_dir,
+                &wikis,
+                run_id.as_deref(),
+                Duration::from_secs(minimum_age_secs),
+            )?;
+            println!("{}", serde_json::to_string(&report)?);
+        }
 
         Commands::SnapshotResolve { wikis } => {
             let version = run_timed_stage("snapshot_resolve", None, || {
