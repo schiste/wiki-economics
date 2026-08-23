@@ -789,6 +789,21 @@ export function createFilterBar({
   if (nsInput) nsInput.addEventListener("input", dispatch);
   for (const {input} of extraInputs) input.addEventListener("input", dispatch);
 
+  // "Break down by user type" toggle: select every user type while it's on,
+  // and revert to the default selection when it's switched back off.
+  const breakdownEntry = userTypesInput ? extraInputs.find(({key}) => key === "breakdown") : null;
+  if (breakdownEntry) {
+    breakdownEntry.input.addEventListener("input", () => {
+      const nextTypes = breakdownEntry.input.value ? USER_TYPE_OPTIONS : defaultUserTypes;
+      // Inputs.checkbox gives each box a positional index as its DOM value
+      // (not the option string), so match against USER_TYPE_OPTIONS by index.
+      userTypesInput.querySelectorAll("input[type=checkbox]").forEach((c, i) => {
+        c.checked = nextTypes.includes(USER_TYPE_OPTIONS[i]);
+      });
+      userTypesInput.dispatchEvent(new Event("input", {bubbles: true}));
+    });
+  }
+
   // Wiki change: update date range and rebuild namespace checkboxes
   wikiInput.addEventListener("input", () => {
     const w = wikiInput.value;
