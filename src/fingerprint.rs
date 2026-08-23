@@ -9,7 +9,7 @@ use std::time::UNIX_EPOCH;
 use tracing::{info, warn};
 
 const RECEIPT_SCHEMA_VERSION: u32 = 1;
-const SITE_ALGORITHM_VERSION: &str = "observable-static-site-v3-source-only";
+const SITE_ALGORITHM_VERSION: &str = "observable-static-site-v4-npm-workspace";
 const DATE_COLUMNS: [&str; 6] = [
     "week_start",
     "year_month",
@@ -492,14 +492,19 @@ fn site_stage_inputs(output_dir: &Path, site_dir: &Path) -> Result<Vec<TrackedPa
     inputs.extend(site_sources);
     let data_build = collect_tracked_files(&site_dir.join("data-build"), "site/data-build")?;
     inputs.extend(data_build);
-    for name in [
-        "observablehq.config.js",
-        "package.json",
-        "package-lock.json",
-    ] {
+    for name in ["observablehq.config.js", "package.json"] {
         inputs.push(TrackedPath::new(
             format!("site/{name}"),
             site_dir.join(name),
+        ));
+    }
+    let workspace_dir = site_dir
+        .parent()
+        .context("site directory has no npm workspace parent")?;
+    for name in ["package.json", "package-lock.json"] {
+        inputs.push(TrackedPath::new(
+            format!("workspace/{name}"),
+            workspace_dir.join(name),
         ));
     }
     inputs.sort_by(|left, right| left.identity.cmp(&right.identity));
@@ -698,7 +703,12 @@ mod tests {
         fs::write(site.join("data-build/manifest.sh"), "true")?;
         fs::write(site.join("observablehq.config.js"), "export default {}")?;
         fs::write(site.join("package.json"), "{}")?;
-        fs::write(site.join("package-lock.json"), "{}")?;
+        fs::write(
+            dir.path().join("package.json"),
+            "{\"workspaces\":[\"site\"]}",
+        )
+        .expect("workspace package fixture should be written");
+        fs::write(dir.path().join("package-lock.json"), "{}")?;
         fs::write(dist.join("index.html"), "published")?;
 
         let receipt = record_site(&output, &site, &dist)?;
@@ -709,11 +719,20 @@ mod tests {
                 .iter()
                 .all(|input| !input.identity.starts_with("site/src/.observablehq/"))
         );
+        assert!(
+            receipt
+                .inputs
+                .iter()
+                .any(|input| input.identity == "workspace/package-lock.json")
+        );
         assert!(site_is_reusable(&output, &site, &dist)?);
         fs::remove_dir_all(site.join("src/.observablehq"))?;
         assert!(site_is_reusable(&output, &site, &dist)?);
 
         fs::write(site.join("src/nested/index.md"), "# Changed")?;
+        assert!(!site_is_reusable(&output, &site, &dist)?);
+        fs::write(site.join("src/nested/index.md"), "# Site")?;
+        fs::write(dir.path().join("package-lock.json"), "{\"changed\":true}")?;
         assert!(!site_is_reusable(&output, &site, &dist)?);
         Ok(())
     }

@@ -1494,10 +1494,11 @@ mod tests {
     fn run_with_ops_records_checks_and_invalidates_site_fingerprint() -> Result<()> {
         let data_dir = TestDir::new()?;
         let output_dir = TestDir::new()?;
-        let site_dir = TestDir::new()?;
+        let workspace_dir = TestDir::new()?;
+        let site_dir = workspace_dir.path().join("site");
         let dist_dir = TestDir::new()?;
-        fs::create_dir_all(site_dir.path().join("src"))?;
-        fs::create_dir_all(site_dir.path().join("data-build"))?;
+        fs::create_dir_all(site_dir.join("src"))?;
+        fs::create_dir_all(site_dir.join("data-build"))?;
         fs::write(output_dir.path().join("metric.json"), "{}")?;
         fs::write(
             output_dir.path().join(".publication-candidate.json"),
@@ -1509,15 +1510,13 @@ mod tests {
             r#"{"selected_snapshot_versions":{"nlwiki":"2026-07"}}"#,
         )
         .expect("gate fixture should be written");
-        fs::write(site_dir.path().join("src/index.md"), "# Site")?;
-        fs::write(site_dir.path().join("data-build/manifest.sh"), "true")?;
-        fs::write(
-            site_dir.path().join("observablehq.config.js"),
-            "export default {}",
-        )
-        .expect("site config fixture should be written");
-        fs::write(site_dir.path().join("package.json"), "{}")?;
-        fs::write(site_dir.path().join("package-lock.json"), "{}")?;
+        fs::write(site_dir.join("src/index.md"), "# Site")?;
+        fs::write(site_dir.join("data-build/manifest.sh"), "true")?;
+        fs::write(site_dir.join("observablehq.config.js"), "export default {}")
+            .expect("site config fixture should be written");
+        fs::write(site_dir.join("package.json"), "{}")?;
+        fs::write(workspace_dir.path().join("package.json"), "{}")?;
+        fs::write(workspace_dir.path().join("package-lock.json"), "{}")?;
         fs::write(dist_dir.path().join("index.html"), "published")?;
         let command = |command| Cli {
             data_dir: data_dir.path().to_path_buf(),
@@ -1528,7 +1527,7 @@ mod tests {
 
         run_with_ops(
             command(Commands::SiteFingerprintRecord {
-                site_dir: site_dir.path().to_path_buf(),
+                site_dir: site_dir.clone(),
                 dist_dir: dist_dir.path().to_path_buf(),
             }),
             &RecordingOps::default(),
@@ -1536,18 +1535,18 @@ mod tests {
         .expect("site fingerprint should record");
         run_with_ops(
             command(Commands::SiteFingerprintCheck {
-                site_dir: site_dir.path().to_path_buf(),
+                site_dir: site_dir.clone(),
                 dist_dir: dist_dir.path().to_path_buf(),
             }),
             &RecordingOps::default(),
         )
         .expect("unchanged site should be reusable");
 
-        fs::write(site_dir.path().join("src/index.md"), "# Changed")?;
+        fs::write(site_dir.join("src/index.md"), "# Changed")?;
         assert!(
             run_with_ops(
                 command(Commands::SiteFingerprintCheck {
-                    site_dir: site_dir.path().to_path_buf(),
+                    site_dir,
                     dist_dir: dist_dir.path().to_path_buf(),
                 }),
                 &RecordingOps::default(),
