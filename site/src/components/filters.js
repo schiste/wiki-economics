@@ -354,6 +354,69 @@ function writePersistedFilters(state, storageKey = FILTER_STATE_STORAGE_KEY) {
   }
 }
 
+/**
+ * Read filter overrides from the page's URL query string, so a shared link
+ * reproduces the exact view it was copied from. Only keys actually present
+ * in the URL are returned (sparse), so callers can layer this over persisted
+ * localStorage state without clobbering fields the link didn't specify.
+ */
+function readUrlFilters(extraKeys = []) {
+  if (typeof location === "undefined") return null;
+  const params = new URLSearchParams(location.search);
+  if (![...params.keys()].length) return null;
+  const out = {};
+  if (params.has("wiki")) out.wiki = params.get("wiki");
+  if (params.has("types")) out.userTypes = params.get("types") ? params.get("types").split(",") : [];
+  if (params.has("gran")) out.granularity = params.get("gran");
+  if (params.has("start")) out.startPeriod = params.get("start");
+  if (params.has("end")) out.endPeriod = params.get("end");
+  if (params.has("ns")) out.namespaces = params.get("ns") ? params.get("ns").split(",").map(Number) : [];
+  const extra = {};
+  for (const key of extraKeys) {
+    if (!params.has(key)) continue;
+    const raw = params.get(key);
+    extra[key] = raw === "true" ? true : raw === "false" ? false : raw;
+  }
+  if (Object.keys(extra).length) out.extra = extra;
+  return out;
+}
+
+/**
+ * Layer URL-provided filter overrides on top of persisted localStorage
+ * state: the URL wins field-by-field (so a partial link like `?wiki=nlwiki`
+ * only overrides wiki, leaving everything else as the visitor last left it).
+ */
+function mergeFilterSources(base, override) {
+  if (!override) return base ?? {};
+  const merged = {...(base ?? {}), ...override};
+  if (override.extra) merged.extra = {...(base?.extra ?? {}), ...override.extra};
+  return merged;
+}
+
+/**
+ * Write the full current filter state into the URL query string via
+ * replaceState, so the address bar always reflects a shareable snapshot of
+ * the view — including on first load, before the user has touched anything.
+ * Uses replaceState (not pushState) so every filter tweak doesn't pollute
+ * browser history.
+ */
+function writeUrlFilters(value, extraKeys = []) {
+  if (typeof history === "undefined" || typeof location === "undefined") return;
+  const params = new URLSearchParams();
+  if (value.wiki != null) params.set("wiki", value.wiki);
+  if (value.userTypes != null) params.set("types", value.userTypes.join(","));
+  if (value.granularity != null) params.set("gran", value.granularity);
+  if (value.startPeriod) params.set("start", value.startPeriod);
+  if (value.endPeriod) params.set("end", value.endPeriod);
+  if (value.namespaces != null) params.set("ns", value.namespaces.join(","));
+  for (const key of extraKeys) {
+    if (value[key] !== undefined) params.set(key, String(value[key]));
+  }
+  const query = params.toString();
+  const url = `${location.pathname}${query ? `?${query}` : ""}${location.hash}`;
+  history.replaceState(history.state, "", url);
+}
+
 function resolveDefaultWiki(defaultWiki, wikis) {
   if (defaultWiki && wikis.includes(defaultWiki)) return defaultWiki;
   return wikis[0] ?? null;
@@ -558,7 +621,8 @@ export function createFilterBar({
   showUserTypes = true,
   extraInputs = [],
 }) {
-  const persisted = readPersistedFilters();
+  const extraKeys = extraInputs.map(({key}) => key);
+  const persisted = mergeFilterSources(readPersistedFilters(), readUrlFilters(extraKeys));
   const resolvedDefaultWiki = resolveDefaultWiki(defaultWiki, wikis);
   const initWiki = wikis.includes(persisted?.wiki) ? persisted.wiki : resolvedDefaultWiki;
   const derivedMaxMonth = deriveMaxMonth(rangeByWiki, maxMonth);
@@ -707,6 +771,7 @@ export function createFilterBar({
       namespacesByWiki: persistedNamespaces,
       extra
     });
+    writeUrlFilters(value, extraKeys);
     container.dispatchEvent(new Event("input", {bubbles: true}));
   };
 
@@ -764,8 +829,9 @@ export function createFilterBar({
     dispatch();
   });
 
-  // Set initial description
+  // Set initial description and make the first-paint state shareable
   updateDesc();
+  writeUrlFilters(getValue(), extraKeys);
 
   // Reparent into <main> so position:sticky works (Observable wraps each
   // cell in a small .observablehq--block div; sticky only sticks within its parent).
