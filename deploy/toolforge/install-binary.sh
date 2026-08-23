@@ -135,6 +135,7 @@ chmod 0755 "$extracted/wiki-econ"
 printf '%s  wiki-econ\n' "$binary_checksum" > "$extracted/wiki-econ.sha256"
 
 release_dir="$app_root/releases/$release_sha"
+mkdir -p "$app_root/releases"
 if [ -e "$release_dir" ]; then
   [ -d "$release_dir" ] && [ ! -L "$release_dir" ] || { echo "Immutable release collision at $release_dir" >&2; exit 1; }
   (cd "$release_dir" && sha256sum --check --strict --status SHA256SUMS) || { echo "Existing immutable release is incomplete or changed" >&2; exit 1; }
