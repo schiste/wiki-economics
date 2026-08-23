@@ -1,8 +1,8 @@
 ---
-title: Wikipedia Economics
+title: Wiki Economics
 ---
 
-# Wikipedia Economics
+# Wiki Economics
 
 <div class="page-intro">
 

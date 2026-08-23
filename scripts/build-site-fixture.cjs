@@ -14,6 +14,7 @@ const REQUIRED_PAGES = [
   "gdp.html",
   "inequality.html",
   "labor.html",
+  "legal.html",
   "patrol.html",
 ];
 const REQUIRED_ATTACHMENTS = [
@@ -70,8 +71,13 @@ function listFiles(directory, prefix = "") {
 
 function verifyBuild(distDir) {
   for (const page of REQUIRED_PAGES) {
-    if (!fs.statSync(path.join(distDir, page), {throwIfNoEntry: false})?.isFile()) {
+    const pagePath = path.join(distDir, page);
+    if (!fs.statSync(pagePath, {throwIfNoEntry: false})?.isFile()) {
       throw new Error(`Observable build is missing page ${page}`);
+    }
+    const html = fs.readFileSync(pagePath, "utf8");
+    if (!/href="(?:\.\/|\/)legal"/.test(html)) {
+      throw new Error(`Observable page ${page} has no one-click legal link`);
     }
   }
   const files = listFiles(distDir);
@@ -81,6 +87,26 @@ function verifyBuild(distDir) {
     if (!files.some((file) => hashedName.test(file))) {
       throw new Error(`Observable build is missing data attachment ${attachment}`);
     }
+  }
+  const manifestPath = files.find((file) => /(?:^|[/\\])manifest\.[a-f0-9]+\.json$/.test(file));
+  const manifest = JSON.parse(fs.readFileSync(path.join(distDir, manifestPath), "utf8"));
+  if (manifest?.schema_version !== 3
+      || manifest?.license?.spdx_identifier !== "MIT"
+      || !manifest?.provenance?.run_id
+      || !Array.isArray(manifest?.source_datasets)
+      || manifest.source_datasets.length === 0
+      || manifest?.toolforge_open_licensing?.open_source_license_spdx !== "MIT"
+      || manifest?.toolforge_open_licensing?.open_data_license_spdx !== "MIT"
+      || typeof manifest?.trademark?.status !== "string") {
+    throw new Error("Observable build has an incomplete licensing or provenance manifest");
+  }
+  const licensedDownloads = new Set((manifest.downloadable_artifacts || [])
+    .filter((artifact) => artifact?.license_spdx === "MIT")
+    .map((artifact) => artifact.name));
+  if (REQUIRED_ATTACHMENTS
+    .filter((attachment) => attachment !== "manifest.json")
+    .some((attachment) => !licensedDownloads.has(attachment))) {
+    throw new Error("Observable build has a downloadable artifact without a discoverable MIT license");
   }
   return files;
 }

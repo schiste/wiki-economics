@@ -1,8 +1,8 @@
 {{Notice|This project is in early development and actively seeking community feedback on its metrics and approach. See [[#Feedback]] below.}}
 
-== Wikipedia Economics ==
+== Wiki Economics ==
 
-'''Wikipedia Economics''' is a project that applies economic indicators to Wikipedia activity data. Every edit is a unit of production, every editor is a worker, every namespace is a sector of the economy. By borrowing well-understood frameworks from economics — [[w:Gross domestic product|GDP]], [[w:Labour economics|labor statistics]], [[w:Economic inequality|inequality metrics]], [[w:Quality control|quality control]] — the project offers a complementary lens on the health, resilience, and dynamics of wiki communities.
+'''Wiki Economics''' is a project that applies economic indicators to Wikipedia activity data. Every edit is a unit of production, every editor is a worker, every namespace is a sector of the economy. By borrowing well-understood frameworks from economics — [[w:Gross domestic product|GDP]], [[w:Labour economics|labor statistics]], [[w:Economic inequality|inequality metrics]], [[w:Quality control|quality control]] — the project offers a complementary lens on the health, resilience, and dynamics of wiki communities.
 
 The goal is not to reduce editors to numbers, but to surface structural patterns that are difficult to see in raw activity logs: Is output concentrated in too few hands? Are newcomers being retained? Is quality control keeping pace with content production? These are questions every wiki community asks — economics provides a shared vocabulary to answer them.
 
