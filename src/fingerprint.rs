@@ -3,7 +3,7 @@ use polars::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
-use std::io::{BufReader, Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 use tracing::{info, warn};
@@ -139,17 +139,7 @@ fn modified_nanos(path: &Path) -> Result<u128> {
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
-    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, File::open(path)?);
-    let mut hash = Sha256::new();
-    let mut buffer = vec![0_u8; 8 * 1024 * 1024];
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hash.update(&buffer[..read]);
-    }
-    Ok(hex::encode(hash.finalize()))
+    crate::storage::sha256_file(path).map(|(_, hash)| hash)
 }
 
 type ParquetSummary = (Vec<String>, u64, Option<String>, Option<String>);

@@ -3505,6 +3505,7 @@ dependencies = [
  "fs4",
  "hex",
  "indicatif",
+ "libc",
  "polars",
  "quick-xml",
  "rayon",

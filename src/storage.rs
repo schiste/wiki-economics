@@ -9,6 +9,9 @@ use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+#[cfg(target_os = "linux")]
+use std::os::fd::AsRawFd;
+
 pub const ANALYTICAL_DIRNAME: &str = "parquet";
 pub const WAREHOUSE_DIRNAME: &str = "warehouse";
 const MARKERS_DIRNAME: &str = "_markers";
@@ -599,8 +602,9 @@ fn analytical_root_identity(
 
 pub fn sha256_file(path: &Path) -> Result<(u64, String)> {
     let mut file = File::open(path)?;
+    prepare_sequential_read(&file);
     let mut hasher = Sha256::new();
-    let mut buffer = vec![0_u8; 1024 * 1024];
+    let mut buffer = vec![0_u8; 8 * 1024 * 1024];
     let mut bytes = 0_u64;
     loop {
         let read = file.read(&mut buffer)?;
@@ -608,12 +612,43 @@ pub fn sha256_file(path: &Path) -> Result<(u64, String)> {
             break;
         }
         hasher.update(&buffer[..read]);
+        discard_file_cache(&file, bytes, read as u64);
         bytes = bytes
             .checked_add(u64::try_from(read)?)
             .context("source size overflow")?;
     }
     Ok((bytes, hex::encode(hasher.finalize())))
 }
+
+/// Tell Linux that a file is being consumed sequentially and that completed
+/// ranges need not remain in the cgroup's page cache. These are best-effort
+/// performance hints: hashing and durability never depend on kernel support.
+#[cfg(target_os = "linux")]
+pub(crate) fn prepare_sequential_read(file: &File) {
+    // SAFETY: `file` owns a valid descriptor for the duration of this call;
+    // offset/length zero apply the advice to the whole file.
+    let _ = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL) };
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn prepare_sequential_read(_file: &File) {}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn discard_file_cache(file: &File, offset: u64, length: u64) {
+    // SAFETY: `file` owns a valid descriptor and these values describe only
+    // advisory byte ranges. A rejected hint has no semantic effect.
+    let _ = unsafe {
+        libc::posix_fadvise(
+            file.as_raw_fd(),
+            offset as libc::off_t,
+            length as libc::off_t,
+            libc::POSIX_FADV_DONTNEED,
+        )
+    };
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn discard_file_cache(_file: &File, _offset: u64, _length: u64) {}
 
 #[cfg(test)]
 pub fn read_marker_manifest(

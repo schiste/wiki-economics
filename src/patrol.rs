@@ -669,7 +669,9 @@ fn parse_logging_events(
     rights_writer: &mut RightsWriter,
 ) -> Result<LoggingParseStats> {
     let file = File::open(xml_path)?;
-    let decoder = MultiGzDecoder::new(BufReader::new(file));
+    let compressed_bytes = file.metadata()?.len();
+    crate::storage::prepare_sequential_read(&file);
+    let decoder = MultiGzDecoder::new(BufReader::new(file.try_clone()?));
     let mut reader = Reader::from_reader(BufReader::new(decoder));
     reader.config_mut().trim_text(true);
 
@@ -742,6 +744,7 @@ fn parse_logging_events(
         buffer.clear();
     }
 
+    crate::storage::discard_file_cache(&file, 0, compressed_bytes);
     Ok(stats)
 }
 

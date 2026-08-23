@@ -1186,6 +1186,8 @@ fn download_attempt<T: HttpTransport>(
         }
 
         file.flush()?;
+        file.sync_data()?;
+        crate::storage::discard_file_cache(&file, 0, downloaded);
         Ok(downloaded)
     })();
 

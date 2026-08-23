@@ -27,14 +27,15 @@ struct IngestRoots {
     snapshot_version: Option<String>,
 }
 
-struct SourceIdentityReader<R> {
-    inner: R,
+struct SourceIdentityReader {
+    inner: File,
     hasher: Sha256,
     bytes: u64,
 }
 
-impl<R> SourceIdentityReader<R> {
-    fn new(inner: R) -> Self {
+impl SourceIdentityReader {
+    fn new(inner: File) -> Self {
+        storage::prepare_sequential_read(&inner);
         Self {
             inner,
             hasher: Sha256::new(),
@@ -47,10 +48,11 @@ impl<R> SourceIdentityReader<R> {
     }
 }
 
-impl<R: Read> Read for SourceIdentityReader<R> {
+impl Read for SourceIdentityReader {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         let read = self.inner.read(buffer)?;
         self.hasher.update(&buffer[..read]);
+        storage::discard_file_cache(&self.inner, self.bytes, read as u64);
         let read = u64::try_from(read).map_err(std::io::Error::other)?;
         self.bytes = self
             .bytes
@@ -231,6 +233,8 @@ fn write_parquet(df: &mut DataFrame, dest: &Path) -> Result<()> {
     ParquetWriter::new(&mut file)
         .with_compression(ParquetCompression::Zstd(None))
         .finish(df)?;
+    file.sync_data()?;
+    storage::discard_file_cache(&file, 0, file.metadata()?.len());
     Ok(())
 }
 
