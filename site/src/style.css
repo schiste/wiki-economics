@@ -115,6 +115,47 @@ html[data-theme="light"] {
   --wk-shadow-md: 0 2px 8px rgba(0,0,0,0.08);
 }
 
+/* ── Sticky footer ───────────────────────────────────────
+   Framework's default layout only approximates a sticky footer: it gives
+   #observablehq-main a min-height of `100vh - 20rem` and hopes that's
+   roughly the height of the header/footer chrome. On short pages (the
+   landing page, Edit Variation, Legal) that heuristic falls short on
+   taller viewports, leaving the footer stranded mid-page with blank
+   space beneath it instead of pinned to the bottom of the screen. Turn
+   body into a real flex column so the footer always lands at the
+   viewport's bottom edge, and only gets pushed further down once page
+   content actually needs the room. */
+body {
+  display: flex;
+  flex-direction: column;
+  min-height: 100dvh;
+}
+#observablehq-center {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+}
+#observablehq-main {
+  flex: 1;
+  min-height: 0;
+}
+#observablehq-footer {
+  margin-top: 4rem;
+  flex-shrink: 0;
+}
+/* Framework's own margin: 1rem auto (for #observablehq-main/header/footer)
+   sets auto side-margins meant to center a block-level element under the
+   old max-width layout. On a flex item, auto cross-axis margins disable
+   align-items: stretch and shrink the item to its content width instead —
+   collapsing #observablehq-main to a sliver. Neutralize the side margins;
+   #observablehq-center's own margin already provides the side gutter. */
+#observablehq-main,
+#observablehq-header,
+#observablehq-footer {
+  margin-left: 0;
+  margin-right: 0;
+}
+
 /* ── Remove Observable's max-width constraints ──────────── */
 
 #observablehq-main p,
@@ -1234,7 +1275,86 @@ body.wk-loading .wk-progress-status {
 
 /* ── Print / screenshot refinements ─────────────────────── */
 
-/* ── Legal footer ─────────────────────────────────────── */
+/* ── Site footer ─────────────────────────────────────── */
+
+.site-footer {
+  display: grid;
+  grid-template-columns: 1.6fr 1fr 1fr;
+  gap: 2rem;
+  padding-bottom: 1.75rem;
+  margin-bottom: 1.5rem;
+  border-bottom: 1px solid var(--wk-border, var(--theme-foreground-faintest));
+}
+
+@media (max-width: 720px) {
+  .site-footer {
+    grid-template-columns: 1fr;
+    gap: 1.5rem;
+  }
+}
+
+.site-footer h3 {
+  margin: 0 0 0.5rem;
+  font-family: var(--wk-sans);
+  font-size: 0.62rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--wk-text-tertiary, var(--theme-foreground-faint));
+}
+
+.site-footer p {
+  margin: 0;
+  font-size: 0.8rem;
+  line-height: 1.55;
+  color: var(--wk-text-secondary, var(--theme-foreground-muted));
+}
+
+.site-footer-vision strong {
+  color: var(--wk-text-primary, var(--theme-foreground));
+}
+
+.site-footer-links {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+}
+
+.site-footer-links a,
+.site-footer-privacy a {
+  font-size: 0.8rem;
+  color: var(--wk-text-secondary, var(--theme-foreground-muted));
+  text-decoration-color: color-mix(in srgb, currentColor 40%, transparent);
+}
+
+.site-footer-links a:hover,
+.site-footer-privacy a:hover,
+.legal-footer a:hover {
+  color: var(--wk-blue);
+}
+
+.site-footer-privacy .privacy-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  margin-bottom: 0.5rem;
+  padding: 0.15rem 0.5rem;
+  font-size: 0.62rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--wk-teal);
+  background: color-mix(in srgb, var(--wk-teal) 12%, transparent);
+  border-radius: 100px;
+}
+
+.site-footer-privacy .privacy-pill::before {
+  content: "";
+  width: 0.4rem;
+  height: 0.4rem;
+  border-radius: 50%;
+  background: var(--wk-teal);
+}
 
 .legal-footer {
   display: flex;
@@ -1249,10 +1369,6 @@ body.wk-loading .wk-progress-status {
 .legal-footer a {
   color: inherit;
   text-decoration-color: color-mix(in srgb, currentColor 45%, transparent);
-}
-
-.legal-footer a:hover {
-  color: var(--theme-foreground);
 }
 
 @media print {
