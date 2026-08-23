@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "vendored_cache_sha256": "d0fb7412b86bf9b9ed72cef16562364105de89eaf09456f096db3a3e97bbf0b7",
+  "vendored_cache_sha256": "f494865c6d2c371a0a397fd417bfde867e4eccf2d8b589b2298b6bb0afc8fd09",
   "build_tools": {
     "@observablehq/framework": "1.13.4",
     "esbuild": "0.28.2"
@@ -14,6 +14,17 @@
     "parquet-wasm": "0.7.2",
     "react": "19.2.8",
     "react-dom": "19.2.8"
+  },
+  "resolution_only_packages": {
+    "@observablehq/sample-datasets": "1.0.1",
+    "arquero": "8.0.3",
+    "echarts": "6.1.0",
+    "leaflet": "1.9.4",
+    "lodash": "4.18.1",
+    "mapbox-gl": "3.29.0",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "topojson-client": "3.1.0"
   },
   "generated_packages": {
     "@observablehq/plot": "0.6.17",

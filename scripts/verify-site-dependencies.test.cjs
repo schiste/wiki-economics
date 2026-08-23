@@ -27,6 +27,7 @@ function fixture() {
     schema_version: 1,
     build_tools: {"@observablehq/framework": "1.13.4", esbuild: "0.28.2"},
     direct_browser_packages: {d3: "7.9.0"},
+    resolution_only_packages: {},
     generated_packages: {d3: "7.9.0"},
     allowed_wasm: [],
     forbidden_asset_patterns: ["_duckdb/", "_npm/@duckdb/"],
@@ -54,20 +55,20 @@ test("the exact generated closure accepts ordinary hyperlinks", () => {
   assert.deepEqual(verifySiteDependencies(current.dist, current).packages, {d3: "7.9.0"});
 });
 
-test("the vendored resolver cache may pin a direct package that is tree-shaken from output", () => {
+test("the vendored resolver cache may pin a resolution-only package tree-shaken from output", () => {
   const current = fixture();
   current.vendorCacheDir = path.join(path.dirname(current.dist), "vendor");
   fs.mkdirSync(path.join(current.vendorCacheDir, "_npm", "react-dom@19.2.8"), {recursive: true});
   fs.writeFileSync(path.join(current.vendorCacheDir, "_npm", "react-dom@19.2.8", "resolution-only.txt"), "pinned\n");
   const closure = JSON.parse(fs.readFileSync(current.closureFile));
-  closure.direct_browser_packages["react-dom"] = "19.2.8";
+  closure.resolution_only_packages["react-dom"] = "19.2.8";
   closure.vendored_cache_sha256 = treeSha256(current.vendorCacheDir);
   fs.writeFileSync(current.closureFile, JSON.stringify(closure));
-  fs.writeFileSync(current.siteManifestFile, JSON.stringify({dependencies: {d3: "7.9.0", "react-dom": "19.2.8"}}));
-  const lock = JSON.parse(fs.readFileSync(current.lockFile));
-  lock.packages["node_modules/react-dom"] = {version: "19.2.8"};
-  fs.writeFileSync(current.lockFile, JSON.stringify(lock));
   assert.deepEqual(verifySiteDependencies(current.dist, current).packages, {d3: "7.9.0"});
+  fs.rmSync(path.join(current.vendorCacheDir, "_npm", "react-dom@19.2.8", "resolution-only.txt"));
+  closure.vendored_cache_sha256 = treeSha256(current.vendorCacheDir);
+  fs.writeFileSync(current.closureFile, JSON.stringify(closure));
+  assert.throws(() => verifySiteDependencies(current.dist, current), /missing vendored resolution-only marker/);
 });
 
 test("undeclared packages, version drift, DuckDB, and remote runtime assets fail closed", () => {

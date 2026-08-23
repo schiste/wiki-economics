@@ -84,6 +84,12 @@ function verifySiteDependencies(distDir, options = {}) {
     if (actualCacheHash !== closure.vendored_cache_sha256) {
       throw new Error(`vendored Observable cache hash ${actualCacheHash} differs from the reviewed closure`);
     }
+    for (const [name, version] of Object.entries(closure.resolution_only_packages || {})) {
+      const marker = path.join(vendorCacheDir, "_npm", `${name}@${version}`, "resolution-only.txt");
+      if (!fs.statSync(marker, {throwIfNoEntry: false})?.isFile()) {
+        throw new Error(`missing vendored resolution-only marker: ${name}@${version}`);
+      }
+    }
     for (const relative of listFiles(vendorCacheDir)) {
       const normalized = relative.replaceAll(path.sep, "/");
       for (const pattern of closure.forbidden_asset_patterns) {
@@ -96,6 +102,7 @@ function verifySiteDependencies(distDir, options = {}) {
       const reviewedVersion = identity && (
         closure.generated_packages[identity.name]
         || closure.direct_browser_packages[identity.name]
+        || closure.resolution_only_packages?.[identity.name]
       );
       if (identity && reviewedVersion !== identity.version) {
         throw new Error(`undeclared vendored browser package: ${identity.name}@${identity.version}`);
