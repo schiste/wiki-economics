@@ -11,8 +11,8 @@ output directory:
 
 - `.publication-run.json` records the run ID, selected refresh wikis, and
   requested snapshot version before work begins.
-- `.publication-candidate.json` is written only after every merged Parquet and
-  every critical dashboard JSON generator succeeds. It inventories file sizes
+- `.publication-candidate.json` is written only after every merged Parquet,
+  Rust dashboard artifact, and the critical manifest validator succeed. It inventories file sizes
   and modification timestamps for the exact artifact set produced by merge.
 - `publication-gate.json` is the public operator receipt. It is written only
   after semantic validation passes and includes snapshot versions, per-wiki
@@ -46,7 +46,7 @@ The Rust gate validates:
 - snapshot-pointer freshness against `freshness_sla_days`;
 - non-zero patrol and rights source rows for scheduled patrol datasets;
 - the exact root metric set, rejecting missing and unexpected stale Parquets;
-- non-empty JSON objects from every critical dashboard generator; and
+- non-empty Rust dashboard JSON objects plus a valid publication manifest; and
 - unchanged size/modification metadata from candidate creation through site
   publication.
 

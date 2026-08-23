@@ -9,10 +9,11 @@ The project controls two dependency graphs:
    `config/site-dependency-closure.json` and the content-hashed offline cache in
    `site/vendor/observable-cache`.
 
-Node `24.15.0`, npm `11.12.1`, and Rust `1.98.0` are pinned in the package
-manifest, local version-manager files, CI, `rust-toolchain.toml`, `Cargo.toml`,
-and Toolforge's Build Service inputs. `scripts/verify-runtime.cjs` fails when
-these declarations or the running tools disagree.
+Node.js, npm, and Rust are pinned in the package manifest, local version-manager
+files, CI, `rust-toolchain.toml`, `Cargo.toml`, and Toolforge's Build Service
+inputs. `scripts/verify-runtime.cjs` fails when these declarations or the
+running tools disagree; the exact values are rendered in the
+[generated stack reference](generated/stack-reference.md).
 
 ## Site proof
 

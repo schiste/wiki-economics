@@ -13,15 +13,16 @@ Keep these locally. Do not commit them:
 - `site/dist/`
 - local cache directories such as `site/src/.observablehq/`
 
-The checked-in dashboard generator scripts live under `site/data-build/`. Live
-data artifacts belong under `output/`.
+The checked-in manifest entrypoint and validator live under `site/data-build/`.
+Rust dashboard defaults and all live data artifacts belong under `output/`.
 
 ## Tracked Source Baseline
 
 The public repo should contain:
 
 - Rust source under `src/`
-- Python and shell utilities under `scripts/`
+- the standard-library Python LCOV helper plus Node and shell utilities under
+  `scripts/`
 - deployment wrappers under `deploy/`
 - frontend source under `site/src/` plus the checked-in data-build scripts under `site/data-build/`
 - docs under `docs/`

@@ -25,9 +25,10 @@ bash -n scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh
 node --check site/admin-auth.cjs
 node --check site/admin-server.cjs
 node --check site/observablehq.config.js
-for f in site/data-build/*.cjs site/data-build/lib/*.cjs; do node --check "$f"; done
+for f in site/data-build/*.cjs; do node --check "$f"; done
 node --test site/admin-auth.test.cjs
 node --test site/admin-server.test.cjs
+node scripts/generate-stack-reference.cjs --check
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets --all-features
@@ -70,7 +71,7 @@ The repo is intentionally one codebase with two orchestration modes:
 The shared contract across both modes is:
 
 - the Rust CLI
-- the Python patrol pipeline
+- the Rust patrol fetch and compute path
 - the merged artifact format under `output/`
 - the Observable production site build
 
@@ -95,7 +96,8 @@ call those shared scripts rather than reimplementing pipeline steps.
 
 GitHub Actions is split into five jobs:
 
-- `quality`: formatting, clippy, Python patrol script checks, docs
+- `quality`: formatting, clippy, Rust and Node checks, the small Python LCOV
+  helper tests, and generated-document consistency
 - `site`: a clean npm workspace install, advisory check, Rust-generated
   deterministic fixture, and real Observable production build with page and
   attachment verification
@@ -164,12 +166,20 @@ The following are live architecture contracts, not incidental implementation det
 - compute prefers the partitioned incremental path when that layout exists
 - compatibility fallback for older parquet layouts still exists for both full-wiki and partitioned loads and should not be broken casually
 - per-wiki metric outputs should include a `wiki` column before merge
-- merge is responsible for refreshing shared dashboard artifacts in `output/` (`manifest.json`, `defaults_*.json`) from the checked-in generator scripts under `site/data-build/`
-- patrol compute also refreshes its merged/default artifacts because it still runs through the Python sidecar pipeline
+- merge uses Rust to refresh `defaults_*.json` and `meta_*.json`, then runs the
+  checked-in `site/data-build/manifest.json.sh` entrypoint to validate and
+  atomically publish `manifest.json`
+- patrol fetch and compute are Rust subcommands; patrol compute participates in
+  the same merge/default materialization path as the history metrics
 - deterministic stage receipts live under `data/stages/` and `output/_stages/`; algorithm changes must increment the owning `*_ALGORITHM_VERSION` constant
 - unpinned fetch/run commands resolve one completed snapshot for the entire run and fail when no dump exists within `WIKI_ECON_MAX_SNAPSHOT_LAG_MONTHS`
 
 If any of these change, update `docs/architecture.md`, tests, and storage helpers together.
+
+Dependency versions and lifecycle state are deliberately absent from this
+narrative guide. Update their manifests, run
+`node scripts/generate-stack-reference.cjs --write`, and let CI validate the
+[generated stack reference](generated/stack-reference.md).
 
 ## Vendored `polars-utils` Patch
 

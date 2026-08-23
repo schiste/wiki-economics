@@ -6,6 +6,10 @@ decisions. The authoritative registry is
 not scheduled is not implicitly obsolete and must never be deleted merely
 because it is absent from a refresh run.
 
+The [generated lifecycle table](generated/stack-reference.md#published-wiki-lifecycle)
+renders the current scheduled Toolforge datasets and paused imported datasets
+directly from that registry.
+
 ## Lifecycle dimensions
 
 `publication` controls whether merge may include a wiki:

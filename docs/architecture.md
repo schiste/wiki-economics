@@ -1,10 +1,12 @@
 # Architecture
 
 This document records the decisions that currently matter to the codebase.
+Exact dependency versions and lifecycle states are generated in the
+[stack reference](generated/stack-reference.md).
 
 ## Pipeline Overview
 
-The project has five distinct data layers rooted under `data/` and `output/`:
+The project has these distinct data layers rooted under `data/` and `output/`:
 
 1. `data/raw/<wiki>/...tsv.bz2`
    Wikimedia MediaWiki History dump shards fetched from `dumps.wikimedia.org`.
@@ -15,15 +17,20 @@ The project has five distinct data layers rooted under `data/` and `output/`:
 3. `data/parquet/<wiki>/_snapshots/<snapshot>/year=<YYYY>/year_month=<YYYY-MM>/*.parquet`
    Ultra-slim analytical layer used by the compute pipeline.
 
-4. `output/<wiki>/*.parquet`
+4. `data/patrol/<wiki>/`
+   Logging XML transport plus parsed patrol and rights Parquet inputs used by
+   the Rust patrol compute path.
+
+5. `output/<wiki>/*.parquet`
    Final per-metric outputs, later merged into `output/*.parquet`.
 
-5. `output/defaults_*.json` and `output/manifest.json`
+6. `output/defaults_*.json`, `output/meta_*.json`, and `output/manifest.json`
    Materialized dashboard artifacts consumed through the `site/src/data -> output` symlink.
 
-The checked-in generator sources for those dashboard artifacts live under
-`site/data-build/*.json.sh`. Generated JSON belongs in `output/`, not next to
-the checked-in scripts.
+Rust dashboard materialization writes the default and metadata JSON. The
+checked-in `site/data-build/manifest.json.sh` entrypoint validates those
+artifacts and assembles publication provenance. Generated JSON belongs in
+`output/`, not next to the checked-in script.
 
 The online-facing layer should use `output/`. The compute pipeline should use `data/parquet/`. The `data/warehouse/` layer exists for future metric work that needs more than the analytical columns.
 
@@ -118,15 +125,17 @@ Important decisions:
 
 - merge only reads per-wiki metric files from `output/<wiki>/`
 - merged outputs are written to `output/<metric>.parquet`
-- merge also materializes the shared dashboard JSON artifacts (`defaults_*.json`, `manifest.json`) from the checked-in generators under `site/data-build/` so the site does not rely on stale Observable cache loaders
+- merge materializes `defaults_*.json` and `meta_*.json` in Rust, then invokes
+  the checked-in `site/data-build/manifest.json.sh` validator to atomically
+  publish `manifest.json`; the site never relies on stale Observable loaders
 - manifest readiness follows `current-snapshot.json` and its matching ingest
   receipt; deleted raw transport files are diagnostic only and never make a
   completed generation look unfetched. Patrol readiness counts Parquet rows,
   so a header-only or zero-row file cannot appear ready.
-- every declared JSON generator is critical: output is parsed and atomically
-  replaced, and any missing, malformed, or failed generator stops merge
-- generator implementations are deterministic merge-fingerprint inputs, so a
-  readiness-code change invalidates reuse and regenerates the published JSON
+- Rust dashboard generation and the manifest validator are critical: any
+  missing, malformed, or failed artifact stops merge
+- dashboard code and manifest-generator files are deterministic merge-
+  fingerprint inputs, so a semantic change invalidates reuse
 - merge assumes every per-wiki metric output already includes a `wiki` column
 
 If a new metric omits the `wiki` column, merge will still concatenate files, but the combined output will be much less useful. Keep the `wiki` column in per-wiki outputs.

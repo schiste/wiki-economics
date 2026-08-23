@@ -35,8 +35,8 @@ fast validation index and is deliberately excluded from the fingerprint.
   algorithm version, and complete recorded metric inventory. When possible its
   input is the validated ingest receipt, avoiding a second multi-gigabyte hash
   pass.
-- **merge** includes published per-wiki Parquets, lifecycle configuration, and
-  every dashboard generator. On a hit it preserves the merged files but issues
+- **merge** includes published per-wiki Parquets, lifecycle configuration,
+  Rust dashboard code, and the manifest validator. On a hit it preserves the merged files but issues
   a new publication candidate for the current run ID.
 - **site** includes the publication candidate's artifacts plus the Observable
   sources/configuration. Reuse runs only inside the fail-closed publication

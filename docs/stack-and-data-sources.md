@@ -1,7 +1,9 @@
 # Stack & Data Sources
 
 For software dependency and license inventory, see
-[`docs/dependencies-and-licenses.md`](dependencies-and-licenses.md).
+[`docs/dependencies-and-licenses.md`](dependencies-and-licenses.md). Exact
+resolved versions and wiki lifecycle states are generated in the
+[stack reference](generated/stack-reference.md).
 
 ## Data sources
 
@@ -19,14 +21,17 @@ analytics, since the upstream terms can change.
 
 ### MediaWiki History dumps
 
-The primary data source. These are tab-separated files published by the Wikimedia Foundation at [dumps.wikimedia.org/other/mediawiki_history](https://dumps.wikimedia.org/other/mediawiki_history/). Each row represents a revision event and contains 76 columns covering:
+The primary data source. These are tab-separated files published by the Wikimedia Foundation at [dumps.wikimedia.org/other/mediawiki_history](https://dumps.wikimedia.org/other/mediawiki_history/). Each row represents a revision event with fields covering:
 
 - **Event metadata** — timestamp, type (create/delete/restore), entity (revision/page/user)
 - **Editor state** — user ID, registration date, edit count at event time, bot flag, anonymous flag, temporary account flag, user groups
 - **Page state** — page ID, title, namespace, creation timestamp, whether the page is a redirect
 - **Revision details** — byte length before/after, SHA1, minor edit flag, deleted/suppressed flags, revert information
 
-The project filters these to **revision-creation events only** and retains 10 analytical columns: timestamp, user ID, user text, page namespace, byte diff, minor flag, bot flag, anonymous flag, temporary flag, and revert indicator.
+The project filters these to **revision-creation events only**. The exact input,
+warehouse, and slim analytical column contracts live in
+[`src/schema.rs`](../src/schema.rs); user classification is normalized during
+ingest rather than carrying all of the source user-state columns into compute.
 
 Dumps are partitioned yearly for most wikis and monthly for the largest projects (English Wikipedia, Wikidata, Commons).
 
@@ -51,11 +56,13 @@ A single lightweight query to the [MediaWiki siteinfo API](https://www.mediawiki
 
 ### Rust — compute engine
 
-The core pipeline is a Rust CLI (`wiki-econ`) that handles fetching, ingesting, computing, and merging. Key dependencies:
+The core pipeline is a Rust CLI (`wiki-econ`) that handles fetching, ingesting,
+computing, patrol processing, merging, validation, and deterministic dashboard
+default generation. Key dependency roles are:
 
 | Crate | Role |
 |-------|------|
-| **Polars 0.53** | Dataframe operations — lazy evaluation, CSV/Parquet I/O, aggregations, joins |
+| **Polars** | Dataframe operations — lazy evaluation, CSV/Parquet I/O, aggregations, joins |
 | **Rayon** | Parallel iteration for multi-wiki processing |
 | **Reqwest** | HTTP client for downloading dumps, with retry and resume support |
 | **bzip2** | Streaming decompression of `.tsv.bz2` dump files |
@@ -80,7 +87,11 @@ coverage was represented in Rust.
 
 ### Observable Framework — dashboard
 
-The interactive dashboard is built with [Observable Framework](https://observablehq.com/framework/) (v1.13). Each page is a Markdown file with embedded JavaScript that renders charts using [Observable Plot](https://observablehq.com/plot/).
+The interactive dashboard is built with [Observable Framework](https://observablehq.com/framework/).
+Each page is a Markdown file with embedded JavaScript that renders charts using
+[Observable Plot](https://observablehq.com/plot/). The exact compiler and
+browser-package versions come from the npm lockfile and are rendered in the
+[generated stack reference](generated/stack-reference.md).
 
 Key frontend patterns:
 
@@ -99,6 +110,7 @@ distributed by the current production build.
 ```
 data/
   raw/<wiki>/              ← downloaded .tsv.bz2 dumps
+  patrol/<wiki>/           ← logging XML plus parsed patrol/right Parquet
   warehouse/<wiki>/_snapshots/<snapshot>/
     year=YYYY/
       year_month=YYYY-MM/   ← wide normalized Parquet
@@ -112,11 +124,14 @@ data/
 output/
   <wiki>/                   ← per-wiki metric Parquet files
   *.parquet                 ← merged cross-wiki files
+  defaults_*.json           ← deterministic Rust-generated dashboard defaults
+  meta_*.json               ← deterministic Rust-generated dashboard metadata
+  manifest.json             ← validated publication inventory and provenance
 
 site/
   data-build/
-    defaults_*.json.sh      ← checked-in dashboard artifact generators
-    manifest.json.sh
+    manifest.json.sh        ← fail-closed manifest entrypoint
+    manifest.json.cjs       ← manifest validation and provenance assembly
   src/
     *.md                    ← Observable pages
     components/             ← shared JS (filters, charts)

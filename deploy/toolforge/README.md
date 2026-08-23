@@ -11,9 +11,11 @@ systemd, no persistent VM. Containers run as Kubernetes Jobs/webservices,
 and storage is NFS-backed under `/data/project/<tool>`. Toolforge's shared NFS
 currently has no per-tool quota; its free space is shared capacity, not a
 private reservation. Measure live headroom and keep reproducible data bounded.
-nlwiki and ptwiki are established scheduled workloads. frwiki (steady-state
-≈9.8GB, rollover estimate ≈31GB) still requires a measured capacity
-qualification. enwiki is out of scope for Toolforge entirely.
+The [generated lifecycle table](../../docs/generated/stack-reference.md#published-wiki-lifecycle)
+is the source of truth for scheduled Toolforge datasets and paused imports.
+frwiki still requires the measured capacity qualification documented in
+[`docs/benchmarking.md`](../../docs/benchmarking.md) before its lifecycle can
+change. enwiki is out of scope for Toolforge entirely.
 
 ## Files
 
@@ -24,8 +26,9 @@ qualification. enwiki is out of scope for Toolforge entirely.
   build-only variable `WIKI_ECON_BUILD_RUST=1` for an emergency manual build.
   Refresh jobs reuse the image's root `node_modules`; production deliberately
   fails instead of running `npm ci` over the network.
-  Root `package.json` pins Node 24.15.0 and npm 11.12.1 exactly; these are the
-  same versions used by CI and local version-manager files. Observable builds
+  Root `package.json` pins Node.js and npm exactly; the generated
+  [stack reference](../../docs/generated/stack-reference.md) renders the
+  values used by CI and local version-manager files. Observable builds
   copy the reviewed cache under `site/vendor/observable-cache` into a clean
   source tree and run with network APIs disabled.
 - `.github/workflows/ci.yml` builds the release binary on an x86-64 Ubuntu

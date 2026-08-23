@@ -11,7 +11,7 @@ This repository supports two runtime profiles from the same codebase:
 The shared parts stay the same:
 
 - Rust CLI
-- Python patrol pipeline
+- Rust patrol fetch and compute
 - merged artifact contract under `output/`
 - Observable production site build
 

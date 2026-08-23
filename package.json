@@ -25,6 +25,7 @@
     "build:site": "scripts/build-site.sh",
     "check:runtime": "node scripts/verify-runtime.cjs",
     "check:npm-licenses": "node scripts/check-npm-licenses.cjs",
+    "check:docs": "node scripts/generate-stack-reference.cjs --check",
     "check:site-dependencies": "node scripts/verify-site-dependencies.cjs",
     "ci:local": "./scripts/ci-local.sh",
     "refresh": "scripts/refresh.sh",

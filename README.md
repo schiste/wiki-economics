@@ -5,13 +5,14 @@
 The repository currently has three main parts:
 
 - A Rust CLI for fetch, ingest, compute, merge, and benchmarking workflows.
-- A Python sidecar pipeline for patrol logging data.
+- Rust patrol fetch and compute stages for MediaWiki logging data.
 - An Observable Framework site for publishing the resulting datasets and charts.
 
 The repo now supports two runtime profiles from the same codebase:
 
 - `local`: interactive development, local data onboarding, and the dev/operator admin UI
-- `production`: static public dashboard serving, scheduled refresh orchestration for a VPS, and an optional authenticated admin surface
+- `production`: static public dashboard serving, Toolforge (or Cloud VPS)
+  refresh orchestration, and an optional authenticated admin surface
 
 ## Repository Status
 
@@ -51,9 +52,12 @@ Useful flags:
 
 Prerequisites:
 
-- Rust stable with `rustfmt` and `clippy`
-- Python 3
-- Node.js and npm
+- the pinned Rust toolchain with `rustfmt` and `clippy`
+- the pinned Node.js and npm toolchain
+- Python 3 for the standard-library LCOV checker only
+
+Exact toolchain and dependency versions are generated from the checked-in
+manifests in the [stack reference](docs/generated/stack-reference.md).
 
 This repository does not bundle Wikimedia datasets or precomputed dashboard outputs. A clean clone starts with no `data/` or `output/` tree; fetch and compute those locally.
 
@@ -65,20 +69,24 @@ Build the Rust CLI:
 cargo build --release --locked
 ```
 
-Run a small end-to-end refresh:
+Run one wiki through the Rust data pipeline locally (this downloads the real
+history and logging dumps and is not a small fixture):
 
 ```sh
-./scripts/refresh.sh frwiki
+cargo run --release --locked -- run frwiki --version YYYY-MM
 ```
 
-Expanded equivalent:
+Expanded stage-oriented equivalent:
 
 ```sh
 cargo run --release --locked -- fetch frwiki
 cargo run --release --locked -- ingest frwiki --version YYYY-MM
 cargo run --release --locked -- compute frwiki
-cargo run --release --locked -- merge
 ```
+
+The shared `scripts/refresh.sh` wrapper additionally enforces the complete
+publication contract and is intended for a full scheduled/published artifact
+set, not an isolated contributor experiment.
 
 Pass `--version YYYY-MM` to `fetch`, `ingest`, or `run` when you need a
 specific dump snapshot. If omitted, `fetch` and `run` resolve and pin the latest
@@ -108,8 +116,9 @@ scripts/dev.sh
 In local development, the admin API is a loopback-only operator tool. In hosted deployments, the supported admin model is an authenticated `meta.wikimedia.org` OAuth 2 login flow with an env-driven username allowlist. No in-repo user database is used.
 
 For hosted deployments, keep the allowlist and MediaWiki OAuth2 credentials in
-deployment secrets and render them into `/etc/wiki-economics.env`; the
-recommended secret names match the runtime env vars exactly
+the platform secret store: Toolforge tool-wide environment variables in the
+current production topology, or `/etc/wiki-economics.env` on Cloud VPS. The
+recommended secret names match the runtime environment variables exactly
 (`WIKI_ECON_ADMIN_ALLOWED_USERNAMES`, `WIKI_ECON_ADMIN_SESSION_SECRET`, and so
 on).
 
@@ -124,11 +133,12 @@ Preferred full local verification command:
 Equivalent expanded commands:
 
 ```sh
-bash -n scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh
+bash -n scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh deploy/toolforge/*.sh
 node --check site/admin-auth.cjs
 node --check site/admin-server.cjs
 node --check site/observablehq.config.js
-for f in site/data-build/*.cjs site/data-build/lib/*.cjs; do node --check "$f"; done
+node scripts/generate-stack-reference.cjs --check
+for f in site/data-build/*.cjs; do node --check "$f"; done
 node --test site/admin-auth.test.cjs
 node --test site/admin-server.test.cjs
 ./scripts/build-site.sh --help
@@ -149,6 +159,8 @@ python3 -m unittest discover -s scripts -p 'test_*.py'
 ## Project Guides
 
 - [Architecture](docs/architecture.md)
+- [Production Topology](docs/production-topology.md)
+- [Generated Stack Reference](docs/generated/stack-reference.md)
 - [Admin Server](docs/admin-server.md)
 - [Cloud VPS Deployment](docs/cloud-vps-deploy.md)
 - [Toolforge Deployment](deploy/toolforge/README.md)
@@ -177,7 +189,8 @@ python3 -m unittest discover -s scripts -p 'test_*.py'
 
 - `data/` is fetched or generated locally and is intentionally not committed.
 - `output/` is generated locally and feeds the dashboard via `site/src/data -> ../../output`.
-- `site/data-build/` contains the checked-in generator scripts that materialize `manifest.json` and `defaults_*.json` into the active output directory.
+- Rust materializes `defaults_*.json` and `meta_*.json`; `site/data-build/`
+  contains the checked-in fail-closed `manifest.json` generator.
 - `site/dist/` and root `node_modules/` are build artifacts and local dependencies.
 
 If you need small permanent fixtures for tests, add them deliberately rather than checking in ad hoc working data.

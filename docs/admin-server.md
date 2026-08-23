@@ -4,8 +4,9 @@ The admin server (`site/admin-server.cjs`) powers the operator surface for
 wiki-economics. It has two supported modes:
 
 - **local/dev**: a loopback-only job-control API used by `scripts/dev.sh`
-- **VPS/prod**: an authenticated admin page at `/admin` and an authenticated
-  API under `/admin-api/*`, intended to sit behind nginx on Wikimedia Cloud VPS
+- **hosted production**: an authenticated admin page at `/admin` and an
+  authenticated API under `/admin-api/*`, served by the Toolforge Build
+  Service webservice or proxied through nginx on Wikimedia Cloud VPS
 
 For the broader threat model, see [`security.md`](security.md).
 
@@ -15,8 +16,12 @@ For the broader threat model, see [`security.md`](security.md).
   preview server.
 - `deploy/cloud-vps/systemd/wiki-econ-admin.service` runs the authenticated
   admin server on a VPS.
-- The server always binds to `127.0.0.1`; nginx is the only supported way to
-  expose it remotely.
+- Toolforge runs `Procfile` as the `wiki-econ-admin` Build Service webservice;
+  the separate refresh Job shares status and artifacts only through NFS.
+- Local and Cloud VPS deployments default to `127.0.0.1`; the VPS exposes it
+  only through nginx. Toolforge explicitly configures the container bind host
+  and port through tool-wide environment variables and relies on Toolforge's
+  ingress for routing plus application-level authentication.
 
 ## Authentication modes
 
@@ -37,13 +42,14 @@ refuses to start with `WIKI_ECON_ADMIN_AUTH_MODE=none`.
 | Variable | Default | Effect |
 | --- | --- | --- |
 | `WIKI_ECON_ADMIN_ENABLED` | `1` (local), `0` (production) | Master switch. When `0`, the server exits on startup with an explanatory message. |
-| `WIKI_ECON_ADMIN_PORT` | `3001` | Loopback port to bind. |
+| `WIKI_ECON_ADMIN_PORT` | `3001` | Listen port; Toolforge sets the value expected by its webservice ingress. |
+| `WIKI_ECON_ADMIN_BIND_HOST` | `127.0.0.1` | Listen address. Keep the default locally/on VPS; Toolforge must set the address expected by its webservice ingress. |
 | `WIKI_ECON_SITE_PORT` | `3000` | Used for the local dev allowlist when the admin page runs from the Observable preview server. |
 | `WIKI_ECON_ENV` | `local` | When `production`, the server enforces authenticated mode if enabled. |
 | `WIKI_ECON_BIN` | (uses `cargo run --release --locked --`) | Override path to the compiled `wiki-econ` binary. |
 | `WIKI_ECON_DATA_DIR` | `data/` | Where the pipeline reads raw + intermediate parquet. |
 | `WIKI_ECON_OUTPUT_DIR` | `output/` | Where the pipeline writes per-wiki and merged metric parquet. |
-| `WIKI_ECON_GENERATOR_DIR` | `site/data-build/` | Where merge looks for dashboard JSON generators. |
+| `WIKI_ECON_GENERATOR_DIR` | `site/data-build/` | Where merge finds the fail-closed publication manifest validator. |
 | `WIKI_ECON_SITE_DIST_DIR` | `site/dist/` | Where the built `admin.html` is read from when serving `/admin`. |
 | `WIKI_ECON_ALLOWED_ORIGINS` | local preview origins | Extra origin allowlist entries for CORS / CSRF checks. In hosted mode the request's own public origin is also accepted. |
 | `WIKI_ECON_ADMIN_AUTH_MODE` | `none` | `none` for local dev, `mediawiki` for hosted admin. |
@@ -107,9 +113,10 @@ The hosted mode intentionally avoids project-local user management:
 - the allowlist is expected to come from deployment secrets, not git
 
 The current intended pattern is to keep the allowlist and OAuth2 credentials
-in deployment secrets (for example GitHub Actions secrets, or
-`toolforge envvars create` on Toolforge) and render/inject them into the
-runtime environment rather than committing them.
+in deployment secrets (`toolforge envvars create` on Toolforge or the root-only
+environment file on Cloud VPS) and inject them into the runtime environment
+rather than committing them. GitHub Actions intentionally has no production
+credentials.
 
 Recommended secret names:
 

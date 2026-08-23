@@ -14,10 +14,10 @@ The repository ships three runtime surfaces:
 
 1. **The Rust CLI (`wiki-econ`).** Reads from `dumps.wikimedia.org`,
    writes to local disk. No inbound surface.
-2. **The Node admin server (`site/admin-server.cjs`).** Operator-facing
-   dev tool exposing job-control endpoints over loopback HTTP.
-3. **The Observable Framework dashboard (`site/`).** Static pages served
-   from a CDN/nginx in production; dev preview in development.
+2. **The Node admin server (`site/admin-server.cjs`).** Loopback-only developer
+   tool locally and authenticated Toolforge/VPS operator surface in production.
+3. **The Observable Framework dashboard (`site/`).** Static pages served by
+   the Toolforge webservice or VPS nginx in production; dev preview locally.
 
 ## Admin server threat model
 
@@ -27,8 +27,8 @@ The admin server now supports two explicit security postures.
 
 This remains the default developer experience:
 
-- Binds only to `127.0.0.1`, never `0.0.0.0`. The bind address is
-  hard-coded; there is no environment variable to expose it directly.
+- Defaults to `127.0.0.1`. Local development must not override
+  `WIKI_ECON_ADMIN_BIND_HOST` to a non-loopback address.
 - Runs without a login flow when `WIKI_ECON_ADMIN_AUTH_MODE=none`.
 - Accepts the local Observable preview origins by default
   (`127.0.0.1:3000`, `localhost:3000`) for CORS.
@@ -42,13 +42,14 @@ Accepted risks in that mode:
 These are acceptable only because the tool is assumed to be used by a
 single operator on the same host.
 
-### Hosted/VPS posture
+### Hosted production posture
 
-The supported hosted deployment keeps the same loopback bind, but adds a
-real authentication boundary in front of the operator surface:
+Hosted deployment adds a real authentication boundary in front of the operator
+surface. Cloud VPS keeps the loopback bind behind nginx; Toolforge configures
+the bind expected by its webservice ingress:
 
-- nginx publishes `/admin` and `/admin-api/*` and proxies them to the
-  loopback-bound Node server.
+- nginx on Cloud VPS or Toolforge ingress publishes `/admin` and
+  `/admin-api/*` to the Node server.
 - The Node server requires `WIKI_ECON_ADMIN_AUTH_MODE=mediawiki` when
   `WIKI_ECON_ENV=production`.
 - Logins use `meta.wikimedia.org`'s OAuth2 authorization-code flow.
@@ -66,19 +67,21 @@ That posture is intentionally simple:
 - no password auth
 - no shell-string command execution
 
-The intended secret sources are deployment secrets (for example GitHub
-Actions secrets) rendered into `/etc/wiki-economics.env`.
+The intended secret sources are Toolforge tool-wide environment variables or
+the root-only `/etc/wiki-economics.env` file on Cloud VPS. GitHub Actions has
+no production credentials.
 
 Recommended practice:
 
 - use secret names that match the runtime env vars exactly
-- render them atomically with `deploy/cloud-vps/render-env.sh`
+- on Cloud VPS, render them atomically with `deploy/cloud-vps/render-env.sh`
 - treat `WIKI_ECON_ADMIN_PUBLIC_ORIGIN` as part of the trusted auth config,
   not as an incidental convenience
 
 ### What the admin server still protects against
 
-- Casual local-network attackers (loopback bind).
+- Casual local-network attackers (loopback locally/VPS; platform ingress plus
+  application authentication on Toolforge).
 - Cross-site request forgery against the hosted admin session
   (SameSite cookies plus origin checks).
 - Command injection via the `wiki` parameter (sanitization + array-form
@@ -168,9 +171,8 @@ is non-zero on every ingest run and the threat is hypothetical.
 - `cargo audit -D warnings` runs on every CI push.
 - `scripts/check-npm-advisories.cjs` audits the checked-in npm workspace lockfile
   on every CI push. Every unapproved severity fails. The current exception list
-  is empty: Observable Framework remains pinned at the latest 1.13.4 release,
-  while the root dependency closure securely overrides its esbuild edge to the
-  fixed 0.28.2 release.
+  is empty; Observable Framework and its overridden build edge are exact pins
+  recorded in the [generated stack reference](generated/stack-reference.md).
 - Future advisory exceptions require an expiry and at least 30 days of warning
   headroom. CI fails when an exception enters that warning window, rather than
   waiting for the expiry date to pass.
