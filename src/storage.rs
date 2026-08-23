@@ -384,7 +384,8 @@ pub fn write_marker_manifest_in(
             == Some(format!("{source_id}.tsv.bz2").as_str()),
         "marker source filename does not match source ID {source_id}"
     );
-    let expected_snapshot = snapshot_version_for_analytical_root(data_dir, analytical_root)?;
+    let (expected_snapshot, analytical_suffix) =
+        analytical_root_identity(data_dir, analytical_root)?;
     ensure!(
         manifest.snapshot_version == expected_snapshot,
         "marker snapshot does not match its analytical generation"
@@ -397,9 +398,6 @@ pub fn write_marker_manifest_in(
         "source {source_id} unexpectedly produced zero rows"
     );
     let analytical_outputs = stored_outputs(data_dir, analytical_root, &manifest.analytical_paths)?;
-    let analytical_suffix = analytical_root
-        .strip_prefix(data_dir.join(ANALYTICAL_DIRNAME))
-        .context("analytical marker root is outside the analytical layer")?;
     let warehouse_root = data_dir.join(WAREHOUSE_DIRNAME).join(analytical_suffix);
     let warehouse_outputs = stored_outputs(data_dir, &warehouse_root, &manifest.warehouse_paths)?;
     ensure_output_totals(
@@ -514,9 +512,7 @@ fn remove_unexpected_source_outputs(
     let expected: std::collections::BTreeSet<_> = expected.iter().collect();
     for path in collect_parquet_files(layer_root)? {
         if is_source_output(&path, source_id) && !expected.contains(&path) {
-            fs::remove_file(&path).with_context(|| {
-                format!("failed to remove stale source output {}", path.display())
-            })?;
+            fs::remove_file(&path)?;
         }
     }
     Ok(())
@@ -573,10 +569,10 @@ fn path_to_string(path: &Path) -> Result<String> {
         .context("marker path is not valid UTF-8")
 }
 
-fn snapshot_version_for_analytical_root(
+fn analytical_root_identity(
     data_dir: &Path,
     analytical_root: &Path,
-) -> Result<Option<String>> {
+) -> Result<(Option<String>, PathBuf)> {
     let suffix = analytical_root
         .strip_prefix(data_dir.join(ANALYTICAL_DIRNAME))
         .context("analytical marker root is outside the analytical layer")?;
@@ -595,9 +591,9 @@ fn snapshot_version_for_analytical_root(
             .to_str()
             .context("snapshot generation is not valid UTF-8")?;
         validate_snapshot_version(snapshot)?;
-        Ok(Some(snapshot.to_string()))
+        Ok((Some(snapshot.to_string()), suffix.to_path_buf()))
     } else {
-        Ok(None)
+        Ok((None, suffix.to_path_buf()))
     }
 }
 
@@ -705,7 +701,8 @@ pub fn marker_manifest_is_valid_in(
     if stored.schema_version != MARKER_SCHEMA_VERSION || stored.source_id != source_id {
         return Ok(false);
     }
-    let Ok(expected_snapshot) = snapshot_version_for_analytical_root(data_dir, analytical_root)
+    let Ok((expected_snapshot, analytical_suffix)) =
+        analytical_root_identity(data_dir, analytical_root)
     else {
         return Ok(false);
     };
@@ -742,10 +739,6 @@ pub fn marker_manifest_is_valid_in(
             return Ok(false);
         }
     }
-    let analytical_suffix = match analytical_root.strip_prefix(data_dir.join(ANALYTICAL_DIRNAME)) {
-        Ok(suffix) => suffix,
-        Err(_) => return Ok(false),
-    };
     let warehouse_root = data_dir.join(WAREHOUSE_DIRNAME).join(analytical_suffix);
     if !validate_stored_outputs(
         data_dir,
@@ -782,19 +775,9 @@ fn validate_stored_outputs(
     if expected_rows > 0 && outputs.is_empty() {
         return false;
     }
-    let recorded: std::collections::BTreeSet<_> = outputs
-        .iter()
-        .filter_map(|output| checked_stored_path(data_dir, &output.path).ok())
-        .collect();
-    let discovered: std::collections::BTreeSet<_> = collect_parquet_files(layer_root)
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|path| is_source_output(path, source_id))
-        .collect();
-    if recorded.len() != outputs.len() || recorded != discovered {
-        return false;
-    }
+    let mut recorded = std::collections::BTreeSet::new();
     let mut actual_total = 0_u64;
+    let mut footer_rows = Vec::with_capacity(outputs.len());
     for output in outputs {
         let Ok(path) = checked_stored_path(data_dir, &output.path) else {
             return false;
@@ -810,21 +793,30 @@ fn validate_stored_outputs(
         {
             return false;
         }
-        let Ok(file) = File::open(path) else {
+        let Some(total) = actual_total.checked_add(output.rows) else {
+            return false;
+        };
+        actual_total = total;
+        let Ok(file) = File::open(&path) else {
             return false;
         };
         let Ok(rows) = ParquetReader::new(file).num_rows() else {
             return false;
         };
-        if u64::try_from(rows).ok() != Some(output.rows) {
-            return false;
-        }
-        let Some(total) = actual_total.checked_add(output.rows) else {
-            return false;
-        };
-        actual_total = total;
+        footer_rows.push((u64::try_from(rows).ok(), output.rows));
+        recorded.insert(path);
     }
-    actual_total == expected_rows
+    let discovered: std::collections::BTreeSet<_> = collect_parquet_files(layer_root)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|path| is_source_output(path, source_id))
+        .collect();
+    footer_rows
+        .iter()
+        .all(|(actual, stored)| *actual == Some(*stored))
+        && recorded.len() == outputs.len()
+        && recorded == discovered
+        && actual_total == expected_rows
 }
 
 pub fn month_partition_dir(root: &Path, year: i32, year_month: &str) -> PathBuf {
@@ -932,6 +924,8 @@ mod tests {
     use crate::test_support::TestDir;
     use polars::prelude::*;
 
+    type MarkerMutation = Box<dyn FnOnce(&mut Value)>;
+
     fn marker_fixture(
         root: &Path,
         wiki: &str,
@@ -956,8 +950,10 @@ mod tests {
                 path.parent().map(fs::create_dir_all).transpose()?;
                 let mut frame = DataFrame::new_infer_height(vec![Column::new(
                     "row".into(),
-                    (0..i64::try_from(rows)?).collect::<Vec<_>>(),
-                )])?;
+                    (0..i64::try_from(rows).expect("fixture row count fits i64"))
+                        .collect::<Vec<_>>(),
+                )])
+                .expect("marker fixture frame should be valid");
                 ParquetWriter::new(File::create(path)?).finish(&mut frame)?;
                 paths.push(path.clone());
             }
@@ -973,6 +969,17 @@ mod tests {
             analytical_paths: paths.first().cloned().into_iter().collect(),
             warehouse_paths: paths.get(1).cloned().into_iter().collect(),
         })
+    }
+
+    fn rewrite_marker(
+        marker: &Path,
+        original: &[u8],
+        mutate: impl FnOnce(&mut Value),
+    ) -> Result<()> {
+        let mut value: Value = serde_json::from_slice(original)?;
+        mutate(&mut value);
+        fs::write(marker, serde_json::to_vec(&value)?)?;
+        Ok(())
     }
 
     #[test]
@@ -1200,6 +1207,9 @@ mod tests {
         assert!(!marker_manifest_is_valid(root, "frwiki", "source")?);
         fs::write(&manifest.source, b"compressed-source-fixture")?;
         assert!(marker_manifest_is_valid(root, "frwiki", "source")?);
+        fs::remove_file(&manifest.source)?;
+        assert!(marker_manifest_is_valid(root, "frwiki", "source")?);
+        fs::write(&manifest.source, b"compressed-source-fixture")?;
 
         let extra = manifest.analytical_paths[0].with_file_name("source.part-99999.parquet");
         fs::copy(&manifest.analytical_paths[0], &extra)?;
@@ -1209,6 +1219,209 @@ mod tests {
         let mut changed = DataFrame::new_infer_height(vec![Column::new("row".into(), [1_i64, 2])])?;
         ParquetWriter::new(File::create(&manifest.analytical_paths[0])?).finish(&mut changed)?;
         assert!(!marker_manifest_is_valid(root, "frwiki", "source")?);
+        Ok(())
+    }
+
+    #[test]
+    fn marker_validation_rejects_every_identity_and_schema_mismatch() -> Result<()> {
+        let temp_dir = TestDir::new()?;
+        let root = temp_dir.path();
+        let manifest = marker_fixture(root, "frwiki", "source", 1)?;
+        let marker = write_marker_manifest(root, "frwiki", "source", &manifest)?;
+        let original = fs::read(&marker)?;
+
+        let mutations: Vec<MarkerMutation> = vec![
+            Box::new(|value| value["schema_version"] = json!(2)),
+            Box::new(|value| value["source_id"] = json!("different")),
+            Box::new(|value| value["snapshot_version"] = json!("2026-13")),
+            Box::new(|value| value["source"]["path"] = json!("raw/frwiki/different.tsv.bz2")),
+            Box::new(|value| value["source"]["path"] = json!("../source.tsv.bz2")),
+            Box::new(|value| value["source"]["size_bytes"] = json!(0)),
+            Box::new(|value| value["source"]["sha256"] = json!("short")),
+            Box::new(|value| value["source"]["sha256"] = json!("z".repeat(64))),
+            Box::new(|value| {
+                value["rows"] = json!(0);
+                value["allow_empty"] = json!(false);
+            }),
+            Box::new(|value| value["unknown_field"] = json!(true)),
+        ];
+        for mutation in mutations {
+            rewrite_marker(&marker, &original, mutation)?;
+            assert!(!marker_manifest_is_valid(root, "frwiki", "source")?);
+        }
+        fs::write(&marker, &original)?;
+        let outside_root = root.join("outside");
+        let outside_marker = marker_path_in(&outside_root, "source");
+        outside_marker
+            .parent()
+            .map(fs::create_dir_all)
+            .transpose()?;
+        fs::copy(&marker, outside_marker)?;
+        assert!(!marker_manifest_is_valid_in(root, &outside_root, "source")?);
+        Ok(())
+    }
+
+    #[test]
+    fn marker_validation_rejects_unsafe_missing_and_unreadable_outputs() -> Result<()> {
+        let temp_dir = TestDir::new()?;
+        let root = temp_dir.path();
+        let manifest = marker_fixture(root, "frwiki", "source", 1)?;
+        let marker = write_marker_manifest(root, "frwiki", "source", &manifest)?;
+        let original = fs::read(&marker)?;
+        let stored: Value = serde_json::from_slice(&original)?;
+        let valid_path = PathBuf::from(
+            stored["analytical_outputs"][0]["path"]
+                .as_str()
+                .context("stored analytical path")?,
+        );
+        let missing = valid_path.with_file_name("source.part-99998.parquet");
+        let corrupt = valid_path.with_file_name("source.part-99999.parquet");
+        fs::write(root.join(&corrupt), b"not parquet")?;
+
+        let mutations: Vec<MarkerMutation> = vec![
+            Box::new(|value| value["analytical_outputs"] = json!([])),
+            Box::new(|value| value["analytical_outputs"][0]["path"] = json!("../unsafe.parquet")),
+            Box::new(|value| {
+                value["analytical_outputs"][0]["path"] =
+                    json!("warehouse/frwiki/year=2024/year_month=2024-01/source.part-00000.parquet")
+            }),
+            Box::new(|value| {
+                value["analytical_outputs"][0]["path"] =
+                    json!("parquet/frwiki/year=2024/year_month=2024-01/source.part-00000.bin")
+            }),
+            Box::new(|value| {
+                value["analytical_outputs"][0]["path"] =
+                    json!("parquet/frwiki/year=2024/year_month=2024-01/other.part-00000.parquet")
+            }),
+            Box::new(move |value| {
+                value["analytical_outputs"][0]["path"] =
+                    json!(missing.to_string_lossy().into_owned())
+            }),
+            Box::new(move |value| {
+                value["analytical_outputs"][0]["path"] =
+                    json!(corrupt.to_string_lossy().into_owned())
+            }),
+        ];
+        for mutation in mutations {
+            rewrite_marker(&marker, &original, mutation)?;
+            assert!(!marker_manifest_is_valid(root, "frwiki", "source")?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn marker_writer_rejects_invalid_source_and_output_contracts() -> Result<()> {
+        let temp_dir = TestDir::new()?;
+        let root = temp_dir.path();
+        let base = marker_fixture(root, "frwiki", "source", 1)?;
+
+        let mut invalid = base.clone();
+        invalid.source = PathBuf::new();
+        assert!(write_marker_manifest(root, "frwiki", "source", &invalid).is_err());
+        invalid = base.clone();
+        invalid.source_size_bytes = 0;
+        assert!(write_marker_manifest(root, "frwiki", "source", &invalid).is_err());
+        invalid = base.clone();
+        invalid.source_sha256 = "invalid".to_string();
+        assert!(write_marker_manifest(root, "frwiki", "source", &invalid).is_err());
+        invalid = base.clone();
+        invalid.source = root.join("raw/frwiki/different.tsv.bz2");
+        assert!(write_marker_manifest(root, "frwiki", "source", &invalid).is_err());
+        invalid = base.clone();
+        invalid.snapshot_version = Some("2026-07".to_string());
+        assert!(write_marker_manifest(root, "frwiki", "source", &invalid).is_err());
+        invalid = base.clone();
+        invalid.analytical_paths = base.warehouse_paths.clone();
+        assert!(write_marker_manifest(root, "frwiki", "source", &invalid).is_err());
+        invalid = base.clone();
+        let wrong_extension = base.analytical_paths[0].with_extension("bin");
+        fs::copy(&base.analytical_paths[0], &wrong_extension)?;
+        invalid.analytical_paths = vec![wrong_extension];
+        assert!(write_marker_manifest(root, "frwiki", "source", &invalid).is_err());
+        invalid = base.clone();
+        invalid.rows = 2;
+        assert!(write_marker_manifest(root, "frwiki", "source", &invalid).is_err());
+        invalid = base;
+        let outside = TestDir::new()?;
+        invalid.source = outside.path().join("source.tsv.bz2");
+        assert!(write_marker_manifest(root, "frwiki", "source", &invalid).is_err());
+        invalid.source = root.join("nested/../source.tsv.bz2");
+        assert!(write_marker_manifest(root, "frwiki", "source", &invalid).is_err());
+        assert!(
+            write_marker_manifest_in(
+                root,
+                &analytical_wiki_dir(root, "frwiki").join("_snapshots/2026-07/extra"),
+                "source",
+                &invalid,
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn marker_commit_removes_only_unrecorded_outputs_for_its_source() -> Result<()> {
+        let temp_dir = TestDir::new()?;
+        let root = temp_dir.path();
+        let manifest = marker_fixture(root, "frwiki", "source", 1)?;
+        let stale = manifest.analytical_paths[0].with_file_name("source.part-99999.parquet");
+        let unrelated = manifest.analytical_paths[0].with_file_name("other.part-99999.parquet");
+        fs::copy(&manifest.analytical_paths[0], &stale)?;
+        fs::copy(&manifest.analytical_paths[0], &unrelated)?;
+
+        write_marker_manifest(root, "frwiki", "source", &manifest)?;
+
+        assert!(!stale.exists());
+        assert!(unrelated.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn output_validation_rejects_row_total_overflow() -> Result<()> {
+        let temp_dir = TestDir::new()?;
+        let root = temp_dir.path();
+        let manifest = marker_fixture(root, "frwiki", "source", 1)?;
+        let relative = manifest.analytical_paths[0]
+            .strip_prefix(root)?
+            .to_string_lossy()
+            .into_owned();
+        let outputs = vec![
+            StoredOutput {
+                path: relative.clone(),
+                rows: u64::MAX,
+            },
+            StoredOutput {
+                path: relative,
+                rows: 1,
+            },
+        ];
+        assert!(!validate_stored_outputs(
+            root,
+            &analytical_wiki_dir(root, "frwiki"),
+            "source",
+            u64::MAX,
+            &outputs,
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn strict_marker_reader_reports_missing_and_mismatched_receipts() -> Result<()> {
+        let temp_dir = TestDir::new()?;
+        let root = temp_dir.path();
+        assert!(read_marker_manifest(root, "frwiki", "missing")?.is_none());
+        let manifest = marker_fixture(root, "frwiki", "source", 1)?;
+        let marker = write_marker_manifest(root, "frwiki", "source", &manifest)?;
+        let original = fs::read(&marker)?;
+        let mutations: [fn(&mut Value); 3] = [
+            |value: &mut Value| value["schema_version"] = json!(2),
+            |value: &mut Value| value["source_id"] = json!("other"),
+            |value: &mut Value| value["snapshot_version"] = json!("2026-99"),
+        ];
+        for mutation in mutations {
+            rewrite_marker(&marker, &original, mutation)?;
+            assert!(read_marker_manifest(root, "frwiki", "source").is_err());
+        }
         Ok(())
     }
 

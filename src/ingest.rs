@@ -927,6 +927,42 @@ mod tests {
     }
 
     #[test]
+    fn convert_file_cleans_outputs_when_marker_commit_is_interrupted() -> Result<()> {
+        let temp_dir = TestDir::new()?;
+        let wiki = "testwiki";
+        let src = temp_dir.path().join("source.tsv.bz2");
+        write_bz2_dump(
+            &src,
+            &[sample_row(
+                "2024-01-01 00:00:00.0",
+                "42",
+                "100",
+                "revision",
+                "create",
+            )],
+        )
+        .expect("valid interrupted-marker fixture should compress");
+        let marker = storage::marker_path(temp_dir.path(), wiki, "source");
+        let staging = marker
+            .parent()
+            .context("marker parent")?
+            .join(format!(".source.done.{}.tmp", std::process::id()));
+        fs::create_dir_all(&staging)?;
+
+        assert!(convert_file(&src, wiki, temp_dir.path()).is_err());
+        assert!(
+            storage::collect_parquet_files(&storage::analytical_wiki_dir(temp_dir.path(), wiki))?
+                .is_empty()
+        );
+        assert!(
+            storage::collect_parquet_files(&storage::warehouse_wiki_dir(temp_dir.path(), wiki))?
+                .is_empty()
+        );
+        assert!(!marker.exists());
+        Ok(())
+    }
+
+    #[test]
     fn ingest_wiki_converts_available_bz2_files() -> Result<()> {
         init_test_tracing();
         let temp_dir = TestDir::new()?;

@@ -1613,6 +1613,64 @@ mod tests {
     }
 
     #[test]
+    fn run_with_ops_dispatches_safe_stale_cleanup() -> Result<()> {
+        let root = TestDir::new()?;
+        let output = root.path().join("output");
+        let site_dist = root.path().join("site/dist");
+        fs::create_dir_all(&output)?;
+        fs::create_dir_all(site_dist.parent().context("site parent")?)?;
+        let abandoned = output.join(".metric.parquet.merge.dead-run.tmp");
+        fs::write(&abandoned, b"partial")?;
+
+        run_with_ops(
+            Cli {
+                data_dir: root.path().join("data"),
+                output_dir: output,
+                run_id: Some("current-run".to_string()),
+                command: Commands::CleanupStale {
+                    site_dist_dir: site_dist,
+                    minimum_age_secs: 0,
+                    wikis: Vec::new(),
+                },
+            },
+            &RecordingOps::default(),
+        )
+        .expect("safe stale cleanup command should succeed");
+
+        assert!(!abandoned.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn run_with_ops_propagates_stale_cleanup_errors() -> Result<()> {
+        let root = TestDir::new()?;
+        let output = root.path().join("output");
+        let site_dist = root.path().join("site/dist");
+        let pointer = storage::snapshot_pointer_path(root.path(), "nlwiki");
+        fs::create_dir_all(&output)?;
+        fs::create_dir_all(site_dist.parent().context("site parent")?)?;
+        pointer.parent().map(fs::create_dir_all).transpose()?;
+        fs::write(pointer, b"invalid")?;
+
+        let result = run_with_ops(
+            Cli {
+                data_dir: root.path().to_path_buf(),
+                output_dir: output,
+                run_id: Some("current-run".to_string()),
+                command: Commands::CleanupStale {
+                    site_dist_dir: site_dist,
+                    minimum_age_secs: 0,
+                    wikis: vec!["nlwiki".to_string()],
+                },
+            },
+            &RecordingOps::default(),
+        );
+
+        assert!(result.is_err());
+        Ok(())
+    }
+
+    #[test]
     fn run_with_ops_propagates_fetch_errors() -> Result<()> {
         init_test_tracing();
         let cli = Cli::try_parse_from(["wiki-econ", "fetch", "frwiki"])?;

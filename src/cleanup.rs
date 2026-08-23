@@ -220,7 +220,8 @@ mod tests {
             &[],
             Some("current-run"),
             Duration::ZERO,
-        )?;
+        )
+        .expect("abandoned staging cleanup should succeed");
 
         assert_eq!(report.merge_temporaries, 1);
         assert_eq!(report.site_builds, 1);
@@ -243,12 +244,12 @@ mod tests {
         fs::create_dir_all(&output)?;
         fs::create_dir_all(dist.parent().context("dist parent")?)?;
         for version in ["2026-07", "2026-08"] {
-            fs::create_dir_all(storage::snapshot_analytical_wiki_dir(
-                &data, "nlwiki", version,
-            )?)?;
-            fs::create_dir_all(storage::snapshot_warehouse_wiki_dir(
-                &data, "nlwiki", version,
-            )?)?;
+            let analytical = storage::snapshot_analytical_wiki_dir(&data, "nlwiki", version)
+                .expect("fixture snapshot version should be valid");
+            let warehouse = storage::snapshot_warehouse_wiki_dir(&data, "nlwiki", version)
+                .expect("fixture snapshot version should be valid");
+            fs::create_dir_all(analytical)?;
+            fs::create_dir_all(warehouse)?;
         }
         storage::publish_current_snapshot(&data, "nlwiki", "2026-08")?;
 
@@ -259,13 +260,146 @@ mod tests {
             &["nlwiki".to_string()],
             Some("current-run"),
             Duration::ZERO,
-        )?;
+        )
+        .expect("inactive generation cleanup should succeed");
 
         assert_eq!(report.snapshot_generations, 2);
         assert!(!storage::snapshot_analytical_wiki_dir(&data, "nlwiki", "2026-07")?.exists());
         assert!(!storage::snapshot_warehouse_wiki_dir(&data, "nlwiki", "2026-07")?.exists());
         assert!(storage::snapshot_analytical_wiki_dir(&data, "nlwiki", "2026-08")?.exists());
         assert!(storage::snapshot_warehouse_wiki_dir(&data, "nlwiki", "2026-08")?.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_ignores_unowned_current_and_recent_artifacts() -> Result<()> {
+        let root = TestDir::new()?;
+        let output = root.path().join("output");
+        let site_parent = root.path().join("site");
+        let dist = site_parent.join("dist");
+        fs::create_dir_all(&output)?;
+        fs::create_dir_all(&site_parent)?;
+        for name in [
+            "metric.parquet.merge.no-leading-dot.tmp",
+            ".metric.parquet.no-merge.tmp",
+            ".metric.parquet.merge.bad$id.tmp",
+            ".metric.parquet.merge.current-run.tmp",
+            ".metric.parquet.merge.tmp",
+        ] {
+            fs::write(output.join(name), b"keep")?;
+        }
+        for name in [
+            ".refresh-staging.",
+            ".refresh-staging.bad$id",
+            ".refresh-staging.current-run",
+            ".unowned-staging.dead-run",
+        ] {
+            fs::create_dir(output.join(name))?;
+        }
+        fs::create_dir(site_parent.join(".dist.build.bad$id"))?;
+        let absolute_live = site_parent.join(".dist.build.live.absolute");
+        fs::create_dir(&absolute_live)?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&absolute_live, &dist)?;
+
+        let report = clean_abandoned(
+            &root.path().join("missing-data"),
+            &output,
+            &dist,
+            &[],
+            Some("current-run"),
+            Duration::from_secs(86_400),
+        )
+        .expect("recent artifact cleanup should succeed");
+
+        assert!(report.removed.is_empty());
+        assert!(read_dir_if_present(&root.path().join("missing"))?.is_empty());
+        assert!(!is_owned_merge_temporary("no-leading-dot"));
+        assert!(!is_owned_merge_temporary(".no-merge"));
+        assert!(is_owned_merge_temporary(".metric.parquet.merge.tmp"));
+        Ok(())
+    }
+
+    #[test]
+    fn inactive_snapshot_cleanup_fails_closed_without_a_pointer() -> Result<()> {
+        let root = TestDir::new()?;
+        let data = root.path().join("data");
+        let generation = storage::snapshot_analytical_wiki_dir(&data, "nlwiki", "2026-07")?;
+        fs::create_dir_all(generation)?;
+        let mut removed = Vec::new();
+
+        assert_eq!(
+            storage::clean_stale_inactive_snapshots(
+                &data,
+                "nlwiki",
+                Duration::ZERO,
+                SystemTime::now(),
+                &mut removed,
+            )
+            .expect("cleanup without a pointer should safely no-op"),
+            0
+        );
+        assert!(removed.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_cleanup_handles_missing_layers_invalid_entries_and_recent_data() -> Result<()> {
+        let root = TestDir::new()?;
+        let data = root.path().join("data");
+        for version in ["2026-07", "2026-08"] {
+            let analytical = storage::snapshot_analytical_wiki_dir(&data, "nlwiki", version)
+                .expect("fixture snapshot version should be valid");
+            let warehouse = storage::snapshot_warehouse_wiki_dir(&data, "nlwiki", version)
+                .expect("fixture snapshot version should be valid");
+            fs::create_dir_all(analytical)?;
+            fs::create_dir_all(warehouse)?;
+        }
+        storage::publish_current_snapshot(&data, "nlwiki", "2026-08")?;
+        let analytical_snapshots = storage::analytical_wiki_dir(&data, "nlwiki").join("_snapshots");
+        fs::create_dir(analytical_snapshots.join("invalid"))?;
+        fs::write(analytical_snapshots.join("README"), b"ignored")?;
+        fs::remove_dir_all(storage::warehouse_wiki_dir(&data, "nlwiki").join("_snapshots"))?;
+        let mut removed = Vec::new();
+
+        let count = storage::clean_stale_inactive_snapshots(
+            &data,
+            "nlwiki",
+            Duration::from_secs(86_400),
+            SystemTime::now(),
+            &mut removed,
+        )
+        .expect("recent snapshot cleanup should succeed");
+
+        assert_eq!(count, 0);
+        assert!(removed.is_empty());
+        assert!(analytical_snapshots.join("2026-07").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_propagates_an_invalid_snapshot_pointer() -> Result<()> {
+        let root = TestDir::new()?;
+        let data = root.path().join("data");
+        let output = root.path().join("output");
+        let dist = root.path().join("site/dist");
+        fs::create_dir_all(&output)?;
+        fs::create_dir_all(dist.parent().context("site parent")?)?;
+        let pointer = storage::snapshot_pointer_path(&data, "nlwiki");
+        pointer.parent().map(fs::create_dir_all).transpose()?;
+        fs::write(pointer, b"truncated")?;
+
+        assert!(
+            clean_abandoned(
+                &data,
+                &output,
+                &dist,
+                &["nlwiki".to_string()],
+                Some("current-run"),
+                Duration::ZERO,
+            )
+            .is_err()
+        );
         Ok(())
     }
 }
