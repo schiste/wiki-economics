@@ -21,8 +21,26 @@ const adminApiScript = `<script>
 window.__wikiEconAdminApiBase=${JSON.stringify(adminApiBase)};
 </script>`;
 
+// The landing page links straight into the four Plot/D3-heavy indicator
+// pages (~900kB of npm imports each) from a nearly-empty bundle. A
+// speculation-rules prerender hint lets the browser start warming that
+// bundle on hover/pointerdown instead of cold-starting it after the click.
+// Framework identifies the built-in home route internally as "/index"
+// (see normalizePath(path) === "/index" in its render.js).
+const speculationRulesScript = `<script type="speculationrules">
+{
+  "prerender": [
+    {
+      "source": "list",
+      "urls": ["/inequality", "/labor", "/gdp", "/patrol"],
+      "eagerness": "moderate"
+    }
+  ]
+}
+</script>`;
+
 export default {
-  title: "Wikipedia Economics",
+  title: "Wiki Economics",
   root: sourceDir,
   output: distDir,
   pager: false,
@@ -30,8 +48,13 @@ export default {
   // headings; we use system fonts everywhere, so drop it to avoid the
   // network fetch.
   globalStylesheets: [],
-  head: `<link rel="stylesheet" href="./style.css">
+  footer: `<div class="legal-footer">
+<span>Wiki Economics · <a href="/legal">MIT licensed</a></span>
+<span>Uses public <a href="https://dumps.wikimedia.org/">Wikimedia data</a> · Independent and not endorsed by the Wikimedia Foundation · <a href="https://github.com/schiste/wiki-economics">Source</a></span>
+</div>`,
+  head: ({ path }) => `<link rel="stylesheet" href="./style.css">
 ${adminApiScript}
+${path === "/index" ? speculationRulesScript : ""}
 <script>
 (function(){var t=localStorage.getItem("wk-theme");if(t&&t!=="auto"){document.documentElement.setAttribute("data-theme",t);document.documentElement.style.colorScheme=t;}})();
 </script>
@@ -115,6 +138,12 @@ document.addEventListener("DOMContentLoaded",function(){
       name: "Staging",
       pages: [
         { name: "Business Health", path: "/business" },
+      ],
+    },
+    {
+      name: "About",
+      pages: [
+        { name: "Legal & Attribution", path: "/legal" },
       ],
     },
     ...(isDev ? [{
