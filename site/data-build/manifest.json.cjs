@@ -8,6 +8,12 @@ const CORE_METRICS = [
   "business_funnel", "gdp", "gdp_activity_tiers", "gdp_user_type_share",
   "inequality", "labor_churn", "labor_cohorts", "labor_monthly",
 ];
+const PUBLIC_JSON_ARTIFACTS = [
+  "defaults_business", "defaults_edit_variation", "defaults_gdp",
+  "defaults_inequality", "defaults_labor", "defaults_patrol",
+  "meta_business", "meta_gdp", "meta_inequality", "meta_labor", "meta_patrol",
+];
+const ARTIFACT_LICENSE_SPDX = "MIT";
 
 function findRoot(start = __dirname) {
   let current = path.resolve(start);
@@ -20,6 +26,22 @@ function findRoot(start = __dirname) {
 
 function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return null; }
+}
+
+function publicationLicensing(file = path.join(findRoot(), "config", "publication-licensing.json")) {
+  const policy = readJson(file);
+  if (policy?.schema_version !== 1
+      || policy?.license?.spdx_identifier !== ARTIFACT_LICENSE_SPDX
+      || !Array.isArray(policy?.source_datasets)
+      || policy.source_datasets.length === 0
+      || typeof policy?.attribution !== "string"
+      || typeof policy?.independence_notice !== "string"
+      || typeof policy?.trademark?.status !== "string"
+      || policy?.toolforge?.open_source_license_spdx !== ARTIFACT_LICENSE_SPDX
+      || policy?.toolforge?.open_data_license_spdx !== ARTIFACT_LICENSE_SPDX) {
+    throw new Error(`invalid publication licensing policy: ${file}`);
+  }
+  return policy;
 }
 
 function statFile(file) {
@@ -35,7 +57,11 @@ function fileList(directory, extension = ".parquet") {
       .filter((entry) => entry.isFile() && entry.name.endsWith(extension))
       .map((entry) => {
         const stat = fs.statSync(path.join(directory, entry.name));
-        return {name: entry.name.slice(0, -extension.length), size_kb: Math.floor(stat.size / 1024)};
+        return {
+          name: entry.name.slice(0, -extension.length),
+          size_kb: Math.floor(stat.size / 1024),
+          license_spdx: ARTIFACT_LICENSE_SPDX,
+        };
       })
       .sort((left, right) => left.name.localeCompare(right.name));
   } catch { return []; }
@@ -218,9 +244,18 @@ async function buildManifest(options = {}) {
   const outputDir = options.outputDir || process.env.WIKI_ECON_OUTPUT_DIR || path.join(root, "output");
   const lifecycleFile = options.lifecycleFile || process.env.WIKI_ECON_WIKI_LIFECYCLE_FILE || path.join(root, "config", "wiki-lifecycle.json");
   const lifecycle = options.lifecycle || readJson(lifecycleFile);
+  const licensing = options.licensing || publicationLicensing(options.licensingFile);
+  const environment = options.environment || process.env;
+  const generatedAt = options.generatedAt || new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
   if (!lifecycle?.publication_contract?.datasets || !lifecycle?.wikis) throw new Error(`invalid wiki lifecycle registry: ${lifecycleFile}`);
   const rowCounter = options.rowCounter || parquetRowCounter();
   const merged = fileList(outputDir);
+  const dashboardJson = fileList(outputDir, ".json")
+    .filter((artifact) => PUBLIC_JSON_ARTIFACTS.includes(artifact.name));
+  const downloadableArtifacts = [
+    ...merged.map((artifact) => ({...artifact, name: `${artifact.name}.parquet`, media_type: "application/vnd.apache.parquet"})),
+    ...dashboardJson.map((artifact) => ({...artifact, name: `${artifact.name}.json`, media_type: "application/json"})),
+  ].sort((left, right) => left.name.localeCompare(right.name));
   const mergedNames = new Set(merged.map((entry) => entry.name));
   const wikis = {};
   try {
@@ -262,8 +297,32 @@ async function buildManifest(options = {}) {
       };
     }
   } finally { await rowCounter.close?.(); }
-  return {schema_version: 2, generated_at: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
-    data_dir: dataDir, output_dir: outputDir, lifecycle, wikis, merged};
+  const selectedSnapshots = Object.fromEntries(Object.entries(wikis)
+    .filter(([, wiki]) => typeof wiki.snapshot?.version === "string")
+    .map(([name, wiki]) => [name, wiki.snapshot.version]));
+  return {
+    schema_version: 3,
+    generated_at: generatedAt,
+    license: licensing.license,
+    attribution: licensing.attribution,
+    independence_notice: licensing.independence_notice,
+    source_datasets: licensing.source_datasets,
+    trademark: licensing.trademark,
+    privacy: licensing.privacy,
+    toolforge_open_licensing: licensing.toolforge,
+    provenance: {
+      run_id: environment.WIKI_ECON_RUN_ID || null,
+      generating_commit: environment.WIKI_ECON_SOURCE_COMMIT || environment.WIKI_ECON_BUILD_COMMIT || null,
+      generated_at: generatedAt,
+      selected_snapshot_versions: selectedSnapshots,
+    },
+    data_dir: dataDir,
+    output_dir: outputDir,
+    lifecycle,
+    wikis,
+    merged,
+    downloadable_artifacts: downloadableArtifacts,
+  };
 }
 
 async function main() {
@@ -278,4 +337,4 @@ if (require.main === module) {
 }
 
 module.exports = {buildManifest, datasetApplies, discoverWikis, generationSummary, humanBytes, parquetRowCounter,
-  patrolSummary, safeReceiptOutput};
+  patrolSummary, publicationLicensing, safeReceiptOutput};

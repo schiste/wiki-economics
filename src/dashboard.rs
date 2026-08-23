@@ -9,6 +9,8 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
 
+use crate::licensing;
+
 pub const ARTIFACTS: [&str; 11] = [
     "defaults_business.json",
     "defaults_edit_variation.json",
@@ -1152,22 +1154,54 @@ pub fn write_site_fixture(output_dir: &Path) -> Result<()> {
         )
         .expect("static fixture columns have equal lengths")),
     ];
+    let downloadable_artifacts: Vec<Value> = fixtures
+        .iter()
+        .map(|(name, _)| {
+            json!({
+                "name": format!("{name}.parquet"),
+                "license_spdx": licensing::ARTIFACT_LICENSE_SPDX,
+                "media_type": "application/vnd.apache.parquet",
+            })
+        })
+        .chain(ARTIFACTS.map(|name| {
+            json!({
+                "name": name,
+                "license_spdx": licensing::ARTIFACT_LICENSE_SPDX,
+                "media_type": "application/json",
+            })
+        }))
+        .collect();
     for (name, frame) in fixtures {
         write_parquet(output_dir, name, frame)?;
     }
     materialize(output_dir)?;
+    let policy = licensing::publication_policy()?;
     publish_json_set(
         output_dir,
         &BTreeMap::from([(
             "manifest.json",
             json!({
-                "schema_version": 2,
+                "schema_version": 3,
                 "generated_at": "2026-01-31T00:00:00Z",
+                "license": policy.license,
+                "attribution": policy.attribution,
+                "independence_notice": policy.independence_notice,
+                "source_datasets": policy.source_datasets,
+                "trademark": policy.trademark,
+                "privacy": policy.privacy,
+                "toolforge_open_licensing": policy.toolforge,
+                "provenance": {
+                    "run_id": "site-fixture",
+                    "generating_commit": licensing::generating_commit(),
+                    "generated_at": "2026-01-31T00:00:00Z",
+                    "selected_snapshot_versions": {"awiki": "2026-01", "zwiki": "2026-01"},
+                },
                 "data_dir": "fixture",
                 "output_dir": "fixture",
                 "lifecycle": {"wikis": {}},
                 "wikis": {"awiki": {"status": "complete"}, "zwiki": {"status": "complete"}},
                 "merged": [],
+                "downloadable_artifacts": downloadable_artifacts,
             }),
         )]),
     )
@@ -1208,6 +1242,13 @@ mod tests {
 
         let manifest = read_json(&first.path().join("manifest.json"))?;
         assert_eq!(manifest["generated_at"], "2026-01-31T00:00:00Z");
+        assert_eq!(manifest["license"]["spdx_identifier"], "MIT");
+        assert_eq!(manifest["provenance"]["run_id"], "site-fixture");
+        assert_eq!(manifest["downloadable_artifacts"][0]["license_spdx"], "MIT");
+        assert_eq!(
+            manifest["toolforge_open_licensing"]["open_data_license_spdx"],
+            "MIT"
+        );
         Ok(())
     }
 

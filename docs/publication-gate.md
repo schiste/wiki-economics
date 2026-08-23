@@ -17,7 +17,10 @@ output directory:
 - `publication-gate.json` is the public operator receipt. It is written only
   after semantic validation passes and includes snapshot versions, per-wiki
   cutoffs, metric row and conservation totals, patrol source counts, and the
-  candidate artifact inventory.
+  candidate artifact inventory. Receipt schema 2 also records the MIT SPDX
+  identifier on every artifact plus the generating commit, run ID, source
+  datasets, attribution, trademark status, privacy notice, and Toolforge open
+  source/open data declaration.
 
 An older receipt cannot authorize a new run because all three records must
 contain the same run ID. `scripts/build-site.sh` verifies the receipt before

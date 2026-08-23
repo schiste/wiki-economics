@@ -8,7 +8,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
 
-use crate::storage;
+use crate::{licensing, storage};
 
 const RUN_CONTEXT_FILE: &str = ".publication-run.json";
 const CANDIDATE_FILE: &str = ".publication-candidate.json";
@@ -226,6 +226,7 @@ struct ArtifactRecord {
     bytes: u64,
     modified_secs: u64,
     modified_nanos: u32,
+    license_spdx: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -297,11 +298,27 @@ struct GateReceipt {
     schema_version: u8,
     run_id: String,
     validated_at_unix: u64,
+    license: licensing::LicensePolicy,
+    attribution: String,
+    independence_notice: String,
+    source_datasets: Vec<licensing::SourceDataset>,
+    trademark: licensing::TrademarkPolicy,
+    privacy: licensing::PrivacyPolicy,
+    toolforge_open_licensing: licensing::ToolforgePolicy,
+    provenance: PublicationProvenance,
     selected_snapshot_versions: BTreeMap<String, String>,
     cutoff_dates: BTreeMap<String, String>,
     metrics: BTreeMap<String, MetricReport>,
     patrol_sources: BTreeMap<String, PatrolSourceReport>,
     artifacts: Vec<ArtifactRecord>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PublicationProvenance {
+    run_id: String,
+    generating_commit: Option<String>,
+    generated_at_unix: u64,
+    selected_snapshot_versions: BTreeMap<String, String>,
 }
 
 struct FileSummary {
@@ -369,6 +386,7 @@ fn artifact_record(path: &Path) -> Result<ArtifactRecord> {
         bytes: metadata.len(),
         modified_secs: modified.as_secs(),
         modified_nanos: modified.subsec_nanos(),
+        license_spdx: licensing::ARTIFACT_LICENSE_SPDX.to_string(),
     })
 }
 
@@ -872,10 +890,25 @@ pub fn validate(
             },
         );
     }
+    let policy = licensing::publication_policy()?;
+    let validated_at_unix = now_unix()?;
     let receipt = GateReceipt {
-        schema_version: 1,
+        schema_version: 2,
         run_id: run_id.to_string(),
-        validated_at_unix: now_unix()?,
+        validated_at_unix,
+        license: policy.license,
+        attribution: policy.attribution,
+        independence_notice: policy.independence_notice,
+        source_datasets: policy.source_datasets,
+        trademark: policy.trademark,
+        privacy: policy.privacy,
+        toolforge_open_licensing: policy.toolforge,
+        provenance: PublicationProvenance {
+            run_id: run_id.to_string(),
+            generating_commit: licensing::generating_commit(),
+            generated_at_unix: validated_at_unix,
+            selected_snapshot_versions: selected_snapshots.clone(),
+        },
         selected_snapshot_versions: selected_snapshots,
         cutoff_dates: cutoffs,
         metrics: reports,
@@ -891,12 +924,25 @@ pub fn verify(output_dir: &Path, run_id: &str) -> Result<()> {
     let context: RunContext = read_json(&output_dir.join(RUN_CONTEXT_FILE))?;
     let candidate: Candidate = read_json(&output_dir.join(CANDIDATE_FILE))?;
     let receipt: GateReceipt = read_json(&output_dir.join(RECEIPT_FILE))?;
+    let policy = licensing::publication_policy()?;
     ensure!(
         context.run_id == run_id && candidate.run_id == run_id && receipt.run_id == run_id,
         "publication receipt does not belong to run ID {run_id}"
     );
     ensure!(
-        receipt.schema_version == 1 && receipt.artifacts == candidate.artifacts,
+        receipt.schema_version == 2
+            && receipt.license == policy.license
+            && receipt.attribution == policy.attribution
+            && receipt.independence_notice == policy.independence_notice
+            && receipt.source_datasets == policy.source_datasets
+            && receipt.trademark == policy.trademark
+            && receipt.privacy == policy.privacy
+            && receipt.toolforge_open_licensing == policy.toolforge
+            && receipt.provenance.run_id == run_id
+            && receipt.provenance.generating_commit == licensing::generating_commit()
+            && receipt.provenance.generated_at_unix == receipt.validated_at_unix
+            && receipt.provenance.selected_snapshot_versions == receipt.selected_snapshot_versions
+            && receipt.artifacts == candidate.artifacts,
         "publication receipt does not match candidate artifacts"
     );
     for artifact in &receipt.artifacts {
@@ -1054,13 +1100,42 @@ mod tests {
         verify(fixture.output.path(), "run-good")?;
 
         let receipt: Value = read_json(&fixture.output.path().join(RECEIPT_FILE))?;
+        assert_eq!(receipt["schema_version"], 2);
         assert_eq!(receipt["run_id"], "run-good");
+        assert_eq!(receipt["license"]["spdx_identifier"], "MIT");
+        assert_eq!(receipt["provenance"]["run_id"], "run-good");
+        assert_eq!(
+            receipt["provenance"]["selected_snapshot_versions"]["nlwiki"],
+            "2026-03"
+        );
+        assert_eq!(
+            receipt["toolforge_open_licensing"]["open_data_license_spdx"],
+            "MIT"
+        );
+        assert!(
+            receipt["source_datasets"]
+                .as_array()
+                .is_some_and(|v| !v.is_empty())
+        );
+        assert!(receipt["artifacts"].as_array().is_some_and(|artifacts| {
+            artifacts
+                .iter()
+                .all(|artifact| artifact["license_spdx"] == "MIT")
+        }));
         assert_eq!(receipt["cutoff_dates"]["nlwiki"], "2026-03");
         assert_eq!(
             receipt["metrics"]["page_weekly_edits"]["conservation_total"],
             1
         );
         assert_eq!(receipt["patrol_sources"]["nlwiki"]["rights_events"], 1);
+
+        let receipt_path = fixture.output.path().join(RECEIPT_FILE);
+        let mut tampered_receipt = receipt.clone();
+        tampered_receipt["attribution"] = Value::String("tampered".to_string());
+        atomic_json(&receipt_path, &tampered_receipt)?;
+        assert!(verify(fixture.output.path(), "run-good").is_err());
+        atomic_json(&receipt_path, &receipt)?;
+        verify(fixture.output.path(), "run-good")?;
 
         begin_run(fixture.output.path(), Some("run-merge-only"), &[], None)?;
         let merge_candidate = record_candidate(

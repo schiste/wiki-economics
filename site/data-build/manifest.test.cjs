@@ -5,7 +5,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const {after, test} = require("node:test");
-const {buildManifest, generationSummary, parquetRowCounter, safeReceiptOutput} = require("./manifest.json.cjs");
+const {buildManifest, generationSummary, parquetRowCounter, publicationLicensing, safeReceiptOutput} = require("./manifest.json.cjs");
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-manifest-"));
 after(() => fs.rmSync(root, {recursive: true, force: true}));
@@ -13,6 +13,11 @@ after(() => fs.rmSync(root, {recursive: true, force: true}));
 const metrics = [
   "business_funnel", "gdp", "gdp_activity_tiers", "gdp_user_type_share", "inequality",
   "labor_churn", "labor_cohorts", "labor_monthly", "page_weekly_edits", "patrol",
+];
+const dashboardJson = [
+  "defaults_business", "defaults_edit_variation", "defaults_gdp", "defaults_inequality",
+  "defaults_labor", "defaults_patrol", "meta_business", "meta_gdp", "meta_inequality",
+  "meta_labor", "meta_patrol",
 ];
 
 function lifecycle() {
@@ -68,6 +73,9 @@ function fixture(name) {
     fs.writeFileSync(path.join(outputDir, "nlwiki", `${metric}.parquet`), metric);
     fs.writeFileSync(path.join(outputDir, `${metric}.parquet`), metric);
   }
+  for (const artifact of dashboardJson) {
+    fs.writeFileSync(path.join(outputDir, `${artifact}.json`), "{}");
+  }
   return {analytical, dataDir, outputDir};
 }
 
@@ -90,8 +98,25 @@ test("generation readiness follows the pointer and strict ingest receipt without
     outputDir: current.outputDir,
     lifecycle: lifecycle(),
     rowCounter: rows({events: 10, rights: 2, metric: 5}),
+    generatedAt: "2026-08-23T12:00:00Z",
+    environment: {WIKI_ECON_RUN_ID: "legal-run", WIKI_ECON_SOURCE_COMMIT: "a".repeat(40)},
   });
-  assert.equal(manifest.schema_version, 2);
+  assert.equal(manifest.schema_version, 3);
+  assert.equal(manifest.license.spdx_identifier, "MIT");
+  assert.equal(manifest.provenance.run_id, "legal-run");
+  assert.equal(manifest.provenance.generating_commit, "a".repeat(40));
+  assert.equal(manifest.provenance.generated_at, "2026-08-23T12:00:00Z");
+  assert.deepEqual(manifest.provenance.selected_snapshot_versions, {nlwiki: "2026-07"});
+  assert.equal(manifest.source_datasets.length, 3);
+  assert.match(manifest.attribution, /Wikimedia/);
+  assert.match(manifest.trademark.status, /No trademark license is recorded/);
+  assert.equal(manifest.toolforge_open_licensing.open_data_license_spdx, "MIT");
+  assert.equal(manifest.merged.every((artifact) => artifact.license_spdx === "MIT"), true);
+  assert.equal(manifest.downloadable_artifacts.length, metrics.length + dashboardJson.length);
+  assert.equal(manifest.downloadable_artifacts.every((artifact) => artifact.license_spdx === "MIT"), true);
+  assert.equal(manifest.downloadable_artifacts.some((artifact) => artifact.name === "defaults_gdp.json"), true);
+  assert.equal(manifest.downloadable_artifacts.some((artifact) => artifact.name === "gdp.parquet"), true);
+  assert.equal(manifest.wikis.nlwiki.metrics.every((artifact) => artifact.license_spdx === "MIT"), true);
   assert.equal(manifest.wikis.nlwiki.status, "complete");
   assert.equal(manifest.wikis.nlwiki.raw.files, 0);
   assert.equal(manifest.wikis.nlwiki.snapshot.version, "2026-07");
@@ -102,6 +127,12 @@ test("generation readiness follows the pointer and strict ingest receipt without
   assert.equal(manifest.wikis._stages, undefined);
   assert.equal(manifest.wikis[".refresh-lock"], undefined);
   assert.equal(manifest.wikis.logs, undefined);
+});
+
+test("publication licensing policy fails closed when required legal fields drift", () => {
+  const file = path.join(root, "invalid-publication-licensing.json");
+  fs.writeFileSync(file, JSON.stringify({schema_version: 1, license: {spdx_identifier: "MIT"}}));
+  assert.throws(() => publicationLicensing(file), /invalid publication licensing policy/);
 });
 
 test("the production row counter consumes the validated Rust footer map", async () => {

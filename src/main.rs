@@ -10,6 +10,7 @@ mod end_to_end_tests;
 mod fetch;
 mod fingerprint;
 mod ingest;
+mod licensing;
 mod merge;
 mod observability;
 mod patrol;
