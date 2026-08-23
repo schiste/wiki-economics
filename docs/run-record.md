@@ -51,8 +51,10 @@ so an old successful receipt cannot contaminate a failed record.
 the atomic status and history records against the lifecycle registry and emits
 `healthy`, `warning`, or `critical` plus machine-readable alerts. Checks cover
 the last-success SLA, unpublished newer snapshots, cutoffs that fail to advance,
-zero patrol data, stale heartbeat/stage runtime, memory pressure at 75%/80%, and
-less than 20 GiB of filesystem headroom. The authenticated admin status embeds
+zero patrol data, stale heartbeat/stage runtime, memory pressure at 75%/80%,
+less than 50 GiB of filesystem headroom, and browser-data total/partition
+size. Missing browser-size evidence is itself critical. Thresholds come from
+`config/operations-slos.json`. The authenticated admin status embeds
 the same evaluation under `freshness`.
 
 `.github/workflows/freshness.yml` reads that endpoint every six hours. It has

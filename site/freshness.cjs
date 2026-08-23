@@ -1,27 +1,16 @@
 "use strict";
 
+const OPERATIONS_SLOS = require("../config/operations-slos.json");
+
 const DAY_MS = 24 * 60 * 60 * 1000;
-const GIB = 1024 ** 3;
 const DEFAULT_THRESHOLDS = Object.freeze({
-  memoryWarningRatio: 0.75,
-  memoryCriticalRatio: 0.80,
-  minimumDiskFreeBytes: 20 * GIB,
-  heartbeatStaleMs: 3 * 60 * 1000,
-  stageLimitsMs: Object.freeze({
-    snapshot_resolve: 5 * 60 * 1000,
-    fetch: 45 * 60 * 1000,
-    patrol_fetch: 45 * 60 * 1000,
-    ingest: 45 * 60 * 1000,
-    cleanup_raw: 5 * 60 * 1000,
-    compute: 2 * 60 * 60 * 1000,
-    patrol_compute: 60 * 60 * 1000,
-    merge: 30 * 60 * 1000,
-    publication_validate: 30 * 60 * 1000,
-    site: 20 * 60 * 1000,
-    publication_verify: 5 * 60 * 1000,
-    snapshot_finalize: 5 * 60 * 1000,
-    artifact_check: 5 * 60 * 1000,
-  }),
+  memoryWarningRatio: OPERATIONS_SLOS.memory.warning_ratio,
+  memoryCriticalRatio: OPERATIONS_SLOS.memory.critical_ratio,
+  minimumDiskFreeBytes: OPERATIONS_SLOS.storage.minimum_free_bytes,
+  heartbeatStaleMs: OPERATIONS_SLOS.heartbeat.maximum_age_ms,
+  maximumBrowserBytes: OPERATIONS_SLOS.browser_artifacts.maximum_total_bytes,
+  maximumBrowserPartitionBytes: OPERATIONS_SLOS.browser_artifacts.maximum_partition_bytes,
+  stageLimitsMs: Object.freeze(OPERATIONS_SLOS.stage_maximum_duration_ms),
 });
 
 function timestamp(value) {
@@ -148,6 +137,24 @@ function evaluateFreshness({last = null, history = [], lifecycle, now = Date.now
     });
   }
 
+  if (latestSuccess) {
+    const browser = latestSuccess.publication?.browserData;
+    if (!browser || !Number.isFinite(browser.bytes) || !Number.isFinite(browser.largestPartitionBytes)) {
+      alert("browser_artifact_evidence_missing", "critical", "The successful publication has no validated browser artifact size evidence.");
+    } else {
+      if (browser.bytes > settings.maximumBrowserBytes) {
+        alert("browser_artifact_total_exceeded", "critical", "Published browser artifacts exceed the total-size SLO.", {
+          bytes: browser.bytes, thresholdBytes: settings.maximumBrowserBytes,
+        });
+      }
+      if (browser.largestPartitionBytes > settings.maximumBrowserPartitionBytes) {
+        alert("browser_artifact_partition_exceeded", "critical", "A published browser partition exceeds the per-file size SLO.", {
+          bytes: browser.largestPartitionBytes, thresholdBytes: settings.maximumBrowserPartitionBytes,
+        });
+      }
+    }
+  }
+
   const status = alerts.some((entry) => entry.severity === "critical")
     ? "critical"
     : alerts.length > 0 ? "warning" : "healthy";
@@ -166,8 +173,16 @@ function evaluateFreshness({last = null, history = [], lifecycle, now = Date.now
       lastSuccessfulAt: latestSuccess?.finishedAt || null,
       selectedSnapshot: last?.selectedSnapshot || latestSuccess?.selectedSnapshot || null,
       publishedSnapshots,
+      slos: {
+        memoryWarningRatio: settings.memoryWarningRatio,
+        memoryCriticalRatio: settings.memoryCriticalRatio,
+        minimumDiskFreeBytes: settings.minimumDiskFreeBytes,
+        heartbeatStaleMs: settings.heartbeatStaleMs,
+        maximumBrowserBytes: settings.maximumBrowserBytes,
+        maximumBrowserPartitionBytes: settings.maximumBrowserPartitionBytes,
+      },
     },
   };
 }
 
-module.exports = {DAY_MS, DEFAULT_THRESHOLDS, evaluateFreshness, successfulRuns};
+module.exports = {DAY_MS, DEFAULT_THRESHOLDS, OPERATIONS_SLOS, evaluateFreshness, successfulRuns};

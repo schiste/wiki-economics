@@ -474,6 +474,7 @@ test("public freshness status is machine-readable without an admin session", asy
       cutoffDates: {nlwiki: "2026-08"},
       metrics: {patrol: {rows: 100}},
       patrolSources: {nlwiki: {patrol_events: 1000, rights_events: 10}},
+      browserData: {generation: "a".repeat(64), partitions: 9, rows: 1000, bytes: 1000, largestPartitionBytes: 500},
     },
   };
   fs.writeFileSync(path.join(outputDir, ".refresh-status.json"), JSON.stringify(record), "utf8");

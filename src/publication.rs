@@ -295,6 +295,15 @@ struct PatrolSourceReport {
 }
 
 #[derive(Serialize, Deserialize)]
+struct BrowserDataReport {
+    generation: String,
+    partitions: usize,
+    rows: u64,
+    bytes: u64,
+    largest_partition_bytes: u64,
+}
+
+#[derive(Serialize, Deserialize)]
 struct GateReceipt {
     schema_version: u8,
     run_id: String,
@@ -311,6 +320,7 @@ struct GateReceipt {
     cutoff_dates: BTreeMap<String, String>,
     metrics: BTreeMap<String, MetricReport>,
     patrol_sources: BTreeMap<String, PatrolSourceReport>,
+    browser_data: BrowserDataReport,
     artifacts: Vec<ArtifactRecord>,
 }
 
@@ -867,6 +877,34 @@ pub fn validate(
         .map(|(wiki, _)| wiki.clone())
         .collect();
     crate::browser_data::validate(output_dir, Some(&published_wikis))?;
+    let browser_index =
+        crate::browser_data::read_index(&output_dir.join(crate::browser_data::INDEX_FILENAME))?;
+    let browser_data = BrowserDataReport {
+        generation: browser_index.generation,
+        partitions: browser_index.entries.len(),
+        rows: browser_index
+            .entries
+            .iter()
+            .try_fold(0_u64, |total, entry| {
+                total
+                    .checked_add(entry.rows)
+                    .context("browser row total overflow")
+            })?,
+        bytes: browser_index
+            .entries
+            .iter()
+            .try_fold(0_u64, |total, entry| {
+                total
+                    .checked_add(entry.bytes)
+                    .context("browser byte total overflow")
+            })?,
+        largest_partition_bytes: browser_index
+            .entries
+            .iter()
+            .map(|entry| entry.bytes)
+            .max()
+            .unwrap_or(0),
+    };
     let selected_snapshots = validate_snapshots(data_dir, &registry, &context, &cutoffs)?;
     let patrol_contract = registry
         .publication_contract
@@ -901,7 +939,7 @@ pub fn validate(
     let policy = licensing::publication_policy()?;
     let validated_at_unix = now_unix()?;
     let receipt = GateReceipt {
-        schema_version: 2,
+        schema_version: 3,
         run_id: run_id.to_string(),
         validated_at_unix,
         license: policy.license,
@@ -921,6 +959,7 @@ pub fn validate(
         cutoff_dates: cutoffs,
         metrics: reports,
         patrol_sources,
+        browser_data,
         artifacts: candidate.artifacts,
     };
     atomic_json(&output_dir.join(RECEIPT_FILE), &receipt)?;
@@ -938,7 +977,7 @@ pub fn verify(output_dir: &Path, run_id: &str) -> Result<()> {
         "publication receipt does not belong to run ID {run_id}"
     );
     ensure!(
-        receipt.schema_version == 2
+        receipt.schema_version == 3
             && receipt.license == policy.license
             && receipt.attribution == policy.attribution
             && receipt.independence_notice == policy.independence_notice
@@ -1116,7 +1155,12 @@ mod tests {
         verify(fixture.output.path(), "run-good")?;
 
         let receipt: Value = read_json(&fixture.output.path().join(RECEIPT_FILE))?;
-        assert_eq!(receipt["schema_version"], 2);
+        assert_eq!(receipt["schema_version"], 3);
+        assert!(
+            receipt["browser_data"]["partitions"]
+                .as_u64()
+                .is_some_and(|value| value > 0)
+        );
         assert_eq!(receipt["run_id"], "run-good");
         assert_eq!(receipt["license"]["spdx_identifier"], "MIT");
         assert_eq!(receipt["provenance"]["run_id"], "run-good");

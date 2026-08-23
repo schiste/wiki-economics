@@ -176,6 +176,13 @@ function publicationSummary(gate, runId) {
     cutoffDates: gate.cutoff_dates || {},
     metrics,
     patrolSources: gate.patrol_sources || {},
+    browserData: gate.browser_data ? {
+      generation: gate.browser_data.generation || null,
+      partitions: gate.browser_data.partitions ?? null,
+      rows: gate.browser_data.rows ?? null,
+      bytes: gate.browser_data.bytes ?? null,
+      largestPartitionBytes: gate.browser_data.largest_partition_bytes ?? null,
+    } : null,
   };
 }
 

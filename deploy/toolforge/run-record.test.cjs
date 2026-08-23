@@ -103,6 +103,7 @@ test("live and final records combine provenance, resources, publication, and sit
     selected_snapshot_versions: {nlwiki: "2026-07"},
     cutoff_dates: {nlwiki: "2026-08"},
     patrol_sources: {nlwiki: {patrol_events: 10, rights_events: 2}},
+    browser_data: {generation: "d".repeat(64), partitions: 9, rows: 90, bytes: 900, largest_partition_bytes: 200},
     metrics: {
       page_weekly_edits: {
         rows: 40,
@@ -120,6 +121,8 @@ test("live and final records combine provenance, resources, publication, and sit
   assert.equal(final.publication.metrics.page_weekly_edits.edits, 70);
   assert.equal(final.publication.metrics.page_weekly_edits.maximumDate, "2026-07-27");
   assert.equal(final.publication.selectedSnapshots.nlwiki, "2026-07");
+  assert.equal(final.publication.browserData.bytes, 900);
+  assert.equal(final.publication.browserData.largestPartitionBytes, 200);
 });
 
 test("failed records prefer the Rust stage error and reject another run's publication", () => {

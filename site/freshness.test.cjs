@@ -28,6 +28,7 @@ function success(overrides = {}) {
       cutoffDates: {nlwiki: "2026-08"},
       metrics: {patrol: {rows: 100}},
       patrolSources: {nlwiki: {patrol_events: 1000, rights_events: 10}},
+      browserData: {generation: "a".repeat(64), partitions: 9, rows: 1000, bytes: 1000, largestPartitionBytes: 500},
     },
     ...overrides,
   };
@@ -97,4 +98,19 @@ test("memory between 75 and 80 percent is a warning", () => {
   assert.equal(result.status, "warning");
   assert.equal(result.alerts[0].code, "memory_pressure");
   assert.equal(result.alerts[0].severity, "warning");
+});
+
+test("browser publication size evidence is fail-closed and budgeted", () => {
+  const missing = success({publication: {...success().publication, browserData: null}});
+  let result = evaluateFreshness({last: missing, history: [], lifecycle, now: Date.parse(missing.finishedAt) + DAY_MS});
+  assert.ok(result.alerts.some((alert) => alert.code === "browser_artifact_evidence_missing"));
+
+  const oversized = success({publication: {...success().publication,
+    browserData: {bytes: 201, largestPartitionBytes: 101}}});
+  result = evaluateFreshness({last: oversized, history: [], lifecycle,
+    now: Date.parse(oversized.finishedAt) + DAY_MS,
+    thresholds: {maximumBrowserBytes: 200, maximumBrowserPartitionBytes: 100}});
+  assert.deepEqual(new Set(result.alerts.map((alert) => alert.code)), new Set([
+    "browser_artifact_total_exceeded", "browser_artifact_partition_exceeded",
+  ]));
 });

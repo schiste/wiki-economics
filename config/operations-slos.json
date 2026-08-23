@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "memory": {
+    "warning_ratio": 0.75,
+    "critical_ratio": 0.80,
+    "qualification_maximum_ratio": 0.75
+  },
+  "storage": {
+    "minimum_free_bytes": 53687091200
+  },
+  "heartbeat": {
+    "maximum_age_ms": 180000
+  },
+  "browser_artifacts": {
+    "maximum_total_bytes": 2147483648,
+    "maximum_partition_bytes": 536870912
+  },
+  "stage_maximum_duration_ms": {
+    "snapshot_resolve": 300000,
+    "fetch": 2700000,
+    "patrol_fetch": 2700000,
+    "ingest": 2700000,
+    "cleanup_raw": 300000,
+    "compute": 7200000,
+    "patrol_compute": 3600000,
+    "merge": 1800000,
+    "publication_validate": 1800000,
+    "site": 1200000,
+    "publication_verify": 300000,
+    "snapshot_finalize": 300000,
+    "artifact_check": 300000
+  }
+}
