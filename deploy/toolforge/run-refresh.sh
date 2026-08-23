@@ -35,6 +35,10 @@ export CARGO_TERM_COLOR=never
 export NO_COLOR=1
 export OBSERVABLE_TELEMETRY_DISABLE=true
 export WIKI_ECON_LOG_ANSI=0
+# The job requests one CPU, but Toolforge's container cpuset currently exposes
+# eight host CPUs. Match data-parallel pools to the real quota by default.
+export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-1}"
+export POLARS_MAX_THREADS="${POLARS_MAX_THREADS:-1}"
 REFRESH_LOCK_HEARTBEAT_SECS="${WIKI_ECON_REFRESH_LOCK_HEARTBEAT_SECS:-60}"
 REFRESH_LOCK_STALE_SECS="${WIKI_ECON_REFRESH_LOCK_STALE_SECS:-21600}"
 REFRESH_LOCK_RECHECK_SECS="${WIKI_ECON_REFRESH_LOCK_RECHECK_SECS:-2}"

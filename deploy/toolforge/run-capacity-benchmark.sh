@@ -31,6 +31,8 @@ report_path="$capacity_root/reports/$wiki/$run_id.json"
 mkdir -p "$output_dir" "$scratch_dir" "$(dirname "$report_path")"
 export WIKI_ECON_RUN_ID="$run_id"
 export WIKI_ECON_LOG_ANSI=0
+export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-1}"
+export POLARS_MAX_THREADS="${POLARS_MAX_THREADS:-1}"
 
 quota_args=()
 if [[ -n "${WIKI_ECON_NFS_QUOTA_BYTES:-}" ]]; then

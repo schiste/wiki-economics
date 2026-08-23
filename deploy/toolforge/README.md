@@ -77,6 +77,11 @@ Toolforge entirely.
   fallback is controlled by `WIKI_ECON_MAX_SNAPSHOT_LAG_MONTHS` (default `2`);
   exceeding it fails closed. Receipt layout and invalidation rules are
   documented in [stage fingerprints](../../docs/stage-fingerprints.md).
+  The one-CPU Toolforge job also defaults `RAYON_NUM_THREADS` and
+  `POLARS_MAX_THREADS` to `1`, because the container currently sees eight host
+  CPUs despite its one-CPU quota. Sequential raw/hash/ingest I/O uses Linux
+  cache-discard hints after durable writes or completed reads so reproducible
+  dump files do not consume the 6 GiB memory limit as retained page cache.
 - `run-record.cjs` — the single atomic writer for live refresh status and the
   bounded terminal history. It folds Rust/site stage events together with
   cgroup, disk, deployment provenance, and publication-gate data.

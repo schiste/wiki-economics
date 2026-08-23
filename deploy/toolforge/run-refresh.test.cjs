@@ -24,6 +24,7 @@ function createFixture(name) {
   const ready = path.join(root, "driver-ready");
   const release = path.join(root, "driver-release");
   const driverArgs = path.join(root, "driver-args");
+  const driverEnv = path.join(root, "driver-env");
   const fakeBinary = path.join(root, "bin", "wiki-econ");
   const fakeDriver = path.join(root, "bin", "refresh-driver");
   fs.mkdirSync(output, {recursive: true});
@@ -47,6 +48,9 @@ set -eu
 node "$FAKE_RUN_RECORD_HELPER" event started fake_pipeline "" "" ""
 if [ -n "\${FAKE_DRIVER_ARGS:-}" ]; then
   printf '%s\n' "$*" > "$FAKE_DRIVER_ARGS"
+fi
+if [ -n "\${FAKE_DRIVER_ENV:-}" ]; then
+  printf '%s\n%s\n' "$RAYON_NUM_THREADS" "$POLARS_MAX_THREADS" > "$FAKE_DRIVER_ENV"
 fi
 if [ -n "\${FAKE_DRIVER_READY:-}" ]; then
   : > "$FAKE_DRIVER_READY"
@@ -97,7 +101,7 @@ node "$FAKE_RUN_RECORD_HELPER" event completed fake_pipeline "" 10 ""
     WIKI_ECON_WIKI_LIFECYCLE_FILE: path.join(repoRoot, "config", "wiki-lifecycle.json"),
     FAKE_RUN_RECORD_HELPER: runRecordHelper,
   };
-  return {driverArgs, env, output, ready, release};
+  return {driverArgs, driverEnv, env, output, ready, release};
 }
 
 function runFixture(fixture, extraEnv = {}) {
@@ -146,6 +150,7 @@ test("an active refresh owns metadata, rejects overlap, and releases cleanly", a
     env: {
       ...fixture.env,
       FAKE_DRIVER_ARGS: fixture.driverArgs,
+      FAKE_DRIVER_ENV: fixture.driverEnv,
       FAKE_DRIVER_READY: fixture.ready,
       FAKE_DRIVER_RELEASE: fixture.release,
       WIKI_ECON_RUN_ID: "active-run",
@@ -206,6 +211,7 @@ test("an active refresh owns metadata, rejects overlap, and releases cleanly", a
     fs.readFileSync(fixture.driverArgs, "utf8").trim(),
     "--version 2026-07 nlwiki",
   );
+  assert.equal(fs.readFileSync(fixture.driverEnv, "utf8"), "1\n1\n");
 });
 
 test("a demonstrably stale cross-job lock is recovered", () => {
