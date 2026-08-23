@@ -37,6 +37,7 @@ for (const [name, exitCode] of [["success", 0], ["failure", 9]]) {
         WIKI_ECON_BIN: writeFakeBinary(path.join(root, "bin")),
         WIKI_ECON_CAPACITY_ROOT: capacityRoot,
         WIKI_ECON_DATA_DIR: path.join(root, "data"),
+        WIKI_ECON_CAPACITY_POLICY: path.join(__dirname, "../../config/capacity-qualification.json"),
       },
     });
     assert.equal(result.status, exitCode, `${result.stdout}\n${result.stderr}`);

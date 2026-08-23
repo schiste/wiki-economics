@@ -93,6 +93,11 @@ change. enwiki is out of scope for Toolforge entirely.
   remove isolated output and scratch data on exit. Refresh startup reaps only
   expired `capacity-*` staging directories, covering hard-killed benchmark
   pods that cannot run their exit trap.
+  The executable performance, backup, rebuild, rollback, pointer, marker,
+  compute, and site recovery procedures are in the
+  [operations runbook](../../docs/operations-recovery.md). SLO and capacity
+  thresholds come from versioned JSON policy rather than duplicated shell
+  constants.
   Every refresh also carries a unique run ID through merge, semantic
   validation, and the two pre-publication receipt checks. The run ID is stored
   in `.refresh-status.json`, `.refresh-history.jsonl`, and

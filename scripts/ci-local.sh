@@ -72,6 +72,8 @@ node --test deploy/toolforge/install-binary.test.cjs
 
 echo "==> node --test deploy/toolforge/run-capacity-benchmark.test.cjs"
 node --test deploy/toolforge/run-capacity-benchmark.test.cjs
+node --test deploy/toolforge/imported-backup.test.cjs
+node --test deploy/toolforge/recovery-operations.test.cjs
 
 echo "==> node --test scripts/check-freshness.test.cjs"
 node --test scripts/check-freshness.test.cjs
@@ -91,6 +93,7 @@ node --test scripts/release-provenance.test.cjs
 node --test scripts/generate-sboms.test.cjs
 node --test scripts/generate-stack-reference.test.cjs
 node --test scripts/release-bundle.test.cjs
+node --test scripts/qualify-capacity.test.cjs
 node --test scripts/verify-site-dependencies.test.cjs
 node --test scripts/verify-site-reproducibility.test.cjs
 node --test scripts/publish-browser-data.test.cjs

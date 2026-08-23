@@ -23,6 +23,18 @@ esac
 bin_path="${WIKI_ECON_BIN:?WIKI_ECON_BIN is required}"
 data_dir="${WIKI_ECON_DATA_DIR:-/data/project/wiki-economics/data}"
 capacity_root="${WIKI_ECON_CAPACITY_ROOT:-/data/project/wiki-economics/capacity}"
+root="$(cd "$(dirname "$0")/../.." && pwd)"
+policy="${WIKI_ECON_CAPACITY_POLICY:-$root/config/capacity-qualification.json}"
+raw_transient_bytes="$(node -e '
+const fs = require("node:fs");
+const policy = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+const entry = policy.wikis?.[process.argv[2]];
+if (!entry?.required_bucket_counts?.includes(Number(process.argv[3]))) process.exit(2);
+process.stdout.write(String(entry.raw_transient_requirement_bytes));
+' "$policy" "$wiki" "$bucket_count")" || {
+  echo "Wiki/bucket combination is absent from capacity policy: $wiki/$bucket_count" >&2
+  exit 2
+}
 run_id="capacity-$(date -u +%Y%m%dT%H%M%SZ)-${bucket_count}-$$"
 output_dir="$capacity_root/output/$run_id"
 scratch_dir="$capacity_root/scratch/$run_id"
@@ -46,6 +58,11 @@ export WIKI_ECON_RUN_ID="$run_id"
 export WIKI_ECON_LOG_ANSI=0
 export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-1}"
 export POLARS_MAX_THREADS="${POLARS_MAX_THREADS:-1}"
+if [[ -z "${WIKI_ECON_SOURCE_COMMIT:-}" ]]; then
+  release_target="$(readlink "$(dirname "$bin_path")" 2>/dev/null || true)"
+  source_commit="$(basename "$release_target")"
+  export WIKI_ECON_SOURCE_COMMIT="$source_commit"
+fi
 
 quota_args=()
 if [[ -n "${WIKI_ECON_NFS_QUOTA_BYTES:-}" ]]; then
@@ -61,7 +78,7 @@ echo "=== wiki-economics capacity benchmark start run_id=$run_id wiki=$wiki buck
   --weekly-buckets "$bucket_count" \
   --scratch-dir "$scratch_dir" \
   --report "$report_path" \
-  --raw-transient-bytes "${WIKI_ECON_FRWIKI_RAW_TRANSIENT_BYTES:-33285996544}" \
+  --raw-transient-bytes "${WIKI_ECON_CAPACITY_RAW_TRANSIENT_BYTES:-$raw_transient_bytes}" \
   ${quota_args[@]+"${quota_args[@]}"} \
   --storage-reserve-bytes "${WIKI_ECON_CAPACITY_STORAGE_RESERVE_BYTES:-53687091200}" \
   --quota-root /data/project/wiki-economics \

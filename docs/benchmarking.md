@@ -66,7 +66,7 @@ If a change affects ingest, storage layout, or Polars behavior, benchmark with d
 ## Toolforge capacity qualification
 
 `frwiki` must remain `refresh: paused` until three independent one-off jobs
-qualify its full imported warehouse under Toolforge's 6 GiB cgroup. Run each
+qualify its full warehouse under Toolforge's 6 GiB cgroup. Run each
 bucket count in a fresh container so `memory.peak` is isolated per variant:
 
 Toolforge's persistent NFS currently has no per-tool quota, as documented by
@@ -104,6 +104,13 @@ Reports are written atomically below
 - available filesystem bytes and pass/fail storage status;
 - rows, edits, date range, largest bucket, output bytes, and SHA-256; and
 - a fail-closed memory gate requiring at least 25% peak headroom.
+
+Reports also contain all per-bucket staged row counts, separate reduction and
+reconciliation durations, peak combined scratch-plus-output working storage,
+project-root storage before/after, source commit, selected snapshot, and exact
+thread configuration. Run `scripts/qualify-capacity.cjs` as described in
+[the operations runbook](operations-recovery.md); comparing only the largest
+bucket is not sufficient qualification evidence.
 
 Compare all three reports. Rows, edit conservation, and date ranges must be
 identical. Repeat the chosen configuration once and require the same output

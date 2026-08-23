@@ -166,6 +166,7 @@ python3 -m unittest discover -s scripts -p 'test_*.py'
 - [Toolforge Deployment](deploy/toolforge/README.md)
 - [Development](docs/development.md)
 - [Benchmarking](docs/benchmarking.md)
+- [Performance qualification and recovery](docs/operations-recovery.md)
 - [Dependencies and Licenses](docs/dependencies-and-licenses.md)
 - [Deterministic Builds](docs/deterministic-builds.md)
 - [Frontend Scalability](docs/frontend-scalability.md)
