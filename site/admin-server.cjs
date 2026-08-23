@@ -770,23 +770,24 @@ function refreshManifestSafely(force = false) {
 }
 
 function markerManifestIsValid(markerPath) {
-  const manifest = {
-    rows: 0,
-    analyticalPaths: [],
-    warehousePaths: [],
-  };
-  for (const line of fs.readFileSync(markerPath, "utf8").split(/\r?\n/)) {
-    const idx = line.indexOf("=");
-    if (idx === -1) continue;
-    const key = line.slice(0, idx);
-    const value = line.slice(idx + 1);
-    if (key === "rows") manifest.rows = Number.parseInt(value, 10) || 0;
-    if (key === "analytical_path") manifest.analyticalPaths.push(path.join(DATA_DIR, value));
-    if (key === "warehouse_path") manifest.warehousePaths.push(path.join(DATA_DIR, value));
+  try {
+    const manifest = JSON.parse(fs.readFileSync(markerPath, "utf8"));
+    const sourceId = path.basename(markerPath, ".done");
+    if (manifest.schema_version !== 1 || manifest.source_id !== sourceId) return false;
+    if (!Number.isSafeInteger(manifest.rows) || manifest.rows < 0) return false;
+    if (!manifest.source || !Number.isSafeInteger(manifest.source.size_bytes) || manifest.source.size_bytes <= 0) return false;
+    if (!/^[0-9a-f]{64}$/i.test(manifest.source.sha256 ?? "")) return false;
+    if (manifest.rows === 0 && !manifest.allow_empty) return false;
+    const outputs = [...(manifest.analytical_outputs ?? []), ...(manifest.warehouse_outputs ?? [])];
+    if (manifest.rows > 0 && outputs.length < 2) return false;
+    return outputs.every((output) => {
+      if (!Number.isSafeInteger(output.rows) || output.rows < 0 || path.isAbsolute(output.path)) return false;
+      const resolved = path.resolve(DATA_DIR, output.path);
+      return resolved.startsWith(`${path.resolve(DATA_DIR)}${path.sep}`) && fs.existsSync(resolved);
+    });
+  } catch {
+    return false;
   }
-  if (manifest.rows === 0) return true;
-  if (manifest.analyticalPaths.length === 0 || manifest.warehousePaths.length === 0) return false;
-  return [...manifest.analyticalPaths, ...manifest.warehousePaths].every((entry) => fs.existsSync(entry));
 }
 
 function walkFiles(root, predicate, acc = []) {
@@ -806,9 +807,12 @@ function cleanupWikiArtifacts(wiki) {
   const removed = [];
   const analyticalDir = path.join(DATA_DIR, "parquet", wiki);
   const warehouseDir = path.join(DATA_DIR, "warehouse", wiki);
+  const staleBefore = Date.now() - 6 * 60 * 60 * 1000;
+  const isOwnedStaleTemporary = (entry) =>
+    /^\..+\.done\.\d+\.tmp$/.test(path.basename(entry)) && fs.statSync(entry).mtimeMs <= staleBefore;
   const tmpFiles = [
-    ...walkFiles(analyticalDir, (entry) => entry.endsWith(".tmp")),
-    ...walkFiles(warehouseDir, (entry) => entry.endsWith(".tmp")),
+    ...walkFiles(analyticalDir, isOwnedStaleTemporary),
+    ...walkFiles(warehouseDir, isOwnedStaleTemporary),
   ];
   for (const tmpPath of tmpFiles) {
     fs.rmSync(tmpPath, { force: true });

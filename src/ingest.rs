@@ -2,11 +2,12 @@ use anyhow::{Context, Result, ensure};
 use bzip2::read::BzDecoder;
 use polars::prelude::*;
 use rayon::prelude::*;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 #[cfg(test)]
 use std::io::Write;
-use std::io::{BufRead, BufReader, Cursor};
+use std::io::{BufRead, BufReader, Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -16,12 +17,47 @@ use crate::fingerprint::{self, StageSpec, TrackedPath};
 use crate::{fetch, schema, storage};
 
 const INGEST_CHUNK_BYTES: usize = 32 * 1024 * 1024;
-pub(crate) const INGEST_ALGORITHM_VERSION: &str = "history-tsv-to-generation-parquet-v2";
+pub(crate) const INGEST_ALGORITHM_VERSION: &str =
+    "history-tsv-to-generation-parquet-v3-strict-markers";
 
 #[derive(Clone, Debug)]
 struct IngestRoots {
     analytical: PathBuf,
     warehouse: PathBuf,
+    snapshot_version: Option<String>,
+}
+
+struct SourceIdentityReader<R> {
+    inner: R,
+    hasher: Sha256,
+    bytes: u64,
+}
+
+impl<R> SourceIdentityReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hasher: Sha256::new(),
+            bytes: 0,
+        }
+    }
+
+    fn finish(self) -> (u64, String) {
+        (self.bytes, hex::encode(self.hasher.finalize()))
+    }
+}
+
+impl<R: Read> Read for SourceIdentityReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.inner.read(buffer)?;
+        self.hasher.update(&buffer[..read]);
+        let read = u64::try_from(read).map_err(std::io::Error::other)?;
+        self.bytes = self
+            .bytes
+            .checked_add(read)
+            .ok_or_else(|| std::io::Error::other("source size overflow"))?;
+        usize::try_from(read).map_err(std::io::Error::other)
+    }
 }
 
 impl IngestRoots {
@@ -29,6 +65,7 @@ impl IngestRoots {
         Self {
             analytical: storage::analytical_wiki_dir(data_dir, wiki),
             warehouse: storage::warehouse_wiki_dir(data_dir, wiki),
+            snapshot_version: None,
         }
     }
 
@@ -36,6 +73,7 @@ impl IngestRoots {
         Ok(Self {
             analytical: storage::snapshot_analytical_wiki_dir(data_dir, wiki, snapshot_version)?,
             warehouse: storage::snapshot_warehouse_wiki_dir(data_dir, wiki, snapshot_version)?,
+            snapshot_version: Some(snapshot_version.to_string()),
         })
     }
 }
@@ -285,7 +323,8 @@ fn convert_file_with_chunk_limit(
     info!(source = %src.display(), wiki = wiki, "converting dump file");
 
     let file = File::open(src).context(format!("Cannot open {}", src.display()))?;
-    let decoder = BzDecoder::new(BufReader::with_capacity(8 * 1024 * 1024, file));
+    let source_reader = SourceIdentityReader::new(file);
+    let decoder = BzDecoder::new(BufReader::with_capacity(8 * 1024 * 1024, source_reader));
     let mut reader = BufReader::with_capacity(8 * 1024 * 1024, decoder);
 
     let mut line = Vec::new();
@@ -322,17 +361,36 @@ fn convert_file_with_chunk_limit(
             warehouse_paths.extend(warehouse);
         }
 
+        Ok(())
+    })();
+
+    if let Err(err) = conversion {
+        cleanup_written_paths(&analytical_paths);
+        cleanup_written_paths(&warehouse_paths);
+        let _ = fs::remove_file(&marker);
+        return Err(err);
+    }
+
+    let receipt = (|| -> Result<()> {
+        let decoder = reader.into_inner();
+        let buffered_source = decoder.into_inner();
+        let mut source_reader = buffered_source.into_inner();
+        std::io::copy(&mut source_reader, &mut std::io::sink())?;
+        let (source_size_bytes, source_sha256) = source_reader.finish();
         let manifest = storage::MarkerManifest {
-            source: Some(src.display().to_string()),
+            snapshot_version: roots.snapshot_version.clone(),
+            source: src.to_path_buf(),
+            source_size_bytes,
+            source_sha256,
             rows: total_rows,
+            allow_empty: false,
             analytical_paths: analytical_paths.clone(),
             warehouse_paths: warehouse_paths.clone(),
         };
         storage::write_marker_manifest_in(data_dir, &roots.analytical, &source_id, &manifest)?;
         Ok(())
     })();
-
-    if let Err(err) = conversion {
+    if let Err(err) = receipt {
         cleanup_written_paths(&analytical_paths);
         cleanup_written_paths(&warehouse_paths);
         let _ = fs::remove_file(&marker);
@@ -992,11 +1050,10 @@ mod tests {
         let filename = fetch::build_file_list(wiki, version)?
             .pop()
             .expect("all-time source");
-        storage::write_marker_manifest_in(
+        storage::write_test_marker_in(
             temp_dir.path(),
             &analytical,
             &ingest_source_id(Path::new(&filename))?,
-            &storage::MarkerManifest::default(),
         )
         .expect("zero-row marker should be written");
 
@@ -1006,8 +1063,8 @@ mod tests {
         let receipt_before = fs::read(&receipt)?;
         let reused = ingest_wiki_snapshot(wiki, version, temp_dir.path())?;
 
-        assert!(paths.is_empty());
-        assert!(reused.is_empty());
+        assert_eq!(paths.len(), 1);
+        assert_eq!(reused, paths);
         assert_eq!(fs::read(receipt)?, receipt_before);
         assert_eq!(
             storage::current_snapshot_version(temp_dir.path(), wiki)?.as_deref(),

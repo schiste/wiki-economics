@@ -2454,11 +2454,10 @@ mod tests {
         let filename = "2026-02.simplewiki.all-time.tsv.bz2";
         let analytical =
             crate::storage::snapshot_analytical_wiki_dir(data_dir.path(), wiki, version)?;
-        crate::storage::write_marker_manifest_in(
+        crate::storage::write_test_marker_in(
             data_dir.path(),
             &analytical,
             &crate::ingest::ingest_source_id(Path::new(filename))?,
-            &crate::storage::MarkerManifest::default(),
         )
         .expect("covered source marker should be written");
         let transport = FakeTransport::default();
@@ -2670,11 +2669,10 @@ mod tests {
         let analytical =
             crate::storage::snapshot_analytical_wiki_dir(data_dir.path(), wiki, version)?;
         let covered = "2002-01.frwiki.2001.tsv.bz2";
-        crate::storage::write_marker_manifest_in(
+        crate::storage::write_test_marker_in(
             data_dir.path(),
             &analytical,
             &crate::ingest::ingest_source_id(Path::new(covered))?,
-            &crate::storage::MarkerManifest::default(),
         )
         .expect("covered year marker should be written");
         let transport = FakeTransport::with_outcomes(
