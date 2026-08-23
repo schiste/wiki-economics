@@ -14,10 +14,17 @@
   "workspaces": [
     "site"
   ],
+  "dependencies": {
+    "@observablehq/framework": "1.13.4"
+  },
+  "overrides": {
+    "esbuild": "0.28.2"
+  },
   "scripts": {
     "rust-build": "cargo build --release --locked",
     "build:site": "scripts/build-site.sh",
     "check:runtime": "node scripts/verify-runtime.cjs",
+    "check:npm-licenses": "node scripts/check-npm-licenses.cjs",
     "check:site-dependencies": "node scripts/verify-site-dependencies.cjs",
     "ci:local": "./scripts/ci-local.sh",
     "refresh": "scripts/refresh.sh",

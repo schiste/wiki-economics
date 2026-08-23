@@ -21,17 +21,26 @@ function fixture() {
   fs.writeFileSync(path.join(dist, "index.html"), '<script type="module" src="./app.js"></script><a href="https://example.org">source</a>');
   const closureFile = path.join(root, "closure.json");
   const siteManifestFile = path.join(root, "package.json");
+  const workspaceManifestFile = path.join(root, "workspace-package.json");
   const lockFile = path.join(root, "package-lock.json");
   fs.writeFileSync(closureFile, JSON.stringify({
     schema_version: 1,
+    build_tools: {"@observablehq/framework": "1.13.4", esbuild: "0.28.2"},
     direct_browser_packages: {d3: "7.9.0"},
     generated_packages: {d3: "7.9.0"},
     allowed_wasm: [],
     forbidden_asset_patterns: ["_duckdb/", "_npm/@duckdb/"],
   }));
   fs.writeFileSync(siteManifestFile, JSON.stringify({dependencies: {d3: "7.9.0"}}));
-  fs.writeFileSync(lockFile, JSON.stringify({packages: {"node_modules/d3": {version: "7.9.0"}}}));
-  return {dist, closureFile, siteManifestFile, lockFile, vendorCacheDir: null};
+  fs.writeFileSync(workspaceManifestFile, JSON.stringify({
+    dependencies: {"@observablehq/framework": "1.13.4"}, overrides: {esbuild: "0.28.2"},
+  }));
+  fs.writeFileSync(lockFile, JSON.stringify({packages: {
+    "node_modules/@observablehq/framework": {version: "1.13.4"},
+    "node_modules/d3": {version: "7.9.0"},
+    "node_modules/esbuild": {version: "0.28.2"},
+  }}));
+  return {dist, closureFile, workspaceManifestFile, siteManifestFile, lockFile, vendorCacheDir: null};
 }
 
 test("package identities support scoped and unscoped generated paths", () => {

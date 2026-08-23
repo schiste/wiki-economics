@@ -60,12 +60,22 @@ function runtimeRemoteReferences(relative, content) {
 
 function verifySiteDependencies(distDir, options = {}) {
   const closureFile = options.closureFile || path.join(root, "config", "site-dependency-closure.json");
+  const workspaceManifestFile = options.workspaceManifestFile || path.join(root, "package.json");
   const siteManifestFile = options.siteManifestFile || path.join(root, "site", "package.json");
   const lockFile = options.lockFile || path.join(root, "package-lock.json");
   const closure = JSON.parse(fs.readFileSync(closureFile, "utf8"));
+  const workspaceManifest = JSON.parse(fs.readFileSync(workspaceManifestFile, "utf8"));
   const siteManifest = JSON.parse(fs.readFileSync(siteManifestFile, "utf8"));
   const lock = JSON.parse(fs.readFileSync(lockFile, "utf8"));
   if (closure.schema_version !== 1) throw new Error("unsupported site dependency closure schema");
+  if (closure.build_tools?.["@observablehq/framework"] !== workspaceManifest.dependencies?.["@observablehq/framework"]
+      || closure.build_tools?.esbuild !== workspaceManifest.overrides?.esbuild) {
+    throw new Error("Observable Framework or esbuild override differs from the reviewed build-tool closure");
+  }
+  for (const [name, expected] of Object.entries(closure.build_tools)) {
+    const locked = dependencyVersion(lock, name);
+    if (locked !== expected) throw new Error(`${name} build-tool lock version ${locked || "missing"} differs from ${expected}`);
+  }
   const vendorCacheDir = options.vendorCacheDir === null
     ? null
     : options.vendorCacheDir || path.join(root, "site", "vendor", "observable-cache");

@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "registry": "https://crates.io",
+  "patches": [
+    {
+      "crate": "object_store",
+      "upstream_version": "0.13.2",
+      "upstream_checksum_sha256": "622acbc9100d3c10e2ee15804b0caa40e55c933d5aa53814cd520805b7958a49",
+      "path": "vendor/object-store"
+    },
+    {
+      "crate": "polars-utils",
+      "upstream_version": "0.55.2",
+      "upstream_checksum_sha256": "88aa5ed59ba6f52190b3368d3d9536f95c8c2ab161ee08a22bb3f4319a11a9bd",
+      "path": "vendor/polars-utils"
+    }
+  ]
+}

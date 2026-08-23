@@ -21,12 +21,17 @@ function advisoryId(url) {
 
 function loadExceptions(file = process.env.WIKI_ECON_NPM_AUDIT_EXCEPTIONS || DEFAULT_EXCEPTIONS_FILE, today = new Date()) {
   const document = JSON.parse(fs.readFileSync(file, "utf8"));
-  if (document?.schema_version !== 1 || !Array.isArray(document.exceptions)) {
+  if (document?.schema_version !== 2 || !Number.isInteger(document.minimum_expiry_warning_days)
+      || document.minimum_expiry_warning_days < 1 || document.minimum_expiry_warning_days > 365
+      || !Array.isArray(document.exceptions)) {
     throw new Error(`${file}: invalid npm audit exception document`);
   }
   const advisories = new Map();
   const packages = new Set();
   const todayString = today.toISOString().slice(0, 10);
+  const warningBoundary = new Date(today);
+  warningBoundary.setUTCDate(warningBoundary.getUTCDate() + document.minimum_expiry_warning_days);
+  const warningBoundaryString = warningBoundary.toISOString().slice(0, 10);
   for (const exception of document.exceptions) {
     if (!/^GHSA-[a-z0-9-]+$/i.test(exception?.advisory || "")
         || !SEVERITY.has(exception?.severity)
@@ -41,6 +46,9 @@ function loadExceptions(file = process.env.WIKI_ECON_NPM_AUDIT_EXCEPTIONS || DEF
     if (exception.expires_on < todayString) {
       throw new Error(`${file}: exception ${exception.advisory} expired on ${exception.expires_on}`);
     }
+    if (exception.expires_on <= warningBoundaryString) {
+      throw new Error(`${file}: exception ${exception.advisory} expires within ${document.minimum_expiry_warning_days} days on ${exception.expires_on}`);
+    }
     if (advisories.has(exception.advisory)) {
       throw new Error(`${file}: duplicate exception ${exception.advisory}`);
     }
@@ -48,7 +56,7 @@ function loadExceptions(file = process.env.WIKI_ECON_NPM_AUDIT_EXCEPTIONS || DEF
     advisories.set(exception.advisory, normalized);
     for (const name of exception.packages) packages.add(name);
   }
-  return {advisories, packages};
+  return {advisories, packages, minimumExpiryWarningDays: document.minimum_expiry_warning_days};
 }
 
 function validateAuditReport(report, label, policy = loadExceptions()) {
@@ -109,8 +117,7 @@ function main() {
   const root = path.resolve(__dirname, "..");
   const summaries = [auditGraph(root, "workspace")];
   for (const summary of summaries) {
-    const detail = summary.allowedLow.length > 0 ? summary.allowedLow.join(", ") : "none";
-    process.stdout.write(`${summary.label}: no moderate-or-higher advisories; accepted low packages: ${detail}\n`);
+    process.stdout.write(`${summary.label}: no unapproved npm advisories\n`);
   }
 }
 

@@ -32,6 +32,7 @@ function lockedVersion(lock, name) {
 }
 
 function browserVersions(repositoryRoot = root) {
+  const workspace = readJson(path.join(repositoryRoot, "package.json"));
   const site = readJson(path.join(repositoryRoot, "site", "package.json"));
   const lock = readJson(path.join(repositoryRoot, "package-lock.json"));
   const closure = readJson(path.join(repositoryRoot, "config", "site-dependency-closure.json"));
@@ -41,7 +42,54 @@ function browserVersions(repositoryRoot = root) {
     if (locked !== version) throw new Error(`release provenance found ${name}@${locked || "missing"}; expected ${version}`);
     direct[name] = version;
   }
-  return {direct, generated: closure.generated_packages};
+  const buildTools = {};
+  for (const [name, version] of Object.entries(workspace.dependencies || {}).sort(([left], [right]) => left.localeCompare(right))) {
+    const locked = lockedVersion(lock, name);
+    if (locked !== version) throw new Error(`release provenance found ${name}@${locked || "missing"}; expected ${version}`);
+    buildTools[name] = version;
+  }
+  return {build_tools: buildTools, direct, generated: closure.generated_packages};
+}
+
+const SBOMS = {
+  rust_binary: ["wiki-econ-rust-binary.cdx.json", "rust-binary"],
+  toolforge_site_image: ["wiki-econ-toolforge-site-image.cdx.json", "toolforge-site-image-closure"],
+  published_browser_bundle: ["wiki-econ-browser-bundle.cdx.json", "published-browser-bundle"],
+};
+
+function sbomProperty(document, name) {
+  return document?.metadata?.component?.properties?.find((entry) => entry.name === `org.wikimedia.toolforge.wiki-econ.${name}`)?.value || null;
+}
+
+function supplyChainArtifacts(directory, sourceCommit) {
+  if (!directory) throw new Error("supply-chain directory is required");
+  const sboms = {};
+  for (const [key, [name, artifact]] of Object.entries(SBOMS)) {
+    const file = path.join(directory, name);
+    const document = readJson(file);
+    if (document.bomFormat !== "CycloneDX" || document.specVersion !== "1.6"
+        || sbomProperty(document, "artifact") !== artifact
+        || sbomProperty(document, "source-commit") !== sourceCommit
+        || !/^[0-9a-f]{64}$/.test(sbomProperty(document, "artifact-sha256") || "")) {
+      throw new Error(`${name} does not identify ${artifact} at ${sourceCommit}`);
+    }
+    sboms[key] = {file: name, sha256: sha256(file), artifact, artifact_sha256: sbomProperty(document, "artifact-sha256")};
+  }
+  const noticesName = "third-party-notices.json";
+  const noticesFile = path.join(directory, noticesName);
+  const notices = readJson(noticesFile);
+  if (notices.schema_version !== 1 || notices.source_commit !== sourceCommit) throw new Error(`${noticesName} does not match ${sourceCommit}`);
+  const humanName = "THIRD_PARTY_NOTICES.md";
+  const humanFile = path.join(directory, humanName);
+  if (!fs.statSync(humanFile, {throwIfNoEntry: false})?.isFile()) throw new Error(`${humanName} is missing`);
+  return {
+    sbom_format: "CycloneDX 1.6",
+    sboms,
+    notices: {
+      machine_readable: {file: noticesName, sha256: sha256(noticesFile)},
+      human_readable: {file: humanName, sha256: sha256(humanFile)},
+    },
+  };
 }
 
 function systemVersions(binary) {

@@ -3,6 +3,9 @@
 This directory mirrors `object_store 0.13.2` from crates.io and is selected by
 the workspace's `[patch.crates-io]` configuration.
 
+Upstream crate checksum (SHA-256):
+`622acbc9100d3c10e2ee15804b0caa40e55c933d5aa53814cd520805b7958a49`.
+
 ## Why it exists
 
 Polars 0.55 requires `object_store ^0.13.1`. That release line constrains

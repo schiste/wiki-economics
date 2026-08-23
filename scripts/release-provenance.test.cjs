@@ -12,7 +12,7 @@ after(() => fs.rmSync(temporary, {recursive: true, force: true}));
 
 test("browser release provenance is exact and agrees with the npm lock", () => {
   const versions = browserVersions();
-  assert.equal(versions.direct["@observablehq/framework"], "1.13.4");
+  assert.equal(versions.build_tools["@observablehq/framework"], "1.13.4");
   assert.equal(versions.direct["apache-arrow"], "21.2.0");
   assert.equal(versions.direct["parquet-wasm"], "0.7.2");
   assert.equal(versions.generated.d3, "7.9.0");

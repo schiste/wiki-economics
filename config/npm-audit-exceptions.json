@@ -1,15 +1,5 @@
 {
-  "schema_version": 1,
-  "exceptions": [
-    {
-      "advisory": "GHSA-g7r4-m6w7-qqqr",
-      "severity": "low",
-      "packages": [
-        "@observablehq/framework",
-        "esbuild"
-      ],
-      "expires_on": "2026-11-30",
-      "reason": "The advisory affects esbuild's Windows development server. CI and Toolforge build on Linux and do not expose the development server. Remove when Observable Framework accepts esbuild 0.28.1 or later."
-    }
-  ]
+  "schema_version": 2,
+  "minimum_expiry_warning_days": 30,
+  "exceptions": []
 }

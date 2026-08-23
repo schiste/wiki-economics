@@ -23,12 +23,9 @@ const esbuild = {
   via: [{url: "https://github.com/advisories/GHSA-g7r4-m6w7-qqqr"}],
 };
 
-test("the exact Observable esbuild advisory is accepted", () => {
-  const result = validateAuditReport(report({
-    "@observablehq/framework": {severity: "low", via: ["esbuild"]},
-    esbuild,
-  }), "fixture");
-  assert.deepEqual(result.allowedLow, ["@observablehq/framework", "esbuild"]);
+test("a clean report passes with no exceptions", () => {
+  const result = validateAuditReport(report(), "fixture");
+  assert.deepEqual(result.allowedLow, []);
   assert.equal(advisoryId(esbuild.via[0].url), "GHSA-g7r4-m6w7-qqqr");
 });
 
@@ -43,25 +40,26 @@ test("moderate advisories and new low advisories fail closed", () => {
   );
 });
 
-test("auditGraph validates parsed npm output even when npm exits for low findings", () => {
+test("auditGraph rejects npm output even when npm reports only a low finding", () => {
   const runner = (_command, _arguments, options) => {
     assert.equal(options.cwd, "/tmp/graph");
     return {status: 1, stdout: JSON.stringify(report({esbuild})), stderr: ""};
   };
-  assert.deepEqual(auditGraph("/tmp/graph", "fixture", runner), {label: "fixture", allowedLow: ["esbuild"]});
+  assert.throws(() => auditGraph("/tmp/graph", "fixture", runner), /not explicitly allowed/);
 });
 
-test("expired exception documents fail closed", () => {
-  const file = path.join(root, "expired.json");
+test("exception documents fail before expiry enters the warning window", () => {
+  const file = path.join(root, "expiring.json");
   fs.writeFileSync(file, JSON.stringify({
-    schema_version: 1,
+    schema_version: 2,
+    minimum_expiry_warning_days: 30,
     exceptions: [{
       advisory: "GHSA-g7r4-m6w7-qqqr",
       severity: "low",
       packages: ["esbuild"],
-      expires_on: "2026-01-01",
+      expires_on: "2026-09-01",
       reason: "Temporary exception used only by this expiration regression test.",
     }],
   }));
-  assert.throws(() => loadExceptions(file, new Date("2026-08-23T00:00:00Z")), /expired on 2026-01-01/);
+  assert.throws(() => loadExceptions(file, new Date("2026-08-23T00:00:00Z")), /expires within 30 days/);
 });
