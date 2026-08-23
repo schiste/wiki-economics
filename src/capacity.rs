@@ -10,7 +10,7 @@ use crate::compute::{
 };
 use crate::{observability::MemorySnapshot, storage};
 
-const REPORT_SCHEMA_VERSION: u32 = 1;
+const REPORT_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct CapacityBenchmarkReport {
@@ -21,10 +21,12 @@ pub struct CapacityBenchmarkReport {
     pub raw_transient_requirement_bytes: u64,
     pub current_generation_bytes: u64,
     pub estimated_rollover_additional_bytes: u64,
-    pub nfs_quota_bytes: u64,
+    pub storage_capacity_source: String,
+    pub nfs_quota_bytes: Option<u64>,
     pub quota_root_bytes: u64,
-    pub quota_available_bytes: u64,
+    pub quota_available_bytes: Option<u64>,
     pub filesystem_available_bytes: u64,
+    pub storage_reserve_bytes: u64,
     pub effective_available_bytes: u64,
     pub storage_gate_passed: bool,
     pub minimum_memory_headroom_percent: u8,
@@ -45,7 +47,8 @@ pub struct CapacityBenchmarkOptions<'a> {
     pub report_path: &'a Path,
     pub bucket_count: usize,
     pub raw_transient_requirement_bytes: u64,
-    pub nfs_quota_bytes: u64,
+    pub nfs_quota_bytes: Option<u64>,
+    pub storage_reserve_bytes: u64,
     pub minimum_memory_headroom_percent: u8,
     pub telemetry_override: Option<MemorySnapshot>,
 }
@@ -55,10 +58,9 @@ pub fn run(options: CapacityBenchmarkOptions<'_>) -> Result<CapacityBenchmarkRep
         options.minimum_memory_headroom_percent <= 100,
         "minimum memory headroom percent must be at most 100"
     );
-    anyhow::ensure!(
-        options.nfs_quota_bytes > 0,
-        "capacity benchmark requires a verified positive NFS quota"
-    );
+    if let Some(nfs_quota_bytes) = options.nfs_quota_bytes {
+        anyhow::ensure!(nfs_quota_bytes > 0, "configured NFS quota must be positive");
+    }
     anyhow::ensure!(
         options.quota_root.is_dir(),
         "capacity quota root does not exist: {}",
@@ -76,8 +78,21 @@ pub fn run(options: CapacityBenchmarkOptions<'_>) -> Result<CapacityBenchmarkRep
             )
         })?;
     let quota_root_bytes = directory_bytes(options.quota_root)?;
-    let quota_available_bytes = options.nfs_quota_bytes.saturating_sub(quota_root_bytes);
-    let effective_available_bytes = filesystem_available_bytes.min(quota_available_bytes);
+    let quota_available_bytes = options
+        .nfs_quota_bytes
+        .map(|quota| quota.saturating_sub(quota_root_bytes));
+    let (storage_capacity_source, capacity_available_bytes) = match quota_available_bytes {
+        Some(quota_available) => (
+            "minimum_of_configured_quota_and_filesystem".to_string(),
+            filesystem_available_bytes.min(quota_available),
+        ),
+        None => (
+            "shared_filesystem_available".to_string(),
+            filesystem_available_bytes,
+        ),
+    };
+    let effective_available_bytes =
+        capacity_available_bytes.saturating_sub(options.storage_reserve_bytes);
     let current_generation_bytes = active_generation_bytes(options.data_dir, options.wiki)?;
 
     let mut aggregation =
@@ -116,10 +131,12 @@ pub fn run(options: CapacityBenchmarkOptions<'_>) -> Result<CapacityBenchmarkRep
         raw_transient_requirement_bytes: options.raw_transient_requirement_bytes,
         current_generation_bytes,
         estimated_rollover_additional_bytes,
+        storage_capacity_source,
         nfs_quota_bytes: options.nfs_quota_bytes,
         quota_root_bytes,
         quota_available_bytes,
         filesystem_available_bytes,
+        storage_reserve_bytes: options.storage_reserve_bytes,
         effective_available_bytes,
         storage_gate_passed,
         minimum_memory_headroom_percent: options.minimum_memory_headroom_percent,
@@ -320,12 +337,18 @@ mod tests {
             report_path: &report_path,
             bucket_count: 256,
             raw_transient_requirement_bytes: 0,
-            nfs_quota_bytes: 1_000_000_000,
+            nfs_quota_bytes: Some(1_000_000_000),
+            storage_reserve_bytes: 0,
             minimum_memory_headroom_percent: 25,
             telemetry_override: Some(telemetry(50, 100)),
         })?;
         assert!(report.memory_gate_passed);
         assert!(report.storage_gate_passed);
+        assert_eq!(
+            report.storage_capacity_source,
+            "minimum_of_configured_quota_and_filesystem"
+        );
+        assert!(report.quota_available_bytes.is_some());
         assert_eq!(report.observed_memory_headroom_percent, 50.0);
         assert_eq!(report.aggregation.total_edits, 3);
         assert_eq!(report.output_sha256.len(), 64);
@@ -342,7 +365,8 @@ mod tests {
             report_path: &storage_failed_report,
             bucket_count: 256,
             raw_transient_requirement_bytes: 1,
-            nfs_quota_bytes: 1,
+            nfs_quota_bytes: Some(1),
+            storage_reserve_bytes: 0,
             minimum_memory_headroom_percent: 25,
             telemetry_override: Some(telemetry(50, 100)),
         })
@@ -360,7 +384,8 @@ mod tests {
             report_path: &failed_report,
             bucket_count: 256,
             raw_transient_requirement_bytes: 0,
-            nfs_quota_bytes: 1_000_000_000,
+            nfs_quota_bytes: Some(1_000_000_000),
+            storage_reserve_bytes: 0,
             minimum_memory_headroom_percent: 25,
             telemetry_override: Some(telemetry(80, 100)),
         })
@@ -389,27 +414,27 @@ mod tests {
         let reports = TestDir::new()?;
         write_weekly_fixture(data.path(), "frwiki")?;
         let report = reports.path().join("invalid.json");
-        let missing_quota = reports.path().join("missing-quota");
+        let missing_quota_root = reports.path().join("missing-quota-root");
         let missing_scratch = reports.path().join("missing-scratch");
 
         let invalid = [
-            (101, 1_000_000_000, data.path(), scratch.path(), 256),
-            (25, 0, data.path(), scratch.path(), 256),
+            (101, Some(1_000_000_000), data.path(), scratch.path(), 256),
+            (25, Some(0), data.path(), scratch.path(), 256),
             (
                 25,
-                1_000_000_000,
-                missing_quota.as_path(),
+                Some(1_000_000_000),
+                missing_quota_root.as_path(),
                 scratch.path(),
                 256,
             ),
             (
                 25,
-                1_000_000_000,
+                Some(1_000_000_000),
                 data.path(),
                 missing_scratch.as_path(),
                 256,
             ),
-            (25, 1_000_000_000, data.path(), scratch.path(), 128),
+            (25, Some(1_000_000_000), data.path(), scratch.path(), 128),
         ];
         for (minimum_headroom, quota, quota_root, scratch_root, buckets) in invalid {
             let result = run(CapacityBenchmarkOptions {
@@ -422,6 +447,7 @@ mod tests {
                 bucket_count: buckets,
                 raw_transient_requirement_bytes: 0,
                 nfs_quota_bytes: quota,
+                storage_reserve_bytes: 0,
                 minimum_memory_headroom_percent: minimum_headroom,
                 telemetry_override: Some(telemetry(50, 100)),
             });
@@ -437,7 +463,8 @@ mod tests {
             report_path: &report,
             bucket_count: 256,
             raw_transient_requirement_bytes: u64::MAX,
-            nfs_quota_bytes: u64::MAX,
+            nfs_quota_bytes: Some(u64::MAX),
+            storage_reserve_bytes: 0,
             minimum_memory_headroom_percent: 25,
             telemetry_override: Some(telemetry(50, 100)),
         })
@@ -453,7 +480,8 @@ mod tests {
             report_path: &report,
             bucket_count: 256,
             raw_transient_requirement_bytes: 0,
-            nfs_quota_bytes: 1_000_000_000,
+            nfs_quota_bytes: Some(1_000_000_000),
+            storage_reserve_bytes: 0,
             minimum_memory_headroom_percent: 25,
             telemetry_override: Some(MemorySnapshot::default()),
         })
@@ -462,6 +490,32 @@ mod tests {
             missing_telemetry
                 .to_string()
                 .contains("cgroup memory telemetry")
+        );
+
+        let unquotaed_report = reports.path().join("unquotaed.json");
+        let unquotaed = run(CapacityBenchmarkOptions {
+            wiki: "frwiki",
+            data_dir: data.path(),
+            output_dir: output.path(),
+            scratch_root: scratch.path(),
+            quota_root: data.path(),
+            report_path: &unquotaed_report,
+            bucket_count: 256,
+            raw_transient_requirement_bytes: 0,
+            nfs_quota_bytes: None,
+            storage_reserve_bytes: 1024,
+            minimum_memory_headroom_percent: 25,
+            telemetry_override: Some(telemetry(50, 100)),
+        })?;
+        assert_eq!(
+            unquotaed.storage_capacity_source,
+            "shared_filesystem_available"
+        );
+        assert_eq!(unquotaed.nfs_quota_bytes, None);
+        assert_eq!(unquotaed.quota_available_bytes, None);
+        assert_eq!(
+            unquotaed.effective_available_bytes,
+            unquotaed.filesystem_available_bytes.saturating_sub(1024)
         );
         Ok(())
     }

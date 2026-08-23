@@ -23,7 +23,6 @@ esac
 bin_path="${WIKI_ECON_BIN:?WIKI_ECON_BIN is required}"
 data_dir="${WIKI_ECON_DATA_DIR:-/data/project/wiki-economics/data}"
 capacity_root="${WIKI_ECON_CAPACITY_ROOT:-/data/project/wiki-economics/capacity}"
-nfs_quota_bytes="${WIKI_ECON_NFS_QUOTA_BYTES:?Set WIKI_ECON_NFS_QUOTA_BYTES from a confirmed tool-specific quota}"
 run_id="capacity-$(date -u +%Y%m%dT%H%M%SZ)-${bucket_count}-$$"
 output_dir="$capacity_root/output/$run_id"
 scratch_dir="$capacity_root/scratch/$run_id"
@@ -32,6 +31,11 @@ report_path="$capacity_root/reports/$wiki/$run_id.json"
 mkdir -p "$output_dir" "$scratch_dir" "$(dirname "$report_path")"
 export WIKI_ECON_RUN_ID="$run_id"
 export WIKI_ECON_LOG_ANSI=0
+
+quota_args=()
+if [[ -n "${WIKI_ECON_NFS_QUOTA_BYTES:-}" ]]; then
+  quota_args=(--nfs-quota-bytes "$WIKI_ECON_NFS_QUOTA_BYTES")
+fi
 
 echo "=== wiki-economics capacity benchmark start run_id=$run_id wiki=$wiki buckets=$bucket_count ==="
 "$bin_path" \
@@ -43,7 +47,8 @@ echo "=== wiki-economics capacity benchmark start run_id=$run_id wiki=$wiki buck
   --scratch-dir "$scratch_dir" \
   --report "$report_path" \
   --raw-transient-bytes "${WIKI_ECON_FRWIKI_RAW_TRANSIENT_BYTES:-33285996544}" \
-  --nfs-quota-bytes "$nfs_quota_bytes" \
+  "${quota_args[@]}" \
+  --storage-reserve-bytes "${WIKI_ECON_CAPACITY_STORAGE_RESERVE_BYTES:-53687091200}" \
   --quota-root /data/project/wiki-economics \
   --minimum-memory-headroom-percent "${WIKI_ECON_CAPACITY_MIN_HEADROOM_PERCENT:-25}"
 echo "=== wiki-economics capacity benchmark end run_id=$run_id report=$report_path ==="

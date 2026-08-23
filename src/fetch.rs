@@ -43,8 +43,8 @@ const DEFAULT_SNAPSHOT_MAX_LAG_MONTHS: u32 = 2;
 const FETCH_ALGORITHM_VERSION: &str = "wikimedia-history-fetch-v2-marker-aware";
 /// Extra headroom required beyond the summed remote byte total before a
 /// fetch is allowed to start. Not a tight budget — just enough to fail fast
-/// on a clearly undersized quota (e.g. frwiki's ~31GB transient peak against
-/// a small Toolforge NFS allocation) rather than discovering it after
+/// when shared storage lacks enough space for a workload (e.g. frwiki's ~31GB
+/// transient estimate on Toolforge) rather than discovering it after
 /// downloading most of the dump.
 const FETCH_DISK_HEADROOM_MARGIN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// Bzip2 magic bytes ("BZh"). Every valid bz2 file begins with these three

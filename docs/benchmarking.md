@@ -69,10 +69,15 @@ If a change affects ingest, storage layout, or Polars behavior, benchmark with d
 qualify its full imported warehouse under Toolforge's 6 GiB cgroup. Run each
 bucket count in a fresh container so `memory.peak` is isolated per variant:
 
-First obtain the tool-specific NFS quota from a Toolforge administrator and
-set `WIKI_ECON_NFS_QUOTA_BYTES` tool-wide. `df` reports shared mount capacity
-and is not acceptable evidence. The wrapper fails before computation when the
-confirmed quota variable is absent.
+Toolforge's persistent NFS currently has no per-tool quota, as documented by
+the [ToolsNfsAlmostFull runbook](https://wikitech.wikimedia.org/wiki/Portal:Toolforge/Admin/Runbooks/ToolsNfsAlmostFull).
+Leave `WIKI_ECON_NFS_QUOTA_BYTES` unset so the report identifies
+`shared_filesystem_available` as its capacity source. If the platform later
+adds an enforceable tool-specific limit, set that variable and the gate will
+use the smaller of quota headroom and live filesystem free space. The wrapper
+also retains 50 GiB after the estimated rollover requirement by default;
+override `WIKI_ECON_CAPACITY_STORAGE_RESERVE_BYTES` only with documented
+operational justification.
 
 ```sh
 toolforge jobs run --image tool-wiki-economics/tool-wiki-economics:latest \
@@ -92,7 +97,8 @@ Reports are written atomically below
 - reduction, reconciliation, and final RSS/cgroup memory;
 - peak disk-backed scratch bytes and the configured scratch root;
 - current analytical plus warehouse generation bytes;
-- confirmed tool quota, current charged-root usage, and remaining allowance;
+- capacity source, current tool-root usage, live filesystem free space, and
+  optional configured-quota headroom, less the configured safety reserve;
 - the estimated additional rollover requirement: 31 GiB raw transient, one
   replacement generation, peak scratch, and the weekly output;
 - available filesystem bytes and pass/fail storage status;

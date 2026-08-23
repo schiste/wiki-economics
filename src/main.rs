@@ -212,9 +212,13 @@ enum Commands {
         #[arg(long, default_value_t = 33_285_996_544_u64)]
         raw_transient_bytes: u64,
 
-        /// Confirmed tool-specific NFS quota; shared filesystem free space is insufficient
+        /// Optional tool-specific NFS quota when the platform enforces one
         #[arg(long)]
-        nfs_quota_bytes: u64,
+        nfs_quota_bytes: Option<u64>,
+
+        /// Free capacity retained after the estimated rollover requirement
+        #[arg(long, default_value_t = 53_687_091_200_u64)]
+        storage_reserve_bytes: u64,
 
         /// Root whose current usage is charged against the confirmed quota
         #[arg(long)]
@@ -282,7 +286,8 @@ trait Ops {
         report_path: &std::path::Path,
         weekly_buckets: usize,
         raw_transient_bytes: u64,
-        nfs_quota_bytes: u64,
+        nfs_quota_bytes: Option<u64>,
+        storage_reserve_bytes: u64,
         quota_root: &std::path::Path,
         minimum_memory_headroom_percent: u8,
     ) -> Result<()>;
@@ -369,7 +374,8 @@ impl Ops for RealOps {
         report_path: &std::path::Path,
         weekly_buckets: usize,
         raw_transient_bytes: u64,
-        nfs_quota_bytes: u64,
+        nfs_quota_bytes: Option<u64>,
+        storage_reserve_bytes: u64,
         quota_root: &std::path::Path,
         minimum_memory_headroom_percent: u8,
     ) -> Result<()> {
@@ -383,6 +389,7 @@ impl Ops for RealOps {
             bucket_count: weekly_buckets,
             raw_transient_requirement_bytes: raw_transient_bytes,
             nfs_quota_bytes,
+            storage_reserve_bytes,
             minimum_memory_headroom_percent,
             telemetry_override: None,
         })
@@ -610,6 +617,7 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             report,
             raw_transient_bytes,
             nfs_quota_bytes,
+            storage_reserve_bytes,
             quota_root,
             minimum_memory_headroom_percent,
         } => {
@@ -639,6 +647,7 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
                     weekly_buckets,
                     raw_transient_bytes,
                     nfs_quota_bytes,
+                    storage_reserve_bytes,
                     &quota_root,
                     minimum_memory_headroom_percent,
                 )
@@ -1049,16 +1058,20 @@ mod tests {
             report_path: &Path,
             weekly_buckets: usize,
             raw_transient_bytes: u64,
-            nfs_quota_bytes: u64,
+            nfs_quota_bytes: Option<u64>,
+            storage_reserve_bytes: u64,
             quota_root: &Path,
             minimum_memory_headroom_percent: u8,
         ) -> Result<()> {
             self.record(format!(
-                "capacity:{wiki}:{}:{}:{}:{}:{weekly_buckets}:{raw_transient_bytes}:{nfs_quota_bytes}:{}:{minimum_memory_headroom_percent}",
+                "capacity:{wiki}:{}:{}:{}:{}:{weekly_buckets}:{raw_transient_bytes}:{}:{storage_reserve_bytes}:{}:{minimum_memory_headroom_percent}",
                 data_dir.display(),
                 output_dir.display(),
                 scratch_dir.display(),
                 report_path.display(),
+                nfs_quota_bytes
+                    .map(|quota| quota.to_string())
+                    .unwrap_or_else(|| "shared".to_string()),
                 quota_root.display(),
             ));
             Ok(())
@@ -1149,7 +1162,8 @@ mod tests {
             _report_path: &Path,
             _weekly_buckets: usize,
             _raw_transient_bytes: u64,
-            _nfs_quota_bytes: u64,
+            _nfs_quota_bytes: Option<u64>,
+            _storage_reserve_bytes: u64,
             _quota_root: &Path,
             _minimum_memory_headroom_percent: u8,
         ) -> Result<()> {
@@ -1456,7 +1470,7 @@ mod tests {
     }
 
     #[test]
-    fn capacity_bench_cli_requires_explicit_bucket_and_scratch_configuration() -> Result<()> {
+    fn capacity_bench_cli_supports_optional_platform_quota() -> Result<()> {
         let cli = Cli::try_parse_from([
             "wiki-econ",
             "capacity-bench",
@@ -1480,13 +1494,31 @@ mod tests {
                 scratch_dir,
                 report,
                 raw_transient_bytes: 33_285_996_544,
-                nfs_quota_bytes: 100_000_000_000,
+                nfs_quota_bytes: Some(100_000_000_000),
+                storage_reserve_bytes: 53_687_091_200,
                 quota_root,
                 minimum_memory_headroom_percent: 25,
             } if wiki == "frwiki"
                 && scratch_dir == Path::new("/scratch")
                 && report.as_deref() == Some(Path::new("/reports/frwiki-512.json"))
                 && quota_root.as_deref() == Some(Path::new("/tool-root"))
+        ));
+
+        let unquotaed = Cli::try_parse_from([
+            "wiki-econ",
+            "capacity-bench",
+            "frwiki",
+            "--weekly-buckets",
+            "256",
+            "--scratch-dir",
+            "/scratch",
+        ])?;
+        assert!(matches!(
+            unquotaed.command,
+            Commands::CapacityBench {
+                nfs_quota_bytes: None,
+                ..
+            }
         ));
         Ok(())
     }
@@ -1522,7 +1554,8 @@ mod tests {
             report_path: &report_path,
             bucket_count: 256,
             raw_transient_requirement_bytes: 0,
-            nfs_quota_bytes: 1_000_000_000,
+            nfs_quota_bytes: Some(1_000_000_000),
+            storage_reserve_bytes: 0,
             minimum_memory_headroom_percent: 25,
             telemetry_override: Some(observability::MemorySnapshot {
                 rss_bytes: Some(25),
@@ -1543,7 +1576,8 @@ mod tests {
             &native_report,
             256,
             0,
-            1_000_000_000,
+            Some(1_000_000_000),
+            0,
             data.path(),
             25,
         );
@@ -1569,6 +1603,8 @@ mod tests {
             "31000000000",
             "--nfs-quota-bytes",
             "100000000000",
+            "--storage-reserve-bytes",
+            "40000000000",
             "--quota-root",
             "tool-root",
             "--minimum-memory-headroom-percent",
@@ -1581,7 +1617,7 @@ mod tests {
         assert_eq!(
             ops.calls.into_inner(),
             vec![
-                "capacity:frwiki:dataset:capacity-out/capacity/frwiki/weekly-buckets-1024:scratch:capacity-out/capacity/frwiki/weekly-buckets-1024.json:1024:31000000000:100000000000:tool-root:30"
+                "capacity:frwiki:dataset:capacity-out/capacity/frwiki/weekly-buckets-1024:scratch:capacity-out/capacity/frwiki/weekly-buckets-1024.json:1024:31000000000:100000000000:40000000000:tool-root:30"
             ]
         );
         Ok(())
@@ -2145,7 +2181,8 @@ mod tests {
             Path::new("report.json"),
             256,
             0,
-            1,
+            Some(1),
+            0,
             data_dir,
             25,
         )

@@ -8,11 +8,12 @@ reused unmodified.
 
 Toolforge is a materially different platform from Cloud VPS: no root, no
 systemd, no persistent VM. Containers run as Kubernetes Jobs/webservices,
-and storage is NFS-backed under `/data/project/<tool>` with a small default
-quota — do not assume Cloud VPS's storage headroom carries over. Start with
-**nlwiki only** (steady-state ≈2.76GB, first-backfill peak ≈8.71GB); add
-frwiki (steady-state ≈9.8GB, peak ≈31GB) only after a quota increase sized
-off its peak, not its steady-state footprint. enwiki is out of scope for
+and storage is NFS-backed under `/data/project/<tool>`. Toolforge's shared NFS
+currently has no per-tool quota; its free space is shared capacity, not a
+private reservation. Measure live headroom and keep reproducible data bounded.
+nlwiki is the established workload and ptwiki is qualified separately before
+joining its schedule. frwiki (steady-state ≈9.8GB, rollover estimate ≈31GB)
+still requires a measured capacity qualification. enwiki is out of scope for
 Toolforge entirely.
 
 ## Files
@@ -42,8 +43,8 @@ Toolforge entirely.
   buildservice webservice; it is not duplicated as a Toolforge Job.
 - `run-refresh.sh` — wraps `scripts/refresh.sh` for the scheduled job.
   Unlike Cloud VPS's `run-refresh.sh`, this does not keep a `releases/`
-  history: retaining multiple full output generations is expensive against
-  a small NFS quota. Parquet files are written to temporary siblings and
+  history: retaining multiple full output generations consumes shared NFS
+  unnecessarily. Parquet files are written to temporary siblings and
   renamed only after successful completion. The Observable site is built in
   a clean hidden sibling directory, then the stable `site-dist` symlink is
   atomically switched and the prior site release is removed. Raw `.bz2` dump
@@ -63,8 +64,9 @@ Toolforge entirely.
   creates a short-lived two-generation storage peak during rollover.
   `wiki-econ fetch` also
   preflights available disk space against the summed remote dump size
-  before downloading anything, so an undersized quota (e.g. frwiki's ~31GB
-  peak) fails fast instead of after partially downloading a large dump.
+  before downloading anything, so insufficient shared headroom (e.g. for
+  frwiki's ~31GB rollover estimate) fails fast instead of after partially
+  downloading a large dump.
   Every refresh also carries a unique run ID through merge, semantic
   validation, and the two pre-publication receipt checks. The run ID is stored
   in `.refresh-status.json`, `.refresh-history.jsonl`, and
@@ -212,7 +214,7 @@ Reload `deploy/toolforge/jobs.yaml` when the job definition changes. The file
 uses the field names emitted by Toolforge CLI 0.3.9's `jobs dump`; inspect a
 fresh dump when upgrading the CLI. The release artifact and checksum are
 retained in GitHub for 30 days. NFS release directories are deliberately not
-auto-deleted; automatic pruning can turn a quota issue into the loss of a
+auto-deleted; automatic pruning can turn storage pressure into the loss of a
 known-good rollback target.
 
 ### Rollback
@@ -268,8 +270,8 @@ here:
   Phabricator quota-request step, just moves it.
 
 Revisit this if Wikimedia ships a dedicated Toolforge-native integration
-for it — check the object storage user guide linked above for updates
-before assuming NFS quota is still the only lever.
+for it — check the object storage user guide linked above for updates before
+assuming shared NFS is still the only practical persistent-storage option.
 
 ## Open risks worth re-checking before relying on this
 

@@ -4,9 +4,8 @@ set -euo pipefail
 # Refresh wrapper invoked by the `wiki-econ-refresh` Toolforge Job.
 #
 # Unlike deploy/cloud-vps/run-refresh.sh, this does NOT retain a release
-# history for output/site: Toolforge's NFS quota is small (see
-# deploy/toolforge/README.md), and retaining multiple full generations is
-# expensive relative to the benefit. Metric files are atomically replaced,
+# history for output/site: Toolforge NFS is shared and retaining multiple full
+# generations is expensive relative to the benefit. Metric files are atomically replaced,
 # and the site builder atomically switches WIKI_ECON_SITE_DIST_DIR to a clean
 # generated sibling before removing the previous site release.
 #
