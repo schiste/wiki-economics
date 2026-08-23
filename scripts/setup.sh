@@ -144,13 +144,6 @@ install_missing_system_packages() {
     esac
   fi
 
-  if ! have node || ! have npm; then
-    case "$manager" in
-      brew) packages+=("node") ;;
-      apt-get) packages+=("nodejs" "npm") ;;
-    esac
-  fi
-
   if ! have cc; then
     case "$manager" in
       apt-get) packages+=("build-essential") ;;
@@ -191,7 +184,7 @@ ensure_rust_toolchain() {
   source_cargo_env
 
   if ! have rustup || ! have cargo; then
-    say "Rust stable is missing. We'll bring in rustup."
+    say "The pinned Rust toolchain is missing. We'll bring in rustup."
 
     if ! have curl; then
       die "curl is required to install rustup automatically."
@@ -201,14 +194,19 @@ ensure_rust_toolchain() {
       die "Rust is required to build wiki-economics."
     fi
 
-    curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain stable --profile minimal
+    curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain none --profile minimal
     source_cargo_env
   fi
 
   say "Ensuring the Rust toolchain matches the repo."
-  rustup default stable >/dev/null
-  rustup component add rustfmt clippy >/dev/null
-  celebrate "Rust stable, rustfmt, and clippy are ready."
+  rustup toolchain install 1.98.0 --profile minimal --component rustfmt --component clippy >/dev/null
+  celebrate "Rust 1.98.0, rustfmt, and clippy are ready."
+}
+
+verify_runtime_closure() {
+  if ! node "$ROOT/scripts/verify-runtime.cjs"; then
+    die "Install the exact versions from .node-version and package.json (Volta users can run: volta install node@24.15.0 npm@11.12.1)."
+  fi
 }
 
 ensure_command() {
@@ -350,9 +348,10 @@ main() {
   ensure_command python3 "Python 3" \
     "Install via your OS package manager (apt-get install python3, brew install python3, etc.)."
   ensure_command node "Node.js" \
-    "Install Node.js 20+ from https://nodejs.org/ or your package manager."
+    "Install Node.js 24.15.0 (Volta, nvm, mise, or asdf can read the checked-in pin)."
   ensure_command npm "npm" \
-    "npm typically ships with Node.js; reinstall Node.js if missing."
+    "Install npm 11.12.1 (Volta users: volta install npm@11.12.1)."
+  verify_runtime_closure
 
   if [ "$SKIP_QUALITY_TOOLS" -eq 0 ]; then
     say "Installing contributor quality tools."

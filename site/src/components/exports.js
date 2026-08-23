@@ -1,4 +1,4 @@
-import {html} from "npm:htl";
+import {html} from "npm:htl@1.0.0";
 
 /**
  * Convert an array of objects to a CSV string.

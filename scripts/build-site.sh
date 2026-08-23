@@ -94,6 +94,9 @@ case "$site_build_run_id" in
     ;;
 esac
 build_dir="$(mktemp -d "$dist_parent/.${dist_name}.build.${site_build_run_id}.XXXXXX")"
+source_dir="$(mktemp -d "$dist_parent/.${dist_name}.source.${site_build_run_id}.XXXXXX")"
+# prepare-site-source requires a destination that does not yet exist.
+rmdir "$source_dir"
 next_link="$(mktemp "$dist_parent/.${dist_name}.next.XXXXXX")"
 rm -f -- "$next_link"
 legacy_dir="$dist_parent/.${dist_name}.previous.$$"
@@ -102,6 +105,7 @@ cleanup_site_build() {
   local exit_code=$? current_target=""
 
   rm -f -- "$next_link"
+  rm -rf -- "$source_dir"
   if [ -L "$dist_dir" ]; then
     current_target="$(readlink "$dist_dir")"
   fi
@@ -126,7 +130,23 @@ echo "    output dir: $WIKI_ECON_OUTPUT_DIR"
 echo "    dist dir:   $WIKI_ECON_SITE_DIST_DIR"
 echo "    staging:    $build_dir"
 
-(cd "$WIKI_ECON_ROOT" && WIKI_ECON_SITE_DIST_DIR="$build_dir" npm --workspace site run build)
+if [ "${WIKI_ECON_VERIFY_SITE_CLOSURE:-1}" = "1" ]; then
+  node "$ROOT/scripts/prepare-site-source.cjs" \
+    "$WIKI_ECON_SITE_DIR/src" \
+    "$source_dir" \
+    "$WIKI_ECON_OUTPUT_DIR" \
+    "$WIKI_ECON_SITE_DIR/vendor/observable-cache"
+
+  offline_guard="$ROOT/scripts/deny-network.cjs"
+  (cd "$WIKI_ECON_ROOT" && \
+    NODE_OPTIONS="--require=$offline_guard${NODE_OPTIONS:+ $NODE_OPTIONS}" \
+    WIKI_ECON_SITE_SOURCE_DIR="$source_dir" \
+    WIKI_ECON_SITE_DIST_DIR="$build_dir" \
+    npm --workspace site run build)
+  node "$ROOT/scripts/verify-site-dependencies.cjs" "$build_dir"
+else
+  (cd "$WIKI_ECON_ROOT" && WIKI_ECON_SITE_DIST_DIR="$build_dir" npm --workspace site run build)
+fi
 
 if [ ! -f "$build_dir/index.html" ]; then
   echo "Observable build did not produce $build_dir/index.html" >&2

@@ -23,8 +23,6 @@ jobs:
   quality:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
-    env:
-      PYTHON_TEST_DEPENDENCIES: pyarrow
 
     steps:
       - name: Check out repository
@@ -33,8 +31,11 @@ jobs:
       - name: Install Node.js
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
         with:
-          node-version: 22
+          node-version-file: .node-version
           package-manager-cache: false
+
+      - name: Install pinned npm
+        run: npm install --global npm@11.12.1
 
       - name: Install Node dependencies
         run: npm ci
@@ -50,6 +51,9 @@ jobs:
         with:
           workspaces: ". -> target"
           cache-on-failure: true
+
+      - name: Verify exact runtime closure
+        run: node scripts/verify-runtime.cjs
 
       - name: Check shell script syntax
         run: bash -n scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh deploy/toolforge/*.sh
@@ -68,7 +72,13 @@ jobs:
           node --check site/observablehq.config.js
           node --check scripts/check-npm-advisories.cjs
           node --check scripts/build-site-fixture.cjs
+          node --check scripts/deny-network.cjs
           node --check scripts/check-freshness.cjs
+          node --check scripts/prepare-site-source.cjs
+          node --check scripts/release-provenance.cjs
+          node --check scripts/verify-runtime.cjs
+          node --check scripts/verify-site-dependencies.cjs
+          node --check scripts/verify-site-reproducibility.cjs
 
       - name: Run Node unit tests
         run: |
@@ -84,6 +94,10 @@ jobs:
           node --test scripts/check-npm-advisories.test.cjs
           node --test scripts/build-site-fixture.test.cjs
           node --test scripts/check-freshness.test.cjs
+          node --test scripts/prepare-site-source.test.cjs
+          node --test scripts/release-provenance.test.cjs
+          node --test scripts/verify-site-dependencies.test.cjs
+          node --test scripts/verify-site-reproducibility.test.cjs
           node --test scripts/wiki-lifecycle.test.cjs
 
       - name: Check helper CLI entrypoints
@@ -102,11 +116,8 @@ jobs:
       # which subsumes a plain `cargo test`. Running `cargo test` here too
       # would double the wall time without adding signal.
 
-      - name: Check Python scripts
-        run: python3 -m py_compile scripts/fetch_patrol.py scripts/compute_patrol.py scripts/check_lcov.py scripts/test_fetch_patrol.py scripts/test_check_lcov.py
-
-      - name: Install Python test dependencies
-        run: python3 -m pip install --disable-pip-version-check $PYTHON_TEST_DEPENDENCIES
+      - name: Check Python coverage helper
+        run: python3 -m py_compile scripts/check_lcov.py scripts/test_check_lcov.py
 
       - name: Run Python tests
         run: python3 -m unittest discover -s scripts -p 'test_*.py'
@@ -126,8 +137,11 @@ jobs:
       - name: Install Node.js
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
         with:
-          node-version: 22
+          node-version-file: .node-version
           package-manager-cache: false
+
+      - name: Install pinned npm
+        run: npm install --global npm@11.12.1
 
       - name: Clean-install workspace dependencies
         run: npm ci
@@ -149,11 +163,11 @@ jobs:
       - name: Generate deterministic site fixture
         run: cargo run --locked -- --output-dir "$RUNNER_TEMP/wiki-econ-site-data" site-fixture
 
-      - name: Build and verify Observable production site
+      - name: Build twice offline and verify byte reproducibility
         run: >-
-          node scripts/build-site-fixture.cjs
+          node scripts/verify-site-reproducibility.cjs
           --data-dir "$RUNNER_TEMP/wiki-econ-site-data"
-          --dist-dir "$RUNNER_TEMP/wiki-econ-site-dist"
+          --work-dir "$RUNNER_TEMP/wiki-econ-site-reproducibility"
 
   coverage:
     runs-on: ubuntu-24.04
@@ -168,8 +182,11 @@ jobs:
       - name: Install Node.js
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
         with:
-          node-version: 22
+          node-version-file: .node-version
           package-manager-cache: false
+
+      - name: Install pinned npm
+        run: npm install --global npm@11.12.1
 
       - name: Install Node dependencies
         run: npm ci
@@ -214,8 +231,11 @@ jobs:
       - name: Install Node.js
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
         with:
-          node-version: 22
+          node-version-file: .node-version
           package-manager-cache: false
+
+      - name: Install pinned npm
+        run: npm install --global npm@11.12.1
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # @stable as of pin
@@ -271,6 +291,15 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Install Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
+        with:
+          node-version-file: .node-version
+          package-manager-cache: false
+
+      - name: Install pinned npm
+        run: npm install --global npm@11.12.1
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # @stable as of pin
         with:
@@ -299,6 +328,13 @@ jobs:
           target/release/wiki-econ --help >/dev/null
           sha256sum target/release/wiki-econ > target/release/wiki-econ.sha256
 
+      - name: Record release dependency and platform provenance
+        run: |
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$GITHUB_SHA")"
+          node scripts/release-provenance.cjs \
+            --binary target/release/wiki-econ \
+            --output target/release/release-provenance.json
+
       - name: Upload release artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
         with:
@@ -306,5 +342,6 @@ jobs:
           path: |
             target/release/wiki-econ
             target/release/wiki-econ.sha256
+            target/release/release-provenance.json
           if-no-files-found: error
           retention-days: 30

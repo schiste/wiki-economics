@@ -31,7 +31,13 @@ test("built site verification requires every page and hashed attachment", () => 
       fs.writeFileSync(destination, JSON.stringify({
         schema_version: 3,
         license: {spdx_identifier: "MIT"},
-        provenance: {run_id: "fixture"},
+        provenance: {
+          run_id: "fixture",
+          release_environment: {
+            runtime: {node: "24.15.0", npm: "11.12.1", rust: "1.98.0"},
+            browser_packages: {direct: {"apache-arrow": "21.2.0"}},
+          },
+        },
         source_datasets: [{id: "mediawiki_history"}],
         trademark: {status: "No trademark license is recorded"},
         toolforge_open_licensing: {

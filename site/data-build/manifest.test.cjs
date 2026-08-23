@@ -5,9 +5,10 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const {after, test} = require("node:test");
-const {buildManifest, generationSummary, parquetRowCounter, publicationLicensing, safeReceiptOutput} = require("./manifest.json.cjs");
+const {buildManifest, generationSummary, parquetRowCounter, publicationLicensing, releaseProvenance, safeReceiptOutput} = require("./manifest.json.cjs");
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-manifest-"));
+const repositoryRoot = path.resolve(__dirname, "../..");
 after(() => fs.rmSync(root, {recursive: true, force: true}));
 
 const metrics = [
@@ -107,6 +108,10 @@ test("generation readiness follows the pointer and strict ingest receipt without
   assert.equal(manifest.provenance.generating_commit, "a".repeat(40));
   assert.equal(manifest.provenance.generated_at, "2026-08-23T12:00:00Z");
   assert.deepEqual(manifest.provenance.selected_snapshot_versions, {nlwiki: "2026-07"});
+  assert.equal(manifest.provenance.release_environment.runtime.node, "24.15.0");
+  assert.equal(manifest.provenance.release_environment.runtime.npm, "11.12.1");
+  assert.equal(manifest.provenance.release_environment.runtime.rust, "1.98.0");
+  assert.equal(manifest.provenance.release_environment.browser_packages.direct["apache-arrow"], "21.2.0");
   assert.equal(manifest.source_datasets.length, 3);
   assert.match(manifest.attribution, /Wikimedia/);
   assert.match(manifest.trademark.status, /No trademark license is recorded/);
@@ -133,6 +138,19 @@ test("publication licensing policy fails closed when required legal fields drift
   const file = path.join(root, "invalid-publication-licensing.json");
   fs.writeFileSync(file, JSON.stringify({schema_version: 1, license: {spdx_identifier: "MIT"}}));
   assert.throws(() => publicationLicensing(file), /invalid publication licensing policy/);
+});
+
+test("production manifest generation requires valid observed release provenance", () => {
+  assert.throws(() => releaseProvenance(repositoryRoot, {
+    WIKI_ECON_ENV: "production",
+    WIKI_ECON_RELEASE_PROVENANCE_FILE: path.join(root, "missing-release.json"),
+  }), /production release provenance is missing/);
+  const file = path.join(root, "invalid-release.json");
+  fs.writeFileSync(file, JSON.stringify({schema_version: 1}));
+  assert.throws(() => releaseProvenance(repositoryRoot, {
+    WIKI_ECON_ENV: "production",
+    WIKI_ECON_RELEASE_PROVENANCE_FILE: file,
+  }), /invalid or mismatched release provenance/);
 });
 
 test("the production row counter consumes the validated Rust footer map", async () => {

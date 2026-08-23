@@ -25,3 +25,56 @@ SPDX-FileCopyrightText = [
     "2024 NVIDIA CORPORATION & AFFILIATES",
 ]
 SPDX-License-Identifier = "MIT"
+
+# Observable's checked-in offline cache redistributes exact upstream browser
+# modules. More specific entries below override the common ISC license.
+[[annotations]]
+path = [
+    "site/vendor/observable-cache/_observablehq/**",
+    "site/vendor/observable-cache/_npm/**",
+]
+precedence = "closest"
+SPDX-FileCopyrightText = "Upstream authors and contributors"
+SPDX-License-Identifier = "ISC"
+
+[[annotations]]
+path = [
+    "site/vendor/observable-cache/_npm/apache-arrow@*/**",
+    "site/vendor/observable-cache/_npm/flatbuffers@*/**",
+]
+precedence = "closest"
+SPDX-FileCopyrightText = "The Apache Software Foundation and upstream contributors"
+SPDX-License-Identifier = "Apache-2.0"
+
+[[annotations]]
+path = [
+    "site/vendor/observable-cache/_npm/binary-search-bounds@*/**",
+    "site/vendor/observable-cache/_npm/interval-tree-1d@*/**",
+]
+precedence = "closest"
+SPDX-FileCopyrightText = "Upstream authors and contributors"
+SPDX-License-Identifier = "MIT"
+
+[[annotations]]
+path = "site/vendor/observable-cache/_npm/d3-ease@*/**"
+precedence = "closest"
+SPDX-FileCopyrightText = "Upstream authors and contributors"
+SPDX-License-Identifier = "BSD-3-Clause"
+
+[[annotations]]
+path = "site/vendor/observable-cache/_npm/parquet-wasm@*/**"
+precedence = "closest"
+SPDX-FileCopyrightText = "Upstream authors and contributors"
+SPDX-License-Identifier = "MIT OR Apache-2.0"
+
+[[annotations]]
+path = "site/vendor/observable-cache/_npm/robust-predicates@*/**"
+precedence = "closest"
+SPDX-FileCopyrightText = "Upstream authors and contributors"
+SPDX-License-Identifier = "Unlicense"
+
+[[annotations]]
+path = "site/vendor/observable-cache/_npm/tslib@*/**"
+precedence = "closest"
+SPDX-FileCopyrightText = "Microsoft Corporation and upstream contributors"
+SPDX-License-Identifier = "0BSD"

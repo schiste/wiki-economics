@@ -6,6 +6,9 @@ cd "$ROOT"
 SITE_FIXTURE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/wiki-econ-site-ci.XXXXXX")"
 trap 'rm -rf -- "$SITE_FIXTURE_ROOT"' EXIT
 
+echo "==> node scripts/verify-runtime.cjs"
+node scripts/verify-runtime.cjs
+
 echo "==> bash -n scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh deploy/toolforge/*.sh"
 bash -n scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh deploy/toolforge/*.sh
 
@@ -19,6 +22,12 @@ echo "==> node --check site/freshness.cjs scripts/check-freshness.cjs"
 node --check site/freshness.cjs
 node --check scripts/check-freshness.cjs
 node --check scripts/check-npm-advisories.cjs
+node --check scripts/deny-network.cjs
+node --check scripts/prepare-site-source.cjs
+node --check scripts/release-provenance.cjs
+node --check scripts/verify-runtime.cjs
+node --check scripts/verify-site-dependencies.cjs
+node --check scripts/verify-site-reproducibility.cjs
 
 echo "==> node --check site/observablehq.config.js"
 node --check site/observablehq.config.js
@@ -60,6 +69,12 @@ node --test scripts/check-npm-advisories.test.cjs
 echo "==> node --test scripts/build-site-fixture.test.cjs"
 node --test scripts/build-site-fixture.test.cjs
 
+echo "==> dependency closure and reproducibility unit tests"
+node --test scripts/prepare-site-source.test.cjs
+node --test scripts/release-provenance.test.cjs
+node --test scripts/verify-site-dependencies.test.cjs
+node --test scripts/verify-site-reproducibility.test.cjs
+
 echo "==> node --test scripts/wiki-lifecycle.test.cjs"
 node --test scripts/wiki-lifecycle.test.cjs
 
@@ -78,11 +93,11 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 echo "==> cargo test --locked --all-targets --all-features"
 cargo test --locked --all-targets --all-features
 
-echo "==> Generate fixture and build the real Observable production site"
+echo "==> Generate fixture and build the real Observable production site twice offline"
 cargo run --locked -- --output-dir "$SITE_FIXTURE_ROOT/data" site-fixture
-node scripts/build-site-fixture.cjs \
+node scripts/verify-site-reproducibility.cjs \
   --data-dir "$SITE_FIXTURE_ROOT/data" \
-  --dist-dir "$SITE_FIXTURE_ROOT/dist"
+  --work-dir "$SITE_FIXTURE_ROOT/reproducibility"
 
 echo "==> cargo doc --locked --no-deps"
 cargo doc --locked --no-deps
@@ -105,12 +120,9 @@ node scripts/check-npm-advisories.cjs
 echo "==> scripts/check_vendor_patches.sh"
 scripts/check_vendor_patches.sh
 
-echo "==> python3 -m py_compile scripts/fetch_patrol.py scripts/compute_patrol.py scripts/check_lcov.py scripts/test_fetch_patrol.py scripts/test_check_lcov.py"
+echo "==> python3 -m py_compile scripts/check_lcov.py scripts/test_check_lcov.py"
 python3 -m py_compile \
-  scripts/fetch_patrol.py \
-  scripts/compute_patrol.py \
   scripts/check_lcov.py \
-  scripts/test_fetch_patrol.py \
   scripts/test_check_lcov.py
 
 echo "==> python3 -m unittest discover -s scripts -p 'test_*.py'"

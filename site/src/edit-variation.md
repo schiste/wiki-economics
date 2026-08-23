@@ -18,7 +18,7 @@ Current scope: <strong>Dutch Wikipedia only (`nlwiki`)</strong>. The ranking use
 
 ```js
 import * as Inputs from "npm:@observablehq/inputs"
-import {html} from "npm:htl"
+import {html} from "npm:htl@1.0.0"
 import {fmtNum} from "./components/filters.js"
 
 const defaults = await FileAttachment("data/defaults_edit_variation.json").json()

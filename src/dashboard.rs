@@ -1176,6 +1176,10 @@ pub fn write_site_fixture(output_dir: &Path) -> Result<()> {
     }
     materialize(output_dir)?;
     let policy = licensing::publication_policy()?;
+    let root_package: Value = serde_json::from_str(include_str!("../package.json"))?;
+    let site_package: Value = serde_json::from_str(include_str!("../site/package.json"))?;
+    let browser_closure: Value =
+        serde_json::from_str(include_str!("../config/site-dependency-closure.json"))?;
     publish_json_set(
         output_dir,
         &BTreeMap::from([(
@@ -1195,6 +1199,20 @@ pub fn write_site_fixture(output_dir: &Path) -> Result<()> {
                     "generating_commit": licensing::generating_commit(),
                     "generated_at": "2026-01-31T00:00:00Z",
                     "selected_snapshot_versions": {"awiki": "2026-01", "zwiki": "2026-01"},
+                    "release_environment": {
+                        "schema_version": 1,
+                        "source": "deterministic-site-fixture",
+                        "runtime": {
+                            "node": root_package["engines"]["node"],
+                            "npm": root_package["engines"]["npm"],
+                            "rust": env!("CARGO_PKG_RUST_VERSION"),
+                        },
+                        "browser_packages": {
+                            "direct": site_package["dependencies"],
+                            "generated": browser_closure["generated_packages"],
+                        },
+                        "system": {"status": "not-applicable-to-deterministic-fixture"},
+                    },
                 },
                 "data_dir": "fixture",
                 "output_dir": "fixture",

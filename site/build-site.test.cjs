@@ -64,6 +64,7 @@ function runBuild(extraEnv = {}) {
         WIKI_ECON_ROOT: fakeRoot,
         WIKI_ECON_RUN_EVENTS_FILE: stageEvents,
         WIKI_ECON_SITE_DIR: fakeSite,
+        WIKI_ECON_VERIFY_SITE_CLOSURE: "0",
         ...extraEnv,
       },
     },

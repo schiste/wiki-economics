@@ -1,5 +1,5 @@
 import * as Inputs from "npm:@observablehq/inputs";
-import {html} from "npm:htl";
+import {html} from "npm:htl@1.0.0";
 
 /**
  * Convert a YYYY-MM string to a period key based on granularity.

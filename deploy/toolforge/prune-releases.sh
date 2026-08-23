@@ -102,7 +102,7 @@ if [ -d "$incoming_root" ]; then
   for candidate in "$incoming_root"/*.part; do
     [ -f "$candidate" ] && [ ! -L "$candidate" ] || continue
     name="$(basename "$candidate")"
-    [[ "$name" =~ ^[0-9a-f]{40}\.part$ ]] || continue
+    [[ "$name" =~ ^[0-9a-f]{40}(\.provenance)?\.part$ ]] || continue
     modified_epoch="$(mtime_epoch "$candidate")"
     age=$((now_epoch - modified_epoch))
     [ "$age" -ge "$incoming_stale_secs" ] || continue

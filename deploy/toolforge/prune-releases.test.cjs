@@ -51,16 +51,18 @@ test("keeps the live release and two newest complete rollbacks", () => {
   const incoming = path.join(appRoot, "incoming");
   fs.mkdirSync(incoming);
   const stalePart = path.join(incoming, `${"f".repeat(40)}.part`);
+  const staleProvenancePart = path.join(incoming, `${"f".repeat(40)}.provenance.part`);
   const recentPart = path.join(incoming, `${"1".repeat(40)}.part`);
   const unrelatedPart = path.join(incoming, "notes.part");
-  for (const file of [stalePart, recentPart, unrelatedPart]) fs.writeFileSync(file, "partial");
+  for (const file of [stalePart, staleProvenancePart, recentPart, unrelatedPart]) fs.writeFileSync(file, "partial");
   fs.utimesSync(stalePart, new Date(1_000), new Date(1_000));
+  fs.utimesSync(staleProvenancePart, new Date(1_000), new Date(1_000));
 
   const result = run(appRoot, 3, {WIKI_ECON_INCOMING_STALE_SECS: "3600"});
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
   assert.deepEqual(JSON.parse(result.stdout), {
     release_directories: 2,
-    incoming_files: 1,
+    incoming_files: 2,
     retained_releases: 3,
   });
   for (const sha of [currentSha, newestSha, secondSha]) {
@@ -71,6 +73,7 @@ test("keeps the live release and two newest complete rollbacks", () => {
   }
   assert.equal(fs.existsSync(invalid), true);
   assert.equal(fs.existsSync(stalePart), false);
+  assert.equal(fs.existsSync(staleProvenancePart), false);
   assert.equal(fs.existsSync(recentPart), true);
   assert.equal(fs.existsSync(unrelatedPart), true);
   assert.equal(fs.readlinkSync(path.join(appRoot, "current")), path.join("releases", currentSha));

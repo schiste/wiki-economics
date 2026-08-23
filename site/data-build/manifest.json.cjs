@@ -44,6 +44,52 @@ function publicationLicensing(file = path.join(findRoot(), "config", "publicatio
   return policy;
 }
 
+function repositoryRuntimeProvenance(root) {
+  const packageManifest = readJson(path.join(root, "package.json"));
+  const siteManifest = readJson(path.join(root, "site", "package.json"));
+  const closure = readJson(path.join(root, "config", "site-dependency-closure.json"));
+  const rust = fs.readFileSync(path.join(root, "rust-toolchain.toml"), "utf8").match(/channel\s*=\s*"([^"]+)"/)?.[1];
+  return {
+    schema_version: 1,
+    source: "repository-pins",
+    runtime: {node: packageManifest?.engines?.node, npm: packageManifest?.engines?.npm, rust},
+    browser_packages: {
+      direct: siteManifest?.dependencies || {},
+      generated: closure?.generated_packages || {},
+    },
+    system: {status: "not-applicable-to-deterministic-fixture"},
+  };
+}
+
+function releaseProvenance(root, environment) {
+  const binary = environment.WIKI_ECON_BIN;
+  const file = environment.WIKI_ECON_RELEASE_PROVENANCE_FILE
+    || (binary ? path.join(path.dirname(binary), "release-provenance.json") : null);
+  const provenance = file ? readJson(file) : null;
+  if (!provenance) {
+    if (environment.WIKI_ECON_ENV === "production") {
+      throw new Error(`production release provenance is missing: ${file || "WIKI_ECON_RELEASE_PROVENANCE_FILE"}`);
+    }
+    return repositoryRuntimeProvenance(root);
+  }
+  const pins = repositoryRuntimeProvenance(root);
+  const expectedCommit = environment.WIKI_ECON_SOURCE_COMMIT || environment.WIKI_ECON_BUILD_COMMIT;
+  if (provenance.schema_version !== 1
+      || !/^[0-9a-f]{40}$/.test(provenance.source_commit || "")
+      || (expectedCommit && provenance.source_commit !== expectedCommit)
+      || !/^[0-9a-f]{64}$/.test(provenance.binary?.sha256 || "")
+      || provenance.runtime?.node !== pins.runtime.node
+      || provenance.runtime?.npm !== pins.runtime.npm
+      || provenance.runtime?.rust !== pins.runtime.rust
+      || JSON.stringify(provenance.browser_packages?.direct) !== JSON.stringify(pins.browser_packages.direct)
+      || JSON.stringify(provenance.browser_packages?.generated) !== JSON.stringify(pins.browser_packages.generated)
+      || !provenance.system?.packages
+      || Object.keys(provenance.system.packages).length === 0) {
+    throw new Error(`invalid or mismatched release provenance: ${file}`);
+  }
+  return provenance;
+}
+
 function statFile(file) {
   try {
     const stat = fs.statSync(file);
@@ -240,6 +286,7 @@ function discoverWikis(dataDir, outputDir, lifecycle) {
 
 async function buildManifest(options = {}) {
   const root = options.root || findRoot();
+  const repositoryRoot = options.repositoryRoot || findRoot();
   const dataDir = options.dataDir || process.env.WIKI_ECON_DATA_DIR || path.join(root, "data");
   const outputDir = options.outputDir || process.env.WIKI_ECON_OUTPUT_DIR || path.join(root, "output");
   const lifecycleFile = options.lifecycleFile || process.env.WIKI_ECON_WIKI_LIFECYCLE_FILE || path.join(root, "config", "wiki-lifecycle.json");
@@ -315,6 +362,7 @@ async function buildManifest(options = {}) {
       generating_commit: environment.WIKI_ECON_SOURCE_COMMIT || environment.WIKI_ECON_BUILD_COMMIT || null,
       generated_at: generatedAt,
       selected_snapshot_versions: selectedSnapshots,
+      release_environment: releaseProvenance(repositoryRoot, environment),
     },
     data_dir: dataDir,
     output_dir: outputDir,
@@ -337,4 +385,4 @@ if (require.main === module) {
 }
 
 module.exports = {buildManifest, datasetApplies, discoverWikis, generationSummary, humanBytes, parquetRowCounter,
-  patrolSummary, publicationLicensing, safeReceiptOutput};
+  patrolSummary, publicationLicensing, releaseProvenance, repositoryRuntimeProvenance, safeReceiptOutput};
