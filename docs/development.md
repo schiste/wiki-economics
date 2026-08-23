@@ -38,7 +38,7 @@ cargo deny check advisories bans licenses sources
 cargo audit -D warnings
 node scripts/check-npm-advisories.cjs
 scripts/check_vendor_patches.sh
-python3 -m py_compile scripts/fetch_patrol.py scripts/compute_patrol.py scripts/check_lcov.py scripts/test_fetch_patrol.py scripts/test_check_lcov.py
+python3 -m py_compile scripts/check_lcov.py scripts/test_check_lcov.py
 python3 -m unittest discover -s scripts -p 'test_*.py'
 ```
 

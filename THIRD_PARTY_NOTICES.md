@@ -54,12 +54,14 @@ components:
 | Observable Runtime | 6.0.0 | ISC |
 | Observable Plot | 0.6.17 | ISC |
 | D3 | 7.9.0 | ISC |
-| Apache Arrow JavaScript | 21.1.0 | Apache-2.0 |
-| parquet-wasm | 0.7.1 | MIT OR Apache-2.0 |
+| Apache Arrow JavaScript | 21.2.0 | Apache-2.0 |
+| HTL | 1.0.0 | ISC |
+| parquet-wasm | 0.7.2 | MIT OR Apache-2.0 |
 
-The Observable build also includes small transitive browser and build modules.
-Their exact package identities and license declarations are available in the
-npm lockfile and the package manifests installed by `npm ci`.
+The Observable build also includes small transitive browser modules. Their
+exact identities are allowlisted in `config/site-dependency-closure.json`; the
+redistributed offline cache is annotated by upstream license in `REUSE.toml`.
+The current closure deliberately contains no DuckDB asset.
 
 ## License texts
 

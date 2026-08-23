@@ -70,12 +70,13 @@ The pipeline processes data in four stages:
 3. **Compute** — reads one monthly Parquet partition at a time, computes metrics per month. Only cohort tracking, churn rates, and funnel state are carried across months. Outputs per-wiki Parquet files
 4. **Merge** — concatenates per-wiki metric files into combined cross-wiki Parquet files
 
-### Python — patrol pipeline
+### Rust — patrol pipeline
 
-Two scripts handle patrol-specific data that comes from logging dumps rather than revision history:
-
-- `scripts/fetch_patrol.py` — downloads and parses XML logging dumps, extracts patrol events and user rights changes
-- `scripts/compute_patrol.py` — joins patrol logs with revision data to compute latency, coverage, and concentration metrics. Classifies each patrolled revision by author type (registered/anonymous/temporary/bot) and namespace
+`src/patrol.rs` handles patrol-specific logging dumps in the same Rust binary as
+the core pipeline. It parses concatenated multi-member gzip streams, extracts
+patrol and rights events, and computes latency, coverage, and concentration
+metrics. The former PyArrow patrol scripts were removed after their regression
+coverage was represented in Rust.
 
 ### Observable Framework — dashboard
 
@@ -84,12 +85,14 @@ The interactive dashboard is built with [Observable Framework](https://observabl
 Key frontend patterns:
 
 - **Pre-computed defaults** — the Rust merge stage uses Polars to produce deterministic JSON files for the default view of each page. This makes initial page load instant without a native Node database dependency
-- **DuckDB WASM** — when a user changes filters, [DuckDB compiled to WebAssembly](https://duckdb.org/docs/api/wasm/overview) queries Parquet files directly in the browser. The ~34 MB DuckDB runtime is lazy-loaded only when needed
+- **Arrow + Parquet-WASM** — the browser decodes the published Parquet files directly. The production dependency verifier rejects DuckDB modules and extensions, which are not needed by the current query path
 - **Shared filter bar** — a single `filters.js` component provides consistent wiki, user type, namespace, date range, and granularity controls across all pages
 
-### DuckDB — browser query layer
+### Browser query layer
 
-DuckDB-WASM runs SQL queries on Parquet files when users apply non-default filters, enabling interactive exploration without a backend server. Server-side default generation is implemented in Rust and Polars; Node does not install or load native DuckDB bindings.
+Filtering runs over rows decoded by Arrow and Parquet-WASM. Server-side default
+generation remains in Rust and Polars; neither native DuckDB nor DuckDB-WASM is
+distributed by the current production build.
 
 ### Storage layout
 

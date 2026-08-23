@@ -24,6 +24,10 @@ qualification. enwiki is out of scope for Toolforge entirely.
   build-only variable `WIKI_ECON_BUILD_RUST=1` for an emergency manual build.
   Refresh jobs reuse the image's root `node_modules`; production deliberately
   fails instead of running `npm ci` over the network.
+  Root `package.json` pins Node 24.15.0 and npm 11.12.1 exactly; these are the
+  same versions used by CI and local version-manager files. Observable builds
+  copy the reviewed cache under `site/vendor/observable-cache` into a clean
+  source tree and run with network APIs disabled.
 - `.github/workflows/ci.yml` builds the release binary on an x86-64 Ubuntu
   24.04 runner after quality, coverage, and security jobs pass. It validates
   the ELF format, dynamic libraries, and `--help`, uploads a 30-day artifact,
@@ -32,6 +36,9 @@ qualification. enwiki is out of scope for Toolforge entirely.
   `install-binary.sh` as the tool account. Releases live at
   `/data/project/wiki-economics/app/releases/<git-sha>/wiki-econ`; the stable
   runtime path is `/data/project/wiki-economics/app/current/wiki-econ`.
+  Each immutable release also contains `release-provenance.json`, tying the
+  binary checksum to exact Node, npm, Rust, browser-package, lockfile, OS, and
+  shared-library versions observed by CI.
   `prune-releases.sh` verifies checksums and smoke tests before retaining the
   live release plus two known-good rollback releases. It also removes exact-SHA
   interrupted uploads after 24 hours. Both limits are configurable with
@@ -231,7 +238,10 @@ gh run download "$run_id" --repo schiste/wiki-economics \
   --name "wiki-econ-linux-x86_64-$release_sha" --dir "$release_dir"
 chmod +x "$release_dir/wiki-econ"
 TOOLFORGE_SSH_TARGET=login.toolforge.org \
-  deploy/toolforge/deploy-binary.sh "$release_dir/wiki-econ" "$release_sha"
+  deploy/toolforge/deploy-binary.sh \
+    "$release_dir/wiki-econ" \
+    "$release_sha" \
+    "$release_dir/release-provenance.json"
 ```
 
 When site, Node, shared script, or Toolforge deployment files changed, rebuild
