@@ -1057,6 +1057,8 @@ mod tests {
 
         discard_parquet_cache_in_dir(root);
         assert!(files[0].is_file());
+        discard_path_cache(&root.join("missing.parquet"));
+        discard_parquet_cache_in_dir(&files[0]);
         Ok(())
     }
 
