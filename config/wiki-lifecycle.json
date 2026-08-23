@@ -10,8 +10,8 @@
       "labor_churn": { "coverage": "all_published", "minimum_rows_per_wiki": 300 },
       "labor_cohorts": { "coverage": "all_published", "minimum_rows_per_wiki": 200 },
       "labor_monthly": { "coverage": "all_published", "minimum_rows_per_wiki": 5000 },
-      "page_weekly_edits": { "wikis": ["nlwiki"], "minimum_rows_per_wiki": 30000000 },
-      "patrol": { "wikis": ["frwiki", "nlwiki"], "minimum_rows_per_wiki": 5000 }
+      "page_weekly_edits": { "wikis": ["nlwiki", "ptwiki"], "minimum_rows_per_wiki": 30000000 },
+      "patrol": { "wikis": ["frwiki", "nlwiki", "ptwiki"], "minimum_rows_per_wiki": 5000 }
     }
   },
   "wikis": {
@@ -35,9 +35,9 @@
     },
     "ptwiki": {
       "publication": "published",
-      "refresh": "paused",
-      "provenance": "local-import",
-      "imported_cutoff": "2026-03"
+      "refresh": "manual",
+      "provenance": "toolforge",
+      "freshness_sla_days": 10
     },
     "svwiki": {
       "publication": "published",

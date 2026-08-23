@@ -49,7 +49,7 @@ function validRegistry() {
   };
 }
 
-test("production lifecycle preserves imported wikis while scheduling only nlwiki", () => {
+test("production lifecycle stages ptwiki manually while scheduling only nlwiki", () => {
   const registry = loadWikiLifecycle(path.join(__dirname, ".."), {});
   assert.deepEqual(resolveRefreshWikis(registry, {}), ["nlwiki"]);
   assert.deepEqual(
@@ -57,6 +57,13 @@ test("production lifecycle preserves imported wikis while scheduling only nlwiki
     ["elwiki", "frwiki", "nlwiki", "ptwiki", "svwiki"],
   );
   assert.equal(registry.wikis.frwiki.imported_cutoff, "2026-03");
+  assert.equal(registry.wikis.ptwiki.refresh, "manual");
+  assert.equal(registry.wikis.ptwiki.provenance, "toolforge");
+  assert.equal(registry.wikis.ptwiki.imported_cutoff, undefined);
+  assert.deepEqual(
+    resolveRefreshWikis(registry, {WIKI_ECON_REFRESH_WIKIS: "nlwiki ptwiki"}),
+    ["nlwiki", "ptwiki"],
+  );
 });
 
 test("refresh overrides are backward compatible but fail closed on disagreement", () => {
