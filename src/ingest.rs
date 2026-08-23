@@ -425,7 +425,7 @@ fn convert_file_with_chunk_limit(
     Ok(analytical_paths)
 }
 
-fn snapshot_version_from_filename<'a>(filename: &'a str, wiki: &str) -> Option<&'a str> {
+pub(crate) fn snapshot_version_from_filename<'a>(filename: &'a str, wiki: &str) -> Option<&'a str> {
     let snapshot_version = filename.get(..7)?;
     let separator = filename.get(7..)?.strip_prefix('.')?;
     separator.strip_prefix(wiki)?.strip_prefix('.')?;

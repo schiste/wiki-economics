@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use crate::storage;
+use crate::{fetch, ingest, storage};
 
 #[derive(Debug, Default, Serialize)]
 pub struct CleanupReport {
@@ -12,15 +12,23 @@ pub struct CleanupReport {
     pub site_builds: usize,
     pub run_staging_directories: usize,
     pub weekly_scratch_directories: usize,
+    pub capacity_staging_directories: usize,
+    pub validated_raw_dumps: usize,
     pub snapshot_generations: usize,
     pub removed: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CleanupStagingRoots<'a> {
+    pub weekly: Option<&'a Path>,
+    pub capacity: Option<&'a Path>,
 }
 
 pub fn clean_abandoned(
     data_dir: &Path,
     output_dir: &Path,
     site_dist_dir: &Path,
-    scratch_dir: Option<&Path>,
+    staging: CleanupStagingRoots<'_>,
     wikis: &[String],
     current_run_id: Option<&str>,
     minimum_age: Duration,
@@ -30,10 +38,14 @@ pub fn clean_abandoned(
     clean_merge_temporaries(output_dir, current_run_id, minimum_age, now, &mut report)?;
     clean_site_builds(site_dist_dir, current_run_id, minimum_age, now, &mut report)?;
     clean_run_staging(output_dir, current_run_id, minimum_age, now, &mut report)?;
-    if let Some(scratch_dir) = scratch_dir {
+    if let Some(scratch_dir) = staging.weekly {
         clean_weekly_scratch(scratch_dir, current_run_id, minimum_age, now, &mut report)?;
     }
+    if let Some(capacity_dir) = staging.capacity {
+        clean_capacity_staging(capacity_dir, current_run_id, minimum_age, now, &mut report)?;
+    }
     for wiki in wikis {
+        clean_validated_raw_dumps(data_dir, wiki, &mut report)?;
         report.snapshot_generations += storage::clean_stale_inactive_snapshots(
             data_dir,
             wiki,
@@ -44,6 +56,76 @@ pub fn clean_abandoned(
     }
     report.removed.sort();
     Ok(report)
+}
+
+fn clean_validated_raw_dumps(
+    data_dir: &Path,
+    wiki: &str,
+    report: &mut CleanupReport,
+) -> Result<()> {
+    let raw_dir = data_dir.join("raw").join(wiki);
+    for entry in read_dir_if_present(&raw_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let filename = entry.file_name().to_string_lossy().into_owned();
+        let Some(snapshot_version) = ingest::snapshot_version_from_filename(&filename, wiki) else {
+            continue;
+        };
+        if !fetch::build_file_list(wiki, snapshot_version)?
+            .iter()
+            .any(|expected| expected == &filename)
+        {
+            continue;
+        }
+        let source = entry.path();
+        let source_id = ingest::ingest_source_id(&source)?;
+        let analytical_root =
+            storage::snapshot_analytical_wiki_dir(data_dir, wiki, snapshot_version)?;
+        if !storage::marker_manifest_covers_source_in(
+            data_dir,
+            &analytical_root,
+            &source_id,
+            &source,
+        ) {
+            continue;
+        }
+        remove_file(source, &mut report.removed)?;
+        report.validated_raw_dumps += 1;
+    }
+    Ok(())
+}
+
+fn clean_capacity_staging(
+    capacity_root: &Path,
+    current_run_id: Option<&str>,
+    minimum_age: Duration,
+    now: SystemTime,
+    report: &mut CleanupReport,
+) -> Result<()> {
+    for kind in ["output", "scratch"] {
+        for entry in read_dir_if_present(&capacity_root.join(kind))? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(owner) = name.strip_prefix("capacity-") else {
+                continue;
+            };
+            if owner.is_empty()
+                || !owner.bytes().all(is_safe_id_byte)
+                || current_run_id == Some(name.as_str())
+                || !is_expired(&entry.path(), minimum_age, now)?
+            {
+                continue;
+            }
+            remove_dir(entry.path(), &mut report.removed)?;
+            report.capacity_staging_directories += 1;
+        }
+    }
+    Ok(())
 }
 
 fn clean_weekly_scratch(
@@ -227,6 +309,51 @@ fn remove_dir(path: PathBuf, removed: &mut Vec<String>) -> Result<()> {
 mod tests {
     use super::*;
     use crate::test_support::TestDir;
+    use polars::prelude::{Column, DataFrame, ParquetWriter};
+    use std::fs::File;
+
+    fn write_ingested_raw_fixture(
+        data_dir: &Path,
+        wiki: &str,
+        snapshot: &str,
+        filename: &str,
+        source_parent: &Path,
+    ) -> Result<PathBuf> {
+        let source = source_parent.join(filename);
+        source.parent().map(fs::create_dir_all).transpose()?;
+        fs::write(&source, b"validated raw source")?;
+        let source_id = ingest::ingest_source_id(&source)?;
+        let analytical_root = storage::snapshot_analytical_wiki_dir(data_dir, wiki, snapshot)?;
+        let warehouse_root = storage::snapshot_warehouse_wiki_dir(data_dir, wiki, snapshot)?;
+        let mut paths = Vec::new();
+        for root in [&analytical_root, &warehouse_root] {
+            let output = root
+                .join("year=2026/year_month=2026-01")
+                .join(format!("{source_id}.part-00000.parquet"));
+            output.parent().map(fs::create_dir_all).transpose()?;
+            let mut frame = DataFrame::new_infer_height(vec![Column::new("row".into(), [1_i64])])?;
+            ParquetWriter::new(File::create(&output)?).finish(&mut frame)?;
+            paths.push(output);
+        }
+        let (source_size_bytes, source_sha256) = storage::sha256_file(&source)?;
+        storage::write_marker_manifest_in(
+            data_dir,
+            &analytical_root,
+            &source_id,
+            &storage::MarkerManifest {
+                snapshot_version: Some(snapshot.to_string()),
+                source: source.clone(),
+                source_size_bytes,
+                source_sha256,
+                rows: 1,
+                allow_empty: false,
+                analytical_paths: vec![paths[0].clone()],
+                warehouse_paths: vec![paths[1].clone()],
+            },
+        )
+        .expect("strict fixture marker should be writable");
+        Ok(source)
+    }
 
     #[test]
     fn killed_merge_and_site_staging_are_removed_but_live_and_current_are_preserved() -> Result<()>
@@ -257,7 +384,7 @@ mod tests {
             &data,
             &output,
             &dist,
-            None,
+            CleanupStagingRoots::default(),
             &[],
             Some("current-run"),
             Duration::ZERO,
@@ -298,7 +425,7 @@ mod tests {
             &data,
             &output,
             &dist,
-            None,
+            CleanupStagingRoots::default(),
             &["nlwiki".to_string()],
             Some("current-run"),
             Duration::ZERO,
@@ -348,7 +475,7 @@ mod tests {
             &root.path().join("missing-data"),
             &output,
             &dist,
-            None,
+            CleanupStagingRoots::default(),
             &[],
             Some("current-run"),
             Duration::from_secs(86_400),
@@ -443,7 +570,10 @@ mod tests {
             &data,
             &output,
             &dist,
-            Some(root.path().join("scratch").as_path()),
+            CleanupStagingRoots {
+                weekly: Some(root.path().join("scratch").as_path()),
+                capacity: None,
+            },
             &[],
             Some("current-run"),
             Duration::ZERO,
@@ -482,13 +612,147 @@ mod tests {
                 &data,
                 &output,
                 &dist,
-                None,
+                CleanupStagingRoots::default(),
                 &["nlwiki".to_string()],
                 Some("current-run"),
                 Duration::ZERO,
             )
             .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_removes_only_raw_dumps_covered_by_strict_exact_markers() -> Result<()> {
+        let root = TestDir::new()?;
+        let data = root.path().join("data");
+        let output = root.path().join("output");
+        let dist = root.path().join("site/dist");
+        let raw = data.join("raw/nlwiki");
+        fs::create_dir_all(&output)?;
+        fs::create_dir_all(dist.parent().context("site parent")?)?;
+        fs::create_dir_all(&raw)?;
+
+        let valid = write_ingested_raw_fixture(
+            &data,
+            "nlwiki",
+            "2026-07",
+            "2026-07.nlwiki.2001.tsv.bz2",
+            &raw,
+        )
+        .expect("valid raw fixture");
+        let recorded_elsewhere = write_ingested_raw_fixture(
+            &data,
+            "nlwiki",
+            "2026-07",
+            "2026-07.nlwiki.2002.tsv.bz2",
+            &data.join("archive"),
+        )
+        .expect("path-mismatch fixture");
+        let path_mismatch = raw.join("2026-07.nlwiki.2002.tsv.bz2");
+        fs::copy(&recorded_elsewhere, &path_mismatch)?;
+        let missing_marker = raw.join("2026-07.nlwiki.2003.tsv.bz2");
+        fs::write(&missing_marker, b"unvalidated")?;
+        let malformed_marker_source = raw.join("2026-07.nlwiki.2004.tsv.bz2");
+        fs::write(&malformed_marker_source, b"unvalidated")?;
+        let malformed_marker = storage::marker_path_in(
+            &storage::snapshot_analytical_wiki_dir(&data, "nlwiki", "2026-07")?,
+            "2026-07.nlwiki.2004",
+        );
+        malformed_marker
+            .parent()
+            .map(fs::create_dir_all)
+            .transpose()?;
+        fs::write(malformed_marker, b"{")?;
+        let unrelated = raw.join("notes.tsv.bz2");
+        fs::write(&unrelated, b"keep")?;
+        let unexpected = raw.join("2026-07.nlwiki.all-time.tsv.bz2");
+        fs::write(&unexpected, b"keep")?;
+        let unsafe_recorded = write_ingested_raw_fixture(
+            &data,
+            "nlwiki",
+            "2026-07",
+            "2026-07.nlwiki.2005.tsv.bz2",
+            &data.join("unsafe-archive"),
+        )
+        .expect("unsafe-marker fixture");
+        let unsafe_candidate = raw.join("2026-07.nlwiki.2005.tsv.bz2");
+        fs::copy(&unsafe_recorded, &unsafe_candidate)?;
+        let unsafe_marker = storage::marker_path_in(
+            &storage::snapshot_analytical_wiki_dir(&data, "nlwiki", "2026-07")?,
+            "2026-07.nlwiki.2005",
+        );
+        let mut unsafe_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(&unsafe_marker)?)?;
+        unsafe_json["source"]["path"] = serde_json::json!("../unsafe.tsv.bz2");
+        fs::write(&unsafe_marker, serde_json::to_vec(&unsafe_json)?)?;
+        fs::create_dir(raw.join("2026-07.nlwiki.2006.tsv.bz2"))?;
+        let report = clean_abandoned(
+            &data,
+            &output,
+            &dist,
+            CleanupStagingRoots::default(),
+            &["nlwiki".to_string()],
+            Some("current-run"),
+            Duration::ZERO,
+        )
+        .expect("raw recovery cleanup should succeed");
+
+        assert_eq!(report.validated_raw_dumps, 1);
+        assert!(!valid.exists());
+        assert!(path_mismatch.exists());
+        assert!(missing_marker.exists());
+        assert!(malformed_marker_source.exists());
+        assert!(unrelated.exists());
+        assert!(unexpected.exists());
+        assert!(recorded_elsewhere.exists());
+        assert!(unsafe_candidate.exists());
+        assert!(unsafe_recorded.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_reaps_only_owned_expired_capacity_staging() -> Result<()> {
+        let root = TestDir::new()?;
+        let output = root.path().join("output");
+        let dist = root.path().join("site/dist");
+        let capacity = root.path().join("capacity");
+        fs::create_dir_all(&output)?;
+        fs::create_dir_all(dist.parent().context("site parent")?)?;
+        for kind in ["output", "scratch"] {
+            for name in [
+                "capacity-dead",
+                "capacity-current",
+                "unowned",
+                "capacity-bad$id",
+            ] {
+                fs::create_dir_all(capacity.join(kind).join(name))?;
+            }
+            fs::write(capacity.join(kind).join("capacity-file"), b"keep")?;
+        }
+
+        let report = clean_abandoned(
+            &root.path().join("data"),
+            &output,
+            &dist,
+            CleanupStagingRoots {
+                weekly: None,
+                capacity: Some(&capacity),
+            },
+            &[],
+            Some("capacity-current"),
+            Duration::ZERO,
+        )
+        .expect("capacity staging cleanup should succeed");
+
+        assert_eq!(report.capacity_staging_directories, 2);
+        for kind in ["output", "scratch"] {
+            assert!(!capacity.join(kind).join("capacity-dead").exists());
+            assert!(capacity.join(kind).join("capacity-current").exists());
+            assert!(capacity.join(kind).join("unowned").exists());
+            assert!(capacity.join(kind).join("capacity-bad$id").exists());
+            assert!(capacity.join(kind).join("capacity-file").exists());
+        }
         Ok(())
     }
 }

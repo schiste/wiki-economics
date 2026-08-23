@@ -80,6 +80,10 @@ enum Commands {
         #[arg(long)]
         scratch_dir: Option<PathBuf>,
 
+        /// Optional root containing isolated capacity benchmark staging
+        #[arg(long)]
+        capacity_dir: Option<PathBuf>,
+
         /// Wiki database names whose abandoned snapshot generations may be retired
         wikis: Vec<String>,
     },
@@ -463,13 +467,17 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             site_dist_dir,
             minimum_age_secs,
             scratch_dir,
+            capacity_dir,
             wikis,
         } => {
             let report = cleanup::clean_abandoned(
                 &data_dir,
                 &output_dir,
                 &site_dist_dir,
-                scratch_dir.as_deref(),
+                cleanup::CleanupStagingRoots {
+                    weekly: scratch_dir.as_deref(),
+                    capacity: capacity_dir.as_deref(),
+                },
                 &wikis,
                 run_id.as_deref(),
                 Duration::from_secs(minimum_age_secs),
@@ -1973,6 +1981,7 @@ mod tests {
                     site_dist_dir: site_dist,
                     minimum_age_secs: 0,
                     scratch_dir: None,
+                    capacity_dir: None,
                     wikis: Vec::new(),
                 },
             },
@@ -2004,6 +2013,7 @@ mod tests {
                     site_dist_dir: site_dist,
                     minimum_age_secs: 0,
                     scratch_dir: None,
+                    capacity_dir: None,
                     wikis: vec!["nlwiki".to_string()],
                 },
             },

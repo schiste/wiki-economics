@@ -808,6 +808,34 @@ pub fn marker_manifest_is_valid_in(
     Ok(true)
 }
 
+/// Return true only when a strict ingest marker validates and names this exact
+/// source path. Cleanup callers need the path check because a source ID alone
+/// does not prove which raw-file instance the marker covered.
+pub fn marker_manifest_covers_source_in(
+    data_dir: &Path,
+    analytical_root: &Path,
+    source_id: &str,
+    source_path: &Path,
+) -> bool {
+    let marker = marker_path_in(analytical_root, source_id);
+    let stored = match read_stored_marker(&marker) {
+        Ok(Some(stored)) => stored,
+        Ok(None) => return false,
+        Err(error) => {
+            tracing::warn!(path = %marker.display(), error = %error, "invalid ingest marker");
+            return false;
+        }
+    };
+    let stored_source = match checked_stored_path(data_dir, &stored.source.path) {
+        Ok(path) => path,
+        Err(_) => return false,
+    };
+    if stored_source != source_path {
+        return false;
+    }
+    marker_manifest_is_valid_in(data_dir, analytical_root, source_id).unwrap_or(false)
+}
+
 fn read_stored_marker(path: &Path) -> Result<Option<StoredMarkerManifest>> {
     if !path.exists() {
         return Ok(None);
