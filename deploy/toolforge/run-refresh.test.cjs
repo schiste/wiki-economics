@@ -98,6 +98,7 @@ node "$FAKE_RUN_RECORD_HELPER" event completed fake_pipeline "" 10 ""
     WIKI_ECON_SITE_DIST_DIR: siteDist,
     WIKI_ECON_SITE_DIR: path.join(root, "site"),
     WIKI_ECON_SOURCE_COMMIT: "a".repeat(40),
+    WIKI_ECON_TOOLFORGE_APP_ROOT: path.join(root, "app"),
     WIKI_ECON_WIKI_LIFECYCLE_FILE: path.join(repoRoot, "config", "wiki-lifecycle.json"),
     FAKE_RUN_RECORD_HELPER: runRecordHelper,
   };

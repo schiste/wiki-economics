@@ -47,6 +47,12 @@ ssh -o BatchMode=yes "$ssh_target" \
   "become $tool_account bash -s -- '$release_sha' '$checksum' '$staged_binary'" \
   < "$(dirname "$0")/install-binary.sh"
 
+if ! ssh -o BatchMode=yes "$ssh_target" \
+  "become $tool_account bash -s -- '$app_root' '${WIKI_ECON_RELEASE_RETENTION:-3}'" \
+  < "$(dirname "$0")/prune-releases.sh"; then
+  echo "WARNING: release installed, but bounded release cleanup failed" >&2
+fi
+
 stable_binary="$app_root/current/wiki-econ"
 ssh -o BatchMode=yes "$ssh_target" \
   "become $tool_account toolforge envvars create WIKI_ECON_BIN '$stable_binary'"

@@ -397,6 +397,7 @@ declare -a cleanup_cmd=(
   cleanup-stale
   --site-dist-dir "$WIKI_ECON_SITE_DIST_DIR"
   --minimum-age-secs "${WIKI_ECON_STALE_ARTIFACT_SECS:-21600}"
+  --capacity-dir "${WIKI_ECON_CAPACITY_ROOT:-/data/project/wiki-economics/capacity}"
 )
 if [ -n "${WIKI_ECON_SCRATCH_DIR:-}" ]; then
   cleanup_cmd+=(--scratch-dir "$WIKI_ECON_SCRATCH_DIR")
@@ -410,9 +411,22 @@ if ! cleanup_summary="$(RUST_LOG=error "${cleanup_cmd[@]}")"; then
     "$REFRESH_FAILURE_ERROR"
   exit 1
 fi
+if ! release_cleanup_summary="$(
+  "$ROOT/deploy/toolforge/prune-releases.sh" \
+    "${WIKI_ECON_TOOLFORGE_APP_ROOT:-/data/project/wiki-economics/app}" \
+    "${WIKI_ECON_RELEASE_RETENTION:-3}"
+)"; then
+  REFRESH_FAILURE_STAGE=cleanup_stale
+  REFRESH_FAILURE_ERROR="safe binary release cleanup failed"
+  wiki_econ_record_stage_event failed cleanup_stale "" \
+    "$(( ($(date +%s) - CLEANUP_STARTED_EPOCH) * 1000 ))" \
+    "$REFRESH_FAILURE_ERROR"
+  exit 1
+fi
 wiki_econ_record_stage_event completed cleanup_stale "" \
   "$(( ($(date +%s) - CLEANUP_STARTED_EPOCH) * 1000 ))"
 echo "==> Abandoned artifact cleanup: $cleanup_summary"
+echo "==> Binary release cleanup: $release_cleanup_summary"
 declare -a resolve_cmd=(
   "$WIKI_ECON_BIN"
   --data-dir "$WIKI_ECON_DATA_DIR"

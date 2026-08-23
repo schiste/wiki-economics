@@ -45,6 +45,12 @@ node --test deploy/toolforge/run-record.test.cjs
 echo "==> node --test deploy/toolforge/run-refresh.test.cjs"
 node --test deploy/toolforge/run-refresh.test.cjs
 
+echo "==> node --test deploy/toolforge/prune-releases.test.cjs"
+node --test deploy/toolforge/prune-releases.test.cjs
+
+echo "==> node --test deploy/toolforge/run-capacity-benchmark.test.cjs"
+node --test deploy/toolforge/run-capacity-benchmark.test.cjs
+
 echo "==> node --test scripts/check-freshness.test.cjs"
 node --test scripts/check-freshness.test.cjs
 

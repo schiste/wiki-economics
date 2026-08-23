@@ -32,6 +32,10 @@ qualification. enwiki is out of scope for Toolforge entirely.
   `install-binary.sh` as the tool account. Releases live at
   `/data/project/wiki-economics/app/releases/<git-sha>/wiki-econ`; the stable
   runtime path is `/data/project/wiki-economics/app/current/wiki-econ`.
+  `prune-releases.sh` verifies checksums and smoke tests before retaining the
+  live release plus two known-good rollback releases. It also removes exact-SHA
+  interrupted uploads after 24 hours. Both limits are configurable with
+  `WIKI_ECON_RELEASE_RETENTION` and `WIKI_ECON_INCOMING_STALE_SECS`.
 - `rollback-binary.sh` validates a retained release and atomically changes
   `current` without compiling or downloading anything.
 - `rebuild-image.sh` rebuilds only the Toolforge image and restarts continuous
@@ -57,6 +61,11 @@ qualification. enwiki is out of scope for Toolforge entirely.
   other wiki's full pipeline, and through the final merge. It's safe because
   generation-scoped ingest markers validate warehouse/analytical outputs,
   never the raw source file — later refreshes stay idempotent without it.
+  Startup recovery removes a leftover raw source only when its exact path,
+  source hash, expected fetch filename, marker schema, output row totals, and
+  every Parquet footer validate. This closes the crash window between durable
+  marker publication and the normal raw unlink without weakening fail-closed
+  ingestion.
   A new monthly snapshot is written beside the active generation and selected
   atomically; the previous generation is retained through compute, merge, and
   site publication, then `snapshot-finalize` removes it. This intentionally
@@ -66,6 +75,10 @@ qualification. enwiki is out of scope for Toolforge entirely.
   before downloading anything, so insufficient shared headroom (e.g. for
   frwiki's ~31GB rollover estimate) fails fast instead of after partially
   downloading a large dump.
+  Capacity benchmarks retain their compact JSON qualification report but
+  remove isolated output and scratch data on exit. Refresh startup reaps only
+  expired `capacity-*` staging directories, covering hard-killed benchmark
+  pods that cannot run their exit trap.
   Every refresh also carries a unique run ID through merge, semantic
   validation, and the two pre-publication receipt checks. The run ID is stored
   in `.refresh-status.json`, `.refresh-history.jsonl`, and
@@ -237,9 +250,11 @@ test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$release_sha"
 Reload `deploy/toolforge/jobs.yaml` when the job definition changes. The file
 uses the field names emitted by Toolforge CLI 0.3.9's `jobs dump`; inspect a
 fresh dump when upgrading the CLI. The release artifact and checksum are
-retained in GitHub for 30 days. NFS release directories are deliberately not
-auto-deleted; automatic pruning can turn storage pressure into the loss of a
-known-good rollback target.
+retained in GitHub for 30 days. NFS storage is bounded to three
+checksum-verified, smoke-tested releases by default: the live target and two
+rollback candidates. Cleanup fails closed if the live symlink is malformed or
+incomplete and ignores every directory that is not an exact 40-character
+commit SHA.
 
 ### Rollback
 
