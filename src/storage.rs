@@ -1054,6 +1054,9 @@ mod tests {
         let files = collect_parquet_files(root)?;
         assert_eq!(files.len(), 1);
         assert!(files[0].ends_with("part-0.parquet"));
+
+        discard_parquet_cache_in_dir(root);
+        assert!(files[0].is_file());
         Ok(())
     }
 
