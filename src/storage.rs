@@ -10,7 +10,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 #[cfg(target_os = "linux")]
-use std::os::fd::AsRawFd;
+use std::num::NonZeroU64;
 
 pub const ANALYTICAL_DIRNAME: &str = "parquet";
 pub const WAREHOUSE_DIRNAME: &str = "warehouse";
@@ -625,9 +625,7 @@ pub fn sha256_file(path: &Path) -> Result<(u64, String)> {
 /// performance hints: hashing and durability never depend on kernel support.
 #[cfg(target_os = "linux")]
 pub(crate) fn prepare_sequential_read(file: &File) {
-    // SAFETY: `file` owns a valid descriptor for the duration of this call;
-    // offset/length zero apply the advice to the whole file.
-    let _ = unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL) };
+    let _ = rustix::fs::fadvise(file, 0, None, rustix::fs::Advice::Sequential);
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -635,16 +633,12 @@ pub(crate) fn prepare_sequential_read(_file: &File) {}
 
 #[cfg(target_os = "linux")]
 pub(crate) fn discard_file_cache(file: &File, offset: u64, length: u64) {
-    // SAFETY: `file` owns a valid descriptor and these values describe only
-    // advisory byte ranges. A rejected hint has no semantic effect.
-    let _ = unsafe {
-        libc::posix_fadvise(
-            file.as_raw_fd(),
-            offset as libc::off_t,
-            length as libc::off_t,
-            libc::POSIX_FADV_DONTNEED,
-        )
-    };
+    let _ = rustix::fs::fadvise(
+        file,
+        offset,
+        NonZeroU64::new(length),
+        rustix::fs::Advice::DontNeed,
+    );
 }
 
 #[cfg(not(target_os = "linux"))]
