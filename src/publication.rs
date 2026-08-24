@@ -1038,9 +1038,15 @@ pub fn verify(output_dir: &Path, run_id: &str) -> Result<()> {
     let candidate: Candidate = read_json(&output_dir.join(CANDIDATE_FILE))?;
     let receipt: GateReceipt = read_json(&output_dir.join(RECEIPT_FILE))?;
     let policy = licensing::publication_policy()?;
+    // A standalone site build (the on-demand wiki-econ-site Toolforge Job) runs
+    // under its own fresh run ID, separate from whichever compute run last
+    // validated the data. What must hold is that context/candidate/receipt all
+    // agree with EACH OTHER, not that they match this invocation's run ID.
     ensure!(
-        context.run_id == run_id && candidate.run_id == run_id && receipt.run_id == run_id,
-        "publication receipt does not belong to run ID {run_id}"
+        context.run_id == candidate.run_id && candidate.run_id == receipt.run_id,
+        "publication receipt (run {}) does not match run context (run {})",
+        receipt.run_id,
+        context.run_id
     );
     ensure!(
         receipt.schema_version == 3
@@ -1051,7 +1057,7 @@ pub fn verify(output_dir: &Path, run_id: &str) -> Result<()> {
             && receipt.trademark == policy.trademark
             && receipt.privacy == policy.privacy
             && receipt.toolforge_open_licensing == policy.toolforge
-            && receipt.provenance.run_id == run_id
+            && receipt.provenance.run_id == receipt.run_id
             && receipt.provenance.generating_commit == licensing::generating_commit()
             && receipt.provenance.generated_at_unix == receipt.validated_at_unix
             && receipt.provenance.selected_snapshot_versions == receipt.selected_snapshot_versions
@@ -1065,7 +1071,7 @@ pub fn verify(output_dir: &Path, run_id: &str) -> Result<()> {
             artifact.name
         );
     }
-    info!(run_id, "publication receipt verified");
+    info!(run_id, receipt_run_id = %receipt.run_id, "publication receipt verified");
     Ok(())
 }
 
@@ -1325,6 +1331,35 @@ mod tests {
             Some("2026-03")
         );
         assert!(fixture.lifecycle.path().is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn publication_gate_verify_accepts_a_later_standalone_run_id() -> Result<()> {
+        // The on-demand wiki-econ-site Toolforge Job builds the site under its
+        // own fresh run ID, independent of whichever wiki-econ-compute run
+        // last validated the data. verify() must accept that: it only needs
+        // context/candidate/receipt to agree with each other, not with the
+        // run ID of the process calling verify.
+        let fixture = Fixture::new()?;
+        fixture.prepare("run-good")?;
+        validate(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "run-good",
+        )?;
+        verify(fixture.output.path(), "a-later-standalone-site-run")?;
+
+        let receipt: Value = read_json(&fixture.output.path().join(RECEIPT_FILE))?;
+        assert_eq!(receipt["run_id"], "run-good");
+
+        let receipt_path = fixture.output.path().join(RECEIPT_FILE);
+        let mut mismatched_receipt = receipt.clone();
+        mismatched_receipt["run_id"] = Value::String("some-other-run".to_string());
+        atomic_json(&receipt_path, &mismatched_receipt)?;
+        assert!(verify(fixture.output.path(), "a-later-standalone-site-run").is_err());
+        atomic_json(&receipt_path, &receipt)?;
         Ok(())
     }
 
