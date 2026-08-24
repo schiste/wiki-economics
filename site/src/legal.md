@@ -29,8 +29,8 @@ source material remains governed separately as described below.
 
 ## Project license
 
-Everything this project itself wrote — the code, docs, dashboard text and
-charts, and the aggregate datasets it generates — is MIT licensed. In
+Everything this project itself wrote (the code, docs, dashboard text and
+charts, and the aggregate datasets it generates) is MIT licensed. In
 practice that means: reuse it, modify it, ship it commercially, whatever you
 need, as long as you keep the copyright notice. See the
 [full license text](https://github.com/schiste/wiki-economics/blob/main/LICENSE)
@@ -38,7 +38,7 @@ for the exact terms.
 
 That license only covers what we actually own. It doesn't reach into the
 Wikimedia source data the dashboard runs on, the third-party software it's
-built with, anyone's trademarks, or personal information — those are each
+built with, anyone's trademarks, or personal information; those are each
 governed by their own terms, covered in the sections below.
 
 ## Wikimedia sources
