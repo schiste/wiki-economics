@@ -106,6 +106,9 @@ node --test site/browser-cache.test.mjs
 echo "==> node --test scripts/wiki-lifecycle.test.cjs"
 node --test scripts/wiki-lifecycle.test.cjs
 
+echo "==> node --test scripts/wiki-econ-runtime.test.cjs"
+node --test scripts/wiki-econ-runtime.test.cjs
+
 echo "==> ./scripts/build-site.sh --help"
 ./scripts/build-site.sh --help
 

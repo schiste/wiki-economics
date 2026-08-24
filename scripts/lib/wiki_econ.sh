@@ -40,6 +40,71 @@ wiki_econ_init_runtime() {
   export WIKI_ECON_SITE_DIST_DIR
   export WIKI_ECON_SITE_PORT
   export WIKI_ECON_ADMIN_PORT
+
+  wiki_econ_init_binary_provenance
+}
+
+wiki_econ_init_binary_provenance() {
+  if [ -z "${WIKI_ECON_BIN:-}" ]; then
+    return 0
+  fi
+  if [ ! -x "$WIKI_ECON_BIN" ]; then
+    if [ "$WIKI_ECON_ENV" = "production" ]; then
+      echo "Production binary is missing or not executable: $WIKI_ECON_BIN" >&2
+      return 1
+    fi
+    return 0
+  fi
+
+  local binary_dir provenance_file source_commit recorded_binary_sha actual_binary_sha
+  binary_dir="$(cd "$(dirname "$WIKI_ECON_BIN")" && pwd -P)"
+  provenance_file="$binary_dir/release-provenance.json"
+  if [ ! -f "$provenance_file" ]; then
+    if [ "$WIKI_ECON_ENV" = "production" ]; then
+      echo "Production binary has no release provenance: $provenance_file" >&2
+      return 1
+    fi
+    return 0
+  fi
+
+  # The JavaScript template expression is intentionally evaluated by Node,
+  # not expanded by the shell.
+  # shellcheck disable=SC2016
+  read -r source_commit recorded_binary_sha < <(node -e '
+    const fs = require("node:fs");
+    const value = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    process.stdout.write(`${value.source_commit || ""} ${value.binary?.sha256 || ""}\n`);
+  ' "$provenance_file")
+  if [[ ! "$source_commit" =~ ^[0-9a-f]{40}$ || ! "$recorded_binary_sha" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "Production release provenance has invalid commit or binary checksum" >&2
+    return 1
+  fi
+
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual_binary_sha="$(sha256sum "$WIKI_ECON_BIN" | awk '{print $1}')"
+  else
+    actual_binary_sha="$(shasum -a 256 "$WIKI_ECON_BIN" | awk '{print $1}')"
+  fi
+  [ "$actual_binary_sha" = "$recorded_binary_sha" ] || {
+    echo "Production binary checksum does not match release provenance" >&2
+    return 1
+  }
+  [ -z "${WIKI_ECON_SOURCE_COMMIT:-}" ] || [ "$WIKI_ECON_SOURCE_COMMIT" = "$source_commit" ] || {
+    echo "Configured source commit does not match binary provenance" >&2
+    return 1
+  }
+  [ -z "${WIKI_ECON_BINARY_SHA256:-}" ] || [ "$WIKI_ECON_BINARY_SHA256" = "$actual_binary_sha" ] || {
+    echo "Configured binary checksum does not match the deployed binary" >&2
+    return 1
+  }
+  [ -z "${WIKI_ECON_IMAGE_SOURCE_COMMIT:-}" ] || [ "$WIKI_ECON_IMAGE_SOURCE_COMMIT" = "$source_commit" ] || {
+    echo "Binary and image source commits disagree" >&2
+    return 1
+  }
+
+  WIKI_ECON_SOURCE_COMMIT="$source_commit"
+  WIKI_ECON_BINARY_SHA256="$actual_binary_sha"
+  export WIKI_ECON_SOURCE_COMMIT WIKI_ECON_BINARY_SHA256
 }
 
 wiki_econ_print_runtime() {

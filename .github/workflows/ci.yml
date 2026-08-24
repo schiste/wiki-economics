@@ -141,6 +141,7 @@ jobs:
           node --test scripts/browser-performance.test.cjs
           node --test site/browser-cache.test.mjs
           node --test scripts/wiki-lifecycle.test.cjs
+          node --test scripts/wiki-econ-runtime.test.cjs
 
       - name: Check helper CLI entrypoints
         run: |
