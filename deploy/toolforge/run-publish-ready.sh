@@ -24,7 +24,11 @@ export WIKI_ECON_RUN_HISTORY_FILE="$WIKI_ECON_OUTPUT_DIR/.refresh-history.jsonl"
 export WIKI_ECON_RUN_PUBLICATION_FILE="$WIKI_ECON_OUTPUT_DIR/publication-gate.json"
 export WIKI_ECON_RUN_STARTED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 export WIKI_ECON_RUN_START_EPOCH="$(date +%s)"
-export WIKI_ECON_RUN_WIKIS_JSON="$(node -e 'process.stdout.write(JSON.stringify(process.argv.slice(1)))' nlwiki ptwiki frwiki)"
+published_wikis=()
+while IFS= read -r wiki; do
+  [ -n "$wiki" ] && published_wikis+=("$wiki")
+done < <(node "$ROOT/scripts/wiki-lifecycle.cjs" published-wikis)
+export WIKI_ECON_RUN_WIKIS_JSON="$(node -e 'process.stdout.write(JSON.stringify(process.argv.slice(1)))' "${published_wikis[@]}")"
 export WIKI_ECON_RUN_LOG_FILE="$log_dir/$WIKI_ECON_RUN_ID.log"
 export WIKI_ECON_REFRESH_HISTORY_LIMIT="${WIKI_ECON_REFRESH_HISTORY_LIMIT:-104}"
 export WIKI_ECON_SITE_DIST_DIR WIKI_ECON_OUTPUT_DIR
