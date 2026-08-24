@@ -62,6 +62,33 @@ not by this project’s MIT license.
 
 ## Privacy
 
+### Hosting and what this app stores
+
+Wiki Economics runs entirely on
+[Wikimedia Toolforge](https://wikitech.wikimedia.org/wiki/Portal:Toolforge),
+part of Wikimedia Cloud Services, operated by the Wikimedia Foundation. The
+dashboard itself:
+
+- Sets no cookies, runs no analytics, and loads no third-party trackers.
+- Stores a light/dark theme preference only in your browser's own
+  `localStorage`; that preference never leaves your browser.
+- Stores, server-side, only aggregate statistics computed from public
+  Wikimedia data dumps (per-namespace edit counts, editor cohorts, patrol
+  metrics, and similar). It does not collect or store personal information
+  about site visitors.
+- Includes an authenticated operator admin panel used to run the data
+  pipeline; it is not visitor-facing and processes no visitor data.
+
+Toolforge's own infrastructure (web server and ingress logs, SSH access, and
+so on) is governed by the Wikimedia Foundation's own policies, not by this
+project. Toolforge projects adhere to the
+[Wikimedia Privacy Policy](https://foundation.wikimedia.org/wiki/Policy:Privacy_policy);
+see also the
+[Wikimedia Cloud Services Terms of Use](https://wikitech.wikimedia.org/wiki/Wikitech:Cloud_Services_Terms_of_use)
+for how Toolforge itself is operated.
+
+### Reuse of published data
+
 Public availability and copyright licensing do not remove privacy or data
 protection obligations. Reusers must still consider applicable privacy law,
 Wikimedia policies, and the context of any public identifier represented in a
