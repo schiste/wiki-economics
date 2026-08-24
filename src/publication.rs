@@ -1036,6 +1036,10 @@ pub fn verify(output_dir: &Path, run_id: &str) -> Result<()> {
         receipt.run_id,
         context.run_id
     );
+    // receipt.provenance.generating_commit records which build produced this
+    // data; it is not compared against this process's own build commit here,
+    // since an on-demand site build legitimately runs a newer (or older)
+    // binary than whatever last validated the data.
     ensure!(
         receipt.schema_version == 3
             && receipt.license == policy.license
@@ -1046,7 +1050,6 @@ pub fn verify(output_dir: &Path, run_id: &str) -> Result<()> {
             && receipt.privacy == policy.privacy
             && receipt.toolforge_open_licensing == policy.toolforge
             && receipt.provenance.run_id == receipt.run_id
-            && receipt.provenance.generating_commit == licensing::generating_commit()
             && receipt.provenance.generated_at_unix == receipt.validated_at_unix
             && receipt.provenance.selected_snapshot_versions == receipt.selected_snapshot_versions
             && receipt.artifacts == candidate.artifacts,
@@ -1372,6 +1375,32 @@ mod tests {
         atomic_json(&receipt_path, &mismatched_receipt)?;
         assert!(verify(fixture.output.path(), "a-later-standalone-site-run").is_err());
         atomic_json(&receipt_path, &receipt)?;
+        Ok(())
+    }
+
+    #[test]
+    fn publication_gate_verify_accepts_a_receipt_built_by_an_older_commit() -> Result<()> {
+        // A redeployed site binary is very often a newer build than whatever
+        // commit last ran publication-validate. verify() must not require the
+        // receipt's recorded generating_commit to equal this process's own
+        // build commit; that provenance field is informational, not a gate.
+        let fixture = Fixture::new()?;
+        fixture.prepare("run-good")?;
+        let validation = validate(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "run-good",
+        );
+        validation?;
+
+        let receipt_path = fixture.output.path().join(RECEIPT_FILE);
+        let mut receipt: Value = read_json(&receipt_path)?;
+        receipt["provenance"]["generating_commit"] =
+            Value::String("stale-compute-commit".to_string());
+        atomic_json(&receipt_path, &receipt)?;
+
+        verify(fixture.output.path(), "run-good")?;
         Ok(())
     }
 
