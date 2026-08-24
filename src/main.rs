@@ -1739,7 +1739,8 @@ mod tests {
         ])
         .expect("capacity command fixture");
         ParquetWriter::new(fs::File::create(partition.join("part.parquet"))?).finish(&mut frame)?;
-        crate::storage::publish_current_snapshot(data.path(), "frwiki", snapshot)?;
+        crate::storage::write_test_generation_manifest_from_files(data.path(), "frwiki", snapshot)?;
+        crate::storage::publish_test_snapshot_pointer(data.path(), "frwiki", snapshot)?;
         let report_path = reports.path().join("frwiki.json");
 
         execute_capacity_benchmark(capacity::CapacityBenchmarkOptions {

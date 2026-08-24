@@ -306,7 +306,8 @@ fn analytical_lazyframe(wiki: &str, data_dir: &Path) -> Result<LazyFrame> {
         anyhow::bail!("No parquet data for {wiki}. Run `ingest` first.");
     }
 
-    let files = storage::collect_parquet_files(&parquet_dir)?;
+    let files =
+        storage::active_fragment_files(data_dir, wiki, storage::GenerationLayer::Analytical)?;
     if files.is_empty() {
         anyhow::bail!(
             "No parquet files found for {wiki} in {}",
@@ -429,8 +430,7 @@ pub fn load_wiki(wiki: &str, data_dir: &Path) -> Result<DataFrame> {
     Ok(df)
 }
 
-fn load_partition(dir: &Path) -> Result<DataFrame> {
-    let files = storage::collect_parquet_files(dir)?;
+fn load_partition(files: &[PathBuf]) -> Result<DataFrame> {
     let args = ScanArgsParquet {
         cache: true,
         ..Default::default()
@@ -445,8 +445,7 @@ fn load_partition(dir: &Path) -> Result<DataFrame> {
     analytical_projection(df, &schema)
 }
 
-fn warehouse_lazyframe(warehouse_dir: &Path) -> Result<LazyFrame> {
-    let files = storage::collect_parquet_files(warehouse_dir)?;
+fn warehouse_lazyframe(files: &[PathBuf]) -> Result<LazyFrame> {
     let args = ScanArgsParquet {
         cache: true,
         ..Default::default()
@@ -741,8 +740,8 @@ fn compute_page_weekly_edits(
     config: &WeeklyAggregationConfig,
 ) -> Result<Option<WeeklyAggregationReport>> {
     let aggregation_started = Instant::now();
-    let warehouse_dir = storage::active_warehouse_wiki_dir(data_dir, wiki)?;
-    let partitions = storage::collect_partition_specs(&warehouse_dir)?;
+    let partitions =
+        storage::active_partition_specs(data_dir, wiki, storage::GenerationLayer::Warehouse)?;
     if partitions.is_empty() {
         info!(
             wiki = wiki,
@@ -781,7 +780,7 @@ fn compute_page_weekly_edits(
     let mut running_rows: usize = 0;
     for (idx, partition) in partitions.iter().enumerate() {
         let started = Instant::now();
-        let partition_weekly = warehouse_lazyframe(&partition.dir)?
+        let partition_weekly = warehouse_lazyframe(&partition.files)?
             .with_column(
                 col("event_timestamp")
                     .str()
@@ -804,7 +803,9 @@ fn compute_page_weekly_edits(
             config.bucket_count,
         );
         stage_result?;
-        storage::discard_parquet_cache_in_dir(&partition.dir);
+        for file in &partition.files {
+            storage::discard_path_cache(file);
+        }
         let memory = MemorySnapshot::capture();
         reduction_peak.observe(memory, None);
         info!(
@@ -1304,8 +1305,8 @@ pub fn write_output(df: &mut DataFrame, wiki: &str, metric: &str, output_dir: &P
 }
 
 fn compute_all_incremental(wiki: &str, data_dir: &Path, output_dir: &Path) -> Result<()> {
-    let analytical_dir = storage::active_analytical_wiki_dir(data_dir, wiki)?;
-    let partitions = storage::collect_partition_specs(&analytical_dir)?;
+    let partitions =
+        storage::active_partition_specs(data_dir, wiki, storage::GenerationLayer::Analytical)?;
     if partitions.is_empty() {
         let base = load_wiki(wiki, data_dir)?;
         inequality::compute(wiki, &base, output_dir)?;
@@ -1322,7 +1323,7 @@ fn compute_all_incremental(wiki: &str, data_dir: &Path, output_dir: &Path) -> Re
     let mut registered_state = RegisteredState::new();
 
     for partition in partitions {
-        let base = load_partition(&partition.dir)?;
+        let base = load_partition(&partition.files)?;
         let year_month_key = partition
             .year_month
             .split_once('-')
@@ -1339,7 +1340,9 @@ fn compute_all_incremental(wiki: &str, data_dir: &Path, output_dir: &Path) -> Re
         gdp_tier_frames.push(gdp_activity_tiers_frame(&base)?);
         labor_monthly_frames.push(labor_monthly_frame(&base)?);
         registered_state.observe_partition(&base, partition.year, year_month_key)?;
-        storage::discard_parquet_cache_in_dir(&partition.dir);
+        for file in &partition.files {
+            storage::discard_path_cache(file);
+        }
     }
 
     let mut inequality_out = concat_frames(inequality_frames)?;
@@ -1386,19 +1389,16 @@ fn compute_all_incremental(wiki: &str, data_dir: &Path, output_dir: &Path) -> Re
 }
 
 fn compute_stage_inputs(wiki: &str, data_dir: &Path) -> Result<Vec<fingerprint::TrackedPath>> {
-    let analytical = storage::active_analytical_wiki_dir(data_dir, wiki)?;
-    let warehouse = storage::active_warehouse_wiki_dir(data_dir, wiki)?;
-    let mut generation_outputs = Vec::new();
-    for (prefix, root) in [("analytical", &analytical), ("warehouse", &warehouse)] {
-        for path in storage::collect_parquet_files(root)? {
-            let relative = path.strip_prefix(root)?;
-            generation_outputs.push(fingerprint::TrackedPath::new(
-                format!("{prefix}/{}", relative.to_string_lossy()),
-                path,
-            ));
-        }
-    }
     if let Some(snapshot) = storage::current_snapshot_version(data_dir, wiki)? {
+        // Resolving the fragments validates (and, for a pre-manifest
+        // generation, safely migrates) the authoritative allowlist.
+        storage::active_fragment_files(data_dir, wiki, storage::GenerationLayer::Analytical)?;
+        storage::active_fragment_files(data_dir, wiki, storage::GenerationLayer::Warehouse)?;
+        let manifest = storage::generation_manifest_path(data_dir, wiki, &snapshot)?;
+        let generation_outputs = vec![fingerprint::TrackedPath::new(
+            "generation-manifest",
+            manifest,
+        )];
         let receipt = fingerprint::data_stage_receipt_path(data_dir, wiki, &snapshot, "ingest");
         let spec = fingerprint::StageSpec {
             stage: "ingest",
@@ -1411,6 +1411,20 @@ fn compute_stage_inputs(wiki: &str, data_dir: &Path) -> Result<Vec<fingerprint::
                 format!("stage/ingest/{wiki}/{snapshot}"),
                 receipt,
             )]);
+        }
+        return Ok(generation_outputs);
+    }
+
+    let analytical = storage::active_analytical_wiki_dir(data_dir, wiki)?;
+    let warehouse = storage::active_warehouse_wiki_dir(data_dir, wiki)?;
+    let mut generation_outputs = Vec::new();
+    for (prefix, root) in [("analytical", &analytical), ("warehouse", &warehouse)] {
+        for path in storage::collect_parquet_files(root)? {
+            let relative = path.strip_prefix(root)?;
+            generation_outputs.push(fingerprint::TrackedPath::new(
+                format!("{prefix}/{}", relative.to_string_lossy()),
+                path,
+            ));
         }
     }
     let mut inputs = generation_outputs;
@@ -1971,10 +1985,48 @@ mod tests {
                 fs::copy(path, target)?;
             }
         }
-        storage::publish_current_snapshot(data_dir.path(), wiki, version)?;
+        storage::write_test_generation_manifest_from_files(data_dir.path(), wiki, version)?;
+        storage::publish_test_snapshot_pointer(data_dir.path(), wiki, version)?;
+
+        let before_rows = load_wiki(wiki, data_dir.path())?.height();
+        let listed = storage::active_fragment_files(
+            data_dir.path(),
+            wiki,
+            storage::GenerationLayer::Analytical,
+        )
+        .expect("selected analytical fragments should resolve");
+        let unlisted = listed[0].with_file_name("unlisted-but-valid.parquet");
+        fs::copy(&listed[0], &unlisted)?;
+        assert_eq!(load_wiki(wiki, data_dir.path())?.height(), before_rows);
+        let active_again = storage::active_fragment_files(
+            data_dir.path(),
+            wiki,
+            storage::GenerationLayer::Analytical,
+        )
+        .expect("manifest allowlist should remain readable");
+        assert!(!active_again.contains(&unlisted));
 
         let inputs = compute_stage_inputs(wiki, data_dir.path())?;
-        assert!(inputs.len() > 1);
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].identity, "generation-manifest");
+
+        let receipt =
+            fingerprint::data_stage_receipt_path(data_dir.path(), wiki, version, "ingest");
+        fingerprint::record(
+            &receipt,
+            fingerprint::StageSpec {
+                stage: "ingest",
+                scope: wiki,
+                selected_snapshot: Some(version),
+                algorithm_version: crate::ingest::INGEST_ALGORITHM_VERSION,
+            },
+            &inputs,
+            &inputs,
+        )
+        .expect("ingest receipt fixture should record");
+        let reused = compute_stage_inputs(wiki, data_dir.path())?;
+        assert_eq!(reused.len(), 1);
+        assert_eq!(reused[0].identity, "stage/ingest/testwiki/2026-08");
         Ok(())
     }
 
@@ -2412,7 +2464,7 @@ mod tests {
             2024,
             "2024-01",
         );
-        let loaded = load_partition(&jan_dir)?;
+        let loaded = load_partition(&storage::collect_parquet_files(&jan_dir)?)?;
 
         assert_eq!(loaded.height(), 2);
         assert_eq!(loaded.width(), schema::ANALYTICAL_COLUMNS.len());
@@ -2433,7 +2485,7 @@ mod tests {
             2024,
             "2024-01",
         );
-        let loaded = load_partition(&jan_dir)?;
+        let loaded = load_partition(&storage::collect_parquet_files(&jan_dir)?)?;
 
         assert_eq!(loaded.height(), 2);
         assert_eq!(loaded.column("is_minor")?.bool()?.get(0), Some(true));

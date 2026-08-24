@@ -1119,7 +1119,7 @@ mod tests {
             let warehouse = storage::snapshot_warehouse_wiki_dir(data.path(), "nlwiki", "2026-03")?;
             fs::create_dir_all(analytical)?;
             fs::create_dir_all(warehouse)?;
-            storage::publish_current_snapshot(data.path(), "nlwiki", "2026-03")?;
+            storage::publish_test_snapshot_pointer(data.path(), "nlwiki", "2026-03")?;
             let patrol_dir = data.path().join("patrol/nlwiki");
             fs::create_dir_all(&patrol_dir)?;
             write_single_i64(&patrol_dir.join("patrol.parquet"))?;
@@ -1519,7 +1519,7 @@ mod tests {
         let warehouse = storage::snapshot_warehouse_wiki_dir(data.path(), "manualwiki", "2026-03")?;
         fs::create_dir_all(analytical)?;
         fs::create_dir_all(warehouse)?;
-        storage::publish_current_snapshot(data.path(), "manualwiki", "2026-03")?;
+        storage::publish_test_snapshot_pointer(data.path(), "manualwiki", "2026-03")?;
         let manual_context = RunContext {
             schema_version: 1,
             run_id: "manual".to_string(),

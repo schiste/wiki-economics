@@ -1005,7 +1005,8 @@ fn revision_lookup_helpers_cover_search_paths_and_sorting() -> Result<()> {
         collect_nearby_lookup_months(&all_months, &[202600]),
         vec![202600]
     );
-    assert!(load_revision_subset_by_ids_once(&warehouse_dir, &HashSet::new())?.is_empty());
+    let warehouse_files = storage::collect_parquet_files(&warehouse_dir)?;
+    assert!(load_revision_subset_by_ids_once(&warehouse_files, &HashSet::new())?.is_empty());
     assert!(
         load_revision_subset_by_ids_near_pending_months(&all_months, &[], &HashSet::from([201]))?
             .is_empty()
@@ -1030,7 +1031,7 @@ fn revision_lookup_helpers_cover_search_paths_and_sorting() -> Result<()> {
     assert_eq!(early_lookup.len(), 1);
 
     let full_lookup =
-        load_revision_subset_by_ids_once(&warehouse_dir, &HashSet::from([201_i64, 401]))?;
+        load_revision_subset_by_ids_once(&warehouse_files, &HashSet::from([201_i64, 401]))?;
     assert_eq!(
         full_lookup.get(&401).map(|meta| meta.page_namespace),
         Some(2)

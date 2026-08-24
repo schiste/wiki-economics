@@ -3,10 +3,11 @@ use polars::prelude::{ParquetReader, SerReader};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 #[cfg(target_os = "linux")]
@@ -18,14 +19,46 @@ const MARKERS_DIRNAME: &str = "_markers";
 const SNAPSHOTS_DIRNAME: &str = "_snapshots";
 const SNAPSHOT_STATE_DIRNAME: &str = "snapshots";
 const CURRENT_SNAPSHOT_FILENAME: &str = "current-snapshot.json";
+const GENERATION_MANIFEST_FILENAME: &str = "generation-manifest.json";
 const SNAPSHOT_POINTER_SCHEMA_VERSION: u64 = 1;
 const MARKER_SCHEMA_VERSION: u64 = 1;
+const GENERATION_MANIFEST_SCHEMA_VERSION: u64 = 1;
+static GENERATION_MANIFEST_TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct PartitionSpec {
     pub year: i32,
     pub year_month: String,
     pub dir: PathBuf,
+    pub files: Vec<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum GenerationLayer {
+    Analytical,
+    Warehouse,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GenerationFragment {
+    pub(crate) layer: GenerationLayer,
+    pub(crate) source_id: String,
+    pub(crate) path: String,
+    pub(crate) rows: u64,
+    pub(crate) bytes: u64,
+    pub(crate) sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct GenerationManifest {
+    pub(crate) schema_version: u64,
+    pub(crate) wiki: String,
+    pub(crate) snapshot_version: String,
+    pub(crate) source_plan_sha256: String,
+    pub(crate) fragments: Vec<GenerationFragment>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -105,6 +138,19 @@ pub(crate) fn snapshot_pointer_path(data_dir: &Path, wiki: &str) -> PathBuf {
         .join(CURRENT_SNAPSHOT_FILENAME)
 }
 
+pub(crate) fn generation_manifest_path(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot_version: &str,
+) -> Result<PathBuf> {
+    validate_snapshot_version(snapshot_version)?;
+    Ok(data_dir
+        .join(SNAPSHOT_STATE_DIRNAME)
+        .join(wiki)
+        .join(snapshot_version)
+        .join(GENERATION_MANIFEST_FILENAME))
+}
+
 pub(crate) fn validate_snapshot_version(snapshot_version: &str) -> Result<()> {
     let bytes = snapshot_version.as_bytes();
     ensure!(
@@ -165,6 +211,265 @@ pub fn active_warehouse_wiki_dir(data_dir: &Path, wiki: &str) -> Result<PathBuf>
     }
 }
 
+fn fragment_layer_root(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot_version: &str,
+    layer: GenerationLayer,
+) -> Result<PathBuf> {
+    match layer {
+        GenerationLayer::Analytical => {
+            snapshot_analytical_wiki_dir(data_dir, wiki, snapshot_version)
+        }
+        GenerationLayer::Warehouse => snapshot_warehouse_wiki_dir(data_dir, wiki, snapshot_version),
+    }
+}
+
+fn fragment_from_stored_output(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot_version: &str,
+    layer: GenerationLayer,
+    source_id: &str,
+    output: &StoredOutput,
+) -> Result<GenerationFragment> {
+    let path = checked_stored_path(data_dir, &output.path)?;
+    let root = fragment_layer_root(data_dir, wiki, snapshot_version, layer)?;
+    ensure!(
+        path.starts_with(&root) && is_source_output(&path, source_id),
+        "source {source_id} records a fragment outside its immutable {layer:?} generation"
+    );
+    let metadata = fs::metadata(&path)
+        .with_context(|| format!("failed to inspect generation fragment {}", path.display()))?;
+    ensure!(metadata.is_file(), "generation fragment is not a file");
+    let (hashed_bytes, sha256) = sha256_file(&path)?;
+    ensure!(
+        hashed_bytes == metadata.len(),
+        "generation fragment size changed while it was being hashed"
+    );
+    Ok(GenerationFragment {
+        layer,
+        source_id: source_id.to_string(),
+        path: path_to_string(&relative_path(data_dir, &path)?)?,
+        rows: output.rows,
+        bytes: metadata.len(),
+        sha256,
+    })
+}
+
+/// Materialize the complete immutable fragment allowlist after strict source
+/// marker validation. The manifest is content-addressed and atomically
+/// replaced; downstream readers never discover generation data by walking the
+/// filesystem once a snapshot pointer exists.
+pub(crate) fn write_generation_manifest(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot_version: &str,
+) -> Result<PathBuf> {
+    validate_snapshot_generation(data_dir, wiki, snapshot_version)?;
+    let (plan, plan_path) =
+        crate::snapshot_plan::SnapshotPlan::load_or_resolve(data_dir, wiki, snapshot_version)?;
+    let analytical = snapshot_analytical_wiki_dir(data_dir, wiki, snapshot_version)?;
+    let mut fragments = Vec::new();
+    for source in &plan.sources {
+        let marker = marker_path_in(&analytical, &source.source_id);
+        let stored =
+            read_stored_marker(&marker)?.context("generation source marker disappeared")?;
+        let fragment = |layer, output| {
+            fragment_from_stored_output(
+                data_dir,
+                wiki,
+                snapshot_version,
+                layer,
+                &source.source_id,
+                output,
+            )
+        };
+        for output in &stored.analytical_outputs {
+            fragments.push(fragment(GenerationLayer::Analytical, output)?);
+        }
+        for output in &stored.warehouse_outputs {
+            fragments.push(fragment(GenerationLayer::Warehouse, output)?);
+        }
+    }
+    fragments.sort();
+    ensure!(
+        fragments
+            .iter()
+            .map(|fragment| fragment.path.as_str())
+            .collect::<BTreeSet<_>>()
+            .len()
+            == fragments.len(),
+        "generation manifest contains duplicate fragment paths"
+    );
+    let (_, source_plan_sha256) = sha256_file(&plan_path)?;
+    let manifest = GenerationManifest {
+        schema_version: GENERATION_MANIFEST_SCHEMA_VERSION,
+        wiki: wiki.to_string(),
+        snapshot_version: snapshot_version.to_string(),
+        source_plan_sha256,
+        fragments,
+    };
+    let path = generation_manifest_path(data_dir, wiki, snapshot_version)?;
+    let parent = path.parent().context("generation manifest has no parent")?;
+    fs::create_dir_all(parent)?;
+    let mut bytes = serde_json::to_vec_pretty(&manifest)?;
+    bytes.push(b'\n');
+    if path.is_file() {
+        if fs::read(&path)? == bytes {
+            return Ok(path);
+        }
+        ensure!(
+            current_snapshot_version(data_dir, wiki)?.as_deref() != Some(snapshot_version),
+            "selected generation manifest is immutable; build a new candidate generation"
+        );
+    }
+    let temporary = parent.join(format!(
+        ".{GENERATION_MANIFEST_FILENAME}.{}.{}.tmp",
+        std::process::id(),
+        GENERATION_MANIFEST_TEMP_NONCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let write_result = (|| -> Result<()> {
+        let mut file = File::create(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, &path)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result?;
+    Ok(path)
+}
+
+fn validate_generation_manifest(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot_version: &str,
+    manifest: &GenerationManifest,
+) -> Result<()> {
+    ensure!(
+        manifest.schema_version == GENERATION_MANIFEST_SCHEMA_VERSION,
+        "unsupported generation manifest schema"
+    );
+    ensure!(
+        manifest.wiki == wiki && manifest.snapshot_version == snapshot_version,
+        "generation manifest identity mismatch"
+    );
+    let (plan, plan_path) =
+        crate::snapshot_plan::SnapshotPlan::load_or_resolve(data_dir, wiki, snapshot_version)?;
+    let (_, plan_sha256) = sha256_file(&plan_path)?;
+    ensure!(
+        manifest.source_plan_sha256 == plan_sha256,
+        "generation manifest source plan identity changed"
+    );
+    ensure!(
+        !manifest.fragments.is_empty(),
+        "generation manifest has no fragments"
+    );
+    ensure!(
+        manifest.fragments.windows(2).all(|pair| pair[0] < pair[1]),
+        "generation manifest fragments are not unique and deterministically sorted"
+    );
+    let expected_sources: BTreeSet<_> = plan
+        .sources
+        .iter()
+        .map(|source| source.source_id.as_str())
+        .collect();
+    let mut analytical_sources = BTreeSet::new();
+    let mut warehouse_sources = BTreeSet::new();
+    let mut fragment_paths = BTreeSet::new();
+    for fragment in &manifest.fragments {
+        ensure!(
+            fragment_paths.insert(fragment.path.as_str()),
+            "generation manifest contains duplicate fragment paths"
+        );
+        ensure!(
+            fragment.sha256.len() == 64
+                && fragment.sha256.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "generation fragment has an invalid SHA-256"
+        );
+        let path = checked_stored_path(data_dir, &fragment.path)?;
+        let root = fragment_layer_root(data_dir, wiki, snapshot_version, fragment.layer)?;
+        ensure!(
+            path.starts_with(&root) && is_source_output(&path, &fragment.source_id),
+            "generation manifest contains a fragment outside its declared layer or source"
+        );
+        let metadata = fs::metadata(&path)
+            .with_context(|| format!("generation fragment is missing: {}", path.display()))?;
+        ensure!(
+            metadata.is_file() && metadata.len() == fragment.bytes,
+            "generation fragment size changed"
+        );
+        let rows = ParquetReader::new(File::open(&path)?).num_rows()?;
+        ensure!(
+            u64::try_from(rows)? == fragment.rows,
+            "generation fragment row count changed"
+        );
+        match fragment.layer {
+            GenerationLayer::Analytical => analytical_sources.insert(fragment.source_id.as_str()),
+            GenerationLayer::Warehouse => warehouse_sources.insert(fragment.source_id.as_str()),
+        };
+    }
+    ensure!(
+        analytical_sources == expected_sources && warehouse_sources == expected_sources,
+        "generation manifest does not cover every planned source in both layers"
+    );
+    Ok(())
+}
+
+pub(crate) fn read_generation_manifest(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot_version: &str,
+) -> Result<GenerationManifest> {
+    let path = generation_manifest_path(data_dir, wiki, snapshot_version)?;
+    let manifest: GenerationManifest = serde_json::from_slice(
+        &fs::read(&path)
+            .with_context(|| format!("failed to read generation manifest {}", path.display()))?,
+    )
+    .with_context(|| format!("invalid generation manifest JSON in {}", path.display()))?;
+    validate_generation_manifest(data_dir, wiki, snapshot_version, &manifest)?;
+    Ok(manifest)
+}
+
+fn ensure_generation_manifest(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot_version: &str,
+) -> Result<GenerationManifest> {
+    let path = generation_manifest_path(data_dir, wiki, snapshot_version)?;
+    if !path.is_file() {
+        // One-time migration for generations published before manifest-owned
+        // reads were introduced. Strict marker validation runs before writing.
+        write_generation_manifest(data_dir, wiki, snapshot_version)?;
+    }
+    read_generation_manifest(data_dir, wiki, snapshot_version)
+}
+
+pub(crate) fn active_fragment_files(
+    data_dir: &Path,
+    wiki: &str,
+    layer: GenerationLayer,
+) -> Result<Vec<PathBuf>> {
+    let Some(snapshot_version) = current_snapshot_version(data_dir, wiki)? else {
+        let root = match layer {
+            GenerationLayer::Analytical => analytical_wiki_dir(data_dir, wiki),
+            GenerationLayer::Warehouse => warehouse_wiki_dir(data_dir, wiki),
+        };
+        return collect_parquet_files(&root);
+    };
+    let manifest = ensure_generation_manifest(data_dir, wiki, &snapshot_version)?;
+    manifest
+        .fragments
+        .into_iter()
+        .filter(|fragment| fragment.layer == layer)
+        .map(|fragment| checked_stored_path(data_dir, &fragment.path))
+        .collect()
+}
+
 pub fn publish_current_snapshot(data_dir: &Path, wiki: &str, snapshot_version: &str) -> Result<()> {
     validate_snapshot_version(snapshot_version)?;
     let analytical = snapshot_analytical_wiki_dir(data_dir, wiki, snapshot_version)?;
@@ -173,6 +478,18 @@ pub fn publish_current_snapshot(data_dir: &Path, wiki: &str, snapshot_version: &
         analytical.is_dir() && warehouse.is_dir(),
         "cannot publish incomplete snapshot {snapshot_version} for {wiki}"
     );
+    read_generation_manifest(data_dir, wiki, snapshot_version)
+        .context("cannot publish snapshot without a valid generation manifest")?;
+
+    write_current_snapshot_pointer(data_dir, wiki, snapshot_version)
+}
+
+fn write_current_snapshot_pointer(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot_version: &str,
+) -> Result<()> {
+    validate_snapshot_version(snapshot_version)?;
 
     let pointer = snapshot_pointer_path(data_dir, wiki);
     let parent = pointer.parent().context("snapshot pointer has no parent")?;
@@ -201,6 +518,117 @@ pub fn publish_current_snapshot(data_dir: &Path, wiki: &str, snapshot_version: &
     write_result
 }
 
+#[cfg(test)]
+pub(crate) fn publish_test_snapshot_pointer(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot_version: &str,
+) -> Result<()> {
+    let analytical = snapshot_analytical_wiki_dir(data_dir, wiki, snapshot_version)?;
+    let warehouse = snapshot_warehouse_wiki_dir(data_dir, wiki, snapshot_version)?;
+    ensure!(
+        analytical.is_dir() && warehouse.is_dir(),
+        "cannot publish incomplete test snapshot {snapshot_version} for {wiki}"
+    );
+    write_current_snapshot_pointer(data_dir, wiki, snapshot_version)
+}
+
+#[cfg(test)]
+pub(crate) fn write_test_generation_manifest_from_files(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot_version: &str,
+) -> Result<PathBuf> {
+    use polars::prelude::ParquetWriter;
+
+    let (plan, plan_path) =
+        crate::snapshot_plan::SnapshotPlan::load_or_resolve(data_dir, wiki, snapshot_version)?;
+    let first_source = plan.sources.first().context("test source plan is empty")?;
+    let analytical_root = fragment_layer_root(
+        data_dir,
+        wiki,
+        snapshot_version,
+        GenerationLayer::Analytical,
+    )
+    .expect("test analytical generation should resolve");
+    let warehouse_root =
+        fragment_layer_root(data_dir, wiki, snapshot_version, GenerationLayer::Warehouse)?;
+    let existing_analytical = collect_parquet_files(&analytical_root)?;
+    let existing_warehouse = collect_parquet_files(&warehouse_root)?;
+    let template = existing_analytical
+        .first()
+        .or_else(|| existing_warehouse.first())
+        .context("test generation has no Parquet template")?;
+    let mut empty_template = ParquetReader::new(File::open(template)?)
+        .with_slice(Some((0, 0)))
+        .finish()?;
+    let mut fragments = Vec::new();
+    for layer in [GenerationLayer::Analytical, GenerationLayer::Warehouse] {
+        let root = fragment_layer_root(data_dir, wiki, snapshot_version, layer)?;
+        let mut files = collect_parquet_files(&root)?;
+        if files.is_empty() {
+            let destination = month_partition_dir(&root, 2026, "2026-01")
+                .join(format!("{}.part-00000.parquet", first_source.source_id));
+            destination.parent().map(fs::create_dir_all).transpose()?;
+            ParquetWriter::new(File::create(&destination)?).finish(&mut empty_template)?;
+            files.push(destination);
+        }
+        for (index, file) in files.into_iter().enumerate() {
+            let destination = file
+                .parent()
+                .context("test fragment has no parent")?
+                .join(format!(
+                    "{}.part-{index:05}.parquet",
+                    first_source.source_id
+                ));
+            if file != destination {
+                fs::rename(&file, &destination)?;
+            }
+            let rows = ParquetReader::new(File::open(&destination)?).num_rows()?;
+            let (bytes, sha256) = sha256_file(&destination)?;
+            fragments.push(GenerationFragment {
+                layer,
+                source_id: first_source.source_id.clone(),
+                path: path_to_string(&relative_path(data_dir, &destination)?)?,
+                rows: u64::try_from(rows)?,
+                bytes,
+                sha256,
+            });
+        }
+        for source in plan.sources.iter().skip(1) {
+            let destination = month_partition_dir(&root, 2026, "2026-01")
+                .join(format!("{}.part-00000.parquet", source.source_id));
+            destination.parent().map(fs::create_dir_all).transpose()?;
+            ParquetWriter::new(File::create(&destination)?).finish(&mut empty_template)?;
+            let (bytes, sha256) = sha256_file(&destination)?;
+            fragments.push(GenerationFragment {
+                layer,
+                source_id: source.source_id.clone(),
+                path: path_to_string(&relative_path(data_dir, &destination)?)?,
+                rows: 0,
+                bytes,
+                sha256,
+            });
+        }
+    }
+    fragments.sort();
+    let (_, source_plan_sha256) = sha256_file(&plan_path)?;
+    let manifest = GenerationManifest {
+        schema_version: GENERATION_MANIFEST_SCHEMA_VERSION,
+        wiki: wiki.to_string(),
+        snapshot_version: snapshot_version.to_string(),
+        source_plan_sha256,
+        fragments,
+    };
+    let path = generation_manifest_path(data_dir, wiki, snapshot_version)?;
+    path.parent().map(fs::create_dir_all).transpose()?;
+    let mut bytes = serde_json::to_vec_pretty(&manifest)?;
+    bytes.push(b'\n');
+    fs::write(&path, bytes)?;
+    read_generation_manifest(data_dir, wiki, snapshot_version)?;
+    Ok(path)
+}
+
 /// Repair a missing or corrupt current-generation pointer only after the
 /// immutable generation's complete marker/output inventory validates.
 pub fn repair_current_snapshot(
@@ -220,7 +648,12 @@ pub(crate) fn validate_and_publish_snapshot(
     wiki: &str,
     snapshot_version: &str,
 ) -> Result<usize> {
-    let marker_count = validate_snapshot_generation(data_dir, wiki, snapshot_version)?;
+    write_generation_manifest(data_dir, wiki, snapshot_version)?;
+    let marker_count =
+        crate::snapshot_plan::SnapshotPlan::load_or_resolve(data_dir, wiki, snapshot_version)?
+            .0
+            .sources
+            .len();
     publish_current_snapshot(data_dir, wiki, snapshot_version)?;
     Ok(marker_count)
 }
@@ -334,6 +767,14 @@ pub fn retire_inactive_snapshots(data_dir: &Path, wiki: &str) -> Result<usize> {
             }
         }
     }
+    let state_root = data_dir.join(SNAPSHOT_STATE_DIRNAME).join(wiki);
+    for entry in fs::read_dir(&state_root)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() && entry.file_name() != active.as_str() {
+            fs::remove_dir_all(entry.path())?;
+            removed += 1;
+        }
+    }
     Ok(removed)
 }
 
@@ -389,6 +830,20 @@ pub(crate) fn clean_stale_inactive_snapshots(
                 removed_paths.push(path.to_string_lossy().into_owned());
                 removed += 1;
             }
+            let state = data_dir
+                .join(SNAPSHOT_STATE_DIRNAME)
+                .join(wiki)
+                .join(&version);
+            state
+                .is_dir()
+                .then_some(state)
+                .into_iter()
+                .try_for_each(|state| -> Result<()> {
+                    fs::remove_dir_all(&state)?;
+                    removed_paths.push(state.to_string_lossy().into_owned());
+                    removed += 1;
+                    Ok(())
+                })?;
         }
     }
     Ok(removed)
@@ -788,6 +1243,7 @@ pub(crate) fn discard_path_cache(path: &Path) {
 }
 
 /// Release completed Parquet input pages below a partition directory.
+#[cfg(test)]
 pub(crate) fn discard_parquet_cache_in_dir(dir: &Path) {
     if let Ok(files) = collect_parquet_files(dir) {
         for path in files {
@@ -1074,12 +1530,73 @@ fn collect_parquet_files_recursive(root: &Path, files: &mut Vec<PathBuf>) -> Res
 pub fn collect_partition_specs(root: &Path) -> Result<Vec<PartitionSpec>> {
     let mut partitions: BTreeMap<(i32, String), PathBuf> = BTreeMap::new();
     collect_partition_specs_recursive(root, &mut partitions)?;
-    Ok(partitions
-        .into_iter()
-        .map(|((year, year_month), dir)| PartitionSpec {
+    let mut specs = Vec::with_capacity(partitions.len());
+    for ((year, year_month), dir) in partitions {
+        let files = collect_parquet_files(&dir)?;
+        specs.push(PartitionSpec {
             year,
             year_month,
             dir,
+            files,
+        });
+    }
+    Ok(specs)
+}
+
+pub(crate) fn active_partition_specs(
+    data_dir: &Path,
+    wiki: &str,
+    layer: GenerationLayer,
+) -> Result<Vec<PartitionSpec>> {
+    let root = match layer {
+        GenerationLayer::Analytical => active_analytical_wiki_dir(data_dir, wiki)?,
+        GenerationLayer::Warehouse => active_warehouse_wiki_dir(data_dir, wiki)?,
+    };
+    if current_snapshot_version(data_dir, wiki)?.is_none() {
+        return collect_partition_specs(&root);
+    }
+    let files = active_fragment_files(data_dir, wiki, layer)?;
+    let mut partitions: BTreeMap<(i32, String, PathBuf), Vec<PathBuf>> = BTreeMap::new();
+    for file in files {
+        let relative = file
+            .strip_prefix(&root)
+            .context("active generation fragment is outside its layer root")?;
+        let parts: Vec<_> = relative.components().collect();
+        ensure!(
+            parts.len() == 3,
+            "generation fragment has an invalid partition path"
+        );
+        let year = parts[0]
+            .as_os_str()
+            .to_str()
+            .and_then(|value| value.strip_prefix("year="))
+            .and_then(|value| value.parse::<i32>().ok())
+            .with_context(|| format!("invalid fragment year partition: {}", file.display()))?;
+        let year_month = parts[1]
+            .as_os_str()
+            .to_str()
+            .and_then(|value| value.strip_prefix("year_month="))
+            .with_context(|| format!("invalid fragment month partition: {}", file.display()))?
+            .to_string();
+        let dir = file
+            .parent()
+            .context("generation fragment has no parent")?
+            .to_path_buf();
+        partitions
+            .entry((year, year_month, dir))
+            .or_default()
+            .push(file);
+    }
+    Ok(partitions
+        .into_iter()
+        .map(|((year, year_month, dir), mut files)| {
+            files.sort();
+            PartitionSpec {
+                year,
+                year_month,
+                dir,
+                files,
+            }
         })
         .collect())
 }
@@ -1251,7 +1768,7 @@ mod tests {
         let warehouse = snapshot_warehouse_wiki_dir(root, wiki, "2026-07")?;
         fs::create_dir_all(&warehouse)?;
 
-        publish_current_snapshot(root, wiki, "2026-07")?;
+        publish_test_snapshot_pointer(root, wiki, "2026-07")?;
 
         assert_eq!(
             current_snapshot_version(root, wiki)?.as_deref(),
@@ -1331,6 +1848,79 @@ mod tests {
     }
 
     #[test]
+    fn generation_manifest_is_deterministic_authoritative_and_fail_closed() -> Result<()> {
+        let data = TestDir::new()?;
+        let wiki = "testwiki";
+        let snapshot = "2026-08";
+        let (plan, _) =
+            crate::snapshot_plan::SnapshotPlan::load_or_resolve(data.path(), wiki, snapshot)?;
+        let analytical = snapshot_analytical_wiki_dir(data.path(), wiki, snapshot)?;
+        write_test_marker_in(data.path(), &analytical, &plan.sources[0].source_id)?;
+
+        let manifest_path = write_generation_manifest(data.path(), wiki, snapshot)?;
+        let first_bytes = fs::read(&manifest_path)?;
+        write_generation_manifest(data.path(), wiki, snapshot)?;
+        assert_eq!(fs::read(&manifest_path)?, first_bytes);
+        let manifest = read_generation_manifest(data.path(), wiki, snapshot)?;
+        assert_eq!(manifest.fragments.len(), 2);
+        assert!(manifest.fragments.iter().all(|fragment| {
+            fragment.bytes > 0 && fragment.sha256.len() == 64 && fragment.rows == 1
+        }));
+
+        publish_current_snapshot(data.path(), wiki, snapshot)?;
+        fs::write(&manifest_path, b"{}\n")?;
+        let immutable = write_generation_manifest(data.path(), wiki, snapshot)
+            .expect_err("selected manifest must not be replaced with different bytes");
+        assert!(immutable.to_string().contains("immutable"));
+        fs::write(&manifest_path, &first_bytes)?;
+        let listed = active_fragment_files(data.path(), wiki, GenerationLayer::Analytical)?;
+        let stray =
+            listed[0].with_file_name(format!("{}.part-99999.parquet", plan.sources[0].source_id));
+        fs::copy(&listed[0], &stray)?;
+        assert_eq!(
+            active_fragment_files(data.path(), wiki, GenerationLayer::Analytical)?,
+            listed
+        );
+
+        fs::write(&manifest_path, b"{truncated")?;
+        assert!(active_fragment_files(data.path(), wiki, GenerationLayer::Analytical).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn pre_manifest_generation_migrates_strictly_and_failed_commit_cleans_staging() -> Result<()> {
+        let data = TestDir::new()?;
+        let wiki = "testwiki";
+        let snapshot = "2026-08";
+        let (plan, _) =
+            crate::snapshot_plan::SnapshotPlan::load_or_resolve(data.path(), wiki, snapshot)?;
+        let analytical = snapshot_analytical_wiki_dir(data.path(), wiki, snapshot)?;
+        write_test_marker_in(data.path(), &analytical, &plan.sources[0].source_id)?;
+        publish_test_snapshot_pointer(data.path(), wiki, snapshot)?;
+        let manifest = generation_manifest_path(data.path(), wiki, snapshot)?;
+        assert!(!manifest.exists());
+
+        assert_eq!(
+            active_fragment_files(data.path(), wiki, GenerationLayer::Warehouse)?.len(),
+            1
+        );
+        assert!(manifest.is_file());
+
+        fs::remove_file(&manifest)?;
+        fs::create_dir(&manifest)?;
+        assert!(write_generation_manifest(data.path(), wiki, snapshot).is_err());
+        let parent = manifest.parent().context("manifest parent")?;
+        assert!(fs::read_dir(parent)?.all(|entry| {
+            !entry
+                .expect("manifest staging entry")
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn failed_snapshot_pointer_write_cleans_temporary_file() -> Result<()> {
         let temp_dir = TestDir::new()?;
         let root = temp_dir.path();
@@ -1346,7 +1936,7 @@ mod tests {
         ));
         fs::create_dir(&temp)?;
 
-        assert!(publish_current_snapshot(root, wiki, "2026-07").is_err());
+        assert!(publish_test_snapshot_pointer(root, wiki, "2026-07").is_err());
         assert!(temp.is_dir());
         assert!(!pointer.exists());
         Ok(())
@@ -1371,7 +1961,7 @@ mod tests {
             fs::create_dir_all(layer.join(MARKERS_DIRNAME))?;
             fs::write(layer.join("keep.txt"), b"not snapshot data")?;
         }
-        publish_current_snapshot(root, wiki, "2026-07")?;
+        publish_test_snapshot_pointer(root, wiki, "2026-07")?;
 
         assert_eq!(retire_inactive_snapshots(root, wiki)?, 6);
         assert!(snapshot_analytical_wiki_dir(root, wiki, "2026-07")?.is_dir());

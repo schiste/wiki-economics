@@ -395,11 +395,13 @@ pub fn compute_patrol(
     let rights_path = patrol_dir.join("rights.parquet");
     let meta_path = patrol_dir.join("autopatrol_groups.json");
     let revision_store_dir = storage::active_warehouse_wiki_dir(data_dir, wiki)?;
+    let revision_files =
+        storage::active_fragment_files(data_dir, wiki, storage::GenerationLayer::Warehouse)?;
 
     if !patrol_path.exists() {
         anyhow::bail!("No patrol data for {wiki}. Run `patrol-fetch` first.");
     }
-    if !revision_store_dir.exists() {
+    if !revision_store_dir.exists() || revision_files.is_empty() {
         anyhow::bail!("No warehouse data for {wiki}. Run `ingest` first.");
     }
 
@@ -469,7 +471,7 @@ pub fn compute_patrol(
     info!(wiki = wiki, "building autopatrol membership timeline");
     let autopatrol_intervals = build_autopatrol_intervals(&rights_path, &autopatrol_groups)?;
 
-    let all_month_partitions = collect_partition_files_by_month(&revision_store_dir)?;
+    let all_month_partitions = collect_partition_files_by_month(data_dir, wiki)?;
     let month_partitions = filter_partition_files_by_month(&all_month_partitions, &pending_set);
     let pending = &pending_set;
     let auto = &autopatrol_intervals;
@@ -499,7 +501,7 @@ pub fn compute_patrol(
         let ids = &still_missing_ids;
         let lookup = &mut summary.patrolled_lookup;
         (!ids.is_empty())
-            .then(|| extend_lookup_once(&revision_store_dir, ids, lookup, wiki))
+            .then(|| extend_lookup_once(&revision_files, ids, lookup, wiki))
             .transpose()?;
     }
 
@@ -539,7 +541,7 @@ fn ensure_parent_dir(path: &Path) -> Result<()> {
 }
 
 fn extend_lookup_once(
-    revision_store_dir: &Path,
+    revision_files: &[PathBuf],
     revision_ids: &HashSet<i64>,
     lookup: &mut HashMap<i64, RevisionMeta>,
     wiki: &str,
@@ -549,7 +551,7 @@ fn extend_lookup_once(
         missing_revision_ids = revision_ids.len(),
         "falling back to full revision lookup for unresolved patrol references"
     );
-    let loaded = load_revision_subset_by_ids_once(revision_store_dir, revision_ids)?;
+    let loaded = load_revision_subset_by_ids_once(revision_files, revision_ids)?;
     lookup.extend(loaded);
     Ok(())
 }
@@ -1152,16 +1154,18 @@ fn collect_patrolled_revision_ids(
 }
 
 fn collect_partition_files_by_month(
-    revision_store_dir: &Path,
+    data_dir: &Path,
+    wiki: &str,
 ) -> Result<BTreeMap<i32, Vec<PathBuf>>> {
     let mut by_month = BTreeMap::new();
-    for spec in storage::collect_partition_specs(revision_store_dir)? {
+    for spec in
+        storage::active_partition_specs(data_dir, wiki, storage::GenerationLayer::Warehouse)?
+    {
         let year_month_key = parse_year_month_key(&spec.year_month).unwrap_or_default();
-        let files = storage::collect_parquet_files(&spec.dir)?;
         by_month
             .entry(year_month_key)
             .or_insert_with(Vec::new)
-            .extend(files);
+            .extend(spec.files);
     }
     Ok(by_month)
 }
@@ -1261,7 +1265,7 @@ fn process_revision_file(
 }
 
 fn load_revision_subset_by_ids_once(
-    revision_store_dir: &Path,
+    files: &[PathBuf],
     revision_ids: &HashSet<i64>,
 ) -> Result<HashMap<i64, RevisionMeta>> {
     let mut lookup = HashMap::new();
@@ -1269,8 +1273,7 @@ fn load_revision_subset_by_ids_once(
         return Ok(lookup);
     }
 
-    let files = storage::collect_parquet_files(revision_store_dir)?;
-    for path in &files {
+    for path in files {
         let df = read_parquet_df(path, Some(revision_projection()))?;
         index_revision_lookup_df(&df, revision_ids, &mut lookup)?;
         if lookup.len() >= revision_ids.len() {

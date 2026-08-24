@@ -422,7 +422,10 @@ mod tests {
             fs::create_dir_all(analytical)?;
             fs::create_dir_all(warehouse)?;
         }
-        storage::publish_current_snapshot(&data, "nlwiki", "2026-08")?;
+        storage::publish_test_snapshot_pointer(&data, "nlwiki", "2026-08")?;
+        let inactive_state = data.join("snapshots/nlwiki/2026-07");
+        fs::create_dir_all(&inactive_state)?;
+        fs::write(inactive_state.join("generation-manifest.json"), b"stale")?;
 
         let report = clean_abandoned(
             &data,
@@ -435,11 +438,12 @@ mod tests {
         )
         .expect("inactive generation cleanup should succeed");
 
-        assert_eq!(report.snapshot_generations, 2);
+        assert_eq!(report.snapshot_generations, 3);
         assert!(!storage::snapshot_analytical_wiki_dir(&data, "nlwiki", "2026-07")?.exists());
         assert!(!storage::snapshot_warehouse_wiki_dir(&data, "nlwiki", "2026-07")?.exists());
         assert!(storage::snapshot_analytical_wiki_dir(&data, "nlwiki", "2026-08")?.exists());
         assert!(storage::snapshot_warehouse_wiki_dir(&data, "nlwiki", "2026-08")?.exists());
+        assert!(!inactive_state.exists());
         Ok(())
     }
 
@@ -528,7 +532,7 @@ mod tests {
             fs::create_dir_all(analytical)?;
             fs::create_dir_all(warehouse)?;
         }
-        storage::publish_current_snapshot(&data, "nlwiki", "2026-08")?;
+        storage::publish_test_snapshot_pointer(&data, "nlwiki", "2026-08")?;
         let analytical_snapshots = storage::analytical_wiki_dir(&data, "nlwiki").join("_snapshots");
         fs::create_dir(analytical_snapshots.join("invalid"))?;
         fs::write(analytical_snapshots.join("README"), b"ignored")?;

@@ -21,7 +21,7 @@ use crate::{schema, storage};
 
 const INGEST_CHUNK_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const INGEST_ALGORITHM_VERSION: &str =
-    "history-tsv-to-generation-parquet-v4-source-transactions";
+    "history-tsv-to-generation-parquet-v5-generation-manifest";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SourceIngestCommit {
@@ -605,7 +605,7 @@ fn ingest_wiki_for_snapshot(
         storage::validate_snapshot_version(version)?;
         SnapshotPlan::load_or_resolve(data_dir, wiki, version)?;
         let roots = IngestRoots::snapshot(data_dir, wiki, version)?;
-        let outputs = ingest_stage_outputs(data_dir, &roots)?;
+        let outputs = ingest_stage_outputs(data_dir, wiki, &roots)?;
         let receipt_path = fingerprint::data_stage_receipt_path(data_dir, wiki, version, "ingest");
         let spec = StageSpec {
             stage: "ingest",
@@ -721,8 +721,9 @@ fn ingest_wiki_for_snapshot(
     }
 
     if let Some(snapshot_version) = snapshot_version.as_deref() {
+        storage::write_generation_manifest(data_dir, wiki, snapshot_version)?;
         let inputs = ingest_stage_inputs(data_dir, wiki, &roots, &src_files)?;
-        let outputs = ingest_stage_outputs(data_dir, &roots)?;
+        let outputs = ingest_stage_outputs(data_dir, wiki, &roots)?;
         fingerprint::record(
             &fingerprint::data_stage_receipt_path(data_dir, wiki, snapshot_version, "ingest"),
             StageSpec {
@@ -749,7 +750,17 @@ fn ingest_wiki_for_snapshot(
     Ok(analytical_paths)
 }
 
-fn ingest_stage_outputs(_data_dir: &Path, roots: &IngestRoots) -> Result<Vec<TrackedPath>> {
+fn ingest_stage_outputs(
+    data_dir: &Path,
+    wiki: &str,
+    roots: &IngestRoots,
+) -> Result<Vec<TrackedPath>> {
+    if let Some(snapshot_version) = roots.snapshot_version.as_deref() {
+        let manifest = storage::generation_manifest_path(data_dir, wiki, snapshot_version)?;
+        if manifest.is_file() {
+            return Ok(vec![TrackedPath::new("generation-manifest", manifest)]);
+        }
+    }
     let mut outputs = Vec::new();
     for (prefix, root) in [
         ("analytical", &roots.analytical),
@@ -859,6 +870,10 @@ pub(crate) fn ingest_snapshot_source(
     fs::create_dir_all(&roots.warehouse)?;
     let reused = storage::marker_manifest_is_valid_in(data_dir, &roots.analytical, &source_id)?;
     if !reused {
+        ensure!(
+            storage::current_snapshot_version(data_dir, wiki)?.as_deref() != Some(snapshot_version),
+            "selected generation is immutable; rebuild this source in a new candidate generation"
+        );
         let stale_outputs = cleanup_planned_source_outputs(&roots, planned_source)?;
         if stale_outputs > 0 {
             info!(
@@ -912,9 +927,9 @@ pub(crate) fn finalize_snapshot_ingest(
     data_dir: &Path,
 ) -> Result<Vec<PathBuf>> {
     let roots = IngestRoots::snapshot(data_dir, wiki, snapshot_version)?;
-    storage::validate_snapshot_generation(data_dir, wiki, snapshot_version)?;
+    storage::write_generation_manifest(data_dir, wiki, snapshot_version)?;
     let inputs = snapshot_marker_inputs(data_dir, wiki, snapshot_version)?;
-    let outputs = ingest_stage_outputs(data_dir, &roots)?;
+    let outputs = ingest_stage_outputs(data_dir, wiki, &roots)?;
     fingerprint::record(
         &fingerprint::data_stage_receipt_path(data_dir, wiki, snapshot_version, "ingest"),
         StageSpec {
@@ -927,7 +942,7 @@ pub(crate) fn finalize_snapshot_ingest(
         &outputs,
     )?;
     storage::publish_current_snapshot(data_dir, wiki, snapshot_version)?;
-    storage::collect_parquet_files(&roots.analytical)
+    storage::active_fragment_files(data_dir, wiki, storage::GenerationLayer::Analytical)
 }
 
 /// Ingest all raw dump files for a wiki into partitioned Parquet. Standard
@@ -1429,8 +1444,12 @@ mod tests {
         let temp_dir = TestDir::new()?;
         let roots = IngestRoots::snapshot(temp_dir.path(), "testwiki", "2026-08")?;
         fs::create_dir_all(&roots.analytical)?;
+        fs::create_dir_all(&roots.warehouse)?;
+        assert!(ingest_stage_outputs(temp_dir.path(), "testwiki", &roots)?.is_empty());
+        let legacy = IngestRoots::legacy(temp_dir.path(), "legacywiki");
+        assert!(ingest_stage_outputs(temp_dir.path(), "legacywiki", &legacy)?.is_empty());
         fs::write(roots.analytical.join("_markers"), "not-a-directory")?;
-        assert!(ingest_stage_outputs(temp_dir.path(), &roots).is_err());
+        assert!(ingest_stage_outputs(temp_dir.path(), "testwiki", &roots).is_err());
         Ok(())
     }
 
@@ -1588,6 +1607,13 @@ mod tests {
             fingerprint::data_stage_receipt_path(data_dir.path(), wiki, version, "ingest")
                 .is_file()
         );
+        fs::write(&marker, b"{truncated")?;
+        fs::write(&source, &compressed)?;
+        let immutable =
+            ingest_snapshot_source(wiki, version, data_dir.path(), &source, "selected-rebuild")
+                .expect_err("selected generation fragments must not be rebuilt in place");
+        assert!(immutable.to_string().contains("immutable"));
+        assert!(source.is_file());
         Ok(())
     }
 

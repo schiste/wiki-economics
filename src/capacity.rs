@@ -317,7 +317,8 @@ mod tests {
             .expect("capacity fixture frame");
             ParquetWriter::new(File::create(directory.join("part.parquet"))?).finish(&mut frame)?;
         }
-        storage::publish_current_snapshot(data_dir, wiki, snapshot_version)?;
+        storage::write_test_generation_manifest_from_files(data_dir, wiki, snapshot_version)?;
+        storage::publish_test_snapshot_pointer(data_dir, wiki, snapshot_version)?;
         Ok(())
     }
 

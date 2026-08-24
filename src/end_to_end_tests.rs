@@ -315,7 +315,7 @@ fn snapshot_rollover_computes_only_the_new_generation() -> Result<()> {
 
     assert_eq!(
         storage::retire_inactive_snapshots(&data_dir, "tinywiki")?,
-        2
+        3
     );
     assert!(!storage::snapshot_warehouse_wiki_dir(&data_dir, "tinywiki", "2026-07")?.exists());
     assert!(storage::snapshot_warehouse_wiki_dir(&data_dir, "tinywiki", "2026-08")?.exists());
