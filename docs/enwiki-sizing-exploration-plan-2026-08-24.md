@@ -5,20 +5,21 @@
 **Candidate workload:** Complete enwiki MediaWiki History and logging data,
 integrated with the existing `frwiki`, `nlwiki`, and `ptwiki` publication
 
-**Current status:** Exploration only. Enwiki is not supported by the fetcher,
-has not been computed by this project, and must not be added to the production
-schedule before the qualification gates in this report pass.
+**Current status:** Exploration only. Generic monthly source planning is
+implemented, but enwiki has not been computed by this project and must not be
+added to the production schedule before the remaining bounded-ingestion,
+compute, and qualification gates in this report pass.
 
 **Reference evidence:**
 [`frwiki-capacity-report-2026-08-24.md`](frwiki-capacity-report-2026-08-24.md)
 
 ## Executive summary
 
-Enwiki is feasible, but it is not a configuration-only addition. The current
-fetcher deliberately rejects monthly-partitioned wikis, and the present
-page-week implementation cannot safely scale by merely raising its bucket
-count. Enwiki needs monthly-source discovery, windowed fetch-and-ingest, and a
-hierarchical or capped-writer aggregation before a complete run is attempted.
+Enwiki is feasible, but it is not a configuration-only addition. The canonical
+source planner now resolves its monthly inventory, but the present page-week
+implementation cannot safely scale by merely raising its bucket count. Enwiki
+still needs windowed fetch-and-ingest and a hierarchical or capped-writer
+aggregation before a complete run is attempted.
 
 The recommended target production envelope is:
 
@@ -142,13 +143,14 @@ describes the shared-storage risk.
 
 ## Current implementation blockers
 
-### Monthly source discovery
+### Monthly source discovery (implemented foundation)
 
-`src/fetch.rs` lists enwiki among `MONTHLY_WIKIS` and deliberately returns an
-error for those wikis. The fetch, expected-source, snapshot-completeness, and
-strict-manifest paths all need one deterministic monthly-source contract.
+The Rust snapshot planner now gives fetch, expected-source validation,
+snapshot-completeness checks, ingest, fingerprints, and recovery one
+deterministic monthly-source contract. Enwiki remains lifecycle-gated because
+bounded raw-file execution and compute qualification are separate requirements.
 
-The implementation must:
+The implemented source-plan contract:
 
 - resolve the newest completed snapshot once and pin it to the run;
 - enumerate the exact expected event-month objects for that snapshot;
@@ -335,8 +337,8 @@ Enwiki may be scheduled only when all of the following hold:
 Do not attempt enwiki in the current 6 GiB production job and do not add it by
 only increasing `WIKI_ECON_WEEKLY_BUCKETS`.
 
-First implement monthly discovery, windowed fetch-and-ingest, bounded open
-writers, hierarchical aggregation, and sequential validation. Then request a
+Continue with windowed fetch-and-ingest, bounded open writers, hierarchical
+aggregation, and sequential validation. Then request a
 16 GiB per-job/24 GiB namespace memory envelope and an operational guarantee of
 250 GiB working headroom. Use a separate qualification job, retain current
 publication until every semantic gate passes, and replace the estimates in

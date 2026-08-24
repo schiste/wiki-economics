@@ -57,7 +57,10 @@ Important decisions:
 - Existing files are not trusted blindly. Fetch validates against remote metadata when possible.
 - Partial files are resumed only when the server advertises range support.
 - Concurrency is bounded. More parallelism looked attractive on paper but would compete with ingest for disk and bandwidth.
-- Monthly-partitioned giant wikis are still rejected by the fetch planner. That is deliberate until the raw-file planning for those projects is implemented properly.
+- Yearly, all-time, and monthly source layouts are resolved into one immutable
+  `source-plan.json` before fetch begins. Monthly planning support does not by
+  itself qualify giant projects for production; windowed ingestion and bounded
+  compute remain required before enabling enwiki.
 
 ## Ingest
 
