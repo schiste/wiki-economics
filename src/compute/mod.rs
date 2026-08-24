@@ -21,7 +21,8 @@ use crate::{
     schema, storage, workload_profile,
 };
 
-const COMPUTE_ALGORITHM_VERSION: &str = "core-metrics-v6-adaptive-workload-profile";
+const COMPUTE_ALGORITHM_VERSION: &str =
+    "core-metrics-v7-null-page-conservation-adaptive-workload-profile";
 const DEFAULT_WEEKLY_BUCKET_COUNT: usize = 256;
 const DEFAULT_SECONDARY_BUCKET_COUNT: usize = 1;
 const WEEKLY_ROUTING_BATCH_ROWS: usize = 250_000;
@@ -922,7 +923,11 @@ fn compute_page_weekly_edits_for_snapshot(
                     .alias("week_start"),
             )
             .group_by(weekly_group_keys())
-            .agg([col("page_id").count().alias("edits")])
+            // Some historical revisions have a valid timestamp/revision ID
+            // but no recoverable page identity (for example a suppressed or
+            // deleted page). The weekly pipeline intentionally supports a
+            // null page key, so count rows rather than non-null page IDs.
+            .agg([len().alias("edits")])
             .collect()?;
         running_rows += partition_weekly.height();
         let partition_edits = sum_edits_column(std::slice::from_ref(&partition_weekly))?;
@@ -2383,6 +2388,33 @@ mod tests {
         Ok(())
     }
 
+    fn write_null_page_warehouse_parquet(temp_dir: &TestDir, wiki: &str) -> Result<()> {
+        let partition_dir = storage::month_partition_dir(
+            &storage::warehouse_wiki_dir(temp_dir.path(), wiki),
+            2002,
+            "2002-06",
+        );
+        fs::create_dir_all(&partition_dir)?;
+
+        let mut frame = DataFrame::new_infer_height(vec![
+            Column::new(
+                "event_timestamp".into(),
+                vec!["2002-06-10 17:55:22.0", "2002-06-10 18:00:00.0"],
+            ),
+            Column::new("page_id".into(), vec![None, Some(10_i64)]),
+            Column::new("page_title".into(), vec![None, Some("Known page")]),
+            Column::new("page_namespace".into(), vec![None, Some(0_i32)]),
+        ])
+        .expect("valid null-page warehouse fixture");
+        ParquetWriter::new(
+            &mut fs::File::create(partition_dir.join("part-000.parquet"))
+                .expect("null-page warehouse fixture should be writable"),
+        )
+        .finish(&mut frame)
+        .expect("null-page warehouse fixture should serialize");
+        Ok(())
+    }
+
     fn write_partitioned_legacy_parquet(temp_dir: &TestDir, wiki: &str) -> Result<()> {
         let jan_dir = storage::month_partition_dir(
             &storage::analytical_wiki_dir(temp_dir.path(), wiki),
@@ -2788,6 +2820,39 @@ mod tests {
         assert_eq!(wow_change, vec![2, -1, 1, 0]);
         assert_eq!(wow_rate, vec![None, Some(-0.5), None, Some(0.0)]);
 
+        Ok(())
+    }
+
+    #[test]
+    fn page_weekly_edits_conserves_revisions_with_null_page_identity() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let output_dir = TestDir::new()?;
+        let wiki = "testwiki";
+        write_null_page_warehouse_parquet(&data_dir, wiki)?;
+        let config = WeeklyAggregationConfig::new(DEFAULT_WEEKLY_BUCKET_COUNT, None)?;
+
+        let report = compute_page_weekly_edits(wiki, data_dir.path(), output_dir.path(), &config)?
+            .context("null-page fixture should produce a weekly report")?;
+        assert_eq!(report.total_edits, 2);
+        assert_eq!(report.output_rows, 2);
+
+        let output = ParquetReader::new(
+            File::open(
+                output_dir
+                    .path()
+                    .join(wiki)
+                    .join("page_weekly_edits.parquet"),
+            )
+            .expect("weekly null-page output should be readable"),
+        )
+        .finish()?;
+        let null_page = output.lazy().filter(col("page_id").is_null()).collect()?;
+        assert_eq!(null_page.height(), 1);
+        assert_eq!(null_page.column("edits")?.u32()?.get(0), Some(1));
+        assert_eq!(
+            null_page.column("week_start")?.str()?.get(0),
+            Some("2002-06-10")
+        );
         Ok(())
     }
 
