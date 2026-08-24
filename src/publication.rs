@@ -13,6 +13,7 @@ use crate::{licensing, storage};
 const RUN_CONTEXT_FILE: &str = ".publication-run.json";
 const CANDIDATE_FILE: &str = ".publication-candidate.json";
 pub const RECEIPT_FILE: &str = "publication-gate.json";
+const VALIDATION_BATCH_ROWS: usize = 250_000;
 const JSON_ARTIFACTS: [&str; 13] = [
     crate::browser_data::INDEX_FILENAME,
     "defaults_business.json",
@@ -541,8 +542,25 @@ fn string_cell(frame: &DataFrame, name: &str) -> Result<String> {
         .with_context(|| format!("aggregate {name} is null"))
 }
 
-fn summarize(path: &Path, spec: &MetricSpec) -> Result<FileSummary> {
-    let path_text = path.to_string_lossy().to_string();
+fn summarize_batched(path: &Path, spec: &MetricSpec, batch_rows: usize) -> Result<FileSummary> {
+    ensure!(
+        batch_rows > 0,
+        "publication validation batch size must be positive"
+    );
+    let mut metadata_reader = ParquetReader::new(File::open(path)?);
+    let rows = metadata_reader.num_rows()?;
+    ensure!(rows > 0, "{} is empty", path.display());
+
+    let mut columns = vec!["wiki".to_string()];
+    if let Some(date) = spec.date_column {
+        columns.push(date.to_string());
+    }
+    if let Some(total) = spec.conservation_column {
+        columns.push(total.to_string());
+    }
+    columns.sort();
+    columns.dedup();
+
     let mut expressions = vec![
         col("wiki").min().alias("wiki_min"),
         col("wiki").max().alias("wiki_max"),
@@ -559,34 +577,87 @@ fn summarize(path: &Path, spec: &MetricSpec) -> Result<FileSummary> {
                 .alias("conservation_total"),
         );
     }
-    let frame = LazyFrame::scan_parquet(path_text.as_str().into(), Default::default())?
-        .select(expressions)
-        .collect()?;
-    let minimum_date = spec
-        .date_column
-        .map(|_| string_cell(&frame, "minimum_date"))
-        .transpose()?;
-    let maximum_date = spec
-        .date_column
-        .map(|_| string_cell(&frame, "maximum_date"))
-        .transpose()?;
-    let conservation_total = spec
-        .conservation_column
-        .map(|_| {
-            frame
-                .column("conservation_total")?
-                .i64()?
-                .get(0)
-                .context("conservation total is null")
+
+    let result = (|| -> Result<FileSummary> {
+        let mut wiki_min: Option<String> = None;
+        let mut wiki_max: Option<String> = None;
+        let mut minimum_date: Option<String> = None;
+        let mut maximum_date: Option<String> = None;
+        let mut conservation_total = spec.conservation_column.map(|_| 0_i64);
+        let mut offset = 0_usize;
+
+        while offset < rows {
+            let length = (rows - offset).min(batch_rows);
+            let batch = ParquetReader::new(File::open(path)?)
+                .with_columns(Some(columns.clone()))
+                .with_slice(Some((offset, length)))
+                .set_low_memory(true)
+                .read_parallel(ParallelStrategy::None)
+                .finish()?;
+            ensure!(
+                batch.height() == length,
+                "short publication validation read for {}",
+                path.display()
+            );
+            let frame = batch.lazy().select(expressions.clone()).collect()?;
+
+            let batch_wiki_min = string_cell(&frame, "wiki_min")?;
+            let batch_wiki_max = string_cell(&frame, "wiki_max")?;
+            if wiki_min
+                .as_ref()
+                .is_none_or(|value| batch_wiki_min.as_str() < value.as_str())
+            {
+                wiki_min = Some(batch_wiki_min);
+            }
+            if wiki_max
+                .as_ref()
+                .is_none_or(|value| batch_wiki_max.as_str() > value.as_str())
+            {
+                wiki_max = Some(batch_wiki_max);
+            }
+            if spec.date_column.is_some() {
+                let batch_minimum = string_cell(&frame, "minimum_date")?;
+                let batch_maximum = string_cell(&frame, "maximum_date")?;
+                if minimum_date
+                    .as_ref()
+                    .is_none_or(|value| batch_minimum.as_str() < value.as_str())
+                {
+                    minimum_date = Some(batch_minimum);
+                }
+                if maximum_date
+                    .as_ref()
+                    .is_none_or(|value| batch_maximum.as_str() > value.as_str())
+                {
+                    maximum_date = Some(batch_maximum);
+                }
+            }
+            if let Some(total) = conservation_total.as_mut() {
+                let batch_total = frame
+                    .column("conservation_total")?
+                    .i64()?
+                    .get(0)
+                    .context("conservation total is null")?;
+                *total = total
+                    .checked_add(batch_total)
+                    .with_context(|| format!("{} conservation total overflow", path.display()))?;
+            }
+            offset += length;
+        }
+
+        Ok(FileSummary {
+            wiki_min: wiki_min.context("aggregate wiki_min is null")?,
+            wiki_max: wiki_max.context("aggregate wiki_max is null")?,
+            minimum_date,
+            maximum_date,
+            conservation_total,
         })
-        .transpose()?;
-    Ok(FileSummary {
-        wiki_min: string_cell(&frame, "wiki_min")?,
-        wiki_max: string_cell(&frame, "wiki_max")?,
-        minimum_date,
-        maximum_date,
-        conservation_total,
-    })
+    })();
+    storage::discard_path_cache(path);
+    result
+}
+
+fn summarize(path: &Path, spec: &MetricSpec) -> Result<FileSummary> {
+    summarize_batched(path, spec, VALIDATION_BATCH_ROWS)
 }
 
 fn validate_date(value: &str, column: &str) -> Result<()> {
@@ -1137,6 +1208,36 @@ mod tests {
             .collect();
         let mut frame = DataFrame::new(1, columns)?;
         ParquetWriter::new(File::create(path)?).finish(&mut frame)?;
+        Ok(())
+    }
+
+    #[test]
+    fn publication_summary_reduces_projected_batches_deterministically() -> Result<()> {
+        let directory = TestDir::new()?;
+        let path = directory.path().join("weekly.parquet");
+        let mut frame = DataFrame::new(
+            3,
+            vec![
+                Column::new("wiki".into(), ["ptwiki", "frwiki", "nlwiki"]),
+                Column::new(
+                    "week_start".into(),
+                    ["2026-07-13", "2026-07-27", "2026-07-20"],
+                ),
+                Column::new("edits".into(), [3_u32, 5_u32, 7_u32]),
+                // This unrelated payload proves the validator projects only
+                // the columns required by the publication contract.
+                Column::new("unused".into(), ["large", "payload", "column"]),
+            ],
+        )?;
+        ParquetWriter::new(File::create(&path)?).finish(&mut frame)?;
+
+        let summary = summarize_batched(&path, &METRICS[8], 1)?;
+        assert_eq!(summary.wiki_min, "frwiki");
+        assert_eq!(summary.wiki_max, "ptwiki");
+        assert_eq!(summary.minimum_date.as_deref(), Some("2026-07-13"));
+        assert_eq!(summary.maximum_date.as_deref(), Some("2026-07-27"));
+        assert_eq!(summary.conservation_total, Some(15));
+        assert!(summarize_batched(&path, &METRICS[8], 0).is_err());
         Ok(())
     }
 

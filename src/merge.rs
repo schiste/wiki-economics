@@ -274,6 +274,11 @@ fn merge_metric_batched(
         }
     };
     fs::rename(&temp_path, dest)?;
+    // The merged output can be larger than a gigabyte. It has already been
+    // synced above, so retaining its clean pages in the cgroup cache only
+    // steals headroom from the fail-closed publication validator that reads
+    // it next. This is a best-effort Linux hint and never affects durability.
+    storage::discard_path_cache(dest);
 
     let memory = MemorySnapshot::capture();
     info!(
