@@ -727,10 +727,15 @@ mod tests {
         files.open_file_descriptors = Some(121);
         assert!(governor.validate_sample(&files, 0).is_err());
 
-        let mut storage = sample;
+        let mut storage = sample.clone();
         storage.memory.rss_bytes = Some(1);
         storage.persistent_available_bytes = Some(9);
         assert!(governor.validate_sample(&storage, 10).is_err());
+
+        let mut unmetered_fds = sample;
+        unmetered_fds.memory.rss_bytes = Some(1);
+        unmetered_fds.open_file_descriptors = None;
+        governor.validate_sample(&unmetered_fds, 0)?;
         Ok(())
     }
 }
