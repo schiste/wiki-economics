@@ -32,16 +32,21 @@ coverage checker and its tests. There is no PyArrow dependency.
 ## Refresh and publication flow
 
 ```text
-weekly Toolforge Job
-  -> atomic NFS single-flight lock + live run record
-  -> resolve one completed snapshot for every scheduled wiki
+per-wiki preparation Jobs
+  -> per-wiki NFS lock + live run record
+  -> resolve one completed snapshot for that wiki
   -> fetch -> ingest immutable generation -> select generation
   -> core compute -> patrol fetch/compute
+  -> semantic candidate validation -> mark candidate ready
+
+short publisher Job
+  -> global publication lock
+  -> select the complete set of ready/current wiki generations
   -> merge + Rust dashboard defaults + validated manifest
   -> fail-closed semantic publication gate
   -> offline Observable build in a run-scoped hidden directory
   -> atomic site-dist symlink switch
-  -> retire the preceding data generation
+  -> retire superseded generations
   -> retain status/history and prune bounded stale/release artifacts
 ```
 
@@ -55,16 +60,20 @@ publication receipt still matches immediately before publication. See
 
 ## Toolforge processes
 
-There are two independent Kubernetes workloads sharing the tool account's NFS
+There are independent Kubernetes workloads sharing the tool account's NFS
 mount:
 
-- `wiki-econ-refresh` is the scheduled one-CPU, 6 GiB Toolforge Job defined in
-  `deploy/toolforge/jobs.yaml`. It always enters through
-  `deploy/toolforge/run-refresh.sh`, resolves scheduled wikis from the lifecycle
-  registry, and owns mutation of data/output/site publication paths.
+- `wiki-econ-prepare-nlwiki`, `wiki-econ-prepare-ptwiki`, and
+  `wiki-econ-prepare-frwiki` are the scheduled per-wiki preparation Jobs defined in
+  `deploy/toolforge/jobs.yaml`. Each owns only its wiki's candidate-generation
+  paths and may run without blocking other wikis or the public site.
+- `wiki-econ-publish-ready` is the short scheduled publisher. It alone acquires
+  the global publication lock and mutates merged output and the live site.
+- `wiki-econ-refresh` is retained as an unscheduled, on-demand compatibility
+  Job for explicit recovery or operator drills; it is not the normal scheduler.
 - `wiki-econ-admin` is a Build Service webservice launched from `Procfile`. It
   serves the current static site and reads the refresh status files. It has no
-  shared process memory or Kubernetes control API with the refresh Job.
+  shared process memory or Kubernetes control API with the pipeline Jobs.
 
 The lifecycle registry—not a deployment-script wiki list—is authoritative.
 The [generated lifecycle table](generated/stack-reference.md#published-wiki-lifecycle)
@@ -155,11 +164,12 @@ For a fresh Toolforge tool account:
    `WIKI_ECON_OUTPUT_DIR`, and `WIKI_ECON_SITE_DIST_DIR` values shown in the
    [Toolforge runbook](../deploy/toolforge/README.md#operator-prerequisites).
 4. Start the Build Service webservice from `Procfile`, load
-   `deploy/toolforge/jobs.yaml`, and confirm the scheduled Job and webservice
-   are both healthy.
-5. Run one manual refresh through `deploy/toolforge/run-refresh.sh`; validate
-   the live run record, publication receipt, current site symlink, and public
-   freshness endpoint before relying on the schedule.
+   `deploy/toolforge/jobs.yaml`, and confirm the three preparation Jobs, the
+   publisher Job, the on-demand compatibility Job, and webservice are healthy.
+5. Run one preparation Job manually and then invoke
+   `deploy/toolforge/run-publish-ready.sh`; validate the per-wiki run record,
+   publication receipt, current site symlink, and public freshness endpoint
+   before relying on the schedules.
 
 Emergency Cargo compilation in Toolforge remains a disaster-recovery path,
 not the normal deployment model. Rollback changes only the verified

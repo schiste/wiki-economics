@@ -80,11 +80,11 @@
   cpu: "1"
 
 # Legacy on-demand-only jobs (no `schedule:`): trigger with
-# `toolforge jobs restart <name>` between scheduled wiki-econ-refresh runs,
-# e.g. after a site/docs-only change that doesn't need a fresh fetch or
-# compute. See README.md's "On-demand stage jobs" section. Each still goes
-# through run-refresh.sh's single shared refresh lock, so it can't race a
-# concurrent wiki-econ-refresh or another on-demand job.
+# `toolforge jobs restart <name>`, e.g. after a site/docs-only change that
+# doesn't need a fresh fetch or compute. See README.md's "On-demand stage jobs"
+# section. Each still goes through run-refresh.sh's compatibility lock, so two
+# legacy stage/monolithic jobs cannot race one another. Normal per-wiki
+# preparation and publication use their narrower dedicated locks.
 #
 # Toolforge Jobs Framework CLI 0.3.9 has no per-job envvar support (`jobs run`
 # takes no --envvar/--envvars flag; `toolforge envvars create` is tool-wide
