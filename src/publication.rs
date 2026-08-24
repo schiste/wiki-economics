@@ -262,6 +262,18 @@ struct ReadyWikiCandidate {
     artifacts: Vec<PreparedArtifact>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum WikiPreparationPlan {
+    NoOp {
+        ready_path: PathBuf,
+    },
+    Build {
+        same_snapshot_candidate: bool,
+        compute_reused: bool,
+        patrol_reused: bool,
+    },
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 struct SelectionEntry {
     wiki: String,
@@ -695,6 +707,131 @@ fn validate_ready_candidate(
         validate_prepared_artifact(candidate_dir, artifact)?;
     }
     validate_snapshot_cutoff(&ready.wiki, &ready.snapshot, &ready.cutoff_date)
+}
+
+fn copy_candidate_files(
+    source_candidate: &Path,
+    target_candidate: &Path,
+    files: &[PathBuf],
+) -> Result<()> {
+    for source in files {
+        let relative = source
+            .strip_prefix(source_candidate)
+            .expect("verified reusable file must remain below its candidate");
+        let target = target_candidate.join(relative);
+        let parent = target
+            .parent()
+            .context("reusable candidate target has no parent")?;
+        fs::create_dir_all(parent)?;
+        let temporary = parent.join(format!(
+            ".{}.{}.reuse.tmp",
+            target
+                .file_name()
+                .context("reusable candidate target has no filename")?
+                .to_string_lossy(),
+            std::process::id()
+        ));
+        let copied = (|| -> Result<()> {
+            fs::copy(source, &temporary)?;
+            File::open(&temporary)?.sync_all()?;
+            fs::rename(&temporary, &target)?;
+            File::open(parent)?.sync_all()?;
+            Ok(())
+        })();
+        if copied.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        copied?;
+    }
+    Ok(())
+}
+
+pub(crate) fn plan_wiki_preparation(
+    data_dir: &Path,
+    output_dir: &Path,
+    wiki: &str,
+    snapshot: &str,
+    run_id: &str,
+) -> Result<WikiPreparationPlan> {
+    ensure!(valid_component(wiki), "unsafe candidate wiki");
+    storage::validate_snapshot_version(snapshot)?;
+    ensure!(valid_component(run_id), "unsafe candidate run ID");
+    let snapshot_root = output_dir.join("_candidates").join(wiki).join(snapshot);
+    let target_candidate = wiki_candidate_dir(output_dir, wiki, snapshot, run_id)?;
+    ensure!(
+        !target_candidate.join("ready.json").exists(),
+        "run ID already identifies a ready candidate"
+    );
+    if !snapshot_root.is_dir() {
+        return Ok(WikiPreparationPlan::Build {
+            same_snapshot_candidate: false,
+            compute_reused: false,
+            patrol_reused: false,
+        });
+    }
+
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(&snapshot_root)? {
+        let candidate_dir = entry?.path();
+        let ready_path = candidate_dir.join("ready.json");
+        if !ready_path.is_file() {
+            continue;
+        }
+        let ready: ReadyWikiCandidate = read_json(&ready_path)?;
+        ensure!(
+            ready.wiki == wiki && ready.snapshot == snapshot,
+            "ready candidate identity does not match preparation request"
+        );
+        validate_ready_candidate(data_dir, &candidate_dir, &ready)?;
+        candidates.push((ready, candidate_dir));
+    }
+    candidates.sort_by(|(left, _), (right, _)| {
+        (left.ready_at_unix, &left.run_id).cmp(&(right.ready_at_unix, &right.run_id))
+    });
+
+    let mut reusable_compute = None;
+    let mut reusable_patrol = None;
+    for (_, candidate_dir) in candidates.iter().rev() {
+        let compute =
+            crate::compute::reusable_candidate_files(wiki, snapshot, data_dir, candidate_dir)?;
+        let patrol =
+            crate::patrol::reusable_candidate_files(wiki, snapshot, data_dir, candidate_dir)?;
+        if compute.is_some() && patrol.is_some() {
+            let ready_path = candidate_dir.join("ready.json");
+            info!(wiki, snapshot, path = %ready_path.display(), "snapshot candidate fingerprints are unchanged");
+            return Ok(WikiPreparationPlan::NoOp { ready_path });
+        }
+        if reusable_compute.is_none()
+            && let Some(files) = compute
+        {
+            reusable_compute = Some((candidate_dir.clone(), files));
+        }
+        if reusable_patrol.is_none()
+            && let Some(files) = patrol
+        {
+            reusable_patrol = Some((candidate_dir.clone(), files));
+        }
+    }
+
+    reusable_compute
+        .as_ref()
+        .map_or(Ok(()), |(source, files)| {
+            copy_candidate_files(source, &target_candidate, files)
+        })?;
+    reusable_patrol.as_ref().map_or(Ok(()), |(source, files)| {
+        copy_candidate_files(source, &target_candidate, files)
+    })?;
+    let compute_reused = reusable_compute.is_some();
+    let patrol_reused = reusable_patrol.is_some();
+    info!(
+        wiki,
+        snapshot, compute_reused, patrol_reused, "planned invalidated candidate stages"
+    );
+    Ok(WikiPreparationPlan::Build {
+        same_snapshot_candidate: !candidates.is_empty(),
+        compute_reused,
+        patrol_reused,
+    })
 }
 
 fn latest_ready_candidates(
@@ -1711,6 +1848,11 @@ mod tests {
             fs::create_dir_all(&patrol_dir)?;
             write_single_i64(&patrol_dir.join("patrol.parquet"))?;
             write_single_i64(&patrol_dir.join("rights.parquet"))?;
+            fs::write(
+                patrol_dir.join("autopatrol_groups.json"),
+                b"{\"autopatrol_groups\":[]}",
+            )
+            .expect("autopatrol group fixture should write");
 
             let wiki_dir = output.path().join("nlwiki");
             fs::create_dir_all(&wiki_dir)?;
@@ -1781,6 +1923,20 @@ mod tests {
                 )
                 .expect("candidate metric should copy");
             }
+            crate::compute::record_candidate_fingerprint_for_test(
+                "nlwiki",
+                "2026-03",
+                self.data.path(),
+                &candidate,
+            )
+            .expect("candidate compute fingerprint should record");
+            crate::patrol::record_candidate_fingerprint_for_test(
+                "nlwiki",
+                "2026-03",
+                self.data.path(),
+                &candidate,
+            )
+            .expect("candidate patrol fingerprint should record");
             mark_wiki_candidate_ready(
                 self.data.path(),
                 self.output.path(),
@@ -2011,6 +2167,155 @@ mod tests {
         let selection: PublicationSelection =
             read_json(&selection_path(fixture.output.path(), "publish-1")?)?;
         assert_eq!(selection.state, "rolled_back");
+        Ok(())
+    }
+
+    #[test]
+    fn preparation_planner_noops_or_seeds_only_reusable_stages() -> Result<()> {
+        let fixture = Fixture::new()?;
+        assert_eq!(
+            plan_wiki_preparation(
+                fixture.data.path(),
+                fixture.output.path(),
+                "nlwiki",
+                "2026-04",
+                "new-snapshot",
+            )
+            .expect("new snapshot should require a build"),
+            WikiPreparationPlan::Build {
+                same_snapshot_candidate: false,
+                compute_reused: false,
+                patrol_reused: false,
+            }
+        );
+
+        fs::create_dir_all(
+            fixture
+                .output
+                .path()
+                .join("_candidates/nlwiki/2026-03/incomplete"),
+        )
+        .expect("incomplete candidate fixture should write");
+        let ready = fixture.ready_candidate("candidate-reusable")?;
+        assert_eq!(
+            plan_wiki_preparation(
+                fixture.data.path(),
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                "noop-check",
+            )
+            .expect("unchanged snapshot should be reusable"),
+            WikiPreparationPlan::NoOp { ready_path: ready }
+        );
+
+        let source = wiki_candidate_dir(
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            "candidate-reusable",
+        )
+        .expect("candidate source path should resolve");
+        let compute_receipt = source.join("_stages/compute/nlwiki.json");
+        let mut receipt: Value = read_json(&compute_receipt)?;
+        receipt["algorithm_version"] = Value::String("superseded-algorithm".to_string());
+        atomic_json(&compute_receipt, &receipt)?;
+        let failed_target =
+            wiki_candidate_dir(fixture.output.path(), "nlwiki", "2026-03", "failed-copy")?;
+        fs::write(&failed_target, b"block candidate directory")?;
+        assert!(
+            plan_wiki_preparation(
+                fixture.data.path(),
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                "failed-copy",
+            )
+            .is_err()
+        );
+        fs::remove_file(failed_target)?;
+
+        let plan = plan_wiki_preparation(
+            fixture.data.path(),
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            "partial-reuse",
+        )
+        .expect("patrol-only reuse should plan");
+        assert_eq!(
+            plan,
+            WikiPreparationPlan::Build {
+                same_snapshot_candidate: true,
+                compute_reused: false,
+                patrol_reused: true,
+            }
+        );
+        let target =
+            wiki_candidate_dir(fixture.output.path(), "nlwiki", "2026-03", "partial-reuse")?;
+        assert!(target.join("nlwiki/patrol.parquet").is_file());
+        assert!(target.join("_stages/patrol_compute/nlwiki.json").is_file());
+        assert!(!target.join("nlwiki/gdp.parquet").exists());
+
+        fixture.ready_candidate("candidate-compute")?;
+        crate::patrol::record_candidate_fingerprint_for_test(
+            "nlwiki",
+            "2026-03",
+            fixture.data.path(),
+            &source,
+        )
+        .expect("reusable patrol fingerprint should follow the generation fixture");
+        let compute_source = wiki_candidate_dir(
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            "candidate-compute",
+        )
+        .expect("compute candidate path should resolve");
+        let patrol_receipt = compute_source.join("_stages/patrol_compute/nlwiki.json");
+        let mut patrol_value: Value = read_json(&patrol_receipt)?;
+        patrol_value["algorithm_version"] = Value::String("superseded-patrol".to_string());
+        atomic_json(&patrol_receipt, &patrol_value)?;
+        assert_eq!(
+            plan_wiki_preparation(
+                fixture.data.path(),
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                "combined-reuse",
+            )
+            .expect("independently reusable stages should combine"),
+            WikiPreparationPlan::Build {
+                same_snapshot_candidate: true,
+                compute_reused: true,
+                patrol_reused: true,
+            }
+        );
+        let combined =
+            wiki_candidate_dir(fixture.output.path(), "nlwiki", "2026-03", "combined-reuse")?;
+        assert!(combined.join("nlwiki/gdp.parquet").is_file());
+        assert!(combined.join("nlwiki/patrol.parquet").is_file());
+        assert!(
+            plan_wiki_preparation(
+                fixture.data.path(),
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                "candidate-reusable",
+            )
+            .is_err()
+        );
+
+        let copy_root = fixture.output.path().join("copy-error");
+        fs::create_dir_all(&copy_root)?;
+        assert!(
+            copy_candidate_files(
+                &copy_root,
+                &fixture.output.path().join("copy-target"),
+                &[copy_root.join("missing")],
+            )
+            .is_err()
+        );
         Ok(())
     }
 

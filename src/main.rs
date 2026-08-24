@@ -415,6 +415,23 @@ trait Ops {
     ) -> Result<()> {
         self.prepare_wiki_snapshot(wiki, version, data_dir, run_id, window_size)
     }
+    fn plan_candidate_preparation(
+        &self,
+        _wiki: &str,
+        _version: &str,
+        _data_dir: &Path,
+        _output_dir: &Path,
+        _run_id: &str,
+    ) -> Result<publication::WikiPreparationPlan> {
+        Ok(publication::WikiPreparationPlan::Build {
+            same_snapshot_candidate: false,
+            compute_reused: false,
+            patrol_reused: false,
+        })
+    }
+    fn cached_patrol_sources_available(&self, _wiki: &str, _data_dir: &Path) -> bool {
+        false
+    }
     fn compute_candidate(
         &self,
         wiki: &str,
@@ -626,6 +643,21 @@ impl Ops for RealOps {
             .map(|_| ())
     }
 
+    fn plan_candidate_preparation(
+        &self,
+        wiki: &str,
+        version: &str,
+        data_dir: &Path,
+        output_dir: &Path,
+        run_id: &str,
+    ) -> Result<publication::WikiPreparationPlan> {
+        publication::plan_wiki_preparation(data_dir, output_dir, wiki, version, run_id)
+    }
+
+    fn cached_patrol_sources_available(&self, wiki: &str, data_dir: &Path) -> bool {
+        patrol::cached_sources_available(data_dir, wiki)
+    }
+
     fn compute_candidate(
         &self,
         wiki: &str,
@@ -677,6 +709,24 @@ fn run_timed_stage<T>(
         Err(error) => observability::record_stage_failed(stage, wiki, duration_ms, error),
     }
     result
+}
+
+fn record_reused_stage(stage: &str, wiki: Option<&str>) {
+    observability::record_stage_started(stage, wiki);
+    observability::record_stage_reused(stage, wiki);
+    observability::record_stage_completed(stage, wiki, 0);
+    info!(
+        stage,
+        wiki = wiki.unwrap_or("-"),
+        "reused stage without execution"
+    );
+}
+
+fn record_skipped_stage(stage: &str, wiki: Option<&str>) {
+    observability::record_stage_started(stage, wiki);
+    observability::record_stage_skipped(stage, wiki);
+    observability::record_stage_completed(stage, wiki, 0);
+    info!(stage, wiki = wiki.unwrap_or("-"), "skipped unneeded stage");
 }
 
 fn snapshot_version_for(now: DateTime<Utc>) -> String {
@@ -789,36 +839,75 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             ops.persist_snapshot_plans(std::slice::from_ref(&wiki), &version, &data_dir)?;
             let candidate_dir =
                 publication::wiki_candidate_dir(&output_dir, &wiki, &version, run_id)?;
-
-            run_timed_stage("source_window", Some(&wiki), || {
-                ops.prepare_candidate_snapshot(
+            let preparation = run_timed_stage("candidate_discovery", Some(&wiki), || {
+                let plan = ops.plan_candidate_preparation(
                     &wiki,
                     &version,
-                    &data_dir,
-                    run_id,
-                    source_window_size,
-                )
-            })?;
-            run_timed_stage("patrol_fetch", Some(&wiki), || {
-                ops.fetch_patrol(&wiki, &data_dir)
-            })?;
-            run_timed_stage("compute", Some(&wiki), || {
-                ops.compute_candidate(&wiki, &version, &data_dir, &candidate_dir)
-            })?;
-            run_timed_stage("patrol_compute", Some(&wiki), || {
-                ops.compute_candidate_patrol(&wiki, &version, &data_dir, &candidate_dir)
-            })?;
-            let ready = run_timed_stage("candidate_validate", Some(&wiki), || {
-                ops.mark_candidate_ready(
                     &data_dir,
                     &output_dir,
-                    &lifecycle,
-                    &wiki,
-                    &version,
                     run_id,
-                )
+                )?;
+                if matches!(plan, publication::WikiPreparationPlan::NoOp { .. }) {
+                    observability::record_stage_reused("candidate_discovery", Some(&wiki));
+                }
+                Ok(plan)
             })?;
-            println!("{}", ready.display());
+
+            match preparation {
+                publication::WikiPreparationPlan::NoOp { ready_path } => {
+                    info!(wiki, version, path = %ready_path.display(), "candidate preparation is a recorded no-op");
+                    println!("{}", ready_path.display());
+                }
+                publication::WikiPreparationPlan::Build {
+                    same_snapshot_candidate,
+                    compute_reused,
+                    patrol_reused,
+                } => {
+                    run_timed_stage("source_window", Some(&wiki), || {
+                        ops.prepare_candidate_snapshot(
+                            &wiki,
+                            &version,
+                            &data_dir,
+                            run_id,
+                            source_window_size,
+                        )
+                    })?;
+                    if same_snapshot_candidate
+                        && ops.cached_patrol_sources_available(&wiki, &data_dir)
+                    {
+                        record_skipped_stage("patrol_fetch", Some(&wiki));
+                    } else {
+                        run_timed_stage("patrol_fetch", Some(&wiki), || {
+                            ops.fetch_patrol(&wiki, &data_dir)
+                        })?;
+                    }
+                    if compute_reused {
+                        record_reused_stage("compute", Some(&wiki));
+                    } else {
+                        run_timed_stage("compute", Some(&wiki), || {
+                            ops.compute_candidate(&wiki, &version, &data_dir, &candidate_dir)
+                        })?;
+                    }
+                    if patrol_reused {
+                        record_reused_stage("patrol_compute", Some(&wiki));
+                    } else {
+                        run_timed_stage("patrol_compute", Some(&wiki), || {
+                            ops.compute_candidate_patrol(&wiki, &version, &data_dir, &candidate_dir)
+                        })?;
+                    }
+                    let ready = run_timed_stage("candidate_validate", Some(&wiki), || {
+                        ops.mark_candidate_ready(
+                            &data_dir,
+                            &output_dir,
+                            &lifecycle,
+                            &wiki,
+                            &version,
+                            run_id,
+                        )
+                    })?;
+                    println!("{}", ready.display());
+                }
+            }
         }
 
         Commands::PublicationPrepareReady { lifecycle } => {
@@ -1150,6 +1239,9 @@ mod tests {
     #[derive(Default)]
     struct RecordingOps {
         calls: RefCell<Vec<String>>,
+        preparation_plans: RefCell<VecDeque<publication::WikiPreparationPlan>>,
+        preparation_error: bool,
+        cached_patrol_sources: bool,
     }
 
     impl RecordingOps {
@@ -1364,6 +1456,30 @@ mod tests {
                 data_dir.display()
             ));
             Ok(())
+        }
+
+        fn plan_candidate_preparation(
+            &self,
+            _wiki: &str,
+            _version: &str,
+            _data_dir: &Path,
+            _output_dir: &Path,
+            _run_id: &str,
+        ) -> Result<publication::WikiPreparationPlan> {
+            if self.preparation_error {
+                anyhow::bail!("candidate plan failed");
+            }
+            Ok(self.preparation_plans.borrow_mut().pop_front().unwrap_or(
+                publication::WikiPreparationPlan::Build {
+                    same_snapshot_candidate: false,
+                    compute_reused: false,
+                    patrol_reused: false,
+                },
+            ))
+        }
+
+        fn cached_patrol_sources_available(&self, _wiki: &str, _data_dir: &Path) -> bool {
+            self.cached_patrol_sources
         }
 
         fn cleanup_raw_dump(&self, wiki: &str, data_dir: &Path) -> Result<()> {
@@ -1782,6 +1898,71 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_candidate_preparation_is_a_recorded_noop() -> Result<()> {
+        let cli = Cli::try_parse_from([
+            "wiki-econ",
+            "--run-id",
+            "noop-run",
+            "prepare-wiki",
+            "nlwiki",
+            "--version",
+            "2026-07",
+        ])?;
+        let ops = RecordingOps {
+            preparation_plans: RefCell::new(VecDeque::from([
+                publication::WikiPreparationPlan::NoOp {
+                    ready_path: PathBuf::from("existing/ready.json"),
+                },
+            ])),
+            ..RecordingOps::default()
+        };
+
+        run_with_ops(cli, &ops)?;
+
+        assert!(ops.calls.into_inner().is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn preparation_runs_only_invalidated_candidate_stages() -> Result<()> {
+        let cli = Cli::try_parse_from([
+            "wiki-econ",
+            "--data-dir",
+            "fixtures/data",
+            "--output-dir",
+            "fixtures/output",
+            "--run-id",
+            "partial-run",
+            "prepare-wiki",
+            "nlwiki",
+            "--version",
+            "2026-07",
+        ])?;
+        let ops = RecordingOps {
+            preparation_plans: RefCell::new(VecDeque::from([
+                publication::WikiPreparationPlan::Build {
+                    same_snapshot_candidate: true,
+                    compute_reused: true,
+                    patrol_reused: true,
+                },
+            ])),
+            cached_patrol_sources: true,
+            ..RecordingOps::default()
+        };
+
+        run_with_ops(cli, &ops)?;
+
+        assert_eq!(
+            ops.calls.into_inner(),
+            vec![
+                "source_window:nlwiki:2026-07:fixtures/data:1",
+                "candidate_ready:nlwiki:2026-07:partial-run",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn ops_default_publication_methods_delegate_and_fail_closed() -> Result<()> {
         let root = TestDir::new()?;
         let data = root.path().join("data");
@@ -1806,6 +1987,15 @@ mod tests {
             ops.rollback_ready_publication(&data, &output, &lifecycle, "rollback")
                 .is_err()
         );
+        assert_eq!(
+            ops.plan_candidate_preparation("nlwiki", "2026-07", &data, &output, "candidate",)?,
+            publication::WikiPreparationPlan::Build {
+                same_snapshot_candidate: false,
+                compute_reused: false,
+                patrol_reused: false,
+            }
+        );
+        assert!(!ops.cached_patrol_sources_available("nlwiki", &data));
         Ok(())
     }
 
@@ -2377,6 +2567,17 @@ mod tests {
             .is_err()
         );
         assert!(
+            ops.plan_candidate_preparation(
+                "../enwiki",
+                "2026-02",
+                data_dir.path(),
+                output_dir.path(),
+                "candidate-run",
+            )
+            .is_err()
+        );
+        assert!(!ops.cached_patrol_sources_available("missingwiki", data_dir.path()));
+        assert!(
             ops.compute_candidate("computewiki", "invalid", data_dir.path(), output_dir.path(),)
                 .is_err()
         );
@@ -2774,6 +2975,27 @@ mod tests {
         )
         .expect_err("fetch failure should propagate");
         assert!(err.to_string().contains("fetch failed"));
+        Ok(())
+    }
+
+    #[test]
+    fn run_with_ops_propagates_candidate_discovery_errors() -> Result<()> {
+        let cli = Cli::try_parse_from([
+            "wiki-econ",
+            "--run-id",
+            "candidate-error",
+            "prepare-wiki",
+            "nlwiki",
+            "--version",
+            "2026-07",
+        ])?;
+        let ops = RecordingOps {
+            preparation_error: true,
+            ..RecordingOps::default()
+        };
+        let error =
+            run_with_ops(cli, &ops).expect_err("candidate discovery failure should propagate");
+        assert!(error.to_string().contains("candidate plan failed"));
         Ok(())
     }
 

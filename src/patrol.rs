@@ -17,7 +17,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use tracing::{info, warn};
 
-use crate::storage;
+use crate::{compute, fingerprint, storage};
 
 #[cfg_attr(coverage, allow(dead_code))]
 const USER_AGENT: &str = "wiki-econ/0.1 (Wikipedia economic analysis research tool)";
@@ -25,6 +25,7 @@ const PATROL_DUMP_BASE: &str = "https://dumps.wikimedia.org";
 const PARQUET_BATCH_ROWS: usize = 50_000;
 const SUBSTANTIAL_LOGGING_DUMP_BYTES: u64 = 1024 * 1024;
 const SUBSTANTIAL_LOG_ITEMS: usize = 10_000;
+const PATROL_COMPUTE_ALGORITHM_VERSION: &str = "patrol-metrics-v2-fingerprinted";
 const REVISION_COLUMNS: &[&str] = &[
     "revision_id",
     "event_timestamp",
@@ -450,7 +451,29 @@ fn compute_patrol_selected(
         anyhow::bail!("No warehouse data for {wiki}. Run `ingest` first.");
     }
 
-    if rebuild {
+    let recordable_run = limit_months.is_none();
+    let fingerprinted_run = !rebuild && recordable_run;
+    let inputs = patrol_stage_inputs(wiki, data_dir, snapshot)?;
+    let outputs = patrol_stage_outputs(wiki, output_dir);
+    let receipt_path = patrol_stage_receipt(output_dir, wiki);
+    let spec = fingerprint::StageSpec {
+        stage: "patrol_compute",
+        scope: wiki,
+        selected_snapshot: snapshot,
+        algorithm_version: PATROL_COMPUTE_ALGORITHM_VERSION,
+    };
+    if fingerprinted_run && fingerprint::reusable(&receipt_path, spec, &inputs, &outputs)? {
+        crate::observability::record_stage_reused("patrol_compute", Some(wiki));
+        info!(
+            wiki,
+            snapshot = snapshot.unwrap_or("legacy"),
+            receipt = %receipt_path.display(),
+            "reusing deterministic patrol compute stage"
+        );
+        return Ok(());
+    }
+
+    if rebuild || fingerprinted_run {
         clear_patrol_parts_dir(output_dir, wiki)?;
     } else {
         bootstrap_patrol_parts_from_final(output_dir, wiki)?;
@@ -485,16 +508,12 @@ fn compute_patrol_selected(
         info!(wiki = wiki, "no patrol months require recomputation");
         let final_path = output_dir.join(wiki).join("patrol.parquet");
         if final_path.is_file() {
-            crate::observability::record_stage_reused("patrol_compute", Some(wiki));
-            info!(
-                wiki = wiki,
-                path = %final_path.display(),
-                "reusing existing patrol metric output"
-            );
+            record_patrol_stage(&receipt_path, spec, &inputs, wiki, output_dir)?;
             return Ok(());
         }
         let merged_path = merge_wiki_patrol_parts(output_dir, wiki)?;
         refresh_patrol_dashboard_artifacts(output_dir, merged_path.as_deref())?;
+        record_patrol_stage(&receipt_path, spec, &inputs, wiki, output_dir)?;
         return Ok(());
     }
 
@@ -554,7 +573,122 @@ fn compute_patrol_selected(
     write_patrol_month_parts(output_dir, wiki, &pending_months, &summary, &patrol_stats)?;
     let merged_path = merge_wiki_patrol_parts(output_dir, wiki)?;
     refresh_patrol_dashboard_artifacts(output_dir, merged_path.as_deref())?;
+    if recordable_run {
+        record_patrol_stage(&receipt_path, spec, &inputs, wiki, output_dir)?;
+    }
     Ok(())
+}
+
+fn patrol_stage_inputs(
+    wiki: &str,
+    data_dir: &Path,
+    snapshot: Option<&str>,
+) -> Result<Vec<fingerprint::TrackedPath>> {
+    let mut inputs = compute::compute_stage_inputs(wiki, data_dir, snapshot)?;
+    let patrol_dir = data_dir.join("patrol").join(wiki);
+    for name in ["autopatrol_groups.json", "patrol.parquet", "rights.parquet"] {
+        inputs.push(fingerprint::TrackedPath::new(
+            format!("patrol-source/{wiki}/{name}"),
+            patrol_dir.join(name),
+        ));
+    }
+    inputs.sort_by(|left, right| left.identity.cmp(&right.identity));
+    Ok(inputs)
+}
+
+fn patrol_stage_outputs(wiki: &str, output_dir: &Path) -> Vec<fingerprint::TrackedPath> {
+    let path = output_dir.join(wiki).join("patrol.parquet");
+    path.is_file()
+        .then(|| fingerprint::TrackedPath::new(format!("output/{wiki}/patrol.parquet"), path))
+        .into_iter()
+        .collect()
+}
+
+fn patrol_stage_receipt(output_dir: &Path, wiki: &str) -> PathBuf {
+    output_dir
+        .join("_stages")
+        .join("patrol_compute")
+        .join(format!("{wiki}.json"))
+}
+
+fn record_patrol_stage(
+    receipt_path: &Path,
+    spec: fingerprint::StageSpec<'_>,
+    inputs: &[fingerprint::TrackedPath],
+    wiki: &str,
+    output_dir: &Path,
+) -> Result<()> {
+    let outputs = patrol_stage_outputs(wiki, output_dir);
+    fingerprint::record(receipt_path, spec, inputs, &outputs)?;
+    Ok(())
+}
+
+pub(crate) fn reusable_candidate_files(
+    wiki: &str,
+    snapshot: &str,
+    data_dir: &Path,
+    candidate_dir: &Path,
+) -> Result<Option<Vec<PathBuf>>> {
+    storage::validate_snapshot_version(snapshot)?;
+    let inputs = patrol_stage_inputs(wiki, data_dir, Some(snapshot))?;
+    let outputs = patrol_stage_outputs(wiki, candidate_dir);
+    let receipt = patrol_stage_receipt(candidate_dir, wiki);
+    let spec = fingerprint::StageSpec {
+        stage: "patrol_compute",
+        scope: wiki,
+        selected_snapshot: Some(snapshot),
+        algorithm_version: PATROL_COMPUTE_ALGORITHM_VERSION,
+    };
+    if !fingerprint::reusable(&receipt, spec, &inputs, &outputs)? {
+        return Ok(None);
+    }
+    let mut files = outputs
+        .into_iter()
+        .map(|output| output.path)
+        .collect::<Vec<_>>();
+    files.push(receipt);
+    Ok(Some(files))
+}
+
+pub(crate) fn cached_sources_available(data_dir: &Path, wiki: &str) -> bool {
+    let patrol_dir = data_dir.join("patrol").join(wiki);
+    let metadata_valid = fs::read(patrol_dir.join("autopatrol_groups.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|value| value.get("autopatrol_groups").cloned())
+        .is_some_and(|groups| groups.is_array());
+    metadata_valid
+        && ["patrol.parquet", "rights.parquet"]
+            .iter()
+            .map(|name| patrol_dir.join(name))
+            .all(|path| {
+                File::open(path)
+                    .ok()
+                    .and_then(|file| ParquetReader::new(file).num_rows().ok())
+                    .is_some_and(|rows| rows > 0)
+            })
+}
+
+#[cfg(test)]
+pub(crate) fn record_candidate_fingerprint_for_test(
+    wiki: &str,
+    snapshot: &str,
+    data_dir: &Path,
+    candidate_dir: &Path,
+) -> Result<()> {
+    let inputs = patrol_stage_inputs(wiki, data_dir, Some(snapshot))?;
+    record_patrol_stage(
+        &patrol_stage_receipt(candidate_dir, wiki),
+        fingerprint::StageSpec {
+            stage: "patrol_compute",
+            scope: wiki,
+            selected_snapshot: Some(snapshot),
+            algorithm_version: PATROL_COMPUTE_ALGORITHM_VERSION,
+        },
+        &inputs,
+        wiki,
+        candidate_dir,
+    )
 }
 
 fn read_parquet_df(path: &Path, columns: Option<Vec<String>>) -> Result<DataFrame> {
@@ -1813,22 +1947,14 @@ fn bootstrap_patrol_parts_from_final(output_dir: &Path, wiki: &str) -> Result<()
     // committed `.parquet` exists. Leftover `.parquet.tmp` files from a
     // previously interrupted run are removed here so the retry can lay down
     // a clean rename target rather than being blocked indefinitely.
+    if committed_patrol_parts_exist(&parts_dir)? {
+        return Ok(());
+    }
     if parts_dir.exists() {
-        let mut has_parquet = false;
-        for entry in fs::read_dir(&parts_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            match path.extension().and_then(|ext| ext.to_str()) {
-                Some("parquet") => has_parquet = true,
-                Some("tmp") => {
-                    let _ = fs::remove_file(&path);
-                }
-                _ => {}
-            }
-        }
-        if has_parquet {
-            return Ok(());
-        }
+        info!(
+            wiki,
+            "patrol parts directory has no committed parquet; bootstrapping"
+        );
     }
     let final_path = output_dir.join(wiki).join("patrol.parquet");
     if !final_path.exists() {
@@ -1859,6 +1985,24 @@ fn bootstrap_patrol_parts_from_final(output_dir: &Path, wiki: &str) -> Result<()
         fs::rename(&temp_path, &final_path)?;
     }
     Ok(())
+}
+
+fn committed_patrol_parts_exist(parts_dir: &Path) -> Result<bool> {
+    if !parts_dir.exists() {
+        return Ok(false);
+    }
+    let mut has_parquet = false;
+    for entry in fs::read_dir(parts_dir)? {
+        let path = entry?.path();
+        match path.extension().and_then(|ext| ext.to_str()) {
+            Some("parquet") => has_parquet = true,
+            Some("tmp") => {
+                let _ = fs::remove_file(path);
+            }
+            _ => {}
+        }
+    }
+    Ok(has_parquet)
 }
 
 fn merge_wiki_patrol_parts(output_dir: &Path, wiki: &str) -> Result<Option<PathBuf>> {

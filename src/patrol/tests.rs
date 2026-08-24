@@ -1189,9 +1189,11 @@ fn artifact_helpers_cover_bootstrap_merge_and_refresh() -> Result<()> {
     let output_dir = temp_dir.path().join("output");
     fs::create_dir_all(&output_dir)?;
 
+    bootstrap_patrol_parts_from_final(&output_dir, "testwiki")?;
     assert!(merge_wiki_patrol_parts(&output_dir, "testwiki")?.is_none());
     fs::create_dir_all(output_dir.join("testwiki").join("_patrol_parts"))?;
     assert!(merge_wiki_patrol_parts(&output_dir, "testwiki")?.is_none());
+    bootstrap_patrol_parts_from_final(&output_dir, "testwiki")?;
     refresh_patrol_dashboard_artifacts(&output_dir, None)?;
     assert!(!output_dir.join("patrol.parquet").exists());
 
@@ -1273,6 +1275,35 @@ fn clear_patrol_parts_dir_is_idempotent_and_removes_existing_dir() -> Result<()>
     fs::write(parts_dir.join("stale.parquet"), b"stale")?;
     clear_patrol_parts_dir(&output_dir, "livewiki")?;
     assert!(!parts_dir.exists());
+    Ok(())
+}
+
+#[test]
+fn cached_patrol_sources_require_three_nonempty_files() -> Result<()> {
+    let data_dir = TestDir::new()?;
+    let patrol_dir = data_dir.path().join("patrol/testwiki");
+    fs::create_dir_all(&patrol_dir)?;
+    assert!(!cached_sources_available(data_dir.path(), "testwiki"));
+    fs::write(
+        patrol_dir.join("autopatrol_groups.json"),
+        b"{\"autopatrol_groups\":[]}",
+    )?;
+    write_patrol_events(
+        &patrol_dir.join("patrol.parquet"),
+        &[(Some("2026-01-01 00:00:00"), 1, 0, Some("Patroller"))],
+    )?;
+    write_rights_events(
+        &patrol_dir.join("rights.parquet"),
+        &[(
+            Some("2026-01-01 00:00:00"),
+            Some("Editor"),
+            Some(""),
+            Some("sysop"),
+        )],
+    )?;
+    assert!(cached_sources_available(data_dir.path(), "testwiki"));
+    fs::write(patrol_dir.join("rights.parquet"), b"")?;
+    assert!(!cached_sources_available(data_dir.path(), "testwiki"));
     Ok(())
 }
 
@@ -1513,9 +1544,11 @@ fn compute_patrol_reports_missing_inputs_and_executes_rebuild_lookup_and_no_pend
         "a no-op patrol refresh must preserve all published artifacts"
     );
 
+    compute_patrol("testwiki", &data_dir, &output_dir, false, Some(1))?;
+
     fs::remove_file(&wiki_output)?;
     fs::remove_file(&dashboard_output)?;
-    compute_patrol("testwiki", &data_dir, &output_dir, false, None)?;
+    compute_patrol("testwiki", &data_dir, &output_dir, false, Some(1))?;
     assert!(wiki_output.exists());
     assert!(dashboard_output.exists());
     assert!(!output_dir.join("defaults_patrol.json").exists());

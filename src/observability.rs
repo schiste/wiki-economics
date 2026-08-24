@@ -103,6 +103,10 @@ pub fn record_stage_reused(stage: &str, wiki: Option<&str>) {
     record_stage_event("reused", stage, wiki, None, None);
 }
 
+pub fn record_stage_skipped(stage: &str, wiki: Option<&str>) {
+    record_stage_event("skipped", stage, wiki, None, None);
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub struct MemorySnapshot {
     pub rss_bytes: Option<u64>,

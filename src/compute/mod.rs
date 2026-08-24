@@ -1927,7 +1927,7 @@ fn compute_all_incremental(
     Ok(())
 }
 
-fn compute_stage_inputs(
+pub(crate) fn compute_stage_inputs(
     wiki: &str,
     data_dir: &Path,
     selected_snapshot: Option<&str>,
@@ -2009,6 +2009,60 @@ fn compute_stage_receipt(output_dir: &Path, wiki: &str) -> PathBuf {
         .join("_stages")
         .join("compute")
         .join(format!("{wiki}.json"))
+}
+
+pub(crate) fn reusable_candidate_files(
+    wiki: &str,
+    snapshot: &str,
+    data_dir: &Path,
+    candidate_dir: &Path,
+) -> Result<Option<Vec<PathBuf>>> {
+    storage::validate_snapshot_version(snapshot)?;
+    let weekly_config = WeeklyAggregationConfig::from_environment()?;
+    let algorithm_version = weekly_config.algorithm_version();
+    let inputs = compute_stage_inputs(wiki, data_dir, Some(snapshot))?;
+    let outputs = compute_stage_outputs(wiki, candidate_dir);
+    let receipt = compute_stage_receipt(candidate_dir, wiki);
+    let spec = fingerprint::StageSpec {
+        stage: "compute",
+        scope: wiki,
+        selected_snapshot: Some(snapshot),
+        algorithm_version: &algorithm_version,
+    };
+    if !fingerprint::reusable(&receipt, spec, &inputs, &outputs)? {
+        return Ok(None);
+    }
+    let mut files = outputs
+        .into_iter()
+        .map(|output| output.path)
+        .collect::<Vec<_>>();
+    files.push(receipt);
+    Ok(Some(files))
+}
+
+#[cfg(test)]
+pub(crate) fn record_candidate_fingerprint_for_test(
+    wiki: &str,
+    snapshot: &str,
+    data_dir: &Path,
+    candidate_dir: &Path,
+) -> Result<()> {
+    let weekly_config = WeeklyAggregationConfig::from_environment()?;
+    let algorithm_version = weekly_config.algorithm_version();
+    let inputs = compute_stage_inputs(wiki, data_dir, Some(snapshot))?;
+    let outputs = compute_stage_outputs(wiki, candidate_dir);
+    fingerprint::record(
+        &compute_stage_receipt(candidate_dir, wiki),
+        fingerprint::StageSpec {
+            stage: "compute",
+            scope: wiki,
+            selected_snapshot: Some(snapshot),
+            algorithm_version: &algorithm_version,
+        },
+        &inputs,
+        &outputs,
+    )
+    .map(|_| ())
 }
 
 /// Run all metric families for a wiki.
