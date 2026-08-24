@@ -167,11 +167,11 @@ python3 -m py_compile \
 echo "==> python3 -m unittest discover -s scripts -p 'test_*.py'"
 python3 -m unittest discover -s scripts -p 'test_*.py'
 
-if [ -f "$ROOT/output/manifest.json" ]; then
+if [ -f "$ROOT/output/manifest.json" ] && [ -f "$ROOT/output/browser-data-index.json" ]; then
   echo "==> ./scripts/build-site.sh"
   ./scripts/build-site.sh
 else
-  echo "==> skipping site build smoke check (output/manifest.json not present)"
+  echo "==> skipping optional live-output site smoke check (complete output set not present)"
 fi
 
 echo "==> all local checks passed"
