@@ -25,6 +25,7 @@ mod storage;
 #[cfg(test)]
 mod test_support;
 mod wiki_lifecycle;
+mod workload_profile;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Utc};

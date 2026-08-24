@@ -8,7 +8,7 @@ use tracing::info;
 
 use crate::resource_governor::{GovernorPaths, ResourceGovernor};
 use crate::snapshot_plan::{SnapshotPlan, SourceSpec};
-use crate::{fetch, ingest};
+use crate::{fetch, ingest, workload_profile};
 
 pub(crate) const SOURCE_WINDOW_SIZE_ENV: &str = "WIKI_ECON_SOURCE_WINDOW_SIZE";
 pub(crate) const DEFAULT_SOURCE_WINDOW_SIZE: usize = 1;
@@ -271,9 +271,7 @@ pub(crate) fn prepare_snapshot(
     run_id: &str,
     window_size: usize,
 ) -> Result<SourceWindowSummary> {
-    let scratch_root = std::env::var_os("WIKI_ECON_SCRATCH_DIR").map(Into::into);
-    let paths = GovernorPaths::new(data_dir.to_path_buf(), scratch_root);
-    let governor = ResourceGovernor::from_environment(paths)?;
+    let governor = governed_snapshot(data_dir, wiki, snapshot, window_size)?;
     prepare_snapshot_with_ops(
         &RealSourceTransactionOps,
         wiki,
@@ -295,9 +293,7 @@ pub(crate) fn prepare_candidate_snapshot(
     run_id: &str,
     window_size: usize,
 ) -> Result<SourceWindowSummary> {
-    let scratch_root = std::env::var_os("WIKI_ECON_SCRATCH_DIR").map(Into::into);
-    let paths = GovernorPaths::new(data_dir.to_path_buf(), scratch_root);
-    let governor = ResourceGovernor::from_environment(paths)?;
+    let governor = governed_snapshot(data_dir, wiki, snapshot, window_size)?;
     prepare_snapshot_with_ops(
         &RealSourceTransactionOps,
         wiki,
@@ -310,6 +306,75 @@ pub(crate) fn prepare_candidate_snapshot(
         },
         Some(&governor),
     )
+}
+
+fn governed_snapshot(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot: &str,
+    window_size: usize,
+) -> Result<ResourceGovernor> {
+    governed_snapshot_with_sizes(data_dir, wiki, snapshot, window_size, |sources| {
+        fetch::snapshot_source_sizes(sources)
+    })
+}
+
+fn governed_snapshot_with_sizes<F>(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot: &str,
+    window_size: usize,
+    resolve_sizes: F,
+) -> Result<ResourceGovernor>
+where
+    F: FnOnce(&[SourceSpec]) -> Result<Vec<Option<u64>>>,
+{
+    let (plan, _) = SnapshotPlan::load_or_resolve(data_dir, wiki, snapshot)?;
+    let analytical = crate::storage::snapshot_analytical_wiki_dir(data_dir, wiki, snapshot)?;
+    let mut source_sizes = vec![None; plan.sources.len()];
+    let mut unresolved = Vec::new();
+    let mut unresolved_indices = Vec::new();
+    for (index, source) in plan.sources.iter().enumerate() {
+        if crate::storage::marker_manifest_is_valid_in(data_dir, &analytical, &source.source_id)?
+            && let Some(marker) =
+                crate::storage::read_marker_manifest_in(data_dir, &analytical, &source.source_id)?
+        {
+            source_sizes[index] = Some(marker.source_size_bytes);
+        } else {
+            unresolved.push(source.clone());
+            unresolved_indices.push(index);
+        }
+    }
+    let resolved = resolve_sizes(&unresolved)?;
+    anyhow::ensure!(
+        resolved.len() == unresolved_indices.len(),
+        "workload sizing returned an incomplete source-size inventory"
+    );
+    for (index, size) in unresolved_indices.into_iter().zip(resolved) {
+        source_sizes[index] = size;
+    }
+    let profile = workload_profile::load_or_select(data_dir, &plan, &source_sizes)?;
+    let scratch_root = std::env::var_os("WIKI_ECON_SCRATCH_DIR").map(Into::into);
+    let paths = GovernorPaths::new(data_dir.to_path_buf(), scratch_root);
+    let source_workers = profile.parameters.source_workers;
+    let governor = ResourceGovernor::from_environment_with_source_workers(paths, source_workers)?;
+    let effective_source_workers = governor.budget().source_worker_limit.min(window_size);
+    profile.ensure_source_qualified(effective_source_workers)?;
+    info!(
+        wiki,
+        snapshot,
+        selected_profile = ?profile.profile,
+        selection_mode = ?profile.selection_mode,
+        total_compressed_bytes = profile.signals.total_compressed_bytes,
+        source_count = profile.signals.source_count,
+        prior_measured_rows = profile.signals.prior_measured_rows,
+        requested_source_workers = profile.parameters.source_workers,
+        effective_source_workers,
+        primary_buckets = profile.parameters.primary_buckets,
+        secondary_buckets = profile.parameters.secondary_buckets,
+        "selected adaptive workload profile"
+    );
+    Ok(governor)
 }
 
 fn prepare_snapshot_with_ops<O: SourceTransactionOps>(
@@ -939,6 +1004,24 @@ mod tests {
             crate::storage::current_snapshot_version(data_dir.path(), wiki)?,
             None
         );
+        prepare_candidate_snapshot(wiki, snapshot, data_dir.path(), "governed-candidate", 1)?;
+        Ok(())
+    }
+
+    #[test]
+    fn governed_snapshot_profiles_a_pending_pinned_source_without_network() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        SnapshotPlan::load_or_resolve(data_dir.path(), "testwiki", "2026-08")?;
+
+        let governor =
+            governed_snapshot_with_sizes(data_dir.path(), "testwiki", "2026-08", 2, |sources| {
+                assert_eq!(sources.len(), 1);
+                Ok(vec![Some(42)])
+            })?;
+        assert_eq!(governor.budget().source_worker_limit, 2);
+        let profile = crate::workload_profile::load(data_dir.path(), "testwiki", "2026-08")?
+            .context("governed snapshot should persist its profile")?;
+        assert_eq!(profile.signals.total_compressed_bytes, 42);
         Ok(())
     }
 }

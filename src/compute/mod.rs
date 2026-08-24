@@ -18,17 +18,17 @@ use crate::{
     fingerprint,
     observability::MemorySnapshot,
     resource_governor::{GovernorPaths, ResourceGovernor},
-    schema, storage,
+    schema, storage, workload_profile,
 };
 
-const COMPUTE_ALGORITHM_VERSION: &str = "core-metrics-v5-two-level-weekly-buckets";
+const COMPUTE_ALGORITHM_VERSION: &str = "core-metrics-v6-adaptive-workload-profile";
 const DEFAULT_WEEKLY_BUCKET_COUNT: usize = 256;
 const DEFAULT_SECONDARY_BUCKET_COUNT: usize = 1;
 const WEEKLY_ROUTING_BATCH_ROWS: usize = 250_000;
-const SUPPORTED_PRIMARY_BUCKET_COUNTS: [usize; 5] = [64, 128, 256, 512, 1024];
+const SUPPORTED_PRIMARY_BUCKET_COUNTS: [usize; 6] = [32, 64, 128, 256, 512, 1024];
 #[cfg(test)]
 const FLAT_BENCHMARK_BUCKET_COUNTS: [usize; 3] = [256, 512, 1024];
-const SUPPORTED_SECONDARY_BUCKET_COUNTS: [usize; 3] = [1, 16, 32];
+const SUPPORTED_SECONDARY_BUCKET_COUNTS: [usize; 4] = [1, 8, 16, 32];
 const WEEKLY_BUCKET_COUNT_ENV: &str = "WIKI_ECON_WEEKLY_BUCKET_COUNT";
 const WEEKLY_PRIMARY_BUCKET_COUNT_ENV: &str = "WIKI_ECON_WEEKLY_PRIMARY_BUCKET_COUNT";
 const WEEKLY_SECONDARY_BUCKET_COUNT_ENV: &str = "WIKI_ECON_WEEKLY_SECONDARY_BUCKET_COUNT";
@@ -50,6 +50,7 @@ pub(crate) struct WeeklyAggregationConfig {
     primary_bucket_count: usize,
     secondary_bucket_count: usize,
     scratch_root: Option<PathBuf>,
+    workload_algorithm_version: Option<String>,
 }
 
 impl WeeklyAggregationConfig {
@@ -65,11 +66,11 @@ impl WeeklyAggregationConfig {
     ) -> Result<Self> {
         anyhow::ensure!(
             SUPPORTED_PRIMARY_BUCKET_COUNTS.contains(&primary_bucket_count),
-            "weekly primary bucket count must be one of 64, 128, 256, 512, or 1024"
+            "weekly primary bucket count must be one of 32, 64, 128, 256, 512, or 1024"
         );
         anyhow::ensure!(
             SUPPORTED_SECONDARY_BUCKET_COUNTS.contains(&secondary_bucket_count),
-            "weekly secondary bucket count must be one of 1, 16, or 32"
+            "weekly secondary bucket count must be one of 1, 8, 16, or 32"
         );
         primary_bucket_count
             .checked_mul(secondary_bucket_count)
@@ -78,7 +79,31 @@ impl WeeklyAggregationConfig {
             primary_bucket_count,
             secondary_bucket_count,
             scratch_root,
+            workload_algorithm_version: None,
         })
+    }
+
+    fn for_snapshot(data_dir: &Path, wiki: &str, snapshot: Option<&str>) -> Result<Self> {
+        let selected_snapshot = match snapshot {
+            Some(snapshot) => Some(snapshot.to_string()),
+            None => storage::current_snapshot_version(data_dir, wiki)?,
+        };
+        if let Some(selected_snapshot) = selected_snapshot
+            && let Some(profile) = workload_profile::load(data_dir, wiki, &selected_snapshot)?
+        {
+            profile.ensure_compute_qualified()?;
+            let scratch_root = env::var_os(SCRATCH_DIR_ENV).map(PathBuf::from);
+            let primary = profile.parameters.primary_buckets;
+            let secondary = profile.parameters.secondary_buckets;
+            let mut config = Self::new_two_level(primary, secondary, scratch_root)?;
+            config.workload_algorithm_version = Some(profile.algorithm_version()?);
+            return Ok(config);
+        }
+        anyhow::ensure!(
+            !workload_profile::require_qualified()?,
+            "qualified production compute requires a persisted workload profile for {wiki}"
+        );
+        Self::from_environment()
     }
 
     fn from_environment() -> Result<Self> {
@@ -117,6 +142,9 @@ impl WeeklyAggregationConfig {
     }
 
     fn algorithm_version(&self) -> String {
+        if let Some(workload) = &self.workload_algorithm_version {
+            return format!("{COMPUTE_ALGORITHM_VERSION}-{workload}");
+        }
         if self.primary_bucket_count == DEFAULT_WEEKLY_BUCKET_COUNT
             && self.secondary_bucket_count == DEFAULT_SECONDARY_BUCKET_COUNT
         {
@@ -1964,13 +1992,23 @@ pub(crate) fn compute_stage_inputs(
             selected_snapshot: Some(&snapshot),
             algorithm_version: crate::ingest::INGEST_ALGORITHM_VERSION,
         };
-        if fingerprint::outputs_reusable(&receipt, spec, &generation_outputs)? {
-            return Ok(vec![fingerprint::TrackedPath::new(
+        let mut inputs = if fingerprint::outputs_reusable(&receipt, spec, &generation_outputs)? {
+            vec![fingerprint::TrackedPath::new(
                 format!("stage/ingest/{wiki}/{snapshot}"),
                 receipt,
-            )]);
+            )]
+        } else {
+            generation_outputs
+        };
+        let profile = workload_profile::profile_path(data_dir, wiki, &snapshot)?;
+        if profile.is_file() {
+            inputs.push(fingerprint::TrackedPath::new(
+                format!("workload-profile/{wiki}/{snapshot}"),
+                profile,
+            ));
         }
-        return Ok(generation_outputs);
+        inputs.sort_by(|left, right| left.identity.cmp(&right.identity));
+        return Ok(inputs);
     }
 
     let analytical = storage::active_analytical_wiki_dir(data_dir, wiki)?;
@@ -2017,7 +2055,7 @@ pub(crate) fn reusable_candidate_files(
     candidate_dir: &Path,
 ) -> Result<Option<Vec<PathBuf>>> {
     storage::validate_snapshot_version(snapshot)?;
-    let weekly_config = WeeklyAggregationConfig::from_environment()?;
+    let weekly_config = WeeklyAggregationConfig::for_snapshot(data_dir, wiki, Some(snapshot))?;
     let algorithm_version = weekly_config.algorithm_version();
     let inputs = compute_stage_inputs(wiki, data_dir, Some(snapshot))?;
     let outputs = compute_stage_outputs(wiki, candidate_dir);
@@ -2046,7 +2084,7 @@ pub(crate) fn record_candidate_fingerprint_for_test(
     data_dir: &Path,
     candidate_dir: &Path,
 ) -> Result<()> {
-    let weekly_config = WeeklyAggregationConfig::from_environment()?;
+    let weekly_config = WeeklyAggregationConfig::for_snapshot(data_dir, wiki, Some(snapshot))?;
     let algorithm_version = weekly_config.algorithm_version();
     let inputs = compute_stage_inputs(wiki, data_dir, Some(snapshot))?;
     let outputs = compute_stage_outputs(wiki, candidate_dir);
@@ -2086,7 +2124,7 @@ fn compute_all_selected(
     output_dir: &Path,
     snapshot: Option<&str>,
 ) -> Result<()> {
-    let weekly_config = WeeklyAggregationConfig::from_environment()?;
+    let weekly_config = WeeklyAggregationConfig::for_snapshot(data_dir, wiki, snapshot)?;
     let algorithm_version = weekly_config.algorithm_version();
     let inputs = compute_stage_inputs(wiki, data_dir, snapshot)?;
     let outputs = compute_stage_outputs(wiki, output_dir);
@@ -2953,7 +2991,11 @@ mod tests {
         assert!(WeeklyAggregationConfig::new(128, None).is_ok());
         assert!(WeeklyAggregationConfig::new(63, None).is_err());
         assert!(WeeklyAggregationConfig::new_two_level(64, 32, None).is_ok());
-        assert!(WeeklyAggregationConfig::new_two_level(64, 8, None).is_err());
+        assert!(WeeklyAggregationConfig::new_two_level(64, 8, None).is_ok());
+        assert_eq!(
+            WeeklyAggregationConfig::new_two_level(32, 8, None)?.logical_bucket_count(),
+            256
+        );
         assert_eq!(
             WeeklyAggregationConfig::new(256, None)?.algorithm_version(),
             COMPUTE_ALGORITHM_VERSION

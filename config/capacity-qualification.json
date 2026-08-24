@@ -7,14 +7,17 @@
   "wikis": {
     "nlwiki": {
       "raw_transient_requirement_bytes": 8589934592,
+      "maximum_source_workers": 1,
       "required_bucket_counts": [256]
     },
     "ptwiki": {
       "raw_transient_requirement_bytes": 9663676416,
+      "maximum_source_workers": 1,
       "required_bucket_counts": [256]
     },
     "frwiki": {
       "raw_transient_requirement_bytes": 33285996544,
+      "maximum_source_workers": 1,
       "minimum_identical_runs": 2,
       "required_bucket_counts": [256, 512, 1024]
     }

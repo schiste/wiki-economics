@@ -47,6 +47,16 @@ pub(crate) struct ResourceBudget {
 
 impl ResourceBudget {
     pub(crate) fn from_environment() -> Result<Self> {
+        Self::from_environment_with_source_workers(1)
+    }
+
+    pub(crate) fn from_environment_with_source_workers(
+        profile_source_workers: usize,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            profile_source_workers > 0,
+            "profile source-worker limit must be positive"
+        );
         let detected_limit = MemorySnapshot::capture().cgroup_limit_bytes;
         let memory_ceiling_bytes = parse_u64_env(MEMORY_CEILING_ENV)?
             .or(detected_limit)
@@ -67,7 +77,9 @@ impl ResourceBudget {
             scratch_limit_bytes: parse_u64_env(SCRATCH_LIMIT_ENV)?
                 .unwrap_or(DEFAULT_SCRATCH_LIMIT_BYTES),
             max_open_files: parse_usize_env(MAX_OPEN_FILES_ENV)?.unwrap_or(DEFAULT_MAX_OPEN_FILES),
-            source_worker_limit: parse_usize_env(SOURCE_WORKERS_ENV)?.unwrap_or(1),
+            source_worker_limit: parse_usize_env(SOURCE_WORKERS_ENV)?
+                .unwrap_or(profile_source_workers)
+                .min(profile_source_workers),
             thread_limit,
             max_logical_partition_bytes: parse_u64_env(MAX_LOGICAL_PARTITION_ENV)?
                 .unwrap_or(DEFAULT_MAX_LOGICAL_PARTITION_BYTES),
@@ -208,6 +220,16 @@ pub(crate) struct ResourceGovernor {
 impl ResourceGovernor {
     pub(crate) fn from_environment(paths: GovernorPaths) -> Result<Self> {
         Ok(Self::new(ResourceBudget::from_environment()?, paths))
+    }
+
+    pub(crate) fn from_environment_with_source_workers(
+        paths: GovernorPaths,
+        profile_source_workers: usize,
+    ) -> Result<Self> {
+        Ok(Self::new(
+            ResourceBudget::from_environment_with_source_workers(profile_source_workers)?,
+            paths,
+        ))
     }
 
     pub(crate) fn new(budget: ResourceBudget, paths: GovernorPaths) -> Self {
