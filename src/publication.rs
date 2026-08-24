@@ -260,6 +260,8 @@ struct ReadyWikiCandidate {
     ready_at_unix: u64,
     generating_commit: Option<String>,
     cutoff_date: String,
+    #[serde(default)]
+    workload_profile: Option<crate::workload_profile::WorkloadProfile>,
     artifacts: Vec<PreparedArtifact>,
 }
 
@@ -284,6 +286,8 @@ struct SelectionEntry {
     previous_candidate_relative: Option<String>,
     previous_snapshot: Option<String>,
     backup_relative: Option<String>,
+    #[serde(default)]
+    workload_profile: Option<crate::workload_profile::WorkloadProfile>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
@@ -436,6 +440,8 @@ struct PublicationProvenance {
     generating_commit: Option<String>,
     generated_at_unix: u64,
     selected_snapshot_versions: BTreeMap<String, String>,
+    #[serde(default)]
+    workload_profiles: BTreeMap<String, crate::workload_profile::WorkloadProfile>,
 }
 
 struct FileSummary {
@@ -722,6 +728,11 @@ pub(crate) fn mark_wiki_candidate_ready(
         );
     }
     artifacts.sort_by(|left, right| left.path.cmp(&right.path));
+    let workload_profile = crate::workload_profile::load(data_dir, wiki, snapshot)?;
+    ensure!(
+        workload_profile.is_some() || !crate::workload_profile::require_qualified()?,
+        "qualified production candidate has no persisted workload profile"
+    );
     let ready = ReadyWikiCandidate {
         schema_version: 1,
         wiki: wiki.to_string(),
@@ -730,6 +741,7 @@ pub(crate) fn mark_wiki_candidate_ready(
         ready_at_unix: now_unix()?,
         generating_commit: licensing::generating_commit(),
         cutoff_date: cutoff_date.context("candidate GDP cutoff is missing")?,
+        workload_profile,
         artifacts,
     };
     let generation_state =
@@ -776,6 +788,15 @@ fn validate_ready_candidate(
         "ready candidate path does not match its identity"
     );
     storage::read_generation_manifest(data_dir, &ready.wiki, &ready.snapshot)?;
+    if let Some(profile) = &ready.workload_profile {
+        profile.validate(&ready.wiki, &ready.snapshot)?;
+        profile.ensure_compute_qualified()?;
+    } else {
+        ensure!(
+            !crate::workload_profile::require_qualified()?,
+            "qualified production ready candidate has no workload profile"
+        );
+    }
     ensure!(
         !ready.artifacts.is_empty(),
         "ready candidate has no artifacts"
@@ -1218,6 +1239,7 @@ fn activate_ready_candidates(
             previous_candidate_relative,
             previous_snapshot,
             backup_relative,
+            workload_profile: ready.workload_profile,
         });
     }
     let mut selection = PublicationSelection {
@@ -1917,6 +1939,16 @@ pub fn validate(
     }
     let policy = licensing::publication_policy()?;
     let validated_at_unix = now_unix()?;
+    let workload_profiles = if selection_path(output_dir, run_id)?.is_file() {
+        let selection: PublicationSelection = read_json(&selection_path(output_dir, run_id)?)?;
+        selection
+            .entries
+            .into_iter()
+            .filter_map(|entry| entry.workload_profile.map(|profile| (entry.wiki, profile)))
+            .collect()
+    } else {
+        BTreeMap::new()
+    };
     let receipt = GateReceipt {
         schema_version: 3,
         run_id: run_id.to_string(),
@@ -1933,6 +1965,7 @@ pub fn validate(
             generating_commit: licensing::generating_commit(),
             generated_at_unix: validated_at_unix,
             selected_snapshot_versions: selected_snapshots.clone(),
+            workload_profiles,
         },
         selected_snapshot_versions: selected_snapshots,
         cutoff_dates: cutoffs,
@@ -2108,6 +2141,12 @@ mod tests {
                 "2026-03",
             )
             .expect("candidate generation manifest should be writable");
+            let snapshot = "2026-03";
+            let data_dir = self.data.path();
+            let (plan, _) =
+                crate::snapshot_plan::SnapshotPlan::load_or_resolve(data_dir, "nlwiki", snapshot)?;
+            let source_sizes = vec![Some(1); plan.sources.len()];
+            crate::workload_profile::load_or_select(self.data.path(), &plan, &source_sizes)?;
             let candidate = wiki_candidate_dir(self.output.path(), "nlwiki", "2026-03", run_id)?;
             let candidate_wiki = candidate.join("nlwiki");
             fs::create_dir_all(&candidate_wiki)?;
@@ -2331,6 +2370,12 @@ mod tests {
         let fixture = Fixture::new()?;
         let ready = fixture.ready_candidate("candidate-1")?;
         assert!(ready.is_file());
+        let mut legacy_ready: ReadyWikiCandidate = read_json(&ready)?;
+        legacy_ready.workload_profile = None;
+        let candidate_dir = ready
+            .parent()
+            .context("ready receipt should have a parent")?;
+        validate_ready_candidate(fixture.data.path(), candidate_dir, &legacy_ready)?;
         let original_wiki_dir = fixture.output.path().join("nlwiki");
         assert!(!original_wiki_dir.is_symlink());
         std::os::unix::fs::symlink(
@@ -2785,6 +2830,7 @@ mod tests {
                     previous_candidate_relative: None,
                     previous_snapshot: Some("2026-03".to_string()),
                     backup_relative: None,
+                    workload_profile: None,
                 }],
             },
         )
@@ -2807,6 +2853,7 @@ mod tests {
                 previous_candidate_relative: None,
                 previous_snapshot: Some("2026-03".to_string()),
                 backup_relative: None,
+                workload_profile: None,
             }],
         };
         assert!(
@@ -2822,6 +2869,7 @@ mod tests {
             previous_candidate_relative: None,
             previous_snapshot: None,
             backup_relative: None,
+            workload_profile: None,
         };
         assert_eq!(
             retire_superseded_candidates(fixture.output.path(), &missing, "publication")?,
@@ -2847,6 +2895,7 @@ mod tests {
             previous_candidate_relative: None,
             previous_snapshot: None,
             backup_relative: None,
+            workload_profile: None,
         };
         assert_eq!(
             retire_superseded_candidates(fixture.output.path(), &retirement, "publication")?,

@@ -275,6 +275,32 @@ function generationSummary(dataDir, wiki) {
     outputs: validOutputs, bytes, in_progress: inProgress, error};
 }
 
+function workloadProfile(dataDir, wiki, snapshot) {
+  if (!snapshot) return null;
+  const file = path.join(dataDir, "snapshots", wiki, snapshot, "workload-profile.json");
+  if (!fs.existsSync(file)) return null;
+  const profile = readJson(file);
+  const parameters = profile?.parameters;
+  const expectedParameters = profile?.profile === "small"
+    ? {source_workers: 2, primary_buckets: 32, secondary_buckets: 8}
+    : profile?.profile === "large"
+      ? {source_workers: 3, primary_buckets: 64, secondary_buckets: 32}
+      : null;
+  if (profile?.schema_version !== 1 || profile.wiki !== wiki || profile.snapshot !== snapshot
+      || !["small", "large"].includes(profile.profile)
+      || !["automatic", "manual_qualification_override"].includes(profile.selection_mode)
+      || !Number.isSafeInteger(profile?.signals?.total_compressed_bytes)
+      || profile.signals.total_compressed_bytes <= 0
+      || !Number.isSafeInteger(profile?.signals?.source_count) || profile.signals.source_count <= 0
+      || !Number.isSafeInteger(parameters?.source_workers) || parameters.source_workers <= 0
+      || !Number.isSafeInteger(parameters?.primary_buckets) || parameters.primary_buckets <= 0
+      || !Number.isSafeInteger(parameters?.secondary_buckets) || parameters.secondary_buckets <= 0
+      || JSON.stringify(parameters) !== JSON.stringify(expectedParameters)) {
+    throw new Error(`invalid workload profile: ${file}`);
+  }
+  return profile;
+}
+
 function parquetRowCounter(countsFile = process.env.WIKI_ECON_PARQUET_ROW_COUNTS_FILE) {
   if (!countsFile) throw new Error("WIKI_ECON_PARQUET_ROW_COUNTS_FILE is required");
   const counts = readJson(countsFile);
@@ -379,6 +405,7 @@ async function buildManifest(options = {}) {
       const metrics = fileList(path.join(outputDir, wiki));
       const metricNames = new Set(metrics.map((entry) => entry.name));
       const patrol = await patrolSummary(dataDir, outputDir, wiki, patrolRequired, rowCounter);
+      const selectedProfile = workloadProfile(dataDir, wiki, generation.version);
       const missingCore = requiredCore.filter((metric) => !metricNames.has(metric));
       const missingMerged = expected.filter((metric) => !mergedNames.has(metric));
       let status = "complete";
@@ -400,6 +427,7 @@ async function buildManifest(options = {}) {
         metrics,
         dashboard: merged,
         patrol,
+        workload_profile: selectedProfile,
         status,
       };
     }
@@ -407,6 +435,9 @@ async function buildManifest(options = {}) {
   const selectedSnapshots = Object.fromEntries(Object.entries(wikis)
     .filter(([, wiki]) => typeof wiki.snapshot?.version === "string")
     .map(([name, wiki]) => [name, wiki.snapshot.version]));
+  const workloadProfiles = Object.fromEntries(Object.entries(wikis)
+    .filter(([, wiki]) => wiki.workload_profile)
+    .map(([name, wiki]) => [name, wiki.workload_profile]));
   return {
     schema_version: 3,
     generated_at: generatedAt,
@@ -422,6 +453,7 @@ async function buildManifest(options = {}) {
       generating_commit: environment.WIKI_ECON_SOURCE_COMMIT || environment.WIKI_ECON_BUILD_COMMIT || null,
       generated_at: generatedAt,
       selected_snapshot_versions: selectedSnapshots,
+      workload_profiles: workloadProfiles,
       release_environment: releaseProvenance(repositoryRoot, environment),
     },
     data_dir: dataDir,
