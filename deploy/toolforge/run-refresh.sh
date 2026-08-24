@@ -39,6 +39,19 @@ export WIKI_ECON_LOG_ANSI=0
 # eight host CPUs. Match data-parallel pools to the real quota by default.
 export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-1}"
 export POLARS_MAX_THREADS="${POLARS_MAX_THREADS:-1}"
+# Fail before a source transaction or logical partition can consume the
+# reserves required to finish already-admitted work. These defaults describe
+# the current 6 GiB Toolforge job; a future enwiki job must override them with
+# its separately qualified 16 GiB / 250 GiB-reserve profile.
+export WIKI_ECON_MEMORY_CEILING_BYTES="${WIKI_ECON_MEMORY_CEILING_BYTES:-6442450944}"
+export WIKI_ECON_MEMORY_RESERVE_BYTES="${WIKI_ECON_MEMORY_RESERVE_BYTES:-1610612736}"
+export WIKI_ECON_PERSISTENT_STORAGE_RESERVE_BYTES="${WIKI_ECON_PERSISTENT_STORAGE_RESERVE_BYTES:-10737418240}"
+export WIKI_ECON_SCRATCH_LIMIT_BYTES="${WIKI_ECON_SCRATCH_LIMIT_BYTES:-68719476736}"
+export WIKI_ECON_MAX_OPEN_FILES="${WIKI_ECON_MAX_OPEN_FILES:-512}"
+export WIKI_ECON_SOURCE_WORKERS="${WIKI_ECON_SOURCE_WORKERS:-1}"
+export WIKI_ECON_THREAD_LIMIT="${WIKI_ECON_THREAD_LIMIT:-1}"
+export WIKI_ECON_MAX_LOGICAL_PARTITION_BYTES="${WIKI_ECON_MAX_LOGICAL_PARTITION_BYTES:-8589934592}"
+export WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS="${WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS:-16}"
 # Keep raw history storage bounded. Operators may raise this to 2–4 after
 # checking NFS headroom; one source is the fail-safe Toolforge default.
 WIKI_ECON_SOURCE_WINDOW_SIZE="${WIKI_ECON_SOURCE_WINDOW_SIZE:-1}"

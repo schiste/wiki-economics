@@ -83,6 +83,10 @@ cargo run --release --locked -- run frwiki --version YYYY-MM
 `run` downloads and ingests one planned source at a time by default. Set
 `--source-window-size 2` through `4` (or `WIKI_ECON_SOURCE_WINDOW_SIZE`) only
 when measured storage headroom justifies retaining more compressed inputs.
+Concurrency and storage/memory admission are controlled by the
+[Rust resource governor](docs/resource-governor.md), including source workers,
+compute threads, Parquet writers, logical partition size, file descriptors,
+scratch use, and required reserves.
 
 Compatibility/operator stage commands are also available, but the separated
 `fetch` then `ingest` form does not provide the bounded raw-storage guarantee

@@ -85,6 +85,10 @@ frwiki completed the measured capacity qualification documented in
   completed source markers let a restart continue at the first unfinished
   source. The candidate generation is selected only after the exact plan,
   marker inventory, Parquet footers, and row totals all validate.
+  The [Rust resource governor](../../docs/resource-governor.md) independently
+  caps concurrency and admits each source against cgroup memory, filesystem
+  reserve, scratch, and file-descriptor signals. Thus a window of four is an
+  upper bound, not a promise that four sources start when resources are tight.
   A new monthly snapshot is written beside the active generation and selected
   atomically; the previous generation is retained through compute, merge, and
   site publication, then `snapshot-finalize` removes it. This intentionally
