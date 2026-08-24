@@ -43,30 +43,32 @@
 # compute. See README.md's "On-demand stage jobs" section. Each still goes
 # through run-refresh.sh's single shared refresh lock, so it can't race a
 # concurrent wiki-econ-refresh or another on-demand job.
+#
+# Toolforge Jobs Framework CLI 0.3.9 has no per-job envvar support (`jobs run`
+# takes no --envvar/--envvars flag; `toolforge envvars create` is tool-wide
+# only), so each job's `command:` points at a small wrapper script that
+# exports WIKI_ECON_REFRESH_STAGE and execs run-refresh.sh unmodified, rather
+# than setting the stage via an `envvars:` field here.
 
 - name: wiki-econ-ingest
   image: tool-wiki-economics/tool-wiki-economics:latest
-  command: deploy/toolforge/run-refresh.sh
+  command: deploy/toolforge/run-refresh-ingest.sh
   filelog: true
   mount: all
   mem: 6Gi
   cpu: "1"
-  envvars:
-    - WIKI_ECON_REFRESH_STAGE=ingest
 
 - name: wiki-econ-compute
   image: tool-wiki-economics/tool-wiki-economics:latest
-  command: deploy/toolforge/run-refresh.sh
+  command: deploy/toolforge/run-refresh-compute.sh
   filelog: true
   mount: all
   mem: 6Gi
   cpu: "1"
-  envvars:
-    - WIKI_ECON_REFRESH_STAGE=compute
 
 - name: wiki-econ-site
   image: tool-wiki-economics/tool-wiki-economics:latest
-  command: deploy/toolforge/run-refresh.sh
+  command: deploy/toolforge/run-refresh-site.sh
   filelog: true
   mount: all
   # Just the Observable build against already-published compute output.
@@ -75,5 +77,3 @@
   # references for wiki-econ-refresh).
   mem: 2Gi
   cpu: "1"
-  envvars:
-    - WIKI_ECON_REFRESH_STAGE=site

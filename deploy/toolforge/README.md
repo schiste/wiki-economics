@@ -61,6 +61,13 @@ frwiki completed the measured capacity qualification documented in
   refreshes — see [On-demand stage jobs](#on-demand-stage-jobs) below.
   `wiki-econ-admin` serves `/admin*` and the built static site as a separate
   buildservice webservice; it is not duplicated as a Toolforge Job.
+- `run-refresh-ingest.sh`, `run-refresh-compute.sh`, `run-refresh-site.sh` —
+  thin wrappers, one per on-demand Job, that export
+  `WIKI_ECON_REFRESH_STAGE` and exec `run-refresh.sh` unmodified. Toolforge
+  Jobs Framework CLI 0.3.9 has no per-job envvar support (`jobs run` takes no
+  `--envvar`/`--envvars` flag; `toolforge envvars create` is tool-wide only),
+  so `jobs.yaml` points each on-demand Job's `command:` at its wrapper
+  instead of setting the stage through an `envvars:` field.
 - `run-refresh.sh` — wraps `scripts/refresh.sh` for the scheduled job.
   Unlike Cloud VPS's `run-refresh.sh`, this does not keep a `releases/`
   history: retaining multiple full output generations consumes shared NFS
@@ -170,8 +177,10 @@ the field contract and operator checks.
 site pipeline, which is unnecessary when only one part changed — a
 `site/`-only or `docs/`-only commit still has to wait through a full
 fetch/compute cycle before the new page is live. `jobs.yaml` also loads three
-on-demand-only Jobs (no `schedule:`, so they never run on their own) that each
-set `WIKI_ECON_REFRESH_STAGE` and reuse `run-refresh.sh` unmodified:
+on-demand-only Jobs (no `schedule:`, so they never run on their own), each
+pointed at its own `run-refresh-<stage>.sh` wrapper (see the `run-refresh.sh`
+bullet above) which sets `WIKI_ECON_REFRESH_STAGE` and reuses `run-refresh.sh`
+unmodified:
 
 - `wiki-econ-ingest` — fetch, ingest, and patrol-fetch only, per wiki.
 - `wiki-econ-compute` — compute, patrol-compute, and merge only, then
