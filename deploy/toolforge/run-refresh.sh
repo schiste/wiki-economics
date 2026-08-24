@@ -51,6 +51,7 @@ export WIKI_ECON_ROLLBACK_GENERATION_RESERVE_BYTES="${WIKI_ECON_ROLLBACK_GENERAT
 export WIKI_ECON_SCRATCH_LIMIT_BYTES="${WIKI_ECON_SCRATCH_LIMIT_BYTES:-68719476736}"
 export WIKI_ECON_MAX_OPEN_FILES="${WIKI_ECON_MAX_OPEN_FILES:-512}"
 export WIKI_ECON_SOURCE_WORKERS="${WIKI_ECON_SOURCE_WORKERS:-1}"
+export WIKI_ECON_REQUIRE_QUALIFIED_PROFILE=1
 export WIKI_ECON_THREAD_LIMIT="${WIKI_ECON_THREAD_LIMIT:-1}"
 export WIKI_ECON_MAX_LOGICAL_PARTITION_BYTES="${WIKI_ECON_MAX_LOGICAL_PARTITION_BYTES:-8589934592}"
 export WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS="${WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS:-16}"
@@ -62,15 +63,8 @@ if [[ ! "$WIKI_ECON_SOURCE_WINDOW_SIZE" =~ ^[1-4]$ ]]; then
   exit 2
 fi
 export WIKI_ECON_SOURCE_WINDOW_SIZE
-# Production capacity qualification selected 256 stable weekly buckets.
-# Reject an accidental Toolforge environment override instead of silently
-# running a configuration that failed the 25% memory-headroom gate.
-WIKI_ECON_WEEKLY_BUCKET_COUNT="${WIKI_ECON_WEEKLY_BUCKET_COUNT:-256}"
-if [ "$WIKI_ECON_WEEKLY_BUCKET_COUNT" != "256" ]; then
-  echo "Toolforge refresh requires WIKI_ECON_WEEKLY_BUCKET_COUNT=256 (got: $WIKI_ECON_WEEKLY_BUCKET_COUNT)" >&2
-  exit 2
-fi
-export WIKI_ECON_WEEKLY_BUCKET_COUNT
+# Rust owns the weekly layout and rejects configurations absent from the
+# checked-in capacity qualification registry before expensive work starts.
 # Which portion of the pipeline to run. `all` (the weekly scheduled job) runs
 # everything; `ingest`/`compute`/`site` are for on-demand jobs that trigger
 # just one stage between scheduled runs.

@@ -15,7 +15,9 @@ The [generated lifecycle table](../../docs/generated/stack-reference.md#publishe
 is the source of truth for scheduled Toolforge datasets and paused imports.
 frwiki completed the measured capacity qualification documented in
 [`docs/benchmarking.md`](../../docs/benchmarking.md) and uses the qualified
-256-bucket configuration. enwiki is out of scope for Toolforge entirely.
+256-logical-bucket envelope through the adaptive `small` profile. enwiki
+remains excluded from production scheduling while its adaptive `large` profile
+and higher resource envelope are being qualified.
 
 ## Files
 

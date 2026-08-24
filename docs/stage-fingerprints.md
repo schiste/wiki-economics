@@ -10,6 +10,7 @@ Receipts are stored outside published artifacts:
 ```text
 data/stages/<wiki>/<snapshot>/fetch.json
 data/stages/<wiki>/<snapshot>/ingest.json
+data/snapshots/<wiki>/<snapshot>/workload-profile.json
 output/_stages/compute/<wiki>.json
 output/_stages/patrol_compute/<wiki>.json
 output/_stages/merge.json
@@ -33,9 +34,11 @@ fast validation index and is deliberately excluded from the fingerprint.
 - **ingest** reuses only a receipt whose complete output generation still
   validates. It then atomically selects that generation again.
 - **compute** reuses only the exact selected generation, explicit Rust
-  algorithm version, and complete recorded metric inventory. When possible its
-  input is the validated ingest receipt, avoiding a second multi-gigabyte hash
-  pass.
+  algorithm version, persisted adaptive workload profile, and complete recorded
+  metric inventory. The profile records total compressed bytes, source count,
+  prior measured rows, preferred source concurrency, and the two-level bucket
+  layout. When possible compute's other input is the validated ingest receipt,
+  avoiding a second multi-gigabyte hash pass.
 - **patrol compute** includes the selected ingest generation and all three
   locally validated patrol inputs (`patrol.parquet`, `rights.parquet`, and the
   autopatrol-group metadata). A changed algorithm or input invalidates patrol

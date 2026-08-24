@@ -62,18 +62,51 @@ All byte values are integer bytes.
 | `WIKI_ECON_THREAD_LIMIT` | Upper bound for Rayon and Polars pools | configured pool size, otherwise 1 |
 | `WIKI_ECON_MAX_LOGICAL_PARTITION_BYTES` | Largest month accepted by compute | 8 GiB |
 | `WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS` | Parquet writers allowed at once | 16 |
+| `WIKI_ECON_WORKLOAD_PROFILE` | Manual `small`/`large` override for isolated qualification only | unset |
+| `WIKI_ECON_REQUIRE_QUALIFIED_PROFILE` | Reject manual or unqualified profiles | false outside production; true in Toolforge wrappers |
 | `WIKI_ECON_WEEKLY_BUCKET_COUNT` | Legacy flat primary count; cannot be combined with the next two settings | 256 |
-| `WIKI_ECON_WEEKLY_PRIMARY_BUCKET_COUNT` | Primary count for an explicit one- or two-level layout: 64, 128, 256, 512, or 1024 | 256 |
-| `WIKI_ECON_WEEKLY_SECONDARY_BUCKET_COUNT` | Secondary count per primary: 1, 16, or 32 | 1 |
+| `WIKI_ECON_WEEKLY_PRIMARY_BUCKET_COUNT` | Primary count for an explicit one- or two-level layout: 32, 64, 128, 256, 512, or 1024 | 256 |
+| `WIKI_ECON_WEEKLY_SECONDARY_BUCKET_COUNT` | Secondary count per primary: 1, 8, 16, or 32 | 1 |
 
 `RAYON_NUM_THREADS` and `POLARS_MAX_THREADS` must not exceed
 `WIKI_ECON_THREAD_LIMIT`. Environment parsing and contradictory budgets are
-fail-closed.
+fail-closed. The weekly bucket variables remain available to `capacity-bench`
+and legacy standalone commands; normal snapshot preparation persists and
+consumes an adaptive profile instead.
+
+## Adaptive workload profiles
+
+At snapshot start Rust resolves one immutable
+`data/snapshots/<wiki>/<snapshot>/workload-profile.json`. Selection uses the
+canonical source plan's source count, the exact total compressed bytes obtained
+from strict markers or remote metadata, and the last validated generation's
+warehouse rows. It never branches on a wiki name.
+
+| Profile | Preferred source workers | Primary buckets | Secondary buckets | Logical buckets |
+| --- | ---: | ---: | ---: | ---: |
+| `small` | 2 | 32 | 8 | 256 |
+| `large` | 3 | 64 | 32 | 2,048 |
+
+`small` is selected only at or below 64 GiB compressed, 64 sources, and five
+billion prior measured rows. Exceeding any boundary selects `large`. Missing
+source sizes fail closed. A missing prior row measurement is allowed for a
+first generation because the source inventory and compressed bytes still bound
+the decision.
+
+Preferred source workers are capped by `WIKI_ECON_SOURCE_WORKERS` and the
+source window. Production checks the resulting concurrency and logical bucket
+count against `config/capacity-qualification.json`. A manual profile override,
+an unknown wiki, or the currently unqualified `large` profile is rejected when
+`WIKI_ECON_REQUIRE_QUALIFIED_PROFILE=1`. Qualification jobs may explicitly
+override the profile with the production gate disabled; publishing it still
+requires checked-in evidence and a new binary.
 
 The Toolforge wrapper pins a 6 GiB ceiling, 1.5 GiB memory reserve, 10 GiB
 safety reserve, 8 GiB bounded-scratch reserve, 8 GiB rollback reserve, one
-source worker, and one compute thread for the existing job. These are
-operational defaults, not enwiki qualification results.
+effective source worker, and one compute thread for the existing job. The
+adaptive `small` profile prefers two workers, but the checked-in production
+capacity policy currently admits only the one-worker cap. These are operational
+defaults, not enwiki qualification results.
 
 ## Proposed enwiki qualification profile
 

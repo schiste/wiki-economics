@@ -50,7 +50,12 @@ if [ -n "\${FAKE_DRIVER_ARGS:-}" ]; then
   printf '%s\n' "$*" > "$FAKE_DRIVER_ARGS"
 fi
 if [ -n "\${FAKE_DRIVER_ENV:-}" ]; then
-  printf '%s\n%s\n%s\n' "$RAYON_NUM_THREADS" "$POLARS_MAX_THREADS" "$WIKI_ECON_WEEKLY_BUCKET_COUNT" > "$FAKE_DRIVER_ENV"
+  printf '%s\n%s\n%s\n%s\n%s\n' \
+    "$RAYON_NUM_THREADS" \
+    "$POLARS_MAX_THREADS" \
+    "$WIKI_ECON_SOURCE_WORKERS" \
+    "$WIKI_ECON_REQUIRE_QUALIFIED_PROFILE" \
+    "\${WIKI_ECON_WEEKLY_BUCKET_COUNT:-unset}" > "$FAKE_DRIVER_ENV"
 fi
 if [ -n "\${FAKE_DRIVER_READY:-}" ]; then
   : > "$FAKE_DRIVER_READY"
@@ -212,15 +217,17 @@ test("an active refresh owns metadata, rejects overlap, and releases cleanly", a
     fs.readFileSync(fixture.driverArgs, "utf8").trim(),
     "--version 2026-07 frwiki nlwiki ptwiki",
   );
-  assert.equal(fs.readFileSync(fixture.driverEnv, "utf8"), "1\n1\n256\n");
+  assert.equal(fs.readFileSync(fixture.driverEnv, "utf8"), "1\n1\n1\n1\nunset\n");
 });
 
-test("production refresh rejects an unqualified weekly bucket override", () => {
-  const fixture = createFixture("unqualified-buckets");
-  const result = runFixture(fixture, {WIKI_ECON_WEEKLY_BUCKET_COUNT: "512"});
-  assert.equal(result.status, 2, `${result.stdout}\n${result.stderr}`);
-  assert.match(result.stderr, /requires WIKI_ECON_WEEKLY_BUCKET_COUNT=256/);
-  assert.equal(fs.existsSync(path.join(fixture.output, ".refresh-lock")), false);
+test("toolforge refresh forces adaptive profile qualification", () => {
+  const fixture = createFixture("qualified-profile");
+  const result = runFixture(fixture, {
+    FAKE_DRIVER_ENV: fixture.driverEnv,
+    WIKI_ECON_REQUIRE_QUALIFIED_PROFILE: "0",
+  });
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.equal(fs.readFileSync(fixture.driverEnv, "utf8"), "1\n1\n1\n1\nunset\n");
 });
 
 test("production refresh rejects an unknown stage", () => {

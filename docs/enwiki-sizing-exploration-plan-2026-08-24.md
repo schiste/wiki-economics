@@ -319,8 +319,11 @@ new-snapshot run. These are scheduling assumptions, not an SLO or benchmark.
 1. Add deterministic monthly-source discovery and fixtures.
 2. **Completed:** add windowed fetch-and-ingest with strict per-source
    checkpoints and source-level restart tests.
-3. Make open writers, logical buckets, source concurrency, scratch root, and
-   memory thresholds explicit configuration recorded in provenance.
+3. **Completed:** select a persisted adaptive workload profile from compressed
+   bytes, source count, and prior measured rows; record its source concurrency
+   and two-level bucket layout in compute and publication provenance. The
+   `large` profile remains fail-closed in production until this plan's
+   qualification gates are completed.
 4. Implement capped-writer or hierarchical page-week aggregation.
 5. Convert all large-file validation to one-pass row-group iteration.
 6. Add cgroup CPU, memory, I/O, scratch, and persistent-storage telemetry.
