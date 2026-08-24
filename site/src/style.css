@@ -1160,6 +1160,10 @@ body.wk-loading .wk-progress-status {
   font-variant-numeric: tabular-nums;
 }
 
+.wide-table {
+  overflow-x: auto;
+}
+
 /* ── Code blocks in admin page ──────────────────────────── */
 
 #observablehq-main pre {

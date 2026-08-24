@@ -96,7 +96,67 @@ dataset.
 
 ## Third-party software
 
-Dependencies retain their upstream licenses. See the
-[third-party notices](https://github.com/schiste/wiki-economics/blob/main/THIRD_PARTY_NOTICES.md),
-[dependency inventory](https://github.com/schiste/wiki-economics/blob/main/docs/dependencies-and-licenses.md),
-and [source repository](https://github.com/schiste/wiki-economics) for details.
+Dependencies retain their upstream licenses. This table is copied from the
+CI-verified
+[generated stack reference](https://github.com/schiste/wiki-economics/blob/main/docs/generated/stack-reference.md);
+see that file for the current, authoritative versions if this page has
+drifted. Full notices are in the
+[third-party notices](https://github.com/schiste/wiki-economics/blob/main/THIRD_PARTY_NOTICES.md)
+and [dependency inventory](https://github.com/schiste/wiki-economics/blob/main/docs/dependencies-and-licenses.md).
+
+### Toolchains and site compiler
+
+| Component | Version |
+| --- | --- |
+| Rust | `1.98.0` |
+| Node.js | `24.15.0` |
+| npm | `11.12.1` |
+| Observable Framework | `1.13.4` |
+| esbuild | `0.28.2` |
+
+### Direct Rust dependencies
+
+<div class="wide-table">
+
+| Crate | Version | Role | License |
+| --- | --- | --- | --- |
+| `anyhow` | `1.0.104` | application error propagation and context | `MIT OR Apache-2.0` |
+| `bzip2` | `0.5.2` | streaming MediaWiki History decompression | `MIT OR Apache-2.0` |
+| `chrono` | `0.4.45` | UTC dates, timestamps, and snapshot boundaries | `MIT OR Apache-2.0` |
+| `clap` | `4.6.6` | command-line parsing | `MIT OR Apache-2.0` |
+| `flate2` | `1.1.9` | concatenated gzip decoding for logging dumps | `MIT OR Apache-2.0` |
+| `fs4` | `1.1.0` | portable file locking | `MIT OR Apache-2.0` |
+| `hex` | `0.4.3` | digest encoding | `MIT OR Apache-2.0` |
+| `indicatif` | `0.18.6` | operator progress reporting | `MIT` |
+| `polars` | `0.55.2` | Parquet/CSV dataframes, aggregation, and deterministic output | `MIT` |
+| `quick-xml` | `0.41.0` | streaming MediaWiki logging XML parsing | `MIT` |
+| `rayon` | `1.12.0` | bounded parallel work | `MIT OR Apache-2.0` |
+| `regex` | `1.13.1` | validated source-name and text parsing | `MIT OR Apache-2.0` |
+| `reqwest` | `0.12.28` | Wikimedia dump and API HTTP client | `MIT OR Apache-2.0` |
+| `rustix` | `1.1.4` | filesystem durability operations | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` |
+| `serde` | `1.0.229` | typed serialization contracts | `MIT OR Apache-2.0` |
+| `serde_json` | `1.0.151` | JSON manifests, receipts, and status records | `MIT OR Apache-2.0` |
+| `sha2` | `0.11.0` | content and artifact fingerprints | `MIT OR Apache-2.0` |
+| `tracing` | `0.1.44` | structured pipeline events | `MIT` |
+| `tracing-subscriber` | `0.3.23` | structured log formatting and filtering | `MIT` |
+| `url` | `2.5.8` | typed canonical snapshot source URLs | `MIT OR Apache-2.0` |
+
+</div>
+
+### Direct browser and site dependencies
+
+<div class="wide-table">
+
+| Package | Version | Role | License |
+| --- | --- | --- | --- |
+| `@observablehq/framework` | `1.13.4` | deterministic static-site compiler | `ISC` |
+| `@observablehq/inputs` | `0.12.0` | interactive controls | `ISC` |
+| `@observablehq/plot` | `0.6.17` | charts | `ISC` |
+| `apache-arrow` | `21.2.0` | browser columnar data representation | `Apache-2.0` |
+| `d3` | `7.9.0` | browser transforms and scales | `ISC` |
+| `htl` | `1.0.0` | safe browser HTML templates | `ISC` |
+| `parquet-wasm` | `0.7.2` | browser Parquet decoding | `MIT OR Apache-2.0` |
+| `react` | `19.2.8` | exact Observable client JSX runtime resolution | `MIT` |
+| `react-dom` | `19.2.8` | exact Observable client JSX renderer resolution | `MIT` |
+
+</div>
