@@ -36,6 +36,7 @@ function fixture(name) {
     WIKI_ECON_BINARY_SHA256: "a".repeat(64),
     WIKI_ECON_IMAGE_SOURCE_COMMIT: "b".repeat(40),
     WIKI_ECON_IMAGE_SOURCE_REF: "main",
+    WIKI_ECON_IMAGE_DIGEST: `registry/image@sha256:${"d".repeat(64)}`,
     WIKI_ECON_OUTPUT_DIR: output,
     WIKI_ECON_REFRESH_HISTORY_LIMIT: "104",
     WIKI_ECON_RUN_EVENTS_FILE: path.join(lock, "stage-events.jsonl"),
@@ -96,6 +97,7 @@ test("live and final records combine provenance, resources, publication, and sit
   assert.equal(live.exitCode, null);
   assert.equal(live.noOp, false);
   assert.equal(live.provenance.imageSourceRef, "main");
+  assert.equal(live.provenance.imageDigest, environment.WIKI_ECON_IMAGE_DIGEST);
   assert.equal(live.disk.path, environment.WIKI_ECON_OUTPUT_DIR);
 
   appendEvent(environment.WIKI_ECON_RUN_EVENTS_FILE, "completed", "compute", "nlwiki", 800);

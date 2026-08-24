@@ -25,13 +25,17 @@ set -euo pipefail
 #      hand for a rebuild to actually take effect.
 
 REPO_URL="${1:-${WIKI_ECON_REPO_URL:-https://github.com/schiste/wiki-economics.git}}"
-SOURCE_REF="${2:-${WIKI_ECON_SOURCE_REF:-main}}"
+SOURCE_REF="${2:-${WIKI_ECON_SOURCE_REF:-}}"
 SOURCE_COMMIT="${3:-${WIKI_ECON_IMAGE_SOURCE_COMMIT:-}}"
 POLL_INTERVAL_SECS="${WIKI_ECON_BUILD_POLL_INTERVAL:-20}"
 POLL_TIMEOUT_SECS="${WIKI_ECON_BUILD_POLL_TIMEOUT:-1800}"
 
 if [[ ! "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
   echo "rebuild-image.sh requires the exact 40-character source commit as its third argument" >&2
+  exit 2
+fi
+if [ "$SOURCE_REF" != "$SOURCE_COMMIT" ]; then
+  echo "rebuild-image.sh requires the exact source commit as both ref and commit" >&2
   exit 2
 fi
 
@@ -66,9 +70,23 @@ if [ "$build_status" != "ok" ]; then
   exit 1
 fi
 
+build_json="$(toolforge build show --json "$build_id")"
+actual_ref="$(jq -er '.build.ref' <<< "$build_json")"
+actual_source="$(jq -er '.build.source_url' <<< "$build_json")"
+image_digest="$(jq -er '.build.destination_image' <<< "$build_json")"
+if [ "$actual_ref" != "$SOURCE_COMMIT" ] || [ "$actual_source" != "$REPO_URL" ]; then
+  echo "Completed build provenance does not match requested source" >&2
+  exit 1
+fi
+if [[ ! "$image_digest" =~ @sha256:[0-9a-f]{64}$ ]]; then
+  echo "Completed build has no immutable image digest" >&2
+  exit 1
+fi
+
 echo "==> Recording image provenance"
 toolforge envvars create WIKI_ECON_IMAGE_SOURCE_REF "$SOURCE_REF"
 toolforge envvars create WIKI_ECON_IMAGE_SOURCE_COMMIT "$SOURCE_COMMIT"
+toolforge envvars create WIKI_ECON_IMAGE_DIGEST "$image_digest"
 
 echo "==> Restarting wiki-econ-admin webservice"
 toolforge webservice restart

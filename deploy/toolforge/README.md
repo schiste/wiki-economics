@@ -365,16 +365,15 @@ TOOLFORGE_SSH_TARGET=login.toolforge.org \
 ```
 
 When site, Node, shared script, or Toolforge deployment files changed, rebuild
-the lightweight image from `main` (Cargo remains skipped). Toolforge's Build
-Service accepts named refs rather than raw commit SHAs, so verify `main` before
-and after the build when pinning it to a release:
+the lightweight image from the exact release commit (Cargo remains skipped).
+Toolforge Build Service accepts commit SHAs as refs; the helper verifies the
+completed build's source URL, ref, and immutable image digest before restarting
+anything:
 
 ```sh
-test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$release_sha"
 ssh login.toolforge.org \
-  "become wiki-economics bash -s -- 'https://github.com/schiste/wiki-economics.git' main '$release_sha'" \
+  "become wiki-economics bash -s -- 'https://github.com/schiste/wiki-economics.git' '$release_sha' '$release_sha'" \
   < deploy/toolforge/rebuild-image.sh
-test "$(git ls-remote origin refs/heads/main | cut -f1)" = "$release_sha"
 ```
 
 Reload `deploy/toolforge/jobs.yaml` when the job definition changes. The file

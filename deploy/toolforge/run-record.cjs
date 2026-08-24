@@ -253,6 +253,7 @@ function buildRecord(environment, finalExitCode = null) {
       binarySha256: environment.WIKI_ECON_BINARY_SHA256 || null,
       imageSourceRef: environment.WIKI_ECON_IMAGE_SOURCE_REF || null,
       imageSourceCommit: environment.WIKI_ECON_IMAGE_SOURCE_COMMIT || null,
+      imageDigest: environment.WIKI_ECON_IMAGE_DIGEST || null,
     },
     publication,
     memoryCurrentBytes: finiteCounter("/sys/fs/cgroup/memory.current"),
