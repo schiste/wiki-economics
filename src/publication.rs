@@ -3155,43 +3155,47 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn hidden_qualification_receipt_is_structurally_ineligible_for_publication() -> Result<()> {
-        let fixture = Fixture::new()?;
-        let mut lifecycle: Value = read_json(&fixture.lifecycle_path)?;
+    fn prepare_hidden_qualification_fixture(fixture: &Fixture, run_id: &str) {
+        let mut lifecycle: Value =
+            read_json(&fixture.lifecycle_path).expect("fixture lifecycle should load");
         lifecycle["wikis"]["nlwiki"] = json!({
             "publication": "hidden",
             "refresh": "qualification"
         });
-        atomic_json(&fixture.lifecycle_path, &lifecycle)?;
-        ensure_qualification_wiki(&fixture.lifecycle_path, "nlwiki")?;
+        atomic_json(&fixture.lifecycle_path, &lifecycle)
+            .expect("hidden qualification lifecycle should persist");
+        ensure_qualification_wiki(&fixture.lifecycle_path, "nlwiki")
+            .expect("hidden qualification lifecycle should validate");
 
         let analytical =
-            storage::snapshot_analytical_wiki_dir(fixture.data.path(), "nlwiki", "2026-03")?;
-        write_single_i64(&analytical.join("template.parquet"))?;
+            storage::snapshot_analytical_wiki_dir(fixture.data.path(), "nlwiki", "2026-03")
+                .expect("analytical generation path should resolve");
+        write_single_i64(&analytical.join("template.parquet"))
+            .expect("analytical fixture should write");
         storage::write_test_generation_manifest_from_files(
             fixture.data.path(),
             "nlwiki",
             "2026-03",
-        )?;
+        )
+        .expect("generation manifest should write");
         let (plan, _) = crate::snapshot_plan::SnapshotPlan::load_or_resolve(
             fixture.data.path(),
             "nlwiki",
             "2026-03",
-        )?;
+        )
+        .expect("snapshot plan should resolve");
         crate::workload_profile::load_or_select(
             fixture.data.path(),
             &plan,
             &vec![Some(1); plan.sources.len()],
-        )?;
-        let qualification = wiki_qualification_dir(
-            fixture.output.path(),
-            "nlwiki",
-            "2026-03",
-            "qualification-1",
-        )?;
+        )
+        .expect("qualification workload profile should persist");
+        let qualification =
+            wiki_qualification_dir(fixture.output.path(), "nlwiki", "2026-03", run_id)
+                .expect("qualification path should resolve");
         let qualification_wiki = qualification.join("nlwiki");
-        fs::create_dir_all(&qualification_wiki)?;
+        fs::create_dir_all(&qualification_wiki)
+            .expect("qualification output directory should exist");
         for spec in &METRICS {
             fs::copy(
                 fixture
@@ -3200,8 +3204,38 @@ mod tests {
                     .join("nlwiki")
                     .join(format!("{}.parquet", spec.name)),
                 qualification_wiki.join(format!("{}.parquet", spec.name)),
-            )?;
+            )
+            .expect("qualification metric should copy");
         }
+    }
+
+    fn block_generation_state_write(fixture: &Fixture, run_id: &str) -> PathBuf {
+        let state_path = crate::generation_lifecycle::state_path(
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            run_id,
+        )
+        .expect("generation state path should resolve");
+        let blocker = state_path
+            .parent()
+            .expect("generation state should have a parent")
+            .join(format!(
+                ".{}.{pid}.tmp",
+                state_path
+                    .file_name()
+                    .expect("generation state should have a filename")
+                    .to_string_lossy(),
+                pid = std::process::id()
+            ));
+        fs::create_dir_all(&blocker).expect("state write blocker should be created");
+        blocker
+    }
+
+    #[test]
+    fn hidden_qualification_receipt_is_structurally_ineligible_for_publication() {
+        let fixture = Fixture::new().expect("qualification fixture should build");
+        prepare_hidden_qualification_fixture(&fixture, "qualification-1");
 
         let receipt_path = mark_wiki_qualification_ready(
             fixture.data.path(),
@@ -3210,20 +3244,94 @@ mod tests {
             "nlwiki",
             "2026-03",
             "qualification-1",
-        )?;
-        let receipt: QualificationReceipt = read_json(&receipt_path)?;
+        )
+        .expect("qualification should become ready");
+        let receipt: QualificationReceipt =
+            read_json(&receipt_path).expect("qualification receipt should load");
         assert!(!receipt.publication_eligible);
         assert_eq!(receipt.artifacts.len(), METRICS.len());
+        assert_eq!(
+            mark_wiki_qualification_ready(
+                fixture.data.path(),
+                fixture.output.path(),
+                &fixture.lifecycle_path,
+                "nlwiki",
+                "2026-03",
+                "qualification-1",
+            )
+            .expect("ready qualification retry should be idempotent"),
+            receipt_path
+        );
         assert!(!fixture.output.path().join("_candidates/nlwiki").exists());
         assert!(
             latest_ready_candidates(
                 fixture.data.path(),
                 fixture.output.path(),
                 &fixture.lifecycle_path,
-            )?
+            )
+            .expect("publisher candidate scan should succeed")
             .is_empty()
         );
-        Ok(())
+    }
+
+    #[test]
+    fn qualification_state_write_failures_never_reach_ready() {
+        for (run_id, fail_after_validation) in [
+            ("qualification-building-failure", false),
+            ("qualification-ready-failure", true),
+        ] {
+            let fixture = Fixture::new().expect("qualification fixture should build");
+            prepare_hidden_qualification_fixture(&fixture, run_id);
+            crate::generation_lifecycle::adopt(
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                run_id,
+                GState::Building,
+                "qualification test started",
+            )
+            .expect("building state should persist");
+            if fail_after_validation {
+                crate::generation_lifecycle::transition(
+                    fixture.output.path(),
+                    "nlwiki",
+                    "2026-03",
+                    run_id,
+                    GState::Validated,
+                    "qualification test validated",
+                    None,
+                )
+                .expect("validated state should persist");
+            }
+            let _blocker = block_generation_state_write(&fixture, run_id);
+
+            let error = mark_wiki_qualification_ready(
+                fixture.data.path(),
+                fixture.output.path(),
+                &fixture.lifecycle_path,
+                "nlwiki",
+                "2026-03",
+                run_id,
+            )
+            .expect_err("blocked lifecycle transition must fail qualification");
+            assert!(error.to_string().contains("directory"));
+            let state = crate::generation_lifecycle::load(
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                run_id,
+            )
+            .expect("generation state should remain readable")
+            .expect("generation state should exist");
+            assert_eq!(
+                state.state,
+                if fail_after_validation {
+                    GState::Validated
+                } else {
+                    GState::Building
+                }
+            );
+        }
     }
 
     #[test]

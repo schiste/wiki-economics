@@ -2068,6 +2068,26 @@ mod tests {
     }
 
     #[test]
+    fn wiki_qualification_resolves_an_unpinned_snapshot() -> Result<()> {
+        let cli = Cli::try_parse_from([
+            "wiki-econ",
+            "--run-id",
+            "qualification-resolved-run",
+            "qualify-wiki",
+            "itwiki",
+        ])?;
+        let ops = RecordingOps::default();
+
+        run_with_ops(cli, &ops)?;
+
+        assert_eq!(ops.calls.borrow()[1], "resolve_snapshot:itwiki");
+        assert!(ops.calls.borrow().iter().any(|call| {
+            call == "qualification_ready:itwiki:2026-07:qualification-resolved-run"
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn candidate_preparation_resolves_an_unpinned_snapshot() -> Result<()> {
         let cli = Cli::try_parse_from([
             "wiki-econ",
