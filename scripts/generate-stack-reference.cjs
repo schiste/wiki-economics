@@ -196,7 +196,7 @@ function buildStackReference(options = {}) {
   const scheduled = lifecycleRows.filter((row) => row[2] === "scheduled").map((row) => row[0]).join(", ");
   const pausedImports = lifecycleRows
     .filter((row) => row[2] === "paused" && row[3] === "local-import")
-    .map((row) => row[0]).join(", ");
+    .map((row) => row[0]).join(", ") || "none";
 
   return `# Generated stack reference
 

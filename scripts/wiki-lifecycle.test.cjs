@@ -54,7 +54,7 @@ test("production lifecycle schedules qualified Toolforge wikis", () => {
   assert.deepEqual(resolveRefreshWikis(registry, {}), ["frwiki", "nlwiki", "ptwiki"]);
   assert.deepEqual(
     wikisWithState(registry, "publication", "published"),
-    ["elwiki", "frwiki", "nlwiki", "ptwiki", "svwiki"],
+    ["elwiki", "frwiki", "itwiki", "nlwiki", "ptwiki", "svwiki"],
   );
   assert.equal(registry.wikis.frwiki.refresh, "scheduled");
   assert.equal(registry.wikis.frwiki.provenance, "toolforge");
@@ -63,8 +63,16 @@ test("production lifecycle schedules qualified Toolforge wikis", () => {
   assert.equal(registry.wikis.ptwiki.refresh, "scheduled");
   assert.equal(registry.wikis.ptwiki.provenance, "toolforge");
   assert.equal(registry.wikis.ptwiki.imported_cutoff, undefined);
-  assert.equal(registry.wikis.itwiki.publication, "hidden");
-  assert.equal(registry.wikis.itwiki.refresh, "qualification");
+  for (const wiki of ["elwiki", "itwiki", "svwiki"]) {
+    assert.equal(registry.wikis[wiki].publication, "published");
+    assert.equal(registry.wikis[wiki].refresh, "manual");
+    assert.equal(registry.wikis[wiki].provenance, "toolforge");
+    assert.equal(registry.wikis[wiki].imported_cutoff, undefined);
+  }
+  assert.equal(
+    registry.publication_contract.datasets.page_weekly_edits.minimum_rows_by_wiki.elwiki,
+    5_000_000,
+  );
   assert.deepEqual(
     resolveRefreshWikis(registry, {WIKI_ECON_REFRESH_WIKIS: "frwiki nlwiki ptwiki"}),
     ["frwiki", "nlwiki", "ptwiki"],
@@ -168,11 +176,11 @@ test("CLI validates and lists lifecycle selections", () => {
   );
   assert.equal(
     execFileSync(process.execPath, [SCRIPT, "published-wikis"], { env, encoding: "utf8" }),
-    "elwiki\nfrwiki\nnlwiki\nptwiki\nsvwiki\n",
+    "elwiki\nfrwiki\nitwiki\nnlwiki\nptwiki\nsvwiki\n",
   );
   assert.equal(
     execFileSync(process.execPath, [SCRIPT, "qualification-wikis"], { env, encoding: "utf8" }),
-    "itwiki\n",
+    "\n",
   );
   assert.equal(JSON.parse(execFileSync(process.execPath, [SCRIPT, "json"], { env, encoding: "utf8" })).schema_version, 1);
   assert.throws(() => execFileSync(process.execPath, [SCRIPT, "unknown"], { env, stdio: "pipe" }));

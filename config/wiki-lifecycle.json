@@ -10,16 +10,26 @@
       "labor_churn": { "coverage": "all_published", "minimum_rows_per_wiki": 300 },
       "labor_cohorts": { "coverage": "all_published", "minimum_rows_per_wiki": 200 },
       "labor_monthly": { "coverage": "all_published", "minimum_rows_per_wiki": 5000 },
-      "page_weekly_edits": { "wikis": ["frwiki", "nlwiki", "ptwiki"], "minimum_rows_per_wiki": 30000000 },
-      "patrol": { "wikis": ["frwiki", "nlwiki", "ptwiki"], "minimum_rows_per_wiki": 5000 }
+      "page_weekly_edits": {
+        "wikis": ["elwiki", "frwiki", "itwiki", "nlwiki", "ptwiki", "svwiki"],
+        "minimum_rows_per_wiki": 30000000,
+        "minimum_rows_by_wiki": {
+          "elwiki": 5000000,
+          "itwiki": 75000000,
+          "svwiki": 40000000
+        }
+      },
+      "patrol": {
+        "wikis": ["elwiki", "frwiki", "itwiki", "nlwiki", "ptwiki", "svwiki"],
+        "minimum_rows_per_wiki": 5000
+      }
     }
   },
   "wikis": {
     "elwiki": {
       "publication": "published",
-      "refresh": "paused",
-      "provenance": "local-import",
-      "imported_cutoff": "2026-03"
+      "refresh": "manual",
+      "provenance": "toolforge"
     },
     "frwiki": {
       "publication": "published",
@@ -28,9 +38,9 @@
       "freshness_sla_days": 10
     },
     "itwiki": {
-      "publication": "hidden",
-      "refresh": "qualification",
-      "provenance": "toolforge-qualification"
+      "publication": "published",
+      "refresh": "manual",
+      "provenance": "toolforge"
     },
     "nlwiki": {
       "publication": "published",
@@ -46,9 +56,8 @@
     },
     "svwiki": {
       "publication": "published",
-      "refresh": "paused",
-      "provenance": "local-import",
-      "imported_cutoff": "2026-03"
+      "refresh": "manual",
+      "provenance": "toolforge"
     }
   }
 }
