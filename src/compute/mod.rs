@@ -1034,6 +1034,10 @@ fn compute_page_weekly_edits_for_snapshot(
                 &mut reconciliation_peak,
             );
             let routed = routing?;
+            anyhow::ensure!(
+                routed.peak_active_writers <= governor.budget().max_active_parquet_writers,
+                "secondary routing reported a writer peak above its governed limit"
+            );
             scratch_peak_bytes = scratch_peak_bytes.max(runs.size_bytes()?);
             working_storage_peak_bytes = working_storage_peak_bytes.max(scratch_peak_bytes);
             fs::remove_file(primary_path)?;
@@ -1052,13 +1056,16 @@ fn compute_page_weekly_edits_for_snapshot(
                 continue;
             }
             let started = Instant::now();
-            let staged = match &secondary_paths {
-                Some(paths) => {
-                    let path = paths[secondary_bucket]
-                        .as_ref()
-                        .context("missing non-empty secondary bucket")?;
-                    ParquetReader::new(File::open(path)?).finish()?
-                }
+            let staged_path = match &secondary_paths {
+                Some(paths) => Some(
+                    paths[secondary_bucket]
+                        .clone()
+                        .context("missing non-empty secondary bucket")?,
+                ),
+                None => None,
+            };
+            let staged = match staged_path.as_deref() {
+                Some(path) => ParquetReader::new(File::open(path)?).finish()?,
                 None => read_staged_weekly_bucket(&staged_paths, primary_bucket)?,
             };
             let actual_staged_rows = staged.height();
@@ -1091,6 +1098,7 @@ fn compute_page_weekly_edits_for_snapshot(
                 .as_mut()
                 .context("page_weekly_edits output writer was not initialized")?
                 .write_batch(&mut result)?;
+            reclaim_completed_weekly_scratch(staged_path.as_deref())?;
             output_rows += result.height();
             total_edits_after = total_edits_after
                 .checked_add(bucket_edits_after)
@@ -1421,6 +1429,7 @@ fn compact_weekly_primary_buckets(
 struct SecondaryRouting {
     paths: Vec<Option<PathBuf>>,
     rows: Vec<usize>,
+    peak_active_writers: usize,
 }
 
 fn parquet_paths_row_count(paths: &[PathBuf]) -> Result<u64> {
@@ -1452,6 +1461,7 @@ fn route_primary_to_secondary_buckets(
     let mut rows = vec![0usize; secondary_bucket_count];
     let mut edits = vec![0i64; secondary_bucket_count];
     let mut writers: BTreeMap<usize, BatchedWriter<File>> = BTreeMap::new();
+    let mut peak_active_writers = 0usize;
     let mut reader =
         storage::SequentialParquetReader::new(primary_path, None, WEEKLY_ROUTING_BATCH_ROWS)?;
     anyhow::ensure!(
@@ -1503,6 +1513,11 @@ fn route_primary_to_secondary_buckets(
                 }
             };
             writer.write_batch(&frame)?;
+            peak_active_writers = peak_active_writers.max(writers.len());
+            anyhow::ensure!(
+                peak_active_writers <= governor.budget().max_active_parquet_writers,
+                "secondary routing exceeded the governed Parquet writer limit"
+            );
         }
         anyhow::ensure!(
             input_edits == routed_edits,
@@ -1522,7 +1537,18 @@ fn route_primary_to_secondary_buckets(
         checked_sum_i64(&edits, "secondary routing edit count")? == expected.edits,
         "primary bucket {primary_bucket} edit count changed during secondary routing"
     );
-    Ok(SecondaryRouting { paths, rows })
+    Ok(SecondaryRouting {
+        paths,
+        rows,
+        peak_active_writers,
+    })
+}
+
+fn reclaim_completed_weekly_scratch(path: Option<&Path>) -> Result<()> {
+    if let Some(path) = path {
+        fs::remove_file(path)?;
+    }
+    Ok(())
 }
 
 fn add_weekly_change_columns(mut weekly: DataFrame, wiki: &str) -> Result<DataFrame> {
@@ -2941,6 +2967,78 @@ mod tests {
                 .collect()
         })
         .map_err(Into::into)
+    }
+
+    #[test]
+    fn large_logical_topology_caps_writers_and_reclaims_scratch_per_unit() -> Result<()> {
+        let output = TestDir::new()?;
+        let runs = WeeklyRunDir::new(output.path(), "testwiki", None)?;
+        let config = WeeklyAggregationConfig::new_two_level(64, 32, None)?;
+        assert_eq!(config.logical_bucket_count(), 2_048);
+
+        let mut page_ids = vec![None; config.secondary_bucket_count];
+        for page_id in 0_i64..1_000_000 {
+            let hash = determinism::stable_page_hash(Some(page_id));
+            if hash as usize & (config.primary_bucket_count - 1) != 0 {
+                continue;
+            }
+            let secondary = (hash >> config.primary_bucket_count.trailing_zeros()) as usize
+                & (config.secondary_bucket_count - 1);
+            page_ids[secondary].get_or_insert(page_id);
+            if page_ids.iter().all(Option::is_some) {
+                break;
+            }
+        }
+        anyhow::ensure!(
+            page_ids.iter().all(Option::is_some),
+            "fixture could not cover every secondary bucket"
+        );
+        let rows = page_ids
+            .iter()
+            .map(|page_id| (*page_id, Some(0), Some("Page"), Some(19_723), Some(1)))
+            .collect::<Vec<_>>();
+        let mut frame = weekly_batch_df(&rows)?;
+        let primary_path = runs.primary_path(0);
+        ParquetWriter::new(File::create(&primary_path)?).finish(&mut frame)?;
+
+        let mut budget = ResourceBudget::from_environment()?;
+        budget.memory_ceiling_bytes = u64::MAX;
+        budget.memory_reserve_bytes = 0;
+        budget.scratch_limit_bytes = u64::MAX;
+        budget.max_open_files = usize::MAX;
+        budget.max_active_parquet_writers = 32;
+        let governor = ResourceGovernor::new(
+            budget,
+            GovernorPaths::new(output.path().to_path_buf(), None),
+        );
+        let mut peak = ResourcePeak::default();
+        let routing = route_primary_to_secondary_buckets(
+            &runs,
+            &primary_path,
+            0,
+            &config,
+            BucketTotals {
+                rows: config.secondary_bucket_count,
+                edits: i64::try_from(config.secondary_bucket_count)?,
+            },
+            &governor,
+            &mut peak,
+        )
+        .expect("bounded routing fixture must succeed");
+
+        assert_eq!(routing.peak_active_writers, 32);
+        assert_eq!(routing.paths.iter().flatten().count(), 32);
+        assert!(config.logical_bucket_count() > routing.peak_active_writers * 32);
+        let mut scratch_bytes = runs.size_bytes()?;
+        for path in routing.paths.iter().flatten() {
+            reclaim_completed_weekly_scratch(Some(path))?;
+            assert!(!path.exists());
+            let remaining = runs.size_bytes()?;
+            assert!(remaining < scratch_bytes);
+            scratch_bytes = remaining;
+        }
+        assert_eq!(scratch_bytes, fs::metadata(primary_path)?.len());
+        Ok(())
     }
 
     #[test]
