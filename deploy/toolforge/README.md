@@ -55,10 +55,10 @@ frwiki completed the measured capacity qualification documented in
 - `rebuild-image.sh` rebuilds only the Toolforge image and restarts continuous
   processes. It uses detached JSON output and polls the exact build ID, so a
   disconnected log stream or concurrent build cannot produce a false result.
-- `jobs.yaml` — the loadable `wiki-econ-refresh` scheduled Job definition,
-  plus three on-demand-only Jobs (`wiki-econ-ingest`, `wiki-econ-compute`,
-  `wiki-econ-site`) for triggering a single pipeline stage between scheduled
-  refreshes — see [On-demand stage jobs](#on-demand-stage-jobs) below.
+- `jobs.yaml` — three independently scheduled per-wiki candidate jobs and the
+  short `wiki-econ-publish-ready` job, plus legacy on-demand recovery jobs.
+  The full state machine and recovery boundary are documented in
+  [per-wiki candidate preparation and publication](../../docs/candidate-publication.md).
   `wiki-econ-admin` serves `/admin*` and the built static site as a separate
   buildservice webservice; it is not duplicated as a Toolforge Job.
 - `run-refresh-ingest.sh`, `run-refresh-compute.sh`, `run-refresh-site.sh` —
@@ -68,7 +68,13 @@ frwiki completed the measured capacity qualification documented in
   `--envvar`/`--envvars` flag; `toolforge envvars create` is tool-wide only),
   so `jobs.yaml` points each on-demand Job's `command:` at its wrapper
   instead of setting the stage through an `envvars:` field.
-- `run-refresh.sh` — wraps `scripts/refresh.sh` for the scheduled job.
+- `run-prepare-wiki.sh`, `run-with-lock.sh`, `run-publish-ready.sh`, and
+  `publish-ready-transaction.sh` implement the production schedule. Long
+  preparation holds a per-wiki NFS-safe heartbeat lock and never changes a
+  live pointer. Publication alone holds the global lock while selecting ready
+  candidates, merging, validating, building, and switching the site.
+- `run-refresh.sh` — wraps `scripts/refresh.sh` as an on-demand compatibility
+  and recovery path; it is no longer the scheduled production path.
   Unlike Cloud VPS's `run-refresh.sh`, this does not keep a `releases/`
   history: retaining multiple full output generations consumes shared NFS
   unnecessarily. Parquet files are written to temporary siblings and
@@ -133,7 +139,19 @@ frwiki completed the measured capacity qualification documented in
   refreshes remain manual SSH/Toolforge operations and are never retried by
   that workflow.
 
-### Refresh single-flight lock
+### Candidate and publication locks
+
+Scheduled preparation uses one lock per wiki under
+`output/_prepare-locks/<wiki>.lock`; publication alone uses
+`output/.publication-lock`. Both are atomic directory locks with owner JSON,
+heartbeats, stable owner tokens, double-checked stale recovery, and exit status
+75 for contention. This allows long wiki builds to overlap without allowing
+two writers for the same wiki or two public release switches.
+
+See [the candidate publication runbook](../../docs/candidate-publication.md)
+for transaction state, rollback, and inspection commands.
+
+### Legacy refresh single-flight lock
 
 Every scheduled or manual Toolforge refresh must enter through
 `deploy/toolforge/run-refresh.sh`. The wrapper acquires an atomic NFS
@@ -177,7 +195,7 @@ the field contract and operator checks.
 
 ### On-demand stage jobs
 
-`wiki-econ-refresh` always runs the full fetch → ingest → compute → merge →
+`wiki-econ-refresh` can still run the full fetch → ingest → compute → merge →
 site pipeline, which is unnecessary when only one part changed — a
 `site/`-only or `docs/`-only commit still has to wait through a full
 fetch/compute cycle before the new page is live. `jobs.yaml` also loads three
@@ -201,8 +219,8 @@ refresh, with `toolforge jobs restart <name>`:
 become wiki-economics toolforge jobs restart wiki-econ-site
 ```
 
-All four jobs — the scheduled `wiki-econ-refresh` and the three on-demand
-ones — still serialize through `run-refresh.sh`'s single shared
+All four legacy jobs — `wiki-econ-refresh` and the three on-demand
+stage jobs — still serialize through `run-refresh.sh`'s single shared
 `.refresh-lock` (see below), so a manual site rebuild can't race a concurrent
 scheduled refresh or another on-demand job; it will simply exit `75` and wait
 for the next attempt.
