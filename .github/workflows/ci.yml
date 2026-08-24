@@ -20,7 +20,36 @@ env:
   WIKI_ECON_BUILD_COMMIT: ${{ github.sha }}
 
 jobs:
-  quality:
+  changes:
+    name: Detect changed areas
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      backend: ${{ steps.filter.outputs.backend }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        with:
+          fetch-depth: 2
+
+      - name: Filter changed paths
+        id: filter
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4.0.3
+        with:
+          filters: |
+            backend:
+              - 'src/**'
+              - 'Cargo.toml'
+              - 'Cargo.lock'
+              - 'rust-toolchain.toml'
+              - 'deploy/**'
+              - 'scripts/**'
+              - 'site/data-build/**'
+              - 'config/**'
+              - '.github/workflows/**'
+
+  quality-node:
+    name: Quality (Node/shell/Python)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
 
@@ -39,18 +68,6 @@ jobs:
 
       - name: Install Node dependencies
         run: npm ci
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # @stable as of pin
-        with:
-          toolchain: 1.98.0
-          components: rustfmt, clippy
-
-      - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
-        with:
-          workspaces: ". -> target"
-          cache-on-failure: true
 
       - name: Verify exact runtime closure
         run: node scripts/verify-runtime.cjs
@@ -128,6 +145,35 @@ jobs:
           ./scripts/refresh.sh --help
           ./scripts/setup.sh --help
 
+      - name: Check Python coverage helper
+        run: python3 -m py_compile scripts/check_lcov.py scripts/test_check_lcov.py
+
+      - name: Run Python tests
+        run: python3 -m unittest discover -s scripts -p 'test_*.py'
+
+  quality-rust:
+    name: Quality (Rust)
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # @stable as of pin
+        with:
+          toolchain: 1.98.0
+          components: rustfmt, clippy
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        with:
+          workspaces: ". -> target"
+          cache-on-failure: true
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
@@ -137,12 +183,6 @@ jobs:
       # Note: the test suite runs in the `coverage` job under cargo-llvm-cov,
       # which subsumes a plain `cargo test`. Running `cargo test` here too
       # would double the wall time without adding signal.
-
-      - name: Check Python coverage helper
-        run: python3 -m py_compile scripts/check_lcov.py scripts/test_check_lcov.py
-
-      - name: Run Python tests
-        run: python3 -m unittest discover -s scripts -p 'test_*.py'
 
       - name: Check docs
         run: cargo doc --locked --no-deps
@@ -214,6 +254,8 @@ jobs:
           if-no-files-found: error
 
   coverage:
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -264,7 +306,8 @@ jobs:
           path: ${{ env.LLVM_COV_OUTPUT_PATH }}
           if-no-files-found: error
 
-  security:
+  security-node:
+    name: Security (Node/Python)
     runs-on: ubuntu-24.04
     timeout-minutes: 30
 
@@ -280,6 +323,32 @@ jobs:
 
       - name: Install pinned npm
         run: npm install --global npm@11.12.1
+
+      - name: Install REUSE compliance tooling
+        run: python3 -m pip install --disable-pip-version-check 'reuse[charset-normalizer]==6.2.0'
+
+      - name: REUSE lint
+        run: reuse --no-multiprocessing lint
+
+      - name: npm advisory policy
+        run: node scripts/check-npm-advisories.cjs
+
+      - name: npm license policy
+        run: node scripts/check-npm-licenses.cjs
+
+      - name: Vendor patch hygiene
+        run: scripts/check_vendor_patches.sh
+
+  security-rust:
+    name: Security (Rust)
+    needs: changes
+    if: needs.changes.outputs.backend == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # @stable as of pin
@@ -297,35 +366,29 @@ jobs:
         with:
           tool: cargo-deny,cargo-audit
 
-      - name: Install REUSE compliance tooling
-        run: python3 -m pip install --disable-pip-version-check 'reuse[charset-normalizer]==6.2.0'
-
-      - name: REUSE lint
-        run: reuse --no-multiprocessing lint
-
       - name: cargo-deny
         run: cargo deny check advisories bans licenses sources
 
       - name: cargo-audit
         run: cargo audit -D warnings
 
-      - name: npm advisory policy
-        run: node scripts/check-npm-advisories.cjs
-
-      - name: npm license policy
-        run: node scripts/check-npm-licenses.cjs
-
-      - name: Vendor patch hygiene
-        run: scripts/check_vendor_patches.sh
-
   toolforge-release:
     name: Build Toolforge release artifact
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: |
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      needs.quality-node.result == 'success' &&
+      (needs.quality-rust.result == 'success' || needs.quality-rust.result == 'skipped') &&
+      needs.site.result == 'success' &&
+      (needs.coverage.result == 'success' || needs.coverage.result == 'skipped') &&
+      needs.security-node.result == 'success' &&
+      (needs.security-rust.result == 'success' || needs.security-rust.result == 'skipped')
     needs:
-      - quality
+      - quality-node
+      - quality-rust
       - site
       - coverage
-      - security
+      - security-node
+      - security-rust
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:

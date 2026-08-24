@@ -94,22 +94,41 @@ call those shared scripts rather than reimplementing pipeline steps.
 
 ## CI Structure
 
-GitHub Actions is split into five jobs:
+GitHub Actions is split into eight jobs, gated by a `changes` job that uses
+`dorny/paths-filter` to detect whether a push/PR touches anything under the
+`backend` path set (`src/**`, `Cargo.{toml,lock}`, `rust-toolchain.toml`,
+`deploy/**`, `scripts/**`, `site/data-build/**`, `config/**`, or the workflow
+file itself):
 
-- `quality`: formatting, clippy, Rust and Node checks, the small Python LCOV
-  helper tests, and generated-document consistency
+- `changes`: computes the `backend` boolean other jobs gate on
+- `quality-node`: formatting-free Node/shell/Python checks — shellcheck,
+  `node --check`/unit tests, the small Python LCOV helper tests, and
+  generated-document consistency. No Rust toolchain, always runs.
+- `quality-rust`: `cargo fmt --check`, `cargo clippy`, `cargo doc`. Gated on
+  `backend` — skipped when a change touches only site content.
 - `site`: a clean npm workspace install, advisory check, Rust-generated
   deterministic fixture, and real Observable production build with page and
-  attachment verification
-- `coverage`: `cargo llvm-cov` LCOV export plus `scripts/check_lcov.py` enforcing zero uncovered lines
-- `security`: `cargo-deny`, `cargo-audit`, fail-closed npm advisory and license
-  policies, REUSE, and registered vendored-patch validation
-- `toolforge-release`: after the other jobs pass on `main`, selectively builds
-  and retains the attested Linux release envelope, three SBOMs, checksums,
-  provenance, and complete notices for an operator-driven SSH deploy
+  attachment verification. Always runs (front-end changes need this
+  signal too); `Swatinem/rust-cache` keeps it fast when Rust is unchanged.
+- `coverage`: `cargo llvm-cov` LCOV export plus `scripts/check_lcov.py`
+  enforcing zero uncovered lines. Gated on `backend` — this is the single
+  most expensive job (a fully instrumented rebuild), and it produces no new
+  signal when Rust source hasn't changed.
+- `security-node`: fail-closed npm advisory/license policies, REUSE, and
+  registered vendored-patch validation. No Rust toolchain, always runs.
+- `security-rust`: `cargo-deny` and `cargo-audit`. Gated on `backend`.
+- `toolforge-release`: after the other jobs pass (or are skipped, for the
+  Rust-gated ones) on `main`, builds and retains the attested Linux release
+  envelope, three SBOMs, checksums, provenance, and complete notices for an
+  operator-driven SSH deploy. Runs unconditionally on `main` pushes — it
+  bundles the browser dist too, so front-end-only changes still need a new
+  release; `Swatinem/rust-cache` keeps the `--release` rebuild fast when the
+  Rust source itself hasn't changed.
 
 That split is intentional. Keep fast correctness failures separate from
-coverage drift and dependency-policy drift. GitHub has no production
+coverage drift and dependency-policy drift, and keep the expensive Rust
+recompiles (instrumented coverage, lint, dependency audit) off the critical
+path for changes that only touch `site/**` content. GitHub has no production
 credentials; Toolforge deployment remains an explicit operator action. The
 coverage run subsumes the ordinary Rust test suite.
 

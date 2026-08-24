@@ -34,7 +34,10 @@ and higher resource envelope are being qualified.
   copy the reviewed cache under `site/vendor/observable-cache` into a clean
   source tree and run with network APIs disabled.
 - `.github/workflows/ci.yml` builds the release binary on an x86-64 Ubuntu
-  24.04 runner after quality, coverage, and security jobs pass. It validates
+  24.04 runner after the quality, site, coverage, and security jobs pass (the
+  Rust-only ones — `quality-rust`, `coverage`, `security-rust` — are skipped
+  rather than run when a change touches only site content, per
+  [CI Structure](../../docs/development.md#ci-structure)). It validates
   the ELF format, dynamic libraries, and `--help`, produces three CycloneDX
   SBOMs, notices, checksums, provenance and a GitHub artifact attestation,
   uploads the sealed 30-day artifact, and leaves deployment to an operator
