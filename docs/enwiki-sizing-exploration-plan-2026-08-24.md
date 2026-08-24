@@ -207,15 +207,35 @@ checks conservation before and after every reduction/routing level and deletes
 completed scratch immediately; enwiki activation still requires measured
 capacity evidence.
 
-### Merge and validation
+### Merge and validation (implemented)
 
 A modeled enwiki `page_weekly_edits.parquet` is 4–5 GiB and may contain roughly
-680–770 million rows. Before qualification:
+680–770 million rows. The large-file paths now share a projected sequential
+Parquet reader. It opens each input once, parses its footer once, advances in
+physical row-group order, caps application batches, and advises completed byte
+ranges out of the Linux page cache. It is used by two-level weekly routing,
+per-wiki and root merge, publication validation, browser-index summaries,
+stage fingerprint date ranges, and the page-week default generator.
 
-- validators must consume Parquet row groups sequentially;
-- repeated reopen-and-slice scans must be eliminated;
-- merge must never materialize every wiki or the complete enwiki metric;
-- kernel page cache and application caches must be released between metrics;
+Merge validates input/footer/output row conservation and deterministic
+wiki-major order while writing bounded Parquet batches. The page-week default
+generator retains only its top 20 candidates rather than sorting or
+materializing the complete dataset. Benchmark artifact inventories read only
+Parquet metadata.
+
+The current publication contract does not require a global page/week key sort:
+page-week files are deterministic in stable logical-bucket order, and root
+files are deterministic in wiki-major input order. Adding an external sort now
+would add I/O without strengthening a declared contract. If a future artifact
+requires global key order, it must use bounded sorted runs followed by a k-way
+merge and incremental Parquet output; an in-memory global Polars sort is not an
+acceptable implementation.
+
+Qualification must verify that:
+
+- validators consume Parquet row groups sequentially;
+- merge never materializes every wiki or the complete enwiki metric;
+- kernel page cache is released as row groups and metrics complete;
 - completed scratch must be removed incrementally;
 - publication must remain generation-aware, atomic, and fail closed.
 

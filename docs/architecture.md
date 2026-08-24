@@ -162,9 +162,15 @@ Important decisions:
   missing, malformed, or failed artifact stops merge
 - dashboard code and manifest-generator files are deterministic merge-
   fingerprint inputs, so a semantic change invalidates reuse
-- merge assumes every per-wiki metric output already includes a `wiki` column
+- merge requires every per-wiki metric output to include a non-null string
+  `wiki` column and fails if inputs violate deterministic wiki-major order
 
-If a new metric omits the `wiki` column, merge will still concatenate files, but the combined output will be much less useful. Keep the `wiki` column in per-wiki outputs.
+Large metric inputs are projected and consumed sequentially by physical
+Parquet row group. Merge writes bounded batches atomically and checks row
+conservation as it advances; it never concatenates complete input frames in
+memory. Current merged files have a deterministic wiki-major contract rather
+than a global metric-key sort. Any future globally sorted artifact must use
+external sorted runs and a bounded k-way merge.
 
 ## Storage Helpers
 
