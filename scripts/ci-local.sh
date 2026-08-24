@@ -72,6 +72,7 @@ node --test deploy/toolforge/install-binary.test.cjs
 
 echo "==> node --test deploy/toolforge/run-capacity-benchmark.test.cjs"
 node --test deploy/toolforge/run-capacity-benchmark.test.cjs
+node --test deploy/toolforge/run-qualify-wiki.test.cjs
 node --test deploy/toolforge/imported-backup.test.cjs
 node --test deploy/toolforge/recovery-operations.test.cjs
 

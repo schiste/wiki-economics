@@ -47,6 +47,11 @@ printf '%s\n' "$selected_snapshot" > "$WIKI_ECON_RUN_SNAPSHOT_FILE.tmp"
 mv "$WIKI_ECON_RUN_SNAPSHOT_FILE.tmp" "$WIKI_ECON_RUN_SNAPSHOT_FILE"
 node "$WIKI_ECON_RUN_RECORD_HELPER" write
 
-wiki_econ_run_cli prepare-wiki "$wiki" --version "$selected_snapshot" \
+prepare_command="${WIKI_ECON_PREPARE_COMMAND:-prepare-wiki}"
+case "$prepare_command" in
+  prepare-wiki|qualify-wiki) ;;
+  *) echo "Unsupported preparation command: $prepare_command" >&2; exit 2 ;;
+esac
+wiki_econ_run_cli "$prepare_command" "$wiki" --version "$selected_snapshot" \
   --source-window-size "$WIKI_ECON_SOURCE_WINDOW_SIZE" \
   --lifecycle "$WIKI_ECON_WIKI_LIFECYCLE_FILE"

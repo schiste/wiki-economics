@@ -27,6 +27,11 @@
       "provenance": "toolforge",
       "freshness_sla_days": 10
     },
+    "itwiki": {
+      "publication": "hidden",
+      "refresh": "qualification",
+      "provenance": "toolforge-qualification"
+    },
     "nlwiki": {
       "publication": "published",
       "refresh": "scheduled",

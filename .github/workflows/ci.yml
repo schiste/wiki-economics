@@ -120,6 +120,7 @@ jobs:
           node --test deploy/toolforge/install-binary.test.cjs
           node --test deploy/toolforge/prune-releases.test.cjs
           node --test deploy/toolforge/run-capacity-benchmark.test.cjs
+          node --test deploy/toolforge/run-qualify-wiki.test.cjs
           node --test deploy/toolforge/imported-backup.test.cjs
           node --test deploy/toolforge/recovery-operations.test.cjs
           node --test scripts/check-npm-advisories.test.cjs

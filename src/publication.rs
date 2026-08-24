@@ -265,6 +265,20 @@ struct ReadyWikiCandidate {
     artifacts: Vec<PreparedArtifact>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+struct QualificationReceipt {
+    schema_version: u8,
+    publication_eligible: bool,
+    wiki: String,
+    snapshot: String,
+    run_id: String,
+    qualified_at_unix: u64,
+    generating_commit: Option<String>,
+    cutoff_date: String,
+    workload_profile: crate::workload_profile::WorkloadProfile,
+    artifacts: Vec<PreparedArtifact>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum WikiPreparationPlan {
     NoOp {
@@ -617,6 +631,28 @@ pub(crate) fn wiki_candidate_dir(
         .join(run_id))
 }
 
+pub(crate) fn wiki_qualification_dir(
+    output_dir: &Path,
+    wiki: &str,
+    snapshot: &str,
+    run_id: &str,
+) -> Result<PathBuf> {
+    ensure!(
+        valid_component(wiki),
+        "unsafe qualification wiki identifier"
+    );
+    storage::validate_snapshot_version(snapshot)?;
+    ensure!(
+        valid_component(run_id),
+        "unsafe qualification run identifier"
+    );
+    Ok(output_dir
+        .join("_qualifications")
+        .join(wiki)
+        .join(snapshot)
+        .join(run_id))
+}
+
 fn prepared_artifact(candidate_dir: &Path, path: &Path) -> Result<PreparedArtifact> {
     let relative = path
         .strip_prefix(candidate_dir)
@@ -770,6 +806,117 @@ pub(crate) fn mark_wiki_candidate_ready(
     }
     info!(wiki, snapshot, run_id, path = %ready_path.display(), "wiki candidate is ready");
     Ok(ready_path)
+}
+
+pub(crate) fn ensure_qualification_wiki(lifecycle_path: &Path, wiki: &str) -> Result<()> {
+    let registry = load_lifecycle(lifecycle_path)?;
+    let lifecycle = registry
+        .wikis
+        .get(wiki)
+        .with_context(|| format!("qualification wiki {wiki} is not registered"))?;
+    ensure!(
+        lifecycle.publication == "hidden" && lifecycle.refresh == "qualification",
+        "qualification wiki {wiki} must use publication=hidden and refresh=qualification"
+    );
+    Ok(())
+}
+
+pub(crate) fn mark_wiki_qualification_ready(
+    data_dir: &Path,
+    output_dir: &Path,
+    lifecycle_path: &Path,
+    wiki: &str,
+    snapshot: &str,
+    run_id: &str,
+) -> Result<PathBuf> {
+    ensure_qualification_wiki(lifecycle_path, wiki)?;
+    storage::read_generation_manifest(data_dir, wiki, snapshot)?;
+    let qualification_dir = wiki_qualification_dir(output_dir, wiki, snapshot, run_id)?;
+    let generation = CandidateGeneration::new(output_dir, wiki, snapshot, run_id);
+    let generation_state = generation.adopt(GState::Building, "recovered qualification run")?;
+    let mut artifacts = Vec::new();
+    let mut cutoff_date = None;
+    for spec in &METRICS {
+        let path = qualification_dir
+            .join(wiki)
+            .join(format!("{}.parquet", spec.name));
+        let rows = validate_schema(&path, spec)?;
+        ensure!(
+            rows > 0,
+            "{} qualification output is empty for {wiki}",
+            spec.name
+        );
+        let summary = summarize(&path, spec)?;
+        ensure!(
+            summary.wiki_min == wiki && summary.wiki_max == wiki,
+            "qualification metric contains rows for another wiki"
+        );
+        if let (Some(column), Some(minimum), Some(maximum)) = (
+            spec.date_column,
+            summary.minimum_date.as_deref(),
+            summary.maximum_date.as_deref(),
+        ) {
+            validate_date(minimum, column)?;
+            validate_date(maximum, column)?;
+        }
+        if spec.name == "gdp" {
+            let cutoff = summary
+                .maximum_date
+                .clone()
+                .context("qualification GDP maximum date is missing")?;
+            validate_snapshot_cutoff(wiki, snapshot, &cutoff)?;
+            cutoff_date = Some(cutoff);
+        }
+        artifacts.push(prepared_artifact(&qualification_dir, &path)?);
+    }
+    let patrol_dir = data_dir.join("patrol").join(wiki);
+    for name in ["patrol.parquet", "rights.parquet"] {
+        let mut reader = ParquetReader::new(File::open(patrol_dir.join(name))?);
+        ensure!(
+            reader.num_rows()? > 0,
+            "qualification patrol source {name} is empty"
+        );
+    }
+    artifacts.sort_by(|left, right| left.path.cmp(&right.path));
+    let workload_profile = crate::workload_profile::load(data_dir, wiki, snapshot)?
+        .context("qualification has no persisted workload profile")?;
+    let receipt = QualificationReceipt {
+        schema_version: 1,
+        publication_eligible: false,
+        wiki: wiki.to_string(),
+        snapshot: snapshot.to_string(),
+        run_id: run_id.to_string(),
+        qualified_at_unix: now_unix()?,
+        generating_commit: licensing::generating_commit(),
+        cutoff_date: cutoff_date.context("qualification GDP cutoff is missing")?,
+        workload_profile,
+        artifacts,
+    };
+    let generation_state = if generation_state.state == GState::Building {
+        generation.transition(
+            GState::Validated,
+            "qualification artifacts passed semantic validation",
+            None,
+        )?
+    } else {
+        generation_state
+    };
+    ensure!(
+        matches!(generation_state.state, GState::Validated | GState::Ready),
+        "qualification cannot be marked ready from {:?}",
+        generation_state.state
+    );
+    let receipt_path = qualification_dir.join("qualification.json");
+    atomic_json(&receipt_path, &receipt)?;
+    if generation_state.state == GState::Validated {
+        generation.transition(
+            GState::Ready,
+            "publication-ineligible qualification receipt was durably published",
+            None,
+        )?;
+    }
+    info!(wiki, snapshot, run_id, path = %receipt_path.display(), "wiki qualification is ready");
+    Ok(receipt_path)
 }
 
 fn validate_ready_candidate(
@@ -1415,6 +1562,30 @@ fn load_lifecycle(path: &Path) -> Result<LifecycleRegistry> {
         actual == expected,
         "publication dataset contracts do not match Rust metric contracts"
     );
+    for (wiki, lifecycle) in &registry.wikis {
+        ensure!(
+            matches!(
+                lifecycle.publication.as_str(),
+                "published" | "hidden" | "retired"
+            ),
+            "wiki lifecycle entry {wiki} has invalid publication state"
+        );
+        ensure!(
+            matches!(
+                lifecycle.refresh.as_str(),
+                "scheduled" | "manual" | "paused" | "qualification"
+            ),
+            "wiki lifecycle entry {wiki} has invalid refresh state"
+        );
+        ensure!(
+            lifecycle.refresh != "qualification" || lifecycle.publication == "hidden",
+            "wiki lifecycle entry {wiki} must be hidden during qualification"
+        );
+        ensure!(
+            lifecycle.publication != "retired" || lifecycle.refresh == "paused",
+            "retired wiki lifecycle entry {wiki} must be paused"
+        );
+    }
     Ok(registry)
 }
 
@@ -2980,6 +3151,77 @@ mod tests {
                 "candidate-subset",
             )
             .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hidden_qualification_receipt_is_structurally_ineligible_for_publication() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let mut lifecycle: Value = read_json(&fixture.lifecycle_path)?;
+        lifecycle["wikis"]["nlwiki"] = json!({
+            "publication": "hidden",
+            "refresh": "qualification"
+        });
+        atomic_json(&fixture.lifecycle_path, &lifecycle)?;
+        ensure_qualification_wiki(&fixture.lifecycle_path, "nlwiki")?;
+
+        let analytical =
+            storage::snapshot_analytical_wiki_dir(fixture.data.path(), "nlwiki", "2026-03")?;
+        write_single_i64(&analytical.join("template.parquet"))?;
+        storage::write_test_generation_manifest_from_files(
+            fixture.data.path(),
+            "nlwiki",
+            "2026-03",
+        )?;
+        let (plan, _) = crate::snapshot_plan::SnapshotPlan::load_or_resolve(
+            fixture.data.path(),
+            "nlwiki",
+            "2026-03",
+        )?;
+        crate::workload_profile::load_or_select(
+            fixture.data.path(),
+            &plan,
+            &vec![Some(1); plan.sources.len()],
+        )?;
+        let qualification = wiki_qualification_dir(
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            "qualification-1",
+        )?;
+        let qualification_wiki = qualification.join("nlwiki");
+        fs::create_dir_all(&qualification_wiki)?;
+        for spec in &METRICS {
+            fs::copy(
+                fixture
+                    .output
+                    .path()
+                    .join("nlwiki")
+                    .join(format!("{}.parquet", spec.name)),
+                qualification_wiki.join(format!("{}.parquet", spec.name)),
+            )?;
+        }
+
+        let receipt_path = mark_wiki_qualification_ready(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "nlwiki",
+            "2026-03",
+            "qualification-1",
+        )?;
+        let receipt: QualificationReceipt = read_json(&receipt_path)?;
+        assert!(!receipt.publication_eligible);
+        assert_eq!(receipt.artifacts.len(), METRICS.len());
+        assert!(!fixture.output.path().join("_candidates/nlwiki").exists());
+        assert!(
+            latest_ready_candidates(
+                fixture.data.path(),
+                fixture.output.path(),
+                &fixture.lifecycle_path,
+            )?
+            .is_empty()
         );
         Ok(())
     }

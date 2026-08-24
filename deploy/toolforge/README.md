@@ -309,6 +309,23 @@ fallback rather than the live rollback boundary. Detailed measurements and the
 resource rationale are preserved in the
 [frwiki capacity report](../../docs/frwiki-capacity-report-2026-08-24.md).
 
+### Publication-invisible wiki qualification
+
+For a wiki registered as `publication=hidden`, `refresh=qualification`, run a
+complete isolated preparation with a one-off 6 GiB/1-vCPU job:
+
+```sh
+toolforge jobs run --image tool-wiki-economics/tool-wiki-economics:latest \
+  --command 'deploy/toolforge/run-qualify-wiki.sh itwiki' \
+  --filelog --mount all --mem 6Gi --cpu 1 wiki-econ-qualify-itwiki
+```
+
+The wrapper writes only below
+`/data/project/wiki-economics/capacity/qualifications`; it does not change a
+production snapshot pointer, ready-candidate set, merged artifact, or site
+symlink. Inspect `qualification.json` and the isolated run status before
+starting capacity variants or considering lifecycle promotion.
+
 ### First cutover
 
 1. Wait for the main-branch quality, coverage, security, and Toolforge release

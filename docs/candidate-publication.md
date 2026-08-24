@@ -114,6 +114,27 @@ The former `wiki-econ-refresh` and split stage jobs remain on-demand recovery
 tools but are no longer scheduled. They use the legacy whole-refresh lock and
 must not be started while candidate or publication jobs are active.
 
+## Publication-invisible qualification
+
+A new wiki enters the lifecycle as `publication=hidden` and
+`refresh=qualification`. `deploy/toolforge/run-qualify-wiki.sh <wiki>` creates
+an isolated run root below `capacity/qualifications/<wiki>/<run-id>` and invokes
+`wiki-econ qualify-wiki`; it never writes into the production data or output
+roots.
+
+Qualification metrics live below `_qualifications`, not `_candidates`, and the
+final `qualification.json` explicitly records `publication_eligible=false`.
+The ready-candidate selector scans only `_candidates` for published
+scheduled/manual wikis. Promoting lifecycle configuration therefore cannot
+make an old qualification receipt publishable: a new production
+`prepare-wiki` run is mandatory after qualification policy is committed.
+
+The qualification wrapper disables the production capacity allowlist only
+inside its isolated root so an unmeasured profile can run and produce evidence.
+It retains the strict memory, storage-reserve, writer, file-descriptor, source
+window, marker, and semantic gates. Qualification is operator-triggered and is
+never loaded as a scheduled Toolforge Job.
+
 ## Recovery
 
 Inspect locks and transactions with:

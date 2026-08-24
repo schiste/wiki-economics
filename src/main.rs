@@ -181,6 +181,24 @@ enum Commands {
         lifecycle: PathBuf,
     },
 
+    /// Prepare and validate an isolated, permanently publication-ineligible wiki
+    QualifyWiki {
+        /// Hidden wiki registered with refresh=qualification
+        wiki: String,
+
+        /// Dump snapshot version (YYYY-MM)
+        #[arg(long)]
+        version: Option<String>,
+
+        /// Maximum number of compressed sources retained before ingest
+        #[arg(long)]
+        source_window_size: Option<usize>,
+
+        /// Wiki lifecycle containing the hidden qualification entry
+        #[arg(long, default_value = "config/wiki-lifecycle.json")]
+        lifecycle: PathBuf,
+    },
+
     /// Select ready wiki candidates, merge, and issue a publication receipt
     PublicationPrepareReady {
         /// Wiki lifecycle and publication contract
@@ -496,6 +514,22 @@ trait Ops {
         run_id: &str,
     ) -> Result<PathBuf> {
         publication::mark_wiki_candidate_ready(
+            data_dir, output_dir, lifecycle, wiki, version, run_id,
+        )
+    }
+    fn ensure_qualification_wiki(&self, lifecycle: &Path, wiki: &str) -> Result<()> {
+        publication::ensure_qualification_wiki(lifecycle, wiki)
+    }
+    fn mark_qualification_ready(
+        &self,
+        data_dir: &Path,
+        output_dir: &Path,
+        lifecycle: &Path,
+        wiki: &str,
+        version: &str,
+        run_id: &str,
+    ) -> Result<PathBuf> {
+        publication::mark_wiki_qualification_ready(
             data_dir, output_dir, lifecycle, wiki, version, run_id,
         )
     }
@@ -962,6 +996,57 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
                     println!("{}", ready.display());
                 }
             }
+        }
+
+        Commands::QualifyWiki {
+            wiki,
+            version,
+            source_window_size,
+            lifecycle,
+        } => {
+            let run_id = run_id
+                .as_deref()
+                .context("wiki qualification requires --run-id")?;
+            ops.ensure_qualification_wiki(&lifecycle, &wiki)?;
+            let version = match version {
+                Some(version) => version,
+                None => run_timed_stage("snapshot_resolve", Some(&wiki), || {
+                    ops.resolve_snapshot(std::slice::from_ref(&wiki), Utc::now())
+                })?,
+            };
+            let source_window_size = source_window::configured_window_size(source_window_size)?;
+            ops.persist_snapshot_plans(std::slice::from_ref(&wiki), &version, &data_dir)?;
+            let qualification_dir =
+                publication::wiki_qualification_dir(&output_dir, &wiki, &version, run_id)?;
+            run_timed_stage("source_window", Some(&wiki), || {
+                ops.prepare_candidate_snapshot(
+                    &wiki,
+                    &version,
+                    &data_dir,
+                    run_id,
+                    source_window_size,
+                )
+            })?;
+            run_timed_stage("patrol_fetch", Some(&wiki), || {
+                ops.fetch_patrol(&wiki, &data_dir)
+            })?;
+            run_timed_stage("compute", Some(&wiki), || {
+                ops.compute_candidate(&wiki, &version, &data_dir, &qualification_dir)
+            })?;
+            run_timed_stage("patrol_compute", Some(&wiki), || {
+                ops.compute_candidate_patrol(&wiki, &version, &data_dir, &qualification_dir)
+            })?;
+            let receipt = run_timed_stage("qualification_validate", Some(&wiki), || {
+                ops.mark_qualification_ready(
+                    &data_dir,
+                    &output_dir,
+                    &lifecycle,
+                    &wiki,
+                    &version,
+                    run_id,
+                )
+            })?;
+            println!("{}", receipt.display());
         }
 
         Commands::PublicationPrepareReady { lifecycle } => {
@@ -1639,6 +1724,24 @@ mod tests {
             Ok(output_dir.join("ready.json"))
         }
 
+        fn ensure_qualification_wiki(&self, _lifecycle: &Path, wiki: &str) -> Result<()> {
+            self.record(format!("qualification_lifecycle:{wiki}"));
+            Ok(())
+        }
+
+        fn mark_qualification_ready(
+            &self,
+            _data_dir: &Path,
+            output_dir: &Path,
+            _lifecycle: &Path,
+            wiki: &str,
+            version: &str,
+            run_id: &str,
+        ) -> Result<PathBuf> {
+            self.record(format!("qualification_ready:{wiki}:{version}:{run_id}"));
+            Ok(output_dir.join("qualification.json"))
+        }
+
         fn prepare_ready_publication(
             &self,
             _data_dir: &Path,
@@ -1929,6 +2032,42 @@ mod tests {
     }
 
     #[test]
+    fn run_with_ops_qualifies_one_publication_invisible_wiki() -> Result<()> {
+        init_test_tracing();
+        let cli = Cli::try_parse_from([
+            "wiki-econ",
+            "--data-dir",
+            "qualification/data",
+            "--output-dir",
+            "qualification/output",
+            "--run-id",
+            "qualify-7",
+            "qualify-wiki",
+            "itwiki",
+            "--version",
+            "2026-07",
+            "--source-window-size",
+            "1",
+        ])?;
+        let ops = RecordingOps::default();
+
+        run_with_ops(cli, &ops)?;
+
+        assert_eq!(
+            ops.calls.into_inner(),
+            vec![
+                "qualification_lifecycle:itwiki",
+                "source_window:itwiki:2026-07:qualification/data:1",
+                "fetch_patrol:itwiki:qualification/data",
+                "compute:itwiki:qualification/data:qualification/output/_qualifications/itwiki/2026-07/qualify-7",
+                "compute_patrol:itwiki:qualification/data:qualification/output/_qualifications/itwiki/2026-07/qualify-7:false:_",
+                "qualification_ready:itwiki:2026-07:qualify-7",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn candidate_preparation_resolves_an_unpinned_snapshot() -> Result<()> {
         let cli = Cli::try_parse_from([
             "wiki-econ",
@@ -2029,6 +2168,18 @@ mod tests {
             ops.mark_candidate_ready(&data, &output, &lifecycle, "nlwiki", "2026-07", "candidate",)
                 .is_err()
         );
+        assert!(ops.ensure_qualification_wiki(&lifecycle, "itwiki").is_err());
+        assert!(
+            ops.mark_qualification_ready(
+                &data,
+                &output,
+                &lifecycle,
+                "itwiki",
+                "2026-07",
+                "qualification",
+            )
+            .is_err()
+        );
         assert!(
             ops.prepare_ready_publication(&data, &output, &lifecycle, "prepare")
                 .is_err()
@@ -2081,6 +2232,7 @@ mod tests {
     fn isolated_candidate_and_publication_commands_require_run_ids() -> Result<()> {
         for args in [
             vec!["wiki-econ", "prepare-wiki", "nlwiki"],
+            vec!["wiki-econ", "qualify-wiki", "itwiki"],
             vec!["wiki-econ", "publication-prepare-ready"],
             vec!["wiki-econ", "publication-commit-ready"],
             vec!["wiki-econ", "publication-rollback-ready"],

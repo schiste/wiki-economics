@@ -25,6 +25,9 @@ directly from that registry.
   `freshness_sla_days`.
 - `manual` — permit deliberate one-off work without adding it to the schedule.
 - `paused` — preserve and publish the current generation without refreshing it.
+- `qualification` — permit isolated correctness and capacity work only. It is
+  valid exclusively with `publication=hidden`; qualification artifacts live
+  outside the publisher's candidate namespace.
 
 Retired wikis must use `refresh=paused`. Imported historical datasets use
 `publication=published`, `refresh=paused`, `provenance=local-import`, and an
@@ -61,6 +64,20 @@ The admin status API exposes:
   timestamp when a per-wiki GDP artifact exists.
 
 The generated manifest also embeds the lifecycle registry.
+
+### Qualify a new wiki
+
+Register the wiki with `publication=hidden`, `refresh=qualification`, and a
+qualification provenance label. Run `wiki-econ qualify-wiki` only with
+isolated data and output roots. Its receipt is written below
+`_qualifications`, records `publication_eligible=false`, and is never scanned
+by `publication-prepare-ready`.
+
+Promotion is deliberately not automatic. After capacity, determinism,
+semantic, rollover, and browser evidence passes, change the wiki to
+`publication=published`, `refresh=manual`, add its production capacity policy,
+and run a new normal `prepare-wiki`. A qualification receipt cannot be
+selected or reused as a publication candidate.
 
 `publication_contract.datasets` defines which published wikis each metric must
 contain and its conservative `minimum_rows_per_wiki`. Use

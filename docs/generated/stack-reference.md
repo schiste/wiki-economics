@@ -71,6 +71,7 @@ datasets are `frwiki`, `nlwiki`, `ptwiki`; paused imported datasets are `elwiki`
 | --- | --- | --- | --- | --- |
 | `elwiki` | published | paused | local-import | 2026-03 |
 | `frwiki` | published | scheduled | toolforge | 10 days |
+| `itwiki` | hidden | qualification | toolforge-qualification | — |
 | `nlwiki` | published | scheduled | toolforge | 10 days |
 | `ptwiki` | published | scheduled | toolforge | 10 days |
 | `svwiki` | published | paused | local-import | 2026-03 |

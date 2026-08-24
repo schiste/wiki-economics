@@ -4,7 +4,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const PUBLICATION_STATES = new Set(["published", "hidden", "retired"]);
-const REFRESH_STATES = new Set(["scheduled", "manual", "paused"]);
+const REFRESH_STATES = new Set(["scheduled", "manual", "paused", "qualification"]);
 const WIKI_NAME = /^[a-z0-9_]+wiki$/;
 const YEAR_MONTH = /^\d{4}-(0[1-9]|1[0-2])$/;
 const DATASET_NAME = /^[a-z][a-z0-9_]*$/;
@@ -53,6 +53,9 @@ function validateWikiLifecycle(registry, label = "wiki lifecycle registry") {
     }
     if (entry.publication === "retired" && entry.refresh !== "paused") {
       throw new Error(`${label}.wikis.${wiki} must use refresh=paused when retired`);
+    }
+    if (entry.refresh === "qualification" && entry.publication !== "hidden") {
+      throw new Error(`${label}.wikis.${wiki} must use publication=hidden when refresh=qualification`);
     }
     if (typeof entry.provenance !== "string" || !entry.provenance.trim()) {
       throw new Error(`${label}.wikis.${wiki}.provenance must be a non-empty string`);
@@ -139,6 +142,10 @@ function runCli(argv = process.argv.slice(2), env = process.env) {
   }
   if (command === "published-wikis") {
     process.stdout.write(`${wikisWithState(registry, "publication", "published").join("\n")}\n`);
+    return;
+  }
+  if (command === "qualification-wikis") {
+    process.stdout.write(`${wikisWithState(registry, "refresh", "qualification").join("\n")}\n`);
     return;
   }
   if (command === "json") {

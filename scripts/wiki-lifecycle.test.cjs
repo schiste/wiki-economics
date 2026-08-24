@@ -42,7 +42,7 @@ function validRegistry() {
       },
       testwiki: {
         publication: "hidden",
-        refresh: "manual",
+        refresh: "qualification",
         provenance: "test",
       },
     },
@@ -63,6 +63,8 @@ test("production lifecycle schedules qualified Toolforge wikis", () => {
   assert.equal(registry.wikis.ptwiki.refresh, "scheduled");
   assert.equal(registry.wikis.ptwiki.provenance, "toolforge");
   assert.equal(registry.wikis.ptwiki.imported_cutoff, undefined);
+  assert.equal(registry.wikis.itwiki.publication, "hidden");
+  assert.equal(registry.wikis.itwiki.refresh, "qualification");
   assert.deepEqual(
     resolveRefreshWikis(registry, {WIKI_ECON_REFRESH_WIKIS: "frwiki nlwiki ptwiki"}),
     ["frwiki", "nlwiki", "ptwiki"],
@@ -89,6 +91,7 @@ test("refresh overrides are backward compatible but fail closed on disagreement"
     /refresh state is paused/,
   );
   registry.wikis.testwiki.publication = "published";
+  registry.wikis.testwiki.refresh = "manual";
   assert.deepEqual(
     resolveRefreshWikis(registry, { WIKI_ECON_REFRESH_WIKIS: "nlwiki testwiki" }),
     ["nlwiki", "testwiki"],
@@ -112,6 +115,7 @@ test("registry validation rejects invalid lifecycle states and metadata", () => 
     [{ schema_version: 1, wikis: { nlwiki: { publication: "gone" } }, ...contract }, /invalid publication/],
     [{ schema_version: 1, wikis: { nlwiki: { publication: "published", refresh: "never" } }, ...contract }, /invalid refresh/],
     [{ schema_version: 1, wikis: { nlwiki: { publication: "retired", refresh: "manual" } }, ...contract }, /refresh=paused/],
+    [{ schema_version: 1, wikis: { nlwiki: { publication: "published", refresh: "qualification" } }, ...contract }, /publication=hidden/],
     [{ schema_version: 1, wikis: { nlwiki: { publication: "published", refresh: "paused", provenance: "" } }, ...contract }, /provenance/],
     [{ schema_version: 1, wikis: { nlwiki: { publication: "published", refresh: "paused", provenance: "x", imported_cutoff: "2026-13" } }, ...contract }, /YYYY-MM/],
     [{ schema_version: 1, wikis: { nlwiki: { publication: "published", refresh: "paused", provenance: "x", freshness_sla_days: 0 } }, ...contract }, /positive integer/],
@@ -153,6 +157,10 @@ test("CLI validates and lists lifecycle selections", () => {
   assert.equal(
     execFileSync(process.execPath, [SCRIPT, "published-wikis"], { env, encoding: "utf8" }),
     "elwiki\nfrwiki\nnlwiki\nptwiki\nsvwiki\n",
+  );
+  assert.equal(
+    execFileSync(process.execPath, [SCRIPT, "qualification-wikis"], { env, encoding: "utf8" }),
+    "itwiki\n",
   );
   assert.equal(JSON.parse(execFileSync(process.execPath, [SCRIPT, "json"], { env, encoding: "utf8" })).schema_version, 1);
   assert.throws(() => execFileSync(process.execPath, [SCRIPT, "unknown"], { env, stdio: "pipe" }));
