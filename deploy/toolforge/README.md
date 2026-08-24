@@ -96,9 +96,13 @@ frwiki completed the measured capacity qualification documented in
   reserve, scratch, and file-descriptor signals. Thus a window of four is an
   upper bound, not a promise that four sources start when resources are tight.
   A new monthly snapshot is written beside the active generation and selected
-  atomically; the previous generation is retained through compute, merge, and
-  site publication, then `snapshot-finalize` removes it. This intentionally
-  creates a short-lived two-generation storage peak during rollover.
+  atomically. Candidate lifecycle receipts advance through `building`,
+  `validated`, `ready`, `published`, `superseded`, and `retired`; the previous
+  published candidate is retained as rollback material, while inactive input
+  snapshots are removed only after the replacement site passes validation.
+  This intentionally creates a bounded current-plus-candidate-plus-rollback
+  storage peak during rollover. Malformed objects inside pipeline-owned
+  staging namespaces are quarantined rather than deleted.
   `wiki-econ fetch` also
   preflights available disk space against the summed remote dump size
   before downloading anything, so insufficient shared headroom (e.g. for

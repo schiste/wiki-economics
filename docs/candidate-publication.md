@@ -21,6 +21,22 @@ schemas, row-count contracts, wiki labels, dates, snapshot cutoff, and
 patrol/rights sources pass validation. A directory without a valid
 `ready.json` is never eligible for publication.
 
+Every attempt also has a durable record below
+`output/_generation-state/<wiki>/<snapshot>/<run-id>.json`. Its guarded state
+machine is:
+
+```text
+building -> validated -> ready -> published -> superseded -> retired
+```
+
+Interrupted `building` or `validated` attempts remain resumable for the
+configured recovery window. Ready and published generations are never removed
+by age-based cleanup. Publication marks the previous live candidate
+`superseded` only after the new site and data pass the publication gate, keeps
+that one generation as rollback material, and transitions older superseded
+generations to `retired` before deleting their directories. The compact state
+receipt remains after data retirement as an audit trail.
+
 Before creating a new candidate, preparation compares the resolved snapshot
 with every valid ready candidate for that wiki and verifies the current core
 and patrol stage fingerprints. When both fingerprints still match, the job
@@ -53,12 +69,20 @@ that sequence restores both the old wiki paths and snapshot pointers.
 
 The site is built in its existing isolated staging directory and its symlink
 is switched atomically. `publication-commit-ready` verifies the publication
-receipt again, removes transaction backups, retires inactive input snapshots,
-and removes superseded candidate generations. If the site build fails before
+receipt again, records `committing` in the recovery journal, advances
+generation states, retires inactive input snapshots, and removes transaction
+backups. If the site build fails before
 its switch, `publication-rollback-ready` restores the previous dataset and
 regenerates its combined artifacts. If cleanup/commit fails after the site
 switch, the wrapper deliberately leaves the selected data and new site
 together and reports the exact run ID whose commit must be retried.
+
+Reclamation follows ownership receipts rather than directory names alone:
+strict ingest success authorizes raw-source deletion, durable bucket append
+authorizes scratch deletion, and lifecycle state authorizes candidate deletion.
+Expired, well-identified site/run staging is removed by run ID. Malformed or
+unknown objects found inside pipeline-owned candidate/staging namespaces are
+moved to `_quarantine` with a JSON receipt instead of being deleted.
 
 ## Toolforge jobs
 

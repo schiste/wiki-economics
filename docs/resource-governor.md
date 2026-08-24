@@ -9,10 +9,18 @@ description of a Toolforge job's CPU or memory quota.
 At snapshot start, Rust resolves the compressed size of every pending source.
 The run fails before downloading data unless free persistent storage can hold:
 
-1. the configured persistent-storage reserve;
-2. a conservative candidate-generation estimate equal to all pending
+1. the configured safety reserve;
+2. the bounded scratch reserve;
+3. the rollback-generation reserve;
+4. a conservative candidate-generation estimate equal to all pending
    compressed sources; and
-3. the largest concurrently active source window.
+5. the largest concurrently active source window.
+
+The current published generation is already charged to filesystem usage, so it
+is not counted again as free space. The explicit rollback reserve keeps room for
+one superseded publication while a candidate is built. The scratch reserve is
+an admission floor, while `WIKI_ECON_SCRATCH_LIMIT_BYTES` remains the hard
+runtime ceiling.
 
 Each source then executes as an independent transaction: admit, download,
 validate, ingest immutable fragments, commit its strict marker, and release its
@@ -27,8 +35,10 @@ one staging writer and reads one primary bucket at a time. Larger workloads can
 use two levels: monthly staging is compacted into 64 or 128 primary files in
 writer-bounded batches, then one primary is streamed by Parquet row group into
 16 or 32 secondary files. Only one secondary reconciliation unit is loaded,
-sorted, and grouped at a time. Completed primary and secondary scratch is
-deleted immediately.
+sorted, and grouped at a time. Primary scratch is deleted after its validated
+secondary fragments are durable. Final-level scratch is retained until the
+complete output has a footer, has been synced, and has been atomically renamed;
+the run directory is then reclaimed as one state transition.
 
 Both levels use non-overlapping bits from the same stable page hash. Traversal
 is primary-major then secondary-major, so repeated runs of one configuration
@@ -44,6 +54,8 @@ All byte values are integer bytes.
 | `WIKI_ECON_MEMORY_CEILING_BYTES` | Absolute process/cgroup memory budget | detected cgroup limit, otherwise 16 GiB |
 | `WIKI_ECON_MEMORY_RESERVE_BYTES` | Memory that admission must keep unused | 25% of ceiling |
 | `WIKI_ECON_PERSISTENT_STORAGE_RESERVE_BYTES` | Free persistent bytes retained after admitted work | 0 |
+| `WIKI_ECON_BOUNDED_SCRATCH_RESERVE_BYTES` | Free bytes reserved for the current bounded scratch unit | 0 |
+| `WIKI_ECON_ROLLBACK_GENERATION_RESERVE_BYTES` | Free bytes reserved for one rollback publication | 0 |
 | `WIKI_ECON_SCRATCH_LIMIT_BYTES` | Maximum pipeline-owned scratch bytes | 64 GiB |
 | `WIKI_ECON_MAX_OPEN_FILES` | File-descriptor admission ceiling | 512 |
 | `WIKI_ECON_SOURCE_WORKERS` | Concurrent source transactions | 1 |
@@ -59,8 +71,9 @@ All byte values are integer bytes.
 fail-closed.
 
 The Toolforge wrapper pins a 6 GiB ceiling, 1.5 GiB memory reserve, 10 GiB
-persistent reserve, one source worker, and one compute thread for the existing
-job. These are operational defaults, not enwiki qualification results.
+safety reserve, 8 GiB bounded-scratch reserve, 8 GiB rollback reserve, one
+source worker, and one compute thread for the existing job. These are
+operational defaults, not enwiki qualification results.
 
 ## Proposed enwiki qualification profile
 
@@ -70,6 +83,8 @@ Begin capacity experiments—not production scheduling—with:
 WIKI_ECON_MEMORY_CEILING_BYTES=17179869184
 WIKI_ECON_MEMORY_RESERVE_BYTES=4294967296
 WIKI_ECON_PERSISTENT_STORAGE_RESERVE_BYTES=268435456000
+WIKI_ECON_BOUNDED_SCRATCH_RESERVE_BYTES=34359738368
+WIKI_ECON_ROLLBACK_GENERATION_RESERVE_BYTES=68719476736
 WIKI_ECON_SOURCE_WORKERS=2
 WIKI_ECON_THREAD_LIMIT=4
 RAYON_NUM_THREADS=4
