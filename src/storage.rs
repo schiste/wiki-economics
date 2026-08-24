@@ -436,7 +436,7 @@ pub(crate) fn read_generation_manifest(
     Ok(manifest)
 }
 
-fn ensure_generation_manifest(
+pub(crate) fn ensure_generation_manifest(
     data_dir: &Path,
     wiki: &str,
     snapshot_version: &str,

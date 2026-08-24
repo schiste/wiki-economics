@@ -344,7 +344,7 @@ fn prior_measured_rows(data_dir: &Path, wiki: &str, snapshot: &str) -> Result<Op
     let Some(version) = version else {
         return Ok(None);
     };
-    let manifest = storage::read_generation_manifest(data_dir, wiki, &version)?;
+    let manifest = storage::ensure_generation_manifest(data_dir, wiki, &version)?;
     manifest
         .fragments
         .iter()
@@ -467,6 +467,24 @@ mod tests {
         fs::write(candidate_manifest, b"{partial")?;
 
         assert_eq!(prior_measured_rows(root.path(), wiki, candidate)?, Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn prior_rows_strictly_migrate_a_selected_pre_manifest_generation() -> Result<()> {
+        let root = TestDir::new()?;
+        let wiki = "testwiki";
+        let current = "2026-07";
+        let (plan, _) = SnapshotPlan::load_or_resolve(root.path(), wiki, current)?;
+        let analytical = storage::snapshot_analytical_wiki_dir(root.path(), wiki, current)?;
+        storage::write_test_marker_in(root.path(), &analytical, &plan.sources[0].source_id)?;
+        let manifest = storage::write_generation_manifest(root.path(), wiki, current)?;
+        storage::publish_current_snapshot(root.path(), wiki, current)?;
+        fs::remove_file(&manifest)?;
+
+        assert_eq!(prior_measured_rows(root.path(), wiki, current)?, Some(1));
+        assert!(manifest.is_file());
+        storage::read_generation_manifest(root.path(), wiki, current)?;
         Ok(())
     }
 
