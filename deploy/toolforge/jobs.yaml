@@ -29,7 +29,6 @@
 - name: wiki-econ-refresh
   image: tool-wiki-economics/tool-wiki-economics:latest
   command: deploy/toolforge/run-refresh.sh
-  schedule: "0 3 * * 0" # weekly; tighten only after measuring real run time
   filelog: true
   mount: all
   # Use Toolforge's per-container ceiling. The Rust process logs cgroup
@@ -37,7 +36,48 @@
   mem: 6Gi
   cpu: "1"
 
-# On-demand-only jobs (no `schedule:`): trigger with
+# Scheduled preparation is isolated per wiki. These jobs never switch the
+# published data or site, and each holds only its own per-wiki lock.
+- name: wiki-econ-prepare-nlwiki
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: deploy/toolforge/run-prepare-nlwiki.sh
+  schedule: "0 1 * * 0"
+  filelog: true
+  mount: all
+  mem: 6Gi
+  cpu: "1"
+
+- name: wiki-econ-prepare-ptwiki
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: deploy/toolforge/run-prepare-ptwiki.sh
+  schedule: "10 1 * * 0"
+  filelog: true
+  mount: all
+  mem: 6Gi
+  cpu: "1"
+
+- name: wiki-econ-prepare-frwiki
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: deploy/toolforge/run-prepare-frwiki.sh
+  schedule: "20 1 * * 0"
+  filelog: true
+  mount: all
+  mem: 6Gi
+  cpu: "1"
+
+# Publication is intentionally short and independent. It selects only fully
+# validated ready candidates, merges, builds, validates, and switches the
+# release while holding the sole global publication lock.
+- name: wiki-econ-publish-ready
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: deploy/toolforge/run-publish-ready.sh
+  schedule: "30 */2 * * *"
+  filelog: true
+  mount: all
+  mem: 6Gi
+  cpu: "1"
+
+# Legacy on-demand-only jobs (no `schedule:`): trigger with
 # `toolforge jobs restart <name>` between scheduled wiki-econ-refresh runs,
 # e.g. after a site/docs-only change that doesn't need a fresh fetch or
 # compute. See README.md's "On-demand stage jobs" section. Each still goes
