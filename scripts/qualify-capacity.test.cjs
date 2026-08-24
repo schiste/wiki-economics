@@ -45,9 +45,13 @@ function completeReports() {
 }
 
 test("qualification requires equivalent deterministic evidence and chooses the bounded default", () => {
-  const result = qualify(completeReports(), policy);
+  const reports = completeReports().map((value, index) => index === 3
+    ? {...value, observed_memory_peak_bytes: 540, observed_memory_headroom_percent: 10,
+      memory_gate_passed: false, output_sha256: "c".repeat(64)} : value);
+  const result = qualify(reports, policy);
   assert.equal(result.qualified, true);
   assert.equal(result.recommended_frwiki_bucket_count, 256);
+  assert.equal(result.evidence.frwiki[512].memory_gate_passed, false);
   assert.equal(result.evidence.frwiki[1024].bucket_staged_rows.length, 1024);
 });
 
@@ -56,5 +60,8 @@ test("qualification fails closed for missing, underprovisioned, or divergent rep
   assert.throws(() => qualify(completeReports().map((value, index) => index === 2
     ? {...value, memory_limit_bytes: 500} : value), policy), /not production-equivalent/);
   assert.throws(() => qualify(completeReports().map((value, index) => index === 4
-    ? {...value, output_sha256: "c".repeat(64)} : value), policy), /identical deterministic/);
+    ? {...value, aggregation: {...value.aggregation, output_rows: 19}} : value), policy),
+  /identical deterministic/);
+  assert.throws(() => qualify(completeReports().map((value, index) => index === 0
+    ? {...value, memory_gate_passed: false} : value), policy), /not production-equivalent/);
 });

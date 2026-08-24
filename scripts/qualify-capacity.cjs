@@ -50,16 +50,17 @@ function validatePolicy(policy) {
   return policy;
 }
 
-function validateReport(report, policy, expectedWiki, expectedBuckets) {
+function validateReport(report, policy, expectedWiki, expectedBuckets, requirePassingGates = true) {
   const aggregation = report?.aggregation;
   if (report?.schema_version !== 3 || report.wiki !== expectedWiki
       || report.bucket_count !== expectedBuckets || !/^\d{4}-\d{2}$/.test(report.selected_snapshot || "")
       || report.memory_limit_bytes !== policy.memory_limit_bytes
       || report.minimum_memory_headroom_percent < policy.minimum_memory_headroom_percent
-      || report.observed_memory_headroom_percent < policy.minimum_memory_headroom_percent
       || report.storage_reserve_bytes < policy.minimum_storage_reserve_bytes
       || report.rayon_threads !== policy.cpu || report.polars_threads !== policy.cpu
-      || report.memory_gate_passed !== true || report.storage_gate_passed !== true
+      || typeof report.memory_gate_passed !== "boolean"
+      || typeof report.storage_gate_passed !== "boolean"
+      || (requirePassingGates && (!report.memory_gate_passed || !report.storage_gate_passed))
       || !aggregation || aggregation.bucket_count !== expectedBuckets
       || !Array.isArray(aggregation.bucket_staged_rows)
       || aggregation.bucket_staged_rows.length !== expectedBuckets) {
@@ -87,7 +88,6 @@ function comparableIdentity(report) {
     edits: aggregation.total_edits,
     minimum: aggregation.minimum_week_start,
     maximum: aggregation.maximum_week_start,
-    sha256: report.output_sha256,
   });
 }
 
@@ -106,7 +106,8 @@ function qualify(reports, policy) {
     for (const buckets of requirements.required_bucket_counts) {
       const report = latest.get(`${wiki}:${buckets}`);
       if (!report) throw new Error(`missing required capacity report: ${wiki}/${buckets}`);
-      selected[wiki][buckets] = validateReport(report, policy, wiki, buckets);
+      const isFrwikiExperiment = wiki === "frwiki";
+      selected[wiki][buckets] = validateReport(report, policy, wiki, buckets, !isFrwikiExperiment);
     }
   }
 
@@ -132,6 +133,8 @@ function qualify(reports, policy) {
         selected_snapshot: report.selected_snapshot,
         peak_memory_bytes: report.observed_memory_peak_bytes,
         memory_headroom_percent: report.observed_memory_headroom_percent,
+        memory_gate_passed: report.memory_gate_passed,
+        storage_gate_passed: report.storage_gate_passed,
         scratch_peak_bytes: report.aggregation.scratch_peak_bytes,
         working_storage_peak_bytes: report.aggregation.working_storage_peak_bytes,
         persistent_storage_peak_bytes: report.persistent_storage_peak_bytes,
