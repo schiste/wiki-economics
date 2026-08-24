@@ -225,6 +225,8 @@ function buildRecord(environment, finalExitCode = null) {
     : null;
   const error = state === "failed" ? (events.failed?.error || shellError) : null;
   const publishedSiteGeneration = siteGeneration(environment.WIKI_ECON_SITE_DIST_DIR);
+  const noOp = isFinal && finalExitCode === 0 && events.stages.length > 0 &&
+    events.stages.every((stage) => stage.reused || stage.skipped || stage.stage === "snapshot_resolve");
 
   return {
     schemaVersion: 2,
@@ -243,6 +245,7 @@ function buildRecord(environment, finalExitCode = null) {
     stages: events.stages,
     reusedStages: events.reusedStages,
     skippedStages: events.skippedStages,
+    noOp,
     failingStage,
     error,
     provenance: {
@@ -275,6 +278,7 @@ function compactHistoryEntry(record) {
     stageDurationsMs: record.stageDurationsMs,
     reusedStages: record.reusedStages,
     skippedStages: record.skippedStages,
+    noOp: record.noOp,
     failingStage: record.failingStage,
     error: record.error,
     memoryPeakBytes: record.memoryPeakBytes,
@@ -340,6 +344,7 @@ function structuredSummaries(record) {
     selectedSnapshot: record.selectedSnapshot,
     reusedStages: record.reusedStages,
     skippedStages: record.skippedStages,
+    noOp: record.noOp,
     failingStage: record.failingStage,
     error: record.error,
     memoryPeakBytes: record.memoryPeakBytes,

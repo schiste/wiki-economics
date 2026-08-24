@@ -94,6 +94,7 @@ test("live and final records combine provenance, resources, publication, and sit
   assert.equal(live.currentStage, "compute");
   assert.equal(live.selectedSnapshot, "2026-07");
   assert.equal(live.exitCode, null);
+  assert.equal(live.noOp, false);
   assert.equal(live.provenance.imageSourceRef, "main");
   assert.equal(live.disk.path, environment.WIKI_ECON_OUTPUT_DIR);
 
@@ -114,6 +115,7 @@ test("live and final records combine provenance, resources, publication, and sit
   }));
   const final = buildRecord(environment, 0);
   assert.equal(final.state, "succeeded");
+  assert.equal(final.noOp, false);
   assert.equal(final.currentStage, null);
   assert.equal(final.publishedSiteGeneration, ".site-dist.build.abc123");
   assert.equal(final.logFile, "complete-run.log");
@@ -140,6 +142,18 @@ test("failed records prefer the Rust stage error and reject another run's public
   assert.equal(record.error, "bad parquet");
   assert.equal(record.publication, null);
   assert.equal(record.publishedSiteGeneration, ".site-dist.build.abc123");
+});
+
+test("snapshot discovery followed only by reused stages is a recorded no-op", () => {
+  const {environment} = fixture("noop");
+  appendEvent(environment.WIKI_ECON_RUN_EVENTS_FILE, "started", "snapshot_resolve", "nlwiki");
+  appendEvent(environment.WIKI_ECON_RUN_EVENTS_FILE, "completed", "snapshot_resolve", "nlwiki", 10);
+  appendEvent(environment.WIKI_ECON_RUN_EVENTS_FILE, "started", "candidate_discovery", "nlwiki");
+  appendEvent(environment.WIKI_ECON_RUN_EVENTS_FILE, "reused", "candidate_discovery", "nlwiki");
+  appendEvent(environment.WIKI_ECON_RUN_EVENTS_FILE, "completed", "candidate_discovery", "nlwiki", 0);
+
+  assert.equal(buildRecord(environment, 0).noOp, true);
+  assert.equal(buildRecord(environment, 1).noOp, false);
 });
 
 test("atomic status writes and compact history retains and deduplicates 104 runs", () => {
