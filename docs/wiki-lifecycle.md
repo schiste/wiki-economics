@@ -73,6 +73,11 @@ isolated data and output roots. Its receipt is written below
 `_qualifications`, records `publication_eligible=false`, and is never scanned
 by `publication-prepare-ready`.
 
+An already-published imported dataset may remain `publication=published` and
+`refresh=paused` while the same isolated qualification runs. This preserves
+the public imported baseline until its replacement has passed qualification.
+Scheduled and manual entries are not eligible for the qualification command.
+
 Promotion is deliberately not automatic. After capacity, determinism,
 semantic, rollover, and browser evidence passes, change the wiki to
 `publication=published`, `refresh=manual`, add its production capacity policy,

@@ -814,9 +814,12 @@ pub(crate) fn ensure_qualification_wiki(lifecycle_path: &Path, wiki: &str) -> Re
         .wikis
         .get(wiki)
         .with_context(|| format!("qualification wiki {wiki} is not registered"))?;
+    let hidden_qualification =
+        lifecycle.publication == "hidden" && lifecycle.refresh == "qualification";
+    let paused_publication = lifecycle.publication == "published" && lifecycle.refresh == "paused";
     ensure!(
-        lifecycle.publication == "hidden" && lifecycle.refresh == "qualification",
-        "qualification wiki {wiki} must use publication=hidden and refresh=qualification"
+        hidden_qualification || paused_publication,
+        "qualification wiki {wiki} must be hidden/qualification or published/paused"
     );
     Ok(())
 }
@@ -3207,6 +3210,29 @@ mod tests {
             )
             .expect("qualification metric should copy");
         }
+    }
+
+    #[test]
+    fn paused_published_wiki_can_qualify_without_hiding_its_imported_baseline() {
+        let fixture = Fixture::new().expect("qualification fixture should build");
+        let mut lifecycle: Value =
+            read_json(&fixture.lifecycle_path).expect("fixture lifecycle should load");
+        lifecycle["wikis"]["nlwiki"] = json!({
+            "publication": "published",
+            "refresh": "paused",
+            "provenance": "local-import",
+            "imported_cutoff": "2026-03"
+        });
+        atomic_json(&fixture.lifecycle_path, &lifecycle)
+            .expect("paused published lifecycle should persist");
+
+        ensure_qualification_wiki(&fixture.lifecycle_path, "nlwiki")
+            .expect("paused published wiki should be eligible for isolated qualification");
+
+        lifecycle["wikis"]["nlwiki"]["refresh"] = json!("scheduled");
+        atomic_json(&fixture.lifecycle_path, &lifecycle)
+            .expect("scheduled lifecycle should persist");
+        assert!(ensure_qualification_wiki(&fixture.lifecycle_path, "nlwiki").is_err());
     }
 
     fn block_generation_state_write(fixture: &Fixture, run_id: &str) -> PathBuf {

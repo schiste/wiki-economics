@@ -311,8 +311,9 @@ resource rationale are preserved in the
 
 ### Publication-invisible wiki qualification
 
-For a wiki registered as `publication=hidden`, `refresh=qualification`, run a
-complete isolated preparation with a one-off 6 GiB/1-vCPU job:
+For a wiki registered as `publication=hidden`, `refresh=qualification`, or an
+already-published imported wiki that remains `refresh=paused`, run a complete
+isolated preparation with a one-off 6 GiB/1-vCPU job:
 
 ```sh
 toolforge jobs run --image tool-wiki-economics/tool-wiki-economics:latest \
