@@ -65,21 +65,16 @@ frwiki completed the measured capacity qualification documented in
   renamed only after successful completion. The Observable site is built in
   a clean hidden sibling directory, then the stable `site-dist` symlink is
   atomically switched and the prior site release is removed. Raw `.bz2` dump
-  cleanup happens inside the pipeline itself, not in this script:
-  `wiki-econ run` deletes each wiki's raw dump
-  immediately after that wiki's ingest stage succeeds (`src/main.rs`'s
-  `Commands::Run` loop, backed by `fetch::cleanup_raw_dump`), rather than
-  waiting for every wiki in the batch plus the site build to finish. This
-  keeps the on-disk transient peak lower — the raw dump doesn't linger
-  through the rest of that wiki's own compute/patrol stages, through every
-  other wiki's full pipeline, and through the final merge. It's safe because
-  generation-scoped ingest markers validate warehouse/analytical outputs,
-  never the raw source file — later refreshes stay idempotent without it.
-  Startup recovery removes a leftover raw source only when its exact path,
-  source hash, expected fetch filename, marker schema, output row totals, and
-  every Parquet footer validate. This closes the crash window between durable
-  marker publication and the normal raw unlink without weakening fail-closed
-  ingestion.
+  cleanup happens inside the pipeline itself, not in this script. `wiki-econ
+  run` processes `WIKI_ECON_SOURCE_WINDOW_SIZE` planned sources at a time
+  (Toolforge defaults to one and rejects values outside 1–4). Each source is
+  downloaded to pipeline-owned staging, stream-ingested, validated, committed
+  with an atomic strict marker, and immediately deleted. This bounds compressed
+  raw storage to the selected window instead of retaining the whole wiki dump.
+  Run-qualified partial files are adopted and resumed after interruption;
+  completed source markers let a restart continue at the first unfinished
+  source. The candidate generation is selected only after the exact plan,
+  marker inventory, Parquet footers, and row totals all validate.
   A new monthly snapshot is written beside the active generation and selected
   atomically; the previous generation is retained through compute, merge, and
   site publication, then `snapshot-finalize` removes it. This intentionally

@@ -6,9 +6,10 @@
 integrated with the existing `frwiki`, `nlwiki`, and `ptwiki` publication
 
 **Current status:** Exploration only. Generic monthly source planning is
-implemented, but enwiki has not been computed by this project and must not be
-added to the production schedule before the remaining bounded-ingestion,
-compute, and qualification gates in this report pass.
+implemented, including bounded source-window fetch and transactional ingest,
+but enwiki has not been computed by this project and must not be added to the
+production schedule before the remaining bounded-compute and qualification
+gates in this report pass.
 
 **Reference evidence:**
 [`frwiki-capacity-report-2026-08-24.md`](frwiki-capacity-report-2026-08-24.md)
@@ -16,10 +17,11 @@ compute, and qualification gates in this report pass.
 ## Executive summary
 
 Enwiki is feasible, but it is not a configuration-only addition. The canonical
-source planner now resolves its monthly inventory, but the present page-week
+source planner now resolves its monthly inventory and the pipeline consumes it
+through resumable one-to-four-source transactions. The present page-week
 implementation cannot safely scale by merely raising its bucket count. Enwiki
-still needs windowed fetch-and-ingest and a hierarchical or capped-writer
-aggregation before a complete run is attempted.
+still needs a hierarchical or capped-writer aggregation before a complete run
+is attempted.
 
 The recommended target production envelope is:
 
@@ -129,7 +131,7 @@ should require **250 GiB free** to cover growth, filesystem variability,
 retries, abandoned staging awaiting safe cleanup, and concurrent activity on
 the shared filesystem.
 
-### Rollover with the current separated fetch stage
+### Rollover with the compatibility separated fetch stage
 
 If all compressed history files are retained until a later ingest stage, the
 same rollover adds 127.88 GiB of raw input. The safe working requirement rises
@@ -141,14 +143,21 @@ fail closed when the actual reserve is below the selected threshold. The
 official [Tools NFS almost full runbook](https://wikitech.wikimedia.org/wiki/Portal:Toolforge/Admin/Runbooks/ToolsNfsAlmostFull)
 describes the shared-storage risk.
 
-## Current implementation blockers
+## Current implementation status and blockers
 
-### Monthly source discovery (implemented foundation)
+### Monthly source discovery and bounded ingestion (implemented)
 
 The Rust snapshot planner now gives fetch, expected-source validation,
 snapshot-completeness checks, ingest, fingerprints, and recovery one
-deterministic monthly-source contract. Enwiki remains lifecycle-gated because
-bounded raw-file execution and compute qualification are separate requirements.
+deterministic monthly-source contract. The `run` orchestrator now executes a
+configurable one-to-four-source window, atomically commits each strict marker,
+deletes its compressed source immediately, resumes abandoned partial downloads,
+and publishes the candidate pointer only after the complete marker/output
+inventory validates. Per-source recovery checks only its recorded outputs; one
+exact generation inventory scan runs before publication, avoiding a full-tree
+scan for each of enwiki's hundreds of sources. Enwiki remains lifecycle-gated
+because bounded compute and production qualification are still separate
+requirements.
 
 The implemented source-plan contract:
 
@@ -274,7 +283,8 @@ new-snapshot run. These are scheduling assumptions, not an SLO or benchmark.
 ### Phase A: implementation and bounded component tests
 
 1. Add deterministic monthly-source discovery and fixtures.
-2. Add windowed fetch-and-ingest with strict per-source checkpoints.
+2. **Completed:** add windowed fetch-and-ingest with strict per-source
+   checkpoints and source-level restart tests.
 3. Make open writers, logical buckets, source concurrency, scratch root, and
    memory thresholds explicit configuration recorded in provenance.
 4. Implement capped-writer or hierarchical page-week aggregation.
@@ -337,8 +347,8 @@ Enwiki may be scheduled only when all of the following hold:
 Do not attempt enwiki in the current 6 GiB production job and do not add it by
 only increasing `WIKI_ECON_WEEKLY_BUCKETS`.
 
-Continue with windowed fetch-and-ingest, bounded open writers, hierarchical
-aggregation, and sequential validation. Then request a
+Continue with bounded open writers, hierarchical aggregation, and sequential
+validation. Then request a
 16 GiB per-job/24 GiB namespace memory envelope and an operational guarantee of
 250 GiB working headroom. Use a separate qualification job, retain current
 publication until every semantic gate passes, and replace the estimates in

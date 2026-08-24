@@ -61,7 +61,11 @@ manifests in the [stack reference](docs/generated/stack-reference.md).
 
 This repository does not bundle Wikimedia datasets or precomputed dashboard outputs. A clean clone starts with no `data/` or `output/` tree; fetch and compute those locally.
 
-The current public release is intentionally Wikipedia-first. The admin picker covers every Wikipedia language edition published in the Wikimedia history dumps; the CLI still rejects monthly-partitioned giants such as `enwiki` until the dedicated fetch planner for those projects lands.
+The current public release is intentionally Wikipedia-first. The admin picker
+covers every Wikipedia language edition published in the Wikimedia history
+dumps. The CLI can plan and transactionally ingest monthly-partitioned enwiki,
+but enwiki remains excluded from scheduled publication until bounded compute
+and production-capacity qualification pass.
 
 Build the Rust CLI:
 
@@ -76,7 +80,13 @@ history and logging dumps and is not a small fixture):
 cargo run --release --locked -- run frwiki --version YYYY-MM
 ```
 
-Expanded stage-oriented equivalent:
+`run` downloads and ingests one planned source at a time by default. Set
+`--source-window-size 2` through `4` (or `WIKI_ECON_SOURCE_WINDOW_SIZE`) only
+when measured storage headroom justifies retaining more compressed inputs.
+
+Compatibility/operator stage commands are also available, but the separated
+`fetch` then `ingest` form does not provide the bounded raw-storage guarantee
+of `run`:
 
 ```sh
 cargo run --release --locked -- fetch frwiki

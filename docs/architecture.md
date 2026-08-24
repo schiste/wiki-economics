@@ -58,9 +58,12 @@ Important decisions:
 - Partial files are resumed only when the server advertises range support.
 - Concurrency is bounded. More parallelism looked attractive on paper but would compete with ingest for disk and bandwidth.
 - Yearly, all-time, and monthly source layouts are resolved into one immutable
-  `source-plan.json` before fetch begins. Monthly planning support does not by
-  itself qualify giant projects for production; windowed ingestion and bounded
-  compute remain required before enabling enwiki.
+  `source-plan.json` before fetch begins. `run` consumes that plan in windows
+  of one source by default (configurable up to four), stages resumable partials
+  with both run and source IDs, and never fetches outside the plan allowlist.
+  Monthly planning plus bounded ingestion does not by itself qualify giant
+  projects for production; bounded compute remains required before enabling
+  enwiki.
 
 ## Ingest
 
@@ -71,6 +74,16 @@ Important decisions:
 - Ingest now filters to `event_entity = revision` and `event_type = create` before writing parquet. This is the single biggest storage reduction in the local pipeline.
 - Ingest no longer writes a full temporary TSV to disk. It decompresses `bz2` into in-memory CSV chunks, parses them with Polars, and writes parquet partitions directly.
 - Source files are tracked by marker files inside their immutable snapshot generation. Reruns skip a source only when the marker still validates both the analytical and warehouse outputs for that source.
+- The full pipeline treats each source as a transaction: download to
+  pipeline-owned staging, validate identity, stream-decode, validate Parquet
+  footers and row totals, atomically commit the marker, then sync and delete
+  the compressed input. A crash loses at most the current bounded window;
+  committed sources are reused without downloading them again.
+- Source-level recovery validates only the files recorded by that source's
+  marker. Immediately before publication, one generation-wide validation
+  checks the exact source allowlist and exact Parquet inventory. This preserves
+  fail-closed completeness without rescanning the full generation once per
+  source.
 - Versioned Wikimedia filenames must form one complete expected snapshot before `current-snapshot.json` is published. Explicit `run --version` and `ingest --version` selections ignore abandoned raw files from older snapshots.
 - Readers retain a legacy-layout fallback only until the first generation pointer is published. Underscore-prefixed staging/generation directories are never recursively scanned as ordinary data.
 - Output is partitioned by `year=` and `year_month=` because the downstream metrics are monthly. This keeps month-scoped compute exact without loading an entire wiki.
