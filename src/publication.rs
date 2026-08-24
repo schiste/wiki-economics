@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
 
@@ -238,6 +238,45 @@ struct RunContext {
     started_at_unix: u64,
     refresh_wikis: BTreeSet<String>,
     requested_snapshot_version: Option<String>,
+    #[serde(default)]
+    requested_snapshot_versions: BTreeMap<String, String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+struct PreparedArtifact {
+    path: String,
+    bytes: u64,
+    rows: u64,
+    sha256: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+struct ReadyWikiCandidate {
+    schema_version: u8,
+    wiki: String,
+    snapshot: String,
+    run_id: String,
+    ready_at_unix: u64,
+    generating_commit: Option<String>,
+    cutoff_date: String,
+    artifacts: Vec<PreparedArtifact>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+struct SelectionEntry {
+    wiki: String,
+    snapshot: String,
+    candidate_relative: String,
+    previous_snapshot: Option<String>,
+    backup_relative: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+struct PublicationSelection {
+    schema_version: u8,
+    run_id: String,
+    state: String,
+    entries: Vec<SelectionEntry>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -421,6 +460,34 @@ pub fn begin_run(
         started_at_unix: now_unix()?,
         refresh_wikis: refresh_wikis.iter().cloned().collect(),
         requested_snapshot_version: requested_snapshot_version.map(str::to_string),
+        requested_snapshot_versions: requested_snapshot_version
+            .map(|snapshot| {
+                refresh_wikis
+                    .iter()
+                    .map(|wiki| (wiki.clone(), snapshot.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
+    atomic_json(&output_dir.join(RUN_CONTEXT_FILE), &context)
+}
+
+fn begin_selected_run(
+    output_dir: &Path,
+    run_id: &str,
+    selected_snapshots: &BTreeMap<String, String>,
+) -> Result<()> {
+    ensure!(
+        !run_id.trim().is_empty(),
+        "publication run ID cannot be empty"
+    );
+    let context = RunContext {
+        schema_version: 2,
+        run_id: run_id.to_string(),
+        started_at_unix: now_unix()?,
+        refresh_wikis: selected_snapshots.keys().cloned().collect(),
+        requested_snapshot_version: None,
+        requested_snapshot_versions: selected_snapshots.clone(),
     };
     atomic_json(&output_dir.join(RUN_CONTEXT_FILE), &context)
 }
@@ -451,6 +518,522 @@ pub fn record_candidate(output_dir: &Path, run_id: Option<&str>, names: &[String
             artifacts,
         },
     )
+}
+
+fn valid_component(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+pub(crate) fn wiki_candidate_dir(
+    output_dir: &Path,
+    wiki: &str,
+    snapshot: &str,
+    run_id: &str,
+) -> Result<PathBuf> {
+    ensure!(valid_component(wiki), "unsafe candidate wiki identifier");
+    storage::validate_snapshot_version(snapshot)?;
+    ensure!(valid_component(run_id), "unsafe candidate run identifier");
+    Ok(output_dir
+        .join("_candidates")
+        .join(wiki)
+        .join(snapshot)
+        .join(run_id))
+}
+
+fn prepared_artifact(candidate_dir: &Path, path: &Path) -> Result<PreparedArtifact> {
+    let relative = path
+        .strip_prefix(candidate_dir)
+        .context("candidate artifact is outside candidate directory")?
+        .to_string_lossy()
+        .into_owned();
+    let mut reader = ParquetReader::new(File::open(path)?);
+    let rows = u64::try_from(reader.num_rows()?)?;
+    let (bytes, sha256) = storage::sha256_file(path)?;
+    Ok(PreparedArtifact {
+        path: relative,
+        bytes,
+        rows,
+        sha256,
+    })
+}
+
+fn validate_prepared_artifact(candidate_dir: &Path, artifact: &PreparedArtifact) -> Result<()> {
+    let relative = Path::new(&artifact.path);
+    ensure!(
+        !relative.is_absolute()
+            && relative
+                .components()
+                .all(|component| matches!(component, std::path::Component::Normal(_))),
+        "candidate artifact has an unsafe path"
+    );
+    let path = candidate_dir.join(relative);
+    let (bytes, sha256) = storage::sha256_file(&path)?;
+    let mut reader = ParquetReader::new(File::open(&path)?);
+    let rows = u64::try_from(reader.num_rows()?)?;
+    ensure!(
+        bytes == artifact.bytes && sha256 == artifact.sha256 && rows == artifact.rows,
+        "prepared candidate artifact identity changed"
+    );
+    Ok(())
+}
+
+pub(crate) fn mark_wiki_candidate_ready(
+    data_dir: &Path,
+    output_dir: &Path,
+    lifecycle_path: &Path,
+    wiki: &str,
+    snapshot: &str,
+    run_id: &str,
+) -> Result<PathBuf> {
+    let candidate_dir = wiki_candidate_dir(output_dir, wiki, snapshot, run_id)?;
+    storage::read_generation_manifest(data_dir, wiki, snapshot)?;
+    let registry = load_lifecycle(lifecycle_path)?;
+    let lifecycle = registry
+        .wikis
+        .get(wiki)
+        .with_context(|| format!("candidate wiki {wiki} is not registered"))?;
+    ensure!(
+        lifecycle.publication == "published"
+            && matches!(lifecycle.refresh.as_str(), "scheduled" | "manual"),
+        "candidate wiki {wiki} is not managed for publication"
+    );
+    let mut artifacts = Vec::new();
+    let mut cutoff_date = None;
+    for spec in &METRICS {
+        let contract = registry
+            .publication_contract
+            .datasets
+            .get(spec.name)
+            .context("missing candidate dataset contract")?;
+        if !expected_wikis(&registry, contract)?.contains(wiki) {
+            continue;
+        }
+        let path = candidate_dir
+            .join(wiki)
+            .join(format!("{}.parquet", spec.name));
+        let rows = validate_schema(&path, spec)?;
+        ensure!(
+            rows >= contract.minimum_rows_per_wiki,
+            "{} candidate has {rows} rows for {wiki}; minimum is {}",
+            spec.name,
+            contract.minimum_rows_per_wiki
+        );
+        let summary = summarize(&path, spec)?;
+        ensure!(
+            summary.wiki_min == wiki && summary.wiki_max == wiki,
+            "candidate metric contains rows for another wiki"
+        );
+        if let (Some(column), Some(minimum), Some(maximum)) = (
+            spec.date_column,
+            summary.minimum_date.as_deref(),
+            summary.maximum_date.as_deref(),
+        ) {
+            validate_date(minimum, column)?;
+            validate_date(maximum, column)?;
+        }
+        if spec.name == "gdp" {
+            let cutoff = summary
+                .maximum_date
+                .clone()
+                .context("candidate GDP maximum date is missing")?;
+            validate_snapshot_cutoff(wiki, snapshot, &cutoff)?;
+            cutoff_date = Some(cutoff);
+        }
+        artifacts.push(prepared_artifact(&candidate_dir, &path)?);
+    }
+    let patrol_dir = data_dir.join("patrol").join(wiki);
+    for name in ["patrol.parquet", "rights.parquet"] {
+        let mut reader = ParquetReader::new(File::open(patrol_dir.join(name))?);
+        ensure!(
+            reader.num_rows()? > 0,
+            "candidate patrol source {name} is empty"
+        );
+    }
+    artifacts.sort_by(|left, right| left.path.cmp(&right.path));
+    let ready = ReadyWikiCandidate {
+        schema_version: 1,
+        wiki: wiki.to_string(),
+        snapshot: snapshot.to_string(),
+        run_id: run_id.to_string(),
+        ready_at_unix: now_unix()?,
+        generating_commit: licensing::generating_commit(),
+        cutoff_date: cutoff_date.context("candidate GDP cutoff is missing")?,
+        artifacts,
+    };
+    let ready_path = candidate_dir.join("ready.json");
+    atomic_json(&ready_path, &ready)?;
+    info!(wiki, snapshot, run_id, path = %ready_path.display(), "wiki candidate is ready");
+    Ok(ready_path)
+}
+
+fn validate_ready_candidate(
+    data_dir: &Path,
+    candidate_dir: &Path,
+    ready: &ReadyWikiCandidate,
+) -> Result<()> {
+    ensure!(
+        ready.schema_version == 1,
+        "unsupported ready candidate schema"
+    );
+    ensure!(
+        candidate_dir.ends_with(
+            Path::new(&ready.wiki)
+                .join(&ready.snapshot)
+                .join(&ready.run_id)
+        ),
+        "ready candidate path does not match its identity"
+    );
+    storage::read_generation_manifest(data_dir, &ready.wiki, &ready.snapshot)?;
+    ensure!(
+        !ready.artifacts.is_empty(),
+        "ready candidate has no artifacts"
+    );
+    for artifact in &ready.artifacts {
+        validate_prepared_artifact(candidate_dir, artifact)?;
+    }
+    validate_snapshot_cutoff(&ready.wiki, &ready.snapshot, &ready.cutoff_date)
+}
+
+fn latest_ready_candidates(
+    data_dir: &Path,
+    output_dir: &Path,
+    lifecycle_path: &Path,
+) -> Result<Vec<(ReadyWikiCandidate, PathBuf)>> {
+    let registry = load_lifecycle(lifecycle_path)?;
+    let mut selected = Vec::new();
+    for (wiki, lifecycle) in registry.wikis {
+        if lifecycle.publication != "published"
+            || !matches!(lifecycle.refresh.as_str(), "scheduled" | "manual")
+        {
+            continue;
+        }
+        let root = output_dir.join("_candidates").join(&wiki);
+        if !root.is_dir() {
+            continue;
+        }
+        let mut candidates = Vec::new();
+        for snapshot_entry in fs::read_dir(&root)? {
+            let snapshot_dir = snapshot_entry?.path();
+            if !snapshot_dir.is_dir() {
+                continue;
+            }
+            for run_entry in fs::read_dir(&snapshot_dir)? {
+                let candidate_dir = run_entry?.path();
+                let ready_path = candidate_dir.join("ready.json");
+                if !ready_path.is_file() {
+                    continue;
+                }
+                let ready: ReadyWikiCandidate = read_json(&ready_path)?;
+                ensure!(ready.wiki == wiki, "ready candidate wiki mismatch");
+                validate_ready_candidate(data_dir, &candidate_dir, &ready)?;
+                candidates.push((ready, candidate_dir));
+            }
+        }
+        candidates.sort_by(|(left, _), (right, _)| {
+            (&left.snapshot, left.ready_at_unix, &left.run_id).cmp(&(
+                &right.snapshot,
+                right.ready_at_unix,
+                &right.run_id,
+            ))
+        });
+        let Some(candidate) = candidates.pop() else {
+            continue;
+        };
+        let current = storage::current_snapshot_version(data_dir, &wiki)?;
+        ensure!(
+            current
+                .as_deref()
+                .is_none_or(|value| candidate.0.snapshot.as_str() >= value),
+            "ready candidate would downgrade {wiki}"
+        );
+        selected.push(candidate);
+    }
+    Ok(selected)
+}
+
+fn selection_path(output_dir: &Path, run_id: &str) -> Result<PathBuf> {
+    ensure!(
+        valid_component(run_id),
+        "unsafe publication selection run ID"
+    );
+    Ok(output_dir
+        .join("_publication_transactions")
+        .join(run_id)
+        .join("selection.json"))
+}
+
+fn active_candidate_target(output_dir: &Path, wiki: &str) -> Result<Option<PathBuf>> {
+    let path = output_dir.join(wiki);
+    match fs::read_link(&path) {
+        Ok(target) => Ok(Some(target)),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn remove_selection_link(path: &Path) -> Result<()> {
+    if path.is_symlink() {
+        fs::remove_file(path)?;
+    }
+    Ok(())
+}
+
+fn move_active_to_backup(output_dir: &Path, active: &Path, backup: Option<&str>) -> Result<()> {
+    let Some(backup) = backup else {
+        return Ok(());
+    };
+    fs::rename(active, output_dir.join(backup))?;
+    Ok(())
+}
+
+fn restore_backup(output_dir: &Path, active: &Path, backup: Option<&str>) -> Result<()> {
+    let Some(backup) = backup else {
+        return Ok(());
+    };
+    let backup = output_dir.join(backup);
+    if backup.exists() || backup.is_symlink() {
+        fs::rename(backup, active)?;
+    }
+    Ok(())
+}
+
+fn remove_committed_backup(output_dir: &Path, backup: Option<&str>) -> Result<()> {
+    let Some(backup) = backup else {
+        return Ok(());
+    };
+    let backup = output_dir.join(backup);
+    if backup.is_dir() {
+        fs::remove_dir_all(backup)?;
+    } else if backup.is_symlink() {
+        fs::remove_file(backup)?;
+    }
+    Ok(())
+}
+
+fn rollback_selection_files(
+    data_dir: &Path,
+    output_dir: &Path,
+    selection: &PublicationSelection,
+) -> Result<()> {
+    for entry in selection.entries.iter().rev() {
+        let active = output_dir.join(&entry.wiki);
+        let expected_target = PathBuf::from(&entry.candidate_relative).join(&entry.wiki);
+        if active_candidate_target(output_dir, &entry.wiki)?.as_ref() == Some(&expected_target) {
+            remove_selection_link(&active)?;
+        }
+        restore_backup(output_dir, &active, entry.backup_relative.as_deref())?;
+        storage::restore_current_snapshot(
+            data_dir,
+            &entry.wiki,
+            entry.previous_snapshot.as_deref(),
+        )?;
+    }
+    Ok(())
+}
+
+fn retire_superseded_candidates(output_dir: &Path, entry: &SelectionEntry) -> Result<usize> {
+    let root = output_dir.join("_candidates").join(&entry.wiki);
+    let retained = output_dir.join(&entry.candidate_relative);
+    let mut removed = 0;
+    if !root.is_dir() {
+        return Ok(0);
+    }
+    for snapshot_entry in fs::read_dir(&root)? {
+        let snapshot_dir = snapshot_entry?.path();
+        if !snapshot_dir.is_dir() {
+            continue;
+        }
+        for run_entry in fs::read_dir(&snapshot_dir)? {
+            let candidate_dir = run_entry?.path();
+            if candidate_dir.is_dir() && candidate_dir != retained {
+                fs::remove_dir_all(&candidate_dir)?;
+                removed += 1;
+            }
+        }
+        if fs::read_dir(&snapshot_dir)?.next().is_none() {
+            fs::remove_dir(&snapshot_dir)?;
+        }
+    }
+    Ok(removed)
+}
+
+fn activate_ready_candidates(
+    data_dir: &Path,
+    output_dir: &Path,
+    lifecycle_path: &Path,
+    run_id: &str,
+) -> Result<PublicationSelection> {
+    let candidates = latest_ready_candidates(data_dir, output_dir, lifecycle_path)?;
+    let transaction_dir = selection_path(output_dir, run_id)?
+        .parent()
+        .context("selection path has no parent")?
+        .to_path_buf();
+    ensure!(
+        !transaction_dir.exists(),
+        "publication transaction already exists"
+    );
+    fs::create_dir_all(transaction_dir.join("backups"))?;
+    let mut entries = Vec::new();
+    for (ready, candidate_dir) in candidates {
+        let candidate_relative = candidate_dir
+            .strip_prefix(output_dir)
+            .context("candidate is outside output directory")?
+            .to_string_lossy()
+            .into_owned();
+        let expected_target = PathBuf::from(&candidate_relative).join(&ready.wiki);
+        if active_candidate_target(output_dir, &ready.wiki)?.as_ref() == Some(&expected_target)
+            && storage::current_snapshot_version(data_dir, &ready.wiki)?.as_deref()
+                == Some(ready.snapshot.as_str())
+        {
+            continue;
+        }
+        let active = output_dir.join(&ready.wiki);
+        let backup = transaction_dir.join("backups").join(&ready.wiki);
+        let backup_relative = (active.exists() || active.is_symlink()).then(|| {
+            backup
+                .strip_prefix(output_dir)
+                .expect("transaction backup remains inside output")
+                .to_string_lossy()
+                .into_owned()
+        });
+        let previous_snapshot = storage::current_snapshot_version(data_dir, &ready.wiki)?;
+        entries.push(SelectionEntry {
+            wiki: ready.wiki,
+            snapshot: ready.snapshot,
+            candidate_relative,
+            previous_snapshot,
+            backup_relative,
+        });
+    }
+    let mut selection = PublicationSelection {
+        schema_version: 1,
+        run_id: run_id.to_string(),
+        state: "activating".to_string(),
+        entries,
+    };
+    let path = selection_path(output_dir, run_id)?;
+    atomic_json(&path, &selection)?;
+    let activation = (|| -> Result<()> {
+        for entry in &selection.entries {
+            let active = output_dir.join(&entry.wiki);
+            move_active_to_backup(output_dir, &active, entry.backup_relative.as_deref())?;
+            let temporary = output_dir.join(format!(".{}.select.{run_id}.tmp", entry.wiki));
+            remove_selection_link(&temporary)?;
+            let link_result = std::os::unix::fs::symlink(
+                PathBuf::from(&entry.candidate_relative).join(&entry.wiki),
+                &temporary,
+            );
+            link_result?;
+            fs::rename(&temporary, &active)?;
+            storage::publish_current_snapshot(data_dir, &entry.wiki, &entry.snapshot)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = activation {
+        for entry in &selection.entries {
+            let temporary = output_dir.join(format!(".{}.select.{run_id}.tmp", entry.wiki));
+            remove_selection_link(&temporary)?;
+        }
+        let rollback_result = rollback_selection_files(data_dir, output_dir, &selection);
+        rollback_result?;
+        selection.state = "rolled_back".to_string();
+        let journal_result = atomic_json(&path, &selection);
+        journal_result?;
+        return Err(error).context("failed to activate ready candidates");
+    }
+    selection.state = "selected".to_string();
+    atomic_json(&path, &selection)?;
+    Ok(selection)
+}
+
+pub(crate) fn prepare_ready_publication(
+    data_dir: &Path,
+    output_dir: &Path,
+    lifecycle_path: &Path,
+    run_id: &str,
+) -> Result<()> {
+    let selection = activate_ready_candidates(data_dir, output_dir, lifecycle_path, run_id)?;
+    let snapshots = selection
+        .entries
+        .iter()
+        .map(|entry| (entry.wiki.clone(), entry.snapshot.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let result = (|| -> Result<()> {
+        begin_selected_run(output_dir, run_id, &snapshots)?;
+        crate::merge::merge_outputs(output_dir, Some(run_id))?;
+        validate(data_dir, output_dir, lifecycle_path, run_id)
+    })();
+    if let Err(error) = result {
+        rollback_selection_files(data_dir, output_dir, &selection)?;
+        let mut rolled_back = selection;
+        rolled_back.state = "rolled_back".to_string();
+        atomic_json(&selection_path(output_dir, run_id)?, &rolled_back)?;
+        return Err(error).context("ready-candidate publication preparation failed");
+    }
+    Ok(())
+}
+
+pub(crate) fn rollback_ready_publication(
+    data_dir: &Path,
+    output_dir: &Path,
+    lifecycle_path: &Path,
+    run_id: &str,
+) -> Result<()> {
+    let path = selection_path(output_dir, run_id)?;
+    let mut selection: PublicationSelection = read_json(&path)?;
+    ensure!(
+        selection.schema_version == 1
+            && selection.run_id == run_id
+            && selection.state == "selected",
+        "publication selection is not active"
+    );
+    rollback_selection_files(data_dir, output_dir, &selection)?;
+    selection.state = "rolled_back".to_string();
+    atomic_json(&path, &selection)?;
+    begin_selected_run(output_dir, run_id, &BTreeMap::new())?;
+    crate::merge::merge_outputs(output_dir, Some(run_id))?;
+    validate(data_dir, output_dir, lifecycle_path, run_id)
+}
+
+pub(crate) fn commit_ready_publication(
+    data_dir: &Path,
+    output_dir: &Path,
+    run_id: &str,
+) -> Result<()> {
+    let path = selection_path(output_dir, run_id)?;
+    let mut selection: PublicationSelection = read_json(&path)?;
+    ensure!(
+        selection.schema_version == 1
+            && selection.run_id == run_id
+            && selection.state == "selected",
+        "publication selection is not active"
+    );
+    verify(output_dir, run_id)?;
+    let receipt: GateReceipt = read_json(&output_dir.join(RECEIPT_FILE))?;
+    ensure!(
+        receipt.run_id == run_id,
+        "publication receipt belongs to another transaction"
+    );
+    for entry in &selection.entries {
+        ensure!(
+            storage::current_snapshot_version(data_dir, &entry.wiki)?.as_deref()
+                == Some(entry.snapshot.as_str()),
+            "selected snapshot changed before publication commit"
+        );
+        remove_committed_backup(output_dir, entry.backup_relative.as_deref())?;
+        storage::retire_inactive_snapshots(data_dir, &entry.wiki)?;
+        let retired_candidates = retire_superseded_candidates(output_dir, entry)?;
+        info!(
+            wiki = entry.wiki,
+            retired_candidates, "retired superseded wiki candidates"
+        );
+    }
+    selection.state = "committed".to_string();
+    atomic_json(&path, &selection)
 }
 
 fn load_lifecycle(path: &Path) -> Result<LifecycleRegistry> {
@@ -753,7 +1336,9 @@ fn validate_snapshots(
         .map(|(wiki, _)| wiki.clone())
         .collect();
     ensure!(
-        context.refresh_wikis.is_empty() || scheduled.is_subset(&context.refresh_wikis),
+        context.schema_version >= 2
+            || context.refresh_wikis.is_empty()
+            || scheduled.is_subset(&context.refresh_wikis),
         "full publication run must include every scheduled wiki"
     );
     for wiki in &context.refresh_wikis {
@@ -796,8 +1381,13 @@ fn validate_snapshots(
             let snapshot = storage::current_snapshot_version(data_dir, wiki)?
                 .with_context(|| format!("managed wiki {wiki} has no selected snapshot"))?;
             if context.refresh_wikis.contains(wiki) {
+                let requested = context
+                    .requested_snapshot_versions
+                    .get(wiki)
+                    .map(String::as_str)
+                    .or(context.requested_snapshot_version.as_deref());
                 ensure!(
-                    context.requested_snapshot_version.as_deref() == Some(snapshot.as_str()),
+                    requested == Some(snapshot.as_str()),
                     "selected snapshot for {wiki} does not match requested snapshot"
                 );
             }
@@ -833,7 +1423,7 @@ pub fn validate(
     let context: RunContext = read_json(&output_dir.join(RUN_CONTEXT_FILE))?;
     let candidate: Candidate = read_json(&output_dir.join(CANDIDATE_FILE))?;
     ensure!(
-        context.schema_version == 1,
+        matches!(context.schema_version, 1 | 2),
         "unsupported publication run schema"
     );
     ensure!(
@@ -1167,6 +1757,39 @@ mod tests {
             result?;
             record_candidate(self.output.path(), Some(run_id), &self.names())
         }
+
+        fn ready_candidate(&self, run_id: &str) -> Result<PathBuf> {
+            let analytical =
+                storage::snapshot_analytical_wiki_dir(self.data.path(), "nlwiki", "2026-03")?;
+            write_single_i64(&analytical.join("template.parquet"))?;
+            storage::write_test_generation_manifest_from_files(
+                self.data.path(),
+                "nlwiki",
+                "2026-03",
+            )
+            .expect("candidate generation manifest should be writable");
+            let candidate = wiki_candidate_dir(self.output.path(), "nlwiki", "2026-03", run_id)?;
+            let candidate_wiki = candidate.join("nlwiki");
+            fs::create_dir_all(&candidate_wiki)?;
+            for spec in &METRICS {
+                fs::copy(
+                    self.output
+                        .path()
+                        .join("nlwiki")
+                        .join(format!("{}.parquet", spec.name)),
+                    candidate_wiki.join(format!("{}.parquet", spec.name)),
+                )
+                .expect("candidate metric should copy");
+            }
+            mark_wiki_candidate_ready(
+                self.data.path(),
+                self.output.path(),
+                &self.lifecycle_path,
+                "nlwiki",
+                "2026-03",
+                run_id,
+            )
+        }
     }
 
     fn write_single_i64(path: &Path) -> Result<()> {
@@ -1336,6 +1959,7 @@ mod tests {
             started_at_unix: now_unix()?,
             refresh_wikis: BTreeSet::new(),
             requested_snapshot_version: None,
+            requested_snapshot_versions: BTreeMap::new(),
         };
         let cutoffs = BTreeMap::from([("nlwiki".to_string(), "2026-03".to_string())]);
         assert_eq!(
@@ -1345,6 +1969,357 @@ mod tests {
             Some("2026-03")
         );
         assert!(fixture.lifecycle.path().is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn ready_candidate_selection_rolls_back_without_touching_the_live_site() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let ready = fixture.ready_candidate("candidate-1")?;
+        assert!(ready.is_file());
+        let original_wiki_dir = fixture.output.path().join("nlwiki");
+        assert!(!original_wiki_dir.is_symlink());
+        std::os::unix::fs::symlink(
+            "stale-target",
+            fixture.output.path().join(".nlwiki.select.publish-1.tmp"),
+        )
+        .expect("stale selection link fixture should be writable");
+
+        prepare_ready_publication(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "publish-1",
+        )
+        .expect("ready publication should select candidate");
+        assert!(original_wiki_dir.is_symlink());
+        verify(fixture.output.path(), "publish-1")?;
+
+        rollback_ready_publication(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "publish-1",
+        )
+        .expect("ready publication rollback should restore prior data");
+        assert!(original_wiki_dir.is_dir());
+        assert!(!original_wiki_dir.is_symlink());
+        assert_eq!(
+            storage::current_snapshot_version(fixture.data.path(), "nlwiki")?.as_deref(),
+            Some("2026-03")
+        );
+        let selection: PublicationSelection =
+            read_json(&selection_path(fixture.output.path(), "publish-1")?)?;
+        assert_eq!(selection.state, "rolled_back");
+        Ok(())
+    }
+
+    #[test]
+    fn ready_candidate_commit_retires_superseded_candidates_and_backup() -> Result<()> {
+        let fixture = Fixture::new()?;
+        fixture.ready_candidate("candidate-1")?;
+        fixture.ready_candidate("candidate-2")?;
+
+        prepare_ready_publication(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "publish-2",
+        )
+        .expect("candidate should prepare for commit");
+        commit_ready_publication(fixture.data.path(), fixture.output.path(), "publish-2")?;
+
+        let active = fixture.output.path().join("nlwiki");
+        assert!(active.is_symlink());
+        assert!(
+            fixture
+                .output
+                .path()
+                .join("_candidates/nlwiki/2026-03/candidate-2")
+                .is_dir()
+        );
+        assert!(
+            !fixture
+                .output
+                .path()
+                .join("_candidates/nlwiki/2026-03/candidate-1")
+                .exists()
+        );
+        let selection: PublicationSelection =
+            read_json(&selection_path(fixture.output.path(), "publish-2")?)?;
+        assert_eq!(selection.state, "committed");
+        assert!(
+            !fixture
+                .output
+                .path()
+                .join("_publication_transactions/publish-2/backups/nlwiki")
+                .exists()
+        );
+
+        prepare_ready_publication(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "publish-noop",
+        )
+        .expect("unchanged candidate publication should prepare");
+        let no_op: PublicationSelection =
+            read_json(&selection_path(fixture.output.path(), "publish-noop")?)?;
+        assert!(no_op.entries.is_empty());
+        commit_ready_publication(fixture.data.path(), fixture.output.path(), "publish-noop")?;
+
+        let candidate_2 =
+            wiki_candidate_dir(fixture.output.path(), "nlwiki", "2026-03", "candidate-2")?;
+        let candidate_3 =
+            wiki_candidate_dir(fixture.output.path(), "nlwiki", "2026-03", "candidate-3")?;
+        fs::create_dir_all(candidate_3.join("nlwiki"))?;
+        for spec in &METRICS {
+            fs::copy(
+                candidate_2
+                    .join("nlwiki")
+                    .join(format!("{}.parquet", spec.name)),
+                candidate_3
+                    .join("nlwiki")
+                    .join(format!("{}.parquet", spec.name)),
+            )
+            .expect("new candidate metric should copy");
+        }
+        let mut cloned: ReadyWikiCandidate = read_json(&candidate_2.join("ready.json"))?;
+        cloned.run_id = "candidate-3".to_string();
+        cloned.ready_at_unix += 1;
+        atomic_json(&candidate_3.join("ready.json"), &cloned)?;
+        prepare_ready_publication(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "publish-symlink-backup",
+        )
+        .expect("symlink-backed candidate should prepare");
+        commit_ready_publication(
+            fixture.data.path(),
+            fixture.output.path(),
+            "publish-symlink-backup",
+        )
+        .expect("symlink-backed candidate should commit");
+        Ok(())
+    }
+
+    #[test]
+    fn candidate_discovery_and_retirement_ignore_only_well_identified_entries() -> Result<()> {
+        let fixture = Fixture::new()?;
+        fixture.ready_candidate("candidate-1")?;
+        let mut lifecycle: Value = read_json(&fixture.lifecycle_path)?;
+        lifecycle["wikis"]["pausedwiki"] = json!({
+            "publication": "published",
+            "refresh": "paused",
+            "imported_cutoff": "2026-03"
+        });
+        lifecycle["wikis"]["hiddenwiki"] = json!({
+            "publication": "hidden",
+            "refresh": "manual"
+        });
+        lifecycle["wikis"]["manualwiki"] = json!({
+            "publication": "published",
+            "refresh": "manual"
+        });
+        lifecycle["wikis"]["missingrootwiki"] = json!({
+            "publication": "published",
+            "refresh": "manual"
+        });
+        atomic_json(&fixture.lifecycle_path, &lifecycle)?;
+
+        let wiki_root = fixture.output.path().join("_candidates/nlwiki");
+        fs::write(wiki_root.join("not-a-snapshot-directory"), b"ignored")?;
+        let empty_snapshot = wiki_root.join("2026-02");
+        fs::create_dir_all(empty_snapshot.join("run-without-ready"))?;
+        fs::write(empty_snapshot.join("not-a-run-directory"), b"ignored")?;
+        fs::create_dir_all(
+            fixture
+                .output
+                .path()
+                .join("_candidates/manualwiki/2026-02/run-without-ready"),
+        )
+        .expect("manual candidate root fixture should be writable");
+        assert_eq!(
+            latest_ready_candidates(
+                fixture.data.path(),
+                fixture.output.path(),
+                &fixture.lifecycle_path,
+            )
+            .expect("ready discovery should succeed")
+            .len(),
+            1
+        );
+        assert!(active_candidate_target(fixture.output.path(), &"x".repeat(10_000)).is_err());
+        assert!(selection_path(fixture.output.path(), "unsafe/run").is_err());
+
+        let active = fixture.output.path().join("nlwiki");
+        move_active_to_backup(fixture.output.path(), &active, None)?;
+        restore_backup(fixture.output.path(), &active, None)?;
+        restore_backup(
+            fixture.output.path(),
+            &active,
+            Some("_publication_transactions/missing-backup"),
+        )
+        .expect("missing backup should be a safe no-op");
+        remove_committed_backup(fixture.output.path(), None)?;
+        let regular_backup = fixture.output.path().join("regular-backup");
+        fs::write(&regular_backup, b"not pipeline owned")?;
+        remove_committed_backup(fixture.output.path(), Some("regular-backup"))?;
+        assert!(regular_backup.is_file());
+        rollback_selection_files(
+            fixture.data.path(),
+            fixture.output.path(),
+            &PublicationSelection {
+                schema_version: 1,
+                run_id: "direct-rollback".to_string(),
+                state: "selected".to_string(),
+                entries: vec![SelectionEntry {
+                    wiki: "nlwiki".to_string(),
+                    snapshot: "2026-03".to_string(),
+                    candidate_relative: "_candidates/nlwiki/2026-03/not-active".to_string(),
+                    previous_snapshot: Some("2026-03".to_string()),
+                    backup_relative: None,
+                }],
+            },
+        )
+        .expect("rollback without a backup should be a safe no-op");
+
+        let pointer = storage::snapshot_pointer_path(fixture.data.path(), "nlwiki");
+        let pointer_temp = pointer
+            .parent()
+            .expect("snapshot pointer always has a parent")
+            .join(format!(".current-snapshot.json.{}.tmp", std::process::id()));
+        fs::create_dir(&pointer_temp).expect("pointer failure fixture should be writable");
+        let failed_restore = PublicationSelection {
+            schema_version: 1,
+            run_id: "failed-restore".to_string(),
+            state: "selected".to_string(),
+            entries: vec![SelectionEntry {
+                wiki: "nlwiki".to_string(),
+                snapshot: "2026-03".to_string(),
+                candidate_relative: "_candidates/nlwiki/2026-03/not-active".to_string(),
+                previous_snapshot: Some("2026-03".to_string()),
+                backup_relative: None,
+            }],
+        };
+        assert!(
+            rollback_selection_files(fixture.data.path(), fixture.output.path(), &failed_restore,)
+                .is_err()
+        );
+        fs::remove_dir(pointer_temp).expect("pointer failure fixture should clean up");
+
+        let missing = SelectionEntry {
+            wiki: "missingwiki".to_string(),
+            snapshot: "2026-03".to_string(),
+            candidate_relative: "_candidates/missingwiki/2026-03/run".to_string(),
+            previous_snapshot: None,
+            backup_relative: None,
+        };
+        assert_eq!(
+            retire_superseded_candidates(fixture.output.path(), &missing)?,
+            0
+        );
+        let retire_root = fixture.output.path().join("_candidates/retirewiki");
+        fs::create_dir_all(retire_root.join("2026-01/empty"))?;
+        fs::write(retire_root.join("not-a-directory"), b"ignored")?;
+        fs::write(
+            retire_root.join("2026-01/empty/not-a-candidate"),
+            b"ignored",
+        )
+        .expect("non-candidate retirement fixture should be writable");
+        let retained = retire_root.join("2026-02/keep");
+        fs::create_dir_all(&retained)?;
+        let retirement = SelectionEntry {
+            wiki: "retirewiki".to_string(),
+            snapshot: "2026-02".to_string(),
+            candidate_relative: "_candidates/retirewiki/2026-02/keep".to_string(),
+            previous_snapshot: None,
+            backup_relative: None,
+        };
+        assert_eq!(
+            retire_superseded_candidates(fixture.output.path(), &retirement)?,
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn candidate_marking_supports_metric_specific_coverage() -> Result<()> {
+        let fixture = Fixture::new()?;
+        fixture.ready_candidate("candidate-subset")?;
+        let mut lifecycle: Value = read_json(&fixture.lifecycle_path)?;
+        lifecycle["publication_contract"]["datasets"]["business_funnel"] =
+            json!({"wikis": ["otherwiki"], "minimum_rows_per_wiki": 1});
+        lifecycle["wikis"]["otherwiki"] = json!({
+            "publication": "published",
+            "refresh": "paused",
+            "imported_cutoff": "2026-03"
+        });
+        atomic_json(&fixture.lifecycle_path, &lifecycle)?;
+
+        let ready_path = mark_wiki_candidate_ready(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "nlwiki",
+            "2026-03",
+            "candidate-subset",
+        )
+        .expect("metric-specific ready candidate should validate");
+        let ready: ReadyWikiCandidate = read_json(&ready_path)?;
+        assert!(
+            !ready
+                .artifacts
+                .iter()
+                .any(|artifact| { artifact.path.ends_with("business_funnel.parquet") })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn activation_and_merge_failures_restore_the_previous_selection() -> Result<()> {
+        let activation_fixture = Fixture::new()?;
+        activation_fixture.ready_candidate("candidate-activation")?;
+        let selection_temp = activation_fixture
+            .output
+            .path()
+            .join(".nlwiki.select.activation-failure.tmp");
+        fs::create_dir(&selection_temp)?;
+        let activation_error = prepare_ready_publication(
+            activation_fixture.data.path(),
+            activation_fixture.output.path(),
+            &activation_fixture.lifecycle_path,
+            "activation-failure",
+        )
+        .expect_err("pointer failure must abort activation");
+        assert!(
+            format!("{activation_error:#}").contains("failed to activate ready candidates"),
+            "unexpected activation error: {activation_error:#}"
+        );
+        assert!(!activation_fixture.output.path().join("nlwiki").is_symlink());
+        fs::remove_dir(selection_temp)?;
+
+        let merge_fixture = Fixture::new()?;
+        merge_fixture.ready_candidate("candidate-merge")?;
+        let root_metric = merge_fixture.output.path().join("business_funnel.parquet");
+        fs::remove_file(&root_metric)?;
+        fs::create_dir(&root_metric)?;
+        assert!(
+            prepare_ready_publication(
+                merge_fixture.data.path(),
+                merge_fixture.output.path(),
+                &merge_fixture.lifecycle_path,
+                "merge-failure",
+            )
+            .is_err()
+        );
+        assert!(!merge_fixture.output.path().join("nlwiki").is_symlink());
+        let journal = selection_path(merge_fixture.output.path(), "merge-failure")
+            .expect("selection journal path should be safe");
+        let selection: PublicationSelection =
+            read_json(&journal).expect("rolled-back selection journal should remain readable");
+        assert_eq!(selection.state, "rolled_back");
         Ok(())
     }
 
@@ -1581,6 +2556,7 @@ mod tests {
             started_at_unix: now_unix()?,
             refresh_wikis: BTreeSet::new(),
             requested_snapshot_version: None,
+            requested_snapshot_versions: BTreeMap::new(),
         };
         let cutoffs = BTreeMap::from([
             ("frwiki".to_string(), "2026-03".to_string()),
@@ -1602,6 +2578,10 @@ mod tests {
             started_at_unix: now_unix()?,
             refresh_wikis: BTreeSet::from(["manualwiki".to_string()]),
             requested_snapshot_version: Some("2026-03".to_string()),
+            requested_snapshot_versions: BTreeMap::from([(
+                "manualwiki".to_string(),
+                "2026-03".to_string(),
+            )]),
         };
         assert_eq!(
             validate_snapshots(data.path(), &registry, &manual_context, &cutoffs)?

@@ -471,6 +471,21 @@ pub(crate) fn active_fragment_files(
         .collect()
 }
 
+pub(crate) fn snapshot_fragment_files(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot_version: &str,
+    layer: GenerationLayer,
+) -> Result<Vec<PathBuf>> {
+    let manifest = read_generation_manifest(data_dir, wiki, snapshot_version)?;
+    manifest
+        .fragments
+        .into_iter()
+        .filter(|fragment| fragment.layer == layer)
+        .map(|fragment| checked_stored_path(data_dir, &fragment.path))
+        .collect()
+}
+
 pub fn publish_current_snapshot(data_dir: &Path, wiki: &str, snapshot_version: &str) -> Result<()> {
     validate_snapshot_version(snapshot_version)?;
     let analytical = snapshot_analytical_wiki_dir(data_dir, wiki, snapshot_version)?;
@@ -483,6 +498,28 @@ pub fn publish_current_snapshot(data_dir: &Path, wiki: &str, snapshot_version: &
         .context("cannot publish snapshot without a valid generation manifest")?;
 
     write_current_snapshot_pointer(data_dir, wiki, snapshot_version)
+}
+
+pub(crate) fn restore_current_snapshot(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot_version: Option<&str>,
+) -> Result<()> {
+    if let Some(snapshot_version) = snapshot_version {
+        return publish_current_snapshot(data_dir, wiki, snapshot_version);
+    }
+    let pointer = snapshot_pointer_path(data_dir, wiki);
+    if pointer.is_file() {
+        fs::remove_file(&pointer)?;
+        let parent = pointer
+            .parent()
+            .expect("snapshot pointer path always has a state directory");
+        let directory_result = File::open(parent);
+        let directory = directory_result?;
+        let sync_result = directory.sync_all();
+        sync_result?;
+    }
+    Ok(())
 }
 
 fn write_current_snapshot_pointer(
@@ -782,6 +819,7 @@ pub fn retire_inactive_snapshots(data_dir: &Path, wiki: &str) -> Result<usize> {
 pub(crate) fn clean_stale_inactive_snapshots(
     data_dir: &Path,
     wiki: &str,
+    protected_versions: &std::collections::BTreeSet<String>,
     minimum_age: Duration,
     now: SystemTime,
     removed_paths: &mut Vec<String>,
@@ -804,7 +842,10 @@ pub(crate) fn clean_stale_inactive_snapshots(
             let entry = entry?;
             if entry.file_type()?.is_dir() {
                 let version = entry.file_name().to_string_lossy().into_owned();
-                if version != active && validate_snapshot_version(&version).is_ok() {
+                if version != active
+                    && !protected_versions.contains(&version)
+                    && validate_snapshot_version(&version).is_ok()
+                {
                     versions.insert(version);
                 }
             }
@@ -1697,10 +1738,17 @@ pub(crate) fn active_partition_specs(
         return collect_partition_specs(&root);
     }
     let files = active_fragment_files(data_dir, wiki, layer)?;
+    partition_specs_from_generation_files(&root, files)
+}
+
+fn partition_specs_from_generation_files(
+    root: &Path,
+    files: Vec<PathBuf>,
+) -> Result<Vec<PartitionSpec>> {
     let mut partitions: BTreeMap<(i32, String, PathBuf), Vec<PathBuf>> = BTreeMap::new();
     for file in files {
         let relative = file
-            .strip_prefix(&root)
+            .strip_prefix(root)
             .context("active generation fragment is outside its layer root")?;
         let parts: Vec<_> = relative.components().collect();
         ensure!(
@@ -1740,6 +1788,17 @@ pub(crate) fn active_partition_specs(
             }
         })
         .collect())
+}
+
+pub(crate) fn snapshot_partition_specs(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot_version: &str,
+    layer: GenerationLayer,
+) -> Result<Vec<PartitionSpec>> {
+    let root = fragment_layer_root(data_dir, wiki, snapshot_version, layer)?;
+    let files = snapshot_fragment_files(data_dir, wiki, snapshot_version, layer)?;
+    partition_specs_from_generation_files(&root, files)
 }
 
 fn collect_partition_specs_recursive(

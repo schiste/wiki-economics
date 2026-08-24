@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::Serialize;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -16,6 +17,7 @@ pub struct CleanupReport {
     pub capacity_staging_directories: usize,
     pub validated_raw_dumps: usize,
     pub snapshot_generations: usize,
+    pub candidate_generations: usize,
     pub removed: Vec<String>,
 }
 
@@ -47,9 +49,26 @@ pub fn clean_abandoned(
     }
     for wiki in wikis {
         clean_validated_raw_dumps(data_dir, wiki, &mut report)?;
+        let protected_result = clean_candidate_generations(
+            output_dir,
+            wiki,
+            current_run_id,
+            minimum_age,
+            now,
+            &mut report,
+        );
+        let protected = protected_result?;
+        if output_dir
+            .join("_prepare-locks")
+            .join(format!("{wiki}.lock"))
+            .is_dir()
+        {
+            continue;
+        }
         report.snapshot_generations += storage::clean_stale_inactive_snapshots(
             data_dir,
             wiki,
+            &protected,
             minimum_age,
             now,
             &mut report.removed,
@@ -57,6 +76,58 @@ pub fn clean_abandoned(
     }
     report.removed.sort();
     Ok(report)
+}
+
+fn clean_candidate_generations(
+    output_dir: &Path,
+    wiki: &str,
+    current_run_id: Option<&str>,
+    minimum_age: Duration,
+    now: SystemTime,
+    report: &mut CleanupReport,
+) -> Result<BTreeSet<String>> {
+    let root = output_dir.join("_candidates").join(wiki);
+    let live_target = fs::read_link(output_dir.join(wiki)).ok().map(|target| {
+        if target.is_absolute() {
+            target
+        } else {
+            output_dir.join(target)
+        }
+    });
+    let mut protected = BTreeSet::new();
+    for snapshot_entry in read_dir_if_present(&root)? {
+        let snapshot_entry = snapshot_entry?;
+        if !snapshot_entry.file_type()?.is_dir() {
+            continue;
+        }
+        let snapshot = snapshot_entry.file_name().to_string_lossy().into_owned();
+        if storage::validate_snapshot_version(&snapshot).is_err() {
+            continue;
+        }
+        for run_entry in read_dir_if_present(&snapshot_entry.path())? {
+            let run_entry = run_entry?;
+            if !run_entry.file_type()?.is_dir() {
+                continue;
+            }
+            let run_id = run_entry.file_name().to_string_lossy().into_owned();
+            let candidate = run_entry.path();
+            let candidate_wiki = candidate.join(wiki);
+            let retained = candidate.join("ready.json").is_file()
+                || live_target.as_ref() == Some(&candidate_wiki)
+                || current_run_id == Some(run_id.as_str())
+                || !is_expired(&candidate, minimum_age, now)?;
+            if retained {
+                protected.insert(snapshot.clone());
+            } else if run_id.bytes().all(is_safe_id_byte) {
+                remove_dir(candidate, &mut report.removed)?;
+                report.candidate_generations += 1;
+            }
+        }
+        if fs::read_dir(snapshot_entry.path())?.next().is_none() {
+            fs::remove_dir(snapshot_entry.path())?;
+        }
+    }
+    Ok(protected)
 }
 
 fn clean_validated_raw_dumps(
@@ -448,6 +519,129 @@ mod tests {
     }
 
     #[test]
+    fn candidate_cleanup_preserves_ready_inputs_and_reaps_abandoned_attempts() -> Result<()> {
+        let root = TestDir::new()?;
+        let data = root.path().join("data");
+        let output = root.path().join("output");
+        let dist = root.path().join("site/dist");
+        fs::create_dir_all(&output)?;
+        fs::create_dir_all(dist.parent().context("site parent")?)?;
+        for version in ["2026-06", "2026-07", "2026-08"] {
+            let analytical = storage::snapshot_analytical_wiki_dir(&data, "nlwiki", version)
+                .expect("analytical candidate fixture path");
+            let warehouse = storage::snapshot_warehouse_wiki_dir(&data, "nlwiki", version)
+                .expect("warehouse candidate fixture path");
+            fs::create_dir_all(analytical)?;
+            fs::create_dir_all(warehouse)?;
+        }
+        storage::publish_test_snapshot_pointer(&data, "nlwiki", "2026-08")?;
+        let ready = output.join("_candidates/nlwiki/2026-07/ready-run");
+        fs::create_dir_all(ready.join("nlwiki"))?;
+        fs::write(ready.join("ready.json"), b"{}")?;
+        let abandoned = output.join("_candidates/nlwiki/2026-06/dead-run");
+        fs::create_dir_all(&abandoned)?;
+
+        let report = clean_abandoned(
+            &data,
+            &output,
+            &dist,
+            CleanupStagingRoots::default(),
+            &["nlwiki".to_string()],
+            None,
+            Duration::ZERO,
+        )
+        .expect("candidate cleanup should succeed");
+
+        assert_eq!(report.candidate_generations, 1);
+        assert!(!abandoned.exists());
+        assert!(ready.is_dir());
+        assert!(storage::snapshot_analytical_wiki_dir(&data, "nlwiki", "2026-07")?.is_dir());
+        assert!(!storage::snapshot_analytical_wiki_dir(&data, "nlwiki", "2026-06")?.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn active_prepare_lock_leases_all_candidate_input_generations() -> Result<()> {
+        let root = TestDir::new()?;
+        let data = root.path().join("data");
+        let output = root.path().join("output");
+        let dist = root.path().join("site/dist");
+        fs::create_dir_all(output.join("_prepare-locks/nlwiki.lock"))?;
+        fs::create_dir_all(dist.parent().context("site parent")?)?;
+        for version in ["2026-07", "2026-08"] {
+            let analytical = storage::snapshot_analytical_wiki_dir(&data, "nlwiki", version)
+                .expect("analytical lock fixture path");
+            let warehouse = storage::snapshot_warehouse_wiki_dir(&data, "nlwiki", version)
+                .expect("warehouse lock fixture path");
+            fs::create_dir_all(analytical)?;
+            fs::create_dir_all(warehouse)?;
+        }
+        storage::publish_test_snapshot_pointer(&data, "nlwiki", "2026-08")?;
+
+        let report = clean_abandoned(
+            &data,
+            &output,
+            &dist,
+            CleanupStagingRoots::default(),
+            &["nlwiki".to_string()],
+            None,
+            Duration::ZERO,
+        )
+        .expect("locked candidate cleanup should succeed");
+
+        assert_eq!(report.snapshot_generations, 0);
+        assert!(storage::snapshot_analytical_wiki_dir(&data, "nlwiki", "2026-07")?.is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn candidate_cleanup_handles_links_invalid_entries_and_unsafe_runs() -> Result<()> {
+        let root = TestDir::new()?;
+        let output = root.path().join("output");
+        let candidate_root = output.join("_candidates/nlwiki");
+        let live = candidate_root.join("2026-07/live-run");
+        fs::create_dir_all(live.join("nlwiki"))?;
+        fs::create_dir_all(&output)?;
+        std::os::unix::fs::symlink(
+            "_candidates/nlwiki/2026-07/live-run/nlwiki",
+            output.join("nlwiki"),
+        )
+        .expect("relative live candidate symlink should be writable");
+        fs::write(candidate_root.join("not-a-snapshot"), b"ignored")?;
+        fs::create_dir_all(candidate_root.join("invalid-version/run"))?;
+        fs::create_dir_all(candidate_root.join("2026-05"))?;
+        fs::create_dir_all(candidate_root.join("2026-06/bad$run"))?;
+        fs::write(candidate_root.join("2026-06/not-a-run"), b"ignored")?;
+        let mut report = CleanupReport::default();
+
+        let protected = clean_candidate_generations(
+            &output,
+            "nlwiki",
+            None,
+            Duration::ZERO,
+            SystemTime::now(),
+            &mut report,
+        )
+        .expect("candidate entry cleanup should succeed");
+
+        assert!(protected.contains("2026-07"));
+        assert!(candidate_root.join("2026-06/bad$run").is_dir());
+        assert!(!candidate_root.join("2026-05").exists());
+        fs::remove_file(output.join("nlwiki"))?;
+        std::os::unix::fs::symlink(live.join("nlwiki"), output.join("nlwiki"))?;
+        clean_candidate_generations(
+            &output,
+            "nlwiki",
+            None,
+            Duration::ZERO,
+            SystemTime::now(),
+            &mut report,
+        )
+        .expect("absolute live candidate link should be preserved");
+        Ok(())
+    }
+
+    #[test]
     fn cleanup_ignores_unowned_current_and_recent_artifacts() -> Result<()> {
         let root = TestDir::new()?;
         let output = root.path().join("output");
@@ -509,6 +703,7 @@ mod tests {
             storage::clean_stale_inactive_snapshots(
                 &data,
                 "nlwiki",
+                &BTreeSet::new(),
                 Duration::ZERO,
                 SystemTime::now(),
                 &mut removed,
@@ -542,6 +737,7 @@ mod tests {
         let count = storage::clean_stale_inactive_snapshots(
             &data,
             "nlwiki",
+            &BTreeSet::new(),
             Duration::from_secs(86_400),
             SystemTime::now(),
             &mut removed,

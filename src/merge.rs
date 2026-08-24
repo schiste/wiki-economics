@@ -146,7 +146,10 @@ fn collect_metric_files(
 
     for entry in fs::read_dir(output_dir)? {
         let entry = entry?;
-        if !entry.file_type()?.is_dir() {
+        // Published per-wiki directories may be relative symlinks to immutable
+        // candidates. Follow the target here; internal candidate roots remain
+        // excluded by the leading-underscore guard below.
+        if !entry.path().is_dir() {
             continue;
         }
         // Skip leading-underscore directories (markers, internal scratch). The

@@ -14,6 +14,12 @@ pub(crate) const SOURCE_WINDOW_SIZE_ENV: &str = "WIKI_ECON_SOURCE_WINDOW_SIZE";
 pub(crate) const DEFAULT_SOURCE_WINDOW_SIZE: usize = 1;
 pub(crate) const MAX_SOURCE_WINDOW_SIZE: usize = 4;
 
+#[derive(Clone, Copy)]
+struct ExecutionMode {
+    window_size: usize,
+    select_generation: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct SourceWindowSummary {
     pub(crate) wiki: String,
@@ -52,7 +58,13 @@ trait SourceTransactionOps: Sync {
         source: &Path,
         run_id: &str,
     ) -> Result<ingest::SourceIngestCommit>;
-    fn finalize(&self, wiki: &str, snapshot: &str, data_dir: &Path) -> Result<()>;
+    fn finalize(
+        &self,
+        wiki: &str,
+        snapshot: &str,
+        data_dir: &Path,
+        select_generation: bool,
+    ) -> Result<()>;
 }
 
 struct RealSourceTransactionOps;
@@ -110,9 +122,19 @@ impl SourceTransactionOps for RealSourceTransactionOps {
         ingest::ingest_snapshot_source(wiki, snapshot, data_dir, source, run_id)
     }
 
-    fn finalize(&self, wiki: &str, snapshot: &str, data_dir: &Path) -> Result<()> {
+    fn finalize(
+        &self,
+        wiki: &str,
+        snapshot: &str,
+        data_dir: &Path,
+        select_generation: bool,
+    ) -> Result<()> {
         fetch::finalize_snapshot_fetch(wiki, snapshot, data_dir)?;
-        ingest::finalize_snapshot_ingest(wiki, snapshot, data_dir)?;
+        if select_generation {
+            ingest::finalize_snapshot_ingest(wiki, snapshot, data_dir)?;
+        } else {
+            ingest::finalize_snapshot_ingest_candidate(wiki, snapshot, data_dir)?;
+        }
         fetch::cleanup_committed_source_window_inputs(wiki, snapshot, data_dir)?;
         Ok(())
     }
@@ -258,7 +280,34 @@ pub(crate) fn prepare_snapshot(
         snapshot,
         data_dir,
         run_id,
-        window_size,
+        ExecutionMode {
+            window_size,
+            select_generation: true,
+        },
+        Some(&governor),
+    )
+}
+
+pub(crate) fn prepare_candidate_snapshot(
+    wiki: &str,
+    snapshot: &str,
+    data_dir: &Path,
+    run_id: &str,
+    window_size: usize,
+) -> Result<SourceWindowSummary> {
+    let scratch_root = std::env::var_os("WIKI_ECON_SCRATCH_DIR").map(Into::into);
+    let paths = GovernorPaths::new(data_dir.to_path_buf(), scratch_root);
+    let governor = ResourceGovernor::from_environment(paths)?;
+    prepare_snapshot_with_ops(
+        &RealSourceTransactionOps,
+        wiki,
+        snapshot,
+        data_dir,
+        run_id,
+        ExecutionMode {
+            window_size,
+            select_generation: false,
+        },
         Some(&governor),
     )
 }
@@ -269,9 +318,13 @@ fn prepare_snapshot_with_ops<O: SourceTransactionOps>(
     snapshot: &str,
     data_dir: &Path,
     run_id: &str,
-    window_size: usize,
+    execution_mode: ExecutionMode,
     governor: Option<&ResourceGovernor>,
 ) -> Result<SourceWindowSummary> {
+    let ExecutionMode {
+        window_size,
+        select_generation,
+    } = execution_mode;
     let planned_sources = ops.planned_sources(wiki, snapshot, data_dir)?;
     let recovered_inputs = ops.cleanup_committed(wiki, snapshot, data_dir)?;
     let pending = ops.pending_sources(wiki, snapshot, data_dir)?;
@@ -342,7 +395,7 @@ fn prepare_snapshot_with_ops<O: SourceTransactionOps>(
         Ok(sources.len())
     })?;
 
-    ops.finalize(wiki, snapshot, data_dir)?;
+    ops.finalize(wiki, snapshot, data_dir, select_generation)?;
     let summary = SourceWindowSummary {
         wiki: wiki.to_string(),
         snapshot: snapshot.to_string(),
@@ -375,6 +428,7 @@ mod tests {
         windows: Mutex<Vec<Vec<String>>>,
         ingested: Mutex<Vec<String>>,
         finalized: AtomicBool,
+        selected_generation: AtomicBool,
         path_count_delta: isize,
         wrong_path: bool,
         wrong_commit: bool,
@@ -456,8 +510,16 @@ mod tests {
             })
         }
 
-        fn finalize(&self, _wiki: &str, _snapshot: &str, _data_dir: &Path) -> Result<()> {
+        fn finalize(
+            &self,
+            _wiki: &str,
+            _snapshot: &str,
+            _data_dir: &Path,
+            select_generation: bool,
+        ) -> Result<()> {
             self.finalized.store(true, Ordering::Relaxed);
+            self.selected_generation
+                .store(select_generation, Ordering::Relaxed);
             Ok(())
         }
     }
@@ -530,9 +592,19 @@ mod tests {
             ..FakeOps::default()
         };
 
-        let summary =
-            prepare_snapshot_with_ops(&ops, "enwiki", "2001-03", data_dir.path(), "run-1", 2, None)
-                .expect("ungoverned fixture should complete");
+        let summary = prepare_snapshot_with_ops(
+            &ops,
+            "enwiki",
+            "2001-03",
+            data_dir.path(),
+            "run-1",
+            ExecutionMode {
+                window_size: 2,
+                select_generation: true,
+            },
+            None,
+        )
+        .expect("ungoverned fixture should complete");
 
         assert_eq!(summary.planned_sources, 5);
         assert_eq!(summary.reused_sources, 2);
@@ -555,6 +627,35 @@ mod tests {
             3
         );
         assert!(ops.finalized.load(Ordering::Relaxed));
+        assert!(ops.selected_generation.load(Ordering::Relaxed));
+        Ok(())
+    }
+
+    #[test]
+    fn candidate_preparation_finalizes_without_selecting_the_generation() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let ops = FakeOps {
+            planned: 1,
+            pending: SnapshotPlan::resolve("testwiki", "2026-08")?.sources,
+            ..FakeOps::default()
+        };
+
+        prepare_snapshot_with_ops(
+            &ops,
+            "testwiki",
+            "2026-08",
+            data_dir.path(),
+            "candidate-run",
+            ExecutionMode {
+                window_size: 1,
+                select_generation: false,
+            },
+            None,
+        )
+        .expect("candidate execution should finalize");
+
+        assert!(ops.finalized.load(Ordering::Relaxed));
+        assert!(!ops.selected_generation.load(Ordering::Relaxed));
         Ok(())
     }
 
@@ -591,7 +692,10 @@ mod tests {
             "2001-01",
             data_dir.path(),
             "governed-run",
-            2,
+            ExecutionMode {
+                window_size: 2,
+                select_generation: true,
+            },
             Some(&governor),
         )
         .expect("governed fixture should complete");
@@ -615,7 +719,10 @@ mod tests {
                 "2026-08",
                 data_dir.path(),
                 "overflow-run",
-                1,
+                ExecutionMode {
+                    window_size: 1,
+                    select_generation: true,
+                },
                 Some(&overflow_governor),
             )
             .is_err()
@@ -640,7 +747,10 @@ mod tests {
                 "2026-08",
                 data_dir.path(),
                 "run-1",
-                1,
+                ExecutionMode {
+                    window_size: 1,
+                    select_generation: true,
+                },
                 None,
             )
             .unwrap_err()
@@ -661,7 +771,10 @@ mod tests {
                 "2026-08",
                 data_dir.path(),
                 "run-2",
-                1,
+                ExecutionMode {
+                    window_size: 1,
+                    select_generation: true,
+                },
                 None,
             )
             .unwrap_err()
@@ -682,7 +795,10 @@ mod tests {
                 "2026-08",
                 data_dir.path(),
                 "run-3",
-                1,
+                ExecutionMode {
+                    window_size: 1,
+                    select_generation: true,
+                },
                 None,
             )
             .unwrap_err()
@@ -702,7 +818,10 @@ mod tests {
                 "2026-08",
                 data_dir.path(),
                 "run-4",
-                1,
+                ExecutionMode {
+                    window_size: 1,
+                    select_generation: true,
+                },
                 None,
             )
             .unwrap_err()
@@ -755,7 +874,10 @@ mod tests {
             ops.ingest_source("testwiki", "invalid", data_dir.path(), &missing, "run",)
                 .is_err()
         );
-        assert!(ops.finalize("../bad", "2026-08", data_dir.path()).is_err());
+        assert!(
+            ops.finalize("../bad", "2026-08", data_dir.path(), true)
+                .is_err()
+        );
         assert!(prepare_snapshot("../bad", "2026-08", data_dir.path(), "run", 1,).is_err());
         Ok(())
     }
@@ -778,13 +900,43 @@ mod tests {
         )
         .expect("strict source marker fixture should be written");
 
-        RealSourceTransactionOps.finalize(wiki, snapshot, data_dir.path())?;
+        RealSourceTransactionOps.finalize(wiki, snapshot, data_dir.path(), true)?;
 
         assert_eq!(
             crate::storage::current_snapshot_version(data_dir.path(), wiki)?.as_deref(),
             Some(snapshot)
         );
         prepare_snapshot(wiki, snapshot, data_dir.path(), "governed-finished", 1)?;
+        Ok(())
+    }
+
+    #[test]
+    fn real_candidate_finalize_commits_receipts_without_switching_pointer() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let wiki = "testwiki";
+        let snapshot = "2026-08";
+        let (plan, _) = SnapshotPlan::load_or_resolve(data_dir.path(), wiki, snapshot)?;
+        let analytical =
+            crate::storage::snapshot_analytical_wiki_dir(data_dir.path(), wiki, snapshot)?;
+        let warehouse =
+            crate::storage::snapshot_warehouse_wiki_dir(data_dir.path(), wiki, snapshot)?;
+        std::fs::create_dir_all(&warehouse)?;
+        crate::storage::write_test_marker_in(
+            data_dir.path(),
+            &analytical,
+            &plan.sources[0].source_id,
+        )
+        .expect("candidate marker fixture should be writable");
+
+        RealSourceTransactionOps.finalize(wiki, snapshot, data_dir.path(), false)?;
+
+        assert!(
+            crate::storage::generation_manifest_path(data_dir.path(), wiki, snapshot)?.is_file()
+        );
+        assert_eq!(
+            crate::storage::current_snapshot_version(data_dir.path(), wiki)?,
+            None
+        );
         Ok(())
     }
 }

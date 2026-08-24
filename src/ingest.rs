@@ -926,6 +926,23 @@ pub(crate) fn finalize_snapshot_ingest(
     snapshot_version: &str,
     data_dir: &Path,
 ) -> Result<Vec<PathBuf>> {
+    finalize_snapshot_ingest_with_selection(wiki, snapshot_version, data_dir, true)
+}
+
+pub(crate) fn finalize_snapshot_ingest_candidate(
+    wiki: &str,
+    snapshot_version: &str,
+    data_dir: &Path,
+) -> Result<Vec<PathBuf>> {
+    finalize_snapshot_ingest_with_selection(wiki, snapshot_version, data_dir, false)
+}
+
+fn finalize_snapshot_ingest_with_selection(
+    wiki: &str,
+    snapshot_version: &str,
+    data_dir: &Path,
+    select_generation: bool,
+) -> Result<Vec<PathBuf>> {
     let roots = IngestRoots::snapshot(data_dir, wiki, snapshot_version)?;
     storage::write_generation_manifest(data_dir, wiki, snapshot_version)?;
     let inputs = snapshot_marker_inputs(data_dir, wiki, snapshot_version)?;
@@ -941,8 +958,15 @@ pub(crate) fn finalize_snapshot_ingest(
         &inputs,
         &outputs,
     )?;
-    storage::publish_current_snapshot(data_dir, wiki, snapshot_version)?;
-    storage::active_fragment_files(data_dir, wiki, storage::GenerationLayer::Analytical)
+    if select_generation {
+        storage::publish_current_snapshot(data_dir, wiki, snapshot_version)?;
+    }
+    storage::snapshot_fragment_files(
+        data_dir,
+        wiki,
+        snapshot_version,
+        storage::GenerationLayer::Analytical,
+    )
 }
 
 /// Ingest all raw dump files for a wiki into partitioned Parquet. Standard

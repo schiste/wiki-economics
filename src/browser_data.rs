@@ -61,7 +61,9 @@ fn published_wikis(output_dir: &Path, allowlist: Option<&BTreeSet<String>>) -> R
     let mut wikis = Vec::new();
     for entry in fs::read_dir(output_dir)? {
         let entry = entry?;
-        if !entry.file_type()?.is_dir() {
+        // Publication selects immutable candidates with per-wiki symlinks.
+        // `Path::is_dir` follows those links while still rejecting files.
+        if !entry.path().is_dir() {
             continue;
         }
         let wiki = entry.file_name().to_string_lossy().into_owned();

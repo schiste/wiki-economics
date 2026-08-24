@@ -390,13 +390,58 @@ pub fn compute_patrol(
     rebuild: bool,
     limit_months: Option<usize>,
 ) -> Result<()> {
+    compute_patrol_selected(wiki, data_dir, output_dir, rebuild, limit_months, None)
+}
+
+pub(crate) fn compute_patrol_for_snapshot(
+    wiki: &str,
+    snapshot: &str,
+    data_dir: &Path,
+    output_dir: &Path,
+    rebuild: bool,
+    limit_months: Option<usize>,
+) -> Result<()> {
+    storage::validate_snapshot_version(snapshot)?;
+    compute_patrol_selected(
+        wiki,
+        data_dir,
+        output_dir,
+        rebuild,
+        limit_months,
+        Some(snapshot),
+    )
+}
+
+fn compute_patrol_selected(
+    wiki: &str,
+    data_dir: &Path,
+    output_dir: &Path,
+    rebuild: bool,
+    limit_months: Option<usize>,
+    snapshot: Option<&str>,
+) -> Result<()> {
     let patrol_dir = data_dir.join("patrol").join(wiki);
     let patrol_path = patrol_dir.join("patrol.parquet");
     let rights_path = patrol_dir.join("rights.parquet");
     let meta_path = patrol_dir.join("autopatrol_groups.json");
-    let revision_store_dir = storage::active_warehouse_wiki_dir(data_dir, wiki)?;
-    let revision_files =
-        storage::active_fragment_files(data_dir, wiki, storage::GenerationLayer::Warehouse)?;
+    let revision_store_dir = match snapshot {
+        Some(snapshot) => storage::snapshot_warehouse_wiki_dir(data_dir, wiki, snapshot)?,
+        None => storage::active_warehouse_wiki_dir(data_dir, wiki)?,
+    };
+    let revision_files = match snapshot {
+        Some(snapshot) => {
+            let result = storage::snapshot_fragment_files(
+                data_dir,
+                wiki,
+                snapshot,
+                storage::GenerationLayer::Warehouse,
+            );
+            result?
+        }
+        None => {
+            storage::active_fragment_files(data_dir, wiki, storage::GenerationLayer::Warehouse)?
+        }
+    };
 
     if !patrol_path.exists() {
         anyhow::bail!("No patrol data for {wiki}. Run `patrol-fetch` first.");
@@ -471,7 +516,7 @@ pub fn compute_patrol(
     info!(wiki = wiki, "building autopatrol membership timeline");
     let autopatrol_intervals = build_autopatrol_intervals(&rights_path, &autopatrol_groups)?;
 
-    let all_month_partitions = collect_partition_files_by_month(data_dir, wiki)?;
+    let all_month_partitions = collect_partition_files_by_month(data_dir, wiki, snapshot)?;
     let month_partitions = filter_partition_files_by_month(&all_month_partitions, &pending_set);
     let pending = &pending_set;
     let auto = &autopatrol_intervals;
@@ -1156,11 +1201,24 @@ fn collect_patrolled_revision_ids(
 fn collect_partition_files_by_month(
     data_dir: &Path,
     wiki: &str,
+    snapshot: Option<&str>,
 ) -> Result<BTreeMap<i32, Vec<PathBuf>>> {
     let mut by_month = BTreeMap::new();
-    for spec in
-        storage::active_partition_specs(data_dir, wiki, storage::GenerationLayer::Warehouse)?
-    {
+    let partitions = match snapshot {
+        Some(snapshot) => {
+            let result = storage::snapshot_partition_specs(
+                data_dir,
+                wiki,
+                snapshot,
+                storage::GenerationLayer::Warehouse,
+            );
+            result?
+        }
+        None => {
+            storage::active_partition_specs(data_dir, wiki, storage::GenerationLayer::Warehouse)?
+        }
+    };
+    for spec in partitions {
         let year_month_key = parse_year_month_key(&spec.year_month).unwrap_or_default();
         by_month
             .entry(year_month_key)

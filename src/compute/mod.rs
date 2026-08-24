@@ -803,6 +803,16 @@ fn compute_page_weekly_edits(
     output_dir: &Path,
     config: &WeeklyAggregationConfig,
 ) -> Result<Option<WeeklyAggregationReport>> {
+    compute_page_weekly_edits_for_snapshot(wiki, data_dir, output_dir, config, None)
+}
+
+fn compute_page_weekly_edits_for_snapshot(
+    wiki: &str,
+    data_dir: &Path,
+    output_dir: &Path,
+    config: &WeeklyAggregationConfig,
+    snapshot: Option<&str>,
+) -> Result<Option<WeeklyAggregationReport>> {
     let aggregation_started = Instant::now();
     let governed_scratch_root = config
         .scratch_root
@@ -810,8 +820,20 @@ fn compute_page_weekly_edits(
         .or_else(|| Some(output_dir.join(wiki)));
     let governor_paths = GovernorPaths::new(data_dir.to_path_buf(), governed_scratch_root);
     let governor = ResourceGovernor::from_environment(governor_paths)?;
-    let partitions =
-        storage::active_partition_specs(data_dir, wiki, storage::GenerationLayer::Warehouse)?;
+    let partitions = match snapshot {
+        Some(snapshot) => {
+            let result = storage::snapshot_partition_specs(
+                data_dir,
+                wiki,
+                snapshot,
+                storage::GenerationLayer::Warehouse,
+            );
+            result?
+        }
+        None => {
+            storage::active_partition_specs(data_dir, wiki, storage::GenerationLayer::Warehouse)?
+        }
+    };
     if partitions.is_empty() {
         info!(
             wiki = wiki,
@@ -1800,10 +1822,31 @@ pub fn write_output(df: &mut DataFrame, wiki: &str, metric: &str, output_dir: &P
     Ok(())
 }
 
-fn compute_all_incremental(wiki: &str, data_dir: &Path, output_dir: &Path) -> Result<()> {
-    let partitions =
-        storage::active_partition_specs(data_dir, wiki, storage::GenerationLayer::Analytical)?;
+fn compute_all_incremental(
+    wiki: &str,
+    data_dir: &Path,
+    output_dir: &Path,
+    snapshot: Option<&str>,
+) -> Result<()> {
+    let partitions = match snapshot {
+        Some(snapshot) => {
+            let result = storage::snapshot_partition_specs(
+                data_dir,
+                wiki,
+                snapshot,
+                storage::GenerationLayer::Analytical,
+            );
+            result?
+        }
+        None => {
+            storage::active_partition_specs(data_dir, wiki, storage::GenerationLayer::Analytical)?
+        }
+    };
     if partitions.is_empty() {
+        anyhow::ensure!(
+            snapshot.is_none(),
+            "snapshot generation contains no analytical partitions"
+        );
         let base = load_wiki(wiki, data_dir)?;
         inequality::compute(wiki, &base, output_dir)?;
         labor::compute(wiki, &base, output_dir)?;
@@ -1884,12 +1927,32 @@ fn compute_all_incremental(wiki: &str, data_dir: &Path, output_dir: &Path) -> Re
     Ok(())
 }
 
-fn compute_stage_inputs(wiki: &str, data_dir: &Path) -> Result<Vec<fingerprint::TrackedPath>> {
-    if let Some(snapshot) = storage::current_snapshot_version(data_dir, wiki)? {
+fn compute_stage_inputs(
+    wiki: &str,
+    data_dir: &Path,
+    selected_snapshot: Option<&str>,
+) -> Result<Vec<fingerprint::TrackedPath>> {
+    let snapshot = match selected_snapshot {
+        Some(snapshot) => Some(snapshot.to_string()),
+        None => storage::current_snapshot_version(data_dir, wiki)?,
+    };
+    if let Some(snapshot) = snapshot {
         // Resolving the fragments validates (and, for a pre-manifest
         // generation, safely migrates) the authoritative allowlist.
-        storage::active_fragment_files(data_dir, wiki, storage::GenerationLayer::Analytical)?;
-        storage::active_fragment_files(data_dir, wiki, storage::GenerationLayer::Warehouse)?;
+        let analytical_fragments = storage::snapshot_fragment_files(
+            data_dir,
+            wiki,
+            &snapshot,
+            storage::GenerationLayer::Analytical,
+        );
+        analytical_fragments?;
+        let warehouse_fragments = storage::snapshot_fragment_files(
+            data_dir,
+            wiki,
+            &snapshot,
+            storage::GenerationLayer::Warehouse,
+        );
+        warehouse_fragments?;
         let manifest = storage::generation_manifest_path(data_dir, wiki, &snapshot)?;
         let generation_outputs = vec![fingerprint::TrackedPath::new(
             "generation-manifest",
@@ -1950,23 +2013,42 @@ fn compute_stage_receipt(output_dir: &Path, wiki: &str) -> PathBuf {
 
 /// Run all metric families for a wiki.
 pub fn compute_all(wiki: &str, data_dir: &Path, output_dir: &Path) -> Result<()> {
+    let snapshot = storage::current_snapshot_version(data_dir, wiki)?;
+    compute_all_selected(wiki, data_dir, output_dir, snapshot.as_deref())
+}
+
+pub(crate) fn compute_all_for_snapshot(
+    wiki: &str,
+    snapshot: &str,
+    data_dir: &Path,
+    output_dir: &Path,
+) -> Result<()> {
+    storage::validate_snapshot_version(snapshot)?;
+    compute_all_selected(wiki, data_dir, output_dir, Some(snapshot))
+}
+
+fn compute_all_selected(
+    wiki: &str,
+    data_dir: &Path,
+    output_dir: &Path,
+    snapshot: Option<&str>,
+) -> Result<()> {
     let weekly_config = WeeklyAggregationConfig::from_environment()?;
     let algorithm_version = weekly_config.algorithm_version();
-    let snapshot = storage::current_snapshot_version(data_dir, wiki)?;
-    let inputs = compute_stage_inputs(wiki, data_dir)?;
+    let inputs = compute_stage_inputs(wiki, data_dir, snapshot)?;
     let outputs = compute_stage_outputs(wiki, output_dir);
     let receipt_path = compute_stage_receipt(output_dir, wiki);
     let spec = fingerprint::StageSpec {
         stage: "compute",
         scope: wiki,
-        selected_snapshot: snapshot.as_deref(),
+        selected_snapshot: snapshot,
         algorithm_version: &algorithm_version,
     };
     if fingerprint::reusable(&receipt_path, spec, &inputs, &outputs)? {
         crate::observability::record_stage_reused("compute", Some(wiki));
         info!(
             wiki,
-            snapshot = snapshot.as_deref().unwrap_or("legacy"),
+            snapshot = snapshot.unwrap_or("legacy"),
             receipt = %receipt_path.display(),
             "reusing deterministic compute stage"
         );
@@ -1976,8 +2058,8 @@ pub fn compute_all(wiki: &str, data_dir: &Path, output_dir: &Path) -> Result<()>
     info!(wiki = wiki, "computing metrics");
     let started = Instant::now();
 
-    compute_all_incremental(wiki, data_dir, output_dir)?;
-    compute_page_weekly_edits(wiki, data_dir, output_dir, &weekly_config)?;
+    compute_all_incremental(wiki, data_dir, output_dir, snapshot)?;
+    compute_page_weekly_edits_for_snapshot(wiki, data_dir, output_dir, &weekly_config, snapshot)?;
     let outputs = compute_stage_outputs(wiki, output_dir);
     fingerprint::record(&receipt_path, spec, &inputs, &outputs)?;
 
@@ -2460,6 +2542,7 @@ mod tests {
     #[test]
     fn versioned_compute_falls_back_when_ingest_receipt_is_missing() -> Result<()> {
         let data_dir = TestDir::new()?;
+        let output_dir = TestDir::new()?;
         let wiki = "testwiki";
         write_input_parquet(&data_dir, wiki)?;
         write_partitioned_warehouse_parquet(&data_dir, wiki)?;
@@ -2477,7 +2560,14 @@ mod tests {
             ),
         ] {
             for path in storage::collect_parquet_files(&source)? {
-                let target = destination.join(path.strip_prefix(&source)?);
+                let relative = path.strip_prefix(&source)?;
+                let target = if relative.components().count() == 1 {
+                    destination
+                        .join("year=2026/year_month=2026-01")
+                        .join(relative)
+                } else {
+                    destination.join(relative)
+                };
                 target.parent().map(fs::create_dir_all).transpose()?;
                 fs::copy(path, target)?;
             }
@@ -2503,7 +2593,7 @@ mod tests {
         .expect("manifest allowlist should remain readable");
         assert!(!active_again.contains(&unlisted));
 
-        let inputs = compute_stage_inputs(wiki, data_dir.path())?;
+        let inputs = compute_stage_inputs(wiki, data_dir.path(), None)?;
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].identity, "generation-manifest");
 
@@ -2521,9 +2611,17 @@ mod tests {
             &inputs,
         )
         .expect("ingest receipt fixture should record");
-        let reused = compute_stage_inputs(wiki, data_dir.path())?;
+        let reused = compute_stage_inputs(wiki, data_dir.path(), None)?;
         assert_eq!(reused.len(), 1);
         assert_eq!(reused[0].identity, "stage/ingest/testwiki/2026-08");
+
+        storage::restore_current_snapshot(data_dir.path(), wiki, None)?;
+        storage::restore_current_snapshot(data_dir.path(), wiki, None)?;
+        compute_all_for_snapshot(wiki, version, data_dir.path(), output_dir.path())?;
+        assert!(output_dir.path().join(wiki).join("gdp.parquet").is_file());
+        assert!(
+            compute_all_for_snapshot(wiki, "invalid", data_dir.path(), output_dir.path()).is_err()
+        );
         Ok(())
     }
 

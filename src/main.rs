@@ -129,6 +129,41 @@ enum Commands {
         wikis: Vec<String>,
     },
 
+    /// Prepare one immutable wiki candidate without changing the published site
+    PrepareWiki {
+        /// Wiki database name
+        wiki: String,
+
+        /// Dump snapshot version (YYYY-MM)
+        #[arg(long)]
+        version: Option<String>,
+
+        /// Maximum number of compressed sources retained before ingest
+        #[arg(long)]
+        source_window_size: Option<usize>,
+
+        /// Wiki lifecycle and publication contract
+        #[arg(long, default_value = "config/wiki-lifecycle.json")]
+        lifecycle: PathBuf,
+    },
+
+    /// Select ready wiki candidates, merge, and issue a publication receipt
+    PublicationPrepareReady {
+        /// Wiki lifecycle and publication contract
+        #[arg(long, default_value = "config/wiki-lifecycle.json")]
+        lifecycle: PathBuf,
+    },
+
+    /// Commit a successfully built ready-candidate publication
+    PublicationCommitReady,
+
+    /// Roll back a selected candidate set after publication failure
+    PublicationRollbackReady {
+        /// Wiki lifecycle and publication contract
+        #[arg(long, default_value = "config/wiki-lifecycle.json")]
+        lifecycle: PathBuf,
+    },
+
     /// Merge per-wiki outputs into combined parquet files
     Merge,
 
@@ -370,6 +405,75 @@ trait Ops {
     ) -> Result<()>;
     fn merge_outputs(&self, output_dir: &std::path::Path, run_id: Option<&str>) -> Result<()>;
     fn finalize_snapshot(&self, wiki: &str, data_dir: &std::path::Path) -> Result<()>;
+    fn prepare_candidate_snapshot(
+        &self,
+        wiki: &str,
+        version: &str,
+        data_dir: &Path,
+        run_id: &str,
+        window_size: usize,
+    ) -> Result<()> {
+        self.prepare_wiki_snapshot(wiki, version, data_dir, run_id, window_size)
+    }
+    fn compute_candidate(
+        &self,
+        wiki: &str,
+        _version: &str,
+        data_dir: &Path,
+        candidate_dir: &Path,
+    ) -> Result<()> {
+        self.compute_all(wiki, data_dir, candidate_dir)?;
+        Ok(())
+    }
+    fn compute_candidate_patrol(
+        &self,
+        wiki: &str,
+        _version: &str,
+        data_dir: &Path,
+        candidate_dir: &Path,
+    ) -> Result<()> {
+        self.compute_patrol(wiki, data_dir, candidate_dir, false, None)?;
+        Ok(())
+    }
+    fn mark_candidate_ready(
+        &self,
+        data_dir: &Path,
+        output_dir: &Path,
+        lifecycle: &Path,
+        wiki: &str,
+        version: &str,
+        run_id: &str,
+    ) -> Result<PathBuf> {
+        publication::mark_wiki_candidate_ready(
+            data_dir, output_dir, lifecycle, wiki, version, run_id,
+        )
+    }
+    fn prepare_ready_publication(
+        &self,
+        data_dir: &Path,
+        output_dir: &Path,
+        lifecycle: &Path,
+        run_id: &str,
+    ) -> Result<()> {
+        publication::prepare_ready_publication(data_dir, output_dir, lifecycle, run_id)
+    }
+    fn commit_ready_publication(
+        &self,
+        data_dir: &Path,
+        output_dir: &Path,
+        run_id: &str,
+    ) -> Result<()> {
+        publication::commit_ready_publication(data_dir, output_dir, run_id)
+    }
+    fn rollback_ready_publication(
+        &self,
+        data_dir: &Path,
+        output_dir: &Path,
+        lifecycle: &Path,
+        run_id: &str,
+    ) -> Result<()> {
+        publication::rollback_ready_publication(data_dir, output_dir, lifecycle, run_id)
+    }
 }
 
 struct RealOps;
@@ -509,6 +613,38 @@ impl Ops for RealOps {
         );
         Ok(())
     }
+
+    fn prepare_candidate_snapshot(
+        &self,
+        wiki: &str,
+        version: &str,
+        data_dir: &Path,
+        run_id: &str,
+        window_size: usize,
+    ) -> Result<()> {
+        source_window::prepare_candidate_snapshot(wiki, version, data_dir, run_id, window_size)
+            .map(|_| ())
+    }
+
+    fn compute_candidate(
+        &self,
+        wiki: &str,
+        version: &str,
+        data_dir: &Path,
+        candidate_dir: &Path,
+    ) -> Result<()> {
+        compute::compute_all_for_snapshot(wiki, version, data_dir, candidate_dir)
+    }
+
+    fn compute_candidate_patrol(
+        &self,
+        wiki: &str,
+        version: &str,
+        data_dir: &Path,
+        candidate_dir: &Path,
+    ) -> Result<()> {
+        patrol::compute_patrol_for_snapshot(wiki, version, data_dir, candidate_dir, false, None)
+    }
 }
 
 fn execute_capacity_benchmark(options: capacity::CapacityBenchmarkOptions<'_>) -> Result<()> {
@@ -631,6 +767,84 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             }
             run_timed_stage("merge", None, || {
                 ops.merge_outputs(&output_dir, run_id.as_deref())
+            })?;
+        }
+
+        Commands::PrepareWiki {
+            wiki,
+            version,
+            source_window_size,
+            lifecycle,
+        } => {
+            let run_id = run_id
+                .as_deref()
+                .context("candidate preparation requires --run-id")?;
+            let version = match version {
+                Some(version) => version,
+                None => run_timed_stage("snapshot_resolve", Some(&wiki), || {
+                    ops.resolve_snapshot(std::slice::from_ref(&wiki), Utc::now())
+                })?,
+            };
+            let source_window_size = source_window::configured_window_size(source_window_size)?;
+            ops.persist_snapshot_plans(std::slice::from_ref(&wiki), &version, &data_dir)?;
+            let candidate_dir =
+                publication::wiki_candidate_dir(&output_dir, &wiki, &version, run_id)?;
+
+            run_timed_stage("source_window", Some(&wiki), || {
+                ops.prepare_candidate_snapshot(
+                    &wiki,
+                    &version,
+                    &data_dir,
+                    run_id,
+                    source_window_size,
+                )
+            })?;
+            run_timed_stage("patrol_fetch", Some(&wiki), || {
+                ops.fetch_patrol(&wiki, &data_dir)
+            })?;
+            run_timed_stage("compute", Some(&wiki), || {
+                ops.compute_candidate(&wiki, &version, &data_dir, &candidate_dir)
+            })?;
+            run_timed_stage("patrol_compute", Some(&wiki), || {
+                ops.compute_candidate_patrol(&wiki, &version, &data_dir, &candidate_dir)
+            })?;
+            let ready = run_timed_stage("candidate_validate", Some(&wiki), || {
+                ops.mark_candidate_ready(
+                    &data_dir,
+                    &output_dir,
+                    &lifecycle,
+                    &wiki,
+                    &version,
+                    run_id,
+                )
+            })?;
+            println!("{}", ready.display());
+        }
+
+        Commands::PublicationPrepareReady { lifecycle } => {
+            let run_id = run_id
+                .as_deref()
+                .context("ready publication preparation requires --run-id")?;
+            run_timed_stage("publication_prepare", None, || {
+                ops.prepare_ready_publication(&data_dir, &output_dir, &lifecycle, run_id)
+            })?;
+        }
+
+        Commands::PublicationCommitReady => {
+            let run_id = run_id
+                .as_deref()
+                .context("ready publication commit requires --run-id")?;
+            run_timed_stage("publication_commit", None, || {
+                ops.commit_ready_publication(&data_dir, &output_dir, run_id)
+            })?;
+        }
+
+        Commands::PublicationRollbackReady { lifecycle } => {
+            let run_id = run_id
+                .as_deref()
+                .context("ready publication rollback requires --run-id")?;
+            run_timed_stage("publication_rollback", None, || {
+                ops.rollback_ready_publication(&data_dir, &output_dir, &lifecycle, run_id)
             })?;
         }
 
@@ -1241,6 +1455,51 @@ mod tests {
             self.record(format!("snapshot_finalize:{wiki}:{}", data_dir.display()));
             Ok(())
         }
+
+        fn mark_candidate_ready(
+            &self,
+            _data_dir: &Path,
+            output_dir: &Path,
+            _lifecycle: &Path,
+            wiki: &str,
+            version: &str,
+            run_id: &str,
+        ) -> Result<PathBuf> {
+            self.record(format!("candidate_ready:{wiki}:{version}:{run_id}"));
+            Ok(output_dir.join("ready.json"))
+        }
+
+        fn prepare_ready_publication(
+            &self,
+            _data_dir: &Path,
+            _output_dir: &Path,
+            _lifecycle: &Path,
+            run_id: &str,
+        ) -> Result<()> {
+            self.record(format!("publication_prepare:{run_id}"));
+            Ok(())
+        }
+
+        fn commit_ready_publication(
+            &self,
+            _data_dir: &Path,
+            _output_dir: &Path,
+            run_id: &str,
+        ) -> Result<()> {
+            self.record(format!("publication_commit:{run_id}"));
+            Ok(())
+        }
+
+        fn rollback_ready_publication(
+            &self,
+            _data_dir: &Path,
+            _output_dir: &Path,
+            _lifecycle: &Path,
+            run_id: &str,
+        ) -> Result<()> {
+            self.record(format!("publication_rollback:{run_id}"));
+            Ok(())
+        }
     }
 
     impl Ops for FailingOps {
@@ -1461,6 +1720,131 @@ mod tests {
                 "merge:o",
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn run_with_ops_prepares_one_isolated_wiki_candidate() -> Result<()> {
+        init_test_tracing();
+        let cli = Cli::try_parse_from([
+            "wiki-econ",
+            "--data-dir",
+            "fixtures/data",
+            "--output-dir",
+            "fixtures/output",
+            "--run-id",
+            "run-7",
+            "prepare-wiki",
+            "nlwiki",
+            "--version",
+            "2026-07",
+            "--source-window-size",
+            "2",
+        ])?;
+        let ops = RecordingOps::default();
+
+        run_with_ops(cli, &ops)?;
+
+        assert_eq!(
+            ops.calls.into_inner(),
+            vec![
+                "source_window:nlwiki:2026-07:fixtures/data:2",
+                "fetch_patrol:nlwiki:fixtures/data",
+                "compute:nlwiki:fixtures/data:fixtures/output/_candidates/nlwiki/2026-07/run-7",
+                "compute_patrol:nlwiki:fixtures/data:fixtures/output/_candidates/nlwiki/2026-07/run-7:false:_",
+                "candidate_ready:nlwiki:2026-07:run-7",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn candidate_preparation_resolves_an_unpinned_snapshot() -> Result<()> {
+        let cli = Cli::try_parse_from([
+            "wiki-econ",
+            "--run-id",
+            "resolved-run",
+            "prepare-wiki",
+            "nlwiki",
+        ])?;
+        let ops = RecordingOps::default();
+
+        run_with_ops(cli, &ops)?;
+
+        assert_eq!(ops.calls.borrow()[0], "resolve_snapshot:nlwiki");
+        assert!(
+            ops.calls
+                .borrow()
+                .iter()
+                .any(|call| call == "candidate_ready:nlwiki:2026-07:resolved-run")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ops_default_publication_methods_delegate_and_fail_closed() -> Result<()> {
+        let root = TestDir::new()?;
+        let data = root.path().join("data");
+        let output = root.path().join("output");
+        let lifecycle = root.path().join("missing-lifecycle.json");
+        fs::create_dir_all(&output)?;
+        let ops = FailingOps { fail_stage: "none" };
+
+        assert!(
+            ops.mark_candidate_ready(&data, &output, &lifecycle, "nlwiki", "2026-07", "candidate",)
+                .is_err()
+        );
+        assert!(
+            ops.prepare_ready_publication(&data, &output, &lifecycle, "prepare")
+                .is_err()
+        );
+        assert!(
+            ops.commit_ready_publication(&data, &output, "commit")
+                .is_err()
+        );
+        assert!(
+            ops.rollback_ready_publication(&data, &output, &lifecycle, "rollback")
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn run_with_ops_dispatches_short_publication_transaction_commands() -> Result<()> {
+        init_test_tracing();
+        let ops = RecordingOps::default();
+        for command in [
+            "publication-prepare-ready",
+            "publication-commit-ready",
+            "publication-rollback-ready",
+        ] {
+            let cli = Cli::try_parse_from(["wiki-econ", "--run-id", "publish-9", command])?;
+            run_with_ops(cli, &ops)?;
+        }
+
+        assert_eq!(
+            ops.calls.into_inner(),
+            vec![
+                "publication_prepare:publish-9",
+                "publication_commit:publish-9",
+                "publication_rollback:publish-9",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn isolated_candidate_and_publication_commands_require_run_ids() -> Result<()> {
+        for args in [
+            vec!["wiki-econ", "prepare-wiki", "nlwiki"],
+            vec!["wiki-econ", "publication-prepare-ready"],
+            vec!["wiki-econ", "publication-commit-ready"],
+            vec!["wiki-econ", "publication-rollback-ready"],
+        ] {
+            let error = run_with_ops(Cli::try_parse_from(args)?, &RecordingOps::default())
+                .expect_err("transactional commands require a stable run ID");
+            assert!(error.to_string().contains("requires --run-id"));
+        }
         Ok(())
     }
 
@@ -1982,6 +2366,20 @@ mod tests {
             ops.prepare_wiki_snapshot("../enwiki", "2026-02", data_dir.path(), "test-run", 1)
                 .is_err()
         );
+        assert!(
+            ops.prepare_candidate_snapshot(
+                "../enwiki",
+                "2026-02",
+                data_dir.path(),
+                "candidate-run",
+                1,
+            )
+            .is_err()
+        );
+        assert!(
+            ops.compute_candidate("computewiki", "invalid", data_dir.path(), output_dir.path(),)
+                .is_err()
+        );
 
         write_compute_input(data_dir.path(), "computewiki")?;
         ops.compute_all("computewiki", data_dir.path(), output_dir.path())?;
@@ -2056,6 +2454,40 @@ mod tests {
                 .join("patrolcomputewiki")
                 .join("patrol.parquet")
                 .exists()
+        );
+
+        let patrol_snapshot = "2026-01";
+        let legacy_warehouse =
+            crate::storage::warehouse_wiki_dir(data_dir.path(), "patrolcomputewiki");
+        let snapshot_warehouse = crate::storage::snapshot_warehouse_wiki_dir(
+            data_dir.path(),
+            "patrolcomputewiki",
+            patrol_snapshot,
+        )
+        .expect("snapshot warehouse fixture should resolve");
+        for path in crate::storage::collect_parquet_files(&legacy_warehouse)? {
+            let destination = snapshot_warehouse.join(path.strip_prefix(&legacy_warehouse)?);
+            destination.parent().map(fs::create_dir_all).transpose()?;
+            fs::copy(path, destination)?;
+        }
+        crate::storage::write_test_generation_manifest_from_files(
+            data_dir.path(),
+            "patrolcomputewiki",
+            patrol_snapshot,
+        )
+        .expect("patrol generation manifest should be writable");
+        let patrol_candidate = output_dir.path().join("patrol-candidate");
+        ops.compute_candidate_patrol(
+            "patrolcomputewiki",
+            patrol_snapshot,
+            data_dir.path(),
+            &patrol_candidate,
+        )
+        .expect("explicit patrol candidate should compute");
+        assert!(
+            patrol_candidate
+                .join("patrolcomputewiki/patrol.parquet")
+                .is_file()
         );
 
         // Re-run with rebuild=true after pre-creating the parts dir; this
