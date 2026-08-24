@@ -14,9 +14,14 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tracing::info;
 
-use crate::{fingerprint, observability::MemorySnapshot, schema, storage};
+use crate::{
+    fingerprint,
+    observability::MemorySnapshot,
+    resource_governor::{GovernorPaths, ResourceGovernor},
+    schema, storage,
+};
 
-const COMPUTE_ALGORITHM_VERSION: &str = "core-metrics-v3-disk-bucket-reduction";
+const COMPUTE_ALGORITHM_VERSION: &str = "core-metrics-v4-governed-row-group-buckets";
 const DEFAULT_WEEKLY_BUCKET_COUNT: usize = 256;
 const SUPPORTED_WEEKLY_BUCKET_COUNTS: [usize; 3] = [256, 512, 1024];
 const WEEKLY_BUCKET_COUNT_ENV: &str = "WIKI_ECON_WEEKLY_BUCKET_COUNT";
@@ -740,6 +745,12 @@ fn compute_page_weekly_edits(
     config: &WeeklyAggregationConfig,
 ) -> Result<Option<WeeklyAggregationReport>> {
     let aggregation_started = Instant::now();
+    let governed_scratch_root = config
+        .scratch_root
+        .clone()
+        .or_else(|| Some(output_dir.join(wiki)));
+    let governor_paths = GovernorPaths::new(data_dir.to_path_buf(), governed_scratch_root);
+    let governor = ResourceGovernor::from_environment(governor_paths)?;
     let partitions =
         storage::active_partition_specs(data_dir, wiki, storage::GenerationLayer::Warehouse)?;
     if partitions.is_empty() {
@@ -749,6 +760,15 @@ fn compute_page_weekly_edits(
         );
         return Ok(None);
     }
+    for partition in &partitions {
+        let bytes = partition.files.iter().try_fold(0_u64, |total, path| {
+            total
+                .checked_add(path.metadata()?.len())
+                .context("logical partition byte count overflow")
+        })?;
+        governor.validate_logical_partition(&partition.year_month, bytes)?;
+    }
+    governor.checkpoint("page_weekly_edits_preflight")?;
 
     let event_date_options = StrptimeOptions {
         format: Some("%Y-%m-%d".into()),
@@ -764,7 +784,7 @@ fn compute_page_weekly_edits(
     // hash group_by and sort that span partitions to one bucket instead of
     // the full ~40M-row nlwiki history.
     let runs = WeeklyRunDir::new(output_dir, wiki, config.scratch_root.as_deref())?;
-    let mut bucket_writers: BTreeMap<usize, BatchedWriter<File>> = BTreeMap::new();
+    let mut staged_paths = Vec::with_capacity(partitions.len());
     let mut bucket_rows = vec![0usize; config.bucket_count];
     let mut total_edits_before = 0i64;
     let mut reduction_peak = ResourcePeak::default();
@@ -774,6 +794,8 @@ fn compute_page_weekly_edits(
         wiki = wiki,
         partitions = partitions.len(),
         buckets = config.bucket_count,
+        max_active_parquet_writers = governor.budget().max_active_parquet_writers,
+        active_parquet_writers = 1,
         run_dir = %runs.path().display(),
         "page_weekly_edits: starting disk-backed bucket reduction"
     );
@@ -796,18 +818,14 @@ fn compute_page_weekly_edits(
             .collect()?;
         running_rows += partition_weekly.height();
         total_edits_before += sum_edits_column(std::slice::from_ref(&partition_weekly))?;
-        let stage_result = runs.stage(
-            &mut bucket_writers,
-            &mut bucket_rows,
-            partition_weekly,
-            config.bucket_count,
-        );
-        stage_result?;
+        let stage_result = runs.stage(idx, &mut bucket_rows, partition_weekly, config.bucket_count);
+        staged_paths.push(stage_result?);
         for file in &partition.files {
             storage::discard_path_cache(file);
         }
         let memory = MemorySnapshot::capture();
         reduction_peak.observe(memory, None);
+        governor.checkpoint("page_weekly_edits_reduce_partition")?;
         info!(
             wiki = wiki,
             partition = idx + 1,
@@ -822,7 +840,6 @@ fn compute_page_weekly_edits(
             "page_weekly_edits: reduced and staged partition"
         );
     }
-    finish_weekly_bucket_writers(bucket_writers)?;
     let reduction_elapsed_ms = reduction_started.elapsed().as_millis() as u64;
     let scratch_peak_bytes = runs.size_bytes()?;
     let mut working_storage_peak_bytes = scratch_peak_bytes;
@@ -847,8 +864,7 @@ fn compute_page_weekly_edits(
             continue;
         }
         let started = Instant::now();
-        let bucket_path = runs.bucket_path(bucket);
-        let staged = ParquetReader::new(File::open(&bucket_path)?).finish()?;
+        let staged = read_staged_weekly_bucket(&staged_paths, bucket)?;
         let actual_staged_rows = staged.height();
         anyhow::ensure!(
             actual_staged_rows == staged_rows,
@@ -891,9 +907,9 @@ fn compute_page_weekly_edits(
             )
             .context("page_weekly_edits working storage byte count overflow")?;
         working_storage_peak_bytes = working_storage_peak_bytes.max(working_bytes);
-        fs::remove_file(bucket_path)?;
         let memory = MemorySnapshot::capture();
         reconciliation_peak.observe(memory, None);
+        governor.checkpoint("page_weekly_edits_reconcile_bucket")?;
         info!(
             wiki = wiki,
             bucket = bucket,
@@ -989,45 +1005,69 @@ fn format_epoch_day(day: i32) -> Option<String> {
 
 fn stage_weekly_partition(
     runs: &WeeklyRunDir,
-    writers: &mut BTreeMap<usize, BatchedWriter<File>>,
+    partition_index: usize,
     bucket_rows: &mut [usize],
     partition: DataFrame,
     bucket_count: usize,
-) -> Result<()> {
+) -> Result<PathBuf> {
     let page_ids = partition.column("page_id")?.i64()?;
     let mut row_indices: Vec<Vec<IdxSize>> = (0..bucket_count).map(|_| Vec::new()).collect();
     for row in 0..partition.height() {
         row_indices[stable_weekly_bucket(page_ids.get(row), bucket_count)].push(row as IdxSize);
     }
 
+    let path = runs.partition_path(partition_index);
+    let mut writer: Option<BatchedWriter<File>> = None;
     for (bucket, indices) in row_indices.into_iter().enumerate() {
         if indices.is_empty() {
             continue;
         }
         let take = IdxCa::from_vec("weekly_bucket_rows".into(), indices);
         let mut bucket_frame = partition.take(&take)?;
+        let stable_bucket_column = Column::new(
+            "_stable_bucket".into(),
+            vec![u32::try_from(bucket)?; bucket_frame.height()],
+        );
+        bucket_frame.with_column(stable_bucket_column)?;
         bucket_frame.rechunk_mut();
-        let writer = match writers.entry(bucket) {
-            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                let file = File::create(runs.bucket_path(bucket))?;
-                let writer = ParquetWriter::new(file)
+        if writer.is_none() {
+            writer = Some(
+                ParquetWriter::new(File::create(&path)?)
                     .with_compression(ParquetCompression::Zstd(None))
-                    .batched(bucket_frame.schema())?;
-                entry.insert(writer)
-            }
-        };
-        writer.write_batch(&bucket_frame)?;
+                    .batched(bucket_frame.schema())?,
+            );
+        }
+        writer
+            .as_mut()
+            .context("weekly partition writer was not initialized")?
+            .write_batch(&bucket_frame)?;
         bucket_rows[bucket] += bucket_frame.height();
     }
-    Ok(())
+    writer
+        .context("weekly partition produced no stable buckets")?
+        .finish()?;
+    Ok(path)
 }
 
-fn finish_weekly_bucket_writers(writers: BTreeMap<usize, BatchedWriter<File>>) -> Result<()> {
-    for writer in writers.into_values() {
-        writer.finish()?;
-    }
-    Ok(())
+fn read_staged_weekly_bucket(paths: &[PathBuf], bucket: usize) -> Result<DataFrame> {
+    let parquet_paths = paths
+        .iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    let sources = parquet_paths
+        .iter()
+        .map(|path| path.as_str().into())
+        .collect();
+    let scan_args = ScanArgsParquet {
+        cache: false,
+        ..Default::default()
+    };
+    let staged = LazyFrame::scan_parquet_sources(ScanSources::Paths(sources), scan_args)?;
+    let bucket = u32::try_from(bucket)?;
+    Ok(staged
+        .filter(col("_stable_bucket").eq(lit(bucket)))
+        .drop(cols(["_stable_bucket"]))
+        .collect()?)
 }
 
 fn add_weekly_change_columns(mut weekly: DataFrame, wiki: &str) -> Result<DataFrame> {
@@ -1143,8 +1183,8 @@ impl WeeklyRunDir {
         &self.path
     }
 
-    fn bucket_path(&self, bucket: usize) -> PathBuf {
-        self.path.join(format!("bucket-{bucket:04}.parquet"))
+    fn partition_path(&self, partition: usize) -> PathBuf {
+        self.path.join(format!("partition-{partition:06}.parquet"))
     }
 
     fn size_bytes(&self) -> Result<u64> {
@@ -1158,12 +1198,12 @@ impl WeeklyRunDir {
 
     fn stage(
         &self,
-        writers: &mut BTreeMap<usize, BatchedWriter<File>>,
+        partition_index: usize,
         bucket_rows: &mut [usize],
         partition: DataFrame,
         bucket_count: usize,
-    ) -> Result<()> {
-        stage_weekly_partition(self, writers, bucket_rows, partition, bucket_count)
+    ) -> Result<PathBuf> {
+        stage_weekly_partition(self, partition_index, bucket_rows, partition, bucket_count)
     }
 }
 
@@ -2261,7 +2301,7 @@ mod tests {
     }
 
     #[test]
-    fn weekly_partition_staging_writes_and_cleans_bucket_runs() -> Result<()> {
+    fn weekly_partition_staging_writes_predicate_pushdown_runs_and_cleans() -> Result<()> {
         let output = TestDir::new()?;
         let scratch = TestDir::new()?;
         let runs = WeeklyRunDir::new(output.path(), "testwiki", Some(scratch.path()))?;
@@ -2271,23 +2311,19 @@ mod tests {
             (Some(1), Some(0), Some("Alpha"), Some(0), Some(3)),
             (Some(2), Some(0), Some("Beta"), Some(7), Some(5)),
         ])?;
-        let mut writers = BTreeMap::new();
         let mut rows = vec![0usize; DEFAULT_WEEKLY_BUCKET_COUNT];
-        let stage_result = stage_weekly_partition(
-            &runs,
-            &mut writers,
-            &mut rows,
-            frame,
-            DEFAULT_WEEKLY_BUCKET_COUNT,
-        );
-        stage_result?;
-        finish_weekly_bucket_writers(writers)?;
+        let path = stage_weekly_partition(&runs, 0, &mut rows, frame, DEFAULT_WEEKLY_BUCKET_COUNT)?;
 
         assert_eq!(rows.iter().sum::<usize>(), 2);
         assert!(runs.size_bytes()? > 0);
+        assert!(path.exists());
+        let alpha_bucket = stable_weekly_bucket(Some(1), DEFAULT_WEEKLY_BUCKET_COUNT);
+        let alpha = read_staged_weekly_bucket(std::slice::from_ref(&path), alpha_bucket)?;
+        assert_eq!(alpha.height(), 1);
+        assert!(alpha.column("_stable_bucket").is_err());
         assert!(
-            runs.bucket_path(stable_weekly_bucket(Some(1), DEFAULT_WEEKLY_BUCKET_COUNT))
-                .exists()
+            read_staged_weekly_bucket(&[scratch.path().join("missing.parquet")], alpha_bucket)
+                .is_err()
         );
         drop(runs);
         assert!(!run_path.exists());
