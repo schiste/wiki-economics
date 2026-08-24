@@ -1808,24 +1808,15 @@ fn merge_wiki_patrol_parts(output_dir: &Path, wiki: &str) -> Result<Option<PathB
     if !parts_dir.exists() {
         return Ok(None);
     }
-    let part_files = storage::collect_parquet_files(&parts_dir)?;
+    let mut part_files = storage::collect_parquet_files(&parts_dir)?;
     if part_files.is_empty() {
         return Ok(None);
     }
-    let lazy_frames: Vec<LazyFrame> = part_files
-        .iter()
-        .map(|path| {
-            LazyFrame::scan_parquet(path.to_string_lossy().as_ref().into(), Default::default())
-        })
-        .collect::<PolarsResult<_>>()?;
-    let mut merged = concat(lazy_frames, Default::default())?.collect()?;
+    part_files.sort();
     let out_dir = output_dir.join(wiki);
     fs::create_dir_all(&out_dir)?;
     let out_path = out_dir.join("patrol.parquet");
-    let mut file = File::create(&out_path)?;
-    ParquetWriter::new(&mut file)
-        .with_compression(ParquetCompression::Zstd(None))
-        .finish(&mut merged)?;
+    crate::merge::merge_metric_batched("patrol.parquet", &part_files, &out_path, 250_000, None)?;
     Ok(Some(out_path))
 }
 
@@ -1833,7 +1824,7 @@ fn refresh_patrol_dashboard_artifacts(
     output_dir: &Path,
     _wiki_output: Option<&Path>,
 ) -> Result<()> {
-    let metric_files: Vec<PathBuf> = fs::read_dir(output_dir)?
+    let mut metric_files: Vec<PathBuf> = fs::read_dir(output_dir)?
         .filter_map(|entry| entry.ok())
         .filter(|entry| entry.file_type().map(|ty| ty.is_dir()).unwrap_or(false))
         .map(|entry| entry.path().join("patrol.parquet"))
@@ -1842,18 +1833,15 @@ fn refresh_patrol_dashboard_artifacts(
     if metric_files.is_empty() {
         return Ok(());
     }
-    let lazy_frames: Vec<LazyFrame> = metric_files
-        .iter()
-        .map(|path| {
-            LazyFrame::scan_parquet(path.to_string_lossy().as_ref().into(), Default::default())
-        })
-        .collect::<PolarsResult<_>>()?;
-    let mut combined = concat(lazy_frames, Default::default())?.collect()?;
+    metric_files.sort();
     let merged_path = output_dir.join("patrol.parquet");
-    let mut merged_file = File::create(&merged_path)?;
-    ParquetWriter::new(&mut merged_file)
-        .with_compression(ParquetCompression::Zstd(None))
-        .finish(&mut combined)?;
+    crate::merge::merge_metric_batched(
+        "patrol.parquet",
+        &metric_files,
+        &merged_path,
+        250_000,
+        None,
+    )?;
     Ok(())
 }
 

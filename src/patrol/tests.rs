@@ -1251,6 +1251,10 @@ fn artifact_helpers_cover_bootstrap_merge_and_refresh() -> Result<()> {
     refresh_patrol_dashboard_artifacts(&output_dir, merged.as_deref())?;
     assert!(output_dir.join("patrol.parquet").exists());
     assert!(!output_dir.join("defaults_patrol.json").exists());
+    let corrupt_dir = output_dir.join("zzwiki");
+    fs::create_dir_all(&corrupt_dir)?;
+    fs::write(corrupt_dir.join("patrol.parquet"), b"not parquet")?;
+    assert!(refresh_patrol_dashboard_artifacts(&output_dir, None).is_err());
     Ok(())
 }
 
