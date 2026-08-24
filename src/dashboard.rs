@@ -9,7 +9,9 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
 
-use crate::licensing;
+use crate::{licensing, storage};
+
+const LARGE_METRIC_BATCH_ROWS: usize = 250_000;
 
 pub const ARTIFACTS: [&str; 11] = [
     "defaults_business.json",
@@ -924,67 +926,133 @@ fn patrol_artifacts(frames: &Frames) -> Result<(Value, Value)> {
     Ok((defaults, meta_json(&meta, true)))
 }
 
+#[derive(Debug)]
+struct VariationRow {
+    week: String,
+    title: String,
+    previous_week_edits: i64,
+    edits: Option<i64>,
+    wow_change: Option<i64>,
+    wow_rate: Option<f64>,
+}
+
+fn variation_order(left: &VariationRow, right: &VariationRow) -> Ordering {
+    right
+        .wow_change
+        .cmp(&left.wow_change)
+        .then_with(|| right.edits.cmp(&left.edits))
+        .then_with(|| left.title.cmp(&right.title))
+        .then_with(|| left.week.cmp(&right.week))
+}
+
+fn retain_top_variation(rows: &mut Vec<VariationRow>, candidate: VariationRow) {
+    if rows.len() < 20 {
+        rows.push(candidate);
+        return;
+    }
+    let worst = rows
+        .iter()
+        .enumerate()
+        .max_by(|(_, left), (_, right)| variation_order(left, right))
+        .map(|(index, _)| index)
+        .expect("twenty retained variation rows cannot be empty");
+    if variation_order(&candidate, &rows[worst]) == Ordering::Less {
+        rows[worst] = candidate;
+    }
+}
+
 fn edit_variation_artifact(output_dir: &Path) -> Result<Value> {
     let path = output_dir.join("page_weekly_edits.parquet");
-    let mut metadata_reader = ParquetReader::new(File::open(&path)?);
-    let rows = metadata_reader.num_rows()?;
+    let columns = Some(
+        [
+            "wiki",
+            "page_namespace",
+            "week_start",
+            "page_title",
+            "previous_week_edits",
+            "edits",
+            "wow_change",
+            "wow_rate",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+    );
+    let mut reader =
+        storage::SequentialParquetReader::new(&path, columns, LARGE_METRIC_BATCH_ROWS)?;
+    let rows = reader.rows();
     ensure!(rows > 0, "page_weekly_edits.parquet is empty");
-    let first = ParquetReader::new(File::open(&path)?)
-        .with_columns(Some(vec!["wiki".to_string()]))
-        .with_slice(Some((0, 1)))
-        .finish()?;
-    let default_wiki = env::var("DEFAULT_WIKI")
-        .ok()
-        .or_else(|| string(&first, "wiki", 0).ok().flatten())
-        .context("page_weekly_edits.parquet has no wiki")?;
-    let path_string = path.to_string_lossy().into_owned();
-    let filtered = LazyFrame::scan_parquet(path_string.as_str().into(), Default::default())?
-        .filter(col("wiki").eq(lit(default_wiki.clone())))
-        .filter(col("page_namespace").eq(lit(0_i32)));
-    let summary = filtered
-        .clone()
-        .select([
-            len().alias("rows"),
-            col("week_start").min().alias("min_week"),
-            col("week_start").max().alias("max_week"),
-        ])
-        .collect_with_engine(Engine::Streaming)?
-        .unwrap_single();
-    let top = filtered
-        .filter(col("previous_week_edits").gt(lit(0_u32)))
-        .sort(
-            ["wow_change", "edits", "page_title", "week_start"],
-            SortMultipleOptions::default()
-                .with_order_descending_multi([true, true, false, false])
-                .with_nulls_last(true),
-        )
-        .limit(20)
-        .select([
-            col("week_start"),
-            col("page_title"),
-            col("previous_week_edits"),
-            col("edits"),
-            col("wow_change"),
-            col("wow_rate"),
-        ])
-        .collect_with_engine(Engine::Streaming)?
-        .unwrap_single();
-
-    let matching_rows = integer(&summary, "rows", 0)?.unwrap_or_default();
-    let min_week = string(&summary, "min_week", 0)?;
-    let max_week = string(&summary, "max_week", 0)?;
-    let mut best = Vec::with_capacity(top.height());
-    for row in 0..top.height() {
-        let week = string(&top, "week_start", row)?.context("variation week is null")?;
-        let parsed_week = NaiveDate::parse_from_str(&week, "%Y-%m-%d")?;
+    let mut default_wiki = env::var("DEFAULT_WIKI").ok();
+    let mut matching_rows = 0_i64;
+    let mut min_week: Option<String> = None;
+    let mut max_week: Option<String> = None;
+    let mut top = Vec::with_capacity(20);
+    let mut observed_rows = 0_usize;
+    while let Some(batch) = reader.next_batch()? {
+        observed_rows = observed_rows
+            .checked_add(batch.height())
+            .context("page-week dashboard row count overflow")?;
+        for row in 0..batch.height() {
+            let wiki = string(&batch, "wiki", row)?.context("variation wiki is null")?;
+            if default_wiki.is_none() {
+                default_wiki = Some(wiki.clone());
+            }
+            if default_wiki.as_deref() != Some(wiki.as_str())
+                || integer(&batch, "page_namespace", row)? != Some(0)
+            {
+                continue;
+            }
+            matching_rows = matching_rows
+                .checked_add(1)
+                .context("page-week dashboard matching row count overflow")?;
+            let week = string(&batch, "week_start", row)?.context("variation week is null")?;
+            if min_week
+                .as_deref()
+                .is_none_or(|minimum| week.as_str() < minimum)
+            {
+                min_week = Some(week.clone());
+            }
+            if max_week
+                .as_deref()
+                .is_none_or(|maximum| week.as_str() > maximum)
+            {
+                max_week = Some(week.clone());
+            }
+            let previous_week_edits =
+                integer(&batch, "previous_week_edits", row)?.unwrap_or_default();
+            if previous_week_edits <= 0 {
+                continue;
+            }
+            retain_top_variation(
+                &mut top,
+                VariationRow {
+                    week,
+                    title: string(&batch, "page_title", row)?.context("variation title is null")?,
+                    previous_week_edits,
+                    edits: integer(&batch, "edits", row)?,
+                    wow_change: integer(&batch, "wow_change", row)?,
+                    wow_rate: float(&batch, "wow_rate", row)?,
+                },
+            );
+        }
+    }
+    ensure!(
+        observed_rows == rows,
+        "page-week dashboard row conservation failed: footer {rows}, scanned {observed_rows}"
+    );
+    let default_wiki = default_wiki.context("page_weekly_edits.parquet has no wiki")?;
+    top.sort_by(variation_order);
+    let mut best = Vec::with_capacity(top.len());
+    for row in top {
+        let parsed_week = NaiveDate::parse_from_str(&row.week, "%Y-%m-%d")?;
         best.push(json!({
-            "week_start": week,
+            "week_start": row.week,
             "week_end": (parsed_week + Duration::days(6)).to_string(),
-            "page_title": string(&top, "page_title", row)?.context("variation title is null")?,
-            "previous_week_edits": integer(&top, "previous_week_edits", row)?.unwrap_or_default(),
-            "edits": integer(&top, "edits", row)?.unwrap_or_default(),
-            "wow_change": integer(&top, "wow_change", row)?.unwrap_or_default(),
-            "wow_rate": float(&top, "wow_rate", row)?.map(number).unwrap_or(Value::Null),
+            "page_title": row.title,
+            "previous_week_edits": row.previous_week_edits,
+            "edits": row.edits.unwrap_or_default(),
+            "wow_change": row.wow_change.unwrap_or_default(),
+            "wow_rate": row.wow_rate.map(number).unwrap_or(Value::Null),
         }));
     }
 
@@ -1523,6 +1591,43 @@ mod tests {
         assert_eq!(string_field(&values[0], "missing"), "");
         assert_eq!(values[0]["a"], "a");
         Ok(())
+    }
+
+    #[test]
+    fn variation_selector_retains_only_the_deterministic_top_twenty() {
+        let row = |change: i64, edits: i64, title: &str, week: &str| VariationRow {
+            week: week.to_string(),
+            title: title.to_string(),
+            previous_week_edits: 1,
+            edits: Some(edits),
+            wow_change: Some(change),
+            wow_rate: None,
+        };
+        let mut rows = Vec::new();
+        for change in 0..20 {
+            retain_top_variation(&mut rows, row(change, 1, "Same", "2026-01-01"));
+        }
+        retain_top_variation(&mut rows, row(-1, 99, "Ignored", "2026-01-01"));
+        retain_top_variation(&mut rows, row(100, 1, "Best", "2026-01-01"));
+        assert_eq!(rows.len(), 20);
+        rows.sort_by(variation_order);
+        assert_eq!(rows[0].wow_change, Some(100));
+        assert_eq!(rows.last().and_then(|row| row.wow_change), Some(1));
+
+        assert_eq!(
+            variation_order(
+                &row(5, 2, "Zulu", "2026-01-02"),
+                &row(5, 1, "Alpha", "2026-01-01")
+            ),
+            Ordering::Less
+        );
+        assert_eq!(
+            variation_order(
+                &row(5, 1, "Alpha", "2026-01-02"),
+                &row(5, 1, "Alpha", "2026-01-01")
+            ),
+            Ordering::Greater
+        );
     }
 
     #[test]

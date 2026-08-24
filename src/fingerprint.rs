@@ -10,6 +10,7 @@ use tracing::{info, warn};
 
 const RECEIPT_SCHEMA_VERSION: u32 = 1;
 const SITE_ALGORITHM_VERSION: &str = "observable-static-site-v4-npm-workspace";
+const PARQUET_SUMMARY_BATCH_ROWS: usize = 250_000;
 const DATE_COLUMNS: [&str; 6] = [
     "week_start",
     "year_month",
@@ -145,11 +146,10 @@ fn sha256_file(path: &Path) -> Result<String> {
 type ParquetSummary = (Vec<String>, u64, Option<String>, Option<String>);
 
 fn parquet_summary(path: &Path) -> Result<ParquetSummary> {
-    let mut row_reader = ParquetReader::new(File::open(path)?);
-    let rows = row_reader.num_rows()? as u64;
-    let schema_frame = ParquetReader::new(File::open(path)?)
-        .with_slice(Some((0, 0)))
-        .finish()?;
+    let mut reader =
+        crate::storage::SequentialParquetReader::new(path, None, PARQUET_SUMMARY_BATCH_ROWS)?;
+    let rows = u64::try_from(reader.rows())?;
+    let schema_frame = reader.schema_frame()?;
     let schema = schema_frame
         .schema()
         .iter_fields()
@@ -164,23 +164,29 @@ fn parquet_summary(path: &Path) -> Result<ParquetSummary> {
     if rows == 0 {
         return Ok((schema, rows, None, None));
     }
-    let path_text = path.to_string_lossy();
-    let range = LazyFrame::scan_parquet(path_text.as_ref().into(), Default::default())?
-        .select([
-            col(*date_column)
-                .min()
-                .cast(DataType::String)
-                .alias("minimum_date"),
-            col(*date_column)
-                .max()
-                .cast(DataType::String)
-                .alias("maximum_date"),
-        ])
-        .collect()?;
-    let value = |name: &str| -> Result<Option<String>> {
-        Ok(range.column(name)?.str()?.get(0).map(ToString::to_string))
-    };
-    Ok((schema, rows, value("minimum_date")?, value("maximum_date")?))
+    reader.set_projection(vec![(*date_column).to_string()]);
+    let mut minimum: Option<String> = None;
+    let mut maximum: Option<String> = None;
+    let mut observed_rows = 0_u64;
+    while let Some(batch) = reader.next_batch()? {
+        observed_rows = observed_rows
+            .checked_add(u64::try_from(batch.height())?)
+            .context("fingerprint Parquet row count overflow")?;
+        let dates = batch.column(date_column)?.cast(&DataType::String)?;
+        for date in dates.str()?.iter().flatten() {
+            if minimum.as_deref().is_none_or(|value| date < value) {
+                minimum = Some(date.to_owned());
+            }
+            if maximum.as_deref().is_none_or(|value| date > value) {
+                maximum = Some(date.to_owned());
+            }
+        }
+    }
+    ensure!(
+        observed_rows == rows,
+        "Parquet row conservation failed while fingerprinting"
+    );
+    Ok((schema, rows, minimum, maximum))
 }
 
 fn inspect(path: &TrackedPath) -> Result<ArtifactIdentity> {

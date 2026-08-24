@@ -242,9 +242,12 @@ fn collect_output_summaries(output_dir: &Path, wiki: &str) -> Result<Vec<OutputS
     let mut outputs = Vec::new();
     for path in paths {
         let bytes = fs::metadata(&path)?.len();
-        let parquet_path = path.to_string_lossy().to_string();
-        let df =
-            LazyFrame::scan_parquet(parquet_path.as_str().into(), Default::default())?.collect()?;
+        let mut reader = ParquetReader::new(fs::File::open(&path)?);
+        let rows = reader.num_rows()?;
+        let columns = ParquetReader::new(fs::File::open(&path)?)
+            .with_slice(Some((0, 0)))
+            .finish()?
+            .width();
         let metric = path
             .file_stem()
             .and_then(|stem| stem.to_str())
@@ -252,8 +255,8 @@ fn collect_output_summaries(output_dir: &Path, wiki: &str) -> Result<Vec<OutputS
             .to_string();
         outputs.push(OutputSummary {
             metric,
-            rows: df.height(),
-            columns: df.width(),
+            rows,
+            columns,
             bytes,
         });
     }

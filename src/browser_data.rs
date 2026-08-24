@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, ensure};
+#[cfg(test)]
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -12,6 +13,7 @@ use crate::{licensing, storage};
 pub const INDEX_FILENAME: &str = "browser-data-index.json";
 pub const INDEX_SCHEMA_VERSION: u32 = 1;
 pub const CACHE_SCHEMA_VERSION: u32 = 1;
+const SUMMARY_BATCH_ROWS: usize = 250_000;
 
 pub const BROWSER_METRICS: [(&str, &str); 9] = [
     ("business_funnel", "cohort_year"),
@@ -78,43 +80,54 @@ fn published_wikis(output_dir: &Path, allowlist: Option<&BTreeSet<String>>) -> R
 }
 
 fn summarize(path: &Path, wiki: &str, date_column: &str) -> Result<(u64, String, String)> {
-    let rows = ParquetReader::new(File::open(path)?).num_rows()? as u64;
+    let columns = Some(vec!["wiki".to_string(), date_column.to_string()]);
+    let mut reader = storage::SequentialParquetReader::new(path, columns, SUMMARY_BATCH_ROWS)?;
+    let rows = u64::try_from(reader.rows())?;
     ensure!(
         rows > 0,
         "browser data partition is empty: {}",
         path.display()
     );
-    let path_text = path.to_string_lossy();
-    let summary = LazyFrame::scan_parquet(path_text.as_ref().into(), Default::default())?
-        .select([
-            col("wiki").min().alias("wiki_min"),
-            col("wiki").max().alias("wiki_max"),
-            col(date_column)
-                .min()
-                .cast(DataType::String)
-                .alias("date_min"),
-            col(date_column)
-                .max()
-                .cast(DataType::String)
-                .alias("date_max"),
-        ])
-        .collect()
-        .map_err(anyhow::Error::from)
-        .with_context(|| format!("failed to summarize browser partition {}", path.display()))?;
-    let string = |name: &str| -> Result<String> {
-        summary
-            .column(name)?
-            .str()?
-            .get(0)
-            .map(str::to_owned)
-            .with_context(|| format!("browser partition {} has null {name}", path.display()))
-    };
+    let mut observed_rows = 0_u64;
+    let mut minimum_date: Option<String> = None;
+    let mut maximum_date: Option<String> = None;
+    while let Some(batch) = reader.next_batch()? {
+        observed_rows = observed_rows
+            .checked_add(u64::try_from(batch.height())?)
+            .context("browser partition row count overflow")?;
+        for observed_wiki in batch.column("wiki")?.str()?.iter() {
+            let observed_wiki = observed_wiki
+                .with_context(|| format!("browser partition {} has null wiki", path.display()))?;
+            ensure!(
+                observed_wiki == wiki,
+                "browser partition {} contains rows outside {wiki}",
+                path.display()
+            );
+        }
+        for date in batch.column(date_column)?.str()?.iter() {
+            let date = date.with_context(|| {
+                format!(
+                    "browser partition {} has null {date_column}",
+                    path.display()
+                )
+            })?;
+            if minimum_date.as_deref().is_none_or(|minimum| date < minimum) {
+                minimum_date = Some(date.to_owned());
+            }
+            if maximum_date.as_deref().is_none_or(|maximum| date > maximum) {
+                maximum_date = Some(date.to_owned());
+            }
+        }
+    }
     ensure!(
-        string("wiki_min")? == wiki && string("wiki_max")? == wiki,
-        "browser partition {} contains rows outside {wiki}",
-        path.display()
+        observed_rows == rows,
+        "browser partition row conservation failed",
     );
-    Ok((rows, string("date_min")?, string("date_max")?))
+    Ok((
+        rows,
+        minimum_date.context("browser partition date minimum is null")?,
+        maximum_date.context("browser partition date maximum is null")?,
+    ))
 }
 
 fn build_index(
@@ -308,10 +321,32 @@ mod tests {
             "value" => &[1_i64, 2],
         )
         .expect("mixed-wiki fixture columns have equal lengths");
-        let mut file = File::create(path)?;
+        let mut file = File::create(&path)?;
         ParquetWriter::new(&mut file)
             .set_parallel(false)
             .finish(&mut mixed)?;
+        assert!(materialize(output.path(), Some(&BTreeSet::from(["nlwiki".to_string()]))).is_err());
+
+        let mut null_date = df!(
+            "wiki" => &["nlwiki"],
+            "year_month" => &[None::<&str>],
+            "value" => &[1_i64],
+        )
+        .expect("null-date fixture columns have equal lengths");
+        ParquetWriter::new(File::create(&path)?)
+            .set_parallel(false)
+            .finish(&mut null_date)?;
+        assert!(materialize(output.path(), Some(&BTreeSet::from(["nlwiki".to_string()]))).is_err());
+
+        let mut null_wiki = df!(
+            "wiki" => &[None::<&str>],
+            "year_month" => &["2026-01"],
+            "value" => &[1_i64],
+        )
+        .expect("null-wiki fixture columns have equal lengths");
+        ParquetWriter::new(File::create(&path)?)
+            .set_parallel(false)
+            .finish(&mut null_wiki)?;
         assert!(materialize(output.path(), Some(&BTreeSet::from(["nlwiki".to_string()]))).is_err());
         Ok(())
     }

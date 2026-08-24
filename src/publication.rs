@@ -533,24 +533,11 @@ fn validate_schema(path: &Path, spec: &MetricSpec) -> Result<u64> {
     Ok(rows)
 }
 
-fn string_cell(frame: &DataFrame, name: &str) -> Result<String> {
-    frame
-        .column(name)?
-        .str()?
-        .get(0)
-        .map(str::to_string)
-        .with_context(|| format!("aggregate {name} is null"))
-}
-
 fn summarize_batched(path: &Path, spec: &MetricSpec, batch_rows: usize) -> Result<FileSummary> {
     ensure!(
         batch_rows > 0,
         "publication validation batch size must be positive"
     );
-    let mut metadata_reader = ParquetReader::new(File::open(path)?);
-    let rows = metadata_reader.num_rows()?;
-    ensure!(rows > 0, "{} is empty", path.display());
-
     let mut columns = vec!["wiki".to_string()];
     if let Some(date) = spec.date_column {
         columns.push(date.to_string());
@@ -560,95 +547,96 @@ fn summarize_batched(path: &Path, spec: &MetricSpec, batch_rows: usize) -> Resul
     }
     columns.sort();
     columns.dedup();
+    let mut reader = storage::SequentialParquetReader::new(path, Some(columns), batch_rows)?;
+    let rows = reader.rows();
+    ensure!(rows > 0, "{} is empty", path.display());
 
-    let mut expressions = vec![
-        col("wiki").min().alias("wiki_min"),
-        col("wiki").max().alias("wiki_max"),
-    ];
-    if let Some(date) = spec.date_column {
-        expressions.push(col(date).min().alias("minimum_date"));
-        expressions.push(col(date).max().alias("maximum_date"));
-    }
-    if let Some(total) = spec.conservation_column {
-        expressions.push(
-            col(total)
-                .cast(DataType::Int64)
-                .sum()
-                .alias("conservation_total"),
-        );
-    }
+    let mut wiki_min: Option<String> = None;
+    let mut wiki_max: Option<String> = None;
+    let mut previous_wiki: Option<String> = None;
+    let mut minimum_date: Option<String> = None;
+    let mut maximum_date: Option<String> = None;
+    let mut conservation_total = spec.conservation_column.map(|_| 0_i64);
+    let mut observed_rows = 0_usize;
 
-    let result = (|| -> Result<FileSummary> {
-        let mut wiki_min: Option<String> = None;
-        let mut wiki_max: Option<String> = None;
-        let mut minimum_date: Option<String> = None;
-        let mut maximum_date: Option<String> = None;
-        let mut conservation_total = spec.conservation_column.map(|_| 0_i64);
-        let mut offset = 0_usize;
-
-        while offset < rows {
-            let length = (rows - offset).min(batch_rows);
-            let batch = ParquetReader::new(File::open(path)?)
-                .with_columns(Some(columns.clone()))
-                .with_slice(Some((offset, length)))
-                .set_low_memory(true)
-                .read_parallel(ParallelStrategy::None)
-                .finish()?;
-            let frame = batch.lazy().select(expressions.clone()).collect()?;
-
-            let batch_wiki_min = string_cell(&frame, "wiki_min")?;
-            let batch_wiki_max = string_cell(&frame, "wiki_max")?;
-            if wiki_min
-                .as_ref()
-                .is_none_or(|value| batch_wiki_min.as_str() < value.as_str())
-            {
-                wiki_min = Some(batch_wiki_min);
+    while let Some(batch) = reader.next_batch()? {
+        observed_rows = observed_rows
+            .checked_add(batch.height())
+            .context("publication validation row count overflow")?;
+        let wikis = batch.column("wiki")?.str()?;
+        for wiki in wikis.iter() {
+            let wiki = wiki.with_context(|| format!("{} contains a null wiki", path.display()))?;
+            ensure!(
+                previous_wiki
+                    .as_deref()
+                    .is_none_or(|previous| previous <= wiki),
+                "{} is not in deterministic wiki-major order",
+                path.display()
+            );
+            update_string_range(wiki, &mut wiki_min, &mut wiki_max);
+            if previous_wiki.as_deref() != Some(wiki) {
+                previous_wiki = Some(wiki.to_owned());
             }
-            if wiki_max
-                .as_ref()
-                .is_none_or(|value| batch_wiki_max.as_str() > value.as_str())
-            {
-                wiki_max = Some(batch_wiki_max);
-            }
-            if spec.date_column.is_some() {
-                let batch_minimum = string_cell(&frame, "minimum_date")?;
-                let batch_maximum = string_cell(&frame, "maximum_date")?;
-                if minimum_date
-                    .as_ref()
-                    .is_none_or(|value| batch_minimum.as_str() < value.as_str())
-                {
-                    minimum_date = Some(batch_minimum);
-                }
-                if maximum_date
-                    .as_ref()
-                    .is_none_or(|value| batch_maximum.as_str() > value.as_str())
-                {
-                    maximum_date = Some(batch_maximum);
-                }
-            }
-            if let Some(total) = conservation_total.as_mut() {
-                let batch_total = frame
-                    .column("conservation_total")?
-                    .i64()?
-                    .get(0)
-                    .context("conservation total is null")?;
-                *total = total
-                    .checked_add(batch_total)
-                    .with_context(|| format!("{} conservation total overflow", path.display()))?;
-            }
-            offset += length;
         }
+        if let Some(date) = spec.date_column {
+            for value in batch.column(date)?.str()?.iter() {
+                let value =
+                    value.with_context(|| format!("{} contains a null {date}", path.display()))?;
+                update_string_range(value, &mut minimum_date, &mut maximum_date);
+            }
+        }
+        if let Some(total_column) = spec.conservation_column {
+            let batch_total = sum_conservation_column(&batch, total_column, path)?;
+            let total = conservation_total
+                .as_mut()
+                .context("missing conservation state")?;
+            *total = total
+                .checked_add(batch_total)
+                .with_context(|| format!("{} conservation total overflow", path.display()))?;
+        }
+    }
+    ensure!(
+        observed_rows == rows,
+        "row conservation failed during publication validation"
+    );
 
-        Ok(FileSummary {
-            wiki_min: wiki_min.context("aggregate wiki_min is null")?,
-            wiki_max: wiki_max.context("aggregate wiki_max is null")?,
-            minimum_date,
-            maximum_date,
-            conservation_total,
-        })
-    })();
-    storage::discard_path_cache(path);
-    result
+    Ok(FileSummary {
+        wiki_min: wiki_min.context("aggregate wiki_min is null")?,
+        wiki_max: wiki_max.context("aggregate wiki_max is null")?,
+        minimum_date,
+        maximum_date,
+        conservation_total,
+    })
+}
+
+fn update_string_range(value: &str, minimum: &mut Option<String>, maximum: &mut Option<String>) {
+    if minimum.as_deref().is_none_or(|current| value < current) {
+        *minimum = Some(value.to_owned());
+    }
+    if maximum.as_deref().is_none_or(|current| value > current) {
+        *maximum = Some(value.to_owned());
+    }
+}
+
+fn sum_conservation_column(frame: &DataFrame, name: &str, _path: &Path) -> Result<i64> {
+    let column = frame.column(name)?;
+    ensure!(
+        column.null_count() == 0,
+        "metric contains null conservation values in {name}"
+    );
+    match column.dtype() {
+        DataType::UInt32 => column.u32()?.iter().try_fold(0_i64, |total, value| {
+            total
+                .checked_add(i64::from(value.context("validated non-null UInt32 value")?))
+                .context("conservation batch total overflow")
+        }),
+        DataType::Int64 => column.i64()?.iter().try_fold(0_i64, |total, value| {
+            total
+                .checked_add(value.context("validated non-null Int64 value")?)
+                .context("conservation batch total overflow")
+        }),
+        dtype => anyhow::bail!("conservation column {name} has type {dtype:?}"),
+    }
 }
 
 fn summarize(path: &Path, spec: &MetricSpec) -> Result<FileSummary> {
@@ -1232,6 +1220,22 @@ mod tests {
         )
         .expect("publication summary fixture must be constructible");
         ParquetWriter::new(File::create(&path)?).finish(&mut frame)?;
+        assert!(summarize_batched(&path, &METRICS[8], 1).is_err());
+
+        let mut frame = DataFrame::new(
+            3,
+            vec![
+                Column::new("wiki".into(), ["frwiki", "nlwiki", "ptwiki"]),
+                Column::new(
+                    "week_start".into(),
+                    ["2026-07-27", "2026-07-20", "2026-07-13"],
+                ),
+                Column::new("edits".into(), [5_u32, 7_u32, 3_u32]),
+                Column::new("unused".into(), ["payload", "column", "large"]),
+            ],
+        )
+        .expect("sorted publication summary fixture must be constructible");
+        ParquetWriter::new(File::create(&path)?).finish(&mut frame)?;
 
         let summary = summarize_batched(&path, &METRICS[8], 1)?;
         assert_eq!(summary.wiki_min, "frwiki");
@@ -1240,6 +1244,13 @@ mod tests {
         assert_eq!(summary.maximum_date.as_deref(), Some("2026-07-27"));
         assert_eq!(summary.conservation_total, Some(15));
         assert!(summarize_batched(&path, &METRICS[8], 0).is_err());
+
+        let nullable = df!("edits" => &[Some(1_u32), None])?;
+        assert!(sum_conservation_column(&nullable, "edits", &path).is_err());
+        let signed = df!("edits" => &[2_i64, -1_i64])?;
+        assert_eq!(sum_conservation_column(&signed, "edits", &path)?, 1);
+        let unsupported = df!("edits" => &[1_f64])?;
+        assert!(sum_conservation_column(&unsupported, "edits", &path).is_err());
         Ok(())
     }
 
@@ -1248,13 +1259,13 @@ mod tests {
         let fixture = Fixture::new()?;
         fixture.prepare("run-good")?;
 
-        let validation = validate(
+        validate(
             fixture.data.path(),
             fixture.output.path(),
             &fixture.lifecycle_path,
             "run-good",
-        );
-        validation?;
+        )
+        .expect("complete publication fixture should validate");
         verify(fixture.output.path(), "run-good")?;
 
         let receipt: Value = read_json(&fixture.output.path().join(RECEIPT_FILE))?;
