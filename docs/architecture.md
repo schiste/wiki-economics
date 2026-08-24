@@ -84,6 +84,16 @@ Important decisions:
   checks the exact source allowlist and exact Parquet inventory. This preserves
   fail-closed completeness without rescanning the full generation once per
   source.
+- Finalization writes an atomic, deterministic `generation-manifest.json` that
+  allowlists every immutable analytical and warehouse fragment with its source
+  identity, row count, byte size, and SHA-256. Once a snapshot is selected,
+  core compute, weekly aggregation, patrol compute, and their fingerprints read
+  only manifest-listed fragments; filesystem discovery is retained solely for
+  imported legacy datasets that have no snapshot pointer. Unlisted or abandoned
+  Parquets therefore cannot enter a computation.
+- Fragment compaction is not currently performed. If introduced, it must be a
+  separately fingerprinted transaction that publishes a replacement generation
+  manifest rather than appending to or rewriting selected fragments in place.
 - Versioned Wikimedia filenames must form one complete expected snapshot before `current-snapshot.json` is published. Explicit `run --version` and `ingest --version` selections ignore abandoned raw files from older snapshots.
 - Readers retain a legacy-layout fallback only until the first generation pointer is published. Underscore-prefixed staging/generation directories are never recursively scanned as ordinary data.
 - Output is partitioned by `year=` and `year_month=` because the downstream metrics are monthly. This keeps month-scoped compute exact without loading an entire wiki.

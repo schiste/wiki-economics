@@ -159,6 +159,12 @@ scan for each of enwiki's hundreds of sources. Enwiki remains lifecycle-gated
 because bounded compute and production qualification are still separate
 requirements.
 
+Finalization also publishes a deterministic fragment manifest containing the
+complete analytical and warehouse allowlist plus rows, bytes, and SHA-256 for
+each source-owned Parquet. Compute and patrol derive their file and partition
+lists from that manifest, so abandoned files and concurrent source-worker
+artifacts cannot leak into an enwiki computation.
+
 The implemented source-plan contract:
 
 - resolve the newest completed snapshot once and pin it to the run;
