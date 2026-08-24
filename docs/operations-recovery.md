@@ -31,7 +31,9 @@ reconciliation, and total duration; sampled/cgroup peak memory; scratch and
 combined scratch-plus-output peak; project storage before/after and estimated
 persistent peak; output rows, edit total, range, bytes, and SHA-256.
 
-Combine the evidence only after every job succeeds:
+Combine the evidence after every job has emitted a complete report. A benchmark
+may exit non-zero because its resource gate failed; that report is still
+required experimental evidence:
 
 ```sh
 node scripts/qualify-capacity.cjs \
@@ -39,10 +41,14 @@ node scripts/qualify-capacity.cjs \
   --output /data/project/wiki-economics/capacity/frwiki-qualification.json
 ```
 
-This fails unless all variants are production-equivalent, all gates pass, and
-the three frwiki variants have identical output identity. Frwiki remains
-paused until the result says `qualified: true` and production has at least 25%
-memory headroom plus the configured 50 GiB storage reserve.
+This fails unless all variants used the production limits and the three
+frwiki variants have identical logical output (snapshot, rows, edit total, and
+date range). At least one frwiki variant must pass both resource gates; failed
+alternatives remain visible in the qualification evidence. Repeat the selected
+variant and require the same output SHA-256 before lifecycle activation.
+Frwiki remains paused until the result says `qualified: true` and the selected
+configuration has at least 25% memory headroom plus the configured 50 GiB
+storage reserve.
 
 ## Imported-data backup and restore
 
