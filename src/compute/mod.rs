@@ -24,6 +24,7 @@ use crate::{
 const COMPUTE_ALGORITHM_VERSION: &str = "core-metrics-v5-two-level-weekly-buckets";
 const DEFAULT_WEEKLY_BUCKET_COUNT: usize = 256;
 const DEFAULT_SECONDARY_BUCKET_COUNT: usize = 1;
+const WEEKLY_ROUTING_BATCH_ROWS: usize = 250_000;
 const SUPPORTED_PRIMARY_BUCKET_COUNTS: [usize; 5] = [64, 128, 256, 512, 1024];
 #[cfg(test)]
 const FLAT_BENCHMARK_BUCKET_COUNTS: [usize; 3] = [256, 512, 1024];
@@ -1389,27 +1390,6 @@ struct SecondaryRouting {
     rows: Vec<usize>,
 }
 
-fn parquet_row_group_slices(path: &Path) -> Result<Vec<(usize, usize)>> {
-    let mut reader = ParquetReader::new(File::open(path)?);
-    let row_counts = reader
-        .get_metadata()?
-        .row_groups
-        .iter()
-        .map(|group| group.num_rows())
-        .collect::<Vec<_>>();
-    let mut offset = 0usize;
-    row_counts
-        .into_iter()
-        .map(|rows| {
-            let slice = (offset, rows);
-            offset = offset
-                .checked_add(rows)
-                .context("Parquet row-group offset overflow")?;
-            Ok(slice)
-        })
-        .collect()
-}
-
 fn parquet_paths_row_count(paths: &[PathBuf]) -> Result<u64> {
     paths.iter().try_fold(0u64, |total, path| {
         let rows = ParquetReader::new(File::open(path)?).num_rows()?;
@@ -1417,14 +1397,6 @@ fn parquet_paths_row_count(paths: &[PathBuf]) -> Result<u64> {
             .checked_add(u64::try_from(rows)?)
             .context("Parquet row count overflow")
     })
-}
-
-fn read_parquet_slice(path: &Path, offset: usize, rows: usize) -> Result<DataFrame> {
-    Ok(ParquetReader::new(File::open(path)?)
-        .with_slice(Some((offset, rows)))
-        .read_parallel(ParallelStrategy::None)
-        .set_low_memory(true)
-        .finish()?)
 }
 
 fn route_primary_to_secondary_buckets(
@@ -1447,9 +1419,14 @@ fn route_primary_to_secondary_buckets(
     let mut rows = vec![0usize; secondary_bucket_count];
     let mut edits = vec![0i64; secondary_bucket_count];
     let mut writers: BTreeMap<usize, BatchedWriter<File>> = BTreeMap::new();
+    let mut reader =
+        storage::SequentialParquetReader::new(primary_path, None, WEEKLY_ROUTING_BATCH_ROWS)?;
+    anyhow::ensure!(
+        reader.rows() == expected.rows,
+        "primary bucket {primary_bucket} footer row count changed before secondary routing"
+    );
 
-    for (offset, row_count) in parquet_row_group_slices(primary_path)? {
-        let batch = read_parquet_slice(primary_path, offset, row_count)?;
+    while let Some(batch) = reader.next_batch()? {
         let input_edits = sum_edits_column(std::slice::from_ref(&batch))?;
         let page_ids = batch.column("page_id")?.i64()?;
         let mut row_indices: Vec<Vec<IdxSize>> =

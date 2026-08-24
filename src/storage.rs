@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, ensure};
-use polars::prelude::{ParquetReader, SerReader};
+use polars::io::parquet::metadata::FileMetadataRef;
+use polars::prelude::{DataFrame, ParallelStrategy, ParquetReader, SerReader};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -1206,6 +1207,146 @@ pub fn sha256_file(path: &Path) -> Result<(u64, String)> {
     Ok((bytes, hex::encode(hasher.finalize())))
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ParquetBatchSlice {
+    offset: usize,
+    rows: usize,
+    completed_byte_range: Option<(u64, u64)>,
+}
+
+/// A projected Parquet reader that parses metadata once and advances through
+/// physical row groups in file order. A large row group is subdivided without
+/// rereading preceding groups, so live DataFrame state is capped by
+/// `maximum_batch_rows` rather than the file's total row count.
+pub(crate) struct SequentialParquetReader {
+    path: PathBuf,
+    file: File,
+    metadata: FileMetadataRef,
+    columns: Option<Vec<String>>,
+    slices: Vec<ParquetBatchSlice>,
+    next_slice: usize,
+    rows: usize,
+    bytes: u64,
+    cache_released: bool,
+}
+
+impl SequentialParquetReader {
+    pub(crate) fn new(
+        path: &Path,
+        columns: Option<Vec<String>>,
+        maximum_batch_rows: usize,
+    ) -> Result<Self> {
+        ensure!(
+            maximum_batch_rows > 0,
+            "sequential Parquet batch size must be positive"
+        );
+        let file = File::open(path)
+            .with_context(|| format!("failed to open Parquet input {}", path.display()))?;
+        prepare_sequential_read(&file);
+        let bytes = file.metadata()?.len();
+        let mut metadata_reader = ParquetReader::new(file.try_clone()?);
+        let metadata = metadata_reader
+            .get_metadata()
+            .with_context(|| format!("unreadable Parquet footer in {}", path.display()))?
+            .clone();
+        let rows = metadata.num_rows;
+        let mut slices = Vec::new();
+        let mut offset = 0usize;
+        for row_group in &metadata.row_groups {
+            let row_group_rows = row_group.num_rows();
+            let byte_range = row_group.full_byte_range();
+            let byte_length = byte_range
+                .end
+                .checked_sub(byte_range.start)
+                .context("invalid Parquet row-group byte range")?;
+            let mut remaining = row_group_rows;
+            while remaining > 0 {
+                let batch_rows = remaining.min(maximum_batch_rows);
+                remaining -= batch_rows;
+                slices.push(ParquetBatchSlice {
+                    offset,
+                    rows: batch_rows,
+                    completed_byte_range: (remaining == 0)
+                        .then_some((byte_range.start, byte_length)),
+                });
+                offset = offset
+                    .checked_add(batch_rows)
+                    .context("Parquet batch row offset overflow")?;
+            }
+        }
+        ensure!(
+            offset == rows,
+            "Parquet row-group totals disagree with footer"
+        );
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+            metadata,
+            columns,
+            slices,
+            next_slice: 0,
+            rows,
+            bytes,
+            cache_released: false,
+        })
+    }
+
+    pub(crate) fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub(crate) fn schema_frame(&self) -> Result<DataFrame> {
+        self.read_slice(0, 0)
+    }
+
+    pub(crate) fn set_projection(&mut self, columns: Vec<String>) {
+        self.columns = Some(columns);
+    }
+
+    pub(crate) fn next_batch(&mut self) -> Result<Option<DataFrame>> {
+        let Some(slice) = self.slices.get(self.next_slice).copied() else {
+            self.release_cache();
+            return Ok(None);
+        };
+        let frame = self.read_slice(slice.offset, slice.rows)?;
+        ensure!(
+            frame.height() == slice.rows,
+            "short sequential Parquet read"
+        );
+        self.next_slice += 1;
+        if let Some((offset, length)) = slice.completed_byte_range {
+            discard_file_cache(&self.file, offset, length);
+        }
+        Ok(Some(frame))
+    }
+
+    fn read_slice(&self, offset: usize, rows: usize) -> Result<DataFrame> {
+        let mut reader = ParquetReader::new(self.file.try_clone()?)
+            .with_columns(self.columns.clone())
+            .with_slice(Some((offset, rows)))
+            .set_low_memory(true)
+            .read_parallel(ParallelStrategy::None);
+        reader.set_metadata(self.metadata.clone());
+        reader
+            .finish()
+            .map_err(anyhow::Error::from)
+            .with_context(|| format!("failed reading Parquet input {}", self.path.display()))
+    }
+
+    fn release_cache(&mut self) {
+        if !self.cache_released {
+            discard_file_cache(&self.file, 0, self.bytes);
+            self.cache_released = true;
+        }
+    }
+}
+
+impl Drop for SequentialParquetReader {
+    fn drop(&mut self) {
+        self.release_cache();
+    }
+}
+
 /// Tell Linux that a file is being consumed sequentially and that completed
 /// ranges need not remain in the cgroup's page cache. These are best-effort
 /// performance hints: hashing and durability never depend on kernel support.
@@ -1657,6 +1798,58 @@ mod tests {
     use polars::prelude::*;
 
     type MarkerMutation = Box<dyn FnOnce(&mut Value)>;
+
+    #[test]
+    fn sequential_parquet_reader_projects_and_advances_through_row_groups() -> Result<()> {
+        let directory = TestDir::new()?;
+        let path = directory.path().join("sequential.parquet");
+        let mut frame = df!(
+            "key" => &[1_i64, 2, 3, 4, 5],
+            "payload" => &["a", "b", "c", "d", "e"],
+        )
+        .expect("sequential reader fixture columns have equal lengths");
+        ParquetWriter::new(File::create(&path)?)
+            .with_row_group_size(Some(2))
+            .finish(&mut frame)?;
+
+        let mut reader = SequentialParquetReader::new(&path, Some(vec!["key".to_string()]), 1)?;
+        assert_eq!(reader.rows(), 5);
+        let schema = reader.schema_frame()?;
+        assert_eq!(schema.width(), 1);
+        assert_eq!(schema.get_column_names()[0].as_str(), "key");
+        let mut values = Vec::new();
+        while let Some(batch) = reader.next_batch()? {
+            assert!(batch.height() <= 1);
+            values.extend(batch.column("key")?.i64()?.into_no_null_iter());
+        }
+        assert_eq!(values, [1, 2, 3, 4, 5]);
+        assert!(reader.next_batch()?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn sequential_parquet_reader_handles_empty_and_invalid_inputs() -> Result<()> {
+        let directory = TestDir::new()?;
+        let empty_path = directory.path().join("empty.parquet");
+        let mut empty = df!("key" => Vec::<i64>::new())?;
+        ParquetWriter::new(File::create(&empty_path)?).finish(&mut empty)?;
+        let mut empty_reader = SequentialParquetReader::new(&empty_path, None, 2)?;
+        assert_eq!(empty_reader.rows(), 0);
+        let schema = empty_reader.schema_frame()?;
+        assert_eq!(schema.width(), 1);
+        assert_eq!(schema.get_column_names()[0].as_str(), "key");
+        assert!(empty_reader.next_batch()?.is_none());
+
+        assert!(SequentialParquetReader::new(&empty_path, None, 0).is_err());
+        let corrupt_path = directory.path().join("corrupt.parquet");
+        fs::write(&corrupt_path, b"not parquet")?;
+        assert!(SequentialParquetReader::new(&corrupt_path, None, 2).is_err());
+        assert!(
+            SequentialParquetReader::new(&directory.path().join("missing.parquet"), None, 2)
+                .is_err()
+        );
+        Ok(())
+    }
 
     fn marker_fixture(
         root: &Path,
