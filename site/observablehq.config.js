@@ -138,12 +138,6 @@ document.addEventListener("DOMContentLoaded",function(){
         { name: "Business Health", path: "/business" },
       ],
     },
-    {
-      name: "About",
-      pages: [
-        { name: "Legal & Attribution", path: "/legal" },
-      ],
-    },
     ...(isDev ? [{
       name: "System",
       pages: [
