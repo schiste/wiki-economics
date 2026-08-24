@@ -39,6 +39,15 @@ export WIKI_ECON_LOG_ANSI=0
 # eight host CPUs. Match data-parallel pools to the real quota by default.
 export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-1}"
 export POLARS_MAX_THREADS="${POLARS_MAX_THREADS:-1}"
+# Production capacity qualification selected 256 stable weekly buckets.
+# Reject an accidental Toolforge environment override instead of silently
+# running a configuration that failed the 25% memory-headroom gate.
+WIKI_ECON_WEEKLY_BUCKET_COUNT="${WIKI_ECON_WEEKLY_BUCKET_COUNT:-256}"
+if [ "$WIKI_ECON_WEEKLY_BUCKET_COUNT" != "256" ]; then
+  echo "Toolforge refresh requires WIKI_ECON_WEEKLY_BUCKET_COUNT=256 (got: $WIKI_ECON_WEEKLY_BUCKET_COUNT)" >&2
+  exit 2
+fi
+export WIKI_ECON_WEEKLY_BUCKET_COUNT
 REFRESH_LOCK_HEARTBEAT_SECS="${WIKI_ECON_REFRESH_LOCK_HEARTBEAT_SECS:-60}"
 REFRESH_LOCK_STALE_SECS="${WIKI_ECON_REFRESH_LOCK_STALE_SECS:-21600}"
 REFRESH_LOCK_RECHECK_SECS="${WIKI_ECON_REFRESH_LOCK_RECHECK_SECS:-2}"
