@@ -381,9 +381,13 @@ ssh login.toolforge.org \
   < deploy/toolforge/rebuild-image.sh
 ```
 
-Reload `deploy/toolforge/jobs.yaml` when the job definition changes. The file
-uses the field names emitted by Toolforge CLI 0.3.9's `jobs dump`; inspect a
-fresh dump when upgrading the CLI. The release artifact and checksum are
+Run `deploy/toolforge/load-scheduled-jobs.sh deploy/toolforge/jobs.yaml` when
+the job definitions change. Do not bulk-load the YAML directly: Toolforge CLI
+0.3.9 starts every unscheduled definition as a one-off. The allowlisted loader
+keeps the legacy refresh/stage definitions absent until an operator deliberately
+loads one with `toolforge jobs load --job <name> ...`. The YAML uses the field
+names emitted by `jobs dump`; inspect a fresh dump when upgrading the CLI. The
+release artifact and checksum are
 retained in GitHub for 30 days. NFS storage is bounded to three
 attestation- and envelope-verified, smoke-tested releases by default: the live target and two
 rollback candidates. Cleanup fails closed if the live symlink is malformed or

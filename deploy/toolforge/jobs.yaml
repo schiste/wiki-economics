@@ -1,7 +1,10 @@
 # Toolforge Jobs definitions for wiki-economics.
 #
-# Load with:
-#   toolforge jobs load deploy/toolforge/jobs.yaml
+# Load the production schedules with:
+#   deploy/toolforge/load-scheduled-jobs.sh deploy/toolforge/jobs.yaml
+# Never bulk-load this file directly: Toolforge treats definitions without a
+# schedule as one-offs and starts them immediately. To deliberately launch one
+# legacy job, use `toolforge jobs load --job <name> deploy/toolforge/jobs.yaml`.
 #
 # Replace <TOOL_IMAGE> with a short image name from `toolforge jobs images`
 # after `toolforge build start <repo-url>` finishes (Toolforge's Build

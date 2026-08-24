@@ -163,9 +163,10 @@ For a fresh Toolforge tool account:
 3. Create the tool-wide `WIKI_ECON_BIN`, `WIKI_ECON_DATA_DIR`,
    `WIKI_ECON_OUTPUT_DIR`, and `WIKI_ECON_SITE_DIST_DIR` values shown in the
    [Toolforge runbook](../deploy/toolforge/README.md#operator-prerequisites).
-4. Start the Build Service webservice from `Procfile`, load
-   `deploy/toolforge/jobs.yaml`, and confirm the three preparation Jobs, the
-   publisher Job, the on-demand compatibility Job, and webservice are healthy.
+4. Start the Build Service webservice from `Procfile`, run the allowlisted
+   `deploy/toolforge/load-scheduled-jobs.sh`, and confirm the three preparation
+   Jobs and publisher Job are waiting for their schedules, the legacy one-off
+   Jobs are absent, and the webservice is healthy.
 5. Run one preparation Job manually and then invoke
    `deploy/toolforge/run-publish-ready.sh`; validate the per-wiki run record,
    publication receipt, current site symlink, and public freshness endpoint
