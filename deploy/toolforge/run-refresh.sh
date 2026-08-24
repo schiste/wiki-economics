@@ -56,6 +56,17 @@ if [ "$WIKI_ECON_WEEKLY_BUCKET_COUNT" != "256" ]; then
   exit 2
 fi
 export WIKI_ECON_WEEKLY_BUCKET_COUNT
+# Which portion of the pipeline to run. `all` (the weekly scheduled job) runs
+# everything; `ingest`/`compute`/`site` are for on-demand jobs that trigger
+# just one stage between scheduled runs.
+REFRESH_STAGE="${WIKI_ECON_REFRESH_STAGE:-all}"
+case "$REFRESH_STAGE" in
+  all|ingest|compute|site) ;;
+  *)
+    echo "Toolforge refresh requires WIKI_ECON_REFRESH_STAGE to be all, ingest, compute, or site (got: $REFRESH_STAGE)" >&2
+    exit 2
+    ;;
+esac
 REFRESH_LOCK_HEARTBEAT_SECS="${WIKI_ECON_REFRESH_LOCK_HEARTBEAT_SECS:-60}"
 REFRESH_LOCK_STALE_SECS="${WIKI_ECON_REFRESH_LOCK_STALE_SECS:-21600}"
 REFRESH_LOCK_RECHECK_SECS="${WIKI_ECON_REFRESH_LOCK_RECHECK_SECS:-2}"
@@ -460,9 +471,13 @@ printf '\n'
 selected_snapshot="$(RUST_LOG=error "${resolve_cmd[@]}")"
 set_refresh_lock_snapshot "$selected_snapshot"
 
-echo "==> Toolforge refresh: ${wikis[*]} (snapshot $SELECTED_SNAPSHOT)"
+echo "==> Toolforge refresh: ${wikis[*]} (snapshot $SELECTED_SNAPSHOT, stage $REFRESH_STAGE)"
 refresh_driver="${WIKI_ECON_REFRESH_DRIVER:-$ROOT/scripts/refresh.sh}"
-"$refresh_driver" --version "$SELECTED_SNAPSHOT" "${wikis[@]}"
+declare -a refresh_driver_cmd=(--version "$SELECTED_SNAPSHOT" "${wikis[@]}")
+if [ "$REFRESH_STAGE" != "all" ]; then
+  refresh_driver_cmd+=(--stage "$REFRESH_STAGE")
+fi
+"$refresh_driver" "${refresh_driver_cmd[@]}"
 
 ARTIFACT_CHECK_STARTED_EPOCH="$(date +%s)"
 wiki_econ_record_stage_event started artifact_check

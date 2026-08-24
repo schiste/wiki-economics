@@ -223,6 +223,27 @@ test("production refresh rejects an unqualified weekly bucket override", () => {
   assert.equal(fs.existsSync(path.join(fixture.output, ".refresh-lock")), false);
 });
 
+test("production refresh rejects an unknown stage", () => {
+  const fixture = createFixture("unknown-stage");
+  const result = runFixture(fixture, {WIKI_ECON_REFRESH_STAGE: "bogus"});
+  assert.equal(result.status, 2, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stderr, /requires WIKI_ECON_REFRESH_STAGE to be all, ingest, compute, or site/);
+  assert.equal(fs.existsSync(path.join(fixture.output, ".refresh-lock")), false);
+});
+
+test("an on-demand stage is passed through to the refresh driver", () => {
+  const fixture = createFixture("stage-passthrough");
+  const result = runFixture(fixture, {
+    WIKI_ECON_REFRESH_STAGE: "ingest",
+    FAKE_DRIVER_ARGS: fixture.driverArgs,
+  });
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.equal(
+    fs.readFileSync(fixture.driverArgs, "utf8").trim(),
+    "--version 2026-07 frwiki nlwiki ptwiki --stage ingest",
+  );
+});
+
 test("a demonstrably stale cross-job lock is recovered", () => {
   const fixture = createFixture("stale");
   const lockDir = path.join(fixture.output, ".refresh-lock");
