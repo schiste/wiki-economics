@@ -82,12 +82,13 @@ contract.
    data while the imported baseline remains recoverable.
 5. Change `refresh` to `scheduled`, add `freshness_sla_days`, and deploy again.
 
-For frwiki, step 1 also requires the three 256/512/1024 Toolforge capacity
+For a large wiki, step 1 also requires the 256/512/1024 Toolforge capacity
 reports described in [benchmarking](benchmarking.md). The selected variant
 must retain at least 25% cgroup memory headroom, the NFS storage gate must
 cover the raw transient plus a second immutable generation and scratch, and a
-repeat run must produce the same output SHA-256. A successful run that merely
-avoids OOM is not sufficient evidence to change its lifecycle state.
+repeat run must produce the same output SHA-256. Frwiki satisfied this gate on
+2026-08-24 and is fixed to 256 buckets. A successful run that merely avoids
+OOM is not sufficient evidence for another large-wiki lifecycle transition.
 
 ### Pause a scheduled wiki
 

@@ -46,13 +46,14 @@ frwiki variants have identical logical output (snapshot, rows, edit total, and
 date range). At least one frwiki variant must pass both resource gates; failed
 alternatives remain visible in the qualification evidence. Repeat the selected
 variant and require the same output SHA-256 before lifecycle activation.
-Frwiki remains paused until the result says `qualified: true` and the selected
-configuration has at least 25% memory headroom plus the configured 50 GiB
-storage reserve.
+Frwiki passed this gate on 2026-08-24 with two byte-identical 256-bucket runs;
+production rejects other bucket counts. Any future bucket or resource-policy
+change requires a new qualification with at least 25% memory headroom plus the
+configured 50 GiB storage reserve.
 
 ## Imported-data backup and restore
 
-The `local-import` datasets (`elwiki`, `frwiki`, and `svwiki` today) are not
+The current `local-import` datasets (`elwiki` and `svwiki`) are not
 reconstructible from Toolforge's current warehouse. Create the archive on
 Toolforge, download it to physically separate storage, verify it there, and
 then remove only the temporary Toolforge copy:
@@ -115,7 +116,7 @@ and patrol sources, runs merge/publication validation, and performs a real
 Observable production build:
 
 ```sh
-deploy/toolforge/run-rebuild-drill.sh IMPORTED_BACKUP nlwiki ptwiki
+deploy/toolforge/run-rebuild-drill.sh IMPORTED_BACKUP frwiki nlwiki ptwiki
 ```
 
 Both commands write compact JSON evidence below

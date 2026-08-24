@@ -65,10 +65,11 @@ If a change affects ingest, storage layout, or Polars behavior, benchmark with d
 
 ## Toolforge capacity qualification
 
-`frwiki` must remain `refresh: paused` until three independent one-off jobs
-measure its full warehouse under Toolforge's 6 GiB cgroup and at least one
-variant qualifies. Run each bucket count in a fresh container so `memory.peak`
-is isolated per variant:
+Before activating a large wiki, independent one-off jobs must measure its full
+warehouse under Toolforge's 6 GiB cgroup and at least one variant must qualify.
+Run each bucket count in a fresh container so `memory.peak` is isolated per
+variant. Frwiki completed this gate on 2026-08-24; 256 buckets is the only
+qualified production configuration and is enforced by the Toolforge wrapper:
 
 Toolforge's persistent NFS currently has no per-tool quota, as documented by
 the [ToolsNfsAlmostFull runbook](https://wikitech.wikimedia.org/wiki/Portal:Toolforge/Admin/Runbooks/ToolsNfsAlmostFull).

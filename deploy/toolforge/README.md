@@ -13,9 +13,9 @@ currently has no per-tool quota; its free space is shared capacity, not a
 private reservation. Measure live headroom and keep reproducible data bounded.
 The [generated lifecycle table](../../docs/generated/stack-reference.md#published-wiki-lifecycle)
 is the source of truth for scheduled Toolforge datasets and paused imports.
-frwiki still requires the measured capacity qualification documented in
-[`docs/benchmarking.md`](../../docs/benchmarking.md) before its lifecycle can
-change. enwiki is out of scope for Toolforge entirely.
+frwiki completed the measured capacity qualification documented in
+[`docs/benchmarking.md`](../../docs/benchmarking.md) and uses the qualified
+256-bucket configuration. enwiki is out of scope for Toolforge entirely.
 
 ## Files
 
@@ -216,6 +216,19 @@ snapshot `2026-07` completed under the normal 6 GiB / one-CPU Toolforge job:
 The lifecycle registry is the production selector. Do not retain a duplicate
 `WIKI_ECON_REFRESH_WIKIS` or legacy `WIKI_ECON_ENABLED_WIKIS` value unless an
 operator is intentionally running a one-off subset.
+
+### frwiki production qualification
+
+frwiki joined the Toolforge lifecycle after the 2026-08-24 qualification
+against snapshot `2026-07`. Two fresh 256-bucket containers produced the same
+119,855,668-row output and identical SHA-256 with 36.1–38.2% memory headroom.
+The 512-bucket alternative retained only 15.4% headroom and the 1024-bucket
+alternative reached the 6 GiB cgroup limit, so `run-refresh.sh` fails closed
+unless `WIKI_ECON_WEEKLY_BUCKET_COUNT=256`.
+
+The imported `2026-03` generation and its checksummed secondary backup remain
+the rollback boundary until the first complete Toolforge refresh passes the
+publication gate and public freshness checks.
 
 ### First cutover
 
