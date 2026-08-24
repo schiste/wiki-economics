@@ -129,6 +129,24 @@ function finiteCounter(file) {
   return Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 
+function cgroupCpu(file) {
+  const counters = {};
+  for (const line of readText(file).split(/\r?\n/)) {
+    const [name, rawValue, ...extra] = line.trim().split(/\s+/);
+    const value = Number(rawValue);
+    if (!name || extra.length > 0 || !Number.isSafeInteger(value) || value < 0) continue;
+    counters[name] = value;
+  }
+  return {
+    usageUsec: counters.usage_usec ?? null,
+    userUsec: counters.user_usec ?? null,
+    systemUsec: counters.system_usec ?? null,
+    periods: counters.nr_periods ?? null,
+    throttledPeriods: counters.nr_throttled ?? null,
+    throttledUsec: counters.throttled_usec ?? null,
+  };
+}
+
 function diskSpace(directory) {
   try {
     const stats = fs.statfsSync(directory, {bigint: true});
@@ -227,6 +245,7 @@ function buildRecord(environment, finalExitCode = null) {
   const publishedSiteGeneration = siteGeneration(environment.WIKI_ECON_SITE_DIST_DIR);
   const noOp = isFinal && finalExitCode === 0 && events.stages.length > 0 &&
     events.stages.every((stage) => stage.reused || stage.skipped || stage.stage === "snapshot_resolve");
+  const cgroupRoot = environment.WIKI_ECON_CGROUP_ROOT || "/sys/fs/cgroup";
 
   return {
     schemaVersion: 2,
@@ -256,9 +275,10 @@ function buildRecord(environment, finalExitCode = null) {
       imageDigest: environment.WIKI_ECON_IMAGE_DIGEST || null,
     },
     publication,
-    memoryCurrentBytes: finiteCounter("/sys/fs/cgroup/memory.current"),
-    memoryPeakBytes: finiteCounter("/sys/fs/cgroup/memory.peak"),
-    memoryLimitBytes: finiteCounter("/sys/fs/cgroup/memory.max"),
+    memoryCurrentBytes: finiteCounter(path.join(cgroupRoot, "memory.current")),
+    memoryPeakBytes: finiteCounter(path.join(cgroupRoot, "memory.peak")),
+    memoryLimitBytes: finiteCounter(path.join(cgroupRoot, "memory.max")),
+    cpu: cgroupCpu(path.join(cgroupRoot, "cpu.stat")),
     disk: diskSpace(environment.WIKI_ECON_OUTPUT_DIR),
     publishedSiteGeneration,
     logFile: environment.WIKI_ECON_RUN_LOG_FILE ? path.basename(environment.WIKI_ECON_RUN_LOG_FILE) : null,
@@ -284,6 +304,7 @@ function compactHistoryEntry(record) {
     error: record.error,
     memoryPeakBytes: record.memoryPeakBytes,
     memoryLimitBytes: record.memoryLimitBytes,
+    cpu: record.cpu,
     diskFreeBytes: record.disk.freeBytes,
     publishedSiteGeneration: record.publishedSiteGeneration,
     logFile: record.logFile,
@@ -350,6 +371,7 @@ function structuredSummaries(record) {
     error: record.error,
     memoryPeakBytes: record.memoryPeakBytes,
     memoryLimitBytes: record.memoryLimitBytes,
+    cpu: record.cpu,
     diskFreeBytes: record.disk.freeBytes,
     publishedSiteGeneration: record.publishedSiteGeneration,
   }));
@@ -401,6 +423,7 @@ module.exports = {
   buildRecord,
   compactHistoryEntry,
   conciseError,
+  cgroupCpu,
   diskSpace,
   foldStageEvents,
   historyLimit,

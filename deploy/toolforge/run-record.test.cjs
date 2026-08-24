@@ -8,6 +8,7 @@ const {after, test} = require("node:test");
 const {
   appendEvent,
   buildRecord,
+  cgroupCpu,
   conciseError,
   foldStageEvents,
   historyLimit,
@@ -32,8 +33,23 @@ function fixture(name) {
   fs.symlinkSync(path.basename(distGeneration), dist);
   fs.writeFileSync(path.join(lock, "run-state"), "running\n");
   fs.writeFileSync(path.join(lock, "selected-snapshot"), "2026-07\n");
+  const cgroup = path.join(root, "cgroup");
+  fs.mkdirSync(cgroup);
+  fs.writeFileSync(path.join(cgroup, "memory.current"), "123456\n");
+  fs.writeFileSync(path.join(cgroup, "memory.peak"), "654321\n");
+  fs.writeFileSync(path.join(cgroup, "memory.max"), "6442450944\n");
+  fs.writeFileSync(path.join(cgroup, "cpu.stat"), [
+    "usage_usec 12000000",
+    "user_usec 9000000",
+    "system_usec 3000000",
+    "nr_periods 140",
+    "nr_throttled 7",
+    "throttled_usec 500000",
+    "",
+  ].join("\n"));
   const environment = {
     WIKI_ECON_BINARY_SHA256: "a".repeat(64),
+    WIKI_ECON_CGROUP_ROOT: cgroup,
     WIKI_ECON_IMAGE_SOURCE_COMMIT: "b".repeat(40),
     WIKI_ECON_IMAGE_SOURCE_REF: "main",
     WIKI_ECON_IMAGE_DIGEST: `registry/image@sha256:${"d".repeat(64)}`,
@@ -99,6 +115,15 @@ test("live and final records combine provenance, resources, publication, and sit
   assert.equal(live.provenance.imageSourceRef, "main");
   assert.equal(live.provenance.imageDigest, environment.WIKI_ECON_IMAGE_DIGEST);
   assert.equal(live.disk.path, environment.WIKI_ECON_OUTPUT_DIR);
+  assert.equal(live.memoryPeakBytes, 654321);
+  assert.deepEqual(live.cpu, {
+    usageUsec: 12000000,
+    userUsec: 9000000,
+    systemUsec: 3000000,
+    periods: 140,
+    throttledPeriods: 7,
+    throttledUsec: 500000,
+  });
 
   appendEvent(environment.WIKI_ECON_RUN_EVENTS_FILE, "completed", "compute", "nlwiki", 800);
   fs.writeFileSync(environment.WIKI_ECON_RUN_PUBLICATION_FILE, JSON.stringify({
@@ -188,6 +213,14 @@ test("parsers and bounds fail safely", () => {
   assert.equal(historyLimit("1000"), 104);
   assert.equal(historyLimit("bad"), 104);
   assert.equal(publicationSummary({run_id: "other"}, "current"), null);
+  assert.deepEqual(cgroupCpu(path.join(fixtureRoot, "missing-cpu.stat")), {
+    usageUsec: null,
+    userUsec: null,
+    systemUsec: null,
+    periods: null,
+    throttledPeriods: null,
+    throttledUsec: null,
+  });
 });
 
 test("structured summaries are log-safe and per-run logs retain 104 files", () => {
@@ -198,6 +231,7 @@ test("structured summaries are log-safe and per-run logs retain 104 files", () =
   assert.equal(summaries[0].type, "wiki_econ_stage_summary");
   assert.equal(summaries[0].durationMs, 25);
   assert.equal(summaries.at(-1).type, "wiki_econ_run_summary");
+  assert.equal(summaries.at(-1).cpu.usageUsec, 12000000);
 
   const logs = path.join(output, "logs");
   fs.mkdirSync(logs);
