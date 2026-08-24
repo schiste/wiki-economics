@@ -16,6 +16,7 @@ mod merge;
 mod observability;
 mod patrol;
 mod publication;
+mod resource_governor;
 mod schema;
 mod snapshot_plan;
 mod source_window;

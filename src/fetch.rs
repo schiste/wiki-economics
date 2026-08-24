@@ -999,6 +999,28 @@ fn probe_remote_file<T: HttpTransport>(transport: &T, url: &str) -> Result<Optio
     Ok(None)
 }
 
+/// Resolve compressed source sizes once for resource preflight. Keeping this
+/// separate from download means the orchestrator can reject an oversized
+/// snapshot before opening a candidate-generation transaction.
+pub(crate) fn snapshot_source_sizes(sources: &[SourceSpec]) -> Result<Vec<Option<u64>>> {
+    let transport = build_transport()?;
+    snapshot_source_sizes_with_transport(&transport, sources)
+}
+
+fn snapshot_source_sizes_with_transport<T: HttpTransport>(
+    transport: &T,
+    sources: &[SourceSpec],
+) -> Result<Vec<Option<u64>>> {
+    sources
+        .iter()
+        .map(|source| match source.expected_size {
+            Some(bytes) => Ok(Some(bytes)),
+            None => Ok(probe_remote_file(transport, source.url.as_str())?
+                .and_then(|remote| remote.content_length)),
+        })
+        .collect()
+}
+
 fn plan_download(dest: &Path, remote: Option<RemoteFileInfo>) -> Result<Option<DownloadPlan>> {
     let local_size = if dest.exists() {
         fs::metadata(dest)?.len()
@@ -3715,6 +3737,22 @@ mod tests {
             source_window_available_space,
         )
         .expect("unknown source size should remain a best-effort lower bound");
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_source_size_inventory_combines_pinned_and_probed_sizes() -> Result<()> {
+        let mut sources = SnapshotPlan::resolve("enwiki", "2001-02")?.sources;
+        sources.truncate(2);
+        sources[0].expected_size = Some(11);
+        let transport = FakeTransport::with_head_outcomes([ok_head(Some(22), true)]);
+        assert_eq!(
+            snapshot_source_sizes_with_transport(&transport, &sources)?,
+            vec![Some(11), Some(22)]
+        );
+
+        sources.truncate(1);
+        assert_eq!(snapshot_source_sizes(&sources)?, vec![Some(11)]);
         Ok(())
     }
 
