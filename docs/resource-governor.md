@@ -108,6 +108,14 @@ adaptive `small` profile prefers two workers, but the checked-in production
 capacity policy currently admits only the one-worker cap. These are operational
 defaults, not enwiki qualification results.
 
+Worker counts are physical admission limits, not computation versions.
+`config/determinism-contract.json` pins the partition hash and every ordering
+rule, while the compute algorithm version includes that contract plus the
+selected primary/secondary topology. Qualification must compare exact
+artifact SHA-256 values across at least two worker counts with topology held
+constant; see `wiki-econ determinism-verify` in
+[deterministic builds](deterministic-builds.md).
+
 ## Proposed enwiki qualification profile
 
 Begin capacity experiments—not production scheduling—with:

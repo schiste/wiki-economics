@@ -36,6 +36,48 @@ from separate clean source and output directories, with networking disabled,
 and compares the SHA-256 hash of every artifact. The expected result is exact
 byte equality; no normalization exception is currently needed.
 
+## Data-pipeline proof across concurrency
+
+`config/determinism-contract.json` is the machine-readable byte contract used
+by Rust and exposed in publication provenance. It pins SHA-256, the seeded
+SplitMix64 page hash, canonical source/fragment order, fragment row order,
+final primary/secondary/key merge order, and the rule that Parquet metadata
+must not contain wall-clock fields. The Rust constants must match this file or
+the pipeline fails closed.
+
+The weekly compute algorithm version contains the contract version, hash
+algorithm and seed, and exact primary/secondary topology. Changing worker
+counts therefore cannot redefine the algorithm; changing the topology does.
+Sources remain independent transactions and only the sorted, single-owner
+finalizer publishes manifests or combined artifacts.
+
+Qualification builds with the same source snapshot, binary, and topology but
+different worker counts are compared with the Rust verifier:
+
+```sh
+wiki-econ determinism-verify \
+  --baseline-root /qualification/workers-1/output/frwiki \
+  --candidate-root /qualification/workers-3/output/frwiki \
+  --baseline-workers 1 \
+  --candidate-workers 3 \
+  --algorithm-version '<exact compute receipt algorithm_version>' \
+  --artifact-extension parquet \
+  --report /qualification/frwiki-concurrency.json
+```
+
+The command sorts relative identities and compares the size and SHA-256 of
+every selected artifact. It rejects equal worker counts, empty artifact sets,
+symlinks, unsafe extensions, and any physical difference. Its atomic report
+contains no timestamp, run ID, PID, or absolute source path, so repeating the
+same comparison produces identical report bytes. CI additionally performs a
+real monthly ingest with one and two Rayon source workers and requires every
+analytical and warehouse fragment to be byte-identical.
+
+Operational timestamps in run status and stage receipts are intentionally
+outside this byte-equivalence contract. They remain useful for monitoring, but
+neither they nor file modification times enter published artifact digests or
+the deterministic qualification report.
+
 ## Release provenance and SBOMs
 
 The Toolforge release job uses the commit timestamp as `SOURCE_DATE_EPOCH` and

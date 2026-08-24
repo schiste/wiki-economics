@@ -115,8 +115,11 @@ thread configuration. Run `scripts/qualify-capacity.cjs` as described in
 bucket is not sufficient qualification evidence.
 
 Compare all three reports. Rows, edit conservation, and date ranges must be
-identical. Repeat the chosen configuration once and require the same output
-SHA-256 to prove byte determinism. Do not choose solely by runtime: prefer the
+identical. Repeat the chosen topology and require the same output SHA-256.
+Then run `wiki-econ determinism-verify` against isolated builds made with two
+distinct worker counts, as described in [deterministic builds](deterministic-builds.md).
+The snapshot, binary commit, computation version, and partition topology must
+remain fixed for that comparison. Do not choose solely by runtime: prefer the
 smallest bucket count that sustains at least 25% headroom, then use larger
 counts only if they materially improve the measured maximum bucket or memory.
 
