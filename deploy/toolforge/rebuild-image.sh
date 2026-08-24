@@ -34,10 +34,27 @@ if [[ ! "$SOURCE_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
   echo "rebuild-image.sh requires the exact 40-character source commit as its third argument" >&2
   exit 2
 fi
-if [ "$SOURCE_REF" != "$SOURCE_COMMIT" ]; then
-  echo "rebuild-image.sh requires the exact source commit as both ref and commit" >&2
+EXPECTED_REF="toolforge-image-$SOURCE_COMMIT"
+if [ "$SOURCE_REF" != "$EXPECTED_REF" ]; then
+  echo "rebuild-image.sh requires deterministic source ref $EXPECTED_REF" >&2
   exit 2
 fi
+command -v git >/dev/null 2>&1 || {
+  echo "rebuild-image.sh requires git to verify the remote source ref" >&2
+  exit 1
+}
+
+verify_source_ref() {
+  local resolved_commit
+  resolved_commit="$(git ls-remote --refs "$REPO_URL" "refs/tags/$SOURCE_REF" | awk 'NR == 1 { print $1 } NR > 1 { exit 2 }')"
+  if [ "$resolved_commit" != "$SOURCE_COMMIT" ]; then
+    echo "Source ref $SOURCE_REF does not resolve exactly to $SOURCE_COMMIT" >&2
+    exit 1
+  fi
+}
+
+echo "==> Verifying immutable source ref $SOURCE_REF"
+verify_source_ref
 
 echo "==> Starting build for $REPO_URL at $SOURCE_REF"
 # Detached JSON output gives us the exact build ID. This avoids both the
@@ -74,7 +91,7 @@ build_json="$(toolforge build show --json "$build_id")"
 actual_ref="$(jq -er '.build.ref' <<< "$build_json")"
 actual_source="$(jq -er '.build.source_url' <<< "$build_json")"
 image_digest="$(jq -er '.build.destination_image' <<< "$build_json")"
-if [ "$actual_ref" != "$SOURCE_COMMIT" ] || [ "$actual_source" != "$REPO_URL" ]; then
+if [ "$actual_ref" != "$SOURCE_REF" ] || [ "$actual_source" != "$REPO_URL" ]; then
   echo "Completed build provenance does not match requested source" >&2
   exit 1
 fi
@@ -82,6 +99,11 @@ if [[ ! "$image_digest" =~ @sha256:[0-9a-f]{64}$ ]]; then
   echo "Completed build has no immutable image digest" >&2
   exit 1
 fi
+
+# Re-resolve the lightweight tag after the build. This detects a moved or
+# deleted deployment ref across the build window before any process restarts.
+echo "==> Re-verifying source ref after build"
+verify_source_ref
 
 echo "==> Recording image provenance"
 toolforge envvars create WIKI_ECON_IMAGE_SOURCE_REF "$SOURCE_REF"

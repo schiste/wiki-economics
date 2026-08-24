@@ -366,13 +366,18 @@ TOOLFORGE_SSH_TARGET=login.toolforge.org \
 
 When site, Node, shared script, or Toolforge deployment files changed, rebuild
 the lightweight image from the exact release commit (Cargo remains skipped).
-Toolforge Build Service accepts commit SHAs as refs; the helper verifies the
-completed build's source URL, ref, and immutable image digest before restarting
-anything:
+Toolforge Build Service resolves named Git refs rather than detached commit
+IDs, so publish a deterministic lightweight deployment tag. The helper
+resolves that tag to the release SHA both before and after the build, then
+verifies the completed build's source URL, ref, and immutable image digest
+before restarting anything:
 
 ```sh
+image_ref="toolforge-image-$release_sha"
+git tag "$image_ref" "$release_sha"
+git push origin "refs/tags/$image_ref"
 ssh login.toolforge.org \
-  "become wiki-economics bash -s -- 'https://github.com/schiste/wiki-economics.git' '$release_sha' '$release_sha'" \
+  "become wiki-economics bash -s -- 'https://github.com/schiste/wiki-economics.git' '$image_ref' '$release_sha'" \
   < deploy/toolforge/rebuild-image.sh
 ```
 
