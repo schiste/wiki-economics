@@ -1343,12 +1343,13 @@ mod tests {
         // run ID of the process calling verify.
         let fixture = Fixture::new()?;
         fixture.prepare("run-good")?;
-        validate(
+        let validation = validate(
             fixture.data.path(),
             fixture.output.path(),
             &fixture.lifecycle_path,
             "run-good",
-        )?;
+        );
+        validation?;
         verify(fixture.output.path(), "a-later-standalone-site-run")?;
 
         let receipt: Value = read_json(&fixture.output.path().join(RECEIPT_FILE))?;
