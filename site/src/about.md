@@ -6,25 +6,19 @@ title: About
 
 <div class="page-intro">
 
-The goal is simple: give Wikipedia communities clear, comparable data to analyze their own health across time — not a one-off snapshot, but a running series you can watch move.
+Every discipline has its own idea of what "healthy" means. Biologists check vitals, sysadmins check uptime, economists check GDP, employment, and how evenly the gains are shared — then watch how those move over time, not just where they sit today. Wiki Economics borrows that last toolkit, and that habit of watching trends, and points both at Wikipedia.
 
 </div>
 
-## Why economics?
+## Where this started
 
-Every edit is a unit of production. Every editor is a worker. Every namespace is a sector of the economy. Wiki Economics borrows well-understood frameworks from economics — GDP, labor statistics, inequality metrics, quality control — to give Wikipedia communities a complementary lens on their own health, resilience, and dynamics.
+I wrote ["Next 25/Wiki Economics"](https://meta.wikimedia.org/wiki/Next_25/Wiki_Economics), my "what now" essay for Wikimedia's Next 25 conversation, about how the movement talks about the health of its own communities. Writing it, I kept running into the same wall: readability. The standard headline numbers — active editors, edit counts, page counts — are the wiki equivalent of judging a country's economy by its headcount alone. Useful as a first glance, but they don't say much about *how* an economy, or a wiki, is actually doing.
 
-That's not about reducing editors to numbers. It's about surfacing structural patterns that are hard to see in raw activity logs: Is output concentrated in too few hands? Are newcomers being retained? Is quality control keeping pace with content production? Every wiki community asks these questions already — economics just gives them a shared, peer-reviewed vocabulary to answer with, instead of ad-hoc definitions reinvented per wiki.
+I'm not a Wikipedia researcher by training; I come from economics and business. So naturally, that's the toolbox I reached for — not to invent new metrics, but to borrow ones economists already trust and adapt them to a wiki. Edit concentration becomes an inequality question: the same Gini and Theil indices the World Bank runs on national income, just pointed at edit counts instead. Editor arrivals and departures become a labor-market question — retention, churn, and a wiki has its own version of *key person risk*: how many core contributors could you lose before the whole enterprise stalls? Bytes added and reverted become a production question: gross output versus what actually survives review, the wiki equivalent of GDP versus GDP-after-you-fix-the-typos. And patrol becomes a regulatory-economics question — is the "inspection" workforce keeping pace with output, or quietly falling behind?
 
-The same framing pays off twice: the metrics are well-defined and already validated outside Wikipedia (Gini, Theil, and Palma are standard tools at the World Bank and OECD), and they're immediately legible to anyone who reads economic reporting — which includes most institutional stakeholders a community might need to make its case to.
+## What this actually is
 
-## What "across time" means in practice
-
-A single number rarely tells a community anything actionable. What matters is the trend: is edit concentration rising or falling, is the newcomer cohort retaining better or worse than last year's, is patrol latency creeping up as volume grows. Wiki Economics is built to answer those comparisons directly — every indicator is computed month by month and can be viewed at monthly, quarterly, or yearly granularity, filtered by wiki, user type, or namespace, so a community can watch its own trajectory rather than read a single point-in-time report.
-
-## Where it stands today
-
-Wiki Economics is in early development. The pipeline runs, the dashboard is live, and the four indicator families — [Edit Distribution](/inequality), [Community](/labor), [Content Production](/gdp), and [Patrol](/patrol) — are computed and published for a growing set of Wikipedia language editions. The metric definitions aren't frozen: they're expected to be refined as wiki communities weigh in on whether the economic analogies hold up against their lived experience.
+To be clear about the epistemics here: this is **experimental**, not a finished instrument. Think of it less as an audited annual report and more as an economist wandering into a wiki with a calculator, muttering "well, actually, in GDP terms...". The goal is to play with the data, try the metrics on for size, and produce concrete, comparable numbers people can actually argue with — the sort of thing you can put in front of a community and ask, "does this match what you're feeling on the ground, or is the metaphor breaking down here?" If a chart starts a real conversation about where a community is heading, it's done its job, whether or not the number behind it survives the conversation.
 
 ## What's next
 

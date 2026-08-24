@@ -122,7 +122,6 @@ document.addEventListener("DOMContentLoaded",function(){
 });
 </script>`,
   pages: [
-    { name: "About", path: "/about" },
     {
       name: "Indicators",
       pages: [
