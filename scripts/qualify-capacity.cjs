@@ -44,7 +44,9 @@ function validatePolicy(policy) {
   if (policy?.schema_version !== 1 || !Number.isSafeInteger(policy.memory_limit_bytes)
       || !(policy.minimum_memory_headroom_percent >= 25)
       || !Number.isSafeInteger(policy.minimum_storage_reserve_bytes)
-      || policy.cpu !== 1 || !policy.wikis) {
+      || policy.cpu !== 1 || !policy.wikis
+      || !Number.isSafeInteger(policy.wikis?.frwiki?.minimum_identical_runs)
+      || policy.wikis.frwiki.minimum_identical_runs < 2) {
     throw new Error("invalid capacity qualification policy");
   }
   return policy;
@@ -119,6 +121,27 @@ function qualify(reports, policy) {
     .sort((left, right) => left.bucket_count - right.bucket_count)
     .find((report) => report.memory_gate_passed && report.storage_gate_passed);
   if (!recommendation) throw new Error("no frwiki bucket variant satisfies qualification gates");
+  const repetitions = reports
+    .filter((report) => report.wiki === "frwiki"
+      && report.bucket_count === recommendation.bucket_count
+      && report.selected_snapshot === recommendation.selected_snapshot)
+    .flatMap((report) => {
+      try {
+        return [validateReport(report, policy, "frwiki", recommendation.bucket_count)];
+      } catch {
+        return [];
+      }
+    })
+    .filter((report) => comparableIdentity(report) === comparableIdentity(recommendation)
+      && report.output_sha256 === recommendation.output_sha256)
+    .filter((report, index, matches) => matches.findIndex(
+      (candidate) => candidate.run_id === report.run_id,
+    ) === index)
+    .sort((left, right) => Number(left.generated_at_unix) - Number(right.generated_at_unix));
+  if (repetitions.length < policy.wikis.frwiki.minimum_identical_runs) {
+    throw new Error(`frwiki/${recommendation.bucket_count} needs at least ${
+      policy.wikis.frwiki.minimum_identical_runs} byte-identical passing runs`);
+  }
 
   return {
     schema_version: 1,
@@ -126,6 +149,7 @@ function qualify(reports, policy) {
     generated_at: new Date().toISOString(),
     policy,
     recommended_frwiki_bucket_count: recommendation.bucket_count,
+    deterministic_repeat_run_ids: repetitions.map((report) => report.run_id),
     evidence: Object.fromEntries(Object.entries(selected).map(([wiki, variants]) => [wiki,
       Object.fromEntries(Object.entries(variants).map(([buckets, report]) => [buckets, {
         run_id: report.run_id,

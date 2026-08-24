@@ -15,6 +15,7 @@
     },
     "frwiki": {
       "raw_transient_requirement_bytes": 33285996544,
+      "minimum_identical_runs": 2,
       "required_bucket_counts": [256, 512, 1024]
     }
   }

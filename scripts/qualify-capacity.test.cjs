@@ -13,7 +13,7 @@ const policy = {
   wikis: {
     nlwiki: {required_bucket_counts: [256]},
     ptwiki: {required_bucket_counts: [256]},
-    frwiki: {required_bucket_counts: [256, 512, 1024]},
+    frwiki: {minimum_identical_runs: 2, required_bucket_counts: [256, 512, 1024]},
   },
 };
 
@@ -41,27 +41,34 @@ function report(wiki, buckets, overrides = {}) {
 
 function completeReports() {
   return [report("nlwiki", 256), report("ptwiki", 256), report("frwiki", 256),
+    report("frwiki", 256, {run_id: "frwiki-256-repeat", generated_at_unix: 257}),
     report("frwiki", 512), report("frwiki", 1024)];
 }
 
 test("qualification requires equivalent deterministic evidence and chooses the bounded default", () => {
-  const reports = completeReports().map((value, index) => index === 3
+  const reports = completeReports().map((value, index) => index === 4
     ? {...value, observed_memory_peak_bytes: 540, observed_memory_headroom_percent: 10,
       memory_gate_passed: false, output_sha256: "c".repeat(64)} : value);
   const result = qualify(reports, policy);
   assert.equal(result.qualified, true);
   assert.equal(result.recommended_frwiki_bucket_count, 256);
+  assert.deepEqual(result.deterministic_repeat_run_ids, ["frwiki-256", "frwiki-256-repeat"]);
   assert.equal(result.evidence.frwiki[512].memory_gate_passed, false);
   assert.equal(result.evidence.frwiki[1024].bucket_staged_rows.length, 1024);
 });
 
 test("qualification fails closed for missing, underprovisioned, or divergent reports", () => {
   assert.throws(() => qualify(completeReports().slice(1), policy), /missing required/);
-  assert.throws(() => qualify(completeReports().map((value, index) => index === 2
+  assert.throws(() => qualify(completeReports().map((value, index) => index === 3
     ? {...value, memory_limit_bytes: 500} : value), policy), /not production-equivalent/);
   assert.throws(() => qualify(completeReports().map((value, index) => index === 4
     ? {...value, aggregation: {...value.aggregation, output_rows: 19}} : value), policy),
   /identical deterministic/);
   assert.throws(() => qualify(completeReports().map((value, index) => index === 0
     ? {...value, memory_gate_passed: false} : value), policy), /not production-equivalent/);
+  assert.throws(() => qualify(completeReports().filter(
+    (value) => value.run_id !== "frwiki-256-repeat",
+  ), policy), /byte-identical passing runs/);
+  assert.throws(() => qualify(completeReports().map((value) => value.run_id === "frwiki-256-repeat"
+    ? {...value, output_sha256: "d".repeat(64)} : value), policy), /byte-identical passing runs/);
 });
