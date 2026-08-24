@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::Serialize;
+use std::collections::VecDeque;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -215,6 +216,7 @@ pub(crate) struct ResourceGovernor {
     budget: ResourceBudget,
     paths: GovernorPaths,
     state: Arc<Mutex<GovernorState>>,
+    persistent_available_sequence: Arc<Mutex<VecDeque<u64>>>,
 }
 
 impl ResourceGovernor {
@@ -237,7 +239,17 @@ impl ResourceGovernor {
             budget,
             paths,
             state: Arc::new(Mutex::new(GovernorState::default())),
+            persistent_available_sequence: Arc::new(Mutex::new(VecDeque::new())),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_persistent_available_sequence(
+        mut self,
+        values: impl IntoIterator<Item = u64>,
+    ) -> Self {
+        self.persistent_available_sequence = Arc::new(Mutex::new(values.into_iter().collect()));
+        self
     }
 
     pub(crate) fn budget(&self) -> &ResourceBudget {
@@ -335,7 +347,13 @@ impl ResourceGovernor {
     }
 
     fn sample_with_state(&self, state: &GovernorState) -> Result<ResourceSample> {
-        let persistent_available_bytes = fs4::available_space(&self.paths.persistent_root).ok();
+        let injected_available = self
+            .persistent_available_sequence
+            .lock()
+            .expect("resource availability sequence mutex poisoned")
+            .pop_front();
+        let persistent_available_bytes =
+            injected_available.or_else(|| fs4::available_space(&self.paths.persistent_root).ok());
         let persistent_filesystem_used_bytes = fs4::total_space(&self.paths.persistent_root)
             .ok()
             .zip(persistent_available_bytes)

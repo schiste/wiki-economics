@@ -523,6 +523,43 @@ mod tests {
     }
 
     #[test]
+    fn monthly_inventory_crosses_year_boundary_and_keeps_partial_final_month() -> Result<()> {
+        let plan = SnapshotPlan::resolve("enwiki", "2001-12")?;
+        let filenames = plan.filenames()?;
+        assert_eq!(
+            filenames,
+            [
+                "2001-12.enwiki.2001-01.tsv.bz2",
+                "2001-12.enwiki.2001-02.tsv.bz2",
+                "2001-12.enwiki.2001-03.tsv.bz2",
+                "2001-12.enwiki.2001-04.tsv.bz2",
+                "2001-12.enwiki.2001-05.tsv.bz2",
+                "2001-12.enwiki.2001-06.tsv.bz2",
+                "2001-12.enwiki.2001-07.tsv.bz2",
+                "2001-12.enwiki.2001-08.tsv.bz2",
+                "2001-12.enwiki.2001-09.tsv.bz2",
+                "2001-12.enwiki.2001-10.tsv.bz2",
+                "2001-12.enwiki.2001-11.tsv.bz2",
+                "2001-12.enwiki.2001-12.tsv.bz2",
+                "2001-12.enwiki.2002-01.tsv.bz2",
+            ]
+        );
+        assert_eq!(
+            plan.sources[11].event_range,
+            DateRange::new("2001-12", "2001-12")?
+        );
+        assert_eq!(
+            plan.sources[12].event_range,
+            DateRange::new("2002-01", "2002-01")?
+        );
+        assert_eq!(
+            plan.expected_date_range,
+            DateRange::new("2001-01", "2002-01")?
+        );
+        Ok(())
+    }
+
+    #[test]
     fn plan_validation_rejects_missing_duplicate_and_reordered_sources() -> Result<()> {
         let plan = SnapshotPlan::resolve("enwiki", "2001-02")?;
 

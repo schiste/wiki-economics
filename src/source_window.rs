@@ -798,6 +798,64 @@ mod tests {
     }
 
     #[test]
+    fn disk_reserve_exhaustion_stops_after_committed_source_without_finalizing() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let pending = SnapshotPlan::resolve("enwiki", "2001-02")?
+            .sources
+            .into_iter()
+            .take(2)
+            .collect::<Vec<_>>();
+        let ops = FakeOps {
+            planned: 2,
+            pending,
+            ..FakeOps::default()
+        };
+        let governor = ResourceGovernor::new(
+            ResourceBudget {
+                memory_ceiling_bytes: u64::MAX,
+                memory_reserve_bytes: 0,
+                persistent_storage_reserve_bytes: 0,
+                bounded_scratch_reserve_bytes: 0,
+                rollback_generation_reserve_bytes: 0,
+                scratch_limit_bytes: u64::MAX,
+                max_open_files: 512,
+                source_worker_limit: 1,
+                thread_limit: 1,
+                max_logical_partition_bytes: u64::MAX,
+                max_active_parquet_writers: 16,
+            },
+            GovernorPaths::new(data_dir.path().to_path_buf(), None),
+        )
+        .with_persistent_available_sequence([100, 100, 100, 0]);
+
+        let error = prepare_snapshot_with_ops(
+            &ops,
+            "enwiki",
+            "2001-02",
+            data_dir.path(),
+            "disk-exhaustion-run",
+            ExecutionMode {
+                window_size: 1,
+                select_generation: false,
+            },
+            Some(&governor),
+        )
+        .expect_err("the second source admission must observe exhausted disk reserve");
+
+        assert!(error.to_string().contains("storage gate closed"));
+        assert_eq!(
+            ops.ingested
+                .lock()
+                .expect("fake ingested mutex poisoned")
+                .len(),
+            1
+        );
+        assert!(!ops.finalized.load(Ordering::Relaxed));
+        assert_eq!(governor.sample()?.ingested_rows, 10);
+        Ok(())
+    }
+
+    #[test]
     fn snapshot_preparation_rejects_fetch_and_commit_mismatches() -> Result<()> {
         let data_dir = TestDir::new()?;
         let pending = SnapshotPlan::resolve("testwiki", "2026-08")?.sources;
@@ -1005,6 +1063,46 @@ mod tests {
             None
         );
         prepare_candidate_snapshot(wiki, snapshot, data_dir.path(), "governed-candidate", 1)?;
+        Ok(())
+    }
+
+    #[test]
+    fn candidate_validation_failure_preserves_current_generation_pointer() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let wiki = "testwiki";
+        let current = "2026-07";
+        let candidate = "2026-08";
+        let (current_plan, _) = SnapshotPlan::load_or_resolve(data_dir.path(), wiki, current)?;
+        let current_analytical =
+            crate::storage::snapshot_analytical_wiki_dir(data_dir.path(), wiki, current)?;
+        let current_warehouse =
+            crate::storage::snapshot_warehouse_wiki_dir(data_dir.path(), wiki, current)?;
+        std::fs::create_dir_all(&current_warehouse)?;
+        crate::storage::write_test_marker_in(
+            data_dir.path(),
+            &current_analytical,
+            &current_plan.sources[0].source_id,
+        )
+        .expect("current generation marker fixture must be valid");
+        RealSourceTransactionOps.finalize(wiki, current, data_dir.path(), true)?;
+        assert_eq!(
+            crate::storage::current_snapshot_version(data_dir.path(), wiki)?.as_deref(),
+            Some(current)
+        );
+
+        SnapshotPlan::load_or_resolve(data_dir.path(), wiki, candidate)?;
+        let error = RealSourceTransactionOps
+            .finalize(wiki, candidate, data_dir.path(), false)
+            .expect_err("candidate without a strict source marker must fail validation");
+
+        assert!(error.to_string().contains("marker"));
+        assert_eq!(
+            crate::storage::current_snapshot_version(data_dir.path(), wiki)?.as_deref(),
+            Some(current)
+        );
+        assert!(
+            !crate::storage::generation_manifest_path(data_dir.path(), wiki, candidate)?.exists()
+        );
         Ok(())
     }
 

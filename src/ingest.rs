@@ -1086,6 +1086,28 @@ mod tests {
         Ok(())
     }
 
+    fn write_snapshot_source_fixture(
+        data_dir: &Path,
+    ) -> Result<(SnapshotPlan, SourceSpec, PathBuf)> {
+        let (plan, _) = SnapshotPlan::load_or_resolve(data_dir, "testwiki", "2026-08")?;
+        let source_spec = plan.sources[0].clone();
+        let staging = data_dir.join("source-fixture");
+        fs::create_dir_all(&staging)?;
+        let source = staging.join(source_spec.filename()?);
+        write_bz2_dump(
+            &source,
+            &[sample_row(
+                "2026-08-15 12:00:00.0",
+                "42",
+                "100",
+                "revision",
+                "create",
+            )],
+        )
+        .expect("snapshot source fixture must compress");
+        Ok((plan, source_spec, source))
+    }
+
     #[test]
     fn source_concurrency_does_not_change_fragment_bytes() -> Result<()> {
         let baseline = TestDir::new()?;
@@ -1123,6 +1145,89 @@ mod tests {
             .expect("worker-independent ingest fragments must qualify");
             assert_eq!(report.artifact_count, expected_sources);
         }
+        Ok(())
+    }
+
+    #[test]
+    fn source_restart_recovers_parquets_renamed_before_marker_publication() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let (_plan, source_spec, source) = write_snapshot_source_fixture(data_dir.path())?;
+        let roots = IngestRoots::snapshot(data_dir.path(), "testwiki", "2026-08")?;
+        let outputs = convert_file_with_chunk_limit(
+            &source,
+            "testwiki",
+            data_dir.path(),
+            &roots,
+            INGEST_CHUNK_BYTES,
+            Some("killed-after-rename"),
+        )
+        .expect("crash fixture must reach marker publication");
+        let marker = storage::marker_path_in(&roots.analytical, &source_spec.source_id);
+        fs::remove_file(&marker)?;
+        assert!(outputs.iter().all(|path| path.is_file()));
+
+        let commit = ingest_snapshot_source(
+            "testwiki",
+            "2026-08",
+            data_dir.path(),
+            &source,
+            "restart-after-rename",
+        )
+        .expect("restart must rebuild uncommitted renamed Parquets");
+
+        assert!(!commit.reused);
+        assert!(!source.exists());
+        let marker_valid = storage::marker_manifest_is_valid_in(
+            data_dir.path(),
+            &roots.analytical,
+            &source_spec.source_id,
+        )
+        .expect("rebuilt marker must be readable");
+        assert!(marker_valid);
+        assert_eq!(storage::collect_parquet_files(&roots.analytical)?.len(), 1);
+        assert_eq!(storage::collect_parquet_files(&roots.warehouse)?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn source_restart_removes_parquet_temporaries_left_before_rename() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let (_plan, source_spec, source) = write_snapshot_source_fixture(data_dir.path())?;
+        let roots = IngestRoots::snapshot(data_dir.path(), "testwiki", "2026-08")?;
+        let partition = storage::month_partition_dir(&roots.analytical, 2026, "2026-08");
+        let warehouse_partition = storage::month_partition_dir(&roots.warehouse, 2026, "2026-08");
+        fs::create_dir_all(&partition)?;
+        fs::create_dir_all(&warehouse_partition)?;
+        let temporary_name = format!(
+            ".{}.part-00000.parquet.killed-before-rename.tmp",
+            source_spec.source_id
+        );
+        let analytical_temporary = partition.join(&temporary_name);
+        let warehouse_temporary = warehouse_partition.join(&temporary_name);
+        fs::write(&analytical_temporary, b"partial")?;
+        fs::write(&warehouse_temporary, b"partial")?;
+
+        let commit = ingest_snapshot_source(
+            "testwiki",
+            "2026-08",
+            data_dir.path(),
+            &source,
+            "restart-before-rename",
+        )
+        .expect("restart must replace abandoned Parquet temporaries");
+
+        assert!(!commit.reused);
+        assert!(!analytical_temporary.exists());
+        assert!(!warehouse_temporary.exists());
+        assert_eq!(storage::collect_parquet_files(&roots.analytical)?.len(), 1);
+        assert_eq!(storage::collect_parquet_files(&roots.warehouse)?.len(), 1);
+        let marker_valid = storage::marker_manifest_is_valid_in(
+            data_dir.path(),
+            &roots.analytical,
+            &source_spec.source_id,
+        )
+        .expect("marker after temporary recovery must be readable");
+        assert!(marker_valid);
         Ok(())
     }
 
