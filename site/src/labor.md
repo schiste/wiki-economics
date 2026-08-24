@@ -9,7 +9,7 @@ title: Community
 Wikipedia's **[labor market](https://en.wikipedia.org/wiki/Labour_economics)** is the pool of editors who contribute their time and expertise.
 Like a real economy, the wiki has hiring (new arrivals), attrition (departures), and a workforce
 whose size and composition shift over time. This page tracks active editors, their user types,
-[churn](https://en.wikipedia.org/wiki/Churn_rate) dynamics, and long-term [cohort](https://en.wikipedia.org/wiki/Cohort_analysis) retention — the vital signs of the community's labor supply.
+[churn](https://en.wikipedia.org/wiki/Churn_rate) dynamics, and long-term [cohort](https://en.wikipedia.org/wiki/Cohort_analysis) retention: the vital signs of the community's labor supply.
 
 </div>
 
@@ -139,7 +139,7 @@ Count of unique editor IDs active in each period. An editor is counted once even
 
 <div class="note">
 
-Same metric broken down by editor classification. Watch for the **temporary accounts** category appearing after July 2025 — this reflects Wikimedia's migration of IP editors to temporary accounts, not a real change in editing behavior.
+Same metric broken down by editor classification. Watch for the **temporary accounts** category appearing after July 2025: this reflects Wikimedia's migration of IP editors to temporary accounts, not a real change in editing behavior.
 
 </div>
 
@@ -226,7 +226,7 @@ withExport(Plot.plot({
 }), churnData, "churn")
 ```
 
-<div class="note"><strong>Caveat:</strong> The last period's departure rate is artificially high — editors whose last edit is recent aren't necessarily gone. Registered editors only.</div>
+<div class="note"><strong>Caveat:</strong> The last period's departure rate is artificially high, since editors whose last edit is recent aren't necessarily gone. Registered editors only.</div>
 
 <details class="methodology">
 <summary>How is this calculated?</summary>
@@ -243,7 +243,7 @@ withExport(Plot.plot({
 
 ## Cohort Retention
 
-<div class="note"><a href="https://en.wikipedia.org/wiki/Survival_analysis">Survival</a> heatmap for registered editors. Each row is a cohort (year of first edit). Colors show what fraction of that cohort is still around (last edit in that year or later). The last column is partial data. The "n=" column shows initial cohort size — small cohorts can produce misleading stability.</div>
+<div class="note"><a href="https://en.wikipedia.org/wiki/Survival_analysis">Survival</a> heatmap for registered editors. Each row is a cohort (year of first edit). Colors show what fraction of that cohort is still around (last edit in that year or later). The last column is partial data. The "n=" column shows initial cohort size; small cohorts can produce misleading stability.</div>
 
 ```js
 startLoading(useDefaults)
@@ -324,7 +324,7 @@ withExport(Plot.plot({
 
 `Survival(cohort, year) = Editors with last_edit ≥ year / Initial Cohort Size × 100%`
 
-Survival-based retention. Each editor is assigned to the cohort of their first edit year. "Survived to year Y" means their last edit is in year Y or later. The metric is monotonically decreasing by design — once an editor's last-edit year is passed, they drop out permanently. The "n=" column shows initial cohort size; small cohorts (< 20) can produce misleading retention curves.
+Survival-based retention. Each editor is assigned to the cohort of their first edit year. "Survived to year Y" means their last edit is in year Y or later. The metric is monotonically decreasing by design: once an editor's last-edit year is passed, they drop out permanently. The "n=" column shows initial cohort size; small cohorts (< 20) can produce misleading retention curves.
 
 </details>
 </div>

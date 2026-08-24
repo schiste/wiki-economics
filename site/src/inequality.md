@@ -5,7 +5,7 @@ title: Edit Distribution
 # Edit Distribution
 
 <p class="page-intro">
-How evenly are edits distributed among Wikipedia editors? This page tracks four complementary inequality metrics — <a href="https://en.wikipedia.org/wiki/Gini_coefficient">Gini</a>, <a href="https://en.wikipedia.org/wiki/Theil_index">Theil</a>, <a href="https://en.wikipedia.org/wiki/Palma_ratio">Palma</a>, and Fragility — to reveal whether a wiki's output is broadly shared or concentrated in the hands of a few prolific contributors. Together they paint a picture of editorial power concentration and community resilience.
+How evenly are edits distributed among Wikipedia editors? This page tracks four complementary inequality metrics (<a href="https://en.wikipedia.org/wiki/Gini_coefficient">Gini</a>, <a href="https://en.wikipedia.org/wiki/Theil_index">Theil</a>, <a href="https://en.wikipedia.org/wiki/Palma_ratio">Palma</a>, and Fragility) to reveal whether a wiki's output is broadly shared or concentrated in the hands of a few prolific contributors. Together they paint a picture of editorial power concentration and community resilience.
 </p>
 
 ```js
@@ -185,7 +185,7 @@ The Palma ratio is the share of total edits made by the top 10% of editors divid
 
 ## Fragility: Editors Needed for 50% of Output
 
-<div class="note">This is the <strong><a href="https://en.wikipedia.org/wiki/Bus_factor">bus factor</a></strong> of the wiki: the minimum number of editors whose combined edits account for at least 50% of all output. The ratio version (% of total editors) lets you compare fragility across periods with different editor populations. A lower number means the community is more fragile — if those few editors leave, half the output disappears.</div>
+<div class="note">This is the <strong><a href="https://en.wikipedia.org/wiki/Bus_factor">bus factor</a></strong> of the wiki: the minimum number of editors whose combined edits account for at least 50% of all output. The ratio version (% of total editors) lets you compare fragility across periods with different editor populations. A lower number means the community is more fragile: if those few editors leave, half the output disappears.</div>
 
 ```js
 const fragility = ineqData.map(d => ({...d, fragility_pct: d.total_editors > 0 ? d.min_editors_50pct / d.total_editors * 100 : 0}))

@@ -6,7 +6,7 @@ title: Business Health
 
 <div class="page-intro">
 
-Wikipedia as a **[Knowledge-as-a-Service](https://en.wikipedia.org/wiki/As_a_service) (KaaS)** platform. This page applies business metrics to Wikipedia's community data — treating editors as the workforce, edits as output, and bytes as revenue.
+Wikipedia as a **[Knowledge-as-a-Service](https://en.wikipedia.org/wiki/As_a_service) (KaaS)** platform. This page applies business metrics to Wikipedia's community data, treating editors as the workforce, edits as output, and bytes as revenue.
 
 </div>
 
@@ -295,7 +295,7 @@ withExport(Plot.plot({
 
 `Tier(editor) = bucket(edit_count): 1–4 | 5–24 | 25–99 | 100+`
 
-Each period, every editor matching the selected user types is placed into one bucket based on their edit count *in that period*: 1-4 (casual), 5-24 (regular), 25-99 (active), 100+ (power). The stacked area shows the workforce snapshot — not a progression funnel. An editor may appear in different tiers across periods.
+Each period, every editor matching the selected user types is placed into one bucket based on their edit count *in that period*: 1-4 (casual), 5-24 (regular), 25-99 (active), 100+ (power). The stacked area shows the workforce snapshot, not a progression funnel. An editor may appear in different tiers across periods.
 
 </details>
 </div>
@@ -306,7 +306,7 @@ Each period, every editor matching the selected user types is placed into one bu
 
 <div class="note">
 
-**SaaS equivalent: [Conversion funnel](https://en.wikipedia.org/wiki/Purchase_funnel).** For each cohort year of new registered editors, what fraction *ever* reached 5+, 25+, or 100+ cumulative edits? Unlike the composition chart above, this tracks individual editors across their full lifetime. Declining conversion rates signal that newer cohorts are less likely to become committed contributors — recent cohorts also have less time, so expect a natural drop-off for the last few years.
+**SaaS equivalent: [Conversion funnel](https://en.wikipedia.org/wiki/Purchase_funnel).** For each cohort year of new registered editors, what fraction *ever* reached 5+, 25+, or 100+ cumulative edits? Unlike the composition chart above, this tracks individual editors across their full lifetime. Declining conversion rates signal that newer cohorts are less likely to become committed contributors, though recent cohorts also have less time, so expect a natural drop-off for the last few years.
 
 </div>
 
@@ -446,7 +446,7 @@ Edit survival rate = (total edits - reverted edits) / total edits. The dashed gr
 
 <div class="note">
 
-**SaaS equivalent: [Net Revenue Retention](https://en.wikipedia.org/wiki/Customer_retention).** Are existing power editors producing *more* over time? This shows the output (net bytes) by activity tier. If the "100+ edits" tier's output grows even as casual editor output shrinks, the platform has strong net retention — its most engaged users are getting more productive.
+**SaaS equivalent: [Net Revenue Retention](https://en.wikipedia.org/wiki/Customer_retention).** Are existing power editors producing *more* over time? This shows the output (net bytes) by activity tier. If the "100+ edits" tier's output grows even as casual editor output shrinks, the platform has strong net retention: its most engaged users are getting more productive.
 
 </div>
 

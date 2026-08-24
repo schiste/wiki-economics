@@ -1334,6 +1334,20 @@ body.wk-loading .wk-progress-status {
   color: var(--wk-blue);
 }
 
+/* Framework's TOC aside is `position: fixed` spanning the full viewport
+ * height, even though its visible content (the heading list) only fills the
+ * top of that box. The empty remainder still intercepts clicks, which on
+ * pages with a TOC swallows the right-aligned footer links (About,
+ * Meta-Wiki, GitHub) that sit underneath it. Restrict hit-testing to the
+ * nav's actual content so clicks fall through everywhere else. */
+#observablehq-toc {
+  pointer-events: none;
+}
+
+#observablehq-toc nav {
+  pointer-events: auto;
+}
+
 @media print {
   #observablehq-sidebar,
   #observablehq-sidebar-toggle {

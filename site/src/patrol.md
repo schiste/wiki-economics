@@ -6,7 +6,7 @@ title: Patrol
 
 <div class="page-intro">
 
-**[Patrolling](https://en.wikipedia.org/wiki/Wikipedia:Patrolled_edit)** is Wikipedia's quality-control mechanism: experienced editors review new edits and pages to catch vandalism, errors, and policy violations. This page tracks patrol volume, reviewer concentration, response times, and coverage signals — an informative, still-evolving view of the community's immune system.
+**[Patrolling](https://en.wikipedia.org/wiki/Wikipedia:Patrolled_edit)** is Wikipedia's quality-control mechanism: experienced editors review new edits and pages to catch vandalism, errors, and policy violations. This page tracks patrol volume, reviewer concentration, response times, and coverage signals: an informative, still-evolving view of the community's immune system.
 
 </div>
 
@@ -125,7 +125,7 @@ withExport(Plot.plot({
 <details class="methodology">
 <summary>How is this calculated?</summary>
 
-Each bar is the count of `log_type=patrol` events from the MediaWiki logging dump for that period. This includes manual patrols only — autopatrol logging was disabled by Wikimedia in 2018.
+Each bar is the count of `log_type=patrol` events from the MediaWiki logging dump for that period. This includes manual patrols only; autopatrol logging was disabled by Wikimedia in 2018.
 
 </details>
 </div>
@@ -136,7 +136,7 @@ Each bar is the count of `log_type=patrol` events from the MediaWiki logging dum
 
 <div class="note">
 
-**Patrol coverage** is the percentage of revisions that appear to have been reviewed. The solid line shows manual patrols only. The dashed line shows an **adjusted coverage estimate** — including edits by users with the autopatrol right, whose edits are automatically marked as patrolled but not logged.
+**Patrol coverage** is the percentage of revisions that appear to have been reviewed. The solid line shows manual patrols only. The dashed line shows an **adjusted coverage estimate**, including edits by users with the autopatrol right, whose edits are automatically marked as patrolled but not logged.
 
 </div>
 
@@ -174,7 +174,7 @@ A revision is "patrolled" if its `revision_id` appears as `current_revision_id` 
 
 <div class="note">
 
-**Patrol latency** measures how quickly edits get reviewed — the time between when an edit is made and when a patroller marks it. The dashed line shows the P90 (worst-case for 90% of edits).
+**Patrol latency** measures how quickly edits get reviewed: the time between when an edit is made and when a patroller marks it. The dashed line shows the P90 (worst-case for 90% of edits).
 
 </div>
 
