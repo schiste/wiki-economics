@@ -18,6 +18,7 @@ mod patrol;
 mod publication;
 mod schema;
 mod snapshot_plan;
+mod source_window;
 mod storage;
 #[cfg(test)]
 mod test_support;
@@ -258,6 +259,10 @@ enum Commands {
         /// Dump snapshot version (YYYY-MM)
         #[arg(long)]
         version: Option<String>,
+
+        /// Maximum number of compressed sources retained before ingest
+        #[arg(long)]
+        source_window_size: Option<usize>,
     },
 }
 
@@ -281,6 +286,18 @@ trait Ops {
         version: Option<&str>,
         data_dir: &std::path::Path,
     ) -> Result<()>;
+    fn prepare_wiki_snapshot(
+        &self,
+        wiki: &str,
+        version: &str,
+        data_dir: &Path,
+        _run_id: &str,
+        _window_size: usize,
+    ) -> Result<()> {
+        self.fetch_wiki(wiki, version, data_dir)?;
+        self.ingest_wiki(wiki, Some(version), data_dir)?;
+        self.cleanup_raw_dump(wiki, data_dir)
+    }
     fn cleanup_raw_dump(&self, wiki: &str, data_dir: &std::path::Path) -> Result<()>;
     fn compute_all(
         &self,
@@ -365,6 +382,17 @@ impl Ops for RealOps {
 
     fn cleanup_raw_dump(&self, wiki: &str, data_dir: &std::path::Path) -> Result<()> {
         fetch::cleanup_raw_dump(wiki, data_dir)
+    }
+
+    fn prepare_wiki_snapshot(
+        &self,
+        wiki: &str,
+        version: &str,
+        data_dir: &Path,
+        run_id: &str,
+        window_size: usize,
+    ) -> Result<()> {
+        source_window::prepare_snapshot(wiki, version, data_dir, run_id, window_size).map(|_| ())
     }
 
     fn compute_all(
@@ -712,28 +740,36 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             })?;
         }
 
-        Commands::Run { wikis, version } => {
+        Commands::Run {
+            wikis,
+            version,
+            source_window_size,
+        } => {
             let version = match version {
                 Some(version) => version,
                 None => run_timed_stage("snapshot_resolve", None, || {
                     ops.resolve_snapshot(&wikis, Utc::now())
                 })?,
             };
+            let source_window_size = source_window::configured_window_size(source_window_size)?;
+            let source_window_run_id = run_id
+                .clone()
+                .unwrap_or_else(|| format!("manual-{}", std::process::id()));
             ops.persist_snapshot_plans(&wikis, &version, &data_dir)?;
             publication::begin_run(&output_dir, run_id.as_deref(), &wikis, Some(&version))?;
             for wiki in &wikis {
                 info!(wiki = wiki, "running full pipeline");
-                run_timed_stage("fetch", Some(wiki), || {
-                    ops.fetch_wiki(wiki, &version, &data_dir)
+                run_timed_stage("source_window", Some(wiki), || {
+                    ops.prepare_wiki_snapshot(
+                        wiki,
+                        &version,
+                        &data_dir,
+                        &source_window_run_id,
+                        source_window_size,
+                    )
                 })?;
                 run_timed_stage("patrol_fetch", Some(wiki), || {
                     ops.fetch_patrol(wiki, &data_dir)
-                })?;
-                run_timed_stage("ingest", Some(wiki), || {
-                    ops.ingest_wiki(wiki, Some(&version), &data_dir)
-                })?;
-                run_timed_stage("cleanup_raw", Some(wiki), || {
-                    ops.cleanup_raw_dump(wiki, &data_dir)
                 })?;
                 run_timed_stage("compute", Some(wiki), || {
                     ops.compute_all(wiki, &data_dir, &output_dir)
@@ -1052,6 +1088,21 @@ mod tests {
             self.record(format!(
                 "ingest:{wiki}:{}:{}",
                 version.unwrap_or("_"),
+                data_dir.display()
+            ));
+            Ok(())
+        }
+
+        fn prepare_wiki_snapshot(
+            &self,
+            wiki: &str,
+            version: &str,
+            data_dir: &Path,
+            _run_id: &str,
+            window_size: usize,
+        ) -> Result<()> {
+            self.record(format!(
+                "source_window:{wiki}:{version}:{}:{window_size}",
                 data_dir.display()
             ));
             Ok(())
@@ -1750,6 +1801,8 @@ mod tests {
             "frwiki",
             "--version",
             "2025-12",
+            "--source-window-size",
+            "3",
         ])?;
         let ops = RecordingOps::default();
 
@@ -1758,10 +1811,8 @@ mod tests {
         assert_eq!(
             ops.calls.into_inner(),
             vec![
-                "fetch:frwiki:2025-12:dataset",
+                "source_window:frwiki:2025-12:dataset:3",
                 "fetch_patrol:frwiki:dataset",
-                "ingest:frwiki:2025-12:dataset",
-                "cleanup_raw:frwiki:dataset",
                 "compute:frwiki:dataset:results",
                 "compute_patrol:frwiki:dataset:results:false:_",
                 "merge:results",
@@ -1810,6 +1861,10 @@ mod tests {
             .fetch_wiki("../enwiki", "2026-02", data_dir.path())
             .expect_err("unsafe wiki should fail before network work");
         assert!(fetch_err.to_string().contains("invalid wiki database name"));
+        assert!(
+            ops.prepare_wiki_snapshot("../enwiki", "2026-02", data_dir.path(), "test-run", 1)
+                .is_err()
+        );
 
         write_compute_input(data_dir.path(), "computewiki")?;
         ops.compute_all("computewiki", data_dir.path(), output_dir.path())?;
@@ -1906,6 +1961,14 @@ mod tests {
         rebuild_result?;
         let stale_gone = !parts_dir.join("stale.parquet").exists();
         assert!(stale_gone);
+        Ok(())
+    }
+
+    #[test]
+    fn recording_ops_covers_compatibility_raw_cleanup() -> Result<()> {
+        let ops = RecordingOps::default();
+        ops.cleanup_raw_dump("testwiki", Path::new("dataset"))?;
+        assert_eq!(ops.calls.into_inner(), vec!["cleanup_raw:testwiki:dataset"]);
         Ok(())
     }
 

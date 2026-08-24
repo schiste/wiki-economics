@@ -13,7 +13,7 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::fingerprint::{self, StageSpec, TrackedPath};
-use crate::snapshot_plan::{MEDIAWIKI_HISTORY_BASE_URL, SnapshotPlan};
+use crate::snapshot_plan::{MEDIAWIKI_HISTORY_BASE_URL, SnapshotPlan, SourceSpec};
 #[cfg(test)]
 use crate::snapshot_plan::{MONTHLY_WIKIS, YEARLY_WIKIS};
 
@@ -43,7 +43,9 @@ const FETCH_RETRY_AFTER_MAX_SECS: u64 = 30;
 const FETCH_MAX_PARALLELISM_ENV: &str = "WIKI_ECON_FETCH_MAX_PARALLELISM";
 const SNAPSHOT_MAX_LAG_ENV: &str = "WIKI_ECON_MAX_SNAPSHOT_LAG_MONTHS";
 const DEFAULT_SNAPSHOT_MAX_LAG_MONTHS: u32 = 2;
-const FETCH_ALGORITHM_VERSION: &str = "wikimedia-history-fetch-v3-snapshot-plan";
+const FETCH_ALGORITHM_VERSION: &str = "wikimedia-history-fetch-v4-source-window";
+const SOURCE_WINDOW_STAGING_DIR: &str = ".source-window";
+const SOURCE_WINDOW_DOWNLOAD_SUFFIX: &str = ".download";
 /// Extra headroom required beyond the summed remote byte total before a
 /// fetch is allowed to start. Not a tight budget — just enough to fail fast
 /// when shared storage lacks enough space for a workload (e.g. frwiki's ~31GB
@@ -1236,6 +1238,100 @@ fn download_file_with_transport<T: HttpTransport>(
     }
 }
 
+fn validate_source_window_run_id(run_id: &str) -> Result<()> {
+    anyhow::ensure!(
+        !run_id.is_empty()
+            && run_id.len() <= 160
+            && run_id
+                .bytes()
+                .all(|byte| { byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.') }),
+        "invalid source-window run ID {run_id:?}"
+    );
+    Ok(())
+}
+
+fn source_window_staging_dir(data_dir: &Path, wiki: &str) -> PathBuf {
+    data_dir
+        .join("raw")
+        .join(wiki)
+        .join(SOURCE_WINDOW_STAGING_DIR)
+}
+
+fn source_download_temp_path(staging_dir: &Path, source_id: &str, run_id: &str) -> PathBuf {
+    staging_dir.join(format!(
+        ".{source_id}.{run_id}{SOURCE_WINDOW_DOWNLOAD_SUFFIX}"
+    ))
+}
+
+fn adopt_source_download(
+    staging_dir: &Path,
+    source_id: &str,
+    run_id: &str,
+    final_path: &Path,
+) -> Result<PathBuf> {
+    let current = source_download_temp_path(staging_dir, source_id, run_id);
+    let prefix = format!(".{source_id}.");
+    let mut recoverable = fs::read_dir(staging_dir)?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| {
+                    name.starts_with(&prefix) && name.ends_with(SOURCE_WINDOW_DOWNLOAD_SUFFIX)
+                })
+        })
+        .collect::<Vec<_>>();
+    if final_path.exists() {
+        recoverable.push(final_path.to_path_buf());
+    }
+    recoverable.sort();
+    recoverable.dedup();
+    anyhow::ensure!(
+        recoverable.len() <= 1,
+        "multiple recoverable source-window inputs found for {source_id}"
+    );
+    if current.exists() {
+        return Ok(current);
+    }
+    if let Some(previous) = recoverable.pop() {
+        fs::rename(&previous, &current).context("failed to adopt source-window input")?;
+        fs::File::open(staging_dir)?.sync_all()?;
+    }
+    Ok(current)
+}
+
+fn download_snapshot_source_with_transport<T: HttpTransport>(
+    transport: &T,
+    source: &SourceSpec,
+    data_dir: &Path,
+    wiki: &str,
+    run_id: &str,
+) -> Result<PathBuf> {
+    validate_source_window_run_id(run_id)?;
+    let staging_dir = source_window_staging_dir(data_dir, wiki);
+    fs::create_dir_all(&staging_dir)?;
+    let filename = source.filename()?;
+    let final_path = staging_dir.join(filename);
+    let temp_path = adopt_source_download(&staging_dir, &source.source_id, run_id, &final_path)?;
+
+    download_file_with_transport(transport, source.url.as_str(), &temp_path, true)?;
+    if let Some(expected_size) = source.expected_size {
+        let actual_size = fs::metadata(&temp_path)?.len();
+        anyhow::ensure!(
+            actual_size == expected_size,
+            "source {} has {} bytes, expected {} from its snapshot plan",
+            source.source_id,
+            actual_size,
+            expected_size
+        );
+    }
+    fs::rename(&temp_path, &final_path).context("failed to commit source-window download")?;
+    fs::File::open(&staging_dir)?.sync_all()?;
+    Ok(final_path)
+}
+
 fn fetch_wiki_from_base_with_transport_at_parallelism<T: HttpTransport>(
     transport: &T,
     base_url: &str,
@@ -1408,6 +1504,247 @@ fn ensure_disk_headroom(
 pub fn fetch_wiki(wiki: &str, version: &str, data_dir: &Path) -> Result<Vec<PathBuf>> {
     let transport = build_transport()?;
     fetch_wiki_with_transport(&transport, BASE_URL, wiki, version, data_dir)
+}
+
+/// Return the canonical sources that do not yet have a strict, readable
+/// source-level ingest commit in the candidate generation.
+pub(crate) fn pending_snapshot_sources(
+    wiki: &str,
+    version: &str,
+    data_dir: &Path,
+) -> Result<Vec<SourceSpec>> {
+    let (plan, _) = SnapshotPlan::load_or_resolve(data_dir, wiki, version)?;
+    let analytical_root = crate::storage::snapshot_analytical_wiki_dir(data_dir, wiki, version)?;
+    let mut pending = Vec::new();
+    for source in plan.sources {
+        if !crate::storage::marker_manifest_is_valid_in(
+            data_dir,
+            &analytical_root,
+            &source.source_id,
+        )? {
+            pending.push(source);
+        }
+    }
+    Ok(pending)
+}
+
+fn source_window_local_bytes(staging_dir: &Path, source: &SourceSpec) -> Result<u64> {
+    let filename = source.filename()?;
+    let prefix = format!(".{}.", source.source_id);
+    let mut largest = fs::metadata(staging_dir.join(filename))
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if staging_dir.is_dir() {
+        for entry in fs::read_dir(staging_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(&prefix) && name.ends_with(SOURCE_WINDOW_DOWNLOAD_SUFFIX) {
+                largest = largest.max(entry.metadata()?.len());
+            }
+        }
+    }
+    Ok(largest)
+}
+
+fn check_source_window_disk_headroom<T: HttpTransport>(
+    transport: &T,
+    wiki: &str,
+    sources: &[SourceSpec],
+    data_dir: &Path,
+) -> Result<()> {
+    check_source_window_disk_headroom_with_available(
+        transport,
+        wiki,
+        sources,
+        data_dir,
+        source_window_available_space,
+    )
+}
+
+fn source_window_available_space(path: &Path) -> std::io::Result<u64> {
+    fs4::available_space(path)
+}
+
+fn check_source_window_disk_headroom_with_available<T, F>(
+    transport: &T,
+    wiki: &str,
+    sources: &[SourceSpec],
+    data_dir: &Path,
+    available_space: F,
+) -> Result<()>
+where
+    T: HttpTransport,
+    F: FnOnce(&Path) -> std::io::Result<u64>,
+{
+    let staging_dir = source_window_staging_dir(data_dir, wiki);
+    let mut needed_bytes = 0_u64;
+    let mut unknown_sources = 0_usize;
+    for source in sources {
+        let remote_size = match source.expected_size {
+            Some(size) => Some(size),
+            None => probe_remote_file(transport, source.url.as_str())?
+                .and_then(|remote| remote.content_length),
+        };
+        match remote_size {
+            Some(size) => {
+                needed_bytes = needed_bytes
+                    .checked_add(
+                        size.saturating_sub(source_window_local_bytes(&staging_dir, source)?),
+                    )
+                    .context("source-window byte requirement overflow")?;
+            }
+            None => unknown_sources += 1,
+        }
+    }
+    if unknown_sources > 0 {
+        warn!(
+            wiki,
+            unknown_sources,
+            "source-window disk check is a lower bound because source sizes are unavailable"
+        );
+    }
+    if needed_bytes == 0 {
+        return Ok(());
+    }
+    match available_space(data_dir) {
+        Ok(available_bytes) => ensure_disk_headroom(wiki, data_dir, needed_bytes, available_bytes),
+        Err(error) => {
+            warn!(
+                wiki,
+                path = %data_dir.display(),
+                error = %error,
+                "could not determine source-window disk space; skipping headroom check"
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Download one bounded plan window into pipeline-owned staging. Every input
+/// is allowlisted by the persisted plan, and partial downloads are named with
+/// both the source and run IDs so a later run can adopt and resume them.
+pub(crate) fn fetch_snapshot_source_window(
+    wiki: &str,
+    version: &str,
+    data_dir: &Path,
+    run_id: &str,
+    sources: &[SourceSpec],
+) -> Result<Vec<PathBuf>> {
+    validate_source_window_run_id(run_id)?;
+    let transport = build_transport()?;
+    fetch_snapshot_source_window_with_transport(
+        &transport, wiki, version, data_dir, run_id, sources,
+    )
+}
+
+fn fetch_snapshot_source_window_with_transport<T: HttpTransport>(
+    transport: &T,
+    wiki: &str,
+    version: &str,
+    data_dir: &Path,
+    run_id: &str,
+    sources: &[SourceSpec],
+) -> Result<Vec<PathBuf>> {
+    let (plan, _) = SnapshotPlan::load_or_resolve(data_dir, wiki, version)?;
+    anyhow::ensure!(!sources.is_empty(), "source window must not be empty");
+    for source in sources {
+        anyhow::ensure!(
+            plan.sources.contains(source),
+            "source {} is not part of the persisted snapshot plan for {wiki} {version}",
+            source.source_id
+        );
+    }
+    check_source_window_disk_headroom(transport, wiki, sources, data_dir)?;
+
+    let mut paths = Vec::with_capacity(sources.len());
+    for source in sources {
+        info!(
+            wiki,
+            version,
+            source = source.source_id,
+            run_id,
+            "starting source-window download"
+        );
+        let path =
+            download_snapshot_source_with_transport(transport, source, data_dir, wiki, run_id)?;
+        paths.push(path);
+    }
+    Ok(paths)
+}
+
+/// Commit the fetch-stage receipt after every planned source is represented
+/// by a strict ingest marker. At this point no raw input needs to remain.
+pub(crate) fn finalize_snapshot_fetch(wiki: &str, version: &str, data_dir: &Path) -> Result<()> {
+    let (plan, plan_path) = SnapshotPlan::load_or_resolve(data_dir, wiki, version)?;
+    let expected = plan.filenames()?;
+    let analytical_root = crate::storage::snapshot_analytical_wiki_dir(data_dir, wiki, version)?;
+    for source in &plan.sources {
+        anyhow::ensure!(
+            crate::storage::marker_manifest_is_valid_in(
+                data_dir,
+                &analytical_root,
+                &source.source_id,
+            )
+            .unwrap_or(false),
+            "cannot finalize fetch: source {} has no valid ingest marker",
+            source.source_id
+        );
+    }
+    record_fetch_stage(data_dir, wiki, version, &plan_path, &expected)
+}
+
+/// Reclaim completed source-window inputs left by an interruption between the
+/// marker commit and raw deletion. Only plan-owned filenames whose strict
+/// marker already validates are eligible for removal.
+pub(crate) fn cleanup_committed_source_window_inputs(
+    wiki: &str,
+    version: &str,
+    data_dir: &Path,
+) -> Result<usize> {
+    let staging_dir = source_window_staging_dir(data_dir, wiki);
+    if !staging_dir.is_dir() {
+        return Ok(0);
+    }
+    let (plan, _) = SnapshotPlan::load_or_resolve(data_dir, wiki, version)?;
+    let analytical_root = crate::storage::snapshot_analytical_wiki_dir(data_dir, wiki, version)?;
+    let mut removed = 0_usize;
+    for source in plan.sources {
+        if !crate::storage::marker_manifest_is_valid_in(
+            data_dir,
+            &analytical_root,
+            &source.source_id,
+        )
+        .unwrap_or(false)
+        {
+            continue;
+        }
+        let filename = source.filename()?;
+        let prefix = format!(".{}.", source.source_id);
+        for entry in fs::read_dir(&staging_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_file() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name == filename
+                || (name.starts_with(&prefix) && name.ends_with(SOURCE_WINDOW_DOWNLOAD_SUFFIX))
+            {
+                fs::remove_file(entry.path())?;
+                removed += 1;
+            }
+        }
+    }
+    if fs::read_dir(&staging_dir)?.next().is_none() {
+        fs::remove_dir(&staging_dir)?;
+    } else {
+        fs::File::open(&staging_dir)?.sync_all()?;
+    }
+    Ok(removed)
 }
 
 fn fetch_wiki_with_transport<T: HttpTransport>(
@@ -3163,6 +3500,238 @@ mod tests {
             .expect_err("unsafe wiki identifier should fail");
 
         assert!(err.to_string().contains("invalid wiki database name"));
+        Ok(())
+    }
+
+    #[test]
+    fn source_window_download_commits_to_deterministic_staging() -> Result<()> {
+        init_test_tracing();
+        let data_dir = TestDir::new()?;
+        let (plan, _) = SnapshotPlan::load_or_resolve(data_dir.path(), "testwiki", "2026-08")?;
+        let source = plan.sources[0].clone();
+        let payload = b"BZhpayload-by";
+        let transport = FakeTransport::with_outcomes(
+            [
+                ok_head(Some(payload.len() as u64), true),
+                ok_head(Some(payload.len() as u64), true),
+            ],
+            [ok_get(payload, true)],
+        );
+
+        let paths = fetch_snapshot_source_window_with_transport(
+            &transport,
+            "testwiki",
+            "2026-08",
+            data_dir.path(),
+            "run-123",
+            std::slice::from_ref(&source),
+        )
+        .expect("source-window fixture should download");
+
+        assert_eq!(paths.len(), 1);
+        assert_eq!(
+            paths[0].file_name().and_then(|name| name.to_str()),
+            Some(source.filename()?)
+        );
+        assert_eq!(fs::read(&paths[0])?, payload);
+        assert_eq!(transport.requested_ranges(), vec![None]);
+        let staging = source_window_staging_dir(data_dir.path(), "testwiki");
+        assert_eq!(fs::read_dir(staging)?.count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn source_window_adopts_and_resumes_an_interrupted_download() -> Result<()> {
+        init_test_tracing();
+        let data_dir = TestDir::new()?;
+        let (plan, _) = SnapshotPlan::load_or_resolve(data_dir.path(), "testwiki", "2026-08")?;
+        let source = plan.sources[0].clone();
+        let payload = b"BZhpayload-by";
+        let staging = source_window_staging_dir(data_dir.path(), "testwiki");
+        fs::create_dir_all(&staging)?;
+        let abandoned = source_download_temp_path(&staging, &source.source_id, "old-run");
+        fs::write(&abandoned, &payload[..5])?;
+        let transport = FakeTransport::with_outcomes(
+            [
+                ok_head(Some(payload.len() as u64), true),
+                ok_head(Some(payload.len() as u64), true),
+            ],
+            [ok_get(payload, true)],
+        );
+
+        let paths = fetch_snapshot_source_window_with_transport(
+            &transport,
+            "testwiki",
+            "2026-08",
+            data_dir.path(),
+            "new-run",
+            std::slice::from_ref(&source),
+        )
+        .expect("abandoned source should resume");
+
+        assert!(!abandoned.exists());
+        assert_eq!(fs::read(&paths[0])?, payload);
+        assert_eq!(transport.requested_ranges(), vec![Some(5)]);
+        Ok(())
+    }
+
+    #[test]
+    fn source_window_rejects_unplanned_sources_and_unsafe_run_ids() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let (plan, _) = SnapshotPlan::load_or_resolve(data_dir.path(), "testwiki", "2026-08")?;
+        let source = plan.sources[0].clone();
+        assert!(validate_source_window_run_id("../unsafe").is_err());
+        assert!(
+            fetch_snapshot_source_window_with_transport(
+                &FakeTransport::default(),
+                "testwiki",
+                "2026-08",
+                data_dir.path(),
+                "safe-run",
+                &[],
+            )
+            .is_err()
+        );
+        let mut changed = source;
+        changed.expected_size = Some(13);
+        assert!(
+            fetch_snapshot_source_window_with_transport(
+                &FakeTransport::default(),
+                "testwiki",
+                "2026-08",
+                data_dir.path(),
+                "safe-run",
+                &[changed],
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn source_window_expected_size_is_fail_closed() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let (plan, _) = SnapshotPlan::load_or_resolve(data_dir.path(), "testwiki", "2026-08")?;
+        let mut source = plan.sources[0].clone();
+        source.expected_size = Some(99);
+        let payload = b"BZhpayload-by";
+        let transport = FakeTransport::with_outcomes(
+            [ok_head(Some(payload.len() as u64), false)],
+            [ok_get(payload, false)],
+        );
+
+        let error = download_snapshot_source_with_transport(
+            &transport,
+            &source,
+            data_dir.path(),
+            "testwiki",
+            "size-run",
+        )
+        .expect_err("plan size mismatch must fail");
+
+        assert!(error.to_string().contains("expected 99"));
+        assert!(
+            !source_window_staging_dir(data_dir.path(), "testwiki")
+                .join(source.filename()?)
+                .exists()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn source_window_recovery_rejects_ambiguous_inputs_and_adopts_final_files() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let (plan, _) = SnapshotPlan::load_or_resolve(data_dir.path(), "testwiki", "2026-08")?;
+        let source = &plan.sources[0];
+        let staging = source_window_staging_dir(data_dir.path(), "testwiki");
+        fs::create_dir_all(&staging)?;
+        let final_path = staging.join(source.filename()?);
+        fs::write(&final_path, b"BZhcomplete")?;
+
+        let adopted = adopt_source_download(&staging, &source.source_id, "new-run", &final_path)?;
+        assert!(adopted.exists());
+        assert!(!final_path.exists());
+        assert_eq!(
+            adopt_source_download(&staging, &source.source_id, "new-run", &final_path)?,
+            adopted
+        );
+
+        let old = source_download_temp_path(&staging, &source.source_id, "old-run");
+        fs::write(&old, b"BZhpartial")?;
+        assert!(
+            adopt_source_download(&staging, &source.source_id, "new-run", &final_path).is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn source_window_disk_preflight_covers_known_unknown_partial_and_failure_paths() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let (plan, _) = SnapshotPlan::load_or_resolve(data_dir.path(), "testwiki", "2026-08")?;
+        let mut source = plan.sources[0].clone();
+        source.expected_size = Some(13);
+        let staging = source_window_staging_dir(data_dir.path(), "testwiki");
+        fs::create_dir_all(staging.join("not-a-file"))?;
+        let partial = source_download_temp_path(&staging, &source.source_id, "old-run");
+        fs::write(&partial, b"BZhpa")?;
+
+        check_source_window_disk_headroom_with_available(
+            &FakeTransport::default(),
+            "testwiki",
+            std::slice::from_ref(&source),
+            data_dir.path(),
+            |_| Ok(FETCH_DISK_HEADROOM_MARGIN_BYTES + 13),
+        )
+        .expect("known-size source should pass disk preflight");
+        assert_eq!(source_window_local_bytes(&staging, &source)?, 5);
+
+        fs::write(staging.join(source.filename()?), b"BZhpayload-by")?;
+        check_source_window_disk_headroom_with_available(
+            &FakeTransport::default(),
+            "testwiki",
+            std::slice::from_ref(&source),
+            data_dir.path(),
+            source_window_available_space,
+        )
+        .expect("fully staged source should need no additional bytes");
+
+        fs::remove_file(staging.join(source.filename()?))?;
+        let error = check_source_window_disk_headroom_with_available(
+            &FakeTransport::default(),
+            "testwiki",
+            std::slice::from_ref(&source),
+            data_dir.path(),
+            |_| Err(std::io::Error::other("space unavailable")),
+        );
+        assert!(error.is_ok());
+
+        let mut unknown = source.clone();
+        unknown.expected_size = None;
+        check_source_window_disk_headroom_with_available(
+            &FakeTransport::with_outcomes([ok_head(None, false)], []),
+            "testwiki",
+            &[unknown],
+            data_dir.path(),
+            source_window_available_space,
+        )
+        .expect("unknown source size should remain a best-effort lower bound");
+        Ok(())
+    }
+
+    #[test]
+    fn source_window_public_wrapper_and_cleanup_fail_closed_without_network() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        assert!(
+            fetch_snapshot_source_window("testwiki", "2026-08", data_dir.path(), "valid-run", &[],)
+                .is_err()
+        );
+        let staging = source_window_staging_dir(data_dir.path(), "testwiki");
+        fs::create_dir_all(&staging)?;
+        assert_eq!(
+            cleanup_committed_source_window_inputs("testwiki", "2026-08", data_dir.path())?,
+            0
+        );
+        assert!(!staging.exists());
         Ok(())
     }
 }

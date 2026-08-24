@@ -10,9 +10,9 @@ set -euo pipefail
 # generated sibling before removing the previous site release.
 #
 # Raw dump cleanup is NOT done here: `wiki-econ run` (invoked by
-# scripts/refresh.sh) deletes each wiki's raw .bz2 files itself immediately
-# after that wiki's ingest stage succeeds, rather than waiting for every
-# wiki in the batch plus the site build to finish. That's safe because
+# scripts/refresh.sh) downloads only a bounded source window and deletes each
+# compressed source immediately after its strict ingest marker commits. That's
+# safe because
 # src/storage.rs::marker_manifest_is_valid verifies the durable source identity
 # recorded at ingest plus every warehouse/analytical Parquet footer and row
 # count. The raw .bz2 may be removed after that receipt commits, so later runs
@@ -39,6 +39,14 @@ export WIKI_ECON_LOG_ANSI=0
 # eight host CPUs. Match data-parallel pools to the real quota by default.
 export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-1}"
 export POLARS_MAX_THREADS="${POLARS_MAX_THREADS:-1}"
+# Keep raw history storage bounded. Operators may raise this to 2–4 after
+# checking NFS headroom; one source is the fail-safe Toolforge default.
+WIKI_ECON_SOURCE_WINDOW_SIZE="${WIKI_ECON_SOURCE_WINDOW_SIZE:-1}"
+if [[ ! "$WIKI_ECON_SOURCE_WINDOW_SIZE" =~ ^[1-4]$ ]]; then
+  echo "Toolforge refresh requires WIKI_ECON_SOURCE_WINDOW_SIZE between 1 and 4 (got: $WIKI_ECON_SOURCE_WINDOW_SIZE)" >&2
+  exit 2
+fi
+export WIKI_ECON_SOURCE_WINDOW_SIZE
 # Production capacity qualification selected 256 stable weekly buckets.
 # Reject an accidental Toolforge environment override instead of silently
 # running a configuration that failed the 25% memory-headroom gate.

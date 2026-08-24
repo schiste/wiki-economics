@@ -16,12 +16,19 @@ use tracing::{debug, info, warn};
 #[cfg(test)]
 use crate::fetch;
 use crate::fingerprint::{self, StageSpec, TrackedPath};
-use crate::snapshot_plan::SnapshotPlan;
+use crate::snapshot_plan::{SnapshotPlan, SourceSpec};
 use crate::{schema, storage};
 
 const INGEST_CHUNK_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const INGEST_ALGORITHM_VERSION: &str =
-    "history-tsv-to-generation-parquet-v3-strict-markers";
+    "history-tsv-to-generation-parquet-v4-source-transactions";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SourceIngestCommit {
+    pub(crate) source_id: String,
+    pub(crate) rows: usize,
+    pub(crate) reused: bool,
+}
 
 #[derive(Clone, Debug)]
 struct IngestRoots {
@@ -107,6 +114,52 @@ fn cleanup_written_paths(paths: &[PathBuf]) {
             warn!(path = %path.display(), error = %err, "failed to remove partial parquet output");
         }
     }
+}
+
+fn next_year_month(value: &str) -> Result<String> {
+    let year = value[..4].parse::<i32>()?;
+    let month = value[5..].parse::<u8>()?;
+    Ok(if month == 12 {
+        format!("{:04}-01", year + 1)
+    } else {
+        format!("{year:04}-{:02}", month + 1)
+    })
+}
+
+fn cleanup_planned_source_outputs(roots: &IngestRoots, source: &SourceSpec) -> Result<usize> {
+    let mut removed = 0_usize;
+    let mut year_month = source.event_range.start.clone();
+    loop {
+        let year = year_month[..4].parse::<i32>()?;
+        for root in [&roots.analytical, &roots.warehouse] {
+            let partition = storage::month_partition_dir(root, year, &year_month);
+            if !partition.is_dir() {
+                continue;
+            }
+            let temporary_prefix = format!(".{}.part-", source.source_id);
+            for entry in fs::read_dir(&partition)? {
+                let entry = entry?;
+                if !entry.file_type()?.is_file() {
+                    continue;
+                }
+                let path = entry.path();
+                let name = entry.file_name();
+                let is_temporary = name.to_string_lossy().starts_with(&temporary_prefix)
+                    && name.to_string_lossy().contains(".parquet.")
+                    && name.to_string_lossy().ends_with(".tmp");
+                if storage::is_source_output(&path, &source.source_id) || is_temporary {
+                    fs::remove_file(path)?;
+                    removed += 1;
+                }
+            }
+            File::open(&partition)?.sync_all()?;
+        }
+        if year_month == source.event_range.end {
+            break;
+        }
+        year_month = next_year_month(&year_month)?;
+    }
+    Ok(removed)
 }
 
 pub(crate) fn ingest_source_id(src: &Path) -> Result<String> {
@@ -229,16 +282,37 @@ fn build_partition_index(df: &DataFrame) -> Result<BTreeMap<(i32, String), Vec<u
     Ok(index)
 }
 
-fn write_parquet(df: &mut DataFrame, dest: &Path) -> Result<()> {
+fn write_parquet(df: &mut DataFrame, dest: &Path, transaction_id: Option<&str>) -> Result<()> {
     dest.parent().map(fs::create_dir_all).transpose()?;
-
-    let mut file = File::create(dest)?;
-    ParquetWriter::new(&mut file)
-        .with_compression(ParquetCompression::Zstd(None))
-        .finish(df)?;
-    file.sync_data()?;
-    storage::discard_file_cache(&file, 0, file.metadata()?.len());
-    Ok(())
+    let target = match transaction_id {
+        Some(transaction_id) => {
+            let filename = dest
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("Parquet output has no valid filename")?;
+            dest.with_file_name(format!(".{filename}.{transaction_id}.tmp"))
+        }
+        None => dest.to_path_buf(),
+    };
+    let write_result = (|| -> Result<()> {
+        let mut file = File::create(&target)?;
+        ParquetWriter::new(&mut file)
+            .with_compression(ParquetCompression::Zstd(None))
+            .finish(df)?;
+        file.sync_all()?;
+        let rows = ParquetReader::new(File::open(&target)?).num_rows()?;
+        ensure!(rows == df.height(), "Parquet row validation failed");
+        storage::discard_file_cache(&file, 0, file.metadata()?.len());
+        if target != dest {
+            fs::rename(&target, dest)?;
+            File::open(dest.parent().context("Parquet output has no parent")?)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if write_result.is_err() && target != dest {
+        let _ = fs::remove_file(&target);
+    }
+    write_result
 }
 
 fn write_partitioned_frames(
@@ -246,6 +320,7 @@ fn write_partitioned_frames(
     roots: &IngestRoots,
     source_id: &str,
     chunk_idx: usize,
+    transaction_id: Option<&str>,
 ) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     let partition_index = build_partition_index(normalized)?;
 
@@ -259,14 +334,14 @@ fn write_partitioned_frames(
         let partition_dir = storage::month_partition_dir(&roots.warehouse, year, &year_month);
         let warehouse_path = partition_dir.join(format!("{source_id}.part-{chunk_idx:05}.parquet"));
         let mut warehouse_df = partition_df.clone();
-        write_parquet(&mut warehouse_df, &warehouse_path)?;
+        write_parquet(&mut warehouse_df, &warehouse_path, transaction_id)?;
         warehouse_paths.push(warehouse_path);
 
         let partition_dir = storage::month_partition_dir(&roots.analytical, year, &year_month);
         let analytical_path =
             partition_dir.join(format!("{source_id}.part-{chunk_idx:05}.parquet"));
         let mut analytical_df = partition_df.select(schema::ANALYTICAL_COLUMNS.iter().copied())?;
-        write_parquet(&mut analytical_df, &analytical_path)?;
+        write_parquet(&mut analytical_df, &analytical_path, transaction_id)?;
         analytical_paths.push(analytical_path);
     }
 
@@ -278,6 +353,7 @@ fn flush_chunk(
     roots: &IngestRoots,
     source_id: &str,
     chunk_idx: usize,
+    transaction_id: Option<&str>,
 ) -> Result<(usize, Vec<PathBuf>, Vec<PathBuf>)> {
     if chunk_bytes.is_empty() {
         return Ok((0, Vec::new(), Vec::new()));
@@ -292,7 +368,7 @@ fn flush_chunk(
     }
 
     let (analytical_paths, warehouse_paths) =
-        write_partitioned_frames(&normalized, roots, source_id, chunk_idx)?;
+        write_partitioned_frames(&normalized, roots, source_id, chunk_idx, transaction_id)?;
     Ok((rows, analytical_paths, warehouse_paths))
 }
 
@@ -305,6 +381,7 @@ fn convert_file(src: &Path, wiki: &str, data_dir: &Path) -> Result<Vec<PathBuf>>
         data_dir,
         &IngestRoots::legacy(data_dir, wiki),
         INGEST_CHUNK_BYTES,
+        None,
     )
 }
 
@@ -314,6 +391,7 @@ fn convert_file_with_chunk_limit(
     data_dir: &Path,
     roots: &IngestRoots,
     chunk_limit: usize,
+    transaction_id: Option<&str>,
 ) -> Result<Vec<PathBuf>> {
     let source_id = ingest_source_id(src)?;
     let marker = storage::marker_path_in(&roots.analytical, &source_id);
@@ -351,8 +429,14 @@ fn convert_file_with_chunk_limit(
 
             chunk_bytes.extend_from_slice(&line);
             if chunk_bytes.len() >= chunk_limit {
-                let (rows, analytical, warehouse) =
-                    flush_chunk(&mut chunk_bytes, roots, &source_id, chunk_idx)?;
+                let (rows, analytical, warehouse) = flush_chunk(
+                    &mut chunk_bytes,
+                    roots,
+                    &source_id,
+                    chunk_idx,
+                    transaction_id,
+                )
+                .context("failed to flush a bounded ingest chunk")?;
                 total_rows += rows;
                 analytical_paths.extend(analytical);
                 warehouse_paths.extend(warehouse);
@@ -361,8 +445,13 @@ fn convert_file_with_chunk_limit(
         }
 
         if !chunk_bytes.is_empty() {
-            let (rows, analytical, warehouse) =
-                flush_chunk(&mut chunk_bytes, roots, &source_id, chunk_idx)?;
+            let (rows, analytical, warehouse) = flush_chunk(
+                &mut chunk_bytes,
+                roots,
+                &source_id,
+                chunk_idx,
+                transaction_id,
+            )?;
             total_rows += rows;
             analytical_paths.extend(analytical);
             warehouse_paths.extend(warehouse);
@@ -394,7 +483,16 @@ fn convert_file_with_chunk_limit(
             analytical_paths: analytical_paths.clone(),
             warehouse_paths: warehouse_paths.clone(),
         };
-        storage::write_marker_manifest_in(data_dir, &roots.analytical, &source_id, &manifest)?;
+        if transaction_id.is_some() {
+            storage::write_precleaned_marker_manifest_in(
+                data_dir,
+                &roots.analytical,
+                &source_id,
+                &manifest,
+            )?;
+        } else {
+            storage::write_marker_manifest_in(data_dir, &roots.analytical, &source_id, &manifest)?;
+        }
         Ok(())
     })();
     if let Err(err) = receipt {
@@ -601,7 +699,8 @@ fn ingest_wiki_for_snapshot(
     );
 
     src_files.par_iter().try_for_each(|src| {
-        convert_file_with_chunk_limit(src, wiki, data_dir, &roots, INGEST_CHUNK_BYTES).map(|_| ())
+        convert_file_with_chunk_limit(src, wiki, data_dir, &roots, INGEST_CHUNK_BYTES, None)
+            .map(|_| ())
     })?;
 
     let sources_to_validate = match snapshot_version.as_deref() {
@@ -690,6 +789,145 @@ fn ingest_stage_inputs(
         inputs.push(TrackedPath::new(format!("raw/{source_id}"), source));
     }
     Ok(inputs)
+}
+
+fn snapshot_marker_inputs(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot_version: &str,
+) -> Result<Vec<TrackedPath>> {
+    let (plan, plan_path) = SnapshotPlan::load_or_resolve(data_dir, wiki, snapshot_version)?;
+    let analytical_root = storage::snapshot_analytical_wiki_dir(data_dir, wiki, snapshot_version)?;
+    let mut inputs = vec![TrackedPath::new("snapshot-plan", plan_path)];
+    for source in plan.sources {
+        let marker = storage::marker_path_in(&analytical_root, &source.source_id);
+        ensure!(
+            storage::marker_manifest_is_valid_in(data_dir, &analytical_root, &source.source_id,)?,
+            "snapshot source {} has no valid ingest marker",
+            source.source_id
+        );
+        inputs.push(TrackedPath::new(
+            format!("ingest-marker/{}", source.source_id),
+            marker,
+        ));
+    }
+    Ok(inputs)
+}
+
+/// Convert and commit one planned source, then release its compressed input.
+/// The marker is synced and revalidated against the exact source before raw
+/// deletion, making the marker the restart boundary for this transaction.
+pub(crate) fn ingest_snapshot_source(
+    wiki: &str,
+    snapshot_version: &str,
+    data_dir: &Path,
+    source: &Path,
+    run_id: &str,
+) -> Result<SourceIngestCommit> {
+    storage::validate_snapshot_version(snapshot_version)?;
+    ensure!(
+        !run_id.is_empty()
+            && run_id.len() <= 160
+            && run_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')),
+        "invalid source transaction run ID {run_id:?}"
+    );
+    let (plan, _) = SnapshotPlan::load_or_resolve(data_dir, wiki, snapshot_version)?;
+    let filename = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .context("snapshot source has no valid filename")?;
+    let source_id = ingest_source_id(source)?;
+    let planned_source = plan
+        .sources
+        .iter()
+        .find(|planned| {
+            planned.source_id == source_id && planned.filename().ok() == Some(filename)
+        })
+        .context(format!(
+            "source {filename} is not part of the persisted snapshot plan for {wiki} {snapshot_version}"
+        ))?;
+    ensure!(
+        source.is_file(),
+        "snapshot source is missing: {}",
+        source.display()
+    );
+
+    let roots = IngestRoots::snapshot(data_dir, wiki, snapshot_version)?;
+    fs::create_dir_all(&roots.analytical)?;
+    fs::create_dir_all(&roots.warehouse)?;
+    let reused = storage::marker_manifest_is_valid_in(data_dir, &roots.analytical, &source_id)?;
+    if !reused {
+        let stale_outputs = cleanup_planned_source_outputs(&roots, planned_source)?;
+        if stale_outputs > 0 {
+            info!(
+                wiki,
+                snapshot_version,
+                source = source_id,
+                stale_outputs,
+                "removed abandoned source outputs"
+            );
+        }
+        convert_file_with_chunk_limit(
+            source,
+            wiki,
+            data_dir,
+            &roots,
+            INGEST_CHUNK_BYTES,
+            Some(run_id),
+        )
+        .context("source-window decode failed")?;
+    }
+    ensure!(
+        storage::marker_manifest_covers_source_in(data_dir, &roots.analytical, &source_id, source,),
+        "strict ingest marker for {source_id} does not cover its staged source"
+    );
+    let manifest = storage::read_marker_manifest_in(data_dir, &roots.analytical, &source_id)?
+        .context("validated ingest marker disappeared before source commit")?;
+    fs::remove_file(source).context("failed to release committed compressed source")?;
+    let parent = source.parent().context("snapshot source has no parent")?;
+    File::open(parent)?.sync_all()?;
+    info!(
+        wiki,
+        snapshot_version,
+        source = source_id,
+        rows = manifest.rows,
+        reused,
+        "committed ingest source and released compressed input"
+    );
+    Ok(SourceIngestCommit {
+        source_id,
+        rows: manifest.rows,
+        reused,
+    })
+}
+
+/// Validate the exact marker/output inventory, record a deterministic ingest
+/// receipt using those durable source commits, and only then select the new
+/// generation for downstream compute.
+pub(crate) fn finalize_snapshot_ingest(
+    wiki: &str,
+    snapshot_version: &str,
+    data_dir: &Path,
+) -> Result<Vec<PathBuf>> {
+    let roots = IngestRoots::snapshot(data_dir, wiki, snapshot_version)?;
+    storage::validate_snapshot_generation(data_dir, wiki, snapshot_version)?;
+    let inputs = snapshot_marker_inputs(data_dir, wiki, snapshot_version)?;
+    let outputs = ingest_stage_outputs(data_dir, &roots)?;
+    fingerprint::record(
+        &fingerprint::data_stage_receipt_path(data_dir, wiki, snapshot_version, "ingest"),
+        StageSpec {
+            stage: "ingest",
+            scope: wiki,
+            selected_snapshot: Some(snapshot_version),
+            algorithm_version: INGEST_ALGORITHM_VERSION,
+        },
+        &inputs,
+        &outputs,
+    )?;
+    storage::publish_current_snapshot(data_dir, wiki, snapshot_version)?;
+    storage::collect_parquet_files(&roots.analytical)
 }
 
 /// Ingest all raw dump files for a wiki into partitioned Parquet. Standard
@@ -841,9 +1079,22 @@ mod tests {
             .join("frame.parquet");
         let mut df = DataFrame::new_infer_height(vec![Column::new("value".into(), vec![1_i32])])?;
 
-        write_parquet(&mut df, &dest)?;
+        write_parquet(&mut df, &dest, None)?;
 
         assert!(dest.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn transactional_parquet_write_cleans_temp_when_commit_fails() -> Result<()> {
+        let temp_dir = TestDir::new()?;
+        let dest = temp_dir.path().join("blocked.parquet");
+        fs::create_dir(&dest)?;
+        let mut frame = DataFrame::new_infer_height(vec![Column::new("value".into(), [1_i64])])?;
+        let temporary = temp_dir.path().join(".blocked.parquet.test-run.tmp");
+
+        assert!(write_parquet(&mut frame, &dest, Some("test-run")).is_err());
+        assert!(!temporary.exists());
         Ok(())
     }
 
@@ -853,14 +1104,14 @@ mod tests {
         let temp_dir = TestDir::new()?;
         let roots = IngestRoots::legacy(temp_dir.path(), "testwiki");
 
-        let empty = flush_chunk(&mut Vec::new(), &roots, "source", 0)?;
+        let empty = flush_chunk(&mut Vec::new(), &roots, "source", 0, None)?;
         assert_eq!(empty.0, 0);
         assert!(empty.1.is_empty());
         assert!(empty.2.is_empty());
 
         let filtered_row = sample_row("2024-01-01 00:00:00.0", "42", "100", "page", "create");
         let mut filtered_bytes = filtered_row.into_bytes();
-        let filtered = flush_chunk(&mut filtered_bytes, &roots, "source", 1)?;
+        let filtered = flush_chunk(&mut filtered_bytes, &roots, "source", 1, None)?;
         assert_eq!(filtered.0, 0);
         assert!(filtered.1.is_empty());
         assert!(filtered.2.is_empty());
@@ -913,7 +1164,15 @@ mod tests {
         write_bz2_dump(&src, &rows)?;
 
         let roots = IngestRoots::legacy(temp_dir.path(), wiki);
-        let outputs = convert_file_with_chunk_limit(&src, wiki, temp_dir.path(), &roots, 128)?;
+        let outputs = convert_file_with_chunk_limit(
+            &src,
+            wiki,
+            temp_dir.path(),
+            &roots,
+            128,
+            Some("threshold-run"),
+        )
+        .expect("transactional threshold fixture should ingest");
 
         assert_eq!(outputs.len(), 2);
         assert!(storage::marker_path(temp_dir.path(), wiki, "source").exists());
@@ -965,7 +1224,17 @@ mod tests {
             .join(format!(".source.done.{}.tmp", std::process::id()));
         fs::create_dir_all(&staging)?;
 
-        assert!(convert_file(&src, wiki, temp_dir.path()).is_err());
+        assert!(
+            convert_file_with_chunk_limit(
+                &src,
+                wiki,
+                temp_dir.path(),
+                &IngestRoots::legacy(temp_dir.path(), wiki),
+                INGEST_CHUNK_BYTES,
+                Some("interrupted-run"),
+            )
+            .is_err()
+        );
         assert!(
             storage::collect_parquet_files(&storage::analytical_wiki_dir(temp_dir.path(), wiki))?
                 .is_empty()
@@ -1207,6 +1476,289 @@ mod tests {
         cleanup_temp_file(&temp_dir.path().join("missing.tsv"));
 
         assert!(dir_path.exists());
+        let planned = SnapshotPlan::resolve("testwiki", "2026-08")?
+            .sources
+            .remove(0);
+        assert_eq!(
+            cleanup_planned_source_outputs(
+                &IngestRoots::snapshot(temp_dir.path(), "testwiki", "2026-08")?,
+                &planned,
+            )
+            .expect("missing candidate roots should require no cleanup"),
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_source_transaction_is_resumable_and_reclaims_raw_input() -> Result<()> {
+        init_test_tracing();
+        let data_dir = TestDir::new()?;
+        let wiki = "testwiki";
+        let version = "2026-08";
+        let (plan, _) = SnapshotPlan::load_or_resolve(data_dir.path(), wiki, version)?;
+        let planned = &plan.sources[0];
+        let staging = data_dir
+            .path()
+            .join("raw")
+            .join(wiki)
+            .join(".source-window");
+        fs::create_dir_all(&staging)?;
+        let source = staging.join(planned.filename()?);
+        write_bz2_dump(
+            &source,
+            &[sample_row(
+                "2026-08-01 00:00:00.0",
+                "42",
+                "100",
+                "revision",
+                "create",
+            )],
+        )
+        .expect("source transaction fixture should compress");
+        let compressed = fs::read(&source)?;
+
+        assert_eq!(
+            fetch::pending_snapshot_sources(wiki, version, data_dir.path())?.len(),
+            1
+        );
+        assert!(fetch::finalize_snapshot_fetch(wiki, version, data_dir.path()).is_err());
+        let first = ingest_snapshot_source(wiki, version, data_dir.path(), &source, "first-run")?;
+        assert_eq!(first.source_id, planned.source_id);
+        assert_eq!(first.rows, 1);
+        assert!(!first.reused);
+        assert!(!source.exists());
+        assert_eq!(
+            storage::current_snapshot_version(data_dir.path(), wiki)?,
+            None
+        );
+        assert!(fetch::pending_snapshot_sources(wiki, version, data_dir.path())?.is_empty());
+
+        let analytical = storage::snapshot_analytical_wiki_dir(data_dir.path(), wiki, version)?;
+        let marker = storage::marker_path_in(&analytical, &planned.source_id);
+        let marker_bytes = fs::read(&marker)?;
+        fs::write(&source, &compressed)?;
+        let reused = ingest_snapshot_source(wiki, version, data_dir.path(), &source, "retry-run")?;
+        assert!(reused.reused);
+        assert_eq!(fs::read(&marker)?, marker_bytes);
+        assert!(!source.exists());
+
+        let stale_output = analytical
+            .join("year=2026/year_month=2026-08")
+            .join(format!(
+                ".{}.part-99999.parquet.dead-run.tmp",
+                planned.source_id
+            ));
+        stale_output.parent().map(fs::create_dir_all).transpose()?;
+        fs::write(&stale_output, b"partial parquet")?;
+        let unrelated_file = stale_output
+            .parent()
+            .context("stale output parent")?
+            .join("keep.txt");
+        let unrelated_dir = stale_output
+            .parent()
+            .context("stale output parent")?
+            .join("keep-dir");
+        fs::write(&unrelated_file, b"keep")?;
+        fs::create_dir(&unrelated_dir)?;
+        fs::write(&marker, b"{truncated")?;
+        fs::write(&source, &compressed)?;
+        let rebuilt =
+            ingest_snapshot_source(wiki, version, data_dir.path(), &source, "rebuild-run")?;
+        assert!(!rebuilt.reused);
+        assert!(!stale_output.exists());
+        assert!(unrelated_file.exists());
+        assert!(unrelated_dir.exists());
+        assert!(
+            storage::marker_manifest_is_valid_in(data_dir.path(), &analytical, &planned.source_id,)
+                .expect("rebuilt marker should be readable")
+        );
+
+        fetch::finalize_snapshot_fetch(wiki, version, data_dir.path())?;
+        let outputs = finalize_snapshot_ingest(wiki, version, data_dir.path())?;
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(
+            storage::current_snapshot_version(data_dir.path(), wiki)?.as_deref(),
+            Some(version)
+        );
+        assert!(
+            fingerprint::data_stage_receipt_path(data_dir.path(), wiki, version, "fetch").is_file()
+        );
+        assert!(
+            fingerprint::data_stage_receipt_path(data_dir.path(), wiki, version, "ingest")
+                .is_file()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn source_transaction_rejects_unplanned_or_missing_inputs() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        SnapshotPlan::load_or_resolve(data_dir.path(), "testwiki", "2026-08")?;
+        let unplanned = data_dir.path().join("raw/testwiki/unplanned.tsv.bz2");
+        fs::create_dir_all(unplanned.parent().context("unplanned source parent")?)?;
+        fs::write(&unplanned, b"BZhfixture")?;
+        assert!(
+            ingest_snapshot_source(
+                "testwiki",
+                "2026-08",
+                data_dir.path(),
+                &unplanned,
+                "test-run",
+            )
+            .is_err()
+        );
+
+        let planned = data_dir
+            .path()
+            .join("raw/testwiki/2026-08.testwiki.all-time.tsv.bz2");
+        assert!(
+            ingest_snapshot_source(
+                "testwiki",
+                "2026-08",
+                data_dir.path(),
+                &planned,
+                "../unsafe",
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("invalid source transaction run ID")
+        );
+        fs::write(&planned, b"BZhnot-a-valid-bzip-stream")?;
+        let decode_error = ingest_snapshot_source(
+            "testwiki",
+            "2026-08",
+            data_dir.path(),
+            &planned,
+            "decode-run",
+        )
+        .expect_err("corrupt compressed input must fail its source transaction");
+        assert!(
+            decode_error
+                .to_string()
+                .contains("source-window decode failed")
+        );
+        fs::remove_file(&planned)?;
+        let error =
+            ingest_snapshot_source("testwiki", "2026-08", data_dir.path(), &planned, "test-run")
+                .expect_err("missing planned source must fail");
+        assert!(error.to_string().contains("source is missing"));
+        Ok(())
+    }
+
+    #[test]
+    fn committed_source_window_cleanup_removes_only_marker_backed_inputs() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let wiki = "testwiki";
+        let version = "2026-08";
+        let (plan, _) = SnapshotPlan::load_or_resolve(data_dir.path(), wiki, version)?;
+        let planned = &plan.sources[0];
+        let staging = data_dir
+            .path()
+            .join("raw")
+            .join(wiki)
+            .join(".source-window");
+        fs::create_dir_all(&staging)?;
+        let source = staging.join(planned.filename()?);
+        write_bz2_dump(
+            &source,
+            &[sample_row(
+                "2026-08-01 00:00:00.0",
+                "42",
+                "100",
+                "revision",
+                "create",
+            )],
+        )
+        .expect("cleanup fixture should compress");
+        let compressed = fs::read(&source)?;
+        ingest_snapshot_source(wiki, version, data_dir.path(), &source, "cleanup-run")?;
+
+        fs::write(&source, &compressed)?;
+        let abandoned = staging.join(format!(".{}.old-run.download", planned.source_id));
+        fs::write(&abandoned, &compressed[..3])?;
+        let unrelated = staging.join("operator-note");
+        fs::write(&unrelated, b"keep")?;
+        let unrelated_dir = staging.join("operator-directory");
+        fs::create_dir(&unrelated_dir)?;
+
+        assert_eq!(
+            fetch::cleanup_committed_source_window_inputs(wiki, version, data_dir.path())?,
+            2
+        );
+        assert!(!source.exists());
+        assert!(!abandoned.exists());
+        assert!(unrelated.exists());
+        assert!(unrelated_dir.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn source_transaction_rejects_a_valid_marker_for_another_staged_path() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let wiki = "testwiki";
+        let version = "2026-08";
+        let (plan, _) = SnapshotPlan::load_or_resolve(data_dir.path(), wiki, version)?;
+        let filename = plan.sources[0].filename()?;
+        let staged = data_dir
+            .path()
+            .join("raw/testwiki/.source-window")
+            .join(filename);
+        staged.parent().map(fs::create_dir_all).transpose()?;
+        write_bz2_dump(
+            &staged,
+            &[sample_row(
+                "2026-08-01 00:00:00.0",
+                "42",
+                "100",
+                "revision",
+                "create",
+            )],
+        )
+        .expect("alternate-path fixture should compress");
+        let compressed = fs::read(&staged)?;
+        ingest_snapshot_source(wiki, version, data_dir.path(), &staged, "first-run")?;
+
+        let other = data_dir.path().join("raw/testwiki").join(filename);
+        fs::write(&other, compressed)?;
+        let error = ingest_snapshot_source(wiki, version, data_dir.path(), &other, "second-run")
+            .expect_err("a marker for another staged path must not cover this input");
+        assert!(error.to_string().contains("does not cover"));
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_pointer_stays_unpublished_when_ingest_receipt_commit_fails() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let wiki = "testwiki";
+        let version = "2026-08";
+        let (plan, _) = SnapshotPlan::load_or_resolve(data_dir.path(), wiki, version)?;
+        let staged = data_dir
+            .path()
+            .join("raw/testwiki/.source-window")
+            .join(plan.sources[0].filename()?);
+        staged.parent().map(fs::create_dir_all).transpose()?;
+        write_bz2_dump(
+            &staged,
+            &[sample_row(
+                "2026-08-01 00:00:00.0",
+                "42",
+                "100",
+                "revision",
+                "create",
+            )],
+        )
+        .expect("receipt failure fixture should compress");
+        ingest_snapshot_source(wiki, version, data_dir.path(), &staged, "receipt-run")?;
+        let receipt =
+            fingerprint::data_stage_receipt_path(data_dir.path(), wiki, version, "ingest");
+        fs::create_dir_all(&receipt)?;
+
+        assert!(finalize_snapshot_ingest(wiki, version, data_dir.path()).is_err());
+        assert_eq!(
+            storage::current_snapshot_version(data_dir.path(), wiki)?,
+            None
+        );
         Ok(())
     }
 }

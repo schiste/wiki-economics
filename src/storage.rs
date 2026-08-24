@@ -208,6 +208,31 @@ pub fn repair_current_snapshot(
     wiki: &str,
     snapshot_version: &str,
 ) -> Result<usize> {
+    validate_and_publish_snapshot(data_dir, wiki, snapshot_version)
+}
+
+/// Validate the complete source-marker and Parquet inventory before making a
+/// candidate generation visible to compute. This is shared by normal ingest
+/// finalization and the explicit pointer-repair command so their readiness
+/// semantics cannot drift.
+pub(crate) fn validate_and_publish_snapshot(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot_version: &str,
+) -> Result<usize> {
+    let marker_count = validate_snapshot_generation(data_dir, wiki, snapshot_version)?;
+    publish_current_snapshot(data_dir, wiki, snapshot_version)?;
+    Ok(marker_count)
+}
+
+/// Validate an immutable generation without making it current. Normal ingest
+/// uses this before committing its stage receipt, so a receipt failure cannot
+/// expose a candidate whose deterministic provenance was not recorded.
+pub(crate) fn validate_snapshot_generation(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot_version: &str,
+) -> Result<usize> {
     validate_snapshot_version(snapshot_version)?;
     let (source_plan, _) =
         crate::snapshot_plan::SnapshotPlan::load_or_resolve(data_dir, wiki, snapshot_version)?;
@@ -278,7 +303,6 @@ pub fn repair_current_snapshot(
         actual_analytical == analytical_allowlist && actual_warehouse == warehouse_allowlist,
         "snapshot marker inventory does not exactly account for generation Parquet files"
     );
-    publish_current_snapshot(data_dir, wiki, snapshot_version)?;
     Ok(marker_count)
 }
 
@@ -458,6 +482,30 @@ pub fn write_marker_manifest_in(
     source_id: &str,
     manifest: &MarkerManifest,
 ) -> Result<PathBuf> {
+    write_marker_manifest_internal(data_dir, analytical_root, source_id, manifest, true)
+}
+
+/// Commit a strict marker after the caller has already removed every output
+/// owned by this source inside its canonical event range. Snapshot-window
+/// ingest uses this to avoid recursively scanning the complete generation for
+/// every source; the final generation validator still performs one exact
+/// allowlist comparison before publication.
+pub(crate) fn write_precleaned_marker_manifest_in(
+    data_dir: &Path,
+    analytical_root: &Path,
+    source_id: &str,
+    manifest: &MarkerManifest,
+) -> Result<PathBuf> {
+    write_marker_manifest_internal(data_dir, analytical_root, source_id, manifest, false)
+}
+
+fn write_marker_manifest_internal(
+    data_dir: &Path,
+    analytical_root: &Path,
+    source_id: &str,
+    manifest: &MarkerManifest,
+    remove_unexpected: bool,
+) -> Result<PathBuf> {
     let marker = marker_path_in(analytical_root, source_id);
     let parent = marker.parent().context("marker path has no parent")?;
     fs::create_dir_all(parent)?;
@@ -490,8 +538,10 @@ pub fn write_marker_manifest_in(
         &analytical_outputs,
         &warehouse_outputs,
     )?;
-    remove_unexpected_source_outputs(analytical_root, source_id, &manifest.analytical_paths)?;
-    remove_unexpected_source_outputs(&warehouse_root, source_id, &manifest.warehouse_paths)?;
+    if remove_unexpected {
+        remove_unexpected_source_outputs(analytical_root, source_id, &manifest.analytical_paths)?;
+        remove_unexpected_source_outputs(&warehouse_root, source_id, &manifest.warehouse_paths)?;
+    }
     let source = relative_path(data_dir, &manifest.source)?;
     let stored = StoredMarkerManifest {
         schema_version: MARKER_SCHEMA_VERSION,
@@ -602,7 +652,7 @@ fn remove_unexpected_source_outputs(
     Ok(())
 }
 
-fn is_source_output(path: &Path, source_id: &str) -> bool {
+pub(crate) fn is_source_output(path: &Path, source_id: &str) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
         .and_then(|name| name.strip_prefix(source_id))
@@ -755,8 +805,7 @@ pub fn read_marker_manifest(
     read_marker_manifest_in(data_dir, &analytical_wiki_dir(data_dir, wiki), source_id)
 }
 
-#[cfg(test)]
-pub fn read_marker_manifest_in(
+pub(crate) fn read_marker_manifest_in(
     data_dir: &Path,
     analytical_root: &Path,
     source_id: &str,
@@ -871,18 +920,21 @@ pub fn marker_manifest_is_valid_in(
         }
     }
     let warehouse_root = data_dir.join(WAREHOUSE_DIRNAME).join(analytical_suffix);
+    let require_exact_source_inventory = stored.snapshot_version.is_none();
     if !validate_stored_outputs(
         data_dir,
         analytical_root,
         source_id,
         stored.rows,
         &stored.analytical_outputs,
+        require_exact_source_inventory,
     ) || !validate_stored_outputs(
         data_dir,
         &warehouse_root,
         source_id,
         stored.rows,
         &stored.warehouse_outputs,
+        require_exact_source_inventory,
     ) {
         return Ok(false);
     }
@@ -930,6 +982,7 @@ fn validate_stored_outputs(
     source_id: &str,
     expected_rows: u64,
     outputs: &[StoredOutput],
+    require_exact_source_inventory: bool,
 ) -> bool {
     if expected_rows > 0 && outputs.is_empty() {
         return false;
@@ -965,17 +1018,20 @@ fn validate_stored_outputs(
         footer_rows.push((u64::try_from(rows).ok(), output.rows));
         recorded.insert(path);
     }
+    let recorded_outputs_are_valid = footer_rows
+        .iter()
+        .all(|(actual, stored)| *actual == Some(*stored))
+        && recorded.len() == outputs.len()
+        && actual_total == expected_rows;
+    if !recorded_outputs_are_valid || !require_exact_source_inventory {
+        return recorded_outputs_are_valid;
+    }
     let discovered: std::collections::BTreeSet<_> = collect_parquet_files(layer_root)
         .unwrap_or_default()
         .into_iter()
         .filter(|path| is_source_output(path, source_id))
         .collect();
-    footer_rows
-        .iter()
-        .all(|(actual, stored)| *actual == Some(*stored))
-        && recorded.len() == outputs.len()
-        && recorded == discovered
-        && actual_total == expected_rows
+    recorded == discovered
 }
 
 pub fn month_partition_dir(root: &Path, year: i32, year_month: &str) -> PathBuf {
@@ -1610,6 +1666,7 @@ mod tests {
             "source",
             u64::MAX,
             &outputs,
+            true,
         ));
         Ok(())
     }
