@@ -40,7 +40,33 @@ test("a recent, advancing, resource-safe publication is healthy", () => {
   assert.equal(result.status, "healthy");
   assert.deepEqual(result.alerts, []);
   assert.equal(result.summary.publishedSnapshots.nlwiki, "2026-07");
+  assert.equal(result.summary.lastPublicationRunId, "run-current");
   assert.equal(successfulRuns(record, [record, {...record, state: "failed", exitCode: 1}]).length, 1);
+});
+
+test("a later site-only success retains the latest validated publication", () => {
+  const publication = success({runId: "publish-1"});
+  const siteOnly = success({
+    runId: "site-2",
+    startedAt: "2026-08-22T01:00:00Z",
+    finishedAt: "2026-08-22T01:02:00Z",
+    memoryPeakBytes: 100 * 1024 ** 2,
+    memoryLimitBytes: 2 * 1024 ** 3,
+    publication: null,
+  });
+  const result = evaluateFreshness({
+    last: siteOnly,
+    history: [publication, siteOnly],
+    lifecycle,
+    now: Date.parse("2026-08-22T03:00:00Z"),
+  });
+  assert.equal(result.status, "healthy");
+  assert.deepEqual(result.alerts, []);
+  assert.equal(result.summary.currentRunId, "site-2");
+  assert.equal(result.summary.lastSuccessfulRunId, "site-2");
+  assert.equal(result.summary.lastPublicationRunId, "publish-1");
+  assert.equal(result.summary.lastPublicationAt, publication.finishedAt);
+  assert.deepEqual(result.summary.publishedSnapshots, {nlwiki: "2026-07"});
 });
 
 test("semantic publication and resource regressions become actionable alerts", () => {

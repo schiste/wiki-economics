@@ -44,12 +44,14 @@ function evaluateFreshness({last = null, history = [], lifecycle, now = Date.now
     .filter(([, entry]) => entry.publication === "published" && entry.refresh === "scheduled");
   const successes = successfulRuns(last, history);
   const latestSuccess = successes.at(-1) || null;
-  const previousSuccess = successes.at(-2) || null;
+  const publicationSuccesses = successes.filter((record) => record.publication);
+  const latestPublication = publicationSuccesses.at(-1) || null;
+  const previousPublication = publicationSuccesses.at(-2) || null;
   const alerts = [];
   const alert = (code, severity, message, details = {}) => alerts.push({code, severity, message, ...details});
 
   for (const [wiki, entry] of scheduledWikis) {
-    const finished = timestamp(latestSuccess?.finishedAt);
+    const finished = timestamp(latestPublication?.finishedAt);
     const maximumAgeMs = Number(entry.freshness_sla_days) * DAY_MS;
     if (!finished) {
       alert("refresh_success_missing", "critical", `No successful refresh is recorded for ${wiki}.`, {wiki});
@@ -78,7 +80,7 @@ function evaluateFreshness({last = null, history = [], lifecycle, now = Date.now
     }
   }
 
-  const publishedSnapshots = latestSuccess?.publication?.selectedSnapshots || {};
+  const publishedSnapshots = latestPublication?.publication?.selectedSnapshots || {};
   for (const [wiki] of scheduledWikis) {
     const published = publishedSnapshots[wiki] || latestSuccess?.selectedSnapshot || null;
     if (last?.selectedSnapshot && published && last.selectedSnapshot > published) {
@@ -88,25 +90,26 @@ function evaluateFreshness({last = null, history = [], lifecycle, now = Date.now
     }
   }
 
-  if (latestSuccess && previousSuccess && latestSuccess.selectedSnapshot > previousSuccess.selectedSnapshot) {
+  if (latestPublication && previousPublication
+      && latestPublication.selectedSnapshot > previousPublication.selectedSnapshot) {
     for (const [wiki] of scheduledWikis) {
-      const currentCutoff = latestSuccess.publication?.cutoffDates?.[wiki] || null;
-      const previousCutoff = previousSuccess.publication?.cutoffDates?.[wiki] || null;
+      const currentCutoff = latestPublication.publication?.cutoffDates?.[wiki] || null;
+      const previousCutoff = previousPublication.publication?.cutoffDates?.[wiki] || null;
       if (currentCutoff && previousCutoff && currentCutoff <= previousCutoff) {
-        alert("output_cutoff_stalled", "critical", `The ${wiki} cutoff did not advance with snapshot ${latestSuccess.selectedSnapshot}.`, {
-          wiki, selectedSnapshot: latestSuccess.selectedSnapshot, cutoff: currentCutoff, previousCutoff,
+        alert("output_cutoff_stalled", "critical", `The ${wiki} cutoff did not advance with snapshot ${latestPublication.selectedSnapshot}.`, {
+          wiki, selectedSnapshot: latestPublication.selectedSnapshot, cutoff: currentCutoff, previousCutoff,
         });
       }
     }
   }
 
-  if (latestSuccess?.publication) {
-    const patrolRows = latestSuccess.publication.metrics?.patrol?.rows;
+  if (latestPublication?.publication) {
+    const patrolRows = latestPublication.publication.metrics?.patrol?.rows;
     if (Number.isFinite(patrolRows) && patrolRows <= 0) {
       alert("patrol_output_zero", "critical", "The published patrol metric contains zero rows.", {rows: patrolRows});
     }
     for (const [wiki] of scheduledWikis) {
-      const source = latestSuccess.publication.patrolSources?.[wiki];
+      const source = latestPublication.publication.patrolSources?.[wiki];
       if (source && (!(source.patrol_events > 0) || !(source.rights_events > 0))) {
         alert("patrol_source_zero", "critical", `The ${wiki} patrol source contains zero patrol or rights rows.`, {
           wiki, patrolEvents: source.patrol_events ?? null, rightsEvents: source.rights_events ?? null,
@@ -115,8 +118,8 @@ function evaluateFreshness({last = null, history = [], lifecycle, now = Date.now
     }
   }
 
-  const peak = latestSuccess?.memoryPeakBytes;
-  const limit = latestSuccess?.memoryLimitBytes;
+  const peak = latestPublication?.memoryPeakBytes;
+  const limit = latestPublication?.memoryLimitBytes;
   if (Number.isFinite(peak) && Number.isFinite(limit) && limit > 0) {
     const ratio = peak / limit;
     if (ratio >= settings.memoryCriticalRatio) {
@@ -137,8 +140,8 @@ function evaluateFreshness({last = null, history = [], lifecycle, now = Date.now
     });
   }
 
-  if (latestSuccess) {
-    const browser = latestSuccess.publication?.browserData;
+  if (latestPublication) {
+    const browser = latestPublication.publication?.browserData;
     if (!browser || !Number.isFinite(browser.bytes) || !Number.isFinite(browser.largestPartitionBytes)) {
       alert("browser_artifact_evidence_missing", "critical", "The successful publication has no validated browser artifact size evidence.");
     } else {
@@ -171,6 +174,8 @@ function evaluateFreshness({last = null, history = [], lifecycle, now = Date.now
       heartbeatAt: last?.heartbeatAt || null,
       lastSuccessfulRunId: latestSuccess?.runId || null,
       lastSuccessfulAt: latestSuccess?.finishedAt || null,
+      lastPublicationRunId: latestPublication?.runId || null,
+      lastPublicationAt: latestPublication?.finishedAt || null,
       selectedSnapshot: last?.selectedSnapshot || latestSuccess?.selectedSnapshot || null,
       publishedSnapshots,
       slos: {
