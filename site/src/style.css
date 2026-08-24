@@ -1323,6 +1323,12 @@ body.wk-loading .wk-progress-status {
   white-space: nowrap;
 }
 
+.site-footer-legal {
+  font-weight: 600;
+  color: var(--wk-text-primary, var(--theme-foreground)) !important;
+  text-decoration-color: currentColor !important;
+}
+
 .site-footer p a:hover,
 .site-footer-links a:hover {
   color: var(--wk-blue);
