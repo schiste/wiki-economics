@@ -6,6 +6,7 @@ mod capacity;
 mod cleanup;
 mod compute;
 mod dashboard;
+mod determinism;
 #[cfg(test)]
 mod end_to_end_tests;
 mod fetch;
@@ -75,6 +76,37 @@ enum Commands {
     /// Write deterministic nlwiki/ptwiki/frwiki browser scalability fixtures
     #[command(hide = true)]
     BrowserPerformanceFixture,
+
+    /// Compare exact artifact bytes produced with two concurrency settings
+    DeterminismVerify {
+        /// Artifact root produced by the lower-concurrency qualification build
+        #[arg(long)]
+        baseline_root: PathBuf,
+
+        /// Artifact root produced by the second qualification build
+        #[arg(long)]
+        candidate_root: PathBuf,
+
+        /// Artifact extension included in the exact comparison
+        #[arg(long, default_value = "parquet")]
+        artifact_extension: String,
+
+        /// Worker count used for the baseline build
+        #[arg(long)]
+        baseline_workers: usize,
+
+        /// Worker count used for the candidate build
+        #[arg(long)]
+        candidate_workers: usize,
+
+        /// Exact computation and partition-topology version under test
+        #[arg(long)]
+        algorithm_version: String,
+
+        /// Atomic deterministic qualification report path
+        #[arg(long)]
+        report: PathBuf,
+    },
 
     /// Remove only expired, pipeline-owned staging artifacts
     #[command(hide = true)]
@@ -751,6 +783,26 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
         Commands::SiteFixture => dashboard::write_site_fixture(&output_dir)?,
         Commands::BrowserPerformanceFixture => {
             dashboard::write_browser_performance_fixture(&output_dir)?
+        }
+        Commands::DeterminismVerify {
+            baseline_root,
+            candidate_root,
+            artifact_extension,
+            baseline_workers,
+            candidate_workers,
+            algorithm_version,
+            report,
+        } => {
+            let qualification = determinism::qualify_concurrency(
+                &baseline_root,
+                &candidate_root,
+                &artifact_extension,
+                baseline_workers,
+                candidate_workers,
+                &algorithm_version,
+                &report,
+            )?;
+            println!("{}", serde_json::to_string(&qualification)?);
         }
         Commands::CleanupStale {
             site_dist_dir,
@@ -2198,6 +2250,58 @@ mod tests {
             ops.calls.into_inner(),
             vec!["bench:frwiki,dewiki:dataset:bench-out:2:4:true"]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn determinism_verify_cli_compares_distinct_worker_builds() -> Result<()> {
+        let root = TestDir::new()?;
+        let baseline = root.path().join("baseline");
+        let candidate = root.path().join("candidate");
+        fs::create_dir(&baseline)?;
+        fs::create_dir(&candidate)?;
+        fs::write(baseline.join("metric.parquet"), b"same")?;
+        fs::write(candidate.join("metric.parquet"), b"same")?;
+        let report = root.path().join("determinism.json");
+        run_with_ops(
+            Cli {
+                data_dir: root.path().join("data"),
+                output_dir: root.path().join("output"),
+                run_id: None,
+                command: Commands::DeterminismVerify {
+                    baseline_root: baseline.clone(),
+                    candidate_root: candidate.clone(),
+                    artifact_extension: "parquet".to_string(),
+                    baseline_workers: 1,
+                    candidate_workers: 2,
+                    algorithm_version: "fixture-primary32-secondary8".to_string(),
+                    report: report.clone(),
+                },
+            },
+            &RecordingOps::default(),
+        )
+        .expect("identical artifacts from distinct worker counts must qualify");
+        let value: Value = serde_json::from_slice(&fs::read(report)?)?;
+        assert_eq!(value["baseline_workers"], 1);
+        assert_eq!(value["candidate_workers"], 2);
+        let rejected = run_with_ops(
+            Cli {
+                data_dir: root.path().join("data"),
+                output_dir: root.path().join("output"),
+                run_id: None,
+                command: Commands::DeterminismVerify {
+                    baseline_root: baseline,
+                    candidate_root: candidate,
+                    artifact_extension: "parquet".to_string(),
+                    baseline_workers: 2,
+                    candidate_workers: 2,
+                    algorithm_version: "fixture-primary32-secondary8".to_string(),
+                    report: root.path().join("rejected.json"),
+                },
+            },
+            &RecordingOps::default(),
+        );
+        assert!(rejected.is_err());
         Ok(())
     }
 

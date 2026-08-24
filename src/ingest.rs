@@ -21,7 +21,7 @@ use crate::{schema, storage};
 
 const INGEST_CHUNK_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const INGEST_ALGORITHM_VERSION: &str =
-    "history-tsv-to-generation-parquet-v5-generation-manifest";
+    "history-tsv-to-generation-parquet-v6-pipeline-byte-determinism-v1";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SourceIngestCommit {
@@ -1040,6 +1040,89 @@ mod tests {
             encoder.write_all(b"\n")?;
         }
         encoder.finish()?;
+        Ok(())
+    }
+
+    fn build_concurrency_qualification_generation(
+        data_dir: &Path,
+        worker_count: usize,
+    ) -> Result<()> {
+        let wiki = "enwiki";
+        let snapshot = "2001-02";
+        let (plan, _) = SnapshotPlan::load_or_resolve(data_dir, wiki, snapshot)?;
+        let staging = data_dir.join("qualification-inputs");
+        fs::create_dir_all(&staging)?;
+        let mut sources = Vec::new();
+        for (index, source) in plan.sources.iter().enumerate() {
+            let path = staging.join(source.filename()?);
+            let timestamp = format!("{}-15 12:00:00.0", source.event_range.start);
+            let row = sample_row(
+                &timestamp,
+                &(index + 1).to_string(),
+                &(100 + index).to_string(),
+                "revision",
+                "create",
+            )
+            .replacen("testwiki", wiki, 1);
+            write_bz2_dump(&path, &[row])?;
+            sources.push(path);
+        }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(worker_count)
+            .build()?;
+        pool.install(|| {
+            sources.par_iter().try_for_each(|source| {
+                ingest_snapshot_source(
+                    wiki,
+                    snapshot,
+                    data_dir,
+                    source,
+                    &format!("qualification-workers-{worker_count}"),
+                )
+                .map(|_| ())
+            })
+        })?;
+        finalize_snapshot_ingest_candidate(wiki, snapshot, data_dir)?;
+        Ok(())
+    }
+
+    #[test]
+    fn source_concurrency_does_not_change_fragment_bytes() -> Result<()> {
+        let baseline = TestDir::new()?;
+        let candidate = TestDir::new()?;
+        let reports = TestDir::new()?;
+        build_concurrency_qualification_generation(baseline.path(), 1)?;
+        build_concurrency_qualification_generation(candidate.path(), 2)?;
+        let wiki = "enwiki";
+        let snapshot = "2001-02";
+        let expected_sources = SnapshotPlan::load_or_resolve(baseline.path(), wiki, snapshot)?
+            .0
+            .sources
+            .len();
+        for (layer, baseline_root, candidate_root) in [
+            (
+                "analytical",
+                storage::snapshot_analytical_wiki_dir(baseline.path(), wiki, snapshot)?,
+                storage::snapshot_analytical_wiki_dir(candidate.path(), wiki, snapshot)?,
+            ),
+            (
+                "warehouse",
+                storage::snapshot_warehouse_wiki_dir(baseline.path(), wiki, snapshot)?,
+                storage::snapshot_warehouse_wiki_dir(candidate.path(), wiki, snapshot)?,
+            ),
+        ] {
+            let report = crate::determinism::qualify_concurrency(
+                &baseline_root,
+                &candidate_root,
+                "parquet",
+                1,
+                2,
+                INGEST_ALGORITHM_VERSION,
+                &reports.path().join(format!("{layer}.json")),
+            )
+            .expect("worker-independent ingest fragments must qualify");
+            assert_eq!(report.artifact_count, expected_sources);
+        }
         Ok(())
     }
 

@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "contract_version": "pipeline-byte-determinism-v1",
+  "digest_algorithm": "SHA-256",
+  "partition_hash": {
+    "algorithm": "splitmix64-finalizer",
+    "version": 1,
+    "seed_u64": 0
+  },
+  "source_order": "snapshot-plan-source-id-ascending-v1",
+  "fragment_order": "generation-manifest-layer-source-path-ascending-v1",
+  "fragment_row_order": "source-stream-month-chunk-v1",
+  "final_merge_order": "primary-secondary-then-page-key-v1",
+  "parquet_metadata_policy": "no-wall-clock-fields-v1"
+}

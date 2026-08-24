@@ -15,7 +15,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tracing::info;
 
 use crate::{
-    fingerprint,
+    determinism, fingerprint,
     observability::MemorySnapshot,
     resource_governor::{GovernorPaths, ResourceGovernor},
     schema, storage, workload_profile,
@@ -141,20 +141,16 @@ impl WeeklyAggregationConfig {
         Self::new_two_level(primary_bucket_count, secondary_bucket_count, scratch_root)
     }
 
-    fn algorithm_version(&self) -> String {
-        if let Some(workload) = &self.workload_algorithm_version {
-            return format!("{COMPUTE_ALGORITHM_VERSION}-{workload}");
-        }
-        if self.primary_bucket_count == DEFAULT_WEEKLY_BUCKET_COUNT
-            && self.secondary_bucket_count == DEFAULT_SECONDARY_BUCKET_COUNT
-        {
-            COMPUTE_ALGORITHM_VERSION.to_string()
-        } else {
-            format!(
-                "{COMPUTE_ALGORITHM_VERSION}-primary{}-secondary{}",
-                self.primary_bucket_count, self.secondary_bucket_count
-            )
-        }
+    pub(crate) fn algorithm_version(&self) -> String {
+        let selection = self
+            .workload_algorithm_version
+            .as_deref()
+            .unwrap_or("explicit-qualification-configuration");
+        let partition = determinism::partition_algorithm_version(
+            self.primary_bucket_count,
+            self.secondary_bucket_count,
+        );
+        format!("{COMPUTE_ALGORITHM_VERSION}-{selection}-{partition}")
     }
 
     fn logical_bucket_count(&self) -> usize {
@@ -1199,15 +1195,8 @@ fn weekly_sort_keys() -> [&'static str; 4] {
     ["page_id", "page_namespace", "page_title", "week_start"]
 }
 
-fn stable_weekly_hash(page_id: Option<i64>) -> u64 {
-    let mut value = page_id.map_or(u64::MAX, |value| value as u64);
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
-}
-
 fn stable_weekly_bucket(page_id: Option<i64>, bucket_count: usize) -> usize {
-    stable_weekly_hash(page_id) as usize & (bucket_count - 1)
+    determinism::stable_page_hash(page_id) as usize & (bucket_count - 1)
 }
 
 fn stable_weekly_secondary_bucket(
@@ -1215,7 +1204,7 @@ fn stable_weekly_secondary_bucket(
     primary_bucket_count: usize,
     secondary_bucket_count: usize,
 ) -> usize {
-    (stable_weekly_hash(page_id) >> primary_bucket_count.trailing_zeros()) as usize
+    (determinism::stable_page_hash(page_id) >> primary_bucket_count.trailing_zeros()) as usize
         & (secondary_bucket_count - 1)
 }
 
@@ -2996,10 +2985,10 @@ mod tests {
             WeeklyAggregationConfig::new_two_level(32, 8, None)?.logical_bucket_count(),
             256
         );
-        assert_eq!(
-            WeeklyAggregationConfig::new(256, None)?.algorithm_version(),
-            COMPUTE_ALGORITHM_VERSION
-        );
+        let default_version = WeeklyAggregationConfig::new(256, None)?.algorithm_version();
+        assert!(default_version.starts_with(COMPUTE_ALGORITHM_VERSION));
+        assert!(default_version.contains("splitmix64-finalizer-v1-seed0000000000000000"));
+        assert!(default_version.ends_with("-primary256-secondary1"));
         assert!(
             WeeklyAggregationConfig::new(512, None)?
                 .algorithm_version()

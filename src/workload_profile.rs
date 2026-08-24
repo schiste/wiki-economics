@@ -316,10 +316,8 @@ impl WorkloadProfile {
 
     pub(crate) fn algorithm_version(&self) -> Result<String> {
         Ok(format!(
-            "{SELECTION_ALGORITHM_VERSION}-{}-primary{}-secondary{}",
-            self.profile.as_str(),
-            self.parameters.primary_buckets,
-            self.parameters.secondary_buckets
+            "{SELECTION_ALGORITHM_VERSION}-{}",
+            self.profile.as_str()
         ))
     }
 }
@@ -497,7 +495,7 @@ mod tests {
         assert!(
             selected
                 .algorithm_version()?
-                .contains("small-primary32-secondary8")
+                .contains("adaptive-workload-profile-v1-small")
         );
         selected.ensure_compute_qualified_with(false)?;
         selected.ensure_compute_qualified_with(true)?;

@@ -233,6 +233,12 @@ impl SnapshotPlan {
         );
         self.expected_date_range.validate()?;
         ensure!(!self.sources.is_empty(), "snapshot source plan is empty");
+        ensure!(
+            self.sources
+                .windows(2)
+                .all(|pair| pair[0].source_id < pair[1].source_id),
+            "snapshot source identities are not unique and strictly sorted"
+        );
         let expected = Self::resolve_from_base(
             source_base_url(self)?,
             self.wiki.as_str(),
