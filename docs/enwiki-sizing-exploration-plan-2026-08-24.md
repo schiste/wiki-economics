@@ -176,10 +176,14 @@ The implemented source-plan contract:
 
 ### Page-week aggregation
 
-The current implementation uses 256 stable disk buckets and retains a Parquet
-writer for every active bucket. Frwiki proved that increasing the count to 512
-or 1024 makes buckets smaller but increases aggregate writer, encoder, file,
-and allocator overhead. The 1024-bucket frwiki run exhausted the 6 GiB cgroup.
+Production continues to use the qualified flat `256 x 1` layout for frwiki.
+The Rust aggregation now also implements an explicit two-level layout for
+larger workloads. Monthly reductions use one staging writer; primary
+compaction opens only the governed writer batch; one primary is then streamed
+by Parquet row group into 16 or 32 secondary files; and one secondary bucket is
+reconciled at a time. The prior flat 512/1024 frwiki experiments remain useful
+evidence that increasing simultaneous encoder/file state is counterproductive:
+the 1024-bucket flat run exhausted the 6 GiB cgroup.
 
 At 256 buckets, the measured largest frwiki bucket contained 492,446 staged
 rows. Scaling by the two observed enwiki ratios gives approximately 2.82–3.17
@@ -191,13 +195,17 @@ The enwiki-capable design should expose two independent bounds:
 1. enough stable logical buckets to bound rows per reconciliation unit; and
 2. a small cap on simultaneously open Parquet writers.
 
-A suitable starting configuration is 2,048 logical buckets with an LRU of
-16–32 open writers, or an equivalent streamed two-level layout of 256 primary
-buckets by eight secondary buckets. Subdivision must itself be streaming; it
-must never load a multi-million-row primary bucket solely to repartition it.
+A suitable starting matrix is `64 x 16`, `64 x 32`, `128 x 16`, and
+`128 x 32` (1,024–4,096 logical buckets). The initial candidate is `64 x 32`:
+2,048 logical buckets with no more than 32 secondary writers. Primary inputs
+are consumed using their Parquet row-group boundaries rather than loaded as a
+complete multi-million-row frame.
 
 Stable key hashing, deterministic bucket order, deterministic row sorting,
-edit conservation, and atomic publication remain mandatory.
+edit conservation, and atomic publication remain mandatory. The implementation
+checks conservation before and after every reduction/routing level and deletes
+completed scratch immediately; enwiki activation still requires measured
+capacity evidence.
 
 ### Merge and validation
 

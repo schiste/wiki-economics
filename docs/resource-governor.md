@@ -22,10 +22,18 @@ free bytes. If a runtime gate closes, no new source starts; already-admitted
 transactions finish normally.
 
 Weekly page aggregation validates every logical month before collecting it.
-Scratch Parquets contain stable-bucket row groups, so 256, 512, or 1024 logical
-buckets require only one active staging writer. Predicate pushdown reads the
-selected row groups during reconciliation. This avoids the former one-open-file
-per-bucket behavior without changing the published schema or aggregation.
+The production `256 x 1` layout writes stable primary-bucket row groups through
+one staging writer and reads one primary bucket at a time. Larger workloads can
+use two levels: monthly staging is compacted into 64 or 128 primary files in
+writer-bounded batches, then one primary is streamed by Parquet row group into
+16 or 32 secondary files. Only one secondary reconciliation unit is loaded,
+sorted, and grouped at a time. Completed primary and secondary scratch is
+deleted immediately.
+
+Both levels use non-overlapping bits from the same stable page hash. Traversal
+is primary-major then secondary-major, so repeated runs of one configuration
+produce deterministic bytes. Row and edit totals are checked after monthly
+reduction, primary routing, secondary routing, and final reconciliation.
 
 ## Configuration
 
@@ -42,6 +50,9 @@ All byte values are integer bytes.
 | `WIKI_ECON_THREAD_LIMIT` | Upper bound for Rayon and Polars pools | configured pool size, otherwise 1 |
 | `WIKI_ECON_MAX_LOGICAL_PARTITION_BYTES` | Largest month accepted by compute | 8 GiB |
 | `WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS` | Parquet writers allowed at once | 16 |
+| `WIKI_ECON_WEEKLY_BUCKET_COUNT` | Legacy flat primary count; cannot be combined with the next two settings | 256 |
+| `WIKI_ECON_WEEKLY_PRIMARY_BUCKET_COUNT` | Primary count for an explicit one- or two-level layout: 64, 128, 256, 512, or 1024 | 256 |
+| `WIKI_ECON_WEEKLY_SECONDARY_BUCKET_COUNT` | Secondary count per primary: 1, 16, or 32 | 1 |
 
 `RAYON_NUM_THREADS` and `POLARS_MAX_THREADS` must not exceed
 `WIKI_ECON_THREAD_LIMIT`. Environment parsing and contradictory budgets are
@@ -63,13 +74,19 @@ WIKI_ECON_SOURCE_WORKERS=2
 WIKI_ECON_THREAD_LIMIT=4
 RAYON_NUM_THREADS=4
 POLARS_MAX_THREADS=4
-WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS=16
+WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS=32
+WIKI_ECON_WEEKLY_PRIMARY_BUCKET_COUNT=64
+WIKI_ECON_WEEKLY_SECONDARY_BUCKET_COUNT=32
 ```
 
-Test two and three source workers, three and four compute threads, and 16 and
-32 writer ceilings. Keep the combination only if the capacity report retains
-at least 25% sustained memory headroom and the measured storage peak stays
-inside quota plus reserve.
+Benchmark `64 x 16`, `64 x 32`, `128 x 16`, and `128 x 32`, with a writer
+ceiling at least as large as the selected secondary count. Also test two and
+three source workers and three and four compute threads. Keep a combination
+only if the capacity report retains at least 25% sustained memory headroom and
+the measured storage peak stays inside quota plus reserve. `capacity-bench`
+accepts `--weekly-buckets <primary>` and
+`--weekly-secondary-buckets <secondary>` and records all three counts
+(primary, secondary, and logical) in report schema 4.
 
 ## Telemetry
 

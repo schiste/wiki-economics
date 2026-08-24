@@ -223,6 +223,10 @@ enum Commands {
         #[arg(long, value_parser = clap::value_parser!(usize))]
         weekly_buckets: usize,
 
+        /// Stable second-level buckets within each primary bucket
+        #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(usize))]
+        weekly_secondary_buckets: usize,
+
         /// Dedicated scratch root for disk-backed aggregation runs
         #[arg(long)]
         scratch_dir: PathBuf,
@@ -357,6 +361,7 @@ trait Ops {
         scratch_dir: &std::path::Path,
         report_path: &std::path::Path,
         weekly_buckets: usize,
+        weekly_secondary_buckets: usize,
         raw_transient_bytes: u64,
         nfs_quota_bytes: Option<u64>,
         storage_reserve_bytes: u64,
@@ -468,6 +473,7 @@ impl Ops for RealOps {
         scratch_dir: &std::path::Path,
         report_path: &std::path::Path,
         weekly_buckets: usize,
+        weekly_secondary_buckets: usize,
         raw_transient_bytes: u64,
         nfs_quota_bytes: Option<u64>,
         storage_reserve_bytes: u64,
@@ -482,6 +488,7 @@ impl Ops for RealOps {
             quota_root,
             report_path,
             bucket_count: weekly_buckets,
+            secondary_bucket_count: weekly_secondary_buckets,
             raw_transient_requirement_bytes: raw_transient_bytes,
             nfs_quota_bytes,
             storage_reserve_bytes,
@@ -725,6 +732,7 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
         Commands::CapacityBench {
             wiki,
             weekly_buckets,
+            weekly_secondary_buckets,
             scratch_dir,
             report,
             raw_transient_bytes,
@@ -733,16 +741,18 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             quota_root,
             minimum_memory_headroom_percent,
         } => {
+            let bucket_label = if weekly_secondary_buckets == 1 {
+                format!("weekly-buckets-{weekly_buckets}")
+            } else {
+                format!("weekly-buckets-{weekly_buckets}x{weekly_secondary_buckets}")
+            };
             let report_path = report.unwrap_or_else(|| {
                 output_dir
                     .join("capacity")
                     .join(&wiki)
-                    .join(format!("weekly-buckets-{weekly_buckets}.json"))
+                    .join(format!("{bucket_label}.json"))
             });
-            let benchmark_output = output_dir
-                .join("capacity")
-                .join(&wiki)
-                .join(format!("weekly-buckets-{weekly_buckets}"));
+            let benchmark_output = output_dir.join("capacity").join(&wiki).join(&bucket_label);
             let quota_root = quota_root.unwrap_or_else(|| {
                 data_dir
                     .parent()
@@ -757,6 +767,7 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
                     &scratch_dir,
                     &report_path,
                     weekly_buckets,
+                    weekly_secondary_buckets,
                     raw_transient_bytes,
                     nfs_quota_bytes,
                     storage_reserve_bytes,
@@ -1200,6 +1211,7 @@ mod tests {
             scratch_dir: &Path,
             report_path: &Path,
             weekly_buckets: usize,
+            weekly_secondary_buckets: usize,
             raw_transient_bytes: u64,
             nfs_quota_bytes: Option<u64>,
             storage_reserve_bytes: u64,
@@ -1207,7 +1219,7 @@ mod tests {
             minimum_memory_headroom_percent: u8,
         ) -> Result<()> {
             self.record(format!(
-                "capacity:{wiki}:{}:{}:{}:{}:{weekly_buckets}:{raw_transient_bytes}:{}:{storage_reserve_bytes}:{}:{minimum_memory_headroom_percent}",
+                "capacity:{wiki}:{}:{}:{}:{}:{weekly_buckets}x{weekly_secondary_buckets}:{raw_transient_bytes}:{}:{storage_reserve_bytes}:{}:{minimum_memory_headroom_percent}",
                 data_dir.display(),
                 output_dir.display(),
                 scratch_dir.display(),
@@ -1304,6 +1316,7 @@ mod tests {
             _scratch_dir: &Path,
             _report_path: &Path,
             _weekly_buckets: usize,
+            _weekly_secondary_buckets: usize,
             _raw_transient_bytes: u64,
             _nfs_quota_bytes: Option<u64>,
             _storage_reserve_bytes: u64,
@@ -1620,6 +1633,8 @@ mod tests {
             "frwiki",
             "--weekly-buckets",
             "512",
+            "--weekly-secondary-buckets",
+            "32",
             "--scratch-dir",
             "/scratch",
             "--report",
@@ -1634,6 +1649,7 @@ mod tests {
             Commands::CapacityBench {
                 wiki,
                 weekly_buckets: 512,
+                weekly_secondary_buckets: 32,
                 scratch_dir,
                 report,
                 raw_transient_bytes: 33_285_996_544,
@@ -1752,6 +1768,7 @@ mod tests {
             quota_root: data.path(),
             report_path: &report_path,
             bucket_count: 256,
+            secondary_bucket_count: 1,
             raw_transient_requirement_bytes: 0,
             nfs_quota_bytes: Some(1_000_000_000),
             storage_reserve_bytes: 0,
@@ -1774,6 +1791,7 @@ mod tests {
             scratch.path(),
             &native_report,
             256,
+            1,
             0,
             Some(1_000_000_000),
             0,
@@ -1796,6 +1814,8 @@ mod tests {
             "frwiki",
             "--weekly-buckets",
             "1024",
+            "--weekly-secondary-buckets",
+            "32",
             "--scratch-dir",
             "scratch",
             "--raw-transient-bytes",
@@ -1816,7 +1836,7 @@ mod tests {
         assert_eq!(
             ops.calls.into_inner(),
             vec![
-                "capacity:frwiki:dataset:capacity-out/capacity/frwiki/weekly-buckets-1024:scratch:capacity-out/capacity/frwiki/weekly-buckets-1024.json:1024:31000000000:100000000000:40000000000:tool-root:30"
+                "capacity:frwiki:dataset:capacity-out/capacity/frwiki/weekly-buckets-1024x32:scratch:capacity-out/capacity/frwiki/weekly-buckets-1024x32.json:1024x32:31000000000:100000000000:40000000000:tool-root:30"
             ]
         );
         Ok(())
@@ -2476,6 +2496,7 @@ mod tests {
             Path::new("scratch"),
             Path::new("report.json"),
             256,
+            1,
             0,
             Some(1),
             0,

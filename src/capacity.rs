@@ -10,7 +10,7 @@ use crate::compute::{
 };
 use crate::{observability::MemorySnapshot, storage};
 
-const REPORT_SCHEMA_VERSION: u32 = 3;
+const REPORT_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct CapacityBenchmarkReport {
@@ -20,7 +20,10 @@ pub struct CapacityBenchmarkReport {
     pub generated_at_unix: u64,
     pub wiki: String,
     pub selected_snapshot: String,
+    /// Total reconciliation units (`primary_bucket_count * secondary_bucket_count`).
     pub bucket_count: usize,
+    pub primary_bucket_count: usize,
+    pub secondary_bucket_count: usize,
     pub rayon_threads: usize,
     pub polars_threads: usize,
     pub scratch_root: String,
@@ -54,7 +57,9 @@ pub struct CapacityBenchmarkOptions<'a> {
     pub scratch_root: &'a Path,
     pub quota_root: &'a Path,
     pub report_path: &'a Path,
+    /// First-level bucket count. Kept under the legacy name for API compatibility.
     pub bucket_count: usize,
+    pub secondary_bucket_count: usize,
     pub raw_transient_requirement_bytes: u64,
     pub nfs_quota_bytes: Option<u64>,
     pub storage_reserve_bytes: u64,
@@ -75,8 +80,9 @@ pub fn run(options: CapacityBenchmarkOptions<'_>) -> Result<CapacityBenchmarkRep
         "capacity quota root does not exist: {}",
         options.quota_root.display()
     );
-    let config = WeeklyAggregationConfig::new(
+    let config = WeeklyAggregationConfig::new_two_level(
         options.bucket_count,
+        options.secondary_bucket_count,
         Some(options.scratch_root.to_path_buf()),
     )?;
     let filesystem_available_bytes =
@@ -146,7 +152,9 @@ pub fn run(options: CapacityBenchmarkOptions<'_>) -> Result<CapacityBenchmarkRep
         generated_at_unix: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
         wiki: options.wiki.to_string(),
         selected_snapshot,
-        bucket_count: options.bucket_count,
+        bucket_count: aggregation.bucket_count,
+        primary_bucket_count: aggregation.primary_bucket_count,
+        secondary_bucket_count: aggregation.secondary_bucket_count,
         rayon_threads: configured_threads("RAYON_NUM_THREADS"),
         polars_threads: configured_threads("POLARS_MAX_THREADS"),
         scratch_root: options.scratch_root.to_string_lossy().into_owned(),
@@ -373,6 +381,7 @@ mod tests {
             quota_root: data.path(),
             report_path: &report_path,
             bucket_count: 256,
+            secondary_bucket_count: 1,
             raw_transient_requirement_bytes: 0,
             nfs_quota_bytes: Some(1_000_000_000),
             storage_reserve_bytes: 0,
@@ -388,6 +397,9 @@ mod tests {
         assert!(report.quota_available_bytes.is_some());
         assert_eq!(report.observed_memory_headroom_percent, 50.0);
         assert_eq!(report.aggregation.total_edits, 3);
+        assert_eq!(report.bucket_count, 256);
+        assert_eq!(report.primary_bucket_count, 256);
+        assert_eq!(report.secondary_bucket_count, 1);
         assert_eq!(report.output_sha256.len(), 64);
         let stored: serde_json::Value = serde_json::from_slice(&fs::read(&report_path)?)?;
         assert_eq!(stored["schema_version"], REPORT_SCHEMA_VERSION);
@@ -401,6 +413,7 @@ mod tests {
             quota_root: data.path(),
             report_path: &storage_failed_report,
             bucket_count: 256,
+            secondary_bucket_count: 1,
             raw_transient_requirement_bytes: 1,
             nfs_quota_bytes: Some(1),
             storage_reserve_bytes: 0,
@@ -420,6 +433,7 @@ mod tests {
             quota_root: data.path(),
             report_path: &failed_report,
             bucket_count: 256,
+            secondary_bucket_count: 1,
             raw_transient_requirement_bytes: 0,
             nfs_quota_bytes: Some(1_000_000_000),
             storage_reserve_bytes: 0,
@@ -471,7 +485,7 @@ mod tests {
                 missing_scratch.as_path(),
                 256,
             ),
-            (25, Some(1_000_000_000), data.path(), scratch.path(), 128),
+            (25, Some(1_000_000_000), data.path(), scratch.path(), 63),
         ];
         for (minimum_headroom, quota, quota_root, scratch_root, buckets) in invalid {
             let result = run(CapacityBenchmarkOptions {
@@ -482,6 +496,7 @@ mod tests {
                 quota_root,
                 report_path: &report,
                 bucket_count: buckets,
+                secondary_bucket_count: 1,
                 raw_transient_requirement_bytes: 0,
                 nfs_quota_bytes: quota,
                 storage_reserve_bytes: 0,
@@ -499,6 +514,7 @@ mod tests {
             quota_root: data.path(),
             report_path: &report,
             bucket_count: 256,
+            secondary_bucket_count: 1,
             raw_transient_requirement_bytes: u64::MAX,
             nfs_quota_bytes: Some(u64::MAX),
             storage_reserve_bytes: 0,
@@ -516,6 +532,7 @@ mod tests {
             quota_root: data.path(),
             report_path: &report,
             bucket_count: 256,
+            secondary_bucket_count: 1,
             raw_transient_requirement_bytes: 0,
             nfs_quota_bytes: Some(1_000_000_000),
             storage_reserve_bytes: 0,
@@ -538,6 +555,7 @@ mod tests {
             quota_root: data.path(),
             report_path: &unquotaed_report,
             bucket_count: 256,
+            secondary_bucket_count: 1,
             raw_transient_requirement_bytes: 0,
             nfs_quota_bytes: None,
             storage_reserve_bytes: 1024,
