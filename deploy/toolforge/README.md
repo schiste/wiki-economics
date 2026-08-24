@@ -55,7 +55,10 @@ frwiki completed the measured capacity qualification documented in
 - `rebuild-image.sh` rebuilds only the Toolforge image and restarts continuous
   processes. It uses detached JSON output and polls the exact build ID, so a
   disconnected log stream or concurrent build cannot produce a false result.
-- `jobs.yaml` — the loadable `wiki-econ-refresh` scheduled Job definition.
+- `jobs.yaml` — the loadable `wiki-econ-refresh` scheduled Job definition,
+  plus three on-demand-only Jobs (`wiki-econ-ingest`, `wiki-econ-compute`,
+  `wiki-econ-site`) for triggering a single pipeline stage between scheduled
+  refreshes — see [On-demand stage jobs](#on-demand-stage-jobs) below.
   `wiki-econ-admin` serves `/admin*` and the built static site as a separate
   buildservice webservice; it is not duplicated as a Toolforge Job.
 - `run-refresh.sh` — wraps `scripts/refresh.sh` for the scheduled job.
@@ -160,6 +163,42 @@ the selected snapshot. Terminal records add validated data summaries, failure
 context, and the published site generation; 104 compact weekly entries are
 retained by default. See the [refresh run record](../../docs/run-record.md) for
 the field contract and operator checks.
+
+### On-demand stage jobs
+
+`wiki-econ-refresh` always runs the full fetch → ingest → compute → merge →
+site pipeline, which is unnecessary when only one part changed — a
+`site/`-only or `docs/`-only commit still has to wait through a full
+fetch/compute cycle before the new page is live. `jobs.yaml` also loads three
+on-demand-only Jobs (no `schedule:`, so they never run on their own) that each
+set `WIKI_ECON_REFRESH_STAGE` and reuse `run-refresh.sh` unmodified:
+
+- `wiki-econ-ingest` — fetch, ingest, and patrol-fetch only, per wiki.
+- `wiki-econ-compute` — compute, patrol-compute, and merge only, then
+  publication-validate. Assumes a prior ingest already populated the
+  warehouse; the existing stage-fingerprint checks fail closed otherwise.
+- `wiki-econ-site` — the Observable production build only, against whatever
+  a prior compute last published. `build-site.sh` re-verifies the
+  publication gate itself, so this needs no wikis and no `run` invocation.
+
+Trigger one manually the same way an operator manually fires the scheduled
+refresh, with `toolforge jobs restart <name>`:
+
+```sh
+become wiki-economics toolforge jobs restart wiki-econ-site
+```
+
+All four jobs — the scheduled `wiki-econ-refresh` and the three on-demand
+ones — still serialize through `run-refresh.sh`'s single shared
+`.refresh-lock` (see below), so a manual site rebuild can't race a concurrent
+scheduled refresh or another on-demand job; it will simply exit `75` and wait
+for the next attempt.
+
+Each on-demand run produces its own independent `.refresh-status.json` /
+`.refresh-history.jsonl` entry rather than one unified ingest→compute→site
+record — deliberately, for now, to avoid unifying run-record/event-log state
+across three separate job invocations. `currentStage`/`stageDurationsMs` in
+that entry only cover the stage that actually ran.
 
 ## Runbook
 

@@ -36,3 +36,44 @@
   # current, peak, and limit values throughout page_weekly_edits.
   mem: 6Gi
   cpu: "1"
+
+# On-demand-only jobs (no `schedule:`): trigger with
+# `toolforge jobs restart <name>` between scheduled wiki-econ-refresh runs,
+# e.g. after a site/docs-only change that doesn't need a fresh fetch or
+# compute. See README.md's "On-demand stage jobs" section. Each still goes
+# through run-refresh.sh's single shared refresh lock, so it can't race a
+# concurrent wiki-econ-refresh or another on-demand job.
+
+- name: wiki-econ-ingest
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: deploy/toolforge/run-refresh.sh
+  filelog: true
+  mount: all
+  mem: 6Gi
+  cpu: "1"
+  envvars:
+    - WIKI_ECON_REFRESH_STAGE=ingest
+
+- name: wiki-econ-compute
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: deploy/toolforge/run-refresh.sh
+  filelog: true
+  mount: all
+  mem: 6Gi
+  cpu: "1"
+  envvars:
+    - WIKI_ECON_REFRESH_STAGE=compute
+
+- name: wiki-econ-site
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: deploy/toolforge/run-refresh.sh
+  filelog: true
+  mount: all
+  # Just the Observable build against already-published compute output.
+  # Conservative initial estimate, not yet measured on Toolforge — tighten
+  # after checking real cgroup peak usage (see the cgroup logging README.md
+  # references for wiki-econ-refresh).
+  mem: 2Gi
+  cpu: "1"
+  envvars:
+    - WIKI_ECON_REFRESH_STAGE=site
