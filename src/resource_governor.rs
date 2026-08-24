@@ -12,6 +12,9 @@ use crate::observability::MemorySnapshot;
 pub(crate) const MEMORY_CEILING_ENV: &str = "WIKI_ECON_MEMORY_CEILING_BYTES";
 pub(crate) const MEMORY_RESERVE_ENV: &str = "WIKI_ECON_MEMORY_RESERVE_BYTES";
 pub(crate) const PERSISTENT_RESERVE_ENV: &str = "WIKI_ECON_PERSISTENT_STORAGE_RESERVE_BYTES";
+pub(crate) const BOUNDED_SCRATCH_RESERVE_ENV: &str = "WIKI_ECON_BOUNDED_SCRATCH_RESERVE_BYTES";
+pub(crate) const ROLLBACK_GENERATION_RESERVE_ENV: &str =
+    "WIKI_ECON_ROLLBACK_GENERATION_RESERVE_BYTES";
 pub(crate) const SCRATCH_LIMIT_ENV: &str = "WIKI_ECON_SCRATCH_LIMIT_BYTES";
 pub(crate) const MAX_OPEN_FILES_ENV: &str = "WIKI_ECON_MAX_OPEN_FILES";
 pub(crate) const SOURCE_WORKERS_ENV: &str = "WIKI_ECON_SOURCE_WORKERS";
@@ -32,6 +35,8 @@ pub(crate) struct ResourceBudget {
     pub(crate) memory_ceiling_bytes: u64,
     pub(crate) memory_reserve_bytes: u64,
     pub(crate) persistent_storage_reserve_bytes: u64,
+    pub(crate) bounded_scratch_reserve_bytes: u64,
+    pub(crate) rollback_generation_reserve_bytes: u64,
     pub(crate) scratch_limit_bytes: u64,
     pub(crate) max_open_files: usize,
     pub(crate) source_worker_limit: usize,
@@ -56,6 +61,9 @@ impl ResourceBudget {
             memory_ceiling_bytes,
             memory_reserve_bytes,
             persistent_storage_reserve_bytes: parse_u64_env(PERSISTENT_RESERVE_ENV)?.unwrap_or(0),
+            bounded_scratch_reserve_bytes: parse_u64_env(BOUNDED_SCRATCH_RESERVE_ENV)?.unwrap_or(0),
+            rollback_generation_reserve_bytes: parse_u64_env(ROLLBACK_GENERATION_RESERVE_ENV)?
+                .unwrap_or(0),
             scratch_limit_bytes: parse_u64_env(SCRATCH_LIMIT_ENV)?
                 .unwrap_or(DEFAULT_SCRATCH_LIMIT_BYTES),
             max_open_files: parse_usize_env(MAX_OPEN_FILES_ENV)?.unwrap_or(DEFAULT_MAX_OPEN_FILES),
@@ -129,6 +137,13 @@ impl ResourceBudget {
 
     pub(crate) fn memory_admission_bytes(&self) -> u64 {
         self.memory_ceiling_bytes - self.memory_reserve_bytes
+    }
+
+    fn persistent_admission_reserve_bytes(&self) -> Result<u64> {
+        self.persistent_storage_reserve_bytes
+            .checked_add(self.bounded_scratch_reserve_bytes)
+            .and_then(|value| value.checked_add(self.rollback_generation_reserve_bytes))
+            .context("persistent storage reserve overflow")
     }
 }
 
@@ -229,15 +244,13 @@ impl ResourceGovernor {
         let available = sample
             .persistent_available_bytes
             .context("resource preflight requires persistent filesystem availability")?;
-        let required = self
-            .budget
-            .persistent_storage_reserve_bytes
+        let fixed_reserve = self.budget.persistent_admission_reserve_bytes()?;
+        let required = fixed_reserve
             .checked_add(estimated_additional)
             .context("snapshot storage requirement overflow")?;
         anyhow::ensure!(
             available >= required,
-            "resource preflight rejected snapshot: {available} persistent bytes available, {required} required (including {} reserve and {estimated_additional} estimated transient/candidate bytes)",
-            self.budget.persistent_storage_reserve_bytes
+            "resource preflight rejected snapshot: {available} persistent bytes available, {required} required (including {fixed_reserve} safety/scratch/rollback reserve and {estimated_additional} estimated raw-window/candidate bytes)"
         );
         self.validate_sample(&sample, 0)?;
         info!(
@@ -373,7 +386,7 @@ impl ResourceGovernor {
             .context("resource governor requires persistent filesystem availability")?;
         let required = self
             .budget
-            .persistent_storage_reserve_bytes
+            .persistent_admission_reserve_bytes()?
             .checked_add(additional_bytes)
             .context("resource admission storage requirement overflow")?;
         anyhow::ensure!(
@@ -552,6 +565,8 @@ mod tests {
             memory_ceiling_bytes: 1_000_000_000,
             memory_reserve_bytes: 250_000_000,
             persistent_storage_reserve_bytes: 0,
+            bounded_scratch_reserve_bytes: 0,
+            rollback_generation_reserve_bytes: 0,
             scratch_limit_bytes: 1_000_000,
             max_open_files: 128,
             source_worker_limit: 2,
@@ -573,6 +588,10 @@ mod tests {
         let mut invalid = budget();
         invalid.memory_reserve_bytes = invalid.memory_ceiling_bytes;
         assert!(invalid.validate().is_err());
+        let mut overflowing = budget();
+        overflowing.persistent_storage_reserve_bytes = u64::MAX;
+        overflowing.bounded_scratch_reserve_bytes = 1;
+        assert!(overflowing.persistent_admission_reserve_bytes().is_err());
         assert!(
             budget()
                 .validate_external_thread_pool_values([

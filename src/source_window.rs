@@ -677,6 +677,8 @@ mod tests {
                 memory_ceiling_bytes: u64::MAX,
                 memory_reserve_bytes: 0,
                 persistent_storage_reserve_bytes: 0,
+                bounded_scratch_reserve_bytes: 0,
+                rollback_generation_reserve_bytes: 0,
                 scratch_limit_bytes: u64::MAX,
                 max_open_files: 512,
                 source_worker_limit: 2,

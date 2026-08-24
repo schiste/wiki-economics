@@ -1081,12 +1081,6 @@ fn compute_page_weekly_edits_for_snapshot(
                 )
                 .context("page_weekly_edits working storage byte count overflow")?;
             working_storage_peak_bytes = working_storage_peak_bytes.max(working_bytes);
-            if let Some(paths) = &secondary_paths {
-                let completed_path = paths[secondary_bucket]
-                    .as_ref()
-                    .context("secondary path disappeared before cleanup")?;
-                fs::remove_file(completed_path)?;
-            }
             let memory = MemorySnapshot::capture();
             reconciliation_peak.observe(memory, None);
             governor.checkpoint("page_weekly_edits_reconcile_bucket")?;
@@ -1716,6 +1710,11 @@ impl PendingOutput {
         File::open(&self.temp_path)?.sync_all()?;
         let bytes = fs::metadata(&self.temp_path)?.len();
         fs::rename(&self.temp_path, &self.final_path)?;
+        let parent = self
+            .final_path
+            .parent()
+            .expect("pending output always has a validated parent directory");
+        File::open(parent)?.sync_all()?;
         self.published = true;
         Ok(bytes)
     }
