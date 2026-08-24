@@ -26,7 +26,7 @@ mod wiki_lifecycle;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Utc};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::env;
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -263,7 +263,32 @@ enum Commands {
         /// Maximum number of compressed sources retained before ingest
         #[arg(long)]
         source_window_size: Option<usize>,
+
+        /// Which portion of the pipeline to execute
+        #[arg(long, value_enum, default_value_t = RunStage::All)]
+        stage: RunStage,
     },
+}
+
+/// Portion of the fetch → ingest → compute → merge pipeline a `Run` invocation executes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum RunStage {
+    /// Ingest and compute, back to back (today's behavior).
+    All,
+    /// Fetch, ingest, and patrol-fetch only.
+    Ingest,
+    /// Compute, patrol-compute, and the trailing merge only.
+    Compute,
+}
+
+impl RunStage {
+    fn runs_ingest(self) -> bool {
+        matches!(self, RunStage::All | RunStage::Ingest)
+    }
+
+    fn runs_compute(self) -> bool {
+        matches!(self, RunStage::All | RunStage::Compute)
+    }
 }
 
 trait Ops {
@@ -744,6 +769,7 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             wikis,
             version,
             source_window_size,
+            stage,
         } => {
             let version = match version {
                 Some(version) => version,
@@ -758,29 +784,35 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             ops.persist_snapshot_plans(&wikis, &version, &data_dir)?;
             publication::begin_run(&output_dir, run_id.as_deref(), &wikis, Some(&version))?;
             for wiki in &wikis {
-                info!(wiki = wiki, "running full pipeline");
-                run_timed_stage("source_window", Some(wiki), || {
-                    ops.prepare_wiki_snapshot(
-                        wiki,
-                        &version,
-                        &data_dir,
-                        &source_window_run_id,
-                        source_window_size,
-                    )
-                })?;
-                run_timed_stage("patrol_fetch", Some(wiki), || {
-                    ops.fetch_patrol(wiki, &data_dir)
-                })?;
-                run_timed_stage("compute", Some(wiki), || {
-                    ops.compute_all(wiki, &data_dir, &output_dir)
-                })?;
-                run_timed_stage("patrol_compute", Some(wiki), || {
-                    ops.compute_patrol(wiki, &data_dir, &output_dir, false, None)
+                info!(wiki = wiki, stage = ?stage, "running pipeline stage");
+                if stage.runs_ingest() {
+                    run_timed_stage("source_window", Some(wiki), || {
+                        ops.prepare_wiki_snapshot(
+                            wiki,
+                            &version,
+                            &data_dir,
+                            &source_window_run_id,
+                            source_window_size,
+                        )
+                    })?;
+                    run_timed_stage("patrol_fetch", Some(wiki), || {
+                        ops.fetch_patrol(wiki, &data_dir)
+                    })?;
+                }
+                if stage.runs_compute() {
+                    run_timed_stage("compute", Some(wiki), || {
+                        ops.compute_all(wiki, &data_dir, &output_dir)
+                    })?;
+                    run_timed_stage("patrol_compute", Some(wiki), || {
+                        ops.compute_patrol(wiki, &data_dir, &output_dir, false, None)
+                    })?;
+                }
+            }
+            if stage.runs_compute() {
+                run_timed_stage("merge", None, || {
+                    ops.merge_outputs(&output_dir, run_id.as_deref())
                 })?;
             }
-            run_timed_stage("merge", None, || {
-                ops.merge_outputs(&output_dir, run_id.as_deref())
-            })?;
         }
     }
 
@@ -1813,6 +1845,69 @@ mod tests {
             vec![
                 "source_window:frwiki:2025-12:dataset:3",
                 "fetch_patrol:frwiki:dataset",
+                "compute:frwiki:dataset:results",
+                "compute_patrol:frwiki:dataset:results:false:_",
+                "merge:results",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn run_with_ops_stage_ingest_skips_compute_and_merge() -> Result<()> {
+        init_test_tracing();
+        let cli = Cli::try_parse_from([
+            "wiki-econ",
+            "--data-dir",
+            "dataset",
+            "--output-dir",
+            "results",
+            "run",
+            "frwiki",
+            "--version",
+            "2025-12",
+            "--source-window-size",
+            "3",
+            "--stage",
+            "ingest",
+        ])?;
+        let ops = RecordingOps::default();
+
+        run_with_ops(cli, &ops)?;
+
+        assert_eq!(
+            ops.calls.into_inner(),
+            vec![
+                "source_window:frwiki:2025-12:dataset:3",
+                "fetch_patrol:frwiki:dataset",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn run_with_ops_stage_compute_skips_fetch_ingest_and_cleanup() -> Result<()> {
+        init_test_tracing();
+        let cli = Cli::try_parse_from([
+            "wiki-econ",
+            "--data-dir",
+            "dataset",
+            "--output-dir",
+            "results",
+            "run",
+            "frwiki",
+            "--version",
+            "2025-12",
+            "--stage",
+            "compute",
+        ])?;
+        let ops = RecordingOps::default();
+
+        run_with_ops(cli, &ops)?;
+
+        assert_eq!(
+            ops.calls.into_inner(),
+            vec![
                 "compute:frwiki:dataset:results",
                 "compute_patrol:frwiki:dataset:results:false:_",
                 "merge:results",
