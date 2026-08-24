@@ -154,7 +154,7 @@ and higher resource envelope are being qualified.
 
 Scheduled preparation uses one lock per wiki under
 `output/_prepare-locks/<wiki>.lock`; publication alone uses
-`output/.publication-lock`. Both are atomic directory locks with owner JSON,
+`output/.publication.lock`. Both are atomic directory locks with owner JSON,
 heartbeats, stable owner tokens, double-checked stale recovery, and exit status
 75 for contention. This allows long wiki builds to overlap without allowing
 two writers for the same wiki or two public release switches.

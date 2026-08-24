@@ -36,7 +36,7 @@ exec > >(tee -a "$log_dir/$WIKI_ECON_RUN_ID.log") 2>&1
 echo "=== publication start run_id=$WIKI_ECON_RUN_ID at=$(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
 
 "$ROOT/deploy/toolforge/run-with-lock.sh" \
-  "$WIKI_ECON_OUTPUT_DIR/.publication-lock" \
+  "$WIKI_ECON_OUTPUT_DIR/.publication.lock" \
   publication \
   "${WIKI_ECON_PUBLICATION_LOCK_STALE_SECS:-21600}" \
   "$ROOT/deploy/toolforge/publish-ready-transaction.sh"

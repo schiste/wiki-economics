@@ -53,7 +53,7 @@ unselected input generation.
 ## Publication transaction
 
 `wiki-econ publication-prepare-ready` runs under the sole global
-`output/.publication-lock`. It revalidates every ready receipt and artifact,
+`output/.publication.lock`. It revalidates every ready receipt and artifact,
 selects the newest non-downgrading candidate for each managed wiki, and writes
 a recovery journal under:
 
@@ -93,7 +93,7 @@ The scheduled jobs are:
 | `wiki-econ-prepare-nlwiki` | `nlwiki.lock` | Prepare and validate nlwiki |
 | `wiki-econ-prepare-ptwiki` | `ptwiki.lock` | Prepare and validate ptwiki |
 | `wiki-econ-prepare-frwiki` | `frwiki.lock` | Prepare and validate frwiki |
-| `wiki-econ-publish-ready` | `.publication-lock` | Select, merge, build, validate, switch, retire |
+| `wiki-econ-publish-ready` | `.publication.lock` | Select, merge, build, validate, switch, retire |
 
 The weekly preparation schedules are discovery triggers rather than an
 instruction to rebuild. Each trigger resolves and pins the latest completed
@@ -141,7 +141,7 @@ Inspect locks and transactions with:
 
 ```sh
 become wiki-economics find /data/project/wiki-economics/output/_prepare-locks -name owner.json -maxdepth 2 -print
-become wiki-economics jq . /data/project/wiki-economics/output/.publication-lock/owner.json
+become wiki-economics jq . /data/project/wiki-economics/output/.publication.lock/owner.json
 become wiki-economics find /data/project/wiki-economics/output/_publication_transactions -name selection.json -print
 ```
 
