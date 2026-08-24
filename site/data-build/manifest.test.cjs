@@ -5,7 +5,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const {after, test} = require("node:test");
-const {buildManifest, generationSummary, parquetRowCounter, publicationLicensing, releaseProvenance, safeReceiptOutput} = require("./manifest.json.cjs");
+const {buildManifest, determinismContract, generationSummary, parquetRowCounter, publicationLicensing, releaseProvenance, safeReceiptOutput} = require("./manifest.json.cjs");
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-manifest-"));
 const repositoryRoot = path.resolve(__dirname, "../..");
@@ -132,6 +132,7 @@ test("generation readiness follows the pointer and strict ingest receipt without
   assert.equal(manifest.provenance.generated_at, "2026-08-23T12:00:00Z");
   assert.deepEqual(manifest.provenance.selected_snapshot_versions, {nlwiki: "2026-07"});
   assert.equal(manifest.provenance.workload_profiles.nlwiki.profile, "small");
+  assert.equal(manifest.provenance.determinism_contract.partition_hash.seed_u64, 0);
   assert.equal(manifest.wikis.nlwiki.workload_profile.parameters.primary_buckets, 32);
   assert.equal(manifest.provenance.release_environment.runtime.node, "24.15.0");
   assert.equal(manifest.provenance.release_environment.runtime.npm, "11.12.1");
@@ -182,6 +183,12 @@ test("publication licensing policy fails closed when required legal fields drift
   const file = path.join(root, "invalid-publication-licensing.json");
   fs.writeFileSync(file, JSON.stringify({schema_version: 1, license: {spdx_identifier: "MIT"}}));
   assert.throws(() => publicationLicensing(file), /invalid publication licensing policy/);
+});
+
+test("determinism provenance fails closed when its hash contract drifts", () => {
+  const file = path.join(root, "invalid-determinism-contract.json");
+  fs.writeFileSync(file, JSON.stringify({schema_version: 1, contract_version: "changed"}));
+  assert.throws(() => determinismContract(file), /invalid determinism contract/);
 });
 
 test("production manifest generation requires valid observed release provenance", () => {

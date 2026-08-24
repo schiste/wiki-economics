@@ -442,6 +442,8 @@ struct PublicationProvenance {
     selected_snapshot_versions: BTreeMap<String, String>,
     #[serde(default)]
     workload_profiles: BTreeMap<String, crate::workload_profile::WorkloadProfile>,
+    #[serde(default)]
+    determinism_contract: Option<crate::determinism::DeterminismContract>,
 }
 
 struct FileSummary {
@@ -1950,7 +1952,7 @@ pub fn validate(
         BTreeMap::new()
     };
     let receipt = GateReceipt {
-        schema_version: 3,
+        schema_version: 4,
         run_id: run_id.to_string(),
         validated_at_unix,
         license: policy.license,
@@ -1966,6 +1968,7 @@ pub fn validate(
             generated_at_unix: validated_at_unix,
             selected_snapshot_versions: selected_snapshots.clone(),
             workload_profiles,
+            determinism_contract: Some(crate::determinism::contract()?),
         },
         selected_snapshot_versions: selected_snapshots,
         cutoff_dates: cutoffs,
@@ -1999,7 +2002,7 @@ pub fn verify(output_dir: &Path, run_id: &str) -> Result<()> {
     // since an on-demand site build legitimately runs a newer (or older)
     // binary than whatever last validated the data.
     ensure!(
-        receipt.schema_version == 3
+        matches!(receipt.schema_version, 3 | 4)
             && receipt.license == policy.license
             && receipt.attribution == policy.attribution
             && receipt.independence_notice == policy.independence_notice
@@ -2010,6 +2013,9 @@ pub fn verify(output_dir: &Path, run_id: &str) -> Result<()> {
             && receipt.provenance.run_id == receipt.run_id
             && receipt.provenance.generated_at_unix == receipt.validated_at_unix
             && receipt.provenance.selected_snapshot_versions == receipt.selected_snapshot_versions
+            && (receipt.schema_version == 3
+                || receipt.provenance.determinism_contract.as_ref()
+                    == Some(&crate::determinism::contract()?))
             && receipt.artifacts == candidate.artifacts,
         "publication receipt does not match candidate artifacts"
     );
@@ -2288,7 +2294,11 @@ mod tests {
         verify(fixture.output.path(), "run-good")?;
 
         let receipt: Value = read_json(&fixture.output.path().join(RECEIPT_FILE))?;
-        assert_eq!(receipt["schema_version"], 3);
+        assert_eq!(receipt["schema_version"], 4);
+        assert_eq!(
+            receipt["provenance"]["determinism_contract"]["contract_version"],
+            "pipeline-byte-determinism-v1"
+        );
         assert!(
             receipt["browser_data"]["partitions"]
                 .as_u64()

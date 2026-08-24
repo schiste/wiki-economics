@@ -46,6 +46,24 @@ function publicationLicensing(file = path.join(findRoot(), "config", "publicatio
   return policy;
 }
 
+function determinismContract(file = path.join(findRoot(), "config", "determinism-contract.json")) {
+  const contract = readJson(file);
+  if (contract?.schema_version !== 1
+      || contract?.contract_version !== "pipeline-byte-determinism-v1"
+      || contract?.digest_algorithm !== "SHA-256"
+      || contract?.partition_hash?.algorithm !== "splitmix64-finalizer"
+      || contract?.partition_hash?.version !== 1
+      || contract?.partition_hash?.seed_u64 !== 0
+      || typeof contract?.source_order !== "string" || contract.source_order.length === 0
+      || typeof contract?.fragment_order !== "string" || contract.fragment_order.length === 0
+      || typeof contract?.fragment_row_order !== "string" || contract.fragment_row_order.length === 0
+      || typeof contract?.final_merge_order !== "string" || contract.final_merge_order.length === 0
+      || contract?.parquet_metadata_policy !== "no-wall-clock-fields-v1") {
+    throw new Error(`invalid determinism contract: ${file}`);
+  }
+  return contract;
+}
+
 function repositoryRuntimeProvenance(root) {
   const packageManifest = readJson(path.join(root, "package.json"));
   const siteManifest = readJson(path.join(root, "site", "package.json"));
@@ -454,6 +472,7 @@ async function buildManifest(options = {}) {
       generated_at: generatedAt,
       selected_snapshot_versions: selectedSnapshots,
       workload_profiles: workloadProfiles,
+      determinism_contract: determinismContract(path.join(repositoryRoot, "config", "determinism-contract.json")),
       release_environment: releaseProvenance(repositoryRoot, environment),
     },
     data_dir: dataDir,
@@ -477,5 +496,5 @@ if (require.main === module) {
   });
 }
 
-module.exports = {BROWSER_INDEX, browserDataSummary, buildManifest, datasetApplies, discoverWikis, generationSummary, humanBytes, parquetRowCounter,
+module.exports = {BROWSER_INDEX, browserDataSummary, buildManifest, datasetApplies, determinismContract, discoverWikis, generationSummary, humanBytes, parquetRowCounter,
   patrolSummary, publicationLicensing, releaseProvenance, repositoryRuntimeProvenance, safeReceiptOutput};
