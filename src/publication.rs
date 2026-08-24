@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
 
+use crate::generation_lifecycle::GenerationState as GState;
 use crate::{licensing, storage};
 
 const RUN_CONTEXT_FILE: &str = ".publication-run.json";
@@ -279,6 +280,8 @@ struct SelectionEntry {
     wiki: String,
     snapshot: String,
     candidate_relative: String,
+    #[serde(default)]
+    previous_candidate_relative: Option<String>,
     previous_snapshot: Option<String>,
     backup_relative: Option<String>,
 }
@@ -289,6 +292,57 @@ struct PublicationSelection {
     run_id: String,
     state: String,
     entries: Vec<SelectionEntry>,
+}
+
+#[derive(Clone, Copy)]
+struct CandidateGeneration<'a> {
+    output_dir: &'a Path,
+    wiki: &'a str,
+    snapshot: &'a str,
+    run_id: &'a str,
+}
+
+impl<'a> CandidateGeneration<'a> {
+    fn new(output_dir: &'a Path, wiki: &'a str, snapshot: &'a str, run_id: &'a str) -> Self {
+        Self {
+            output_dir,
+            wiki,
+            snapshot,
+            run_id,
+        }
+    }
+
+    fn adopt(
+        self,
+        state: GState,
+        reason: &str,
+    ) -> Result<crate::generation_lifecycle::GenerationRecord> {
+        crate::generation_lifecycle::adopt(
+            self.output_dir,
+            self.wiki,
+            self.snapshot,
+            self.run_id,
+            state,
+            reason,
+        )
+    }
+
+    fn transition(
+        self,
+        state: GState,
+        reason: &str,
+        publication_run_id: Option<&str>,
+    ) -> Result<crate::generation_lifecycle::GenerationRecord> {
+        crate::generation_lifecycle::transition(
+            self.output_dir,
+            self.wiki,
+            self.snapshot,
+            self.run_id,
+            state,
+            reason,
+            publication_run_id,
+        )
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -601,6 +655,9 @@ pub(crate) fn mark_wiki_candidate_ready(
     run_id: &str,
 ) -> Result<PathBuf> {
     let candidate_dir = wiki_candidate_dir(output_dir, wiki, snapshot, run_id)?;
+    let generation = CandidateGeneration::new(output_dir, wiki, snapshot, run_id);
+    let reason = "recovered candidate preparation";
+    let generation_state = generation.adopt(GState::Building, reason)?;
     storage::read_generation_manifest(data_dir, wiki, snapshot)?;
     let registry = load_lifecycle(lifecycle_path)?;
     let lifecycle = registry
@@ -675,8 +732,28 @@ pub(crate) fn mark_wiki_candidate_ready(
         cutoff_date: cutoff_date.context("candidate GDP cutoff is missing")?,
         artifacts,
     };
+    let generation_state =
+        if generation_state.state == crate::generation_lifecycle::GenerationState::Building {
+            let reason = "candidate artifacts passed semantic validation";
+            generation.transition(GState::Validated, reason, None)?
+        } else {
+            generation_state
+        };
+    ensure!(
+        matches!(
+            generation_state.state,
+            crate::generation_lifecycle::GenerationState::Validated
+                | crate::generation_lifecycle::GenerationState::Ready
+        ),
+        "candidate cannot be marked ready from {:?}",
+        generation_state.state
+    );
     let ready_path = candidate_dir.join("ready.json");
     atomic_json(&ready_path, &ready)?;
+    if generation_state.state == crate::generation_lifecycle::GenerationState::Validated {
+        let reason = "ready receipt was durably published";
+        generation.transition(GState::Ready, reason, None)?;
+    }
     info!(wiki, snapshot, run_id, path = %ready_path.display(), "wiki candidate is ready");
     Ok(ready_path)
 }
@@ -707,6 +784,22 @@ fn validate_ready_candidate(
         validate_prepared_artifact(candidate_dir, artifact)?;
     }
     validate_snapshot_cutoff(&ready.wiki, &ready.snapshot, &ready.cutoff_date)
+}
+
+fn reconcile_ready_generation_state(output_dir: &Path, ready: &ReadyWikiCandidate) -> Result<()> {
+    let generation =
+        CandidateGeneration::new(output_dir, &ready.wiki, &ready.snapshot, &ready.run_id);
+    let reason = "adopted legacy validated ready receipt";
+    let mut record = generation.adopt(GState::Ready, reason)?;
+    if record.state == crate::generation_lifecycle::GenerationState::Building {
+        let reason = "recovered candidate passed ready-receipt validation";
+        record = generation.transition(GState::Validated, reason, None)?;
+    }
+    if record.state == crate::generation_lifecycle::GenerationState::Validated {
+        let reason = "recovered durable ready receipt";
+        generation.transition(GState::Ready, reason, None)?;
+    }
+    Ok(())
 }
 
 fn copy_candidate_files(
@@ -763,6 +856,7 @@ pub(crate) fn plan_wiki_preparation(
         "run ID already identifies a ready candidate"
     );
     if !snapshot_root.is_dir() {
+        crate::generation_lifecycle::begin(output_dir, wiki, snapshot, run_id)?;
         return Ok(WikiPreparationPlan::Build {
             same_snapshot_candidate: false,
             compute_reused: false,
@@ -783,6 +877,7 @@ pub(crate) fn plan_wiki_preparation(
             "ready candidate identity does not match preparation request"
         );
         validate_ready_candidate(data_dir, &candidate_dir, &ready)?;
+        reconcile_ready_generation_state(output_dir, &ready)?;
         candidates.push((ready, candidate_dir));
     }
     candidates.sort_by(|(left, _), (right, _)| {
@@ -812,6 +907,8 @@ pub(crate) fn plan_wiki_preparation(
             reusable_patrol = Some((candidate_dir.clone(), files));
         }
     }
+
+    crate::generation_lifecycle::begin(output_dir, wiki, snapshot, run_id)?;
 
     reusable_compute
         .as_ref()
@@ -866,6 +963,7 @@ fn latest_ready_candidates(
                 let ready: ReadyWikiCandidate = read_json(&ready_path)?;
                 ensure!(ready.wiki == wiki, "ready candidate wiki mismatch");
                 validate_ready_candidate(data_dir, &candidate_dir, &ready)?;
+                reconcile_ready_generation_state(output_dir, &ready)?;
                 candidates.push((ready, candidate_dir));
             }
         }
@@ -909,6 +1007,44 @@ fn active_candidate_target(output_dir: &Path, wiki: &str) -> Result<Option<PathB
         Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Ok(None),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
+    }
+}
+
+fn active_candidate_relative(output_dir: &Path, wiki: &str) -> Result<Option<String>> {
+    let Some(target) = active_candidate_target(output_dir, wiki)? else {
+        return Ok(None);
+    };
+    let absolute = if target.is_absolute() {
+        target
+    } else {
+        output_dir.join(target)
+    };
+    let Some(candidate) = absolute.parent() else {
+        return Ok(None);
+    };
+    let Ok(relative) = candidate.strip_prefix(output_dir) else {
+        return Ok(None);
+    };
+    let components = relative
+        .components()
+        .map(|component| match component {
+            std::path::Component::Normal(value) => value.to_str(),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>();
+    let Some(components) = components else {
+        return Ok(None);
+    };
+    if components.len() == 4
+        && components[0] == "_candidates"
+        && components[1] == wiki
+        && crate::storage::validate_snapshot_version(components[2]).is_ok()
+        && valid_component(components[3])
+        && absolute.file_name().and_then(|name| name.to_str()) == Some(wiki)
+    {
+        Ok(Some(relative.to_string_lossy().into_owned()))
+    } else {
+        Ok(None)
     }
 }
 
@@ -972,9 +1108,24 @@ fn rollback_selection_files(
     Ok(())
 }
 
-fn retire_superseded_candidates(output_dir: &Path, entry: &SelectionEntry) -> Result<usize> {
+fn candidate_identity(candidate_dir: &Path) -> Option<(&str, &str)> {
+    let run_id = candidate_dir.file_name()?.to_str()?;
+    let snapshot = candidate_dir.parent()?.file_name()?.to_str()?;
+    (valid_component(run_id) && crate::storage::validate_snapshot_version(snapshot).is_ok())
+        .then_some((snapshot, run_id))
+}
+
+fn retire_superseded_candidates(
+    output_dir: &Path,
+    entry: &SelectionEntry,
+    publication_run_id: &str,
+) -> Result<usize> {
     let root = output_dir.join("_candidates").join(&entry.wiki);
     let retained = output_dir.join(&entry.candidate_relative);
+    let rollback = entry
+        .previous_candidate_relative
+        .as_deref()
+        .map(|relative| output_dir.join(relative));
     let mut removed = 0;
     if !root.is_dir() {
         return Ok(0);
@@ -986,10 +1137,31 @@ fn retire_superseded_candidates(output_dir: &Path, entry: &SelectionEntry) -> Re
         }
         for run_entry in fs::read_dir(&snapshot_dir)? {
             let candidate_dir = run_entry?.path();
-            if candidate_dir.is_dir() && candidate_dir != retained {
-                fs::remove_dir_all(&candidate_dir)?;
-                removed += 1;
+            if !candidate_dir.is_dir()
+                || candidate_dir == retained
+                || rollback.as_ref() == Some(&candidate_dir)
+                || !candidate_dir.join("ready.json").is_file()
+            {
+                continue;
             }
+            let Some((snapshot, run_id)) = candidate_identity(&candidate_dir) else {
+                continue;
+            };
+            let generation = CandidateGeneration::new(output_dir, &entry.wiki, snapshot, run_id);
+            let reason = "adopted legacy ready candidate";
+            let record = generation.adopt(GState::Ready, reason)?;
+            if matches!(
+                record.state,
+                crate::generation_lifecycle::GenerationState::Ready
+                    | crate::generation_lifecycle::GenerationState::Published
+            ) {
+                let reason = "a newer candidate passed publication validation";
+                generation.transition(GState::Superseded, reason, Some(publication_run_id))?;
+            }
+            let reason = "superseded candidate is outside the rollback window";
+            generation.transition(GState::Retired, reason, Some(publication_run_id))?;
+            fs::remove_dir_all(&candidate_dir)?;
+            removed += 1;
         }
         if fs::read_dir(&snapshot_dir)?.next().is_none() {
             fs::remove_dir(&snapshot_dir)?;
@@ -1038,10 +1210,12 @@ fn activate_ready_candidates(
                 .into_owned()
         });
         let previous_snapshot = storage::current_snapshot_version(data_dir, &ready.wiki)?;
+        let previous_candidate_relative = active_candidate_relative(output_dir, &ready.wiki)?;
         entries.push(SelectionEntry {
             wiki: ready.wiki,
             snapshot: ready.snapshot,
             candidate_relative,
+            previous_candidate_relative,
             previous_snapshot,
             backup_relative,
         });
@@ -1146,7 +1320,7 @@ pub(crate) fn commit_ready_publication(
     ensure!(
         selection.schema_version == 1
             && selection.run_id == run_id
-            && selection.state == "selected",
+            && matches!(selection.state.as_str(), "selected" | "committing"),
         "publication selection is not active"
     );
     verify(output_dir, run_id)?;
@@ -1155,15 +1329,39 @@ pub(crate) fn commit_ready_publication(
         receipt.run_id == run_id,
         "publication receipt belongs to another transaction"
     );
+    if selection.state == "selected" {
+        selection.state = "committing".to_string();
+        atomic_json(&path, &selection)?;
+    }
     for entry in &selection.entries {
         ensure!(
             storage::current_snapshot_version(data_dir, &entry.wiki)?.as_deref()
                 == Some(entry.snapshot.as_str()),
             "selected snapshot changed before publication commit"
         );
-        remove_committed_backup(output_dir, entry.backup_relative.as_deref())?;
+        let selected = output_dir.join(&entry.candidate_relative);
+        let (selected_snapshot, selected_run_id) =
+            candidate_identity(&selected).context("selected candidate identity is invalid")?;
+        let generation =
+            CandidateGeneration::new(output_dir, &entry.wiki, selected_snapshot, selected_run_id);
+        let reason = "adopted legacy selected candidate";
+        generation.adopt(GState::Ready, reason)?;
+        let reason = "site publication passed validation";
+        generation.transition(GState::Published, reason, Some(run_id))?;
+        if let Some(previous) = entry.previous_candidate_relative.as_deref() {
+            let previous = output_dir.join(previous);
+            if let Some((snapshot, candidate_run_id)) = candidate_identity(&previous) {
+                let previous =
+                    CandidateGeneration::new(output_dir, &entry.wiki, snapshot, candidate_run_id);
+                let reason = "adopted legacy published candidate";
+                previous.adopt(GState::Published, reason)?;
+                let reason = "replacement site publication passed validation";
+                previous.transition(GState::Superseded, reason, Some(run_id))?;
+            }
+        }
+        let retired_candidates = retire_superseded_candidates(output_dir, entry, run_id)?;
         storage::retire_inactive_snapshots(data_dir, &entry.wiki)?;
-        let retired_candidates = retire_superseded_candidates(output_dir, entry)?;
+        remove_committed_backup(output_dir, entry.backup_relative.as_deref())?;
         info!(
             wiki = entry.wiki,
             retired_candidates, "retired superseded wiki candidates"
@@ -2197,6 +2395,21 @@ mod tests {
         )
         .expect("incomplete candidate fixture should write");
         let ready = fixture.ready_candidate("candidate-reusable")?;
+        let state_path = crate::generation_lifecycle::state_path(
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            "candidate-reusable",
+        )
+        .expect("candidate state path should resolve");
+        fs::remove_file(state_path).expect("candidate state should be removable");
+        crate::generation_lifecycle::begin(
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            "candidate-reusable",
+        )
+        .expect("candidate lifecycle should restart");
         assert_eq!(
             plan_wiki_preparation(
                 fixture.data.path(),
@@ -2332,6 +2545,12 @@ mod tests {
             "publish-2",
         )
         .expect("candidate should prepare for commit");
+        let selection_file = selection_path(fixture.output.path(), "publish-2")?;
+        let mut interrupted: PublicationSelection = read_json(&selection_file)?;
+        interrupted.state = "committing".to_string();
+        interrupted.entries[0].previous_candidate_relative =
+            Some("_candidates/nlwiki/invalid/run".to_string());
+        atomic_json(&selection_file, &interrupted)?;
         commit_ready_publication(fixture.data.path(), fixture.output.path(), "publish-2")?;
 
         let active = fixture.output.path().join("nlwiki");
@@ -2349,6 +2568,18 @@ mod tests {
                 .path()
                 .join("_candidates/nlwiki/2026-03/candidate-1")
                 .exists()
+        );
+        assert_eq!(
+            crate::generation_lifecycle::load(
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                "candidate-1",
+            )
+            .expect("retired candidate state should load")
+            .context("retired candidate state should remain")?
+            .state,
+            crate::generation_lifecycle::GenerationState::Retired
         );
         let selection: PublicationSelection =
             read_json(&selection_path(fixture.output.path(), "publish-2")?)?;
@@ -2406,6 +2637,31 @@ mod tests {
             "publish-symlink-backup",
         )
         .expect("symlink-backed candidate should commit");
+        assert_eq!(
+            crate::generation_lifecycle::load(
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                "candidate-2",
+            )
+            .expect("rollback candidate state should load")
+            .context("rollback candidate state should remain")?
+            .state,
+            crate::generation_lifecycle::GenerationState::Superseded
+        );
+        assert!(candidate_2.is_dir());
+        assert_eq!(
+            crate::generation_lifecycle::load(
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                "candidate-3",
+            )
+            .expect("published candidate state should load")
+            .context("published candidate state should exist")?
+            .state,
+            crate::generation_lifecycle::GenerationState::Published
+        );
         Ok(())
     }
 
@@ -2456,6 +2712,49 @@ mod tests {
             1
         );
         assert!(active_candidate_target(fixture.output.path(), &"x".repeat(10_000)).is_err());
+        assert_eq!(
+            active_candidate_relative(fixture.output.path(), "missingwiki")?,
+            None
+        );
+        let invalid_active = fixture.output.path().join("invalid-active");
+        std::os::unix::fs::symlink("outside", &invalid_active)?;
+        assert_eq!(
+            active_candidate_relative(fixture.output.path(), "invalid-active")?,
+            None
+        );
+        fs::remove_file(&invalid_active)?;
+        std::os::unix::fs::symlink(
+            "_candidates/nlwiki/2026-03/../candidate-1/nlwiki",
+            &invalid_active,
+        )
+        .expect("traversal symlink fixture should be writable");
+        assert_eq!(
+            active_candidate_relative(fixture.output.path(), "invalid-active")?,
+            None
+        );
+        fs::remove_file(&invalid_active)?;
+        std::os::unix::fs::symlink(Path::new("/"), &invalid_active)?;
+        assert_eq!(
+            active_candidate_relative(fixture.output.path(), "invalid-active")?,
+            None
+        );
+        fs::remove_file(&invalid_active)?;
+        std::os::unix::fs::symlink("/outside/invalid-active", &invalid_active)?;
+        assert_eq!(
+            active_candidate_relative(fixture.output.path(), "invalid-active")?,
+            None
+        );
+        fs::remove_file(&invalid_active)?;
+        let absolute_candidate = fixture
+            .output
+            .path()
+            .join("_candidates/nlwiki/2026-03/candidate-1/nlwiki");
+        std::os::unix::fs::symlink(&absolute_candidate, &invalid_active)?;
+        assert_eq!(
+            active_candidate_relative(fixture.output.path(), "invalid-active")?,
+            None
+        );
+        fs::remove_file(&invalid_active)?;
         assert!(selection_path(fixture.output.path(), "unsafe/run").is_err());
 
         let active = fixture.output.path().join("nlwiki");
@@ -2483,6 +2782,7 @@ mod tests {
                     wiki: "nlwiki".to_string(),
                     snapshot: "2026-03".to_string(),
                     candidate_relative: "_candidates/nlwiki/2026-03/not-active".to_string(),
+                    previous_candidate_relative: None,
                     previous_snapshot: Some("2026-03".to_string()),
                     backup_relative: None,
                 }],
@@ -2504,6 +2804,7 @@ mod tests {
                 wiki: "nlwiki".to_string(),
                 snapshot: "2026-03".to_string(),
                 candidate_relative: "_candidates/nlwiki/2026-03/not-active".to_string(),
+                previous_candidate_relative: None,
                 previous_snapshot: Some("2026-03".to_string()),
                 backup_relative: None,
             }],
@@ -2518,32 +2819,53 @@ mod tests {
             wiki: "missingwiki".to_string(),
             snapshot: "2026-03".to_string(),
             candidate_relative: "_candidates/missingwiki/2026-03/run".to_string(),
+            previous_candidate_relative: None,
             previous_snapshot: None,
             backup_relative: None,
         };
         assert_eq!(
-            retire_superseded_candidates(fixture.output.path(), &missing)?,
+            retire_superseded_candidates(fixture.output.path(), &missing, "publication")?,
             0
         );
         let retire_root = fixture.output.path().join("_candidates/retirewiki");
         fs::create_dir_all(retire_root.join("2026-01/empty"))?;
+        fs::create_dir_all(retire_root.join("invalid/unsafe$run"))?;
+        fs::write(retire_root.join("invalid/unsafe$run/ready.json"), b"ready")?;
         fs::write(retire_root.join("not-a-directory"), b"ignored")?;
         fs::write(
             retire_root.join("2026-01/empty/not-a-candidate"),
             b"ignored",
         )
         .expect("non-candidate retirement fixture should be writable");
+        fs::write(retire_root.join("2026-01/empty/ready.json"), b"ready")?;
         let retained = retire_root.join("2026-02/keep");
         fs::create_dir_all(&retained)?;
         let retirement = SelectionEntry {
             wiki: "retirewiki".to_string(),
             snapshot: "2026-02".to_string(),
             candidate_relative: "_candidates/retirewiki/2026-02/keep".to_string(),
+            previous_candidate_relative: None,
             previous_snapshot: None,
             backup_relative: None,
         };
         assert_eq!(
-            retire_superseded_candidates(fixture.output.path(), &retirement)?,
+            retire_superseded_candidates(fixture.output.path(), &retirement, "publication")?,
+            1
+        );
+        let superseded = retire_root.join("2026-01/superseded");
+        fs::create_dir_all(&superseded)?;
+        fs::write(superseded.join("ready.json"), b"ready")?;
+        crate::generation_lifecycle::adopt(
+            fixture.output.path(),
+            "retirewiki",
+            "2026-01",
+            "superseded",
+            GState::Superseded,
+            "superseded fixture",
+        )
+        .expect("superseded lifecycle fixture should be adopted");
+        assert_eq!(
+            retire_superseded_candidates(fixture.output.path(), &retirement, "publication")?,
             1
         );
         Ok(())
@@ -2579,7 +2901,57 @@ mod tests {
                 .iter()
                 .any(|artifact| { artifact.path.ends_with("business_funnel.parquet") })
         );
+        crate::generation_lifecycle::transition(
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            "candidate-subset",
+            GState::Published,
+            "published fixture",
+            Some("publication"),
+        )
+        .expect("published lifecycle fixture should transition");
+        assert!(
+            mark_wiki_candidate_ready(
+                fixture.data.path(),
+                fixture.output.path(),
+                &fixture.lifecycle_path,
+                "nlwiki",
+                "2026-03",
+                "candidate-subset",
+            )
+            .is_err()
+        );
         Ok(())
+    }
+
+    #[test]
+    fn initial_candidate_commit_has_no_previous_generation() {
+        let fixture = Fixture::new().expect("initial publication fixture should build");
+        fixture
+            .ready_candidate("initial-candidate")
+            .expect("initial candidate should become ready");
+        prepare_ready_publication(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "initial-publication",
+        )
+        .expect("initial candidate should prepare for publication");
+
+        commit_ready_publication(
+            fixture.data.path(),
+            fixture.output.path(),
+            "initial-publication",
+        )
+        .expect("initial candidate should commit");
+
+        let path = selection_path(fixture.output.path(), "initial-publication")
+            .expect("initial selection path should resolve");
+        let selection: PublicationSelection =
+            read_json(&path).expect("initial selection should remain readable");
+        assert!(selection.entries[0].previous_candidate_relative.is_none());
+        assert_eq!(selection.state, "committed");
     }
 
     #[test]

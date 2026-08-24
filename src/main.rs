@@ -10,6 +10,7 @@ mod dashboard;
 mod end_to_end_tests;
 mod fetch;
 mod fingerprint;
+mod generation_lifecycle;
 mod ingest;
 mod licensing;
 mod merge;

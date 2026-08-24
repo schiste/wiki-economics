@@ -1,10 +1,11 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use crate::generation_lifecycle::GenerationState as GState;
 use crate::snapshot_plan::SnapshotPlan;
 use crate::{ingest, storage};
 
@@ -18,7 +19,87 @@ pub struct CleanupReport {
     pub validated_raw_dumps: usize,
     pub snapshot_generations: usize,
     pub candidate_generations: usize,
+    pub quarantined_artifacts: usize,
     pub removed: Vec<String>,
+    pub quarantined: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+enum QuarantineKind {
+    RootEntry,
+    Snapshot,
+    RunEntry,
+    RunId,
+    Merge,
+    Site,
+    Staging,
+}
+
+impl QuarantineKind {
+    fn reason(self) -> &'static str {
+        match self {
+            Self::RootEntry => "unexpected non-directory in candidate wiki root",
+            Self::Snapshot => "invalid snapshot directory in candidate root",
+            Self::RunEntry => "unexpected non-directory in candidate snapshot",
+            Self::RunId => "unsafe candidate run identifier",
+            Self::Merge => "malformed pipeline merge temporary",
+            Self::Site => "malformed pipeline site staging directory",
+            Self::Staging => "malformed pipeline run staging directory",
+        }
+    }
+}
+
+impl CleanupReport {
+    fn q(
+        &mut self,
+        root: &Path,
+        path: PathBuf,
+        kind: QuarantineKind,
+        now: SystemTime,
+    ) -> Result<()> {
+        quarantine(root, path, kind.reason(), now, self)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CandidateGeneration<'a> {
+    output_dir: &'a Path,
+    wiki: &'a str,
+    snapshot: &'a str,
+    run_id: &'a str,
+}
+
+impl<'a> CandidateGeneration<'a> {
+    fn load(self) -> Result<Option<crate::generation_lifecycle::GenerationRecord>> {
+        crate::generation_lifecycle::load(self.output_dir, self.wiki, self.snapshot, self.run_id)
+    }
+
+    fn adopt(
+        self,
+        state: GState,
+        reason: &str,
+    ) -> Result<crate::generation_lifecycle::GenerationRecord> {
+        crate::generation_lifecycle::adopt(
+            self.output_dir,
+            self.wiki,
+            self.snapshot,
+            self.run_id,
+            state,
+            reason,
+        )
+    }
+
+    fn retire(self, reason: &str) -> Result<crate::generation_lifecycle::GenerationRecord> {
+        crate::generation_lifecycle::transition(
+            self.output_dir,
+            self.wiki,
+            self.snapshot,
+            self.run_id,
+            GState::Retired,
+            reason,
+            None,
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -75,6 +156,7 @@ pub fn clean_abandoned(
         )?;
     }
     report.removed.sort();
+    report.quarantined.sort();
     Ok(report)
 }
 
@@ -98,27 +180,73 @@ fn clean_candidate_generations(
     for snapshot_entry in read_dir_if_present(&root)? {
         let snapshot_entry = snapshot_entry?;
         if !snapshot_entry.file_type()?.is_dir() {
+            if is_expired(&snapshot_entry.path(), minimum_age, now)? {
+                let path = snapshot_entry.path();
+                report.q(output_dir, path, QuarantineKind::RootEntry, now)?;
+            }
             continue;
         }
         let snapshot = snapshot_entry.file_name().to_string_lossy().into_owned();
         if storage::validate_snapshot_version(&snapshot).is_err() {
+            if is_expired(&snapshot_entry.path(), minimum_age, now)? {
+                let path = snapshot_entry.path();
+                report.q(output_dir, path, QuarantineKind::Snapshot, now)?;
+            }
             continue;
         }
         for run_entry in read_dir_if_present(&snapshot_entry.path())? {
             let run_entry = run_entry?;
             if !run_entry.file_type()?.is_dir() {
+                if is_expired(&run_entry.path(), minimum_age, now)? {
+                    report.q(output_dir, run_entry.path(), QuarantineKind::RunEntry, now)?;
+                }
                 continue;
             }
             let run_id = run_entry.file_name().to_string_lossy().into_owned();
             let candidate = run_entry.path();
             let candidate_wiki = candidate.join(wiki);
-            let retained = candidate.join("ready.json").is_file()
-                || live_target.as_ref() == Some(&candidate_wiki)
+            if !run_id.bytes().all(is_safe_id_byte) {
+                if is_expired(&candidate, minimum_age, now)? {
+                    report.q(output_dir, candidate, QuarantineKind::RunId, now)?;
+                }
+                continue;
+            }
+            let live = live_target.as_ref() == Some(&candidate_wiki);
+            let generation = CandidateGeneration {
+                output_dir,
+                wiki,
+                snapshot: &snapshot,
+                run_id: &run_id,
+            };
+            let state = match generation.load()? {
+                Some(record) => record,
+                None if live => {
+                    let reason = "adopted legacy live generation";
+                    generation.adopt(GState::Published, reason)?
+                }
+                None if candidate.join("ready.json").is_file() => {
+                    let reason = "adopted legacy ready generation";
+                    generation.adopt(GState::Ready, reason)?
+                }
+                None => {
+                    let reason = "adopted resumable legacy generation";
+                    generation.adopt(GState::Building, reason)?
+                }
+            };
+            let expired = state_is_expired(state.updated_at_unix, minimum_age, now)?;
+            let retained = live
                 || current_run_id == Some(run_id.as_str())
-                || !is_expired(&candidate, minimum_age, now)?;
+                || matches!(
+                    state.state,
+                    GState::Ready | GState::Published | GState::Superseded
+                )
+                || (!expired && matches!(state.state, GState::Building | GState::Validated));
             if retained {
                 protected.insert(snapshot.clone());
-            } else if run_id.bytes().all(is_safe_id_byte) {
+            } else {
+                if state.state != GState::Retired {
+                    generation.retire("resumable candidate exceeded its recovery window")?;
+                }
                 remove_dir(candidate, &mut report.removed)?;
                 report.candidate_generations += 1;
             }
@@ -250,9 +378,15 @@ fn clean_merge_temporaries(
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
-        if !is_owned_merge_temporary(&name)
-            || current_run_id.is_some_and(|run_id| name.contains(&format!(".merge.{run_id}.tmp")))
-            || !is_expired(&entry.path(), minimum_age, now)?
+        let expired = is_expired(&entry.path(), minimum_age, now)?;
+        if !is_owned_merge_temporary(&name) {
+            if looks_like_merge_temporary(&name) && expired {
+                report.q(output_dir, entry.path(), QuarantineKind::Merge, now)?;
+            }
+            continue;
+        }
+        if current_run_id.is_some_and(|run_id| name.contains(&format!(".merge.{run_id}.tmp")))
+            || !expired
         {
             continue;
         }
@@ -260,6 +394,13 @@ fn clean_merge_temporaries(
         report.merge_temporaries += 1;
     }
     Ok(())
+}
+
+fn looks_like_merge_temporary(name: &str) -> bool {
+    name.starts_with('.')
+        && name.split_once(".merge.").is_some_and(|(metric, suffix)| {
+            metric.ends_with(".parquet") && suffix.ends_with(".tmp")
+        })
 }
 
 fn is_owned_merge_temporary(name: &str) -> bool {
@@ -305,13 +446,21 @@ fn clean_site_builds(
         }
         let name = entry.file_name().to_string_lossy().into_owned();
         let candidate = entry.path();
-        if !name.starts_with(&prefix)
-            || !name[prefix.len()..].bytes().all(is_safe_id_byte)
-            || live_target
-                .as_ref()
-                .is_some_and(|target| target == &candidate)
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        let expired = is_expired(&candidate, minimum_age, now)?;
+        if !name[prefix.len()..].bytes().all(is_safe_id_byte) {
+            if expired {
+                report.q(parent, candidate, QuarantineKind::Site, now)?;
+            }
+            continue;
+        }
+        if live_target
+            .as_ref()
+            .is_some_and(|target| target == &candidate)
             || current_run_id.is_some_and(|run_id| name.starts_with(&format!("{prefix}{run_id}.")))
-            || !is_expired(&candidate, minimum_age, now)?
+            || !expired
         {
             continue;
         }
@@ -337,12 +486,17 @@ fn clean_run_staging(
         let owned = [".refresh-staging.", ".publication-staging."]
             .iter()
             .find_map(|prefix| name.strip_prefix(prefix));
-        if owned.is_none_or(|run_id| {
-            run_id.is_empty()
-                || !run_id.bytes().all(is_safe_id_byte)
-                || current_run_id == Some(run_id)
-        }) || !is_expired(&entry.path(), minimum_age, now)?
-        {
+        let Some(owner) = owned else {
+            continue;
+        };
+        let expired = is_expired(&entry.path(), minimum_age, now)?;
+        if owner.is_empty() || !owner.bytes().all(is_safe_id_byte) {
+            if expired {
+                report.q(output_dir, entry.path(), QuarantineKind::Staging, now)?;
+            }
+            continue;
+        }
+        if current_run_id == Some(owner) || !expired {
             continue;
         }
         remove_dir(entry.path(), &mut report.removed)?;
@@ -358,6 +512,13 @@ fn is_safe_id_byte(byte: u8) -> bool {
 fn is_expired(path: &Path, minimum_age: Duration, now: SystemTime) -> Result<bool> {
     let modified = fs::metadata(path)?.modified()?;
     Ok(now.duration_since(modified).unwrap_or_default() >= minimum_age)
+}
+
+fn state_is_expired(updated_at_unix: u64, minimum_age: Duration, now: SystemTime) -> Result<bool> {
+    let updated_at = SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_secs(updated_at_unix))
+        .context("generation state timestamp overflow")?;
+    Ok(now.duration_since(updated_at).unwrap_or_default() >= minimum_age)
 }
 
 fn read_dir_if_present(path: &Path) -> Result<Vec<std::io::Result<fs::DirEntry>>> {
@@ -376,6 +537,77 @@ fn remove_file(path: PathBuf, removed: &mut Vec<String>) -> Result<()> {
 fn remove_dir(path: PathBuf, removed: &mut Vec<String>) -> Result<()> {
     fs::remove_dir_all(&path)?;
     removed.push(path.to_string_lossy().into_owned());
+    Ok(())
+}
+
+#[derive(Serialize)]
+struct QuarantineReceipt {
+    schema_version: u8,
+    quarantined_at_unix: u64,
+    original_relative: String,
+    reason: String,
+}
+
+fn quarantine(
+    output_dir: &Path,
+    path: PathBuf,
+    reason: &str,
+    now: SystemTime,
+    report: &mut CleanupReport,
+) -> Result<()> {
+    let relative = path
+        .strip_prefix(output_dir)
+        .context("quarantine source is outside the output directory")?;
+    let timestamp = now.duration_since(SystemTime::UNIX_EPOCH)?.as_secs();
+    let destination = output_dir
+        .join("_quarantine")
+        .join(timestamp.to_string())
+        .join(relative);
+    let parent = destination
+        .parent()
+        .context("quarantine destination has no parent")?;
+    fs::create_dir_all(parent)?;
+    ensure!(
+        !destination.exists(),
+        "quarantine destination already exists"
+    );
+    fs::rename(&path, &destination)?;
+    let receipt_path = destination.with_extension(format!(
+        "{}.quarantine.json",
+        destination
+            .extension()
+            .map_or_else(|| "artifact".into(), |value| value.to_string_lossy())
+    ));
+    let receipt_temporary = receipt_path.with_extension(format!(
+        "{}.{}.tmp",
+        receipt_path
+            .extension()
+            .context("quarantine receipt has no extension")?
+            .to_string_lossy(),
+        std::process::id()
+    ));
+    let receipt_result = (|| -> Result<()> {
+        let mut receipt = fs::File::create(&receipt_temporary)?;
+        let value = QuarantineReceipt {
+            schema_version: 1,
+            quarantined_at_unix: timestamp,
+            original_relative: relative.to_string_lossy().into_owned(),
+            reason: reason.to_string(),
+        };
+        serde_json::to_writer_pretty(&mut receipt, &value)?;
+        receipt.sync_all()?;
+        fs::rename(&receipt_temporary, &receipt_path)?;
+        Ok(())
+    })();
+    if receipt_result.is_err() {
+        let _ = fs::remove_file(&receipt_temporary);
+    }
+    receipt_result?;
+    fs::File::open(parent)?.sync_all()?;
+    report.quarantined_artifacts += 1;
+    report
+        .quarantined
+        .push(destination.to_string_lossy().into_owned());
     Ok(())
 }
 
@@ -440,19 +672,31 @@ mod tests {
         fs::create_dir_all(&output)?;
         fs::create_dir_all(&site_parent)?;
         let stale_merge = output.join(".metric.parquet.merge.dead-run.tmp");
+        let malformed_merge = output.join(".metric.parquet.merge.bad$id.tmp");
         let unrelated = output.join(".notes.merge.dead-run.tmp");
         fs::write(&stale_merge, b"partial")?;
+        fs::write(&malformed_merge, b"partial")?;
         fs::write(&unrelated, b"keep")?;
         let stale_site = site_parent.join(".dist.build.dead-run.abc123");
+        let malformed_site = site_parent.join(".dist.build.bad$id");
+        let unrelated_site = site_parent.join("unrelated-site-directory");
         let live_site = site_parent.join(".dist.build.live-run.abc123");
         let current_site = site_parent.join(".dist.build.current-run.abc123");
-        for directory in [&stale_site, &live_site, &current_site] {
+        for directory in [
+            &stale_site,
+            &malformed_site,
+            &unrelated_site,
+            &live_site,
+            &current_site,
+        ] {
             fs::create_dir(directory)?;
         }
         #[cfg(unix)]
         std::os::unix::fs::symlink(live_site.file_name().context("live name")?, &dist)?;
         let run_stage = output.join(".refresh-staging.dead-run");
+        let malformed_run_stage = output.join(".refresh-staging.bad$id");
         fs::create_dir(&run_stage)?;
+        fs::create_dir(&malformed_run_stage)?;
 
         let report = clean_abandoned(
             &data,
@@ -468,10 +712,15 @@ mod tests {
         assert_eq!(report.merge_temporaries, 1);
         assert_eq!(report.site_builds, 1);
         assert_eq!(report.run_staging_directories, 1);
+        assert_eq!(report.quarantined_artifacts, 3);
         assert!(!stale_merge.exists());
+        assert!(!malformed_merge.exists());
         assert!(!stale_site.exists());
+        assert!(!malformed_site.exists());
         assert!(!run_stage.exists());
+        assert!(!malformed_run_stage.exists());
         assert!(unrelated.exists());
+        assert!(unrelated_site.exists());
         assert!(live_site.exists());
         assert!(current_site.exists());
         Ok(())
@@ -555,8 +804,95 @@ mod tests {
         assert_eq!(report.candidate_generations, 1);
         assert!(!abandoned.exists());
         assert!(ready.is_dir());
+        assert_eq!(
+            crate::generation_lifecycle::load(&output, "nlwiki", "2026-06", "dead-run")?
+                .context("retired candidate state should remain")?
+                .state,
+            crate::generation_lifecycle::GenerationState::Retired
+        );
         assert!(storage::snapshot_analytical_wiki_dir(&data, "nlwiki", "2026-07")?.is_dir());
         assert!(!storage::snapshot_analytical_wiki_dir(&data, "nlwiki", "2026-06")?.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn candidate_cleanup_uses_lifecycle_state_and_state_age() -> Result<()> {
+        let root = TestDir::new()?;
+        let output = root.path().join("output");
+        for run in ["building", "validated", "already-retired"] {
+            fs::create_dir_all(output.join(format!("_candidates/nlwiki/2026-08/{run}")))?;
+        }
+        crate::generation_lifecycle::begin(&output, "nlwiki", "2026-08", "building")?;
+        crate::generation_lifecycle::begin(&output, "nlwiki", "2026-08", "validated")?;
+        crate::generation_lifecycle::transition(
+            &output,
+            "nlwiki",
+            "2026-08",
+            "validated",
+            GState::Validated,
+            "validated fixture",
+            None,
+        )
+        .expect("validated fixture state should transition");
+        crate::generation_lifecycle::adopt(
+            &output,
+            "nlwiki",
+            "2026-08",
+            "already-retired",
+            GState::Retired,
+            "retired fixture",
+        )
+        .expect("retired fixture state should be adopted");
+        let mut report = CleanupReport::default();
+
+        let protected = clean_candidate_generations(
+            &output,
+            "nlwiki",
+            None,
+            Duration::from_secs(3_600),
+            SystemTime::now(),
+            &mut report,
+        )
+        .expect("lifecycle cleanup should succeed");
+
+        assert!(protected.contains("2026-08"));
+        assert!(output.join("_candidates/nlwiki/2026-08/building").is_dir());
+        assert!(output.join("_candidates/nlwiki/2026-08/validated").is_dir());
+        assert!(
+            !output
+                .join("_candidates/nlwiki/2026-08/already-retired")
+                .exists()
+        );
+        assert_eq!(report.candidate_generations, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn recent_unknown_candidate_entries_wait_for_the_recovery_window() -> Result<()> {
+        let root = TestDir::new()?;
+        let output = root.path().join("output");
+        let candidate_root = output.join("_candidates/nlwiki");
+        fs::create_dir_all(candidate_root.join("invalid-snapshot/run"))?;
+        fs::create_dir_all(candidate_root.join("2026-08/bad$run"))?;
+        fs::write(candidate_root.join("unexpected-file"), b"keep")?;
+        fs::write(candidate_root.join("2026-08/unexpected-file"), b"keep")?;
+        let mut report = CleanupReport::default();
+
+        clean_candidate_generations(
+            &output,
+            "nlwiki",
+            None,
+            Duration::from_secs(86_400),
+            SystemTime::now(),
+            &mut report,
+        )
+        .expect("recent candidate cleanup should succeed");
+
+        assert_eq!(report.quarantined_artifacts, 0);
+        assert!(candidate_root.join("unexpected-file").is_file());
+        assert!(candidate_root.join("invalid-snapshot/run").is_dir());
+        assert!(candidate_root.join("2026-08/unexpected-file").is_file());
+        assert!(candidate_root.join("2026-08/bad$run").is_dir());
         Ok(())
     }
 
@@ -625,7 +961,15 @@ mod tests {
         .expect("candidate entry cleanup should succeed");
 
         assert!(protected.contains("2026-07"));
-        assert!(candidate_root.join("2026-06/bad$run").is_dir());
+        assert!(!candidate_root.join("2026-06/bad$run").exists());
+        assert_eq!(report.quarantined_artifacts, 4);
+        assert_eq!(report.quarantined.len(), 4);
+        assert_eq!(
+            crate::generation_lifecycle::load(&output, "nlwiki", "2026-07", "live-run")?
+                .context("live legacy candidate should be adopted")?
+                .state,
+            crate::generation_lifecycle::GenerationState::Published
+        );
         assert!(!candidate_root.join("2026-05").exists());
         fs::remove_file(output.join("nlwiki"))?;
         std::os::unix::fs::symlink(live.join("nlwiki"), output.join("nlwiki"))?;
@@ -688,6 +1032,32 @@ mod tests {
         assert!(!is_owned_merge_temporary("no-leading-dot"));
         assert!(!is_owned_merge_temporary(".no-merge"));
         assert!(is_owned_merge_temporary(".metric.parquet.merge.tmp"));
+        Ok(())
+    }
+
+    #[test]
+    fn quarantine_receipt_failure_keeps_the_artifact_and_cleans_file_temporaries() -> Result<()> {
+        let root = TestDir::new()?;
+        let output = root.path();
+        let source = output.join("unknown");
+        fs::write(&source, b"unknown")?;
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(42);
+        let destination = output.join("_quarantine/42/unknown");
+        fs::create_dir_all(destination.parent().context("quarantine parent")?)?;
+        let temporary = output.join(format!(
+            "_quarantine/42/unknown.artifact.quarantine.json.{}.tmp",
+            std::process::id()
+        ));
+        fs::create_dir(&temporary)?;
+        let mut report = CleanupReport::default();
+
+        assert!(quarantine(output, source, "test", now, &mut report).is_err());
+        assert!(destination.is_file());
+        assert!(temporary.is_dir());
+        assert_eq!(report.quarantined_artifacts, 0);
+        fs::remove_dir(temporary)?;
+        assert!(state_is_expired(0, Duration::ZERO, now)?);
+        assert!(state_is_expired(u64::MAX, Duration::ZERO, now).is_err());
         Ok(())
     }
 
