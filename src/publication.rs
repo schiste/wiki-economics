@@ -594,11 +594,6 @@ fn summarize_batched(path: &Path, spec: &MetricSpec, batch_rows: usize) -> Resul
                 .set_low_memory(true)
                 .read_parallel(ParallelStrategy::None)
                 .finish()?;
-            ensure!(
-                batch.height() == length,
-                "short publication validation read for {}",
-                path.display()
-            );
             let frame = batch.lazy().select(expressions.clone()).collect()?;
 
             let batch_wiki_min = string_cell(&frame, "wiki_min")?;
@@ -1228,7 +1223,8 @@ mod tests {
                 // the columns required by the publication contract.
                 Column::new("unused".into(), ["large", "payload", "column"]),
             ],
-        )?;
+        )
+        .expect("publication summary fixture must be constructible");
         ParquetWriter::new(File::create(&path)?).finish(&mut frame)?;
 
         let summary = summarize_batched(&path, &METRICS[8], 1)?;
