@@ -36,8 +36,10 @@
   mem: 6Gi
   cpu: "1"
 
-# Scheduled preparation is isolated per wiki. These jobs never switch the
-# published data or site, and each holds only its own per-wiki lock.
+# Scheduled preparation is isolated per wiki. The weekly trigger discovers a
+# completed snapshot and is a recorded no-op when current/ready fingerprints
+# already cover it. These jobs never switch the published data or site, and
+# each holds only its own per-wiki lock.
 - name: wiki-econ-prepare-nlwiki
   image: tool-wiki-economics/tool-wiki-economics:latest
   command: deploy/toolforge/run-prepare-nlwiki.sh

@@ -11,6 +11,7 @@ Receipts are stored outside published artifacts:
 data/stages/<wiki>/<snapshot>/fetch.json
 data/stages/<wiki>/<snapshot>/ingest.json
 output/_stages/compute/<wiki>.json
+output/_stages/patrol_compute/<wiki>.json
 output/_stages/merge.json
 output/_stages/site.json
 ```
@@ -35,6 +36,14 @@ fast validation index and is deliberately excluded from the fingerprint.
   algorithm version, and complete recorded metric inventory. When possible its
   input is the validated ingest receipt, avoiding a second multi-gigabyte hash
   pass.
+- **patrol compute** includes the selected ingest generation and all three
+  locally validated patrol inputs (`patrol.parquet`, `rights.parquet`, and the
+  autopatrol-group metadata). A changed algorithm or input invalidates patrol
+  without invalidating core metrics.
+- **candidate discovery** validates `ready.json`, every artifact hash, and the
+  current compute and patrol receipts. A complete hit is a recorded no-op. On
+  a partial hit, only receipt-covered stage files are copied atomically into
+  the new immutable candidate; invalidated stages alone execute.
 - **merge** includes published per-wiki Parquets, lifecycle configuration,
   Rust dashboard code, and the manifest validator. On a hit it preserves the merged files but issues
   a new publication candidate for the current run ID.
@@ -56,6 +65,9 @@ within `WIKI_ECON_MAX_SNAPSHOT_LAG_MONTHS` (default: `2`). A fallback emits a
 warning; finding nothing within the bound fails the run.
 
 A newly completed monthly snapshot therefore changes the pinned version and
-invalidates fetch, ingest, compute, merge, and site in order. Repeated weekly
-runs against the same snapshot become no-ops except for independently updated
-patrol data and publication validation.
+invalidates the complete historical source generation. The pipeline does not
+derive synthetic deltas from two Wikimedia history snapshots: suppressions,
+corrections, and historical changes must remain observable. Repeated weekly
+preparation runs against the same snapshot validate the current and ready
+candidate fingerprints and exit as recorded no-ops when they are unchanged.
+An explicit algorithm-version change can invalidate compute or patrol alone.

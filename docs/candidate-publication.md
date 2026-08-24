@@ -21,6 +21,14 @@ schemas, row-count contracts, wiki labels, dates, snapshot cutoff, and
 patrol/rights sources pass validation. A directory without a valid
 `ready.json` is never eligible for publication.
 
+Before creating a new candidate, preparation compares the resolved snapshot
+with every valid ready candidate for that wiki and verifies the current core
+and patrol stage fingerprints. When both fingerprints still match, the job
+finishes successfully as an explicit no-op and points its log at the existing
+`ready.json`. When only one fingerprint matches, its receipt-covered files are
+copied atomically into the new candidate and only the invalidated stage runs.
+The original ready candidate remains immutable.
+
 Preparation holds `output/_prepare-locks/<wiki>.lock`. Different wikis may run
 concurrently; a second preparation for the same wiki exits with status 75.
 The lock heartbeat also prevents stale cleanup from removing a candidate's
@@ -63,6 +71,16 @@ The scheduled jobs are:
 | `wiki-econ-prepare-frwiki` | `frwiki.lock` | Prepare and validate frwiki |
 | `wiki-econ-publish-ready` | `.publication-lock` | Select, merge, build, validate, switch, retire |
 
+The weekly preparation schedules are discovery triggers rather than an
+instruction to rebuild. Each trigger resolves and pins the latest completed
+snapshot. If that version and its stage fingerprints are already represented
+by a ready candidate, the run record reports `noOp: true`; no dump or patrol
+download and no compute stage starts.
+
+Every Wikimedia monthly history dump is treated as a complete authoritative
+snapshot. Snapshot rollover performs the complete source-generation ingest;
+the pipeline deliberately does not infer cross-snapshot deltas.
+
 The publisher runs every two hours. It may publish one wiki while another is
 still computing; an incomplete or failed candidate is invisible to it. A
 publication with no new ready candidate is a validated near-no-op and may
@@ -87,4 +105,3 @@ automatically. To retry explicitly, use the original run ID with
 `publication-rollback-ready`. For a post-site-switch commit failure, use the
 original run ID with `publication-commit-ready`; do not roll back only the data
 after the site has changed.
-
