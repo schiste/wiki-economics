@@ -42,8 +42,11 @@ function fixture(name) {
   const outputDir = path.join(directory, "output");
   const snapshot = "2026-07";
   const analytical = path.join(dataDir, "parquet", "nlwiki", "_snapshots", snapshot, "year=2026", "part.parquet");
+  const warehouse = path.join(dataDir, "warehouse", "nlwiki", "_snapshots", snapshot, "year=2026", "part.parquet");
   fs.mkdirSync(path.dirname(analytical), {recursive: true});
+  fs.mkdirSync(path.dirname(warehouse), {recursive: true});
   fs.writeFileSync(analytical, "valid-ingest-output");
+  fs.writeFileSync(warehouse, "valid-warehouse-output");
   fs.mkdirSync(path.join(dataDir, "snapshots", "nlwiki"), {recursive: true});
   fs.writeFileSync(path.join(dataDir, "snapshots", "nlwiki", "current-snapshot.json"), JSON.stringify({
     schema_version: 1, wiki: "nlwiki", snapshot_version: snapshot,
@@ -66,11 +69,18 @@ function fixture(name) {
     scope: "nlwiki",
     selected_snapshot: snapshot,
     inputs: [{identity: "raw/2026-07.nlwiki.2026"}],
-    outputs: [{
-      identity: "analytical/year=2026/part.parquet",
-      bytes: fs.statSync(analytical).size,
-      rows: 42,
-    }],
+    outputs: [
+      {
+        identity: "analytical/year=2026/part.parquet",
+        bytes: fs.statSync(analytical).size,
+        rows: 42,
+      },
+      {
+        identity: "warehouse/year=2026/part.parquet",
+        bytes: fs.statSync(warehouse).size,
+        rows: 42,
+      },
+    ],
   }));
   const patrolDir = path.join(dataDir, "patrol", "nlwiki");
   fs.mkdirSync(patrolDir, {recursive: true});
@@ -100,7 +110,7 @@ function fixture(name) {
     schema_version: 1, cache_schema_version: 1, generation: "a".repeat(64), license_spdx: "MIT",
     entries: browserEntries,
   }));
-  return {analytical, dataDir, outputDir};
+  return {analytical, dataDir, outputDir, warehouse};
 }
 
 function rows(values) {
@@ -154,11 +164,25 @@ test("generation readiness follows the pointer and strict ingest receipt without
   assert.equal(manifest.wikis.nlwiki.snapshot.version, "2026-07");
   assert.equal(manifest.wikis.nlwiki.ingest.ready, 1);
   assert.equal(manifest.wikis.nlwiki.ingest.rows, 42);
+  assert.equal(manifest.wikis.nlwiki.ingest.outputs, 2);
   assert.equal(manifest.wikis.nlwiki.patrol.event_rows, 10);
   assert.equal(manifest.wikis.nlwiki.patrol.rights_rows, 2);
   assert.equal(manifest.wikis._stages, undefined);
   assert.equal(manifest.wikis[".refresh-lock"], undefined);
   assert.equal(manifest.wikis.logs, undefined);
+});
+
+test("generation readiness rejects divergent analytical and warehouse row totals", () => {
+  const current = fixture("divergent-layer-rows");
+  const receiptPath = path.join(current.dataDir, "stages", "nlwiki", "2026-07", "ingest.json");
+  const receipt = JSON.parse(fs.readFileSync(receiptPath, "utf8"));
+  receipt.outputs.find((output) => output.identity.startsWith("warehouse/")).rows = 41;
+  fs.writeFileSync(receiptPath, JSON.stringify(receipt));
+
+  const summary = generationSummary(current.dataDir, "nlwiki");
+  assert.equal(summary.rows, 42);
+  assert.equal(summary.ingest_ready, 0);
+  assert.match(summary.error, /layer row totals disagree/);
 });
 
 test("publication rejects a workload profile whose parameters do not match its name", async () => {

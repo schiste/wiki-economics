@@ -248,7 +248,8 @@ function generationSummary(dataDir, wiki) {
   const receiptPath = path.join(dataDir, "stages", wiki, snapshot, "ingest.json");
   const receipt = readJson(receiptPath);
   let error = null;
-  let rows = 0;
+  let analyticalRows = 0;
+  let warehouseRows = 0;
   let bytes = 0;
   let validOutputs = 0;
   const structurallyValid = receipt?.schema_version === 1 && receipt.stage === "ingest" && receipt.scope === wiki
@@ -264,12 +265,19 @@ function generationSummary(dataDir, wiki) {
         error = `invalid ingest output: ${artifact.identity || "unknown"}`;
         break;
       }
-      rows += artifact.rows;
+      if (artifact.identity.startsWith("analytical/")) analyticalRows += artifact.rows;
+      else if (artifact.identity.startsWith("warehouse/")) warehouseRows += artifact.rows;
       bytes += artifact.bytes;
       validOutputs += 1;
     }
+    if (!error && analyticalRows > 0 && warehouseRows > 0 && analyticalRows !== warehouseRows) {
+      error = `ingest layer row totals disagree: analytical=${analyticalRows}, warehouse=${warehouseRows}`;
+    }
+    const rows = analyticalRows || warehouseRows;
     if (!error && rows <= 0) error = "ingest receipt contains zero rows";
   }
+
+  const rows = analyticalRows || warehouseRows;
 
   const activeRoots = ["parquet", "warehouse"].map((layer) => path.join(dataDir, layer, wiki, "_snapshots", snapshot));
   let inProgress = 0;
