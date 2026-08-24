@@ -96,6 +96,20 @@ function validateWikiLifecycle(registry, label = "wiki lifecycle registry") {
     if (!Number.isSafeInteger(contract.minimum_rows_per_wiki) || contract.minimum_rows_per_wiki <= 0) {
       throw new Error(`${label}.publication_contract.datasets.${dataset}.minimum_rows_per_wiki must be a positive safe integer`);
     }
+    if (contract.minimum_rows_by_wiki != null) {
+      if (typeof contract.minimum_rows_by_wiki !== "object" || Array.isArray(contract.minimum_rows_by_wiki)) {
+        throw new Error(`${label}.publication_contract.datasets.${dataset}.minimum_rows_by_wiki must be a JSON object`);
+      }
+      const expected = new Set(allPublished ? published : contract.wikis);
+      for (const [wiki, minimum] of Object.entries(contract.minimum_rows_by_wiki)) {
+        if (!expected.has(wiki)) {
+          throw new Error(`${label}.publication_contract.datasets.${dataset}.minimum_rows_by_wiki contains unexpected wiki ${wiki}`);
+        }
+        if (!Number.isSafeInteger(minimum) || minimum <= 0) {
+          throw new Error(`${label}.publication_contract.datasets.${dataset}.minimum_rows_by_wiki.${wiki} must be a positive safe integer`);
+        }
+      }
+    }
   }
   return registry;
 }

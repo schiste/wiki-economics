@@ -138,6 +138,9 @@ test("registry validation rejects invalid publication dataset contracts", () => 
     [{ gdp: { wikis: ["nlwiki", "nlwiki"], minimum_rows_per_wiki: 1 } }, /non-empty and unique/],
     [{ gdp: { wikis: ["testwiki"], minimum_rows_per_wiki: 1 } }, /non-published/],
     [{ gdp: { coverage: "all_published", minimum_rows_per_wiki: 0 } }, /positive safe integer/],
+    [{ gdp: { coverage: "all_published", minimum_rows_per_wiki: 1, minimum_rows_by_wiki: [] } }, /must be a JSON object/],
+    [{ gdp: { coverage: "all_published", minimum_rows_per_wiki: 1, minimum_rows_by_wiki: {testwiki: 1} } }, /unexpected wiki/],
+    [{ gdp: { coverage: "all_published", minimum_rows_per_wiki: 1, minimum_rows_by_wiki: {nlwiki: 0} } }, /positive safe integer/],
   ];
   for (const [datasets, expected] of invalid) {
     assert.throws(
@@ -145,6 +148,15 @@ test("registry validation rejects invalid publication dataset contracts", () => 
       expected,
     );
   }
+});
+
+test("registry accepts positive per-wiki row threshold overrides", () => {
+  const registry = validRegistry();
+  registry.publication_contract.datasets.gdp.minimum_rows_by_wiki = {
+    frwiki: 2,
+    nlwiki: 3,
+  };
+  assert.equal(validateWikiLifecycle(registry), registry);
 });
 
 test("CLI validates and lists lifecycle selections", () => {

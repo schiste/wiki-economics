@@ -387,6 +387,17 @@ struct DatasetContract {
     coverage: Option<String>,
     wikis: Option<BTreeSet<String>>,
     minimum_rows_per_wiki: u64,
+    #[serde(default)]
+    minimum_rows_by_wiki: BTreeMap<String, u64>,
+}
+
+impl DatasetContract {
+    fn minimum_rows(&self, wiki: &str) -> u64 {
+        self.minimum_rows_by_wiki
+            .get(wiki)
+            .copied()
+            .unwrap_or(self.minimum_rows_per_wiki)
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -728,11 +739,11 @@ pub(crate) fn mark_wiki_candidate_ready(
             .join(wiki)
             .join(format!("{}.parquet", spec.name));
         let rows = validate_schema(&path, spec)?;
+        let minimum_rows = contract.minimum_rows(wiki);
         ensure!(
-            rows >= contract.minimum_rows_per_wiki,
-            "{} candidate has {rows} rows for {wiki}; minimum is {}",
-            spec.name,
-            contract.minimum_rows_per_wiki
+            rows >= minimum_rows,
+            "{} candidate has {rows} rows for {wiki}; minimum is {minimum_rows}",
+            spec.name
         );
         let summary = summarize(&path, spec)?;
         ensure!(
@@ -1985,11 +1996,11 @@ pub fn validate(
                 .join(&wiki)
                 .join(format!("{}.parquet", spec.name));
             let rows = validate_schema(&path, spec)?;
+            let minimum_rows = contract.minimum_rows(&wiki);
             ensure!(
-                rows >= contract.minimum_rows_per_wiki,
-                "{} has {rows} rows for {wiki}; minimum is {}",
-                spec.name,
-                contract.minimum_rows_per_wiki
+                rows >= minimum_rows,
+                "{} has {rows} rows for {wiki}; minimum is {minimum_rows}",
+                spec.name
             );
             let summary = summarize(&path, spec)?;
             ensure!(
@@ -3565,6 +3576,7 @@ mod tests {
             coverage: None,
             wikis: None,
             minimum_rows_per_wiki: 1,
+            minimum_rows_by_wiki: BTreeMap::new(),
         };
         assert!(expected_wikis(&registry, &invalid).is_err());
 
@@ -3572,7 +3584,10 @@ mod tests {
             coverage: None,
             wikis: Some(BTreeSet::from(["nlwiki".to_string()])),
             minimum_rows_per_wiki: 1,
+            minimum_rows_by_wiki: BTreeMap::from([("nlwiki".to_string(), 2)]),
         };
+        assert_eq!(explicit.minimum_rows("nlwiki"), 2);
+        assert_eq!(explicit.minimum_rows("frwiki"), 1);
         assert_eq!(
             expected_wikis(&registry, &explicit)?,
             BTreeSet::from(["nlwiki".to_string()])

@@ -79,7 +79,9 @@ rerun merge/validation, and let the pipeline issue a new receipt.
 `publication_contract.datasets` in `config/wiki-lifecycle.json` is the
 authoritative applicability and plausibility policy. Core metrics use
 `coverage: "all_published"`; specialized metrics list their supported wikis.
-Each dataset also declares `minimum_rows_per_wiki`.
+Each dataset also declares `minimum_rows_per_wiki`. When differently sized
+wikis share a metric, `minimum_rows_by_wiki` may provide explicit measured
+overrides without weakening the default gate for every other wiki.
 
 When enabling a new wiki or metric, update the contract in the same change and
 choose a minimum that detects gross truncation without encoding an exact row

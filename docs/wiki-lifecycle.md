@@ -85,7 +85,10 @@ and run a new normal `prepare-wiki`. A qualification receipt cannot be
 selected or reused as a publication candidate.
 
 `publication_contract.datasets` defines which published wikis each metric must
-contain and its conservative `minimum_rows_per_wiki`. Use
+contain and its conservative `minimum_rows_per_wiki`. A dataset may add a
+`minimum_rows_by_wiki` object for evidence-based scale exceptions; unspecified
+wikis retain the conservative default. Override keys must belong to that
+dataset's declared coverage and every threshold remains strictly positive. Use
 `coverage=all_published` for core datasets and an explicit `wikis` array for a
 specialized dataset such as patrol. The Rust
 [publication gate](publication-gate.md) enforces this registry before the site
