@@ -1,0 +1,239 @@
+{
+  "schema_version": 1,
+  "report_date": "2026-08-24",
+  "license_spdx": "MIT",
+  "generated_for_repository": "https://github.com/schiste/wiki-economics",
+  "evidence_sources": [
+    "Toolforge capacity report JSON",
+    "Toolforge frwiki qualification summary",
+    "Toolforge refresh status and history",
+    "Toolforge refresh logs",
+    "strict ingest manifests",
+    "publication gate receipt",
+    "browser data index",
+    "public freshness endpoint"
+  ],
+  "units": {
+    "bytes": "bytes",
+    "durations": "milliseconds unless the field name says otherwise",
+    "memory_headroom": "percent of the 6442450944-byte cgroup limit"
+  },
+  "environment": {
+    "platform": "Wikimedia Toolforge Kubernetes Jobs Framework",
+    "scheduled_job": "wiki-econ-refresh",
+    "schedule_utc": "0 3 * * 0",
+    "memory_limit_bytes": 6442450944,
+    "cpu_limit_cores": 1,
+    "rayon_threads": 1,
+    "polars_threads": 1,
+    "image": "tool-wiki-economics/tool-wiki-economics:latest",
+    "mounts": "all",
+    "retry": false
+  },
+  "dataset": {
+    "wiki": "frwiki",
+    "selected_snapshot": "2026-07",
+    "source_files": 26,
+    "compressed_source_bytes": 21327005470,
+    "source_edit_rows": 237798382,
+    "analytical_parquet_files": 4201,
+    "analytical_rows": 237798382,
+    "warehouse_parquet_files": 4201,
+    "warehouse_rows": 237798382,
+    "monthly_partitions": 301,
+    "page_weekly_edits": {
+      "rows": 119855668,
+      "edits": 236874141,
+      "minimum_week_start": "2001-05-28",
+      "maximum_week_start": "2026-07-27",
+      "bytes": 787584999
+    },
+    "patrol": {
+      "source_patrol_events": 5364943,
+      "source_rights_events": 4460,
+      "published_rows": 14518,
+      "published_conservation_total": 5346508,
+      "minimum_month": "2007-01",
+      "maximum_month": "2026-08",
+      "bytes": 214148
+    },
+    "browser_publication": {
+      "generation": "d3c874e8b40c30916ac217f8a1d72641c229ff7f9466c2e302e3d344a0d2681f",
+      "partitions": 9,
+      "rows": 54713,
+      "bytes": 1036399,
+      "largest_partition_bytes": 566429
+    }
+  },
+  "capacity_qualification": {
+    "source_commit": "b2e81b830fc13f43292704dffcde189501288397",
+    "minimum_memory_headroom_percent": 25,
+    "minimum_storage_reserve_bytes": 53687091200,
+    "qualified": true,
+    "selected_bucket_count": 256,
+    "runs": [
+      {
+        "run_id": "capacity-20260823T234840Z-256-7",
+        "bucket_count": 256,
+        "elapsed_ms": 724916,
+        "reduction_elapsed_ms": 461411,
+        "reconciliation_elapsed_ms": 263484,
+        "memory_peak_bytes": 3982630912,
+        "memory_headroom_percent": 38.18143208821615,
+        "memory_gate_passed": true,
+        "scratch_peak_bytes": 1991845019,
+        "working_storage_peak_bytes": 1994953118,
+        "persistent_storage_peak_bytes": 40080329126,
+        "largest_bucket_staged_rows": 492446,
+        "output_bytes": 787584999,
+        "output_sha256": "e2c40b00596a69a2f3f03959d80cc077bee3187124b1407ad96567a65bc8a299"
+      },
+      {
+        "run_id": "capacity-20260824T000158Z-512-7",
+        "bucket_count": 512,
+        "elapsed_ms": 877198,
+        "reduction_elapsed_ms": 583650,
+        "reconciliation_elapsed_ms": 293521,
+        "memory_peak_bytes": 5449555968,
+        "memory_headroom_percent": 15.411758422851562,
+        "memory_gate_passed": false,
+        "scratch_peak_bytes": 2149996853,
+        "working_storage_peak_bytes": 2151570503,
+        "persistent_storage_peak_bytes": 40237151708,
+        "largest_bucket_staged_rows": 250580,
+        "output_bytes": 803114220,
+        "output_sha256": "6365d559ee0ca060acb408f1e19e2ea5a5e3e43cf7a257c9cb68ba62fd058080"
+      },
+      {
+        "run_id": "capacity-20260824T001801Z-1024-7",
+        "bucket_count": 1024,
+        "elapsed_ms": 1151907,
+        "reduction_elapsed_ms": 815115,
+        "reconciliation_elapsed_ms": 336758,
+        "memory_peak_bytes": 6442450944,
+        "memory_headroom_percent": 0.0,
+        "memory_gate_passed": false,
+        "scratch_peak_bytes": 2397694836,
+        "working_storage_peak_bytes": 2398501850,
+        "persistent_storage_peak_bytes": 40484378464,
+        "largest_bucket_staged_rows": 129941,
+        "output_bytes": 820266476,
+        "output_sha256": "0e7fbe54dd3a9491714a84bae2f3ff9e4b6c01936e74f072890f989f01149c06"
+      },
+      {
+        "run_id": "capacity-20260824T004132Z-256-7",
+        "bucket_count": 256,
+        "elapsed_ms": 734559,
+        "reduction_elapsed_ms": 465492,
+        "reconciliation_elapsed_ms": 269048,
+        "memory_peak_bytes": 4117860352,
+        "memory_headroom_percent": 36.08239491780599,
+        "memory_gate_passed": true,
+        "scratch_peak_bytes": 1991832123,
+        "working_storage_peak_bytes": 1994940222,
+        "persistent_storage_peak_bytes": 40081303287,
+        "largest_bucket_staged_rows": 492446,
+        "output_bytes": 787584999,
+        "output_sha256": "e2c40b00596a69a2f3f03959d80cc077bee3187124b1407ad96567a65bc8a299"
+      }
+    ],
+    "storage_model": {
+      "raw_transient_requirement_bytes": 33285996544,
+      "current_generation_bytes": 8533569820,
+      "selected_run_estimated_rollover_additional_bytes": 44598983486,
+      "storage_capacity_source": "shared_filesystem_available",
+      "tool_specific_nfs_quota_bytes": null
+    }
+  },
+  "production": {
+    "first_cutover": {
+      "run_id": "20260824T055214Z-7",
+      "result": "oom_killed_during_publication_validation",
+      "frwiki_stage_durations_ms": {
+        "fetch": 64068,
+        "patrol_fetch": 330016,
+        "ingest": 4495,
+        "cleanup_raw": 3,
+        "compute": 651993,
+        "patrol_compute": 82384
+      },
+      "merge_duration_ms": 492828,
+      "page_weekly_compute_cgroup_peak_bytes": 4523180032,
+      "merge_cgroup_peak_bytes": 5311934464,
+      "last_live_sample_before_oom_bytes": 6028140544,
+      "last_live_sample_provenance": "operator-observed running refresh status; the hard-killed pod did not append a terminal history record"
+    },
+    "successful_recovery": {
+      "run_id": "20260824T065411Z-7",
+      "started_at": "2026-08-24T06:54:11Z",
+      "finished_at": "2026-08-24T07:04:19Z",
+      "duration_seconds": 608,
+      "source_commit": "5e3c4060e1e18eacb866d2232513e3e43dd59041",
+      "binary_sha256": "1c15838715f7d71f07cc079002e8f67920494ae7815d8ecc449e6bc2c904ba6c",
+      "memory_peak_bytes": 4770750464,
+      "memory_headroom_percent": 25.948206583658852,
+      "memory_current_at_exit_bytes": 1216200704,
+      "disk_free_bytes": 2097798971392,
+      "disk_total_bytes": 10907270774784,
+      "stage_durations_ms": {
+        "cleanup_stale": 3000,
+        "snapshot_resolve": 280,
+        "fetch": 116926,
+        "patrol_fetch": 294647,
+        "ingest": 8130,
+        "cleanup_raw": 8,
+        "compute": 1190,
+        "patrol_compute": 8258,
+        "merge": 36,
+        "publication_validate": 136583,
+        "site": 35000,
+        "publication_verify": 11,
+        "snapshot_finalize": 21,
+        "artifact_check": 0
+      },
+      "reused_stages": [
+        "fetch:frwiki",
+        "ingest:frwiki",
+        "compute:frwiki",
+        "patrol_compute:frwiki",
+        "fetch:nlwiki",
+        "ingest:nlwiki",
+        "compute:nlwiki",
+        "patrol_compute:nlwiki",
+        "fetch:ptwiki",
+        "ingest:ptwiki",
+        "compute:ptwiki",
+        "patrol_compute:ptwiki",
+        "merge"
+      ]
+    }
+  },
+  "current_storage": {
+    "frwiki_analytical_bytes": 1156916105,
+    "frwiki_warehouse_bytes": 7376653715,
+    "frwiki_patrol_source_bytes": 1304542525,
+    "frwiki_stage_metadata_bytes": 8835417,
+    "frwiki_raw_bytes_after_cleanup": 0,
+    "frwiki_output_bytes": 790392545,
+    "all_wikis_data_bytes": 16556484491,
+    "all_wikis_output_bytes": 1938007553
+  },
+  "current_health": {
+    "checked_at": "2026-08-24T07:28:35.673Z",
+    "status": "healthy",
+    "alerts": [],
+    "scheduled_wikis": [
+      "frwiki",
+      "nlwiki",
+      "ptwiki"
+    ],
+    "published_frwiki_snapshot": "2026-07",
+    "last_successful_run_id": "20260824T065411Z-7"
+  },
+  "measurement_limits": {
+    "cpu_seconds_or_utilization_recorded": false,
+    "explanation": "The retained records capture the one-core quota, one-thread execution, wall-clock durations, and throughput, but not cgroup cpu.stat or Kubernetes CPU usage samples.",
+    "first_cutover_terminal_recorded": false,
+    "explanation_first_cutover": "The pod was hard-killed by the cgroup, so its exit trap could not append a terminal refresh-history record. The run log ends at publication_validate start."
+  }
+}

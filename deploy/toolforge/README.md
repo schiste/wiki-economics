@@ -226,9 +226,12 @@ The 512-bucket alternative retained only 15.4% headroom and the 1024-bucket
 alternative reached the 6 GiB cgroup limit, so `run-refresh.sh` fails closed
 unless `WIKI_ECON_WEEKLY_BUCKET_COUNT=256`.
 
-The imported `2026-03` generation and its checksummed secondary backup remain
-the rollback boundary until the first complete Toolforge refresh passes the
-publication gate and public freshness checks.
+The first complete Toolforge refresh passed the publication gate and public
+freshness checks on 2026-08-24. The scheduled current generation is now
+`2026-07`; the checksummed imported `2026-03` backup remains a disaster-recovery
+fallback rather than the live rollback boundary. Detailed measurements and the
+resource rationale are preserved in the
+[frwiki capacity report](../../docs/frwiki-capacity-report-2026-08-24.md).
 
 ### First cutover
 
