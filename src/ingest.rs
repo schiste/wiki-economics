@@ -13,8 +13,11 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
+#[cfg(test)]
+use crate::fetch;
 use crate::fingerprint::{self, StageSpec, TrackedPath};
-use crate::{fetch, schema, storage};
+use crate::snapshot_plan::SnapshotPlan;
+use crate::{schema, storage};
 
 const INGEST_CHUNK_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const INGEST_ALGORITHM_VERSION: &str =
@@ -466,7 +469,8 @@ fn select_ingest_sources(
     let Some(snapshot_version) = snapshot_version else {
         return Ok((None, src_files));
     };
-    let expected = fetch::build_file_list(wiki, &snapshot_version)?;
+    let plan = SnapshotPlan::resolve(wiki, &snapshot_version)?;
+    let expected = plan.filenames()?;
     let by_name: BTreeMap<String, PathBuf> = src_files
         .into_iter()
         .filter_map(|path| {
@@ -501,6 +505,7 @@ fn ingest_wiki_for_snapshot(
     let raw_dir = data_dir.join("raw").join(wiki);
     if let Some(version) = requested_snapshot {
         storage::validate_snapshot_version(version)?;
+        SnapshotPlan::load_or_resolve(data_dir, wiki, version)?;
         let roots = IngestRoots::snapshot(data_dir, wiki, version)?;
         let outputs = ingest_stage_outputs(data_dir, &roots)?;
         let receipt_path = fingerprint::data_stage_receipt_path(data_dir, wiki, version, "ingest");
@@ -536,7 +541,8 @@ fn ingest_wiki_for_snapshot(
         Some(version) => {
             storage::validate_snapshot_version(version)?;
             let roots = IngestRoots::snapshot(data_dir, wiki, version)?;
-            let expected = fetch::build_file_list(wiki, version)?;
+            let (plan, _) = SnapshotPlan::load_or_resolve(data_dir, wiki, version)?;
+            let expected = plan.filenames()?;
             let by_name: BTreeMap<String, PathBuf> = src_files
                 .into_iter()
                 .filter_map(|path| {
@@ -577,6 +583,9 @@ fn ingest_wiki_for_snapshot(
             select_ingest_sources(wiki, src_files, None)?
         }
     };
+    if let Some(version) = snapshot_version.as_deref() {
+        SnapshotPlan::load_or_resolve(data_dir, wiki, version)?;
+    }
     let roots = match snapshot_version.as_deref() {
         Some(version) => IngestRoots::snapshot(data_dir, wiki, version)?,
         None => IngestRoots::legacy(data_dir, wiki),
@@ -596,7 +605,9 @@ fn ingest_wiki_for_snapshot(
     })?;
 
     let sources_to_validate = match snapshot_version.as_deref() {
-        Some(version) => fetch::build_file_list(wiki, version)?
+        Some(version) => SnapshotPlan::load_or_resolve(data_dir, wiki, version)?
+            .0
+            .filenames()?
             .into_iter()
             .map(PathBuf::from)
             .collect(),
@@ -611,7 +622,7 @@ fn ingest_wiki_for_snapshot(
     }
 
     if let Some(snapshot_version) = snapshot_version.as_deref() {
-        let inputs = ingest_stage_inputs(data_dir, &roots, &src_files)?;
+        let inputs = ingest_stage_inputs(data_dir, wiki, &roots, &src_files)?;
         let outputs = ingest_stage_outputs(data_dir, &roots)?;
         fingerprint::record(
             &fingerprint::data_stage_receipt_path(data_dir, wiki, snapshot_version, "ingest"),
@@ -664,18 +675,19 @@ fn ingest_stage_outputs(_data_dir: &Path, roots: &IngestRoots) -> Result<Vec<Tra
 }
 
 fn ingest_stage_inputs(
-    _data_dir: &Path,
+    data_dir: &Path,
+    wiki: &str,
     roots: &IngestRoots,
     raw_sources: &[PathBuf],
 ) -> Result<Vec<TrackedPath>> {
     let mut inputs = Vec::new();
+    if let Some(snapshot) = roots.snapshot_version.as_deref() {
+        let (_, plan_path) = SnapshotPlan::load_or_resolve(data_dir, wiki, snapshot)?;
+        inputs.push(TrackedPath::new("snapshot-plan", plan_path));
+    }
     for source in raw_sources {
         let source_id = ingest_source_id(source)?;
         inputs.push(TrackedPath::new(format!("raw/{source_id}"), source));
-    }
-    if inputs.is_empty() {
-        let marker_root = roots.analytical.join("_markers");
-        inputs = fingerprint::collect_tracked_files(&marker_root, "ingest-marker")?;
     }
     Ok(inputs)
 }
@@ -1119,6 +1131,27 @@ mod tests {
         let error = ingest_wiki_snapshot("testwiki", "2026-08", temp_dir.path())
             .expect_err("an uncovered source must require fetching");
         assert!(error.to_string().contains("missing 1 source file"));
+        Ok(())
+    }
+
+    #[test]
+    fn ingest_stage_inputs_rejects_a_corrupt_snapshot_plan() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let wiki = "testwiki";
+        let version = "2026-08";
+        let roots = IngestRoots::snapshot(data_dir.path(), wiki, version)?;
+        let plan_path = crate::snapshot_plan::plan_path(data_dir.path(), wiki, version)?;
+        fs::create_dir_all(plan_path.parent().expect("plan parent"))?;
+        fs::write(&plan_path, b"{truncated")?;
+
+        assert!(ingest_stage_inputs(data_dir.path(), wiki, &roots, &[]).is_err());
+
+        let legacy_source = data_dir.path().join("legacy.tsv.bz2");
+        fs::write(&legacy_source, b"BZhfixture")?;
+        let legacy = IngestRoots::legacy(data_dir.path(), wiki);
+        let inputs = ingest_stage_inputs(data_dir.path(), wiki, &legacy, &[legacy_source])?;
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(inputs[0].identity, "raw/legacy");
         Ok(())
     }
 

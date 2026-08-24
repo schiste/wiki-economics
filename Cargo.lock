@@ -3336,6 +3336,7 @@ dependencies = [
  "idna",
  "percent-encoding",
  "serde",
+ "serde_derive",
 ]
 
 [[package]]
@@ -3516,6 +3517,7 @@ dependencies = [
  "sha2",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

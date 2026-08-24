@@ -13,8 +13,11 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 use crate::fingerprint::{self, StageSpec, TrackedPath};
+use crate::snapshot_plan::{MEDIAWIKI_HISTORY_BASE_URL, SnapshotPlan};
+#[cfg(test)]
+use crate::snapshot_plan::{MONTHLY_WIKIS, YEARLY_WIKIS};
 
-const BASE_URL: &str = "https://dumps.wikimedia.org/other/mediawiki_history";
+const BASE_URL: &str = MEDIAWIKI_HISTORY_BASE_URL;
 pub(crate) const DUMPS_HOST: &str = "dumps.wikimedia.org";
 const USER_AGENT: &str = "wiki-econ/0.1 (Wikipedia economic analysis research tool)";
 /// dumps.wikimedia.org kept 429ing this client even after the Retry-After
@@ -40,7 +43,7 @@ const FETCH_RETRY_AFTER_MAX_SECS: u64 = 30;
 const FETCH_MAX_PARALLELISM_ENV: &str = "WIKI_ECON_FETCH_MAX_PARALLELISM";
 const SNAPSHOT_MAX_LAG_ENV: &str = "WIKI_ECON_MAX_SNAPSHOT_LAG_MONTHS";
 const DEFAULT_SNAPSHOT_MAX_LAG_MONTHS: u32 = 2;
-const FETCH_ALGORITHM_VERSION: &str = "wikimedia-history-fetch-v2-marker-aware";
+const FETCH_ALGORITHM_VERSION: &str = "wikimedia-history-fetch-v3-snapshot-plan";
 /// Extra headroom required beyond the summed remote byte total before a
 /// fetch is allowed to start. Not a tight budget — just enough to fail fast
 /// when shared storage lacks enough space for a workload (e.g. frwiki's ~31GB
@@ -56,29 +59,11 @@ const FETCH_DISK_HEADROOM_MARGIN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// we can apply on top of TLS.
 const BZ2_MAGIC: &[u8] = b"BZh";
 
-/// Wikipedia language editions partitioned yearly in the
-/// `mediawiki_history` dumps (medium-sized wikis). Determined by probing
-/// `https://dumps.wikimedia.org/other/mediawiki_history/<version>/<wiki>/`
-/// for filenames matching `<wiki>.<YYYY>.tsv.bz2`. If a Wikipedia is
-/// promoted from all-time to yearly upstream, add it here.
-const YEARLY_WIKIS: &[&str] = &[
-    "arwiki", "bgwiki", "cawiki", "cebwiki", "cswiki", "dawiki", "dewiki", "eswiki", "fawiki",
-    "fiwiki", "frwiki", "hewiki", "huwiki", "idwiki", "itwiki", "jawiki", "kowiki", "nlwiki",
-    "nowiki", "plwiki", "ptwiki", "rowiki", "ruwiki", "shwiki", "srwiki", "svwiki", "thwiki",
-    "trwiki", "ukwiki", "viwiki", "zhwiki",
-];
-
-/// Wikis partitioned monthly (very large). Currently `enwiki` is the only
-/// Wikipedia language edition with monthly partitioning; `wikidatawiki` and
-/// `commonswiki` aren't Wikipedias but are included here so the CLI rejects
-/// them with the same "not yet supported" error if invoked directly.
-const MONTHLY_WIKIS: &[&str] = &["enwiki", "wikidatawiki", "commonswiki"];
-
 /// Complete list of Wikipedia language-edition database names exposed by the
 /// admin picker. Sourced from the canonical Wikimedia sitematrix and pruned
-/// to wikis with a published `mediawiki_history` directory. The dispatch
-/// inside `build_file_list` decides yearly vs all-time vs monthly per-wiki;
-/// this list is purely the picker's universe.
+/// to wikis with a published `mediawiki_history` directory. Snapshot planning
+/// decides yearly vs all-time vs monthly per-wiki; this list is purely the
+/// picker's universe.
 ///
 /// The Rust binary itself does not reference this constant directly; the
 /// admin server in `site/admin-server.cjs` reads it via a regex scrape of
@@ -558,12 +543,15 @@ fn snapshot_is_complete<T: HttpTransport>(
     version: &str,
 ) -> Result<bool> {
     for wiki in wikis {
-        let mut files = build_file_list(wiki, version)?;
-        files.reverse();
-        for filename in files {
-            let url = format!("{base_url}/{version}/{wiki}/{filename}");
-            if !snapshot_source_exists(transport, &url)? {
-                info!(wiki, version, source = filename, "snapshot is not complete");
+        let plan = SnapshotPlan::resolve_from_base(base_url, wiki, version)?;
+        for source in plan.sources.iter().rev() {
+            if !snapshot_source_exists(transport, source.url.as_str())? {
+                info!(
+                    wiki,
+                    version,
+                    source = source.source_id,
+                    "snapshot is not complete"
+                );
                 return Ok(false);
             }
         }
@@ -654,25 +642,9 @@ impl AttemptError {
 }
 
 /// Determine the file list for a given wiki and snapshot version.
+#[cfg(test)]
 pub(crate) fn build_file_list(wiki: &str, version: &str) -> Result<Vec<String>> {
-    if MONTHLY_WIKIS.contains(&wiki) {
-        anyhow::bail!(
-            "Monthly-partitioned wikis (enwiki, etc.) are not yet supported. Use yearly wikis."
-        );
-    }
-
-    if YEARLY_WIKIS.contains(&wiki) {
-        let end_year: u32 = version
-            .get(..4)
-            .context("Invalid version format")?
-            .parse()
-            .context("Invalid version format")?;
-        Ok((2001..=end_year)
-            .map(|year| format!("{version}.{wiki}.{year}.tsv.bz2"))
-            .collect())
-    } else {
-        Ok(vec![format!("{version}.{wiki}.all-time.tsv.bz2")])
-    }
+    SnapshotPlan::resolve(wiki, version)?.filenames()
 }
 
 /// Maximum redirect chain length the dumps-host policy will follow before
@@ -1445,7 +1417,8 @@ fn fetch_wiki_with_transport<T: HttpTransport>(
     version: &str,
     data_dir: &Path,
 ) -> Result<Vec<PathBuf>> {
-    let expected = build_file_list(wiki, version)?;
+    let (plan, plan_path) = SnapshotPlan::load_or_resolve(data_dir, wiki, version)?;
+    let expected = plan.filenames()?;
     let analytical_root = crate::storage::snapshot_analytical_wiki_dir(data_dir, wiki, version)?;
     let mut files = Vec::new();
     for filename in &expected {
@@ -1471,7 +1444,7 @@ fn fetch_wiki_with_transport<T: HttpTransport>(
     );
     if files.is_empty() {
         crate::observability::record_stage_reused("fetch", Some(wiki));
-        record_fetch_stage(data_dir, wiki, version, &expected)?;
+        record_fetch_stage(data_dir, wiki, version, &plan_path, &expected)?;
         return Ok(Vec::new());
     }
     check_disk_headroom(transport, base_url, wiki, version, &files, data_dir)?;
@@ -1486,7 +1459,7 @@ fn fetch_wiki_with_transport<T: HttpTransport>(
         parallelism,
     )
     .and_then(|paths| {
-        record_fetch_stage(data_dir, wiki, version, &expected)?;
+        record_fetch_stage(data_dir, wiki, version, &plan_path, &expected)?;
         Ok(paths)
     })
 }
@@ -1495,11 +1468,13 @@ fn record_fetch_stage(
     data_dir: &Path,
     wiki: &str,
     version: &str,
+    plan_path: &Path,
     expected: &[String],
 ) -> Result<()> {
     let analytical_root = crate::storage::snapshot_analytical_wiki_dir(data_dir, wiki, version)?;
     let raw_root = data_dir.join("raw").join(wiki);
-    let mut sources = Vec::with_capacity(expected.len());
+    let mut sources = Vec::with_capacity(expected.len() + 1);
+    sources.push(TrackedPath::new("snapshot-plan", plan_path));
     for filename in expected {
         let source_id = crate::ingest::ingest_source_id(Path::new(filename))?;
         let marker = crate::storage::marker_path_in(&analytical_root, &source_id);
@@ -1882,10 +1857,13 @@ mod tests {
     }
 
     #[test]
-    fn build_file_list_rejects_monthly_wikis() {
+    fn build_file_list_supports_monthly_wikis_through_partial_final_month() -> Result<()> {
         init_test_tracing();
-        let err = build_file_list("enwiki", "2026-02").expect_err("monthly wikis should error");
-        assert!(err.to_string().contains("not yet supported"));
+        let files = build_file_list("enwiki", "2026-07")?;
+        assert_eq!(files.len(), 308);
+        assert_eq!(files.first().unwrap(), "2026-07.enwiki.2001-01.tsv.bz2");
+        assert_eq!(files.last().unwrap(), "2026-07.enwiki.2026-08.tsv.bz2");
+        Ok(())
     }
 
     #[test]
@@ -1897,10 +1875,10 @@ mod tests {
             #[rustfmt::skip]
             assert!(WIKIPEDIA_DATABASES.contains(wiki), "YEARLY_WIKIS entry {wiki} missing from WIKIPEDIA_DATABASES");
         }
-        // Among MONTHLY_WIKIS, only enwiki is a Wikipedia language edition;
-        // wikidatawiki and commonswiki are deliberately excluded from the
-        // picker universe.
-        assert!(WIKIPEDIA_DATABASES.contains(&"enwiki"));
+        for wiki in MONTHLY_WIKIS {
+            #[rustfmt::skip]
+            assert!(WIKIPEDIA_DATABASES.contains(wiki), "MONTHLY_WIKIS entry {wiki} missing from WIKIPEDIA_DATABASES");
+        }
 
         // Sorted-and-deduped — the admin server sorts again before display
         // but a sorted source list keeps diffs clean and helps reviewers.
@@ -2699,6 +2677,62 @@ mod tests {
     }
 
     #[test]
+    fn fetch_wiki_persists_and_uses_monthly_snapshot_plan() -> Result<()> {
+        init_test_tracing();
+        let data_dir = TestDir::new()?;
+        let wiki = "enwiki";
+        let version = "2001-01";
+        let transport = FakeTransport::with_outcomes(
+            [
+                ok_head(Some(13), false),
+                ok_head(Some(13), false),
+                ok_head(Some(13), false),
+                ok_head(Some(13), false),
+            ],
+            [
+                ok_get(b"BZhpayload-by", false),
+                ok_get(b"BZhpayload-by", false),
+            ],
+        );
+
+        let paths = fetch_wiki_with_transport(
+            &transport,
+            "http://example.invalid",
+            wiki,
+            version,
+            data_dir.path(),
+        )
+        .expect("monthly plan fetch should succeed");
+
+        assert_eq!(paths.len(), 2);
+        assert!(paths[0].ends_with("2001-01.enwiki.2001-01.tsv.bz2"));
+        assert!(paths[1].ends_with("2001-01.enwiki.2001-02.tsv.bz2"));
+        assert_eq!(transport.get_requests(), 2);
+        let plan_path = crate::snapshot_plan::plan_path(data_dir.path(), wiki, version)?;
+        let plan = SnapshotPlan::load(&plan_path)?;
+        assert_eq!(plan.filenames()?.len(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn monthly_snapshot_completion_rejects_a_missing_expected_month() -> Result<()> {
+        let transport = FakeTransport::with_head_outcomes([
+            ok_head(Some(13), false),
+            status_head(StatusCode::NOT_FOUND),
+        ]);
+        assert!(
+            !snapshot_is_complete(
+                &transport,
+                "http://example.invalid",
+                &["enwiki".to_string()],
+                "2001-01",
+            )
+            .expect("monthly completeness probe should return a result")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn fetch_wiki_downloads_only_years_missing_valid_markers() -> Result<()> {
         init_test_tracing();
         let data_dir = TestDir::new()?;
@@ -3122,13 +3156,13 @@ mod tests {
     }
 
     #[test]
-    fn public_fetch_wiki_rejects_monthly_wikis_before_network_work() -> Result<()> {
+    fn public_fetch_wiki_rejects_invalid_wiki_before_network_work() -> Result<()> {
         init_test_tracing();
         let data_dir = TestDir::new()?;
-        let err = fetch_wiki("enwiki", "2026-02", data_dir.path())
-            .expect_err("monthly wikis should fail");
+        let err = fetch_wiki("../enwiki", "2026-02", data_dir.path())
+            .expect_err("unsafe wiki identifier should fail");
 
-        assert!(err.to_string().contains("not yet supported"));
+        assert!(err.to_string().contains("invalid wiki database name"));
         Ok(())
     }
 }

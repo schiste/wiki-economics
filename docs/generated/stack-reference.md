@@ -42,6 +42,7 @@ This table is resolved from `cargo metadata --locked`, not copied from
 | `sha2` | `0.11.0` | content and artifact fingerprints | `MIT OR Apache-2.0` |
 | `tracing` | `0.1.44` | structured pipeline events | `MIT` |
 | `tracing-subscriber` | `0.3.23` | structured log formatting and filtering | `MIT` |
+| `url` | `2.5.8` | typed canonical snapshot source URLs | `MIT OR Apache-2.0` |
 
 ## Direct browser and site dependencies
 

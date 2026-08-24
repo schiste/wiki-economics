@@ -28,6 +28,7 @@ const RUST_ROLES = {
   sha2: "content and artifact fingerprints",
   tracing: "structured pipeline events",
   "tracing-subscriber": "structured log formatting and filtering",
+  url: "typed canonical snapshot source URLs",
 };
 
 const FRONTEND_ROLES = {

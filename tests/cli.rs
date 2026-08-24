@@ -32,7 +32,7 @@ fn binary_entrypoint_rejects_incomplete_merge_inputs() {
 }
 
 #[test]
-fn binary_entrypoint_reports_monthly_fetch_error() {
+fn binary_entrypoint_rejects_unsafe_wiki_before_fetch() {
     init_test_tracing();
     let data_dir = TestDir::new().expect("temp dir");
 
@@ -40,13 +40,15 @@ fn binary_entrypoint_reports_monthly_fetch_error() {
         .arg("--data-dir")
         .arg(data_dir.path())
         .arg("fetch")
-        .arg("enwiki")
+        .arg("--version")
+        .arg("2026-07")
+        .arg("../enwiki")
         .output()
         .expect("binary should run");
 
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("not yet supported"));
+    assert!(stderr.contains("invalid wiki database name"));
 }
 
 fn stage_events(path: &Path) -> Vec<serde_json::Value> {

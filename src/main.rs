@@ -17,6 +17,7 @@ mod observability;
 mod patrol;
 mod publication;
 mod schema;
+mod snapshot_plan;
 mod storage;
 #[cfg(test)]
 mod test_support;
@@ -264,6 +265,14 @@ trait Ops {
     fn resolve_snapshot(&self, _wikis: &[String], now: DateTime<Utc>) -> Result<String> {
         Ok(snapshot_version_for(now))
     }
+    fn persist_snapshot_plans(
+        &self,
+        _wikis: &[String],
+        _version: &str,
+        _data_dir: &Path,
+    ) -> Result<()> {
+        Ok(())
+    }
     fn fetch_wiki(&self, wiki: &str, version: &str, data_dir: &std::path::Path) -> Result<()>;
     fn fetch_patrol(&self, wiki: &str, data_dir: &std::path::Path) -> Result<()>;
     fn ingest_wiki(
@@ -320,6 +329,18 @@ struct RealOps;
 impl Ops for RealOps {
     fn resolve_snapshot(&self, wikis: &[String], now: DateTime<Utc>) -> Result<String> {
         fetch::resolve_latest_completed_snapshot(wikis, now)
+    }
+
+    fn persist_snapshot_plans(
+        &self,
+        wikis: &[String],
+        version: &str,
+        data_dir: &Path,
+    ) -> Result<()> {
+        for wiki in wikis {
+            snapshot_plan::SnapshotPlan::load_or_resolve(data_dir, wiki, version)?;
+        }
+        Ok(())
     }
 
     fn fetch_wiki(&self, wiki: &str, version: &str, data_dir: &std::path::Path) -> Result<()> {
@@ -508,6 +529,7 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             let version = run_timed_stage("snapshot_resolve", None, || {
                 ops.resolve_snapshot(&wikis, Utc::now())
             })?;
+            ops.persist_snapshot_plans(&wikis, &version, &data_dir)?;
             println!("{version}");
         }
 
@@ -518,6 +540,7 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
                     ops.resolve_snapshot(&wikis, Utc::now())
                 })?,
             };
+            ops.persist_snapshot_plans(&wikis, &version, &data_dir)?;
             for wiki in &wikis {
                 run_timed_stage("fetch", Some(wiki), || {
                     ops.fetch_wiki(wiki, &version, &data_dir)
@@ -696,6 +719,7 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
                     ops.resolve_snapshot(&wikis, Utc::now())
                 })?,
             };
+            ops.persist_snapshot_plans(&wikis, &version, &data_dir)?;
             publication::begin_run(&output_dir, run_id.as_deref(), &wikis, Some(&version))?;
             for wiki in &wikis {
                 info!(wiki = wiki, "running full pipeline");
@@ -1580,10 +1604,15 @@ mod tests {
     fn snapshot_repair_command_validates_and_selects_the_generation() -> Result<()> {
         let data = TestDir::new()?;
         let output = TestDir::new()?;
-        let wiki = "nlwiki";
+        let wiki = "repairwiki";
         let version = "2026-07";
         let analytical = crate::storage::snapshot_analytical_wiki_dir(data.path(), wiki, version)?;
-        crate::storage::write_test_marker_in(data.path(), &analytical, "2026-07.nlwiki.2001")?;
+        crate::storage::write_test_marker_in(
+            data.path(),
+            &analytical,
+            "2026-07.repairwiki.all-time",
+        )
+        .expect("repair marker should be writable");
         run_with_ops(
             Cli {
                 data_dir: data.path().to_path_buf(),
@@ -1748,6 +1777,13 @@ mod tests {
         let data_dir = TestDir::new()?;
         let output_dir = TestDir::new()?;
 
+        let now = chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 8, 22, 0, 0, 0).unwrap();
+        assert!(ops.resolve_snapshot(&[], now).is_err());
+        ops.persist_snapshot_plans(&["simplewiki".to_string()], "2026-07", data_dir.path())?;
+        assert!(
+            crate::snapshot_plan::plan_path(data_dir.path(), "simplewiki", "2026-07")?.is_file()
+        );
+
         let raw_ingest_dir = data_dir.path().join("raw").join("ingestwiki");
         fs::create_dir_all(&raw_ingest_dir)?;
         write_bz2_dump(&raw_ingest_dir.join("2026-02.ingestwiki.all-time.tsv.bz2"))?;
@@ -1771,9 +1807,9 @@ mod tests {
         );
 
         let fetch_err = ops
-            .fetch_wiki("enwiki", "2026-02", data_dir.path())
-            .expect_err("monthly fetch should fail before network work");
-        assert!(fetch_err.to_string().contains("not yet supported"));
+            .fetch_wiki("../enwiki", "2026-02", data_dir.path())
+            .expect_err("unsafe wiki should fail before network work");
+        assert!(fetch_err.to_string().contains("invalid wiki database name"));
 
         write_compute_input(data_dir.path(), "computewiki")?;
         ops.compute_all("computewiki", data_dir.path(), output_dir.path())?;

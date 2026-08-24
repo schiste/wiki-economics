@@ -4,7 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use crate::{fetch, ingest, storage};
+use crate::snapshot_plan::SnapshotPlan;
+use crate::{ingest, storage};
 
 #[derive(Debug, Default, Serialize)]
 pub struct CleanupReport {
@@ -73,7 +74,9 @@ fn clean_validated_raw_dumps(
         let Some(snapshot_version) = ingest::snapshot_version_from_filename(&filename, wiki) else {
             continue;
         };
-        if !fetch::build_file_list(wiki, snapshot_version)?
+        if !SnapshotPlan::load_or_resolve(data_dir, wiki, snapshot_version)?
+            .0
+            .filenames()?
             .iter()
             .any(|expected| expected == &filename)
         {
