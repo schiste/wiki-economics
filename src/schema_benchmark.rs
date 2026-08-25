@@ -114,6 +114,43 @@ fn benchmark_wiki(data_dir: &Path, scratch: &Path, wiki: &str) -> Result<WikiSch
     let started = Instant::now();
     let selected_snapshot = storage::current_snapshot_version(data_dir, wiki)?
         .with_context(|| format!("schema benchmark requires an active snapshot for {wiki}"))?;
+    let active_layer_result = storage::snapshot_compute_layer(
+        data_dir,
+        wiki,
+        &selected_snapshot,
+        storage::GenerationLayer::Warehouse,
+    );
+    let active_layer = active_layer_result?;
+    if active_layer == storage::GenerationLayer::MetricInput {
+        let root = storage::active_metric_input_wiki_dir(data_dir, wiki)?;
+        let sources = storage::active_fragment_files(data_dir, wiki, active_layer)?;
+        ensure!(
+            !sources.is_empty(),
+            "no metric-input fragments found for {wiki}"
+        );
+        let rows = sources.iter().try_fold(0_u64, |total, source| {
+            let rows = ParquetReader::new(File::open(source)?).num_rows()?;
+            total
+                .checked_add(u64::try_from(rows)?)
+                .context("schema benchmark row count overflow")
+        })?;
+        let bytes = directory_bytes(&root)?;
+        return Ok(WikiSchemaBenchmark {
+            wiki: wiki.to_string(),
+            selected_snapshot,
+            fragments: sources.len(),
+            rows,
+            warehouse_bytes: 0,
+            analytical_bytes: 0,
+            current_two_layer_bytes: bytes,
+            projected_metric_input_bytes: bytes,
+            projected_savings_bytes: 0,
+            projected_savings_percent: 0.0,
+            largest_temporary_fragment_bytes: 0,
+            elapsed_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            memory: MemorySnapshot::capture(),
+        });
+    }
     let warehouse_root = storage::active_warehouse_wiki_dir(data_dir, wiki)?;
     let analytical_root = storage::active_analytical_wiki_dir(data_dir, wiki)?;
     let sources =
@@ -296,13 +333,16 @@ mod tests {
         Ok(())
     }
 
-    fn write_generation(data_dir: &Path, wiki: &str, snapshot: &str) -> Result<()> {
+    fn write_generation(
+        data_dir: &Path,
+        wiki: &str,
+        snapshot: &str,
+        metric_input_only: bool,
+    ) -> Result<()> {
         let warehouse = storage::snapshot_warehouse_wiki_dir(data_dir, wiki, snapshot)?;
         let analytical = storage::snapshot_analytical_wiki_dir(data_dir, wiki, snapshot)?;
         let warehouse_partition = storage::month_partition_dir(&warehouse, 2026, "2026-01");
         let analytical_partition = storage::month_partition_dir(&analytical, 2026, "2026-01");
-        fs::create_dir_all(&warehouse_partition)?;
-        fs::create_dir_all(&analytical_partition)?;
         let source = crate::snapshot_plan::SnapshotPlan::resolve(wiki, snapshot)?
             .sources
             .into_iter()
@@ -338,14 +378,24 @@ mod tests {
             columns.push(column);
         }
         let mut warehouse_frame = DataFrame::new(2, columns)?;
-        ParquetWriter::new(File::create(warehouse_partition.join(&filename))?)
-            .finish(&mut warehouse_frame)?;
-        let mut analytical_frame =
-            warehouse_frame.select(schema::ANALYTICAL_COLUMNS.iter().copied())?;
-        ParquetWriter::new(File::create(analytical_partition.join(filename))?)
-            .finish(&mut analytical_frame)?;
+        if metric_input_only {
+            let metric_input = storage::snapshot_metric_input_wiki_dir(data_dir, wiki, snapshot)?;
+            let partition = storage::month_partition_dir(&metric_input, 2026, "2026-01");
+            fs::create_dir_all(&partition)?;
+            let mut frame = warehouse_frame.select(schema::METRIC_INPUT_COLUMNS.iter().copied())?;
+            ParquetWriter::new(File::create(partition.join(filename))?).finish(&mut frame)?;
+        } else {
+            fs::create_dir_all(&warehouse_partition)?;
+            fs::create_dir_all(&analytical_partition)?;
+            ParquetWriter::new(File::create(warehouse_partition.join(&filename))?)
+                .finish(&mut warehouse_frame)?;
+            let mut analytical_frame =
+                warehouse_frame.select(schema::ANALYTICAL_COLUMNS.iter().copied())?;
+            ParquetWriter::new(File::create(analytical_partition.join(filename))?)
+                .finish(&mut analytical_frame)?;
+        }
         storage::write_test_generation_manifest_from_files(data_dir, wiki, snapshot)?;
-        storage::publish_test_snapshot_pointer(data_dir, wiki, snapshot)
+        storage::publish_current_snapshot(data_dir, wiki, snapshot)
     }
 
     #[test]
@@ -353,18 +403,19 @@ mod tests {
         let data = TestDir::new()?;
         let scratch = TestDir::new()?;
         let reports = TestDir::new()?;
-        write_generation(data.path(), "tinywiki", "2026-01")?;
+        write_generation(data.path(), "tinywiki", "2026-01", false)?;
         let report_path = reports.path().join("schema.json");
 
         let wikis = ["tinywiki".to_string()];
-        let report = run(
+        let report_result = run(
             data.path(),
             scratch.path(),
             &report_path,
             &wikis,
             Some("aabbcc"),
             Some("schema-test"),
-        )?;
+        );
+        let report = report_result?;
 
         assert_eq!(report.schema_version, 1);
         assert_eq!(report.wikis.len(), 1);
@@ -377,6 +428,32 @@ mod tests {
             fs::read_dir(scratch.path())?.next().is_none(),
             "benchmark scratch must be reclaimed after a successful run"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn benchmark_recognizes_an_already_qualified_generation() -> Result<()> {
+        let data = TestDir::new()?;
+        let scratch = TestDir::new()?;
+        let reports = TestDir::new()?;
+        write_generation(data.path(), "tinywiki", "2026-01", true)?;
+
+        let report_result = run(
+            data.path(),
+            scratch.path(),
+            &reports.path().join("schema.json"),
+            &["tinywiki".to_string()],
+            None,
+            None,
+        );
+        let report = report_result?;
+        assert_eq!(report.wikis[0].rows, 2);
+        assert_eq!(report.wikis[0].projected_savings_bytes, 0);
+        assert_eq!(
+            report.wikis[0].current_two_layer_bytes,
+            report.wikis[0].projected_metric_input_bytes
+        );
+        assert_eq!(report.wikis[0].largest_temporary_fragment_bytes, 0);
         Ok(())
     }
 

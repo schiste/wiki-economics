@@ -717,14 +717,15 @@ impl Ops for RealOps {
         wikis: &[String],
         run_id: Option<&str>,
     ) -> Result<()> {
-        let result = schema_benchmark::run(
+        let benchmark = schema_benchmark::run(
             data_dir,
             scratch_dir,
             report_path,
             wikis,
             std::env::var("WIKI_ECON_SOURCE_COMMIT").ok().as_deref(),
             run_id,
-        )?;
+        );
+        let result = benchmark?;
         println!("{}", serde_json::to_string(&result)?);
         Ok(())
     }
@@ -2923,7 +2924,8 @@ mod tests {
         write_bz2_dump(&raw_ingest_dir.join("2026-02.ingestwiki.all-time.tsv.bz2"))?;
         ops.ingest_wiki("ingestwiki", Some("2026-02"), data_dir.path())?;
         assert!({
-            let active = crate::storage::active_analytical_wiki_dir(data_dir.path(), "ingestwiki")?;
+            let active =
+                crate::storage::active_metric_input_wiki_dir(data_dir.path(), "ingestwiki")?;
             !crate::storage::collect_parquet_files(&active)?.is_empty()
         });
         ops.finalize_snapshot("ingestwiki", data_dir.path())?;

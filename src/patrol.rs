@@ -431,13 +431,9 @@ fn compute_patrol_selected(
     let patrol_path = patrol_dir.join("patrol.parquet");
     let rights_path = patrol_dir.join("rights.parquet");
     let meta_path = patrol_dir.join("autopatrol_groups.json");
-    let revision_store_dir = match snapshot {
-        Some(snapshot) => storage::snapshot_warehouse_wiki_dir(data_dir, wiki, snapshot)?,
-        None => storage::active_warehouse_wiki_dir(data_dir, wiki)?,
-    };
-    let revision_files = match snapshot {
+    let revision_layer = match snapshot {
         Some(snapshot) => {
-            let result = storage::snapshot_fragment_files(
+            let result = storage::snapshot_compute_layer(
                 data_dir,
                 wiki,
                 snapshot,
@@ -445,9 +441,20 @@ fn compute_patrol_selected(
             );
             result?
         }
-        None => {
-            storage::active_fragment_files(data_dir, wiki, storage::GenerationLayer::Warehouse)?
+        None => storage::active_compute_layer(data_dir, wiki, storage::GenerationLayer::Warehouse)?,
+    };
+    let revision_store_dir = match snapshot {
+        Some(snapshot) => {
+            storage::snapshot_layer_wiki_dir(data_dir, wiki, snapshot, revision_layer)?
         }
+        None => storage::active_layer_wiki_dir(data_dir, wiki, revision_layer)?,
+    };
+    let revision_files = match snapshot {
+        Some(snapshot) => {
+            let result = storage::snapshot_fragment_files(data_dir, wiki, snapshot, revision_layer);
+            result?
+        }
+        None => storage::active_fragment_files(data_dir, wiki, revision_layer)?,
     };
 
     if !patrol_path.exists() {
@@ -1346,16 +1353,20 @@ fn collect_partition_files_by_month(
     let mut by_month = BTreeMap::new();
     let partitions = match snapshot {
         Some(snapshot) => {
-            let result = storage::snapshot_partition_specs(
+            let layer_result = storage::snapshot_compute_layer(
                 data_dir,
                 wiki,
                 snapshot,
                 storage::GenerationLayer::Warehouse,
             );
+            let layer = layer_result?;
+            let result = storage::snapshot_partition_specs(data_dir, wiki, snapshot, layer);
             result?
         }
         None => {
-            storage::active_partition_specs(data_dir, wiki, storage::GenerationLayer::Warehouse)?
+            let layer =
+                storage::active_compute_layer(data_dir, wiki, storage::GenerationLayer::Warehouse)?;
+            storage::active_partition_specs(data_dir, wiki, layer)?
         }
     };
     for spec in partitions {

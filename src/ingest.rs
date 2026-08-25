@@ -21,7 +21,7 @@ use crate::{schema, storage};
 
 const INGEST_CHUNK_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const INGEST_ALGORITHM_VERSION: &str =
-    "history-tsv-to-generation-parquet-v6-pipeline-byte-determinism-v1";
+    "history-tsv-to-qualified-metric-input-v7-generation-schema-v2";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SourceIngestCommit {
@@ -34,7 +34,15 @@ pub(crate) struct SourceIngestCommit {
 struct IngestRoots {
     analytical: PathBuf,
     warehouse: PathBuf,
+    metric_input: Option<PathBuf>,
     snapshot_version: Option<String>,
+}
+
+#[derive(Default)]
+struct LayerOutputs {
+    analytical: Vec<PathBuf>,
+    warehouse: Vec<PathBuf>,
+    metric_input: Vec<PathBuf>,
 }
 
 struct SourceIdentityReader {
@@ -77,14 +85,18 @@ impl IngestRoots {
         Self {
             analytical: storage::analytical_wiki_dir(data_dir, wiki),
             warehouse: storage::warehouse_wiki_dir(data_dir, wiki),
+            metric_input: None,
             snapshot_version: None,
         }
     }
 
     fn snapshot(data_dir: &Path, wiki: &str, snapshot_version: &str) -> Result<Self> {
+        let metric_input =
+            storage::snapshot_metric_input_wiki_dir(data_dir, wiki, snapshot_version)?;
         Ok(Self {
             analytical: storage::snapshot_analytical_wiki_dir(data_dir, wiki, snapshot_version)?,
             warehouse: storage::snapshot_warehouse_wiki_dir(data_dir, wiki, snapshot_version)?,
+            metric_input: Some(metric_input),
             snapshot_version: Some(snapshot_version.to_string()),
         })
     }
@@ -131,7 +143,11 @@ fn cleanup_planned_source_outputs(roots: &IngestRoots, source: &SourceSpec) -> R
     let mut year_month = source.event_range.start.clone();
     loop {
         let year = year_month[..4].parse::<i32>()?;
-        for root in [&roots.analytical, &roots.warehouse] {
+        let mut layer_roots = vec![&roots.analytical, &roots.warehouse];
+        if let Some(metric_input) = roots.metric_input.as_ref() {
+            layer_roots.push(metric_input);
+        }
+        for root in layer_roots {
             let partition = storage::month_partition_dir(root, year, &year_month);
             if !partition.is_dir() {
                 continue;
@@ -321,31 +337,41 @@ fn write_partitioned_frames(
     source_id: &str,
     chunk_idx: usize,
     transaction_id: Option<&str>,
-) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
+) -> Result<LayerOutputs> {
     let partition_index = build_partition_index(normalized)?;
-
-    let mut analytical_paths = Vec::new();
-    let mut warehouse_paths = Vec::new();
+    let mut outputs = LayerOutputs::default();
 
     for ((year, year_month), row_indices) in partition_index {
         let take_idx = UInt32Chunked::from_vec("idx".into(), row_indices);
         let partition_df = normalized.take(&take_idx)?;
 
-        let partition_dir = storage::month_partition_dir(&roots.warehouse, year, &year_month);
-        let warehouse_path = partition_dir.join(format!("{source_id}.part-{chunk_idx:05}.parquet"));
-        let mut warehouse_df = partition_df.clone();
-        write_parquet(&mut warehouse_df, &warehouse_path, transaction_id)?;
-        warehouse_paths.push(warehouse_path);
+        if let Some(metric_input_root) = roots.metric_input.as_ref() {
+            let partition_dir = storage::month_partition_dir(metric_input_root, year, &year_month);
+            let metric_input_path =
+                partition_dir.join(format!("{source_id}.part-{chunk_idx:05}.parquet"));
+            let mut metric_input_df =
+                partition_df.select(schema::METRIC_INPUT_COLUMNS.iter().copied())?;
+            write_parquet(&mut metric_input_df, &metric_input_path, transaction_id)?;
+            outputs.metric_input.push(metric_input_path);
+        } else {
+            let partition_dir = storage::month_partition_dir(&roots.warehouse, year, &year_month);
+            let warehouse_path =
+                partition_dir.join(format!("{source_id}.part-{chunk_idx:05}.parquet"));
+            let mut warehouse_df = partition_df.clone();
+            write_parquet(&mut warehouse_df, &warehouse_path, transaction_id)?;
+            outputs.warehouse.push(warehouse_path);
 
-        let partition_dir = storage::month_partition_dir(&roots.analytical, year, &year_month);
-        let analytical_path =
-            partition_dir.join(format!("{source_id}.part-{chunk_idx:05}.parquet"));
-        let mut analytical_df = partition_df.select(schema::ANALYTICAL_COLUMNS.iter().copied())?;
-        write_parquet(&mut analytical_df, &analytical_path, transaction_id)?;
-        analytical_paths.push(analytical_path);
+            let partition_dir = storage::month_partition_dir(&roots.analytical, year, &year_month);
+            let analytical_path =
+                partition_dir.join(format!("{source_id}.part-{chunk_idx:05}.parquet"));
+            let mut analytical_df =
+                partition_df.select(schema::ANALYTICAL_COLUMNS.iter().copied())?;
+            write_parquet(&mut analytical_df, &analytical_path, transaction_id)?;
+            outputs.analytical.push(analytical_path);
+        }
     }
 
-    Ok((analytical_paths, warehouse_paths))
+    Ok(outputs)
 }
 
 fn flush_chunk(
@@ -354,9 +380,9 @@ fn flush_chunk(
     source_id: &str,
     chunk_idx: usize,
     transaction_id: Option<&str>,
-) -> Result<(usize, Vec<PathBuf>, Vec<PathBuf>)> {
+) -> Result<(usize, LayerOutputs)> {
     if chunk_bytes.is_empty() {
-        return Ok((0, Vec::new(), Vec::new()));
+        return Ok((0, LayerOutputs::default()));
     }
 
     let bytes = std::mem::take(chunk_bytes);
@@ -364,12 +390,12 @@ fn flush_chunk(
     let normalized = normalize_revision_chunk(parsed)?;
     let rows = normalized.height();
     if rows == 0 {
-        return Ok((0, Vec::new(), Vec::new()));
+        return Ok((0, LayerOutputs::default()));
     }
 
-    let (analytical_paths, warehouse_paths) =
+    let outputs =
         write_partitioned_frames(&normalized, roots, source_id, chunk_idx, transaction_id)?;
-    Ok((rows, analytical_paths, warehouse_paths))
+    Ok((rows, outputs))
 }
 
 /// Convert a single TSV.bz2 dump file into partitioned Parquet layers.
@@ -401,7 +427,9 @@ fn convert_file_with_chunk_limit(
             marker = %marker.display(),
             "skipping already ingested source"
         );
-        return storage::collect_parquet_files(&roots.analytical);
+        return storage::collect_parquet_files(
+            roots.metric_input.as_deref().unwrap_or(&roots.analytical),
+        );
     }
 
     let started = Instant::now();
@@ -418,6 +446,7 @@ fn convert_file_with_chunk_limit(
     let mut total_rows = 0usize;
     let mut analytical_paths = Vec::new();
     let mut warehouse_paths = Vec::new();
+    let mut metric_input_paths = Vec::new();
 
     let conversion = (|| -> Result<()> {
         loop {
@@ -429,7 +458,7 @@ fn convert_file_with_chunk_limit(
 
             chunk_bytes.extend_from_slice(&line);
             if chunk_bytes.len() >= chunk_limit {
-                let (rows, analytical, warehouse) = flush_chunk(
+                let (rows, outputs) = flush_chunk(
                     &mut chunk_bytes,
                     roots,
                     &source_id,
@@ -438,14 +467,15 @@ fn convert_file_with_chunk_limit(
                 )
                 .context("failed to flush a bounded ingest chunk")?;
                 total_rows += rows;
-                analytical_paths.extend(analytical);
-                warehouse_paths.extend(warehouse);
+                analytical_paths.extend(outputs.analytical);
+                warehouse_paths.extend(outputs.warehouse);
+                metric_input_paths.extend(outputs.metric_input);
                 chunk_idx += 1;
             }
         }
 
         if !chunk_bytes.is_empty() {
-            let (rows, analytical, warehouse) = flush_chunk(
+            let (rows, outputs) = flush_chunk(
                 &mut chunk_bytes,
                 roots,
                 &source_id,
@@ -453,8 +483,9 @@ fn convert_file_with_chunk_limit(
                 transaction_id,
             )?;
             total_rows += rows;
-            analytical_paths.extend(analytical);
-            warehouse_paths.extend(warehouse);
+            analytical_paths.extend(outputs.analytical);
+            warehouse_paths.extend(outputs.warehouse);
+            metric_input_paths.extend(outputs.metric_input);
         }
 
         Ok(())
@@ -463,6 +494,7 @@ fn convert_file_with_chunk_limit(
     if let Err(err) = conversion {
         cleanup_written_paths(&analytical_paths);
         cleanup_written_paths(&warehouse_paths);
+        cleanup_written_paths(&metric_input_paths);
         let _ = fs::remove_file(&marker);
         return Err(err);
     }
@@ -482,6 +514,7 @@ fn convert_file_with_chunk_limit(
             allow_empty: false,
             analytical_paths: analytical_paths.clone(),
             warehouse_paths: warehouse_paths.clone(),
+            metric_input_paths: metric_input_paths.clone(),
         };
         if transaction_id.is_some() {
             storage::write_precleaned_marker_manifest_in(
@@ -498,6 +531,7 @@ fn convert_file_with_chunk_limit(
     if let Err(err) = receipt {
         cleanup_written_paths(&analytical_paths);
         cleanup_written_paths(&warehouse_paths);
+        cleanup_written_paths(&metric_input_paths);
         let _ = fs::remove_file(&marker);
         return Err(err);
     }
@@ -510,6 +544,10 @@ fn convert_file_with_chunk_limit(
         .iter()
         .filter_map(|path| fs::metadata(path).ok().map(|metadata| metadata.len()))
         .sum();
+    let metric_input_bytes: u64 = metric_input_paths
+        .iter()
+        .filter_map(|path| fs::metadata(path).ok().map(|metadata| metadata.len()))
+        .sum();
 
     info!(
         source = %src.display(),
@@ -519,11 +557,17 @@ fn convert_file_with_chunk_limit(
         analytical_mb = analytical_bytes as f64 / 1_048_576.0,
         warehouse_parts = warehouse_paths.len(),
         warehouse_mb = warehouse_bytes as f64 / 1_048_576.0,
+        metric_input_parts = metric_input_paths.len(),
+        metric_input_mb = metric_input_bytes as f64 / 1_048_576.0,
         elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
         "converted dump file"
     );
 
-    Ok(analytical_paths)
+    Ok(if metric_input_paths.is_empty() {
+        analytical_paths
+    } else {
+        metric_input_paths
+    })
 }
 
 pub(crate) fn snapshot_version_from_filename<'a>(filename: &'a str, wiki: &str) -> Option<&'a str> {
@@ -622,7 +666,14 @@ fn ingest_wiki_for_snapshot(
                 receipt = %receipt_path.display(),
                 "reusing deterministic ingest stage"
             );
-            return storage::collect_parquet_files(&roots.analytical);
+            let layer_result = storage::snapshot_compute_layer(
+                data_dir,
+                wiki,
+                version,
+                storage::GenerationLayer::Analytical,
+            );
+            let layer = layer_result?;
+            return storage::snapshot_fragment_files(data_dir, wiki, version, layer);
         }
     }
     let mut src_files: Vec<PathBuf> = if raw_dir.exists() {
@@ -689,7 +740,11 @@ fn ingest_wiki_for_snapshot(
         None => IngestRoots::legacy(data_dir, wiki),
     };
     fs::create_dir_all(&roots.analytical)?;
-    fs::create_dir_all(&roots.warehouse)?;
+    if let Some(metric_input) = roots.metric_input.as_ref() {
+        fs::create_dir_all(metric_input)?;
+    } else {
+        fs::create_dir_all(&roots.warehouse)?;
+    }
 
     info!(
         wiki = wiki,
@@ -738,16 +793,27 @@ fn ingest_wiki_for_snapshot(
         storage::publish_current_snapshot(data_dir, wiki, snapshot_version)?;
     }
 
-    let analytical_paths = storage::collect_parquet_files(&roots.analytical)?;
+    let output_root = roots.metric_input.as_deref().unwrap_or(&roots.analytical);
+    let output_paths = storage::collect_parquet_files(output_root)?;
     info!(
         wiki = wiki,
         snapshot_version = snapshot_version.as_deref().unwrap_or("legacy"),
-        files = analytical_paths.len(),
-        analytical_dir = %roots.analytical.display(),
-        warehouse_dir = %roots.warehouse.display(),
+        files = output_paths.len(),
+        output_dir = %output_root.display(),
         "finished ingest"
     );
-    Ok(analytical_paths)
+    if let Some(snapshot) = snapshot_version.as_deref() {
+        let layer_result = storage::snapshot_compute_layer(
+            data_dir,
+            wiki,
+            snapshot,
+            storage::GenerationLayer::Analytical,
+        );
+        let layer = layer_result?;
+        storage::snapshot_fragment_files(data_dir, wiki, snapshot, layer)
+    } else {
+        Ok(output_paths)
+    }
 }
 
 fn ingest_stage_outputs(
@@ -762,10 +828,14 @@ fn ingest_stage_outputs(
         }
     }
     let mut outputs = Vec::new();
-    for (prefix, root) in [
+    let mut layer_roots = vec![
         ("analytical", &roots.analytical),
         ("warehouse", &roots.warehouse),
-    ] {
+    ];
+    if let Some(metric_input) = roots.metric_input.as_ref() {
+        layer_roots.push(("metric-input", metric_input));
+    }
+    for (prefix, root) in layer_roots {
         for path in storage::collect_parquet_files(root)? {
             let relative = path.strip_prefix(root)?;
             outputs.push(TrackedPath::new(
@@ -867,7 +937,11 @@ pub(crate) fn ingest_snapshot_source(
 
     let roots = IngestRoots::snapshot(data_dir, wiki, snapshot_version)?;
     fs::create_dir_all(&roots.analytical)?;
-    fs::create_dir_all(&roots.warehouse)?;
+    let metric_input_root = roots
+        .metric_input
+        .as_ref()
+        .context("snapshot ingest has no metric-input root")?;
+    fs::create_dir_all(metric_input_root)?;
     let reused = storage::marker_manifest_is_valid_in(data_dir, &roots.analytical, &source_id)?;
     if !reused {
         ensure!(
@@ -961,12 +1035,14 @@ fn finalize_snapshot_ingest_with_selection(
     if select_generation {
         storage::publish_current_snapshot(data_dir, wiki, snapshot_version)?;
     }
-    storage::snapshot_fragment_files(
+    let layer_result = storage::snapshot_compute_layer(
         data_dir,
         wiki,
         snapshot_version,
         storage::GenerationLayer::Analytical,
-    )
+    );
+    let layer = layer_result?;
+    storage::snapshot_fragment_files(data_dir, wiki, snapshot_version, layer)
 }
 
 /// Ingest all raw dump files for a wiki into partitioned Parquet. Standard
@@ -1121,30 +1197,22 @@ mod tests {
             .0
             .sources
             .len();
-        for (layer, baseline_root, candidate_root) in [
-            (
-                "analytical",
-                storage::snapshot_analytical_wiki_dir(baseline.path(), wiki, snapshot)?,
-                storage::snapshot_analytical_wiki_dir(candidate.path(), wiki, snapshot)?,
-            ),
-            (
-                "warehouse",
-                storage::snapshot_warehouse_wiki_dir(baseline.path(), wiki, snapshot)?,
-                storage::snapshot_warehouse_wiki_dir(candidate.path(), wiki, snapshot)?,
-            ),
-        ] {
-            let report = crate::determinism::qualify_concurrency(
-                &baseline_root,
-                &candidate_root,
-                "parquet",
-                1,
-                2,
-                INGEST_ALGORITHM_VERSION,
-                &reports.path().join(format!("{layer}.json")),
-            )
-            .expect("worker-independent ingest fragments must qualify");
-            assert_eq!(report.artifact_count, expected_sources);
-        }
+        let (layer, baseline_root, candidate_root) = (
+            "metric-input",
+            storage::snapshot_metric_input_wiki_dir(baseline.path(), wiki, snapshot)?,
+            storage::snapshot_metric_input_wiki_dir(candidate.path(), wiki, snapshot)?,
+        );
+        let report = crate::determinism::qualify_concurrency(
+            &baseline_root,
+            &candidate_root,
+            "parquet",
+            1,
+            2,
+            INGEST_ALGORITHM_VERSION,
+            &reports.path().join(format!("{layer}.json")),
+        )
+        .expect("worker-independent ingest fragments must qualify");
+        assert_eq!(report.artifact_count, expected_sources);
         Ok(())
     }
 
@@ -1184,8 +1252,10 @@ mod tests {
         )
         .expect("rebuilt marker must be readable");
         assert!(marker_valid);
-        assert_eq!(storage::collect_parquet_files(&roots.analytical)?.len(), 1);
-        assert_eq!(storage::collect_parquet_files(&roots.warehouse)?.len(), 1);
+        assert!(storage::collect_parquet_files(&roots.analytical)?.is_empty());
+        assert!(storage::collect_parquet_files(&roots.warehouse)?.is_empty());
+        let metric_input_root = roots.metric_input.as_ref().expect("metric input root");
+        assert_eq!(storage::collect_parquet_files(metric_input_root)?.len(), 1);
         Ok(())
     }
 
@@ -1196,16 +1266,24 @@ mod tests {
         let roots = IngestRoots::snapshot(data_dir.path(), "testwiki", "2026-08")?;
         let partition = storage::month_partition_dir(&roots.analytical, 2026, "2026-08");
         let warehouse_partition = storage::month_partition_dir(&roots.warehouse, 2026, "2026-08");
+        let metric_input_partition = storage::month_partition_dir(
+            roots.metric_input.as_ref().expect("metric input root"),
+            2026,
+            "2026-08",
+        );
         fs::create_dir_all(&partition)?;
         fs::create_dir_all(&warehouse_partition)?;
+        fs::create_dir_all(&metric_input_partition)?;
         let temporary_name = format!(
             ".{}.part-00000.parquet.killed-before-rename.tmp",
             source_spec.source_id
         );
         let analytical_temporary = partition.join(&temporary_name);
         let warehouse_temporary = warehouse_partition.join(&temporary_name);
+        let metric_input_temporary = metric_input_partition.join(&temporary_name);
         fs::write(&analytical_temporary, b"partial")?;
         fs::write(&warehouse_temporary, b"partial")?;
+        fs::write(&metric_input_temporary, b"partial")?;
 
         let commit = ingest_snapshot_source(
             "testwiki",
@@ -1219,8 +1297,11 @@ mod tests {
         assert!(!commit.reused);
         assert!(!analytical_temporary.exists());
         assert!(!warehouse_temporary.exists());
-        assert_eq!(storage::collect_parquet_files(&roots.analytical)?.len(), 1);
-        assert_eq!(storage::collect_parquet_files(&roots.warehouse)?.len(), 1);
+        assert!(!metric_input_temporary.exists());
+        assert!(storage::collect_parquet_files(&roots.analytical)?.is_empty());
+        assert!(storage::collect_parquet_files(&roots.warehouse)?.is_empty());
+        let metric_input_root = roots.metric_input.as_ref().expect("metric input root");
+        assert_eq!(storage::collect_parquet_files(metric_input_root)?.len(), 1);
         let marker_valid = storage::marker_manifest_is_valid_in(
             data_dir.path(),
             &roots.analytical,
@@ -1333,15 +1414,17 @@ mod tests {
 
         let empty = flush_chunk(&mut Vec::new(), &roots, "source", 0, None)?;
         assert_eq!(empty.0, 0);
-        assert!(empty.1.is_empty());
-        assert!(empty.2.is_empty());
+        assert!(empty.1.analytical.is_empty());
+        assert!(empty.1.warehouse.is_empty());
+        assert!(empty.1.metric_input.is_empty());
 
         let filtered_row = sample_row("2024-01-01 00:00:00.0", "42", "100", "page", "create");
         let mut filtered_bytes = filtered_row.into_bytes();
         let filtered = flush_chunk(&mut filtered_bytes, &roots, "source", 1, None)?;
         assert_eq!(filtered.0, 0);
-        assert!(filtered.1.is_empty());
-        assert!(filtered.2.is_empty());
+        assert!(filtered.1.analytical.is_empty());
+        assert!(filtered.1.warehouse.is_empty());
+        assert!(filtered.1.metric_input.is_empty());
         Ok(())
     }
 

@@ -390,13 +390,14 @@ fn analytical_select_exprs() -> Vec<Expr> {
 }
 
 fn analytical_lazyframe(wiki: &str, data_dir: &Path) -> Result<LazyFrame> {
-    let parquet_dir = storage::active_analytical_wiki_dir(data_dir, wiki)?;
+    let layer =
+        storage::active_compute_layer(data_dir, wiki, storage::GenerationLayer::Analytical)?;
+    let parquet_dir = storage::active_layer_wiki_dir(data_dir, wiki, layer)?;
     if !parquet_dir.exists() {
         anyhow::bail!("No parquet data for {wiki}. Run `ingest` first.");
     }
 
-    let files =
-        storage::active_fragment_files(data_dir, wiki, storage::GenerationLayer::Analytical)?;
+    let files = storage::active_fragment_files(data_dir, wiki, layer)?;
     if files.is_empty() {
         anyhow::bail!(
             "No parquet files found for {wiki} in {}",
@@ -847,16 +848,20 @@ fn compute_page_weekly_edits_for_snapshot(
     let governor = ResourceGovernor::from_environment(governor_paths)?;
     let partitions = match snapshot {
         Some(snapshot) => {
-            let result = storage::snapshot_partition_specs(
+            let layer_result = storage::snapshot_compute_layer(
                 data_dir,
                 wiki,
                 snapshot,
                 storage::GenerationLayer::Warehouse,
             );
+            let layer = layer_result?;
+            let result = storage::snapshot_partition_specs(data_dir, wiki, snapshot, layer);
             result?
         }
         None => {
-            storage::active_partition_specs(data_dir, wiki, storage::GenerationLayer::Warehouse)?
+            let layer =
+                storage::active_compute_layer(data_dir, wiki, storage::GenerationLayer::Warehouse)?;
+            storage::active_partition_specs(data_dir, wiki, layer)?
         }
     };
     if partitions.is_empty() {
@@ -1877,16 +1882,21 @@ fn compute_all_incremental(
 ) -> Result<()> {
     let partitions = match snapshot {
         Some(snapshot) => {
-            let result = storage::snapshot_partition_specs(
+            let layer_result = storage::snapshot_compute_layer(
                 data_dir,
                 wiki,
                 snapshot,
                 storage::GenerationLayer::Analytical,
             );
+            let layer = layer_result?;
+            let result = storage::snapshot_partition_specs(data_dir, wiki, snapshot, layer);
             result?
         }
         None => {
-            storage::active_partition_specs(data_dir, wiki, storage::GenerationLayer::Analytical)?
+            let layer_result =
+                storage::active_compute_layer(data_dir, wiki, storage::GenerationLayer::Analytical);
+            let layer = layer_result?;
+            storage::active_partition_specs(data_dir, wiki, layer)?
         }
     };
     if partitions.is_empty() {
@@ -1986,20 +1996,7 @@ pub(crate) fn compute_stage_inputs(
     if let Some(snapshot) = snapshot {
         // Resolving the fragments validates (and, for a pre-manifest
         // generation, safely migrates) the authoritative allowlist.
-        let analytical_fragments = storage::snapshot_fragment_files(
-            data_dir,
-            wiki,
-            &snapshot,
-            storage::GenerationLayer::Analytical,
-        );
-        analytical_fragments?;
-        let warehouse_fragments = storage::snapshot_fragment_files(
-            data_dir,
-            wiki,
-            &snapshot,
-            storage::GenerationLayer::Warehouse,
-        );
-        warehouse_fragments?;
+        storage::read_generation_manifest(data_dir, wiki, &snapshot)?;
         let manifest = storage::generation_manifest_path(data_dir, wiki, &snapshot)?;
         let generation_outputs = vec![fingerprint::TrackedPath::new(
             "generation-manifest",

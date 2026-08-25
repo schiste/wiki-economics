@@ -1564,5 +1564,39 @@ fn compute_patrol_reports_missing_inputs_and_executes_rebuild_lookup_and_no_pend
     assert!(wiki_output.exists());
     assert!(dashboard_output.exists());
     assert!(!output_dir.join("defaults_patrol.json").exists());
+
+    let snapshot_wiki = "snapshotwiki";
+    let snapshot = "2026-08";
+    let template = write_revision_partition(
+        &data_dir,
+        snapshot_wiki,
+        "2026-02",
+        &[(
+            Some(501),
+            Some("2026-02-01 00:00:00"),
+            Some("SnapshotUser"),
+            Some(0),
+            None,
+            false,
+            false,
+        )],
+    )?;
+    let plan =
+        crate::snapshot_plan::SnapshotPlan::load_or_resolve(&data_dir, snapshot_wiki, snapshot)?.0;
+    let source_id = &plan.sources.first().context("snapshot source")?.source_id;
+    let metric_root = storage::snapshot_metric_input_wiki_dir(&data_dir, snapshot_wiki, snapshot)?;
+    let metric_file = storage::month_partition_dir(&metric_root, 2026, "2026-02")
+        .join(format!("{source_id}.part-00000.parquet"));
+    metric_file.parent().map(fs::create_dir_all).transpose()?;
+    fs::copy(template, metric_file)?;
+    storage::write_test_generation_manifest_from_files(&data_dir, snapshot_wiki, snapshot)?;
+    assert_eq!(
+        collect_partition_files_by_month(&data_dir, snapshot_wiki, Some(snapshot))?.len(),
+        1
+    );
+    let error =
+        compute_patrol_for_snapshot(snapshot_wiki, snapshot, &data_dir, &output_dir, false, None)
+            .expect_err("snapshot patrol inputs are intentionally absent");
+    assert!(error.to_string().contains("patrol-fetch"));
     Ok(())
 }

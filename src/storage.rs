@@ -16,14 +16,15 @@ use std::num::NonZeroU64;
 
 pub const ANALYTICAL_DIRNAME: &str = "parquet";
 pub const WAREHOUSE_DIRNAME: &str = "warehouse";
+pub const METRIC_INPUT_DIRNAME: &str = "metric-input";
 const MARKERS_DIRNAME: &str = "_markers";
 const SNAPSHOTS_DIRNAME: &str = "_snapshots";
 const SNAPSHOT_STATE_DIRNAME: &str = "snapshots";
 const CURRENT_SNAPSHOT_FILENAME: &str = "current-snapshot.json";
 const GENERATION_MANIFEST_FILENAME: &str = "generation-manifest.json";
 const SNAPSHOT_POINTER_SCHEMA_VERSION: u64 = 1;
-const MARKER_SCHEMA_VERSION: u64 = 1;
-const GENERATION_MANIFEST_SCHEMA_VERSION: u64 = 1;
+const MARKER_SCHEMA_VERSION: u64 = 2;
+const GENERATION_MANIFEST_SCHEMA_VERSION: u64 = 2;
 static GENERATION_MANIFEST_TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -39,6 +40,7 @@ pub struct PartitionSpec {
 pub(crate) enum GenerationLayer {
     Analytical,
     Warehouse,
+    MetricInput,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -72,6 +74,7 @@ pub struct MarkerManifest {
     pub allow_empty: bool,
     pub analytical_paths: Vec<PathBuf>,
     pub warehouse_paths: Vec<PathBuf>,
+    pub metric_input_paths: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -85,6 +88,8 @@ struct StoredMarkerManifest {
     allow_empty: bool,
     analytical_outputs: Vec<StoredOutput>,
     warehouse_outputs: Vec<StoredOutput>,
+    #[serde(default)]
+    metric_input_outputs: Vec<StoredOutput>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -110,6 +115,10 @@ pub fn warehouse_wiki_dir(data_dir: &Path, wiki: &str) -> PathBuf {
     data_dir.join(WAREHOUSE_DIRNAME).join(wiki)
 }
 
+pub fn metric_input_wiki_dir(data_dir: &Path, wiki: &str) -> PathBuf {
+    data_dir.join(METRIC_INPUT_DIRNAME).join(wiki)
+}
+
 pub fn snapshot_analytical_wiki_dir(
     data_dir: &Path,
     wiki: &str,
@@ -128,6 +137,17 @@ pub fn snapshot_warehouse_wiki_dir(
 ) -> Result<PathBuf> {
     validate_snapshot_version(snapshot_version)?;
     Ok(warehouse_wiki_dir(data_dir, wiki)
+        .join(SNAPSHOTS_DIRNAME)
+        .join(snapshot_version))
+}
+
+pub fn snapshot_metric_input_wiki_dir(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot_version: &str,
+) -> Result<PathBuf> {
+    validate_snapshot_version(snapshot_version)?;
+    Ok(metric_input_wiki_dir(data_dir, wiki)
         .join(SNAPSHOTS_DIRNAME)
         .join(snapshot_version))
 }
@@ -212,6 +232,34 @@ pub fn active_warehouse_wiki_dir(data_dir: &Path, wiki: &str) -> Result<PathBuf>
     }
 }
 
+pub fn active_metric_input_wiki_dir(data_dir: &Path, wiki: &str) -> Result<PathBuf> {
+    match current_snapshot_version(data_dir, wiki)? {
+        Some(snapshot_version) => snapshot_metric_input_wiki_dir(data_dir, wiki, &snapshot_version),
+        None => Ok(metric_input_wiki_dir(data_dir, wiki)),
+    }
+}
+
+pub(crate) fn snapshot_layer_wiki_dir(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot_version: &str,
+    layer: GenerationLayer,
+) -> Result<PathBuf> {
+    fragment_layer_root(data_dir, wiki, snapshot_version, layer)
+}
+
+pub(crate) fn active_layer_wiki_dir(
+    data_dir: &Path,
+    wiki: &str,
+    layer: GenerationLayer,
+) -> Result<PathBuf> {
+    match layer {
+        GenerationLayer::Analytical => active_analytical_wiki_dir(data_dir, wiki),
+        GenerationLayer::Warehouse => active_warehouse_wiki_dir(data_dir, wiki),
+        GenerationLayer::MetricInput => active_metric_input_wiki_dir(data_dir, wiki),
+    }
+}
+
 fn fragment_layer_root(
     data_dir: &Path,
     wiki: &str,
@@ -223,6 +271,9 @@ fn fragment_layer_root(
             snapshot_analytical_wiki_dir(data_dir, wiki, snapshot_version)
         }
         GenerationLayer::Warehouse => snapshot_warehouse_wiki_dir(data_dir, wiki, snapshot_version),
+        GenerationLayer::MetricInput => {
+            snapshot_metric_input_wiki_dir(data_dir, wiki, snapshot_version)
+        }
     }
 }
 
@@ -292,6 +343,9 @@ pub(crate) fn write_generation_manifest(
         for output in &stored.warehouse_outputs {
             fragments.push(fragment(GenerationLayer::Warehouse, output)?);
         }
+        for output in &stored.metric_input_outputs {
+            fragments.push(fragment(GenerationLayer::MetricInput, output)?);
+        }
     }
     fragments.sort();
     ensure!(
@@ -304,8 +358,32 @@ pub(crate) fn write_generation_manifest(
         "generation manifest contains duplicate fragment paths"
     );
     let (_, source_plan_sha256) = sha256_file(&plan_path)?;
+    let metric_input_generation = fragments
+        .iter()
+        .any(|fragment| fragment.layer == GenerationLayer::MetricInput);
+    let legacy_generation = fragments.iter().any(|fragment| {
+        matches!(
+            fragment.layer,
+            GenerationLayer::Analytical | GenerationLayer::Warehouse
+        )
+    });
+    ensure!(
+        metric_input_generation != legacy_generation,
+        "generation must use exactly one storage layout"
+    );
+    ensure!(
+        metric_input_generation
+            || fragments
+                .iter()
+                .any(|fragment| fragment.layer == GenerationLayer::Analytical),
+        "generation contains no supported metric input fragments"
+    );
     let manifest = GenerationManifest {
-        schema_version: GENERATION_MANIFEST_SCHEMA_VERSION,
+        schema_version: if metric_input_generation {
+            GENERATION_MANIFEST_SCHEMA_VERSION
+        } else {
+            1
+        },
         wiki: wiki.to_string(),
         snapshot_version: snapshot_version.to_string(),
         source_plan_sha256,
@@ -352,7 +430,10 @@ fn validate_generation_manifest(
     manifest: &GenerationManifest,
 ) -> Result<()> {
     ensure!(
-        manifest.schema_version == GENERATION_MANIFEST_SCHEMA_VERSION,
+        matches!(
+            manifest.schema_version,
+            1 | GENERATION_MANIFEST_SCHEMA_VERSION
+        ),
         "unsupported generation manifest schema"
     );
     ensure!(
@@ -381,6 +462,7 @@ fn validate_generation_manifest(
         .collect();
     let mut analytical_sources = BTreeSet::new();
     let mut warehouse_sources = BTreeSet::new();
+    let mut metric_input_sources = BTreeSet::new();
     let mut fragment_paths = BTreeSet::new();
     for fragment in &manifest.fragments {
         ensure!(
@@ -412,12 +494,26 @@ fn validate_generation_manifest(
         match fragment.layer {
             GenerationLayer::Analytical => analytical_sources.insert(fragment.source_id.as_str()),
             GenerationLayer::Warehouse => warehouse_sources.insert(fragment.source_id.as_str()),
+            GenerationLayer::MetricInput => {
+                metric_input_sources.insert(fragment.source_id.as_str())
+            }
         };
     }
-    ensure!(
-        analytical_sources == expected_sources && warehouse_sources == expected_sources,
-        "generation manifest does not cover every planned source in both layers"
-    );
+    if manifest.schema_version == 1 {
+        ensure!(
+            analytical_sources == expected_sources
+                && warehouse_sources == expected_sources
+                && metric_input_sources.is_empty(),
+            "schema-v1 generation does not cover every planned source in both legacy layers"
+        );
+    } else {
+        ensure!(
+            metric_input_sources == expected_sources
+                && analytical_sources.is_empty()
+                && warehouse_sources.is_empty(),
+            "schema-v2 generation must contain exactly one metric-input layer"
+        );
+    }
     Ok(())
 }
 
@@ -459,6 +555,7 @@ pub(crate) fn active_fragment_files(
         let root = match layer {
             GenerationLayer::Analytical => analytical_wiki_dir(data_dir, wiki),
             GenerationLayer::Warehouse => warehouse_wiki_dir(data_dir, wiki),
+            GenerationLayer::MetricInput => metric_input_wiki_dir(data_dir, wiki),
         };
         return collect_parquet_files(&root);
     };
@@ -486,16 +583,50 @@ pub(crate) fn snapshot_fragment_files(
         .collect()
 }
 
+/// Select the single authoritative compute layer while retaining read
+/// compatibility with immutable schema-v1 generations.
+pub(crate) fn snapshot_compute_layer(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot_version: &str,
+    legacy_layer: GenerationLayer,
+) -> Result<GenerationLayer> {
+    let manifest = read_generation_manifest(data_dir, wiki, snapshot_version)?;
+    Ok(
+        if manifest.schema_version == GENERATION_MANIFEST_SCHEMA_VERSION {
+            GenerationLayer::MetricInput
+        } else {
+            legacy_layer
+        },
+    )
+}
+
+pub(crate) fn active_compute_layer(
+    data_dir: &Path,
+    wiki: &str,
+    legacy_layer: GenerationLayer,
+) -> Result<GenerationLayer> {
+    match current_snapshot_version(data_dir, wiki)? {
+        Some(snapshot) => snapshot_compute_layer(data_dir, wiki, &snapshot, legacy_layer),
+        None => Ok(legacy_layer),
+    }
+}
+
 pub fn publish_current_snapshot(data_dir: &Path, wiki: &str, snapshot_version: &str) -> Result<()> {
     validate_snapshot_version(snapshot_version)?;
-    let analytical = snapshot_analytical_wiki_dir(data_dir, wiki, snapshot_version)?;
-    let warehouse = snapshot_warehouse_wiki_dir(data_dir, wiki, snapshot_version)?;
-    ensure!(
-        analytical.is_dir() && warehouse.is_dir(),
-        "cannot publish incomplete snapshot {snapshot_version} for {wiki}"
-    );
-    read_generation_manifest(data_dir, wiki, snapshot_version)
+    let manifest = read_generation_manifest(data_dir, wiki, snapshot_version)
         .context("cannot publish snapshot without a valid generation manifest")?;
+    let required_layers: BTreeSet<_> = manifest
+        .fragments
+        .iter()
+        .map(|fragment| fragment.layer)
+        .collect();
+    for layer in required_layers {
+        ensure!(
+            fragment_layer_root(data_dir, wiki, snapshot_version, layer)?.is_dir(),
+            "cannot publish incomplete snapshot {snapshot_version} for {wiki}"
+        );
+    }
 
     write_current_snapshot_pointer(data_dir, wiki, snapshot_version)
 }
@@ -591,17 +722,32 @@ pub(crate) fn write_test_generation_manifest_from_files(
     .expect("test analytical generation should resolve");
     let warehouse_root =
         fragment_layer_root(data_dir, wiki, snapshot_version, GenerationLayer::Warehouse)?;
+    let metric_input_root_result = fragment_layer_root(
+        data_dir,
+        wiki,
+        snapshot_version,
+        GenerationLayer::MetricInput,
+    );
+    let metric_input_root = metric_input_root_result?;
     let existing_analytical = collect_parquet_files(&analytical_root)?;
     let existing_warehouse = collect_parquet_files(&warehouse_root)?;
-    let template = existing_analytical
+    let existing_metric_input = collect_parquet_files(&metric_input_root)?;
+    let metric_input_generation = !existing_metric_input.is_empty();
+    let template = existing_metric_input
         .first()
+        .or_else(|| existing_analytical.first())
         .or_else(|| existing_warehouse.first())
         .context("test generation has no Parquet template")?;
     let mut empty_template = ParquetReader::new(File::open(template)?)
         .with_slice(Some((0, 0)))
         .finish()?;
     let mut fragments = Vec::new();
-    for layer in [GenerationLayer::Analytical, GenerationLayer::Warehouse] {
+    let layers: &[GenerationLayer] = if metric_input_generation {
+        &[GenerationLayer::MetricInput]
+    } else {
+        &[GenerationLayer::Analytical, GenerationLayer::Warehouse]
+    };
+    for &layer in layers {
         let root = fragment_layer_root(data_dir, wiki, snapshot_version, layer)?;
         let mut files = collect_parquet_files(&root)?;
         if files.is_empty() {
@@ -652,7 +798,7 @@ pub(crate) fn write_test_generation_manifest_from_files(
     fragments.sort();
     let (_, source_plan_sha256) = sha256_file(&plan_path)?;
     let manifest = GenerationManifest {
-        schema_version: GENERATION_MANIFEST_SCHEMA_VERSION,
+        schema_version: if metric_input_generation { 2 } else { 1 },
         wiki: wiki.to_string(),
         snapshot_version: snapshot_version.to_string(),
         source_plan_sha256,
@@ -714,8 +860,9 @@ pub(crate) fn validate_snapshot_generation(
         .collect();
     let analytical = snapshot_analytical_wiki_dir(data_dir, wiki, snapshot_version)?;
     let warehouse = snapshot_warehouse_wiki_dir(data_dir, wiki, snapshot_version)?;
+    let metric_input = snapshot_metric_input_wiki_dir(data_dir, wiki, snapshot_version)?;
     ensure!(
-        analytical.is_dir() && warehouse.is_dir(),
+        analytical.is_dir() && (warehouse.is_dir() || metric_input.is_dir()),
         "cannot repair incomplete snapshot {snapshot_version} for {wiki}"
     );
     let markers = analytical.join(MARKERS_DIRNAME);
@@ -727,6 +874,7 @@ pub(crate) fn validate_snapshot_generation(
     let mut actual_source_ids = std::collections::BTreeSet::new();
     let mut analytical_allowlist = std::collections::BTreeSet::new();
     let mut warehouse_allowlist = std::collections::BTreeSet::new();
+    let mut metric_input_allowlist = std::collections::BTreeSet::new();
     for entry in fs::read_dir(&markers)? {
         let entry = entry?;
         ensure!(
@@ -759,6 +907,9 @@ pub(crate) fn validate_snapshot_generation(
         for output in stored.warehouse_outputs {
             warehouse_allowlist.insert(checked_stored_path(data_dir, &output.path)?);
         }
+        for output in stored.metric_input_outputs {
+            metric_input_allowlist.insert(checked_stored_path(data_dir, &output.path)?);
+        }
         marker_count += 1;
     }
     ensure!(marker_count > 0, "snapshot marker inventory is empty");
@@ -770,8 +921,12 @@ pub(crate) fn validate_snapshot_generation(
         collect_parquet_files(&analytical)?.into_iter().collect();
     let actual_warehouse: std::collections::BTreeSet<_> =
         collect_parquet_files(&warehouse)?.into_iter().collect();
+    let actual_metric_input: std::collections::BTreeSet<_> =
+        collect_parquet_files(&metric_input)?.into_iter().collect();
     ensure!(
-        actual_analytical == analytical_allowlist && actual_warehouse == warehouse_allowlist,
+        actual_analytical == analytical_allowlist
+            && actual_warehouse == warehouse_allowlist
+            && actual_metric_input == metric_input_allowlist,
         "snapshot marker inventory does not exactly account for generation Parquet files"
     );
     Ok(marker_count)
@@ -785,8 +940,12 @@ pub fn retire_inactive_snapshots(data_dir: &Path, wiki: &str) -> Result<usize> {
     for layer_root in [
         analytical_wiki_dir(data_dir, wiki),
         warehouse_wiki_dir(data_dir, wiki),
+        metric_input_wiki_dir(data_dir, wiki),
     ] {
         let snapshots_root = layer_root.join(SNAPSHOTS_DIRNAME);
+        if !snapshots_root.is_dir() {
+            continue;
+        }
         for entry in fs::read_dir(&snapshots_root)? {
             let entry = entry?;
             if entry.file_type()?.is_dir() && entry.file_name() != active.as_str() {
@@ -832,6 +991,7 @@ pub(crate) fn clean_stale_inactive_snapshots(
     let layer_roots = [
         analytical_wiki_dir(data_dir, wiki).join(SNAPSHOTS_DIRNAME),
         warehouse_wiki_dir(data_dir, wiki).join(SNAPSHOTS_DIRNAME),
+        metric_input_wiki_dir(data_dir, wiki).join(SNAPSHOTS_DIRNAME),
     ];
     let mut versions = std::collections::BTreeSet::new();
     for root in &layer_roots {
@@ -954,6 +1114,7 @@ pub fn write_test_marker_in(
             allow_empty: false,
             analytical_paths: vec![paths[0].clone()],
             warehouse_paths: vec![paths[1].clone()],
+            metric_input_paths: Vec::new(),
         },
     )
 }
@@ -1029,15 +1190,29 @@ fn write_marker_manifest_internal(
     let analytical_outputs = stored_outputs(data_dir, analytical_root, &manifest.analytical_paths)?;
     let warehouse_root = data_dir.join(WAREHOUSE_DIRNAME).join(analytical_suffix);
     let warehouse_outputs = stored_outputs(data_dir, &warehouse_root, &manifest.warehouse_paths)?;
+    let metric_input_root = data_dir.join(METRIC_INPUT_DIRNAME).join(
+        analytical_root
+            .strip_prefix(data_dir.join(ANALYTICAL_DIRNAME))
+            .context("analytical marker root is outside the data directory")?,
+    );
+    let metric_input_outputs =
+        stored_outputs(data_dir, &metric_input_root, &manifest.metric_input_paths)?;
     ensure_output_totals(
         source_id,
         manifest.rows,
         &analytical_outputs,
         &warehouse_outputs,
+        &metric_input_outputs,
     )?;
     if remove_unexpected {
         remove_unexpected_source_outputs(analytical_root, source_id, &manifest.analytical_paths)?;
         remove_unexpected_source_outputs(&warehouse_root, source_id, &manifest.warehouse_paths)?;
+        let metric_cleanup = remove_unexpected_source_outputs(
+            &metric_input_root,
+            source_id,
+            &manifest.metric_input_paths,
+        );
+        metric_cleanup?;
     }
     let source = relative_path(data_dir, &manifest.source)?;
     let stored = StoredMarkerManifest {
@@ -1053,6 +1228,7 @@ fn write_marker_manifest_internal(
         allow_empty: manifest.allow_empty,
         analytical_outputs,
         warehouse_outputs,
+        metric_input_outputs,
     };
     let mut bytes = serde_json::to_vec_pretty(&stored)?;
     bytes.push(b'\n');
@@ -1113,15 +1289,27 @@ fn ensure_output_totals(
     expected_rows: usize,
     analytical: &[StoredOutput],
     warehouse: &[StoredOutput],
+    metric_input: &[StoredOutput],
 ) -> Result<()> {
-    if expected_rows > 0 {
-        ensure!(
-            !analytical.is_empty() && !warehouse.is_empty(),
-            "source {source_id} has rows but is missing an output layer"
-        );
-    }
+    let uses_legacy_layers = !analytical.is_empty() || !warehouse.is_empty();
+    let uses_metric_input = !metric_input.is_empty();
+    ensure!(
+        expected_rows == 0
+            || (uses_legacy_layers && !uses_metric_input)
+            || (!uses_legacy_layers && uses_metric_input),
+        "source {source_id} must use exactly one storage layout"
+    );
+    ensure!(
+        !uses_legacy_layers || (!analytical.is_empty() && !warehouse.is_empty()),
+        "source {source_id} has an incomplete legacy output layout"
+    );
     let expected_rows = u64::try_from(expected_rows)?;
-    for (layer, outputs) in [("analytical", analytical), ("warehouse", warehouse)] {
+    let layers: &[(&str, &[StoredOutput])] = if uses_metric_input {
+        &[("metric_input", metric_input)]
+    } else {
+        &[("analytical", analytical), ("warehouse", warehouse)]
+    };
+    for (layer, outputs) in layers {
         let actual = outputs.iter().try_fold(0_u64, |total, output| {
             total
                 .checked_add(output.rows)
@@ -1456,7 +1644,7 @@ pub(crate) fn read_marker_manifest_in(
     let stored: StoredMarkerManifest = serde_json::from_slice(&fs::read(&marker)?)
         .with_context(|| format!("invalid ingest marker JSON in {}", marker.display()))?;
     ensure!(
-        stored.schema_version == MARKER_SCHEMA_VERSION,
+        matches!(stored.schema_version, 1 | MARKER_SCHEMA_VERSION),
         "unsupported ingest marker schema in {}",
         marker.display()
     );
@@ -1481,6 +1669,11 @@ pub(crate) fn read_marker_manifest_in(
             .collect::<Result<_>>()?,
         warehouse_paths: stored
             .warehouse_outputs
+            .iter()
+            .map(|output| checked_stored_path(data_dir, &output.path))
+            .collect::<Result<_>>()?,
+        metric_input_paths: stored
+            .metric_input_outputs
             .iter()
             .map(|output| checked_stored_path(data_dir, &output.path))
             .collect::<Result<_>>()?,
@@ -1516,7 +1709,8 @@ pub fn marker_manifest_is_valid_in(
             return Ok(false);
         }
     };
-    if stored.schema_version != MARKER_SCHEMA_VERSION || stored.source_id != source_id {
+    if !matches!(stored.schema_version, 1 | MARKER_SCHEMA_VERSION) || stored.source_id != source_id
+    {
         return Ok(false);
     }
     let Ok((expected_snapshot, analytical_suffix)) =
@@ -1557,23 +1751,53 @@ pub fn marker_manifest_is_valid_in(
             return Ok(false);
         }
     }
-    let warehouse_root = data_dir.join(WAREHOUSE_DIRNAME).join(analytical_suffix);
+    let warehouse_root = data_dir.join(WAREHOUSE_DIRNAME).join(&analytical_suffix);
+    let metric_input_root = data_dir.join(METRIC_INPUT_DIRNAME).join(&analytical_suffix);
     let require_exact_source_inventory = stored.snapshot_version.is_none();
-    if !validate_stored_outputs(
-        data_dir,
-        analytical_root,
-        source_id,
-        stored.rows,
-        &stored.analytical_outputs,
-        require_exact_source_inventory,
-    ) || !validate_stored_outputs(
-        data_dir,
-        &warehouse_root,
-        source_id,
-        stored.rows,
-        &stored.warehouse_outputs,
-        require_exact_source_inventory,
-    ) {
+    let legacy_layout =
+        !stored.analytical_outputs.is_empty() || !stored.warehouse_outputs.is_empty();
+    let metric_input_layout = !stored.metric_input_outputs.is_empty();
+    if stored.schema_version == 1 && metric_input_layout {
+        return Ok(false);
+    }
+    if stored.rows > 0
+        && (legacy_layout == metric_input_layout
+            || (legacy_layout
+                && (stored.analytical_outputs.is_empty() || stored.warehouse_outputs.is_empty())))
+    {
+        return Ok(false);
+    }
+    let outputs_valid = if metric_input_layout {
+        stored.analytical_outputs.is_empty()
+            && stored.warehouse_outputs.is_empty()
+            && validate_stored_outputs(
+                data_dir,
+                &metric_input_root,
+                source_id,
+                stored.rows,
+                &stored.metric_input_outputs,
+                require_exact_source_inventory,
+            )
+    } else {
+        stored.metric_input_outputs.is_empty()
+            && validate_stored_outputs(
+                data_dir,
+                analytical_root,
+                source_id,
+                stored.rows,
+                &stored.analytical_outputs,
+                require_exact_source_inventory,
+            )
+            && validate_stored_outputs(
+                data_dir,
+                &warehouse_root,
+                source_id,
+                stored.rows,
+                &stored.warehouse_outputs,
+                require_exact_source_inventory,
+            )
+    };
+    if !outputs_valid {
         return Ok(false);
     }
     Ok(true)
@@ -1730,10 +1954,7 @@ pub(crate) fn active_partition_specs(
     wiki: &str,
     layer: GenerationLayer,
 ) -> Result<Vec<PartitionSpec>> {
-    let root = match layer {
-        GenerationLayer::Analytical => active_analytical_wiki_dir(data_dir, wiki)?,
-        GenerationLayer::Warehouse => active_warehouse_wiki_dir(data_dir, wiki)?,
-    };
+    let root = active_layer_wiki_dir(data_dir, wiki, layer)?;
     if current_snapshot_version(data_dir, wiki)?.is_none() {
         return collect_partition_specs(&root);
     }
@@ -1952,6 +2173,7 @@ mod tests {
             allow_empty: rows == 0,
             analytical_paths: paths.first().cloned().into_iter().collect(),
             warehouse_paths: paths.get(1).cloned().into_iter().collect(),
+            metric_input_paths: Vec::new(),
         })
     }
 
@@ -2118,6 +2340,12 @@ mod tests {
         assert!(manifest.fragments.iter().all(|fragment| {
             fragment.bytes > 0 && fragment.sha256.len() == 64 && fragment.rows == 1
         }));
+
+        let mut unsupported: Value = serde_json::from_slice(&first_bytes)?;
+        unsupported["schema_version"] = json!(3);
+        fs::write(&manifest_path, serde_json::to_vec(&unsupported)?)?;
+        assert!(read_generation_manifest(data.path(), wiki, snapshot).is_err());
+        fs::write(&manifest_path, &first_bytes)?;
 
         publish_current_snapshot(data.path(), wiki, snapshot)?;
         fs::write(&manifest_path, b"{}\n")?;
@@ -2338,7 +2566,7 @@ mod tests {
         let original = fs::read(&marker)?;
 
         let mutations: Vec<MarkerMutation> = vec![
-            Box::new(|value| value["schema_version"] = json!(2)),
+            Box::new(|value| value["schema_version"] = json!(3)),
             Box::new(|value| value["source_id"] = json!("different")),
             Box::new(|value| value["snapshot_version"] = json!("2026-13")),
             Box::new(|value| value["source"]["path"] = json!("raw/frwiki/different.tsv.bz2")),
@@ -2522,7 +2750,7 @@ mod tests {
         let marker = write_marker_manifest(root, "frwiki", "source", &manifest)?;
         let original = fs::read(&marker)?;
         let mutations: [fn(&mut Value); 3] = [
-            |value: &mut Value| value["schema_version"] = json!(2),
+            |value: &mut Value| value["schema_version"] = json!(3),
             |value: &mut Value| value["source_id"] = json!("other"),
             |value: &mut Value| value["snapshot_version"] = json!("2026-99"),
         ];
@@ -2587,6 +2815,70 @@ mod tests {
         manifest.warehouse_paths.clear();
         assert!(write_marker_manifest(root, "frwiki", "source", &manifest).is_err());
         assert!(!marker_manifest_is_valid(root, "frwiki", "source")?);
+        Ok(())
+    }
+
+    #[test]
+    fn unversioned_metric_input_helpers_and_marker_contract_are_strict() -> Result<()> {
+        let temp_dir = TestDir::new()?;
+        let root = temp_dir.path();
+        let wiki = "metricwiki";
+        let source_id = "source";
+        let source = root.join("raw/metricwiki/source.tsv.bz2");
+        source.parent().map(fs::create_dir_all).transpose()?;
+        fs::write(&source, b"metric-input-source")?;
+
+        let metric_root = metric_input_wiki_dir(root, wiki);
+        let output =
+            month_partition_dir(&metric_root, 2026, "2026-01").join("source.part-00000.parquet");
+        output.parent().map(fs::create_dir_all).transpose()?;
+        let mut frame = df!("row" => &[1_i64])?;
+        ParquetWriter::new(File::create(&output)?).finish(&mut frame)?;
+        let (source_size_bytes, source_sha256) = sha256_file(&source)?;
+        let marker_result = write_marker_manifest_in(
+            root,
+            &analytical_wiki_dir(root, wiki),
+            source_id,
+            &MarkerManifest {
+                snapshot_version: None,
+                source,
+                source_size_bytes,
+                source_sha256,
+                rows: 1,
+                allow_empty: false,
+                analytical_paths: Vec::new(),
+                warehouse_paths: Vec::new(),
+                metric_input_paths: vec![output.clone()],
+            },
+        );
+        let marker = marker_result?;
+        let valid_result =
+            marker_manifest_is_valid_in(root, &analytical_wiki_dir(root, wiki), source_id);
+        assert!(valid_result?);
+        assert_eq!(active_metric_input_wiki_dir(root, wiki)?, metric_root);
+        assert_eq!(
+            active_fragment_files(root, wiki, GenerationLayer::MetricInput)?,
+            vec![output]
+        );
+        assert_eq!(
+            active_partition_specs(root, wiki, GenerationLayer::MetricInput)?.len(),
+            1
+        );
+        assert!(!validate_stored_outputs(
+            root,
+            &metric_root,
+            source_id,
+            1,
+            &[],
+            true
+        ));
+
+        let mut value: Value = serde_json::from_slice(&fs::read(&marker)?)?;
+        value["schema_version"] = json!(1);
+        fs::write(&marker, serde_json::to_vec(&value)?)?;
+        let downgraded_result =
+            marker_manifest_is_valid_in(root, &analytical_wiki_dir(root, wiki), source_id);
+        assert!(!downgraded_result?);
         Ok(())
     }
 }

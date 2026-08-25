@@ -278,6 +278,15 @@ fn snapshot_rollover_computes_only_the_new_generation() -> Result<()> {
         ],
     )?;
     ingest::ingest_wiki_snapshot("tinywiki", "2026-07", &data_dir)?;
+    let july_manifest = storage::read_generation_manifest(&data_dir, "tinywiki", "2026-07")?;
+    assert_eq!(july_manifest.schema_version, 2);
+    assert!(
+        july_manifest
+            .fragments
+            .iter()
+            .all(|fragment| fragment.layer == storage::GenerationLayer::MetricInput),
+        "new snapshot generations must contain only the qualified metric-input layer"
+    );
     assert_eq!(
         storage::current_snapshot_version(&data_dir, "tinywiki")?.as_deref(),
         Some("2026-07")
@@ -300,10 +309,10 @@ fn snapshot_rollover_computes_only_the_new_generation() -> Result<()> {
         Some("2026-08")
     );
     assert!(
-        storage::snapshot_warehouse_wiki_dir(&data_dir, "tinywiki", "2026-07")?.exists(),
+        storage::snapshot_metric_input_wiki_dir(&data_dir, "tinywiki", "2026-07")?.exists(),
         "the previous generation remains available until publication succeeds"
     );
-    compute::compute_all("tinywiki", &data_dir, &output_dir)?;
+    compute::compute_all_for_snapshot("tinywiki", "2026-08", &data_dir, &output_dir)?;
 
     let weekly = read_parquet(&output_dir.join("tinywiki/page_weekly_edits.parquet"))?;
     let total_edits: u32 = weekly.column("edits")?.u32()?.into_no_null_iter().sum();
@@ -317,7 +326,7 @@ fn snapshot_rollover_computes_only_the_new_generation() -> Result<()> {
         storage::retire_inactive_snapshots(&data_dir, "tinywiki")?,
         3
     );
-    assert!(!storage::snapshot_warehouse_wiki_dir(&data_dir, "tinywiki", "2026-07")?.exists());
-    assert!(storage::snapshot_warehouse_wiki_dir(&data_dir, "tinywiki", "2026-08")?.exists());
+    assert!(!storage::snapshot_metric_input_wiki_dir(&data_dir, "tinywiki", "2026-07")?.exists());
+    assert!(storage::snapshot_metric_input_wiki_dir(&data_dir, "tinywiki", "2026-08")?.exists());
     Ok(())
 }

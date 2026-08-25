@@ -655,6 +655,7 @@ mod tests {
                 allow_empty: false,
                 analytical_paths: vec![paths[0].clone()],
                 warehouse_paths: vec![paths[1].clone()],
+                metric_input_paths: Vec::new(),
             },
         )
         .expect("strict fixture marker should be writable");
