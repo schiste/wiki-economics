@@ -41,7 +41,6 @@ for required in \
   defaults_gdp.json \
   defaults_inequality.json \
   defaults_labor.json \
-  defaults_overview.json \
   defaults_patrol.json \
   meta_business.json \
   meta_gdp.json \
@@ -64,7 +63,7 @@ do
   fi
 done
 
-for page in index.html business.html gdp.html inequality.html labor.html patrol.html; do
+for page in business.html gdp.html inequality.html labor.html patrol.html; do
   if [ ! -f "$site_release/$page" ]; then
     echo "Site build is missing required page: $site_release/$page" >&2
     exit 1

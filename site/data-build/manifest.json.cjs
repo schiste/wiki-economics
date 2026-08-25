@@ -12,7 +12,7 @@ const CORE_METRICS = [
 const PARTITION_ONLY_METRICS = new Set(["page_weekly_edits"]);
 const PUBLIC_JSON_ARTIFACTS = [
   "defaults_business", "defaults_edit_variation", "defaults_gdp",
-  "defaults_inequality", "defaults_labor", "defaults_overview", "defaults_patrol",
+  "defaults_inequality", "defaults_labor", "defaults_patrol",
   "meta_business", "meta_gdp", "meta_inequality", "meta_labor", "meta_patrol",
 ];
 const ARTIFACT_LICENSE_SPDX = "MIT";

@@ -119,7 +119,7 @@ html[data-theme="light"] {
    Framework's default layout only approximates a sticky footer: it gives
    #observablehq-main a min-height of `100vh - 20rem` and hopes that's
    roughly the height of the header/footer chrome. On short pages (the
-   landing page, Edit Variation, Legal) that heuristic falls short on
+   short dashboards such as Edit Variation and Legal) that heuristic falls short on
    taller viewports, leaving the footer stranded mid-page with blank
    space beneath it instead of pinned to the bottom of the screen. Turn
    body into a real flex column so the footer always lands at the
@@ -933,14 +933,6 @@ body.wk-loading .wk-progress-status {
 .note strong {
   color: var(--wk-text-primary, var(--theme-foreground));
   font-weight: 600;
-}
-
-/* Row-level flag for data that has fallen behind other rows in the same
-   table (e.g. a wiki whose import cutoff lags the rest). Unused until a
-   caller opts a row in -- see site/src/index.md. */
-.wk-stale-row {
-  background: color-mix(in srgb, var(--wk-amber) 12%, transparent);
-  box-shadow: inset 3px 0 0 var(--wk-amber);
 }
 
 /* ── Methodology collapsibles ───────────────────────────── */

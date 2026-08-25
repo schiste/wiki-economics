@@ -37,6 +37,8 @@ const DATA_DIR = resolveConfiguredPath("WIKI_ECON_DATA_DIR", "data");
 const OUTPUT_DIR = resolveConfiguredPath("WIKI_ECON_OUTPUT_DIR", "output");
 const GENERATOR_DIR = resolveConfiguredPath("WIKI_ECON_GENERATOR_DIR", path.join("site", "data-build"));
 const SITE_DIST_DIR = resolveConfiguredPath("WIKI_ECON_SITE_DIST_DIR", path.join("site", "dist"));
+const DEFAULT_DASHBOARD_PATH = "/inequality?wiki=all&types=registered&gran=year&start=2001-06&end=2026-08";
+const RETIRED_HOME_PATHS = new Set(["/", "/index", "/index.html"]);
 const DEFAULT_RUNNER = {
   program: "cargo",
   args: ["run", "--release", "--"],
@@ -1063,6 +1065,11 @@ async function handleRequest(req, res) {
 
   const url = new URL(req.url, `http://localhost:${PORT}`);
   const session = AUTH_ENABLED ? readSession(req) : null;
+
+  if ((req.method === "GET" || req.method === "HEAD") && RETIRED_HOME_PATHS.has(url.pathname)) {
+    redirect(res, DEFAULT_DASHBOARD_PATH);
+    return;
+  }
 
   if (req.method === "GET" && url.pathname === FRESHNESS_STATUS_PATH) {
     writeJson(res, 200, evaluateFreshness({...readRefreshStatus(), lifecycle: WIKI_LIFECYCLE}));

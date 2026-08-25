@@ -37,7 +37,7 @@ fs.writeFileSync(path.join(outputDir, "browser-data-index.json"), JSON.stringify
     file: "browser-data/gdp/nlwiki.parquet", rows: 1, bytes: browserBytes, sha256: browserSha256}],
 }));
 fs.mkdirSync(distDir, {recursive: true});
-fs.writeFileSync(path.join(distDir, "index.html"), "old release\n");
+fs.writeFileSync(path.join(distDir, "inequality.html"), "old release\n");
 fs.copyFileSync(
   path.join(repoRoot, "deploy", "toolforge", "run-record.cjs"),
   path.join(fakeRoot, "deploy", "toolforge", "run-record.cjs"),
@@ -52,7 +52,7 @@ if [ -n "\${FAKE_NPM_LOG:-}" ]; then
   printf '%s\n' "$*" >> "$FAKE_NPM_LOG"
 fi
 mkdir -p "$WIKI_ECON_SITE_DIST_DIR"
-printf 'new release\\n' > "$WIKI_ECON_SITE_DIST_DIR/index.html"
+printf 'new release\\n' > "$WIKI_ECON_SITE_DIST_DIR/inequality.html"
 if [ "\${FAKE_BUILD_FAIL:-0}" = 1 ]; then
   exit 1
 fi
@@ -95,7 +95,7 @@ test("site builds are switched atomically and failed staging is discarded", () =
   assert.equal(fs.lstatSync(distDir).isSymbolicLink(), true);
   const firstTarget = fs.readlinkSync(distDir);
   assert.match(firstTarget, /^\.site-dist\.build\./);
-  assert.equal(fs.readFileSync(path.join(distDir, "index.html"), "utf8"), "new release\n");
+  assert.equal(fs.readFileSync(path.join(distDir, "inequality.html"), "utf8"), "new release\n");
 
   const second = runBuild();
   assertBuildSucceeded(second);

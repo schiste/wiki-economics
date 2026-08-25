@@ -496,7 +496,6 @@ for required in \
   defaults_gdp.json \
   defaults_inequality.json \
   defaults_labor.json \
-  defaults_overview.json \
   defaults_patrol.json \
   defaults_edit_variation.json \
   business_funnel.parquet \
@@ -520,7 +519,7 @@ do
   fi
 done
 
-for page in index.html business.html gdp.html inequality.html labor.html patrol.html edit-variation.html; do
+for page in business.html gdp.html inequality.html labor.html patrol.html edit-variation.html; do
   if [ ! -f "$WIKI_ECON_SITE_DIST_DIR/$page" ]; then
     REFRESH_FAILURE_STAGE=artifact_check
     REFRESH_FAILURE_ERROR="published site page is missing: $page"

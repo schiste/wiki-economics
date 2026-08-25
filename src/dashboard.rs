@@ -14,13 +14,12 @@ use crate::{licensing, storage};
 const LARGE_METRIC_BATCH_ROWS: usize = 250_000;
 const ALL_WIKIS_SCOPE: &str = "all";
 
-pub const ARTIFACTS: [&str; 12] = [
+pub const ARTIFACTS: [&str; 11] = [
     "defaults_business.json",
     "defaults_edit_variation.json",
     "defaults_gdp.json",
     "defaults_inequality.json",
     "defaults_labor.json",
-    "defaults_overview.json",
     "defaults_patrol.json",
     "meta_business.json",
     "meta_gdp.json",
@@ -93,7 +92,6 @@ pub fn materialize(output_dir: &Path) -> Result<()> {
     let (defaults_business, meta_business) = business_artifacts(&frames)?;
     let (defaults_inequality, meta_inequality) = inequality_artifacts(&frames)?;
     let (defaults_patrol, meta_patrol) = patrol_artifacts(&frames)?;
-    let defaults_overview = overview_artifacts(&frames)?;
 
     artifacts.insert("defaults_business.json", defaults_business);
     artifacts.insert(
@@ -103,7 +101,6 @@ pub fn materialize(output_dir: &Path) -> Result<()> {
     artifacts.insert("defaults_gdp.json", defaults_gdp);
     artifacts.insert("defaults_inequality.json", defaults_inequality);
     artifacts.insert("defaults_labor.json", defaults_labor);
-    artifacts.insert("defaults_overview.json", defaults_overview);
     artifacts.insert("defaults_patrol.json", defaults_patrol);
     artifacts.insert("meta_business.json", meta_business);
     artifacts.insert("meta_gdp.json", meta_gdp);
@@ -116,7 +113,15 @@ pub fn materialize(output_dir: &Path) -> Result<()> {
             && ARTIFACTS.iter().all(|name| artifacts.contains_key(name)),
         "Rust dashboard generator did not produce the complete artifact set"
     );
-    publish_json_set(output_dir, &artifacts)
+    publish_json_set(output_dir, &artifacts)?;
+    let retired = output_dir.join("defaults_overview.json");
+    if retired.is_file() {
+        fs::remove_file(&retired).with_context(|| {
+            format!("failed to retire dashboard artifact {}", retired.display())
+        })?;
+        File::open(output_dir)?.sync_all()?;
+    }
+    Ok(())
 }
 
 impl Frames {
@@ -393,109 +398,6 @@ fn selected_month_row(df: &DataFrame, row: usize, wiki: &str, max_month: &str) -
 
 fn selected_wiki_row(df: &DataFrame, row: usize, wiki: &str) -> Result<bool> {
     Ok(wiki == ALL_WIKIS_SCOPE || string(df, "wiki", row)?.as_deref() == Some(wiki))
-}
-
-/// Global landing-page snapshot: content-production totals summed across every
-/// published wiki, plus a per-wiki breakdown for deep-linking into `/gdp`.
-fn overview_artifacts(frames: &Frames) -> Result<Value> {
-    let meta = common_meta(&frames.gdp, None)?;
-    overview_from_gdp(&frames.gdp, &meta)
-}
-
-fn overview_row_in_range(df: &DataFrame, row: usize, max_month: &str) -> Result<bool> {
-    Ok(string(df, "wiki", row)?.is_some()
-        && string(df, "year_month", row)?.is_some_and(|month| month.as_str() <= max_month))
-}
-
-fn overview_from_gdp(gdp: &DataFrame, meta: &CommonMeta) -> Result<Value> {
-    let mut trend: BTreeMap<String, [f64; 5]> = BTreeMap::new();
-    let mut by_wiki_month: BTreeMap<(String, String), [f64; 5]> = BTreeMap::new();
-
-    for row in 0..gdp.height() {
-        if !overview_row_in_range(gdp, row, &meta.max_month)? {
-            continue;
-        }
-        let wiki = string(gdp, "wiki", row)?.context("gdp wiki is null")?;
-        let month = string(gdp, "year_month", row)?.context("gdp month is null")?;
-        let Some(namespace) = integer(gdp, "page_namespace", row)? else {
-            continue;
-        };
-        let user_type = string(gdp, "user_type", row)?.context("gdp user type is null")?;
-        if namespace != 0 || user_type != "registered" {
-            continue;
-        }
-
-        let period = year(&month)?;
-        let trend_entry = trend.entry(period).or_default();
-        let wiki_entry = by_wiki_month.entry((wiki, month)).or_default();
-        for (index, column) in [
-            "gross_bytes_added",
-            "net_bytes",
-            "total_edits",
-            "reverted_edits",
-            "unique_editors",
-        ]
-        .iter()
-        .enumerate()
-        {
-            let value = float(gdp, column, row)?.unwrap_or_default();
-            trend_entry[index] += value;
-            wiki_entry[index] += value;
-        }
-    }
-
-    // Wikis currently reach the dashboard on different schedules (see
-    // config/wiki-lifecycle.json): some refresh live, others are frozen at an
-    // import cutoff. Rather than collapsing that into one global "as of"
-    // month -- which would either hide stale wikis behind a fresher headline
-    // or drag the headline down to the stalest wiki -- each row below reports
-    // the wiki's own latest available month, so the gap stays visible.
-    let mut latest_by_wiki: BTreeMap<String, String> = BTreeMap::new();
-    for (wiki, month) in by_wiki_month.keys() {
-        latest_by_wiki
-            .entry(wiki.clone())
-            .and_modify(|current: &mut String| {
-                if *month > *current {
-                    *current = month.clone();
-                }
-            })
-            .or_insert_with(|| month.clone());
-    }
-
-    let by_wiki: Vec<Value> = latest_by_wiki
-        .iter()
-        .map(|(wiki, month)| {
-            let values = by_wiki_month
-                .get(&(wiki.clone(), month.clone()))
-                .copied()
-                .unwrap_or_default();
-            json!({
-                "wiki": wiki,
-                "latestMonth": month,
-                "gross_bytes_added": number(values[0]),
-                "net_bytes": number(values[1]),
-                "total_edits": number(values[2]),
-                "reverted_edits": number(values[3]),
-                "unique_editors": number(values[4]),
-            })
-        })
-        .collect();
-
-    Ok(json!({
-        "defaultWiki": meta.default_wiki,
-        "maxMonth": meta.max_month,
-        "wikis": meta.wikis,
-        "rangeByWiki": meta.ranges,
-        "trend": trend.into_iter().map(|(period, values)| json!({
-            "period": period,
-            "gross_bytes_added": number(values[0]),
-            "net_bytes": number(values[1]),
-            "total_edits": number(values[2]),
-            "reverted_edits": number(values[3]),
-            "unique_editors": number(values[4]),
-        })).collect::<Vec<_>>(),
-        "byWiki": by_wiki,
-    }))
 }
 
 fn gdp_artifacts(frames: &Frames) -> Result<(Value, Value)> {
@@ -1665,8 +1567,10 @@ mod tests {
         let first = TestDir::new()?;
         let second = TestDir::new()?;
 
+        fs::write(first.path().join("defaults_overview.json"), b"retired")?;
         write_site_fixture(first.path())?;
         write_site_fixture(second.path())?;
+        assert!(!first.path().join("defaults_overview.json").exists());
 
         for artifact in ARTIFACTS {
             let first_bytes = fs::read(first.path().join(artifact))?;
@@ -2027,39 +1931,6 @@ mod tests {
         let output = TestDir::new()?;
         fs::create_dir(output.path().join("business_funnel.parquet"))?;
         assert!(write_site_fixture(output.path()).is_err());
-        Ok(())
-    }
-
-    #[test]
-    fn overview_from_gdp_skips_null_and_future_rows() -> Result<()> {
-        let gdp = df!(
-            "wiki" => &[None, Some("xwiki"), Some("xwiki"), Some("xwiki")],
-            "year_month" => &[Some("2026-01"), None, Some("2026-02"), Some("2026-01")],
-            "page_namespace" => &[Some(0_i32), Some(0), Some(0), Some(0)],
-            "user_type" => &["registered", "registered", "registered", "registered"],
-            "gross_bytes_added" => &[100_i64, 100, 100, 40],
-            "net_bytes" => &[80_i64, 80, 80, 30],
-            "total_edits" => &[10_u32, 10, 10, 4],
-            "reverted_edits" => &[2_u32, 2, 2, 1],
-            "unique_editors" => &[5_u32, 5, 5, 2],
-        )
-        .expect("overview fixture columns have equal lengths");
-        let meta = CommonMeta {
-            default_wiki: "xwiki".to_string(),
-            max_month: "2026-01".to_string(),
-            wikis: vec![json!("xwiki")],
-            namespaces: vec![],
-            ranges: vec![],
-        };
-
-        let overview = overview_from_gdp(&gdp, &meta)?;
-        assert_eq!(overview["maxMonth"], "2026-01");
-        assert_eq!(overview["trend"].as_array().map(Vec::len), Some(1));
-        assert_eq!(overview["trend"][0]["total_edits"], 4);
-        assert_eq!(overview["byWiki"].as_array().map(Vec::len), Some(1));
-        assert_eq!(overview["byWiki"][0]["wiki"], "xwiki");
-        assert_eq!(overview["byWiki"][0]["latestMonth"], "2026-01");
-        assert_eq!(overview["byWiki"][0]["total_edits"], 4);
         Ok(())
     }
 }

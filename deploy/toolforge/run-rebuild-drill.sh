@@ -29,7 +29,7 @@ WIKI_ECON_RUN_ID="$run_id" "$bin_path" --data-dir "$data_dir" --output-dir "$out
 WIKI_ECON_RUN_ID="$run_id" WIKI_ECON_REQUIRE_PUBLICATION_GATE=1 WIKI_ECON_BIN="$bin_path" \
   "${WIKI_ECON_BUILD_SITE_SCRIPT:-$ROOT/scripts/build-site.sh}" --output-dir "$output_dir" --dist-dir "$dist_dir"
 
-for page in index.html business.html gdp.html inequality.html labor.html patrol.html edit-variation.html; do
+for page in business.html gdp.html inequality.html labor.html patrol.html edit-variation.html; do
   [ -f "$dist_dir/$page" ] || { echo "Rebuild drill site is missing $page" >&2; exit 1; }
 done
 report="$operations_root/reports/$run_id.json"

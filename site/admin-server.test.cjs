@@ -269,20 +269,32 @@ test("hosted mode enforces same-origin checks on mutating admin API requests", a
   assert.equal(JSON.parse(accepted.text()).error, "No job is currently running");
 });
 
+test("retired homepage routes redirect to the canonical all-wiki inequality view", async (t) => {
+  const { module, host, distDir } = await startServer(t, LOCAL_ENV);
+  fs.writeFileSync(path.join(distDir, "index.html"), "<!doctype html><h1>Retired home</h1>", "utf8");
+  const expected = "/inequality?wiki=all&types=registered&gran=year&start=2001-06&end=2026-08";
+
+  for (const url of ["/", "/index", "/index.html"]) {
+    const response = await invoke(module, { url, headers: { host } });
+    assert.equal(response.statusCode, 302);
+    assert.equal(response.getHeader("location"), expected);
+    assert.equal(response.getHeader("cache-control"), "no-store");
+    assert.equal(response.text(), "");
+  }
+
+  const head = await invoke(module, { method: "HEAD", url: "/", headers: { host } });
+  assert.equal(head.statusCode, 302);
+  assert.equal(head.getHeader("location"), expected);
+});
+
 test("static fallback serves site assets from SITE_DIST_DIR with per-path cache-control", async (t) => {
   const { module, host, distDir } = await startServer(t, LOCAL_ENV);
-  fs.writeFileSync(path.join(distDir, "index.html"), "<!doctype html><h1>Home</h1>", "utf8");
   fs.mkdirSync(path.join(distDir, "gdp"), { recursive: true });
   fs.writeFileSync(path.join(distDir, "gdp.html"), "<!doctype html><h1>GDP</h1>", "utf8");
   fs.mkdirSync(path.join(distDir, "_observablehq"), { recursive: true });
   fs.writeFileSync(path.join(distDir, "_observablehq", "client.js"), "console.log('ok')", "utf8");
   fs.mkdirSync(path.join(distDir, "_file"), { recursive: true });
   fs.writeFileSync(path.join(distDir, "_file", "data.csv"), "a,b\n1,2\n", "utf8");
-
-  const index = await invoke(module, { url: "/", headers: { host } });
-  assert.equal(index.statusCode, 200);
-  assert.match(index.text(), /Home/);
-  assert.equal(index.getHeader("cache-control"), undefined);
 
   // $uri.html fallback, mirroring nginx's try_files $uri $uri.html $uri/ =404
   const extensionless = await invoke(module, { url: "/gdp", headers: { host } });

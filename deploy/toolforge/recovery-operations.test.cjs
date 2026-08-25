@@ -46,7 +46,7 @@ test("stage recovery dispatches minimal replay commands and repairs a lost site 
 
   const generation = ".site-dist.build.recovered";
   fs.mkdirSync(path.join(root, generation));
-  for (const page of ["index.html", "business.html", "gdp.html", "inequality.html", "labor.html", "patrol.html", "edit-variation.html"]) {
+  for (const page of ["business.html", "gdp.html", "inequality.html", "labor.html", "patrol.html", "edit-variation.html"]) {
     fs.writeFileSync(path.join(root, generation, page), page);
   }
   let result = spawnSync("bash", [recover, "site-link", generation], {encoding: "utf8", env: environment});

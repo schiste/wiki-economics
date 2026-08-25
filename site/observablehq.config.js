@@ -22,24 +22,6 @@ const adminApiScript = `<script>
 window.__wikiEconAdminApiBase=${JSON.stringify(adminApiBase)};
 </script>`;
 
-// The landing page links straight into the four Plot/D3-heavy indicator
-// pages (~900kB of npm imports each) from a nearly-empty bundle. A
-// speculation-rules prerender hint lets the browser start warming that
-// bundle on hover/pointerdown instead of cold-starting it after the click.
-// Framework identifies the built-in home route internally as "/index"
-// (see normalizePath(path) === "/index" in its render.js).
-const speculationRulesScript = `<script type="speculationrules">
-{
-  "prerender": [
-    {
-      "source": "list",
-      "urls": ["/inequality", "/labor", "/gdp", "/patrol"],
-      "eagerness": "moderate"
-    }
-  ]
-}
-</script>`;
-
 export default {
   title: "Wiki Economics",
   root: sourceDir,
@@ -50,9 +32,8 @@ export default {
   // network fetch.
   globalStylesheets: [],
   footer: siteFooter,
-  head: ({ path }) => `<link rel="stylesheet" href="./style.css">
+  head: () => `<link rel="stylesheet" href="./style.css">
 ${adminApiScript}
-${path === "/index" ? speculationRulesScript : ""}
 <script>
 (function(){var t=localStorage.getItem("wk-theme");if(t&&t!=="auto"){document.documentElement.setAttribute("data-theme",t);document.documentElement.style.colorScheme=t;}})();
 </script>

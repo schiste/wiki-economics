@@ -99,9 +99,9 @@ test("built site verification fails closed on legal and manifest regressions", (
     fs.writeFileSync(path.join(data, `${stem}.deadbeef${extension}`), attachment === "manifest.json" ? "{}" : "fixture");
   }
 
-  fs.writeFileSync(path.join(dist, "index.html"), "<!doctype html>");
-  assert.throws(() => verifyBuild(dist), /index.html has no one-click legal link/);
-  fs.writeFileSync(path.join(dist, "index.html"), '<a href="/legal">Legal</a>');
+  fs.writeFileSync(path.join(dist, "inequality.html"), "<!doctype html>");
+  assert.throws(() => verifyBuild(dist), /inequality.html has no one-click legal link/);
+  fs.writeFileSync(path.join(dist, "inequality.html"), '<a href="/legal">Legal</a>');
   assert.throws(() => verifyBuild(dist), /incomplete licensing or provenance manifest/);
 });
 

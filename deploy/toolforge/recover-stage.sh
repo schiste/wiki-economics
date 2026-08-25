@@ -57,7 +57,7 @@ case "$action" in
     case "$generation" in ".${dist_name}.build."*) ;; *) echo "Unsafe site generation: $generation" >&2; exit 1 ;; esac
     target="$dist_parent/$generation"
     [ -d "$target" ] || { echo "Site generation does not exist: $target" >&2; exit 1; }
-    for page in index.html business.html gdp.html inequality.html labor.html patrol.html edit-variation.html; do
+    for page in business.html gdp.html inequality.html labor.html patrol.html edit-variation.html; do
       [ -f "$target/$page" ] || { echo "Site generation is missing $page" >&2; exit 1; }
     done
     if [ -e "$dist_dir" ] && [ ! -L "$dist_dir" ]; then

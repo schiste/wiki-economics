@@ -150,8 +150,8 @@ else
   node "$ROOT/scripts/publish-browser-data.cjs" "$WIKI_ECON_OUTPUT_DIR" "$build_dir"
 fi
 
-if [ ! -f "$build_dir/index.html" ]; then
-  echo "Observable build did not produce $build_dir/index.html" >&2
+if [ ! -f "$build_dir/inequality.html" ]; then
+  echo "Observable build did not produce $build_dir/inequality.html" >&2
   exit 1
 fi
 

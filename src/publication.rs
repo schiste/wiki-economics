@@ -15,14 +15,13 @@ const RUN_CONTEXT_FILE: &str = ".publication-run.json";
 const CANDIDATE_FILE: &str = ".publication-candidate.json";
 pub const RECEIPT_FILE: &str = "publication-gate.json";
 const VALIDATION_BATCH_ROWS: usize = 250_000;
-const JSON_ARTIFACTS: [&str; 14] = [
+const JSON_ARTIFACTS: [&str; 13] = [
     crate::browser_data::INDEX_FILENAME,
     "defaults_business.json",
     "defaults_edit_variation.json",
     "defaults_gdp.json",
     "defaults_inequality.json",
     "defaults_labor.json",
-    "defaults_overview.json",
     "defaults_patrol.json",
     "meta_business.json",
     "meta_gdp.json",
