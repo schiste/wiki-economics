@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
@@ -519,6 +519,24 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
 }
 
 fn artifact_record(path: &Path) -> Result<ArtifactRecord> {
+    let name = path
+        .file_name()
+        .context("artifact path has no filename")?
+        .to_string_lossy()
+        .into_owned();
+    artifact_record_named(path, name)
+}
+
+fn artifact_record_named(path: &Path, name: impl Into<String>) -> Result<ArtifactRecord> {
+    let name = name.into();
+    let relative = Path::new(&name);
+    ensure!(
+        !relative.is_absolute()
+            && relative
+                .components()
+                .all(|component| matches!(component, Component::Normal(_))),
+        "unsafe publication artifact identity {name:?}"
+    );
     let metadata = fs::metadata(path)
         .with_context(|| format!("missing publication artifact {}", path.display()))?;
     ensure!(
@@ -528,11 +546,7 @@ fn artifact_record(path: &Path) -> Result<ArtifactRecord> {
     );
     let modified = metadata.modified()?.duration_since(UNIX_EPOCH)?;
     Ok(ArtifactRecord {
-        name: path
-            .file_name()
-            .context("artifact path has no filename")?
-            .to_string_lossy()
-            .into_owned(),
+        name,
         bytes: metadata.len(),
         modified_secs: modified.as_secs(),
         modified_nanos: modified.subsec_nanos(),
@@ -607,12 +621,12 @@ pub fn record_candidate(output_dir: &Path, run_id: Option<&str>, names: &[String
     );
     let artifacts = unique
         .iter()
-        .map(|name| artifact_record(&output_dir.join(name)))
+        .map(|name| artifact_record_named(&output_dir.join(name), name.clone()))
         .collect::<Result<Vec<_>>>()?;
     atomic_json(
         &output_dir.join(CANDIDATE_FILE),
         &Candidate {
-            schema_version: 1,
+            schema_version: 2,
             run_id: run_id.to_string(),
             artifacts,
         },
@@ -1504,7 +1518,8 @@ pub(crate) fn prepare_ready_publication(
         let reusable = read_json::<Candidate>(&output_dir.join(CANDIDATE_FILE))
             .context("unchanged publication has no current artifact inventory")
             .and_then(|published| {
-                validate_artifact_inventory(output_dir, &published)
+                let registry = load_lifecycle(lifecycle_path)?;
+                validate_artifact_inventory(output_dir, &published, &registry)
                     .context("unchanged publication artifacts are not reusable")
             });
         match reusable {
@@ -1863,16 +1878,44 @@ fn validate_date(value: &str, column: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_artifact_inventory(output_dir: &Path, candidate: &Candidate) -> Result<()> {
-    ensure!(
-        candidate.schema_version == 1,
-        "unsupported publication candidate schema"
-    );
-    let expected: BTreeSet<_> = METRICS
+fn partition_only_metric(spec: &MetricSpec) -> bool {
+    spec.name == "page_weekly_edits"
+}
+
+fn expected_artifact_names(registry: &LifecycleRegistry) -> Result<BTreeSet<String>> {
+    let mut expected: BTreeSet<_> = METRICS
         .iter()
+        .filter(|metric| !partition_only_metric(metric))
         .map(|metric| format!("{}.parquet", metric.name))
         .chain(JSON_ARTIFACTS.iter().map(|name| name.to_string()))
         .collect();
+    let weekly = METRICS
+        .iter()
+        .find(|metric| partition_only_metric(metric))
+        .context("weekly metric contract is missing")?;
+    let contract = registry
+        .publication_contract
+        .datasets
+        .get(weekly.name)
+        .context("weekly dataset contract is missing")?;
+    expected.extend(
+        expected_wikis(registry, contract)?
+            .into_iter()
+            .map(|wiki| format!("{wiki}/{}.parquet", weekly.name)),
+    );
+    Ok(expected)
+}
+
+fn validate_artifact_inventory(
+    output_dir: &Path,
+    candidate: &Candidate,
+    registry: &LifecycleRegistry,
+) -> Result<()> {
+    ensure!(
+        candidate.schema_version == 2,
+        "unsupported publication candidate schema"
+    );
+    let expected = expected_artifact_names(registry)?;
     let candidate_names: BTreeSet<_> = candidate
         .artifacts
         .iter()
@@ -1898,6 +1941,7 @@ fn validate_artifact_inventory(output_dir: &Path, candidate: &Candidate) -> Resu
         .collect();
     let expected_parquets: BTreeSet<_> = METRICS
         .iter()
+        .filter(|metric| !partition_only_metric(metric))
         .map(|metric| format!("{}.parquet", metric.name))
         .collect();
     ensure!(
@@ -1906,7 +1950,8 @@ fn validate_artifact_inventory(output_dir: &Path, candidate: &Candidate) -> Resu
     );
     for recorded in &candidate.artifacts {
         ensure!(
-            &artifact_record(&output_dir.join(&recorded.name))? == recorded,
+            &artifact_record_named(&output_dir.join(&recorded.name), recorded.name.clone())?
+                == recorded,
             "artifact {} changed after merge",
             recorded.name
         );
@@ -2047,8 +2092,8 @@ pub fn validate(
         context.run_id == run_id && candidate.run_id == run_id,
         "publication state does not belong to run ID {run_id}"
     );
-    validate_artifact_inventory(output_dir, &candidate)?;
     let registry = load_lifecycle(lifecycle_path)?;
+    validate_artifact_inventory(output_dir, &candidate, &registry)?;
     let mut reports = BTreeMap::new();
     let mut cutoffs = BTreeMap::new();
     for spec in &METRICS {
@@ -2058,9 +2103,13 @@ pub fn validate(
             .get(spec.name)
             .context("missing dataset contract")?;
         let wikis = expected_wikis(&registry, contract)?;
-        let root = output_dir.join(format!("{}.parquet", spec.name));
-        let root_rows = validate_schema(&root, spec)?;
-        let root_summary = summarize(&root, spec)?;
+        let root_metric = if partition_only_metric(spec) {
+            None
+        } else {
+            let root = output_dir.join(format!("{}.parquet", spec.name));
+            let rows = validate_schema(&root, spec)?;
+            Some((rows, summarize(&root, spec)?))
+        };
         let mut wiki_reports = BTreeMap::new();
         let mut source_rows = 0_u64;
         let mut source_total = 0_i64;
@@ -2110,23 +2159,36 @@ pub fn validate(
                 },
             );
         }
-        ensure!(
-            root_rows == source_rows,
-            "{} row conservation failed: root={root_rows}, sources={source_rows}",
-            spec.name
-        );
-        if let Some(root_total) = root_summary.conservation_total {
+        if let Some((root_rows, _)) = root_metric.as_ref() {
             ensure!(
-                root_total > 0 && root_total == source_total,
-                "{} value conservation failed: root={root_total}, sources={source_total}",
+                *root_rows == source_rows,
+                "{} row conservation failed: root={}, sources={source_rows}",
+                spec.name,
+                root_rows
+            );
+        }
+        if spec.conservation_column.is_some() {
+            ensure!(
+                source_total > 0,
+                "{} source value conservation total must be positive",
                 spec.name
             );
+            if let Some(root_total) = root_metric
+                .as_ref()
+                .and_then(|(_, summary)| summary.conservation_total)
+            {
+                ensure!(
+                    root_total == source_total,
+                    "{} value conservation failed: root={root_total}, sources={source_total}",
+                    spec.name
+                );
+            }
         }
         reports.insert(
             spec.name.to_string(),
             MetricReport {
-                rows: root_rows,
-                conservation_total: root_summary.conservation_total,
+                rows: source_rows,
+                conservation_total: spec.conservation_column.map(|_| source_total),
                 wikis: wiki_reports,
             },
         );
@@ -2210,7 +2272,7 @@ pub fn validate(
         BTreeMap::new()
     };
     let receipt = GateReceipt {
-        schema_version: 4,
+        schema_version: 5,
         run_id: run_id.to_string(),
         validated_at_unix,
         license: policy.license,
@@ -2266,7 +2328,7 @@ pub fn verify(output_dir: &Path, run_id: &str) -> Result<()> {
     // since an on-demand site build legitimately runs a newer (or older)
     // binary than whatever last validated the data.
     ensure!(
-        matches!(receipt.schema_version, 3 | 4)
+        matches!(receipt.schema_version, 3 | 4 | 5)
             && receipt.license == policy.license
             && receipt.attribution == policy.attribution
             && receipt.independence_notice == policy.independence_notice
@@ -2285,7 +2347,8 @@ pub fn verify(output_dir: &Path, run_id: &str) -> Result<()> {
     );
     for artifact in &receipt.artifacts {
         ensure!(
-            &artifact_record(&output_dir.join(&artifact.name))? == artifact,
+            &artifact_record_named(&output_dir.join(&artifact.name), artifact.name.clone())?
+                == artifact,
             "artifact {} changed after validation",
             artifact.name
         );
@@ -2360,8 +2423,10 @@ mod tests {
             for spec in &METRICS {
                 let wiki_path = wiki_dir.join(format!("{}.parquet", spec.name));
                 write_metric(&wiki_path, spec, "nlwiki")?;
-                let root_path = output.path().join(format!("{}.parquet", spec.name));
-                write_metric(&root_path, spec, "nlwiki")?;
+                if !partition_only_metric(spec) {
+                    let root_path = output.path().join(format!("{}.parquet", spec.name));
+                    write_metric(&root_path, spec, "nlwiki")?;
+                }
             }
             crate::browser_data::materialize(
                 output.path(),
@@ -2385,7 +2450,13 @@ mod tests {
         fn names(&self) -> Vec<String> {
             METRICS
                 .iter()
-                .map(|metric| format!("{}.parquet", metric.name))
+                .map(|metric| {
+                    if partition_only_metric(metric) {
+                        format!("nlwiki/{}.parquet", metric.name)
+                    } else {
+                        format!("{}.parquet", metric.name)
+                    }
+                })
                 .chain(JSON_ARTIFACTS.iter().map(|name| name.to_string()))
                 .collect()
         }
@@ -2558,7 +2629,7 @@ mod tests {
         verify(fixture.output.path(), "run-good")?;
 
         let receipt: Value = read_json(&fixture.output.path().join(RECEIPT_FILE))?;
-        assert_eq!(receipt["schema_version"], 4);
+        assert_eq!(receipt["schema_version"], 5);
         assert_eq!(
             receipt["provenance"]["determinism_contract"]["contract_version"],
             "pipeline-byte-determinism-v1"
@@ -2963,7 +3034,10 @@ mod tests {
                 .exists()
         );
 
-        let page_weekly = fixture.output.path().join("page_weekly_edits.parquet");
+        let page_weekly = fixture
+            .output
+            .path()
+            .join("nlwiki/page_weekly_edits.parquet");
         let page_weekly_before = fs::read(&page_weekly)?;
         let candidate_before = fs::read(fixture.output.path().join(CANDIDATE_FILE))?;
         let receipt_before = fs::read(fixture.output.path().join(RECEIPT_FILE))?;
@@ -2993,7 +3067,8 @@ mod tests {
                 .is_err()
         );
 
-        fs::write(&page_weekly, b"interrupted publication debris")?;
+        let repair_target = fixture.output.path().join("gdp.parquet");
+        fs::write(&repair_target, b"interrupted publication debris")?;
         prepare_ready_publication(
             fixture.data.path(),
             fixture.output.path(),
@@ -3003,7 +3078,7 @@ mod tests {
         .expect("damaged published inventory should rebuild transactionally");
         commit_ready_publication(fixture.data.path(), fixture.output.path(), "publish-repair")
             .expect("repaired publication should commit");
-        assert_ne!(fs::read(&page_weekly)?, b"interrupted publication debris");
+        assert_ne!(fs::read(&repair_target)?, b"interrupted publication debris");
 
         let candidate_2 =
             wiki_candidate_dir(fixture.output.path(), "nlwiki", "2026-03", "candidate-2")?;

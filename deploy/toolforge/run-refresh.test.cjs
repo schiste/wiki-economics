@@ -73,7 +73,7 @@ for artifact in \\
   defaults_labor.json defaults_patrol.json defaults_edit_variation.json \\
   business_funnel.parquet gdp.parquet gdp_activity_tiers.parquet \\
   gdp_user_type_share.parquet inequality.parquet labor_churn.parquet \\
-  labor_cohorts.parquet labor_monthly.parquet page_weekly_edits.parquet patrol.parquet
+  labor_cohorts.parquet labor_monthly.parquet patrol.parquet
 do
   : > "$WIKI_ECON_OUTPUT_DIR/$artifact"
 done

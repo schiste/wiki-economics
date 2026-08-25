@@ -9,7 +9,7 @@ use std::time::UNIX_EPOCH;
 use tracing::{info, warn};
 
 const RECEIPT_SCHEMA_VERSION: u32 = 1;
-const SITE_ALGORITHM_VERSION: &str = "observable-static-site-v4-npm-workspace";
+const SITE_ALGORITHM_VERSION: &str = "observable-static-site-v5-publication-receipt-identity";
 const PARQUET_SUMMARY_BATCH_ROWS: usize = 250_000;
 const DATE_COLUMNS: [&str; 6] = [
     "week_start",
@@ -466,23 +466,20 @@ fn site_selected_snapshots(output_dir: &Path) -> Result<String> {
 }
 
 fn site_stage_inputs(output_dir: &Path, site_dir: &Path) -> Result<Vec<TrackedPath>> {
-    let candidate: serde_json::Value =
-        serde_json::from_slice(&fs::read(output_dir.join(".publication-candidate.json"))?)?;
-    let artifacts = candidate
-        .get("artifacts")
-        .and_then(serde_json::Value::as_array)
-        .context("publication candidate is missing artifacts")?;
-    let mut inputs = Vec::new();
-    for artifact in artifacts {
-        let name = artifact
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .context("publication candidate artifact is missing its name")?;
-        inputs.push(TrackedPath::new(
-            format!("data/{name}"),
-            output_dir.join(name),
-        ));
-    }
+    // scripts/build-site.sh verifies every candidate artifact against the
+    // publication gate before it reaches this fingerprint check. The two
+    // atomic receipts therefore form a compact, already-verified identity for
+    // the full data set and avoid hashing multi-gigabyte Parquets a second time.
+    let mut inputs = vec![
+        TrackedPath::new(
+            "data/.publication-candidate.json",
+            output_dir.join(".publication-candidate.json"),
+        ),
+        TrackedPath::new(
+            format!("data/{}", crate::publication::RECEIPT_FILE),
+            output_dir.join(crate::publication::RECEIPT_FILE),
+        ),
+    ];
     let mut site_sources = collect_tracked_files(&site_dir.join("src"), "site/src")?;
     site_sources.retain(|source| !source.identity.starts_with("site/src/.observablehq/"));
     inputs.extend(site_sources);
@@ -729,6 +726,17 @@ mod tests {
         assert!(!site_is_reusable(&output, &site, &dist)?);
         fs::write(site.join("src/nested/index.md"), "# Site")?;
         fs::write(dir.path().join("package-lock.json"), "{\"changed\":true}")?;
+        assert!(!site_is_reusable(&output, &site, &dist)?);
+        fs::write(dir.path().join("package-lock.json"), "{}")?;
+        fs::write(output.join("metric.json"), "{\"changed\":true}")?;
+        assert!(
+            site_is_reusable(&output, &site, &dist)?,
+            "publication verification owns artifact validation; the site fingerprint consumes its receipt identity"
+        );
+        fs::write(
+            output.join(crate::publication::RECEIPT_FILE),
+            r#"{"selected_snapshot_versions":{"nlwiki":"2026-08"}}"#,
+        )?;
         assert!(!site_is_reusable(&output, &site, &dist)?);
         Ok(())
     }

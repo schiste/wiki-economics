@@ -13,9 +13,14 @@ use crate::storage;
 use crate::wiki_lifecycle;
 
 const MERGE_BATCH_ROWS: usize = 250_000;
-const MERGE_ALGORITHM_VERSION: &str = "merged-metrics-v5-partitioned-browser-data";
+const MERGE_ALGORITHM_VERSION: &str = "merged-metrics-v6-partition-native-weekly";
 const GENERATOR_DEPENDENCIES: [&str; 1] = ["manifest.json.cjs"];
 const MANIFEST_GENERATOR: &str = "manifest.json.sh";
+const PARTITION_ONLY_METRICS: [&str; 1] = ["page_weekly_edits.parquet"];
+
+fn is_partition_only_metric(name: &str) -> bool {
+    PARTITION_ONLY_METRICS.contains(&name)
+}
 
 /// Merge per-wiki metric parquet files into combined files at the output root.
 /// e.g., output/nlwiki/inequality.parquet + output/dewiki/inequality.parquet
@@ -36,7 +41,28 @@ fn merge_outputs_from_dir(
     let lifecycle_path = env::var_os("WIKI_ECON_WIKI_LIFECYCLE_FILE").map(PathBuf::from);
     let published_wikis = wiki_lifecycle::published_wikis(lifecycle_path.as_deref())?;
     let metric_files = collect_metric_files(output_dir, published_wikis.as_ref())?;
-    let mut artifact_names: Vec<String> = metric_files.keys().cloned().collect();
+    let mut artifact_names: Vec<String> = metric_files
+        .iter()
+        .flat_map(|(metric_name, paths)| {
+            if is_partition_only_metric(metric_name) {
+                paths
+                    .iter()
+                    .map(|path| {
+                        path.strip_prefix(output_dir)
+                            .map(|relative| relative.to_string_lossy().into_owned())
+                            .with_context(|| {
+                                format!(
+                                    "partitioned metric {} is outside output directory",
+                                    path.display()
+                                )
+                            })
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                vec![Ok(metric_name.clone())]
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
 
     artifact_names.extend(
         crate::dashboard::ARTIFACTS
@@ -81,8 +107,19 @@ fn merge_outputs_from_dir(
         "config/wiki-lifecycle.json",
         lifecycle_file,
     ));
-    let outputs: Vec<_> = artifact_names
-        .iter()
+    let outputs: Vec<_> = metric_files
+        .keys()
+        .filter(|name| !is_partition_only_metric(name))
+        .cloned()
+        .chain(
+            crate::dashboard::ARTIFACTS
+                .iter()
+                .map(|name| (*name).to_string()),
+        )
+        .chain([
+            "manifest.json".to_string(),
+            crate::browser_data::INDEX_FILENAME.to_string(),
+        ])
         .map(|name| TrackedPath::new(format!("merged/{name}"), output_dir.join(name)))
         .collect();
     let compute_receipts = output_dir.join("_stages").join("compute");
@@ -123,9 +160,23 @@ fn merge_outputs_from_dir(
     }
 
     for (metric_name, mut paths) in metric_files {
+        if is_partition_only_metric(&metric_name) {
+            continue;
+        }
         paths.sort();
         let dest = output_dir.join(&metric_name);
         merge_metric_batched(&metric_name, &paths, &dest, MERGE_BATCH_ROWS, run_id)?;
+    }
+
+    let obsolete_weekly = output_dir.join("page_weekly_edits.parquet");
+    if obsolete_weekly.is_file() {
+        fs::remove_file(&obsolete_weekly).with_context(|| {
+            format!(
+                "failed to remove obsolete combined weekly metric {}",
+                obsolete_weekly.display()
+            )
+        })?;
+        File::open(output_dir)?.sync_all()?;
     }
 
     crate::dashboard::materialize(output_dir)?;
@@ -514,6 +565,10 @@ mod tests {
         write_dashboard_fixture(output_dir.path())?;
         write_metric(output_dir.path(), "enwiki", "metric", 1)?;
         write_metric(output_dir.path(), "frwiki", "metric", 2)?;
+        fs::write(
+            output_dir.path().join("page_weekly_edits.parquet"),
+            b"obsolete combined weekly artifact",
+        )?;
 
         merge_outputs_from_dir(output_dir.path(), generator_dir.path(), None)?;
 
@@ -522,6 +577,10 @@ mod tests {
         let merged =
             LazyFrame::scan_parquet(merged_path.as_str().into(), Default::default())?.collect()?;
         assert_eq!(merged.height(), 2);
+        assert!(
+            !output_dir.path().join("page_weekly_edits.parquet").exists(),
+            "weekly publication must remain per-wiki instead of consuming a redundant root artifact"
+        );
 
         Ok(())
     }

@@ -94,7 +94,7 @@ function fixture(name) {
   fs.mkdirSync(path.join(outputDir, "logs"), {recursive: true});
   for (const metric of metrics) {
     fs.writeFileSync(path.join(outputDir, "nlwiki", `${metric}.parquet`), metric);
-    fs.writeFileSync(path.join(outputDir, `${metric}.parquet`), metric);
+    if (metric !== "page_weekly_edits") fs.writeFileSync(path.join(outputDir, `${metric}.parquet`), metric);
   }
   for (const artifact of dashboardJson) {
     fs.writeFileSync(path.join(outputDir, `${artifact}.json`), "{}");
@@ -158,6 +158,7 @@ test("generation readiness follows the pointer and strict ingest receipt without
   assert.equal(manifest.downloadable_artifacts.every((artifact) => artifact.license_spdx === "MIT"), true);
   assert.equal(manifest.downloadable_artifacts.some((artifact) => artifact.name === "defaults_gdp.json"), true);
   assert.equal(manifest.downloadable_artifacts.some((artifact) => artifact.name === "gdp.parquet"), true);
+  assert.equal(manifest.downloadable_artifacts.some((artifact) => artifact.name === "nlwiki/page_weekly_edits.parquet"), true);
   assert.equal(manifest.wikis.nlwiki.metrics.every((artifact) => artifact.license_spdx === "MIT"), true);
   assert.equal(manifest.wikis.nlwiki.status, "complete");
   assert.equal(manifest.wikis.nlwiki.raw.files, 0);

@@ -9,6 +9,7 @@ const CORE_METRICS = [
   "business_funnel", "gdp", "gdp_activity_tiers", "gdp_user_type_share",
   "inequality", "labor_churn", "labor_cohorts", "labor_monthly",
 ];
+const PARTITION_ONLY_METRICS = new Set(["page_weekly_edits"]);
 const PUBLIC_JSON_ARTIFACTS = [
   "defaults_business", "defaults_edit_variation", "defaults_gdp",
   "defaults_inequality", "defaults_labor", "defaults_patrol",
@@ -433,7 +434,20 @@ async function buildManifest(options = {}) {
       const patrol = await patrolSummary(dataDir, outputDir, wiki, patrolRequired, rowCounter);
       const selectedProfile = workloadProfile(dataDir, wiki, generation.version);
       const missingCore = requiredCore.filter((metric) => !metricNames.has(metric));
-      const missingMerged = expected.filter((metric) => !mergedNames.has(metric));
+      const missingMerged = expected.filter((metric) =>
+        PARTITION_ONLY_METRICS.has(metric) ? !metricNames.has(metric) : !mergedNames.has(metric));
+      if (published && metricNames.has("page_weekly_edits")) {
+        const weeklyPath = path.join(outputDir, wiki, "page_weekly_edits.parquet");
+        const weekly = statFile(weeklyPath);
+        if (weekly) {
+          downloadableArtifacts.push({
+            name: `${wiki}/page_weekly_edits.parquet`,
+            size_kb: Math.floor(weekly.size / 1024),
+            license_spdx: ARTIFACT_LICENSE_SPDX,
+            media_type: "application/vnd.apache.parquet",
+          });
+        }
+      }
       let status = "complete";
       if (scheduled && !generation.pointer_ready && raw.files === 0) status = "needs_fetch";
       else if (scheduled && !generation.ingest_ready) status = "needs_ingest";
@@ -458,6 +472,7 @@ async function buildManifest(options = {}) {
       };
     }
   } finally { await rowCounter.close?.(); }
+  downloadableArtifacts.sort((left, right) => left.name.localeCompare(right.name));
   const selectedSnapshots = Object.fromEntries(Object.entries(wikis)
     .filter(([, wiki]) => typeof wiki.snapshot?.version === "string")
     .map(([name, wiki]) => [name, wiki.snapshot.version]));
