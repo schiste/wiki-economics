@@ -2996,6 +2996,41 @@ mod tests {
     }
 
     #[test]
+    fn preparation_planner_rebuilds_compute_while_bootstrapping_workload_profile() -> Result<()> {
+        let fixture = Fixture::new()?;
+        fixture.ready_candidate("profile-source")?;
+        fs::remove_file(crate::workload_profile::profile_path(
+            fixture.data.path(),
+            "nlwiki",
+            "2026-03",
+        )?)?;
+
+        assert_eq!(
+            plan_wiki_preparation(
+                fixture.data.path(),
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                "profile-bootstrap",
+            )?,
+            WikiPreparationPlan::Build {
+                same_snapshot_candidate: true,
+                compute_reused: false,
+                patrol_reused: false,
+            }
+        );
+        let target = wiki_candidate_dir(
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            "profile-bootstrap",
+        )?;
+        assert!(!target.join("nlwiki/gdp.parquet").exists());
+        assert!(!target.join("nlwiki/patrol.parquet").exists());
+        Ok(())
+    }
+
+    #[test]
     fn ready_candidate_commit_retires_superseded_candidates_and_backup() -> Result<()> {
         let fixture = Fixture::new()?;
         fixture.ready_candidate("candidate-1")?;

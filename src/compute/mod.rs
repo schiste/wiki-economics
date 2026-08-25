@@ -2296,6 +2296,13 @@ pub(crate) fn reusable_candidate_files(
     candidate_dir: &Path,
 ) -> Result<Option<Vec<PathBuf>>> {
     storage::validate_snapshot_version(snapshot)?;
+    if workload_profile::load(data_dir, wiki, snapshot)?.is_none() {
+        info!(
+            wiki,
+            snapshot, "compute candidate cannot be reused before workload profile selection"
+        );
+        return Ok(None);
+    }
     let weekly_config = WeeklyAggregationConfig::for_snapshot(data_dir, wiki, Some(snapshot))?;
     let algorithm_version = weekly_config.algorithm_version();
     let inputs = compute_stage_inputs(wiki, data_dir, Some(snapshot))?;
