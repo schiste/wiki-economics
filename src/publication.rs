@@ -2328,7 +2328,7 @@ pub fn verify(output_dir: &Path, run_id: &str) -> Result<()> {
     // since an on-demand site build legitimately runs a newer (or older)
     // binary than whatever last validated the data.
     ensure!(
-        matches!(receipt.schema_version, 3 | 4 | 5)
+        matches!(receipt.schema_version, 3..=5)
             && receipt.license == policy.license
             && receipt.attribution == policy.attribution
             && receipt.independence_notice == policy.independence_notice

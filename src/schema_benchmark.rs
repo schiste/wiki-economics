@@ -219,12 +219,10 @@ pub(crate) fn run(
         run_scratch.display()
     );
     fs::create_dir(&run_scratch)?;
-    let result = (|| -> Result<Vec<WikiSchemaBenchmark>> {
-        wikis
-            .iter()
-            .map(|wiki| benchmark_wiki(data_dir, &run_scratch, wiki))
-            .collect()
-    })();
+    let result: Result<Vec<WikiSchemaBenchmark>> = wikis
+        .iter()
+        .map(|wiki| benchmark_wiki(data_dir, &run_scratch, wiki))
+        .collect();
     let cleanup = fs::remove_dir_all(&run_scratch);
     let reports = result?;
     cleanup?;
