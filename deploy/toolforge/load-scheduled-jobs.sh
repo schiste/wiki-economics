@@ -18,6 +18,9 @@ scheduled_jobs=(
   wiki-econ-prepare-nlwiki
   wiki-econ-prepare-ptwiki
   wiki-econ-prepare-frwiki
+  wiki-econ-prepare-itwiki
+  wiki-econ-prepare-svwiki
+  wiki-econ-prepare-elwiki
   wiki-econ-publish-ready
 )
 on_demand_jobs=(

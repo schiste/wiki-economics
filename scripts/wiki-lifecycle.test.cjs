@@ -51,7 +51,10 @@ function validRegistry() {
 
 test("production lifecycle schedules qualified Toolforge wikis", () => {
   const registry = loadWikiLifecycle(path.join(__dirname, ".."), {});
-  assert.deepEqual(resolveRefreshWikis(registry, {}), ["frwiki", "nlwiki", "ptwiki"]);
+  assert.deepEqual(
+    resolveRefreshWikis(registry, {}),
+    ["elwiki", "frwiki", "itwiki", "nlwiki", "ptwiki", "svwiki"],
+  );
   assert.deepEqual(
     wikisWithState(registry, "publication", "published"),
     ["elwiki", "frwiki", "itwiki", "nlwiki", "ptwiki", "svwiki"],
@@ -65,8 +68,9 @@ test("production lifecycle schedules qualified Toolforge wikis", () => {
   assert.equal(registry.wikis.ptwiki.imported_cutoff, undefined);
   for (const wiki of ["elwiki", "itwiki", "svwiki"]) {
     assert.equal(registry.wikis[wiki].publication, "published");
-    assert.equal(registry.wikis[wiki].refresh, "manual");
+    assert.equal(registry.wikis[wiki].refresh, "scheduled");
     assert.equal(registry.wikis[wiki].provenance, "toolforge");
+    assert.equal(registry.wikis[wiki].freshness_sla_days, 10);
     assert.equal(registry.wikis[wiki].imported_cutoff, undefined);
   }
   assert.equal(
@@ -172,7 +176,7 @@ test("CLI validates and lists lifecycle selections", () => {
   assert.equal(execFileSync(process.execPath, [SCRIPT, "validate"], { env, encoding: "utf8" }), "");
   assert.equal(
     execFileSync(process.execPath, [SCRIPT, "refresh-wikis"], { env, encoding: "utf8" }),
-    "frwiki\nnlwiki\nptwiki\n",
+    "elwiki\nfrwiki\nitwiki\nnlwiki\nptwiki\nsvwiki\n",
   );
   assert.equal(
     execFileSync(process.execPath, [SCRIPT, "published-wikis"], { env, encoding: "utf8" }),

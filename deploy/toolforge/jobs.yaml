@@ -70,6 +70,36 @@
   mem: 6Gi
   cpu: "1"
 
+# Newly promoted datasets are deliberately spread across separate UTC days.
+# This bounds shared NFS and download pressure and makes per-wiki performance
+# records attributable instead of overlapping the Sunday preparation window.
+- name: wiki-econ-prepare-itwiki
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: deploy/toolforge/run-prepare-itwiki.sh
+  schedule: "0 1 * * 1"
+  filelog: true
+  mount: all
+  mem: 6Gi
+  cpu: "1"
+
+- name: wiki-econ-prepare-svwiki
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: deploy/toolforge/run-prepare-svwiki.sh
+  schedule: "0 1 * * 2"
+  filelog: true
+  mount: all
+  mem: 6Gi
+  cpu: "1"
+
+- name: wiki-econ-prepare-elwiki
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: deploy/toolforge/run-prepare-elwiki.sh
+  schedule: "0 1 * * 3"
+  filelog: true
+  mount: all
+  mem: 6Gi
+  cpu: "1"
+
 # Publication is intentionally short and independent. It selects only fully
 # validated ready candidates, merges, builds, validates, and switches the
 # release while holding the sole global publication lock.

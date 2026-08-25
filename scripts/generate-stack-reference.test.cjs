@@ -19,7 +19,10 @@ test("stack reference is deterministic and reflects authoritative metadata", () 
   assert.equal(first, second);
   assert.match(first, /\| `polars` \| `\d+\.\d+\.\d+` \|/);
   assert.match(first, /\| `apache-arrow` \| `\d+\.\d+\.\d+` \|/);
-  assert.match(first, /Scheduled\s+datasets are `frwiki`, `nlwiki`, `ptwiki`/);
+  assert.match(
+    first,
+    /Scheduled\s+datasets are `elwiki`, `frwiki`, `itwiki`, `nlwiki`, `ptwiki`, `svwiki`/,
+  );
   assert.match(first, /paused imported datasets are none/);
 });
 

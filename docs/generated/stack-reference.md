@@ -65,13 +65,13 @@ build or browser dependency.
 ## Published wiki lifecycle
 
 The table below is rendered from `config/wiki-lifecycle.json`. Scheduled
-datasets are `frwiki`, `nlwiki`, `ptwiki`; paused imported datasets are none.
+datasets are `elwiki`, `frwiki`, `itwiki`, `nlwiki`, `ptwiki`, `svwiki`; paused imported datasets are none.
 
 | Wiki | Publication | Refresh | Provenance | Freshness SLA / imported cutoff |
 | --- | --- | --- | --- | --- |
-| `elwiki` | published | manual | toolforge | — |
+| `elwiki` | published | scheduled | toolforge | 10 days |
 | `frwiki` | published | scheduled | toolforge | 10 days |
-| `itwiki` | published | manual | toolforge | — |
+| `itwiki` | published | scheduled | toolforge | 10 days |
 | `nlwiki` | published | scheduled | toolforge | 10 days |
 | `ptwiki` | published | scheduled | toolforge | 10 days |
-| `svwiki` | published | manual | toolforge | — |
+| `svwiki` | published | scheduled | toolforge | 10 days |

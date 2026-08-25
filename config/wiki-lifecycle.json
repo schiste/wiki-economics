@@ -28,8 +28,9 @@
   "wikis": {
     "elwiki": {
       "publication": "published",
-      "refresh": "manual",
-      "provenance": "toolforge"
+      "refresh": "scheduled",
+      "provenance": "toolforge",
+      "freshness_sla_days": 10
     },
     "frwiki": {
       "publication": "published",
@@ -39,8 +40,9 @@
     },
     "itwiki": {
       "publication": "published",
-      "refresh": "manual",
-      "provenance": "toolforge"
+      "refresh": "scheduled",
+      "provenance": "toolforge",
+      "freshness_sla_days": 10
     },
     "nlwiki": {
       "publication": "published",
@@ -56,8 +58,9 @@
     },
     "svwiki": {
       "publication": "published",
-      "refresh": "manual",
-      "provenance": "toolforge"
+      "refresh": "scheduled",
+      "provenance": "toolforge",
+      "freshness_sla_days": 10
     }
   }
 }

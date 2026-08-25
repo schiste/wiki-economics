@@ -35,6 +35,9 @@ esac
       `jobs load --job wiki-econ-prepare-nlwiki ${manifest}`,
       `jobs load --job wiki-econ-prepare-ptwiki ${manifest}`,
       `jobs load --job wiki-econ-prepare-frwiki ${manifest}`,
+      `jobs load --job wiki-econ-prepare-itwiki ${manifest}`,
+      `jobs load --job wiki-econ-prepare-svwiki ${manifest}`,
+      `jobs load --job wiki-econ-prepare-elwiki ${manifest}`,
       `jobs load --job wiki-econ-publish-ready ${manifest}`,
     ]);
     for (const name of ["wiki-econ-refresh", "wiki-econ-ingest", "wiki-econ-compute", "wiki-econ-site"]) {
