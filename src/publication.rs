@@ -6,7 +6,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::generation_lifecycle::GenerationState as GState;
 use crate::{licensing, storage};
@@ -933,7 +933,7 @@ pub(crate) fn mark_wiki_qualification_ready(
     Ok(receipt_path)
 }
 
-fn validate_ready_candidate(
+fn validate_ready_candidate_metadata(
     data_dir: &Path,
     candidate_dir: &Path,
     ready: &ReadyWikiCandidate,
@@ -964,10 +964,19 @@ fn validate_ready_candidate(
         !ready.artifacts.is_empty(),
         "ready candidate has no artifacts"
     );
+    validate_snapshot_cutoff(&ready.wiki, &ready.snapshot, &ready.cutoff_date)
+}
+
+fn validate_ready_candidate(
+    data_dir: &Path,
+    candidate_dir: &Path,
+    ready: &ReadyWikiCandidate,
+) -> Result<()> {
+    validate_ready_candidate_metadata(data_dir, candidate_dir, ready)?;
     for artifact in &ready.artifacts {
         validate_prepared_artifact(candidate_dir, artifact)?;
     }
-    validate_snapshot_cutoff(&ready.wiki, &ready.snapshot, &ready.cutoff_date)
+    Ok(())
 }
 
 fn reconcile_ready_generation_state(output_dir: &Path, ready: &ReadyWikiCandidate) -> Result<()> {
@@ -1146,7 +1155,7 @@ fn latest_ready_candidates(
                 }
                 let ready: ReadyWikiCandidate = read_json(&ready_path)?;
                 ensure!(ready.wiki == wiki, "ready candidate wiki mismatch");
-                validate_ready_candidate(data_dir, &candidate_dir, &ready)?;
+                validate_ready_candidate_metadata(data_dir, &candidate_dir, &ready)?;
                 reconcile_ready_generation_state(output_dir, &ready)?;
                 candidates.push((ready, candidate_dir));
             }
@@ -1384,6 +1393,7 @@ fn activate_ready_candidates(
         {
             continue;
         }
+        validate_ready_candidate(data_dir, &candidate_dir, &ready)?;
         let active = output_dir.join(&ready.wiki);
         let backup = transaction_dir.join("backups").join(&ready.wiki);
         let backup_relative = (active.exists() || active.is_symlink()).then(|| {
@@ -1446,6 +1456,27 @@ fn activate_ready_candidates(
     Ok(selection)
 }
 
+fn validate_active_ready_candidates(
+    data_dir: &Path,
+    output_dir: &Path,
+    lifecycle_path: &Path,
+) -> Result<()> {
+    for (ready, candidate_dir) in latest_ready_candidates(data_dir, output_dir, lifecycle_path)? {
+        let expected_target = candidate_dir
+            .strip_prefix(output_dir)
+            .context("candidate is outside output directory")?
+            .join(&ready.wiki);
+        ensure!(
+            active_candidate_target(output_dir, &ready.wiki)?.as_ref() == Some(&expected_target)
+                && storage::current_snapshot_version(data_dir, &ready.wiki)?.as_deref()
+                    == Some(ready.snapshot.as_str()),
+            "published candidate identity changed while planning repair"
+        );
+        validate_ready_candidate(data_dir, &candidate_dir, &ready)?;
+    }
+    Ok(())
+}
+
 pub(crate) fn prepare_ready_publication(
     data_dir: &Path,
     output_dir: &Path,
@@ -1454,15 +1485,30 @@ pub(crate) fn prepare_ready_publication(
 ) -> Result<()> {
     let mut selection = activate_ready_candidates(data_dir, output_dir, lifecycle_path, run_id)?;
     if selection.entries.is_empty() {
-        let published: Candidate = read_json(&output_dir.join(CANDIDATE_FILE))
-            .context("unchanged publication has no current artifact inventory")?;
-        validate_artifact_inventory(output_dir, &published)
-            .context("unchanged publication artifacts are not reusable")?;
-        selection.state = "no_op".to_string();
-        atomic_json(&selection_path(output_dir, run_id)?, &selection)?;
-        crate::observability::record_stage_skipped("publication_prepare", None);
-        info!(run_id, "ready-candidate publication is unchanged");
-        return Ok(());
+        let reusable = read_json::<Candidate>(&output_dir.join(CANDIDATE_FILE))
+            .context("unchanged publication has no current artifact inventory")
+            .and_then(|published| {
+                validate_artifact_inventory(output_dir, &published)
+                    .context("unchanged publication artifacts are not reusable")
+            });
+        match reusable {
+            Ok(()) => {
+                selection.state = "no_op".to_string();
+                atomic_json(&selection_path(output_dir, run_id)?, &selection)?;
+                crate::observability::record_stage_skipped("publication_prepare", None);
+                info!(run_id, "ready-candidate publication is unchanged");
+                return Ok(());
+            }
+            Err(error) => {
+                warn!(
+                    run_id,
+                    error = %format!("{error:#}"),
+                    "published artifact inventory requires transactional repair"
+                );
+                validate_active_ready_candidates(data_dir, output_dir, lifecycle_path)
+                    .context("publication repair inputs are not reusable")?;
+            }
+        }
     }
     let snapshots = selection
         .entries
@@ -2859,7 +2905,7 @@ mod tests {
             read_json(&selection_path(fixture.output.path(), "publish-noop")?)?;
         assert!(no_op.entries.is_empty());
         assert_eq!(no_op.state, "no_op");
-        assert_eq!(fs::read(page_weekly)?, page_weekly_before);
+        assert_eq!(fs::read(&page_weekly)?, page_weekly_before);
         assert_eq!(
             fs::read(fixture.output.path().join(CANDIDATE_FILE))?,
             candidate_before
@@ -2872,6 +2918,18 @@ mod tests {
             commit_ready_publication(fixture.data.path(), fixture.output.path(), "publish-noop")
                 .is_err()
         );
+
+        fs::write(&page_weekly, b"interrupted publication debris")?;
+        prepare_ready_publication(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "publish-repair",
+        )
+        .expect("damaged published inventory should rebuild transactionally");
+        commit_ready_publication(fixture.data.path(), fixture.output.path(), "publish-repair")
+            .expect("repaired publication should commit");
+        assert_ne!(fs::read(&page_weekly)?, b"interrupted publication debris");
 
         let candidate_2 =
             wiki_candidate_dir(fixture.output.path(), "nlwiki", "2026-03", "candidate-2")?;
