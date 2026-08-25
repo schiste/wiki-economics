@@ -1510,10 +1510,8 @@ mod tests {
         let mut mislabeled =
             ParquetReader::new(File::open(default_dir.join("page_weekly_edits.parquet"))?)
                 .finish()?;
-        mislabeled.replace(
-            "wiki",
-            Series::new("wiki".into(), vec!["nlwiki"; mislabeled.height()]).into(),
-        )?;
+        let wiki = Column::new("wiki".into(), vec!["nlwiki"; mislabeled.height()]);
+        mislabeled.replace("wiki", wiki)?;
         write_parquet(&default_dir, "page_weekly_edits", mislabeled)?;
 
         let error = materialize(output.path())
