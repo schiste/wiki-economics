@@ -398,6 +398,18 @@ fn selected_wiki_row(df: &DataFrame, row: usize, wiki: &str) -> Result<bool> {
     Ok(wiki == ALL_WIKIS_SCOPE || string(df, "wiki", row)?.as_deref() == Some(wiki))
 }
 
+fn selected_activity_tier_row(
+    df: &DataFrame,
+    row: usize,
+    wiki: &str,
+    max_month: &str,
+    period_type: &str,
+) -> Result<bool> {
+    Ok(selected_wiki_row(df, row, wiki)?
+        && string(df, "period_type", row)?.as_deref() == Some(period_type)
+        && string(df, "period_start", row)?.is_some_and(|start| start.as_str() <= max_month))
+}
+
 fn gdp_artifacts(frames: &Frames) -> Result<(Value, Value)> {
     let meta = common_meta(&frames.gdp, Some(&frames.gdp))?;
     gdp_artifacts_with_meta(frames, meta)
@@ -459,15 +471,21 @@ fn gdp_artifacts_with_meta(frames: &Frames, meta: CommonMeta) -> Result<(Value, 
         }
     }
 
-    let mut tiers: BTreeMap<(String, String), [f64; 4]> = BTreeMap::new();
+    let mut tiers: BTreeMap<(String, i64, String), [f64; 4]> = BTreeMap::new();
     for row in 0..frames.tiers.height() {
-        if !selected_month_row(&frames.tiers, row, &meta.default_wiki, &meta.max_month)?
-            || string(&frames.tiers, "user_type", row)?.as_deref() != Some("registered")
+        if !selected_activity_tier_row(
+            &frames.tiers,
+            row,
+            &meta.default_wiki,
+            &meta.max_month,
+            "year",
+        )? || string(&frames.tiers, "user_type", row)?.as_deref() != Some("registered")
         {
             continue;
         }
         let key = (
-            string(&frames.tiers, "year_month", row)?.context("tier month is null")?,
+            string(&frames.tiers, "period", row)?.context("tier period is null")?,
+            integer(&frames.tiers, "tier_rank", row)?.context("tier rank is null")?,
             string(&frames.tiers, "activity_tier", row)?.context("activity tier is null")?,
         );
         let entry = tiers.entry(key).or_default();
@@ -523,9 +541,12 @@ fn gdp_artifacts_with_meta(frames: &Frames, meta: CommonMeta) -> Result<(Value, 
             "gross_bytes": number(values[1]),
             "net_bytes": number(values[2]),
         })).collect::<Vec<_>>(),
-        "tiers": tiers.into_iter().map(|((period, activity_tier), values)| json!({
+        "tiers": tiers.into_iter().map(|((period, tier_rank, activity_tier), values)| json!({
             "period": period,
             "activity_tier": activity_tier,
+            "tier_rank": tier_rank,
+            "period_type": "year",
+            "period_months": 12,
             "editors": number(values[0]),
             "total_edits": number(values[1]),
             "gross_bytes": number(values[2]),
@@ -707,15 +728,21 @@ fn business_artifacts(frames: &Frames) -> Result<(Value, Value)> {
     let max_quarter = quarter(&meta.max_month)?;
     let churn = churn_rows(&frames.churn, &meta.default_wiki, "quarter", &max_quarter)?;
 
-    let mut tiers: BTreeMap<(String, String), [f64; 4]> = BTreeMap::new();
+    let mut tiers: BTreeMap<(String, i64, String), [f64; 4]> = BTreeMap::new();
     for row in 0..frames.tiers.height() {
-        if !selected_month_row(&frames.tiers, row, &meta.default_wiki, &meta.max_month)?
-            || string(&frames.tiers, "user_type", row)?.as_deref() != Some("registered")
+        if !selected_activity_tier_row(
+            &frames.tiers,
+            row,
+            &meta.default_wiki,
+            &meta.max_month,
+            "year",
+        )? || string(&frames.tiers, "user_type", row)?.as_deref() != Some("registered")
         {
             continue;
         }
         let key = (
-            quarter(&string(&frames.tiers, "year_month", row)?.context("tier month is null")?)?,
+            string(&frames.tiers, "period", row)?.context("tier period is null")?,
+            integer(&frames.tiers, "tier_rank", row)?.context("tier rank is null")?,
             string(&frames.tiers, "activity_tier", row)?.context("activity tier is null")?,
         );
         let entry = tiers.entry(key).or_default();
@@ -786,9 +813,12 @@ fn business_artifacts(frames: &Frames) -> Result<(Value, Value)> {
         "nsByWiki": meta.namespaces,
         "rangeByWiki": meta.ranges,
         "churn": churn,
-        "tiers": tiers.into_iter().map(|((period, tier), values)| json!({
+        "tiers": tiers.into_iter().map(|((period, tier_rank, tier), values)| json!({
             "period": period,
             "tier": tier,
+            "tier_rank": tier_rank,
+            "period_type": "year",
+            "period_months": 12,
             "editors": number(values[0]),
             "edits": number(values[1]),
             "net_bytes": number(values[2]),
@@ -1275,8 +1305,14 @@ pub fn write_site_fixture(output_dir: &Path) -> Result<()> {
         "gdp_activity_tiers",
         df!(
             "year_month" => &["2026-01", "2026-01"],
+            "period" => &["2026", "2026"],
+            "period_start" => &["2026-01", "2026-01"],
+            "period_end" => &["2026-12", "2026-12"],
+            "period_type" => &["year", "year"],
+            "period_months" => &[12_u32, 12],
             "user_type" => &["registered", "registered"],
-            "activity_tier" => &["active", "active"],
+            "activity_tier" => &["1-12 edits", "1-12 edits"],
+            "tier_rank" => &[0_u32, 0],
             "editors" => &[6_u32, 4],
             "total_edits" => &[12_u32, 8],
             "net_bytes" => &[90_i64, 60],
@@ -1580,6 +1616,9 @@ mod tests {
         assert_eq!(gdp["defaultWiki"], ALL_WIKIS_SCOPE);
         assert_eq!(gdp["maxMonth"], "2026-01");
         assert_eq!(gdp["output"][1]["total_edits"], 32);
+        assert_eq!(gdp["tiers"][0]["activity_tier"], "1-12 edits");
+        assert_eq!(gdp["tiers"][0]["editors"], 16);
+        assert_eq!(gdp["tiers"][0]["period_type"], "year");
         assert_eq!(
             gdp["rangeByWiki"]
                 .as_array()
@@ -1594,6 +1633,10 @@ mod tests {
         let labor = read_json(&first.path().join("defaults_labor.json"))?;
         assert_eq!(labor["churn"][1]["active_editors"], 16);
         assert_eq!(labor["churn"][1]["arrivals"], 5);
+
+        let business = read_json(&first.path().join("defaults_business.json"))?;
+        assert_eq!(business["tiers"][0]["tier"], "1-12 edits");
+        assert_eq!(business["tiers"][0]["period"], "2026");
 
         let variation = read_json(&first.path().join("defaults_edit_variation.json"))?;
         assert_eq!(variation["defaultWiki"], ALL_WIKIS_SCOPE);

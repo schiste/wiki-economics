@@ -27,7 +27,7 @@ function writeBrowserData(dist) {
   const entry = {metric: "gdp", wiki: "nlwiki", minimum_date: "2026-01", maximum_date: "2026-07",
     file, rows: 1, bytes, sha256};
   fs.writeFileSync(path.join(dist, "browser-data", "index.json"), JSON.stringify({
-    schema_version: 1, cache_schema_version: 1, generation: "a".repeat(64), license_spdx: "MIT", entries: [entry],
+    schema_version: 1, cache_schema_version: 2, generation: "a".repeat(64), license_spdx: "MIT", entries: [entry],
   }));
   return [
     {name: "browser-data-index.json", license_spdx: "MIT"},

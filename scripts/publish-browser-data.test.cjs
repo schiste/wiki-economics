@@ -23,7 +23,7 @@ function fixture() {
   fs.writeFileSync(source, "parquet-fixture");
   const bytes = fs.statSync(source).size;
   const sha256 = crypto.createHash("sha256").update(fs.readFileSync(source)).digest("hex");
-  const index = {schema_version: 1, cache_schema_version: 1, generation: "a".repeat(64), license_spdx: "MIT",
+  const index = {schema_version: 1, cache_schema_version: 2, generation: "a".repeat(64), license_spdx: "MIT",
     entries: [{metric: "gdp", wiki: "nlwiki", minimum_date: "2020-01", maximum_date: "2026-07",
       file: "browser-data/gdp/nlwiki.parquet", rows: 2, bytes, sha256}]};
   fs.writeFileSync(path.join(dataDir, "browser-data-index.json"), JSON.stringify(index));

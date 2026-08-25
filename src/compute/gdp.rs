@@ -86,44 +86,9 @@ pub fn compute(wiki: &str, base: &DataFrame, output_dir: &Path) -> Result<()> {
     write_output(&mut type_out, wiki, "gdp_user_type_share", output_dir)?;
 
     // --- 3. Activity tier breakdown ---
-    // Per editor per month: count edits, classify into tier, then aggregate
-    let tiers = base
-        .clone()
-        .group_by([col("year_month"), col("user_type"), col("event_user_id")])
-        .agg([
-            col("revision_id").count().alias("edits"),
-            col("revision_text_bytes_diff").sum().alias("net_bytes"),
-            col("revision_text_bytes_diff")
-                .filter(col("revision_text_bytes_diff").gt(lit(0i64)))
-                .sum()
-                .alias("gross_bytes"),
-        ])
-        .with_column(
-            when(col("edits").eq(lit(1)))
-                .then(lit("1 edit"))
-                .when(col("edits").lt(lit(5)))
-                .then(lit("2-4 edits"))
-                .when(col("edits").lt(lit(25)))
-                .then(lit("5-24 edits"))
-                .when(col("edits").lt(lit(100)))
-                .then(lit("25-99 edits"))
-                .otherwise(lit("100+ edits"))
-                .alias("activity_tier"),
-        )
-        .group_by([col("year_month"), col("user_type"), col("activity_tier")])
-        .agg([
-            col("event_user_id").n_unique().alias("editors"),
-            col("edits").sum().alias("total_edits"),
-            col("net_bytes").sum().alias("net_bytes"),
-            col("gross_bytes").sum().alias("gross_bytes"),
-        ])
-        .sort(
-            ["year_month", "user_type", "activity_tier"],
-            SortMultipleOptions::default(),
-        )
-        .collect()?;
-
-    let mut tier_out = tiers;
+    // Classification is recomputed at each supported period length. A power
+    // editor therefore means 100+ edits/month, 300+/quarter, or 1200+/year.
+    let mut tier_out = super::activity_tiers_all_periods(base.clone().collect()?)?;
     let wiki_col = Column::new("wiki".into(), vec![wiki; tier_out.height()]);
     tier_out.with_column(wiki_col)?;
     write_output(&mut tier_out, wiki, "gdp_activity_tiers", output_dir)?;

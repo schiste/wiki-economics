@@ -12,13 +12,13 @@ use crate::{licensing, storage};
 
 pub const INDEX_FILENAME: &str = "browser-data-index.json";
 pub const INDEX_SCHEMA_VERSION: u32 = 1;
-pub const CACHE_SCHEMA_VERSION: u32 = 1;
+pub const CACHE_SCHEMA_VERSION: u32 = 2;
 const SUMMARY_BATCH_ROWS: usize = 250_000;
 
 pub const BROWSER_METRICS: [(&str, &str); 9] = [
     ("business_funnel", "cohort_year"),
     ("gdp", "year_month"),
-    ("gdp_activity_tiers", "year_month"),
+    ("gdp_activity_tiers", "period_start"),
     ("gdp_user_type_share", "year_month"),
     ("inequality", "year_month"),
     ("labor_churn", "period"),

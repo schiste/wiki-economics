@@ -144,7 +144,7 @@ function browserDataSummary(outputDir) {
   const indexPath = path.join(outputDir, BROWSER_INDEX);
   const index = readJson(indexPath);
   if (index?.schema_version !== 1
-      || index?.cache_schema_version !== 1
+      || index?.cache_schema_version !== 2
       || !/^[0-9a-f]{64}$/.test(index?.generation || "")
       || index?.license_spdx !== ARTIFACT_LICENSE_SPDX
       || !Array.isArray(index?.entries)

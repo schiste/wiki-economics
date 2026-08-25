@@ -21,8 +21,7 @@ use crate::{
     schema, storage, workload_profile,
 };
 
-const COMPUTE_ALGORITHM_VERSION: &str =
-    "core-metrics-v7-null-page-conservation-adaptive-workload-profile";
+const COMPUTE_ALGORITHM_VERSION: &str = "core-metrics-v8-period-aware-activity-tiers";
 const DEFAULT_WEEKLY_BUCKET_COUNT: usize = 256;
 const DEFAULT_SECONDARY_BUCKET_COUNT: usize = 1;
 const WEEKLY_ROUTING_BATCH_ROWS: usize = 250_000;
@@ -681,10 +680,15 @@ fn gdp_type_share_frame(base: &DataFrame) -> Result<DataFrame> {
         .map_err(Into::into)
 }
 
-fn gdp_activity_tiers_frame(base: &DataFrame) -> Result<DataFrame> {
+fn gdp_editor_month_frame(base: &DataFrame) -> Result<DataFrame> {
     base.clone()
         .lazy()
-        .group_by([col("year_month"), col("user_type"), col("event_user_id")])
+        .group_by([
+            col("year_month"),
+            col("year_month_key"),
+            col("user_type"),
+            col("event_user_id"),
+        ])
         .agg([
             col("revision_id").count().alias("edits"),
             col("revision_text_bytes_diff").sum().alias("net_bytes"),
@@ -693,27 +697,241 @@ fn gdp_activity_tiers_frame(base: &DataFrame) -> Result<DataFrame> {
                 .sum()
                 .alias("gross_bytes"),
         ])
-        .with_column(
-            when(col("edits").eq(lit(1)))
-                .then(lit("1 edit"))
-                .when(col("edits").lt(lit(5)))
-                .then(lit("2-4 edits"))
-                .when(col("edits").lt(lit(25)))
-                .then(lit("5-24 edits"))
-                .when(col("edits").lt(lit(100)))
-                .then(lit("25-99 edits"))
-                .otherwise(lit("100+ edits"))
+        .collect()
+        .map_err(Into::into)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActivityPeriod {
+    Month,
+    Quarter,
+    Year,
+}
+
+impl ActivityPeriod {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Month => "month",
+            Self::Quarter => "quarter",
+            Self::Year => "year",
+        }
+    }
+
+    fn months(self) -> u32 {
+        match self {
+            Self::Month => 1,
+            Self::Quarter => 3,
+            Self::Year => 12,
+        }
+    }
+
+    fn key_expr(self) -> Expr {
+        match self {
+            Self::Month => col("year_month_key"),
+            Self::Quarter => {
+                let year = col("year_month_key") / lit(100_i32);
+                let month = col("year_month_key") % lit(100_i32);
+                year * lit(10_i32) + ((month - lit(1_i32)) / lit(3_i32) + lit(1_i32))
+            }
+            Self::Year => col("year_month_key") / lit(100_i32),
+        }
+    }
+
+    fn fields(self, key: i32) -> Result<(String, String, String)> {
+        match self {
+            Self::Month => {
+                let year = key / 100;
+                let month = key % 100;
+                anyhow::ensure!(
+                    (1..=12).contains(&month),
+                    "invalid activity month key {key}"
+                );
+                let period = format!("{year:04}-{month:02}");
+                Ok((period.clone(), period.clone(), period))
+            }
+            Self::Quarter => {
+                let year = key / 10;
+                let quarter = key % 10;
+                anyhow::ensure!(
+                    (1..=4).contains(&quarter),
+                    "invalid activity quarter key {key}"
+                );
+                let first_month = (quarter - 1) * 3 + 1;
+                Ok((
+                    format!("{year:04}-Q{quarter}"),
+                    format!("{year:04}-{first_month:02}"),
+                    format!("{year:04}-{:02}", first_month + 2),
+                ))
+            }
+            Self::Year => Ok((
+                format!("{key:04}"),
+                format!("{key:04}-01"),
+                format!("{key:04}-12"),
+            )),
+        }
+    }
+}
+
+fn activity_tier_labels(months: u32) -> [String; 5] {
+    let first = if months == 1 {
+        "1 edit".to_string()
+    } else {
+        format!("1-{months} edits")
+    };
+    [
+        first,
+        format!("{}-{} edits", months + 1, 5 * months - 1),
+        format!("{}-{} edits", 5 * months, 25 * months - 1),
+        format!("{}-{} edits", 25 * months, 100 * months - 1),
+        format!("{}+ edits", 100 * months),
+    ]
+}
+
+fn gdp_activity_tiers_for_period(
+    editor_months: &DataFrame,
+    period: ActivityPeriod,
+) -> Result<DataFrame> {
+    let months = period.months();
+    let labels = activity_tier_labels(months);
+    let input_edits = editor_months
+        .column("edits")?
+        .cast(&DataType::Int64)?
+        .i64()?
+        .sum()
+        .unwrap_or(0);
+    let mut frame = editor_months
+        .clone()
+        .lazy()
+        .with_column(period.key_expr().alias("period_key"))
+        .group_by([col("period_key"), col("user_type"), col("event_user_id")])
+        .agg([
+            col("edits").sum().alias("edits"),
+            col("net_bytes").sum().alias("net_bytes"),
+            col("gross_bytes").sum().alias("gross_bytes"),
+        ])
+        .with_columns([
+            when(col("edits").lt_eq(lit(months)))
+                .then(lit(labels[0].clone()))
+                .when(col("edits").lt(lit(5 * months)))
+                .then(lit(labels[1].clone()))
+                .when(col("edits").lt(lit(25 * months)))
+                .then(lit(labels[2].clone()))
+                .when(col("edits").lt(lit(100 * months)))
+                .then(lit(labels[3].clone()))
+                .otherwise(lit(labels[4].clone()))
                 .alias("activity_tier"),
-        )
-        .group_by([col("year_month"), col("user_type"), col("activity_tier")])
+            when(col("edits").lt_eq(lit(months)))
+                .then(lit(0_u32))
+                .when(col("edits").lt(lit(5 * months)))
+                .then(lit(1_u32))
+                .when(col("edits").lt(lit(25 * months)))
+                .then(lit(2_u32))
+                .when(col("edits").lt(lit(100 * months)))
+                .then(lit(3_u32))
+                .otherwise(lit(4_u32))
+                .cast(DataType::UInt32)
+                .alias("tier_rank"),
+        ])
+        .group_by([
+            col("period_key"),
+            col("user_type"),
+            col("tier_rank"),
+            col("activity_tier"),
+        ])
         .agg([
             col("event_user_id").n_unique().alias("editors"),
             col("edits").sum().alias("total_edits"),
             col("net_bytes").sum().alias("net_bytes"),
             col("gross_bytes").sum().alias("gross_bytes"),
         ])
-        .collect()
-        .map_err(Into::into)
+        .collect()?;
+
+    let output_edits = frame
+        .column("total_edits")?
+        .cast(&DataType::Int64)?
+        .i64()?
+        .sum()
+        .unwrap_or(0);
+    anyhow::ensure!(
+        input_edits == output_edits,
+        "{} activity-tier edit conservation failed: input={input_edits}, output={output_edits}",
+        period.name()
+    );
+
+    let keys = frame.column("period_key")?.i32()?;
+    let fields = keys
+        .into_no_null_iter()
+        .map(|key| period.fields(key))
+        .collect::<Result<Vec<_>>>()?;
+    let height = frame.height();
+    for column in [
+        Column::new(
+            "period".into(),
+            fields
+                .iter()
+                .map(|(value, _, _)| value.as_str())
+                .collect::<Vec<_>>(),
+        ),
+        Column::new(
+            "period_start".into(),
+            fields
+                .iter()
+                .map(|(_, value, _)| value.as_str())
+                .collect::<Vec<_>>(),
+        ),
+        Column::new(
+            "year_month".into(),
+            fields
+                .iter()
+                .map(|(_, value, _)| value.as_str())
+                .collect::<Vec<_>>(),
+        ),
+        Column::new(
+            "period_end".into(),
+            fields
+                .iter()
+                .map(|(_, _, value)| value.as_str())
+                .collect::<Vec<_>>(),
+        ),
+        Column::new("period_type".into(), vec![period.name(); height]),
+        Column::new("period_months".into(), vec![months; height]),
+    ] {
+        frame.with_column(column)?;
+    }
+    frame.drop_in_place("period_key")?;
+    sort_frame(frame, ["period", "user_type", "tier_rank"])
+}
+
+fn activity_tiers_all_periods(base: DataFrame) -> Result<DataFrame> {
+    let editor_months = gdp_editor_month_frame(&base)?;
+    concat_frames(vec![
+        gdp_activity_tiers_for_period(&editor_months, ActivityPeriod::Month)?,
+        gdp_activity_tiers_for_period(&editor_months, ActivityPeriod::Quarter)?,
+        gdp_activity_tiers_for_period(&editor_months, ActivityPeriod::Year)?,
+    ])
+}
+
+fn finish_activity_year(
+    editor_month_frames: &mut Vec<DataFrame>,
+    output_frames: &mut Vec<DataFrame>,
+) -> Result<()> {
+    if editor_month_frames.is_empty() {
+        return Ok(());
+    }
+    let editor_months = concat_frames(std::mem::take(editor_month_frames))?;
+    output_frames.push(gdp_activity_tiers_for_period(
+        &editor_months,
+        ActivityPeriod::Month,
+    )?);
+    output_frames.push(gdp_activity_tiers_for_period(
+        &editor_months,
+        ActivityPeriod::Quarter,
+    )?);
+    output_frames.push(gdp_activity_tiers_for_period(
+        &editor_months,
+        ActivityPeriod::Year,
+    )?);
+    Ok(())
 }
 
 fn labor_monthly_frame(base: &DataFrame) -> Result<DataFrame> {
@@ -1915,10 +2133,22 @@ fn compute_all_incremental(
     let mut gdp_frames = Vec::new();
     let mut gdp_type_frames = Vec::new();
     let mut gdp_tier_frames = Vec::new();
+    let mut gdp_editor_month_frames = Vec::new();
+    let mut gdp_activity_year = None;
     let mut labor_monthly_frames = Vec::new();
     let mut registered_state = RegisteredState::new();
 
     for partition in partitions {
+        if let Some(current_year) = gdp_activity_year {
+            anyhow::ensure!(
+                partition.year >= current_year,
+                "analytical partitions are not ordered chronologically"
+            );
+            if partition.year != current_year {
+                finish_activity_year(&mut gdp_editor_month_frames, &mut gdp_tier_frames)?;
+            }
+        }
+        gdp_activity_year = Some(partition.year);
         let base = load_partition(&partition.files)?;
         let year_month_key = partition
             .year_month
@@ -1933,13 +2163,14 @@ fn compute_all_incremental(
         inequality_frames.push(inequality::compute_frame(&base)?);
         gdp_frames.push(gdp_monthly_frame(&base)?);
         gdp_type_frames.push(gdp_type_share_frame(&base)?);
-        gdp_tier_frames.push(gdp_activity_tiers_frame(&base)?);
+        gdp_editor_month_frames.push(gdp_editor_month_frame(&base)?);
         labor_monthly_frames.push(labor_monthly_frame(&base)?);
         registered_state.observe_partition(&base, partition.year, year_month_key)?;
         for file in &partition.files {
             storage::discard_path_cache(file);
         }
     }
+    finish_activity_year(&mut gdp_editor_month_frames, &mut gdp_tier_frames)?;
 
     let mut inequality_out = concat_frames(inequality_frames)?;
     inequality_out =
@@ -1959,7 +2190,7 @@ fn compute_all_incremental(
     write_output(&mut gdp_type_out, wiki, "gdp_user_type_share", output_dir)?;
 
     let mut gdp_tier_out = concat_frames(gdp_tier_frames)?;
-    gdp_tier_out = sort_frame(gdp_tier_out, ["year_month", "user_type", "activity_tier"])?;
+    gdp_tier_out = sort_frame(gdp_tier_out, ["period", "user_type", "tier_rank"])?;
     add_wiki_column(&mut gdp_tier_out, wiki)?;
     write_output(&mut gdp_tier_out, wiki, "gdp_activity_tiers", output_dir)?;
 
@@ -2195,6 +2426,170 @@ mod tests {
     use super::*;
     use crate::resource_governor::ResourceBudget;
     use crate::test_support::{TestDir, init_test_tracing};
+
+    fn editor_months(edits: &[u32], month_keys: &[i32], user_ids: &[i64]) -> Result<DataFrame> {
+        anyhow::ensure!(edits.len() == month_keys.len() && edits.len() == user_ids.len());
+        DataFrame::new_infer_height(vec![
+            Column::new(
+                "year_month".into(),
+                month_keys
+                    .iter()
+                    .map(|key| format!("{:04}-{:02}", key / 100, key % 100))
+                    .collect::<Vec<_>>(),
+            ),
+            Column::new("year_month_key".into(), month_keys.to_vec()),
+            Column::new("user_type".into(), vec!["registered"; edits.len()]),
+            Column::new("event_user_id".into(), user_ids.to_vec()),
+            Column::new("edits".into(), edits.to_vec()),
+            Column::new(
+                "net_bytes".into(),
+                edits
+                    .iter()
+                    .map(|value| i64::from(*value))
+                    .collect::<Vec<_>>(),
+            ),
+            Column::new(
+                "gross_bytes".into(),
+                edits
+                    .iter()
+                    .map(|value| i64::from(*value))
+                    .collect::<Vec<_>>(),
+            ),
+        ])
+        .map_err(Into::into)
+    }
+
+    fn single_activity_tier(period: ActivityPeriod, edits: u32) -> Result<(String, u32)> {
+        let frame = editor_months(&[edits], &[202401], &[1])?;
+        let output = gdp_activity_tiers_for_period(&frame, period)?;
+        Ok((
+            output
+                .column("activity_tier")?
+                .str()?
+                .get(0)
+                .context("activity tier should be present")?
+                .to_string(),
+            output
+                .column("tier_rank")?
+                .u32()?
+                .get(0)
+                .context("activity tier rank should be present")?,
+        ))
+    }
+
+    #[test]
+    fn activity_tiers_scale_monthly_rates_at_exact_period_boundaries() -> Result<()> {
+        for (period, boundaries) in [
+            (
+                ActivityPeriod::Month,
+                [
+                    (1, "1 edit"),
+                    (2, "2-4 edits"),
+                    (5, "5-24 edits"),
+                    (25, "25-99 edits"),
+                    (100, "100+ edits"),
+                ],
+            ),
+            (
+                ActivityPeriod::Quarter,
+                [
+                    (3, "1-3 edits"),
+                    (4, "4-14 edits"),
+                    (15, "15-74 edits"),
+                    (75, "75-299 edits"),
+                    (300, "300+ edits"),
+                ],
+            ),
+            (
+                ActivityPeriod::Year,
+                [
+                    (12, "1-12 edits"),
+                    (13, "13-59 edits"),
+                    (60, "60-299 edits"),
+                    (300, "300-1199 edits"),
+                    (1200, "1200+ edits"),
+                ],
+            ),
+        ] {
+            for (rank, (edits, label)) in boundaries.into_iter().enumerate() {
+                assert_eq!(
+                    single_activity_tier(period, edits)?,
+                    (label.to_string(), rank as u32)
+                );
+            }
+        }
+        assert_eq!(
+            single_activity_tier(ActivityPeriod::Month, 99)?.0,
+            "25-99 edits"
+        );
+        assert_eq!(
+            single_activity_tier(ActivityPeriod::Quarter, 299)?.0,
+            "75-299 edits"
+        );
+        assert_eq!(
+            single_activity_tier(ActivityPeriod::Year, 1199)?.0,
+            "300-1199 edits"
+        );
+        assert_eq!(activity_tier_labels(1)[0], "1 edit");
+        assert_eq!(activity_tier_labels(3)[0], "1-3 edits");
+        assert!(ActivityPeriod::Month.fields(202400).is_err());
+        assert!(ActivityPeriod::Quarter.fields(20240).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn activity_tiers_reclassify_editors_and_conserve_edits_for_each_period() -> Result<()> {
+        let months = [202401, 202402, 202403];
+        let frame = editor_months(
+            &[100, 100, 100, 99, 99, 99],
+            &[
+                months[0], months[1], months[2], months[0], months[1], months[2],
+            ],
+            &[1, 1, 1, 2, 2, 2],
+        )?;
+        let quarterly = gdp_activity_tiers_for_period(&frame, ActivityPeriod::Quarter)?;
+        assert_eq!(quarterly.column("total_edits")?.u32()?.sum(), Some(597));
+        assert_eq!(quarterly.column("editors")?.u32()?.sum(), Some(2));
+        assert_eq!(quarterly.column("period")?.str()?.get(0), Some("2024-Q1"));
+        assert_eq!(
+            quarterly.column("period_start")?.str()?.get(0),
+            Some("2024-01")
+        );
+        assert_eq!(
+            quarterly.column("period_end")?.str()?.get(0),
+            Some("2024-03")
+        );
+        assert_eq!(quarterly.column("period_months")?.u32()?.get(0), Some(3));
+        assert!(
+            quarterly
+                .column("activity_tier")?
+                .str()?
+                .iter()
+                .flatten()
+                .any(|tier| tier == "300+ edits")
+        );
+
+        let all_periods = activity_tiers_all_periods(registered_base_df(&[
+            (Some(1), 2024, 202401, 1),
+            (Some(1), 2024, 202402, 2),
+        ])?)?;
+        let period_types = all_periods
+            .column("period_type")?
+            .str()?
+            .iter()
+            .flatten()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            period_types,
+            std::collections::BTreeSet::from(["month", "quarter", "year"])
+        );
+
+        let mut empty = Vec::new();
+        let mut output = Vec::new();
+        finish_activity_year(&mut empty, &mut output)?;
+        assert!(output.is_empty());
+        Ok(())
+    }
 
     fn sample_input_df() -> Result<DataFrame> {
         DataFrame::new_infer_height(vec![

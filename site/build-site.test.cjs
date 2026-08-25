@@ -30,7 +30,7 @@ const browserBytes = fs.statSync(browserSource).size;
 const browserSha256 = crypto.createHash("sha256").update(fs.readFileSync(browserSource)).digest("hex");
 fs.writeFileSync(path.join(outputDir, "browser-data-index.json"), JSON.stringify({
   schema_version: 1,
-  cache_schema_version: 1,
+  cache_schema_version: 2,
   generation: "a".repeat(64),
   license_spdx: "MIT",
   entries: [{metric: "gdp", wiki: "nlwiki", minimum_date: "2026-01", maximum_date: "2026-07",

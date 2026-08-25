@@ -24,7 +24,7 @@ function publishBrowserData({dataDir, distDir}) {
   const indexPath = path.join(dataDir, INDEX_FILENAME);
   const index = JSON.parse(fs.readFileSync(indexPath, "utf8"));
   if (index?.schema_version !== 1
-      || index?.cache_schema_version !== 1
+      || index?.cache_schema_version !== 2
       || !/^[0-9a-f]{64}$/.test(index?.generation || "")
       || index?.license_spdx !== "MIT"
       || !Array.isArray(index?.entries)

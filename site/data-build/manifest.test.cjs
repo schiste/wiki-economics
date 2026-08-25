@@ -107,7 +107,7 @@ function fixture(name) {
       file: `browser-data/${metric}/nlwiki.parquet`, rows: 5, bytes, sha256};
   });
   fs.writeFileSync(path.join(outputDir, "browser-data-index.json"), JSON.stringify({
-    schema_version: 1, cache_schema_version: 1, generation: "a".repeat(64), license_spdx: "MIT",
+    schema_version: 1, cache_schema_version: 2, generation: "a".repeat(64), license_spdx: "MIT",
     entries: browserEntries,
   }));
   return {analytical, dataDir, outputDir, warehouse};
