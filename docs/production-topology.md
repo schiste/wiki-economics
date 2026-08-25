@@ -16,7 +16,7 @@ this narrative document.
 | Concern | Production implementation | Persistent result |
 | --- | --- | --- |
 | Snapshot resolution and history fetch | Rust `wiki-econ` | raw Wikimedia dump shards, then strict fetch receipts |
-| History ingest | Rust + Polars | immutable warehouse and analytical Parquet generations |
+| History ingest | Rust + Polars | immutable qualified metric-input Parquet generations |
 | Core metric compute | Rust + Polars | per-wiki Parquet metrics |
 | Patrol/rights fetch and compute | Rust streaming multi-member gzip/XML path + Polars | parsed patrol/right Parquet and per-wiki patrol metrics |
 | Cross-wiki merge and dashboard defaults | Rust + Polars | merged Parquet, `defaults_*.json`, and `meta_*.json` |
@@ -96,8 +96,8 @@ app/
 data/
   raw/<wiki>/                       transient history dumps, deleted after ingest
   patrol/<wiki>/                    logging source and parsed patrol/right data
-  warehouse/<wiki>/_snapshots/<snapshot>/
-  parquet/<wiki>/_snapshots/<snapshot>/
+  metric-input/<wiki>/_snapshots/<snapshot>/
+  warehouse/, parquet/              schema-v1 rollback generations only
   snapshots/<wiki>/current-snapshot.json
   stages/                           fetch/ingest stage receipts
 
@@ -116,7 +116,9 @@ site-dist -> .site-dist.build.<run-id>.*
 capacity/                            isolated qualification reports/staging
 ```
 
-The active snapshot pointer selects exactly one immutable warehouse generation.
+The active snapshot pointer selects exactly one immutable generation and its
+manifest selects one storage layout. Schema-v2 generations contain only the
+qualified metric-input layer; schema-v1 rollback generations remain readable.
 During rollover the prior generation remains available until compute, merge,
 validation, and the site switch succeed. Raw dumps are then disposable because
 strict ingest markers validate every Parquet output. Cleanup only removes

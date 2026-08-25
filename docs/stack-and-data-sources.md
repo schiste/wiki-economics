@@ -73,7 +73,7 @@ default generation. Key dependency roles are:
 The pipeline processes data in four stages:
 
 1. **Fetch** — streams dumps from Wikimedia to disk, supports resume on range-capable servers, bounded to 4 concurrent downloads
-2. **Ingest** — decompresses bz2 into 32 MB in-memory chunks, parses CSV with Polars, writes Parquet partitions directly (no intermediate TSV on disk). Produces two layers: a wider warehouse layer and a slim analytical layer
+2. **Ingest** — decompresses bz2 into 32 MB in-memory chunks, parses CSV with Polars, and writes one qualified 13-column metric-input Parquet layer directly (no intermediate TSV or duplicate analytical layer)
 3. **Compute** — reads one monthly Parquet partition at a time, computes metrics per month. Only cohort tracking, churn rates, and funnel state are carried across months. Outputs per-wiki Parquet files
 4. **Merge** — concatenates per-wiki metric files into combined cross-wiki Parquet files
 
@@ -111,12 +111,11 @@ distributed by the current production build.
 data/
   raw/<wiki>/              ← downloaded .tsv.bz2 dumps
   patrol/<wiki>/           ← logging XML plus parsed patrol/right Parquet
-  warehouse/<wiki>/_snapshots/<snapshot>/
+  metric-input/<wiki>/_snapshots/<snapshot>/
     year=YYYY/
-      year_month=YYYY-MM/   ← wide normalized Parquet
+      year_month=YYYY-MM/   ← qualified shared compute input
+  parquet/, warehouse/      ← schema-v1 compatibility generations
   parquet/<wiki>/_snapshots/<snapshot>/
-    year=YYYY/
-      year_month=YYYY-MM/   ← slim analytical Parquet
     _markers/               ← generation-scoped ingest markers
   snapshots/<wiki>/
     current-snapshot.json   ← atomically selected generation

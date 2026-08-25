@@ -219,7 +219,7 @@ unmodified:
 - `wiki-econ-ingest` — fetch, ingest, and patrol-fetch only, per wiki.
 - `wiki-econ-compute` — compute, patrol-compute, and merge only, then
   publication-validate. Assumes a prior ingest already populated the
-  warehouse; the existing stage-fingerprint checks fail closed otherwise.
+  selected generation; the existing stage-fingerprint checks fail closed otherwise.
 - `wiki-econ-site` — the Observable production build only, against whatever
   a prior compute last published. `build-site.sh` re-verifies the
   publication gate itself, so this needs no wikis and no `run` invocation.

@@ -176,11 +176,11 @@ Do not add new long-running operational logging with unstructured `println!`.
 
 The following are live architecture contracts, not incidental implementation details:
 
-- analytical parquet lives under `data/parquet/<wiki>/_snapshots/<snapshot>/`
-- warehouse parquet lives under `data/warehouse/<wiki>/_snapshots/<snapshot>/`
+- new metric input lives under `data/metric-input/<wiki>/_snapshots/<snapshot>/`
+- `data/parquet/` and `data/warehouse/` remain schema-v1 read-compatibility paths
 - ingest markers live inside the corresponding analytical snapshot generation
 - `data/snapshots/<wiki>/current-snapshot.json` selects the only generation compute may read
-- a marker is valid only when it still resolves to the analytical and warehouse outputs it claims
+- a marker is valid only when it resolves to one exact supported layout and every output it claims
 - partition names are `year=YYYY/year_month=YYYY-MM`
 - compute prefers the partitioned incremental path when that layout exists
 - compatibility fallback for older parquet layouts still exists for both full-wiki and partitioned loads and should not be broken casually

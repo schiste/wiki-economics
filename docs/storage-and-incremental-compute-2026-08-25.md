@@ -88,19 +88,18 @@ partitioned dataset rather than requiring a physically concatenated root file.
 The existing per-wiki files remain authoritative and must still pass schema,
 row, edit-conservation, ordering, date, wiki-label, and hash validation.
 
-### Structural target
+### Qualified structural migration
 
-Ingest currently writes each revision to both a 10-column analytical layer and
-a 28-column warehouse layer. Core metrics use the analytical layer, while the
-weekly and patrol paths use only a subset of warehouse fields. The intended
-replacement is one versioned metric-input schema containing the exact union of
-columns used by every Rust metric.
+Schema-v1 ingest wrote each revision to both a 10-column analytical layer and
+a 28-column warehouse layer. Schema-v2 ingest now writes one versioned,
+13-column metric-input schema containing the exact union consumed by every
+Rust metric. Readers select the layout from the immutable generation manifest,
+so active and rollback schema-v1 generations remain valid.
 
-This migration should be accepted only after measuring its real Parquet size
-and read performance on nlwiki, ptwiki, and frwiki. It is reasonable to expect a
-large saving from eliminating duplicate values and unused warehouse columns,
-but this report deliberately does not turn that expectation into an unmeasured
-quota promise.
+The production qualification covered nlwiki, ptwiki, and frwiki under the 6 GiB
+Toolforge cgroup. It measured 5,541,144,344 bytes (5.16 GiB, 41.28%) of aggregate
+savings with a 514,822,144-byte maximum cgroup peak. See the
+[qualification report](metric-input-schema-qualification-2026-08-25.md).
 
 ## Correct incremental-compute contract
 
@@ -197,4 +196,3 @@ Wikimedia's MediaWiki History README describes each monthly release as the full
 history and cautions against treating releases as safely incremental:
 
 <https://dumps.wikimedia.org/other/mediawiki_history/readme.html>
-

@@ -11,11 +11,10 @@ The project has these distinct data layers rooted under `data/` and `output/`:
 1. `data/raw/<wiki>/...tsv.bz2`
    Wikimedia MediaWiki History dump shards fetched from `dumps.wikimedia.org`.
 
-2. `data/warehouse/<wiki>/_snapshots/<snapshot>/year=<YYYY>/year_month=<YYYY-MM>/*.parquet`
-   Filtered and normalized revision-create rows with a wider set of columns.
-
-3. `data/parquet/<wiki>/_snapshots/<snapshot>/year=<YYYY>/year_month=<YYYY-MM>/*.parquet`
-   Ultra-slim analytical layer used by the compute pipeline.
+2. `data/metric-input/<wiki>/_snapshots/<snapshot>/year=<YYYY>/year_month=<YYYY-MM>/*.parquet`
+   The qualified 13-column input contract shared by core, weekly, and patrol
+   compute for schema-v2 generations. Readers retain compatibility with the
+   historical `warehouse/` plus `parquet/` schema-v1 layout.
 
 4. `data/patrol/<wiki>/`
    Logging XML transport plus parsed patrol and rights Parquet inputs used by
@@ -32,7 +31,8 @@ checked-in `site/data-build/manifest.json.sh` entrypoint validates those
 artifacts and assembles publication provenance. Generated JSON belongs in
 `output/`, not next to the checked-in script.
 
-The online-facing layer should use `output/`. The compute pipeline should use `data/parquet/`. The `data/warehouse/` layer exists for future metric work that needs more than the analytical columns.
+The online-facing layer uses `output/`. Compute resolves the layer named by the
+selected generation manifest; new generations use `data/metric-input/`.
 
 Two operational locations matter during ingest:
 
@@ -41,7 +41,7 @@ Two operational locations matter during ingest:
 
 Marker files are the ingest completion contract for a source dump. The current
 snapshot pointer is atomically replaced only after every expected source for a
-generation has valid analytical and warehouse outputs. Compute resolves that
+generation has valid outputs in exactly one supported layout. Compute resolves that
 pointer and therefore never scans two full monthly snapshots together. The
 older generation remains a rollback source until the site build succeeds;
 `snapshot-finalize` then removes it and any pre-generation legacy partitions.
@@ -73,7 +73,7 @@ Important decisions:
 
 - Ingest now filters to `event_entity = revision` and `event_type = create` before writing parquet. This is the single biggest storage reduction in the local pipeline.
 - Ingest no longer writes a full temporary TSV to disk. It decompresses `bz2` into in-memory CSV chunks, parses them with Polars, and writes parquet partitions directly.
-- Source files are tracked by marker files inside their immutable snapshot generation. Reruns skip a source only when the marker still validates both the analytical and warehouse outputs for that source.
+- Source files are tracked by marker files inside their immutable snapshot generation. Reruns skip a source only when the marker validates its exact metric-input output inventory (or both legacy layers for schema-v1 data).
 - The full pipeline treats each source as a transaction: download to
   pipeline-owned staging, validate identity, stream-decode, validate Parquet
   footers and row totals, atomically commit the marker, then sync and delete
@@ -85,7 +85,7 @@ Important decisions:
   fail-closed completeness without rescanning the full generation once per
   source.
 - Finalization writes an atomic, deterministic `generation-manifest.json` that
-  allowlists every immutable analytical and warehouse fragment with its source
+  allowlists every immutable metric-input fragment with its source
   identity, row count, byte size, and SHA-256. Once a snapshot is selected,
   core compute, weekly aggregation, patrol compute, and their fingerprints read
   only manifest-listed fragments; filesystem discovery is retained solely for
@@ -97,21 +97,25 @@ Important decisions:
 - Versioned Wikimedia filenames must form one complete expected snapshot before `current-snapshot.json` is published. Explicit `run --version` and `ingest --version` selections ignore abandoned raw files from older snapshots.
 - Readers retain a legacy-layout fallback only until the first generation pointer is published. Underscore-prefixed staging/generation directories are never recursively scanned as ordinary data.
 - Output is partitioned by `year=` and `year_month=` because the downstream metrics are monthly. This keeps month-scoped compute exact without loading an entire wiki.
-- The slim analytical layer is intentionally duplicated from the warehouse layer. This trades some disk space for much lower compute-time scan and memory cost.
-- Ingest failure cleanup must stay symmetric: if a source fails partway through, both analytical and warehouse partial outputs are removed and the marker is not left behind.
+- New snapshots write one qualified metric-input fragment per logical output,
+  eliminating the duplicated 28-column warehouse and 10-column analytical
+  writes. Production qualification measured a 39.90–41.93% reduction across
+  nlwiki, ptwiki, and frwiki.
+- Ingest failure cleanup removes partial outputs from every supported layout
+  and never leaves a success marker behind.
 - Snapshot retirement happens only after compute, merge, and the atomic site publication all succeed. `--skip-site-build` deliberately retains the prior generation.
 
 Schema contracts live in [src/schema.rs](../src/schema.rs):
 
 - `INGEST_COLUMNS`: columns read from TSV
-- `WAREHOUSE_COLUMNS`: richer normalized revision layer
-- `ANALYTICAL_COLUMNS`: exact compute input contract
+- `METRIC_INPUT_COLUMNS`: exact shared production compute contract
+- `WAREHOUSE_COLUMNS` and `ANALYTICAL_COLUMNS`: schema-v1 compatibility
 
 If a new metric needs more fields, the preferred path is:
 
-1. add them to `WAREHOUSE_COLUMNS`
-2. decide whether they are also needed in `ANALYTICAL_COLUMNS`
-3. update the incremental compute path if they affect large-wiki processing
+1. add them to `INGEST_COLUMNS` and `METRIC_INPUT_COLUMNS`
+2. increment the ingest/generation algorithm version
+3. update every bounded consumer and requalify storage and performance
 
 ## Compute
 
@@ -124,7 +128,7 @@ Important decisions:
   - benchmark split-stage measurements
   - tests and small-wiki workflows
 - Compatibility with older parquet files is deliberate. Both `load_wiki()` and partition loading can still derive missing analytical columns from legacy data, which makes migrations safer and keeps old test fixtures useful.
-- `compute_all()` prefers the partitioned incremental path whenever the analytical layer is laid out under `year=/year_month=` directories.
+- `compute_all()` prefers the partitioned incremental path whenever the selected generation is laid out under `year=/year_month=` directories.
 - Here, “incremental” means bounded partition-at-a-time memory use inside one
   selected snapshot. Cross-snapshot metric reuse is not yet implemented; its
   content-digest contract and measured storage baseline are documented in
@@ -184,6 +188,7 @@ Do not hardcode:
 
 - `parquet/`
 - `warehouse/`
+- `metric-input/`
 - `_markers/`
 - `year=.../year_month=...`
 
