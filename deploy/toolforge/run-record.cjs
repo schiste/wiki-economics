@@ -36,6 +36,18 @@ function atomicWriteJson(file, value) {
   }
 }
 
+function atomicWriteText(file, value) {
+  fs.mkdirSync(path.dirname(file), {recursive: true});
+  const temporary = `${file}.tmp.${process.pid}`;
+  try {
+    fs.writeFileSync(temporary, `${value}\n`, {mode: 0o600});
+    fs.renameSync(temporary, file);
+  } catch (error) {
+    try { fs.unlinkSync(temporary); } catch {}
+    throw error;
+  }
+}
+
 function conciseError(value) {
   if (!value) return null;
   return String(value).replace(/[\r\n]+/g, " ").trim().slice(0, MAX_ERROR_CHARS) || null;
@@ -341,6 +353,7 @@ function writeRunRecord(environment, finalExitCode = null) {
       record,
       historyLimit(environment.WIKI_ECON_REFRESH_HISTORY_LIMIT),
     );
+    atomicWriteText(environment.WIKI_ECON_RUN_STATE_FILE, record.state);
   }
   atomicWriteJson(environment.WIKI_ECON_RUN_STATUS_FILE, record);
   return record;
@@ -420,6 +433,7 @@ module.exports = {
   appendEvent,
   appendHistory,
   atomicWriteJson,
+  atomicWriteText,
   buildRecord,
   compactHistoryEntry,
   conciseError,

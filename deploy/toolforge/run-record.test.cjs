@@ -197,6 +197,7 @@ test("atomic status writes and compact history retains and deduplicates 104 runs
   const status = JSON.parse(fs.readFileSync(environment.WIKI_ECON_RUN_STATUS_FILE, "utf8"));
   const history = fs.readFileSync(environment.WIKI_ECON_RUN_HISTORY_FILE, "utf8").trim().split("\n").map(JSON.parse);
   assert.equal(status.state, "succeeded");
+  assert.equal(fs.readFileSync(environment.WIKI_ECON_RUN_STATE_FILE, "utf8"), "succeeded\n");
   assert.equal(history.length, 104);
   assert.equal(history.at(-1).runId, environment.WIKI_ECON_RUN_ID);
   assert.equal(history.filter((entry) => entry.runId === environment.WIKI_ECON_RUN_ID).length, 1);
