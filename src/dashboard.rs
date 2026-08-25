@@ -1503,6 +1503,26 @@ mod tests {
     }
 
     #[test]
+    fn default_weekly_partition_rejects_rows_for_another_wiki() -> Result<()> {
+        let output = TestDir::new()?;
+        write_site_fixture(output.path())?;
+        let default_dir = output.path().join("frwiki");
+        let mut mislabeled =
+            ParquetReader::new(File::open(default_dir.join("page_weekly_edits.parquet"))?)
+                .finish()?;
+        mislabeled.replace(
+            "wiki",
+            Series::new("wiki".into(), vec!["nlwiki"; mislabeled.height()]).into(),
+        )?;
+        write_parquet(&default_dir, "page_weekly_edits", mislabeled)?;
+
+        let error = materialize(output.path())
+            .expect_err("a per-wiki partition carrying another wiki must fail");
+        assert!(error.to_string().contains("unexpected wiki nlwiki"));
+        Ok(())
+    }
+
+    #[test]
     fn scalar_conversion_helpers_cover_supported_and_invalid_types() -> Result<()> {
         let frame = DataFrame::new(
             1,
