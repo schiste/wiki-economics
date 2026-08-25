@@ -20,6 +20,7 @@ mod patrol;
 mod publication;
 mod resource_governor;
 mod schema;
+mod schema_benchmark;
 mod snapshot_plan;
 mod source_window;
 mod storage;
@@ -341,6 +342,20 @@ enum Commands {
         /// Required cgroup memory headroom at the observed peak
         #[arg(long, default_value_t = 25_u8)]
         minimum_memory_headroom_percent: u8,
+    },
+
+    /// Qualify the single metric-input schema against active warehouse data
+    SchemaBenchmark {
+        /// Wiki database names to qualify
+        wikis: Vec<String>,
+
+        /// Scratch root; only one projected fragment is retained at a time
+        #[arg(long)]
+        scratch_dir: PathBuf,
+
+        /// Atomic JSON qualification report path
+        #[arg(long)]
+        report: PathBuf,
     },
 
     /// Run the full pipeline: fetch → ingest → compute → merge
@@ -1216,6 +1231,18 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
                     &quota_root,
                     minimum_memory_headroom_percent,
                 )
+            })?;
+        }
+
+        Commands::SchemaBenchmark {
+            wikis,
+            scratch_dir,
+            report,
+        } => {
+            run_timed_stage("schema_benchmark", None, || {
+                let result = schema_benchmark::run(&data_dir, &scratch_dir, &report, &wikis)?;
+                println!("{}", serde_json::to_string(&result)?);
+                Ok(())
             })?;
         }
 

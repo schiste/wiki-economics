@@ -163,6 +163,24 @@ pub const ANALYTICAL_COLUMNS: &[&str] = &[
     "is_minor",
 ];
 
+/// One normalized, lossless-enough input contract for every production metric.
+/// Calendar keys and user type are derived during bounded compute reads.
+pub const METRIC_INPUT_COLUMNS: &[&str] = &[
+    "event_timestamp",
+    "event_user_id",
+    "event_user_text",
+    "event_user_is_bot_by",
+    "event_user_is_anonymous",
+    "event_user_is_temporary",
+    "page_id",
+    "page_title",
+    "page_namespace",
+    "revision_id",
+    "revision_text_bytes_diff",
+    "is_reverted",
+    "is_minor",
+];
+
 /// Build the full Polars schema for reading TSV dumps.
 /// Everything is read as String/Utf8 initially — we cast during ingest.
 pub fn dump_schema() -> Schema {
@@ -203,6 +221,27 @@ mod tests {
     fn warehouse_and_analytical_columns_match_pipeline_contracts() {
         for required in ["year_month", "year_month_key", "user_type", "is_reverted"] {
             assert_contains(WAREHOUSE_COLUMNS, required, "warehouse");
+        }
+        for required in ANALYTICAL_COLUMNS {
+            assert!(
+                METRIC_INPUT_COLUMNS.contains(required)
+                    || matches!(
+                        *required,
+                        "year_month" | "year" | "year_month_key" | "user_type"
+                    ),
+                "metric input cannot supply analytical column {required}"
+            );
+        }
+        for required in [
+            "event_timestamp",
+            "event_user_text",
+            "event_user_is_bot_by",
+            "event_user_is_anonymous",
+            "event_user_is_temporary",
+            "page_id",
+            "page_title",
+        ] {
+            assert_contains(METRIC_INPUT_COLUMNS, required, "metric input");
         }
         for required in [
             "year_month",
