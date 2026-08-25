@@ -1963,6 +1963,12 @@ fn validate_artifact_inventory(
             value.as_object().is_some_and(|object| !object.is_empty()),
             "dashboard artifact {name} must be a non-empty JSON object"
         );
+        if name.starts_with("defaults_") {
+            ensure!(
+                value["defaultWiki"].as_str() == Some("all"),
+                "dashboard artifact {name} must use the all-wiki default scope"
+            );
+        }
     }
     Ok(())
 }
@@ -2438,7 +2444,12 @@ mod tests {
                 .into_iter()
                 .filter(|name| *name != crate::browser_data::INDEX_FILENAME)
             {
-                fs::write(output.path().join(name), b"{\"ok\":true}\n")?;
+                let value = if name.starts_with("defaults_") {
+                    b"{\"defaultWiki\":\"all\"}\n".as_slice()
+                } else {
+                    b"{\"ok\":true}\n".as_slice()
+                };
+                fs::write(output.path().join(name), value)?;
             }
             Ok(Self {
                 data,
@@ -3807,6 +3818,25 @@ mod tests {
         )
         .expect_err("artifact mutation must fail");
         assert!(changed.to_string().contains("changed after merge"));
+
+        let wrong_default = Fixture::new()?;
+        fs::write(
+            wrong_default
+                .output
+                .path()
+                .join("defaults_edit_variation.json"),
+            b"{\"defaultWiki\":\"nlwiki\"}\n",
+        )
+        .expect("wrong-scope fixture should be writable");
+        wrong_default.prepare("run-wrong-default")?;
+        let error = validate(
+            wrong_default.data.path(),
+            wrong_default.output.path(),
+            &wrong_default.lifecycle_path,
+            "run-wrong-default",
+        )
+        .expect_err("a single-wiki dashboard default must fail publication");
+        assert!(error.to_string().contains("all-wiki default scope"));
         Ok(())
     }
 

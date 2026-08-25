@@ -83,13 +83,9 @@ impl Average {
 pub fn materialize(output_dir: &Path) -> Result<()> {
     let frames = Frames::read(output_dir)?;
     let dashboard_wikis = wiki_set(&frames.gdp)?;
-    let default_wiki = env::var("DEFAULT_WIKI")
-        .ok()
-        .or_else(|| dashboard_wikis.first().cloned())
-        .context("dashboard input contains no wiki")?;
     ensure!(
-        dashboard_wikis.contains(&default_wiki),
-        "DEFAULT_WIKI {default_wiki} is absent from dashboard inputs"
+        !dashboard_wikis.is_empty(),
+        "dashboard input contains no wiki"
     );
     let mut artifacts = BTreeMap::new();
     let (defaults_gdp, meta_gdp) = gdp_artifacts(&frames)?;
@@ -102,7 +98,7 @@ pub fn materialize(output_dir: &Path) -> Result<()> {
     artifacts.insert("defaults_business.json", defaults_business);
     artifacts.insert(
         "defaults_edit_variation.json",
-        edit_variation_artifact(output_dir, &default_wiki)?,
+        edit_variation_artifact(output_dir, ALL_WIKIS_SCOPE, &dashboard_wikis)?,
     );
     artifacts.insert("defaults_gdp.json", defaults_gdp);
     artifacts.insert("defaults_inequality.json", defaults_inequality);
@@ -1100,8 +1096,9 @@ fn patrol_artifacts(frames: &Frames) -> Result<(Value, Value)> {
     Ok((defaults, meta_json(&meta, true)))
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct VariationRow {
+    wiki: String,
     week: String,
     title: String,
     previous_week_edits: i64,
@@ -1115,6 +1112,7 @@ fn variation_order(left: &VariationRow, right: &VariationRow) -> Ordering {
         .wow_change
         .cmp(&left.wow_change)
         .then_with(|| right.edits.cmp(&left.edits))
+        .then_with(|| left.wiki.cmp(&right.wiki))
         .then_with(|| left.title.cmp(&right.title))
         .then_with(|| left.week.cmp(&right.week))
 }
@@ -1135,9 +1133,44 @@ fn retain_top_variation(rows: &mut Vec<VariationRow>, candidate: VariationRow) {
     }
 }
 
-fn edit_variation_artifact(output_dir: &Path, default_wiki: &str) -> Result<Value> {
+#[derive(Default)]
+struct VariationScope {
+    matching_rows: i64,
+    min_week: Option<String>,
+    max_week: Option<String>,
+    top: Vec<VariationRow>,
+}
+
+impl VariationScope {
+    fn merge(&mut self, other: &Self) -> Result<()> {
+        self.matching_rows = self
+            .matching_rows
+            .checked_add(other.matching_rows)
+            .context("page-week dashboard matching row count overflow")?;
+        if other.min_week.as_deref().is_some_and(|week| {
+            self.min_week
+                .as_deref()
+                .is_none_or(|current| week < current)
+        }) {
+            self.min_week.clone_from(&other.min_week);
+        }
+        if other.max_week.as_deref().is_some_and(|week| {
+            self.max_week
+                .as_deref()
+                .is_none_or(|current| week > current)
+        }) {
+            self.max_week.clone_from(&other.max_week);
+        }
+        for row in &other.top {
+            retain_top_variation(&mut self.top, row.clone());
+        }
+        Ok(())
+    }
+}
+
+fn scan_variation_partition(output_dir: &Path, expected_wiki: &str) -> Result<VariationScope> {
     let path = output_dir
-        .join(default_wiki)
+        .join(expected_wiki)
         .join("page_weekly_edits.parquet");
     let columns = Some(
         [
@@ -1158,10 +1191,10 @@ fn edit_variation_artifact(output_dir: &Path, default_wiki: &str) -> Result<Valu
         storage::SequentialParquetReader::new(&path, columns, LARGE_METRIC_BATCH_ROWS)?;
     let rows = reader.rows();
     ensure!(rows > 0, "page_weekly_edits.parquet is empty");
-    let mut matching_rows = 0_i64;
-    let mut min_week: Option<String> = None;
-    let mut max_week: Option<String> = None;
-    let mut top = Vec::with_capacity(20);
+    let mut scope = VariationScope {
+        top: Vec::with_capacity(20),
+        ..VariationScope::default()
+    };
     let mut observed_rows = 0_usize;
     while let Some(batch) = reader.next_batch()? {
         observed_rows = observed_rows
@@ -1170,28 +1203,31 @@ fn edit_variation_artifact(output_dir: &Path, default_wiki: &str) -> Result<Valu
         for row in 0..batch.height() {
             let wiki = string(&batch, "wiki", row)?.context("variation wiki is null")?;
             ensure!(
-                wiki == default_wiki,
+                wiki == expected_wiki,
                 "{} contains rows for unexpected wiki {wiki}",
                 path.display()
             );
             if integer(&batch, "page_namespace", row)? != Some(0) {
                 continue;
             }
-            matching_rows = matching_rows
+            scope.matching_rows = scope
+                .matching_rows
                 .checked_add(1)
                 .context("page-week dashboard matching row count overflow")?;
             let week = string(&batch, "week_start", row)?.context("variation week is null")?;
-            if min_week
+            if scope
+                .min_week
                 .as_deref()
                 .is_none_or(|minimum| week.as_str() < minimum)
             {
-                min_week = Some(week.clone());
+                scope.min_week = Some(week.clone());
             }
-            if max_week
+            if scope
+                .max_week
                 .as_deref()
                 .is_none_or(|maximum| week.as_str() > maximum)
             {
-                max_week = Some(week.clone());
+                scope.max_week = Some(week.clone());
             }
             let previous_week_edits =
                 integer(&batch, "previous_week_edits", row)?.unwrap_or_default();
@@ -1199,8 +1235,9 @@ fn edit_variation_artifact(output_dir: &Path, default_wiki: &str) -> Result<Valu
                 continue;
             }
             retain_top_variation(
-                &mut top,
+                &mut scope.top,
                 VariationRow {
+                    wiki,
                     week,
                     title: string(&batch, "page_title", row)?.context("variation title is null")?,
                     previous_week_edits,
@@ -1215,11 +1252,16 @@ fn edit_variation_artifact(output_dir: &Path, default_wiki: &str) -> Result<Valu
         observed_rows == rows,
         "page-week dashboard row conservation failed: footer {rows}, scanned {observed_rows}"
     );
-    top.sort_by(variation_order);
-    let mut best = Vec::with_capacity(top.len());
-    for row in top {
+    scope.top.sort_by(variation_order);
+    Ok(scope)
+}
+
+fn variation_payload(scope: &VariationScope) -> Result<Value> {
+    let mut best = Vec::with_capacity(scope.top.len());
+    for row in &scope.top {
         let parsed_week = NaiveDate::parse_from_str(&row.week, "%Y-%m-%d")?;
         best.push(json!({
+            "wiki": row.wiki,
             "week_start": row.week,
             "week_end": (parsed_week + Duration::days(6)).to_string(),
             "page_title": row.title,
@@ -1231,13 +1273,59 @@ fn edit_variation_artifact(output_dir: &Path, default_wiki: &str) -> Result<Valu
     }
 
     Ok(json!({
-        "defaultWiki": default_wiki,
         "summary": [{
-            "rows": matching_rows,
-            "min_week": min_week,
-            "max_week": max_week,
+            "rows": scope.matching_rows,
+            "min_week": scope.min_week,
+            "max_week": scope.max_week,
         }],
         "topVariation": best,
+    }))
+}
+
+fn edit_variation_artifact(
+    output_dir: &Path,
+    default_wiki: &str,
+    dashboard_wikis: &BTreeSet<String>,
+) -> Result<Value> {
+    ensure!(
+        !dashboard_wikis.is_empty(),
+        "dashboard input contains no wiki"
+    );
+    ensure!(
+        default_wiki == ALL_WIKIS_SCOPE || dashboard_wikis.contains(default_wiki),
+        "default edit-variation wiki {default_wiki} is absent from dashboard inputs"
+    );
+
+    let mut all = VariationScope::default();
+    let mut scopes = BTreeMap::new();
+    for wiki in dashboard_wikis {
+        let scope = scan_variation_partition(output_dir, wiki)?;
+        all.merge(&scope)?;
+        scopes.insert(wiki.clone(), scope);
+    }
+    all.top.sort_by(variation_order);
+    scopes.insert(ALL_WIKIS_SCOPE.to_string(), all);
+
+    let selected = scopes
+        .get(default_wiki)
+        .context("default edit-variation scope was not generated")?;
+    let selected_payload = variation_payload(selected)?;
+    let mut by_wiki = Vec::with_capacity(scopes.len());
+    for (wiki, scope) in &scopes {
+        let payload = variation_payload(scope)?;
+        by_wiki.push(json!({
+            "wiki": wiki,
+            "summary": payload["summary"],
+            "topVariation": payload["topVariation"],
+        }));
+    }
+
+    Ok(json!({
+        "defaultWiki": default_wiki,
+        "wikis": dashboard_wikis.iter().map(|wiki| json!({"wiki": wiki})).collect::<Vec<_>>(),
+        "summary": selected_payload["summary"],
+        "topVariation": selected_payload["topVariation"],
+        "byWiki": by_wiki,
     }))
 }
 
@@ -1606,9 +1694,12 @@ mod tests {
         assert_eq!(labor["churn"][1]["arrivals"], 5);
 
         let variation = read_json(&first.path().join("defaults_edit_variation.json"))?;
-        assert_eq!(variation["summary"][0]["rows"], 2);
+        assert_eq!(variation["defaultWiki"], ALL_WIKIS_SCOPE);
+        assert_eq!(variation["summary"][0]["rows"], 5);
         assert_eq!(variation["topVariation"][0]["week_end"], "2026-01-18");
+        assert_eq!(variation["topVariation"][0]["wiki"], "frwiki");
         assert_eq!(variation["topVariation"][0]["page_title"], "Alpha");
+        assert_eq!(variation["byWiki"].as_array().map(Vec::len), Some(4));
 
         let manifest = read_json(&first.path().join("manifest.json"))?;
         assert_eq!(manifest["generated_at"], "2026-01-31T00:00:00Z");
@@ -1850,6 +1941,7 @@ mod tests {
     #[test]
     fn variation_selector_retains_only_the_deterministic_top_twenty() {
         let row = |change: i64, edits: i64, title: &str, week: &str| VariationRow {
+            wiki: "nlwiki".to_string(),
             week: week.to_string(),
             title: title.to_string(),
             previous_week_edits: 1,
