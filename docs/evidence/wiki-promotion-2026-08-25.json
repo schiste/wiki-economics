@@ -15,6 +15,39 @@
     "image_source_ref": "toolforge-image-db7000dd73fcf57ba9a8f290de99d15c5c5a4fd9",
     "image_digest": "tools-harbor.wmcloud.org/tool-wiki-economics/tool-wiki-economics:latest@sha256:69ce5d373b228c51b885cf8a318c205bd29d6cb3cfc465f677e7ca5067d8ad0a"
   },
+  "final_operations": {
+    "commit": "e127f740fa756c4d204567d70e4c5c9ce3b7080b",
+    "ci_run_id": 32813988772,
+    "ci_conclusion": "success",
+    "binary_bytes": 110296208,
+    "binary_sha256": "1991bc8986d4a4d4f352ababab324fe818cd4af7f8d740f7debdb1c6e8db216f",
+    "image_source_ref": "toolforge-image-e127f740fa756c4d204567d70e4c5c9ce3b7080b",
+    "image_digest": "tools-harbor.wmcloud.org/tool-wiki-economics/tool-wiki-economics:latest@sha256:237f91bc44cdf5247eab5bce0b6136d835f15a89a07efa91963fc96a9f459690",
+    "clean_operator_verification": "passed",
+    "scheduled_jobs": {
+      "wiki-econ-prepare-nlwiki": "0 1 * * 0",
+      "wiki-econ-prepare-ptwiki": "10 1 * * 0",
+      "wiki-econ-prepare-frwiki": "20 1 * * 0",
+      "wiki-econ-prepare-itwiki": "0 1 * * 1",
+      "wiki-econ-prepare-svwiki": "0 1 * * 2",
+      "wiki-econ-prepare-elwiki": "0 1 * * 3",
+      "wiki-econ-publish-ready": "30 */2 * * *"
+    },
+    "cron_job_count": 7,
+    "continuous_job_count": 1,
+    "public_http_status": 200,
+    "public_response_seconds": 0.501777,
+    "public_freshness_status": "healthy",
+    "public_alerts": [],
+    "scheduled_wikis": [
+      "elwiki",
+      "frwiki",
+      "itwiki",
+      "nlwiki",
+      "ptwiki",
+      "svwiki"
+    ]
+  },
   "toolforge_quota": {
     "running_pods_used": 2,
     "running_pods_limit": 16,

@@ -5,6 +5,7 @@
 **Toolforge job limits:** 1 CPU, 6 GiB memory per job  
 **Promotion policy commit:** `cdd3958210c48a85b477f4d8e527e6a0429bb92b`  
 **Production runtime commit:** `db7000dd73fcf57ba9a8f290de99d15c5c5a4fd9`  
+**Final operations commit:** `e127f740fa756c4d204567d70e4c5c9ce3b7080b`
 **Evidence:** [`evidence/wiki-promotion-2026-08-25.json`](evidence/wiki-promotion-2026-08-25.json)
 
 ## Outcome
@@ -206,6 +207,49 @@ The deployed runtime is CI-built commit
 `c6f16d66fec0d1880aba7dd77f1f515c2ee9da2783be30145a8000a078456fca`,
 and image digest
 `sha256:69ce5d373b228c51b885cf8a318c205bd29d6cb3cfc465f677e7ca5067d8ad0a`.
+
+### Final scheduled production state
+
+After the data publication was validated, operations commit
+`e127f740fa756c4d204567d70e4c5c9ce3b7080b` was pushed, passed the complete
+remote CI workflow, and was deployed through the attested manual SSH path. It
+does not rewrite the validated data generation: it installs the final runtime,
+activates the reviewed schedules, and keeps the prior atomic site target live.
+
+The final binary is 110,296,208 bytes with SHA-256
+`1991bc8986d4a4d4f352ababab324fe818cd4af7f8d740f7debdb1c6e8db216f`.
+The Toolforge image source ref is
+`toolforge-image-e127f740fa756c4d204567d70e4c5c9ce3b7080b`, and its immutable
+digest is
+`sha256:237f91bc44cdf5247eab5bce0b6136d835f15a89a07efa91963fc96a9f459690`.
+The clean-operator verifier confirmed that binary provenance, binary checksum,
+image source commit, and image digest agree.
+
+GitHub Actions run
+[`32813988772`](https://github.com/schiste/wiki-economics/actions/runs/32813988772)
+passed for this exact SHA. Its gates included Rust and Node security policy,
+REUSE, formatting and linting, 100% line coverage, two byte-reproducible
+offline site builds, browser performance budgets, SBOM generation, sealed
+provenance, and artifact attestation.
+
+The live recurring topology is:
+
+| Job | UTC schedule |
+| --- | --- |
+| nlwiki preparation | Sunday 01:00 |
+| ptwiki preparation | Sunday 01:10 |
+| frwiki preparation | Sunday 01:20 |
+| itwiki preparation | Monday 01:00 |
+| svwiki preparation | Tuesday 01:00 |
+| elwiki preparation | Wednesday 01:00 |
+| atomic ready-candidate publisher | Every two hours at minute 30 |
+
+The legacy monolithic refresh and its ingest/compute/site components are not
+loaded as recurring jobs; they remain explicit on-demand recovery entrypoints.
+The final Toolforge inventory contained exactly seven cron jobs and one
+continuous admin service. A delayed external validation returned HTTP 200 in
+0.502 seconds, reported all six wikis as scheduled and published at snapshot
+`2026-07`, and remained `healthy` with an empty alert list.
 
 ## Three new learnings and next improvements
 
