@@ -609,6 +609,12 @@ autopatrolled,sysop</params>
                 .to_string()
         ]
     );
+    assert!(
+        !patrol_dir
+            .join("testwiki-latest-pages-logging.xml.gz")
+            .exists(),
+        "the compressed source should be released after both Parquet outputs commit"
+    );
     Ok(())
 }
 
@@ -639,6 +645,12 @@ fn fetch_patrol_rejects_irrelevant_dump_without_replacing_outputs() -> Result<()
     assert_eq!(fs::read(&rights_path)?, b"previous rights");
     assert!(!patrol_path.with_extension("parquet.tmp").exists());
     assert!(!rights_path.with_extension("parquet.tmp").exists());
+    assert!(
+        patrol_dir
+            .join("testwiki-latest-pages-logging.xml.gz")
+            .is_file(),
+        "a rejected parse must retain its source for diagnosis and recovery"
+    );
     Ok(())
 }
 

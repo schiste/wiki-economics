@@ -374,11 +374,17 @@ fn fetch_patrol_with_transport<T: PatrolTransport + ?Sized>(
     };
     fs::rename(&patrol_temp_path, &patrol_path)?;
     fs::rename(&rights_temp_path, &rights_path)?;
+    File::open(&patrol_path)?.sync_all()?;
+    File::open(&rights_path)?.sync_all()?;
+    File::open(&patrol_dir)?.sync_all()?;
+    fs::remove_file(&xml_path).context("failed to release committed patrol XML source")?;
+    File::open(&patrol_dir)?.sync_all()?;
 
     info!(
         wiki = wiki,
         patrol_events = stats.patrol_events,
         rights_events = stats.rights_events,
+        released_source = %xml_path.display(),
         "published patrol parquet outputs"
     );
     Ok(())
