@@ -9,7 +9,7 @@ How evenly are edits distributed among Wikipedia editors? This page tracks four 
 </p>
 
 ```js
-import {queryGrouped, makeRowsLoader, makeJsonLoader, fmtNum, createFilterBar, isDefaultView, parseDefaultsMeta, startLoading, doneLoading} from "./components/filters.js"
+import {filterRows, aggregateInequalityByPeriod, makeRowsLoader, makeJsonLoader, fmtNum, createFilterBar, isDefaultView, parseDefaultsMeta, startLoading, doneLoading} from "./components/filters.js"
 import {withExport, pageExportBar} from "./components/exports.js"
 
 const meta = await FileAttachment("data/meta_inequality.json").json()
@@ -41,11 +41,10 @@ if (useDefaults) {
   ineqData = defaults.data
 } else {
   const {inequality} = await loadIneqRows(wiki)
-  ineqData = queryGrouped(inequality, {
-    sumCols: ["total_editors", "total_edits", "min_editors_50pct"],
-    avgCols: ["gini", "theil", "palma"],
+  const selected = filterRows(inequality, {
     wiki, userTypes, namespaces: null, startPeriod, endPeriod, granularity
   })
+  ineqData = aggregateInequalityByPeriod(selected)
 }
 } finally {
   doneLoading()
@@ -111,7 +110,7 @@ withExport(Plot.plot({
 `Gini = (2 × Σ rank × edits_i) / (n × Total Edits) − (n + 1) / n`
 where n = number of editors, sorted by ascending edit count, rank = 1…n
 
-The standard Gini coefficient is applied to the distribution of edits across all active editors in each period. A value of 0 means perfect equality (every editor made the same number of edits), while 1 means maximum inequality (one editor made all edits). The coefficient is computed per user type and then averaged across selected types.
+The standard Gini coefficient is applied to the distribution of edits across all active editors in each wiki and month. A value of 0 means perfect equality (every editor made the same number of edits), while 1 means maximum inequality (one editor made all edits). Selected rows are weighted by active-editor count when combined. The All wikis view is therefore an editor-weighted portfolio statistic, not a pooled re-identification of people across projects.
 
 </details>
 </div>

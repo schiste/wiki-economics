@@ -11,7 +11,7 @@ In national economics, **[GDP](https://en.wikipedia.org/wiki/Gross_domestic_prod
 </div>
 
 ```js
-import {queryGrouped, filterRows, makeRowsLoader, makeJsonLoader, toPeriod, nsLabel, fmtNum, fmtBytes, createFilterBar, isDefaultView, parseDefaultsMeta, startLoading, doneLoading} from "./components/filters.js"
+import {queryGrouped, filterRows, makeRowsLoader, makeJsonLoader, toPeriod, nsLabel, fmtNum, fmtBytes, createFilterBar, isDefaultView, parseDefaultsMeta, startLoading, doneLoading, wikiMatches} from "./components/filters.js"
 import {withExport, pageExportBar} from "./components/exports.js"
 
 const meta = await FileAttachment("data/meta_gdp.json").json()
@@ -57,7 +57,7 @@ if (useDefaults) {
     wiki, userTypes, namespaces, startPeriod, endPeriod, granularity
   })
   const byTypeRows = gdpRaw
-    .filter(d => d.wiki === wiki && userTypes.includes(d.user_type) && namespaces.includes(d.page_namespace)
+    .filter(d => wikiMatches(d, wiki) && userTypes.includes(d.user_type) && namespaces.includes(d.page_namespace)
       && d.year_month >= startPeriod && d.year_month <= endPeriod)
     .map(d => ({...d, period: toPeriod(d.year_month, granularity)}))
   byType = d3.rollups(byTypeRows, v => ({
@@ -270,7 +270,7 @@ if (useDefaults) {
 } else {
   const {tiers: tiersRaw} = await loadGdpRows(wiki)
   const tiersFiltered = tiersRaw
-    .filter(d => d.wiki === wiki && userTypes.includes(d.user_type) && d.year_month >= startPeriod && d.year_month <= endPeriod)
+    .filter(d => wikiMatches(d, wiki) && userTypes.includes(d.user_type) && d.year_month >= startPeriod && d.year_month <= endPeriod)
     .map(d => ({...d, period: toPeriod(d.year_month, granularity)}))
   tiersAgg = d3.rollups(tiersFiltered, v => ({
       editors: d3.sum(v, d => d.editors),
@@ -375,7 +375,7 @@ if (useDefaults) {
 } else {
   const {typeShare: shareRaw} = await loadGdpRows(wiki)
   const shareData = shareRaw
-    .filter(d => d.wiki === wiki && d.year_month >= startPeriod && d.year_month <= endPeriod)
+    .filter(d => wikiMatches(d, wiki) && d.year_month >= startPeriod && d.year_month <= endPeriod)
     .map(d => ({...d, period: toPeriod(d.year_month, granularity)}))
   shareAgg = d3.rollups(shareData, v => d3.sum(v, d => d.edits), d => d.period, d => d.user_type)
     .flatMap(([period, types]) => {
@@ -436,7 +436,7 @@ if (useDefaults) {
 } else {
   const {gdp: gdpRaw} = await loadGdpRows(wiki)
   const sectorRows = gdpRaw
-    .filter(d => d.wiki === wiki && userTypes.includes(d.user_type) && namespaces.includes(d.page_namespace)
+    .filter(d => wikiMatches(d, wiki) && userTypes.includes(d.user_type) && namespaces.includes(d.page_namespace)
       && d.year_month >= startPeriod && d.year_month <= endPeriod)
     .map(d => ({...d, period: toPeriod(d.year_month, granularity), ns_label: nsLabel(d.page_namespace)}))
   sectorAgg = d3.rollups(sectorRows, v => ({

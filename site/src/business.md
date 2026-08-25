@@ -11,7 +11,7 @@ Wikipedia as a **[Knowledge-as-a-Service](https://en.wikipedia.org/wiki/As_a_ser
 </div>
 
 ```js
-import {queryGrouped, filterRows, makeRowsLoader, makeJsonLoader, toPeriod, fmtNum, fmtBytes, createFilterBar, isDefaultView, parseDefaultsMeta, startLoading, doneLoading} from "./components/filters.js"
+import {queryGrouped, filterRows, makeRowsLoader, makeJsonLoader, toPeriod, fmtNum, fmtBytes, createFilterBar, isDefaultView, parseDefaultsMeta, startLoading, doneLoading, aggregateChurn, aggregateCohorts, aggregateFunnel, wikiMatches} from "./components/filters.js"
 import {withExport, pageExportBar} from "./components/exports.js"
 
 const meta = await FileAttachment("data/meta_business.json").json()
@@ -54,7 +54,7 @@ if (useDefaults) {
   churnData = defaults.churn
 } else {
   const {churn: churnRaw} = await loadBizRows(wiki)
-  churnData = churnRaw.filter(d => d.wiki === wiki && d.period_type === granularity && d.period >= startP && d.period <= endP)
+  churnData = aggregateChurn(churnRaw.filter(d => wikiMatches(d, wiki) && d.period_type === granularity && d.period >= startP && d.period <= endP))
 }
 } finally {
   doneLoading()
@@ -72,7 +72,7 @@ if (useDefaults) {
 } else {
   const {tiers: tiersRaw} = await loadBizRows(wiki)
   const tierFiltered = tiersRaw
-    .filter(d => d.wiki === wiki && userTypes.includes(d.user_type) && d.year_month >= startPeriod && d.year_month <= endPeriod)
+    .filter(d => wikiMatches(d, wiki) && userTypes.includes(d.user_type) && d.year_month >= startPeriod && d.year_month <= endPeriod)
     .map(d => ({...d, period: toPeriod(d.year_month, granularity)}))
   tierAgg = d3.rollups(tierFiltered, v => ({
     editors: d3.sum(v, d => d.editors),
@@ -104,7 +104,7 @@ if (useDefaults) {
   gdpRaw = null
 } else {
   const {gdp} = await loadBizRows(wiki)
-  gdpRaw = gdp.filter(d => d.wiki === wiki)
+  gdpRaw = gdp.filter(d => wikiMatches(d, wiki))
   const gdpFiltered = gdpRaw
     .filter(d => userTypes.includes(d.user_type) && namespaces.includes(d.page_namespace) && d.year_month >= startPeriod && d.year_month <= endPeriod)
     .map(d => ({...d, period: toPeriod(d.year_month, granularity)}))
@@ -173,9 +173,7 @@ if (useDefaults) {
   }))
 } else {
   const {cohorts} = await loadBizRows(wiki)
-  cohortData = cohorts
-    .filter(d => d.wiki === wiki)
-    .sort((a, b) => d3.ascending(a.cohort_year, b.cohort_year) || d3.ascending(a.year, b.year))
+  cohortData = aggregateCohorts(cohorts.filter(d => wikiMatches(d, wiki)))
   yearlyBytesPerEditor = d3.rollups(
     gdpRaw.filter(d => userTypes.includes(d.user_type) && d.page_namespace === 0),
     v => {
@@ -319,18 +317,18 @@ try {
     funnelData = defaults.funnel
   } else {
     const {funnel} = await loadBizRows(wiki)
-    funnelData = funnel
-      .filter(d => d.wiki === wiki)
-      .map(d => ({
-        ...d,
-        pct_5: d.cohort_size > 0 ? d.reached_5 / d.cohort_size : 0,
-        pct_25: d.cohort_size > 0 ? d.reached_25 / d.cohort_size : 0,
-        pct_100: d.cohort_size > 0 ? d.reached_100 / d.cohort_size : 0,
-      }))
+    funnelData = aggregateFunnel(funnel.filter(d => wikiMatches(d, wiki)))
   }
 } finally {
   doneLoading()
 }
+
+funnelData = funnelData.map(d => ({
+  ...d,
+  pct_5: d.cohort_size > 0 ? d.reached_5 / d.cohort_size : 0,
+  pct_25: d.cohort_size > 0 ? d.reached_25 / d.cohort_size : 0,
+  pct_100: d.cohort_size > 0 ? d.reached_100 / d.cohort_size : 0,
+}))
 
 const funnelLong = funnelData.flatMap(d => [
   {cohort_year: d.cohort_year, milestone: "5+ edits", pct: d.pct_5, editors: d.reached_5, cohort_size: d.cohort_size},

@@ -17,7 +17,7 @@ Patrol metrics on this page are currently **informative and under active work**.
 </div>
 
 ```js
-import {queryGrouped, makeRowsLoader, makeJsonLoader, fmtNum, createFilterBar, isDefaultView, parseDefaultsMeta, startLoading, doneLoading} from "./components/filters.js"
+import {filterRows, aggregatePatrolByPeriod, makeRowsLoader, makeJsonLoader, fmtNum, createFilterBar, isDefaultView, parseDefaultsMeta, startLoading, doneLoading} from "./components/filters.js"
 import {withExport, pageExportBar} from "./components/exports.js"
 
 const meta = await FileAttachment("data/meta_patrol.json").json()
@@ -45,12 +45,10 @@ if (useDefaults) {
   data = defaults.patrol
 } else {
   const {patrol} = await loadPatrolRows(wiki)
-  data = queryGrouped(patrol, {
-    sumCols: ["total_patrols", "unique_patrollers", "patrol_new_pages", "patrol_diffs",
-              "patrolled_revisions", "autopatrolled_revisions", "total_revisions", "min_patrollers_50pct"],
-    avgCols: ["median_latency_hours", "p90_latency_hours", "patrol_coverage_pct", "adjusted_coverage_pct", "top1_pct"],
+  const selected = filterRows(patrol, {
     wiki, userTypes, namespaces, startPeriod, endPeriod, granularity
   })
+  data = aggregatePatrolByPeriod(selected)
 }
 } finally {
   doneLoading()
@@ -204,7 +202,7 @@ withExport(Plot.plot({
 
 `Latency = patrol_timestamp − revision_timestamp`
 
-For each patrol event, the corresponding revision's creation time is looked up and the difference computed. Median and 90th percentile are computed per period. Only events with a matched revision and latency under 1 year are included.
+For each patrol event, the corresponding revision's creation time is looked up and the difference computed. Median and 90th percentile are computed per wiki and month. Only events with a matched revision and latency under 1 year are included. When multiple wikis or months are combined, these summaries are weighted by patrol volume; they are portfolio summaries rather than a pooled event-level percentile.
 
 </details>
 </div>

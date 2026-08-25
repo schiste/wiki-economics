@@ -1,4 +1,5 @@
 import {createBrowserCache} from "./browser-cache.js";
+import {isAllWikis} from "./wiki-scope.js";
 
 const DEFAULT_INDEX_URL = "/browser-data/index.json";
 let decoderPromise;
@@ -39,13 +40,25 @@ export function validateBrowserIndex(index) {
 
 export function selectBrowserEntries(index, metrics, wiki) {
   const requested = new Set(Object.values(metrics));
-  const selected = index.entries.filter(entry => entry.wiki === wiki && requested.has(entry.metric));
+  const selected = index.entries.filter(entry =>
+    (isAllWikis(wiki) || entry.wiki === wiki) && requested.has(entry.metric));
   for (const metric of requested) {
     if (!selected.some(entry => entry.metric === metric)) {
       throw new Error(`Browser data index has no ${metric} partition for ${wiki}`);
     }
   }
+  if (isAllWikis(wiki)) {
+    const selectedWikis = new Set(selected.map(entry => entry.wiki));
+    for (const selectedWiki of selectedWikis) {
+      for (const metric of requested) {
+        if (!selected.some(entry => entry.wiki === selectedWiki && entry.metric === metric)) {
+          throw new Error(`Browser data index has no ${metric} partition for ${selectedWiki}`);
+        }
+      }
+    }
+  }
   return selected.sort((left, right) => left.metric.localeCompare(right.metric)
+    || left.wiki.localeCompare(right.wiki)
     || left.minimum_date.localeCompare(right.minimum_date) || left.file.localeCompare(right.file));
 }
 

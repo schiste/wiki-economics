@@ -102,6 +102,7 @@ node --test scripts/verify-site-reproducibility.test.cjs
 node --test scripts/publish-browser-data.test.cjs
 node --test scripts/browser-performance.test.cjs
 node --test site/browser-cache.test.mjs
+node --test site/wiki-scope.test.mjs
 
 echo "==> node --test scripts/wiki-lifecycle.test.cjs"
 node --test scripts/wiki-lifecycle.test.cjs

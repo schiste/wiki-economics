@@ -1,6 +1,25 @@
 import * as Inputs from "npm:@observablehq/inputs";
 import {html} from "npm:htl@1.0.0";
+import {
+  ALL_WIKIS,
+  combinedNamespaces,
+  combinedRange,
+  formatWiki,
+  wikiMatches,
+  withAllWikis,
+} from "./wiki-scope.js";
 export {makeRowsLoader} from "./browser-data.js";
+export {
+  ALL_WIKIS,
+  aggregateChurn,
+  aggregateCohorts,
+  aggregateFunnel,
+  aggregateInequalityByPeriod,
+  aggregatePatrolByPeriod,
+  formatWiki,
+  isAllWikis,
+  wikiMatches,
+} from "./wiki-scope.js";
 
 /**
  * Convert a YYYY-MM string to a period key based on granularity.
@@ -69,7 +88,7 @@ export function makeJsonLoader(file) {
 export function filterRows(rows, {wiki, userTypes, namespaces, startPeriod, endPeriod, granularity}) {
   return rows
     .filter(d =>
-      (wiki == null || d.wiki === wiki) &&
+      (wiki == null || wikiMatches(d, wiki)) &&
       (!userTypes?.length || userTypes.includes(d.user_type)) &&
       d.year_month >= startPeriod &&
       d.year_month <= endPeriod &&
@@ -304,6 +323,7 @@ function writeUrlFilters(value, extraKeys = []) {
 
 function resolveDefaultWiki(defaultWiki, wikis) {
   if (defaultWiki && wikis.includes(defaultWiki)) return defaultWiki;
+  if (wikis.includes(ALL_WIKIS)) return ALL_WIKIS;
   return wikis[0] ?? null;
 }
 
@@ -382,7 +402,7 @@ function persistedNamespacesForWiki(persisted, wiki) {
  * Build a human-readable description of the active filters.
  */
 export function describeFilters({wiki, userTypes, granularity, startPeriod, endPeriod, namespaces}) {
-  const wikiName = wiki ?? "all wikis";
+  const wikiName = wiki == null ? "all wikis" : formatWiki(wiki);
   const types = userTypes == null ? null : (userTypes.length ? userTypes.join(", ") : "no user types");
   const gran = granularity ?? "month";
   const period = `${startPeriod ?? "start"} to ${endPeriod ?? "end"}`;
@@ -425,12 +445,10 @@ export function queryGrouped(rows, {
  * Used to decide whether to show instant defaults or query DuckDB.
  */
 export function isDefaultView(filters, defaults, {defaultUserTypes = ["registered"], defaultGranularity = "year", defaultNamespaces = [0]} = {}) {
-  const defaultWiki = resolveDefaultWiki(
-    defaults.defaultWiki,
-    defaults.wikis.map(d => d.wiki)
-  )
+  const parsed = parseDefaultsMeta(defaults)
+  const defaultWiki = parsed.defaultWiki
   if (!defaultWiki) return false
-  const range = defaults.rangeByWiki.find(d => d.wiki === defaultWiki)
+  const range = parsed.rangeByWiki.get(defaultWiki)
   if (!range) return false
   const {wiki, userTypes, granularity, startPeriod, endPeriod, namespaces} = filters
   return wiki === defaultWiki
@@ -453,7 +471,7 @@ export function isDefaultView(filters, defaults, {defaultUserTypes = ["registere
  * Parse metadata from a defaults JSON object into the format expected by createFilterBar.
  */
 export function parseDefaultsMeta(defaults) {
-  const wikis = defaults.wikis.map(d => d.wiki)
+  const wikis = withAllWikis(defaults.wikis.map(d => d.wiki))
   let nsByWiki = null
   if (defaults.nsByWiki) {
     nsByWiki = new Map()
@@ -461,11 +479,13 @@ export function parseDefaultsMeta(defaults) {
       if (!nsByWiki.has(wiki)) nsByWiki.set(wiki, [])
       nsByWiki.get(wiki).push(page_namespace)
     }
+    if (!nsByWiki.has(ALL_WIKIS)) nsByWiki.set(ALL_WIKIS, combinedNamespaces(nsByWiki))
   }
   const rangeByWiki = new Map(
     defaults.rangeByWiki.map(d => [d.wiki, {mn: d.mn, mx: d.mx}])
   )
-  const resolvedDefaultWiki = resolveDefaultWiki(defaults.defaultWiki, wikis)
+  if (!rangeByWiki.has(ALL_WIKIS)) rangeByWiki.set(ALL_WIKIS, combinedRange(rangeByWiki))
+  const resolvedDefaultWiki = resolveDefaultWiki(defaults.defaultWiki ?? ALL_WIKIS, wikis)
   return {
     wikis,
     nsByWiki,
@@ -520,7 +540,7 @@ export function createFilterBar({
     ? persisted.granularity
     : defaultGranularity;
 
-  const wikiInput = Inputs.select(wikis, {label: "Wiki", value: initWiki});
+  const wikiInput = Inputs.select(wikis, {label: "Wiki", value: initWiki, format: formatWiki});
   const userTypesInput = showUserTypes ? Inputs.checkbox(
     USER_TYPE_OPTIONS,
     {label: "User types", value: initialUserTypes}

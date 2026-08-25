@@ -14,7 +14,7 @@ whose size and composition shift over time. This page tracks active editors, the
 </div>
 
 ```js
-import {queryGrouped, filterRows, makeRowsLoader, makeJsonLoader, toPeriod, fmtNum, fmtBytes, createFilterBar, isDefaultView, parseDefaultsMeta, startLoading, doneLoading} from "./components/filters.js"
+import {queryGrouped, filterRows, makeRowsLoader, makeJsonLoader, toPeriod, fmtNum, fmtBytes, createFilterBar, isDefaultView, parseDefaultsMeta, startLoading, doneLoading, aggregateChurn, aggregateCohorts, wikiMatches} from "./components/filters.js"
 import {withExport, pageExportBar} from "./components/exports.js"
 
 const meta = await FileAttachment("data/meta_labor.json").json()
@@ -54,7 +54,7 @@ if (useDefaults) {
     sumCols: ["unique_editors", "total_edits", "net_bytes", "reverted_edits"],
     wiki, userTypes, namespaces, startPeriod, endPeriod, granularity
   })
-  churnData = churnRaw.filter(d => d.wiki === wiki && d.period_type === granularity && d.period >= startP && d.period <= endP)
+  churnData = aggregateChurn(churnRaw.filter(d => wikiMatches(d, wiki) && d.period_type === granularity && d.period >= startP && d.period <= endP))
 }
 } finally {
   doneLoading()
@@ -128,7 +128,7 @@ withExport(Plot.plot({
 
 `Active Editors = COUNT(DISTINCT editor_id) per period`
 
-Count of unique editor IDs active in each period. An editor is counted once even if they edit multiple namespaces. When aggregated to quarter or year, the sum may count the same editor in multiple months.
+Count of unique editor IDs active in each period. An editor is counted once per wiki and month even if they edit multiple namespaces. When wikis, months, quarters, or years are combined, this is an editor-participation count: the same person may contribute more than once across projects or months because local actor IDs are not a safe global identity.
 
 </details>
 </div>
@@ -153,7 +153,7 @@ if (useDefaults) {
 } else {
   const {labor: laborRaw} = await loadLaborRows(wiki)
   const byType = laborRaw
-    .filter(d => d.wiki === wiki && d.year_month >= startPeriod && d.year_month <= endPeriod && namespaces.includes(d.page_namespace))
+    .filter(d => wikiMatches(d, wiki) && d.year_month >= startPeriod && d.year_month <= endPeriod && namespaces.includes(d.page_namespace))
     .map(d => ({...d, period: toPeriod(d.year_month, granularity)}))
   typeAgg = d3.rollups(byType, v => d3.sum(v, d => d.unique_editors), d => d.period, d => d.user_type)
     .flatMap(([period, types]) => types.map(([user_type, editors]) => ({period, user_type, editors})))
@@ -254,9 +254,7 @@ if (useDefaults) {
   cohortData = defaults.cohorts
 } else {
   const {cohorts} = await loadLaborRows(wiki)
-  cohortData = cohorts
-    .filter(d => d.wiki === wiki)
-    .sort((a, b) => d3.ascending(a.cohort_year, b.cohort_year) || d3.ascending(a.year, b.year))
+  cohortData = aggregateCohorts(cohorts.filter(d => wikiMatches(d, wiki)))
 }
 } finally {
   doneLoading()
