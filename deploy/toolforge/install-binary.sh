@@ -40,9 +40,17 @@ done < <(tar -tzf "$staged_archive")
 
 extracted="$app_root/incoming/.extract.$release_sha.$$"
 temporary_link="$app_root/.current.tmp.$$"
+publication_lock="${WIKI_ECON_PUBLICATION_LOCK_DIR:-$(dirname "$app_root")/output/.publication.lock}"
+deployment_lock_token="deploy-$release_sha-$$-$(date +%s)"
+deployment_lock_owned=0
 cleanup() {
   rm -rf -- "$extracted"
   rm -f -- "$temporary_link"
+  if [ "$deployment_lock_owned" -eq 1 ] && [ -f "$publication_lock/owner-token" ] &&
+     [ "$(<"$publication_lock/owner-token")" = "$deployment_lock_token" ]; then
+    rm -f -- "$publication_lock/owner.json" "$publication_lock/owner.json.tmp.$$" "$publication_lock/owner-token"
+    rmdir -- "$publication_lock" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT
 mkdir -m 0700 "$extracted"
@@ -133,6 +141,33 @@ esac
 chmod 0755 "$extracted/wiki-econ"
 "$extracted/wiki-econ" --help >/dev/null
 printf '%s  wiki-econ\n' "$binary_checksum" > "$extracted/wiki-econ.sha256"
+
+# Publication reads both the stable binary provenance and the image identity.
+# Serialize the release switch with the publisher so neither process can
+# observe a different runtime halfway through one fail-closed transaction.
+case "$(basename "$publication_lock")" in
+  *.lock) ;;
+  *) echo "Refusing unsafe publication lock path: $publication_lock" >&2; exit 2 ;;
+esac
+mkdir -p "$(dirname "$publication_lock")"
+if ! mkdir "$publication_lock" 2>/dev/null; then
+  echo "Publication lock is active; refusing concurrent deployment" >&2
+  [ ! -f "$publication_lock/owner.json" ] || tr -d '\n' < "$publication_lock/owner.json" >&2
+  echo >&2
+  exit 75
+fi
+chmod 700 "$publication_lock"
+printf '%s\n' "$deployment_lock_token" > "$publication_lock/owner-token"
+deployment_lock_owned=1
+jq -cn \
+  --arg run_id "deploy-$release_sha" \
+  --arg owner_token "$deployment_lock_token" \
+  --arg started_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+  --argjson pid "$$" \
+  --argjson heartbeat_epoch "$(date +%s)" \
+  '{schema_version:1,run_id:$run_id,scope:"deployment",pid:$pid,job_identity:null,process_identity:null,owner_token:$owner_token,started_at:$started_at,heartbeat_epoch:$heartbeat_epoch}' \
+  > "$publication_lock/owner.json.tmp.$$"
+mv "$publication_lock/owner.json.tmp.$$" "$publication_lock/owner.json"
 
 release_dir="$app_root/releases/$release_sha"
 mkdir -p "$app_root/releases"

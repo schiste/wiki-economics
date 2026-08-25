@@ -110,4 +110,28 @@ test("remote installation switches current only after the complete envelope vali
   assert.equal(fs.readlinkSync(path.join(appRoot, "current")), path.join("releases", sha));
   assert.equal(fs.existsSync(path.join(appRoot, "releases", sha, "wiki-econ-rust-binary.cdx.json")), true);
   assert.equal(fs.existsSync(archive.staged), false);
+  assert.equal(fs.existsSync(path.join(path.dirname(appRoot), "output", ".publication.lock")), false);
+});
+
+test("remote installation refuses to switch during an active publication", {skip: process.platform !== "linux"}, () => {
+  const appRoot = path.join(temporary, "publication-lock", "app");
+  const sha = "d".repeat(40);
+  const archive = validArchive(appRoot, sha);
+  const lock = path.join(path.dirname(appRoot), "output", ".publication.lock");
+  fs.mkdirSync(lock, {recursive: true});
+  fs.writeFileSync(path.join(lock, "owner-token"), "publisher-token\n");
+  json(path.join(lock, "owner.json"), {
+    schema_version: 1,
+    run_id: "active-publication",
+    scope: "publication",
+    owner_token: "publisher-token",
+    heartbeat_epoch: Math.floor(Date.now() / 1000),
+  });
+
+  const result = run(appRoot, sha, archive.checksum, archive.staged);
+  assert.equal(result.status, 75, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stderr, /Publication lock is active/);
+  assert.equal(fs.existsSync(path.join(appRoot, "current")), false);
+  assert.equal(fs.existsSync(archive.staged), true);
+  assert.equal(fs.readFileSync(path.join(lock, "owner-token"), "utf8"), "publisher-token\n");
 });
