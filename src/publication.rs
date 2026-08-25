@@ -1048,30 +1048,23 @@ pub(crate) fn plan_wiki_preparation(
         !target_candidate.join("ready.json").exists(),
         "run ID already identifies a ready candidate"
     );
-    if !snapshot_root.is_dir() {
-        crate::generation_lifecycle::begin(output_dir, wiki, snapshot, run_id)?;
-        return Ok(WikiPreparationPlan::Build {
-            same_snapshot_candidate: false,
-            compute_reused: false,
-            patrol_reused: false,
-        });
-    }
-
     let mut candidates = Vec::new();
-    for entry in fs::read_dir(&snapshot_root)? {
-        let candidate_dir = entry?.path();
-        let ready_path = candidate_dir.join("ready.json");
-        if !ready_path.is_file() {
-            continue;
+    if snapshot_root.is_dir() {
+        for entry in fs::read_dir(&snapshot_root)? {
+            let candidate_dir = entry?.path();
+            let ready_path = candidate_dir.join("ready.json");
+            if !ready_path.is_file() {
+                continue;
+            }
+            let ready: ReadyWikiCandidate = read_json(&ready_path)?;
+            ensure!(
+                ready.wiki == wiki && ready.snapshot == snapshot,
+                "ready candidate identity does not match preparation request"
+            );
+            validate_ready_candidate_metadata(data_dir, &candidate_dir, &ready)?;
+            reconcile_ready_generation_state(output_dir, &ready)?;
+            candidates.push((ready, candidate_dir));
         }
-        let ready: ReadyWikiCandidate = read_json(&ready_path)?;
-        ensure!(
-            ready.wiki == wiki && ready.snapshot == snapshot,
-            "ready candidate identity does not match preparation request"
-        );
-        validate_ready_candidate(data_dir, &candidate_dir, &ready)?;
-        reconcile_ready_generation_state(output_dir, &ready)?;
-        candidates.push((ready, candidate_dir));
     }
     candidates.sort_by(|(left, _), (right, _)| {
         (left.ready_at_unix, &left.run_id).cmp(&(right.ready_at_unix, &right.run_id))
@@ -1101,6 +1094,29 @@ pub(crate) fn plan_wiki_preparation(
         }
     }
 
+    // Outputs created before candidate publication was introduced live directly
+    // below `output/<wiki>`. Adopt their independently fingerprinted stages into
+    // one immutable candidate instead of recomputing an unchanged snapshot once
+    // merely to migrate the directory layout.
+    let active_output = output_dir.join(wiki);
+    let legacy_same_snapshot = !active_output.is_symlink()
+        && active_output.is_dir()
+        && storage::current_snapshot_version(data_dir, wiki)?.as_deref() == Some(snapshot);
+    if legacy_same_snapshot {
+        if reusable_compute.is_none()
+            && let Some(files) =
+                crate::compute::reusable_candidate_files(wiki, snapshot, data_dir, output_dir)?
+        {
+            reusable_compute = Some((output_dir.to_path_buf(), files));
+        }
+        if reusable_patrol.is_none()
+            && let Some(files) =
+                crate::patrol::reusable_candidate_files(wiki, snapshot, data_dir, output_dir)?
+        {
+            reusable_patrol = Some((output_dir.to_path_buf(), files));
+        }
+    }
+
     crate::generation_lifecycle::begin(output_dir, wiki, snapshot, run_id)?;
 
     reusable_compute
@@ -1118,7 +1134,7 @@ pub(crate) fn plan_wiki_preparation(
         snapshot, compute_reused, patrol_reused, "planned invalidated candidate stages"
     );
     Ok(WikiPreparationPlan::Build {
-        same_snapshot_candidate: !candidates.is_empty(),
+        same_snapshot_candidate: !candidates.is_empty() || legacy_same_snapshot,
         compute_reused,
         patrol_reused,
     })
@@ -2832,6 +2848,58 @@ mod tests {
             )
             .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn preparation_planner_adopts_fingerprinted_legacy_outputs() -> Result<()> {
+        let fixture = Fixture::new()?;
+        // Reuse the fixture helper to finish the selected input generation, then
+        // remove its candidate so the only reusable metrics are the legacy
+        // `output/<wiki>` directory created before candidate publication.
+        fixture.ready_candidate("generation-fixture")?;
+        fs::remove_dir_all(fixture.output.path().join("_candidates/nlwiki"))?;
+        crate::compute::record_candidate_fingerprint_for_test(
+            "nlwiki",
+            "2026-03",
+            fixture.data.path(),
+            fixture.output.path(),
+        )
+        .expect("legacy compute receipt should be recordable");
+        crate::patrol::record_candidate_fingerprint_for_test(
+            "nlwiki",
+            "2026-03",
+            fixture.data.path(),
+            fixture.output.path(),
+        )
+        .expect("legacy patrol receipt should be recordable");
+
+        assert_eq!(
+            plan_wiki_preparation(
+                fixture.data.path(),
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                "legacy-adoption",
+            )
+            .expect("fingerprinted legacy outputs should be adoptable"),
+            WikiPreparationPlan::Build {
+                same_snapshot_candidate: true,
+                compute_reused: true,
+                patrol_reused: true,
+            }
+        );
+        let adopted = wiki_candidate_dir(
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            "legacy-adoption",
+        )
+        .expect("adopted candidate path should resolve");
+        assert!(adopted.join("nlwiki/page_weekly_edits.parquet").is_file());
+        assert!(adopted.join("nlwiki/patrol.parquet").is_file());
+        assert!(adopted.join("_stages/compute/nlwiki.json").is_file());
+        assert!(adopted.join("_stages/patrol_compute/nlwiki.json").is_file());
         Ok(())
     }
 
