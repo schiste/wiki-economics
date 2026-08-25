@@ -116,9 +116,7 @@ pub fn materialize(output_dir: &Path) -> Result<()> {
     publish_json_set(output_dir, &artifacts)?;
     let retired = output_dir.join("defaults_overview.json");
     if retired.is_file() {
-        fs::remove_file(&retired).with_context(|| {
-            format!("failed to retire dashboard artifact {}", retired.display())
-        })?;
+        fs::remove_file(&retired)?;
         File::open(output_dir)?.sync_all()?;
     }
     Ok(())
