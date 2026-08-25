@@ -60,8 +60,9 @@ and higher resource envelope are being qualified.
 - `rebuild-image.sh` rebuilds only the Toolforge image and restarts continuous
   processes. It uses detached JSON output and polls the exact build ID, so a
   disconnected log stream or concurrent build cannot produce a false result.
-- `jobs.yaml` — three independently scheduled per-wiki candidate jobs and the
-  short `wiki-econ-publish-ready` job, plus legacy on-demand recovery jobs.
+- `jobs.yaml` — six independently scheduled per-wiki candidate jobs (elwiki,
+  frwiki, itwiki, nlwiki, ptwiki, and svwiki) and the short
+  `wiki-econ-publish-ready` job, plus legacy on-demand recovery jobs.
   The full state machine and recovery boundary are documented in
   [per-wiki candidate preparation and publication](../../docs/candidate-publication.md).
   `wiki-econ-admin` serves `/admin*` and the built static site as a separate

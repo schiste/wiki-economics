@@ -17,6 +17,10 @@ const {
 
 const SCRIPT = path.join(__dirname, "wiki-lifecycle.cjs");
 const REGISTRY = path.join(__dirname, "..", "config", "wiki-lifecycle.json");
+const OPERATOR_DOCS = [
+  path.join(__dirname, "..", "deploy", "toolforge", "README.md"),
+  path.join(__dirname, "..", "docs", "production-topology.md"),
+];
 
 function validRegistry() {
   return {
@@ -81,6 +85,17 @@ test("production lifecycle schedules qualified Toolforge wikis", () => {
     resolveRefreshWikis(registry, {WIKI_ECON_REFRESH_WIKIS: "frwiki nlwiki ptwiki"}),
     ["frwiki", "nlwiki", "ptwiki"],
   );
+});
+
+test("operator topology documents enumerate every scheduled wiki", () => {
+  const registry = loadWikiLifecycle(path.join(__dirname, ".."), {});
+  const scheduledWikis = resolveRefreshWikis(registry, {});
+  for (const documentPath of OPERATOR_DOCS) {
+    const document = fs.readFileSync(documentPath, "utf8");
+    for (const wiki of scheduledWikis) {
+      assert.match(document, new RegExp(`\\b${wiki}\\b`), `${documentPath} omits ${wiki}`);
+    }
+  }
 });
 
 test("refresh overrides are backward compatible but fail closed on disagreement", () => {

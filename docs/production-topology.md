@@ -63,10 +63,12 @@ publication receipt still matches immediately before publication. See
 There are independent Kubernetes workloads sharing the tool account's NFS
 mount:
 
-- `wiki-econ-prepare-nlwiki`, `wiki-econ-prepare-ptwiki`, and
-  `wiki-econ-prepare-frwiki` are the scheduled per-wiki preparation Jobs defined in
-  `deploy/toolforge/jobs.yaml`. Each owns only its wiki's candidate-generation
-  paths and may run without blocking other wikis or the public site.
+- `wiki-econ-prepare-elwiki`, `wiki-econ-prepare-frwiki`,
+  `wiki-econ-prepare-itwiki`, `wiki-econ-prepare-nlwiki`,
+  `wiki-econ-prepare-ptwiki`, and `wiki-econ-prepare-svwiki` are the scheduled
+  per-wiki preparation Jobs defined in `deploy/toolforge/jobs.yaml`. Each owns
+  only its wiki's candidate-generation paths and may run without blocking other
+  wikis or the public site.
 - `wiki-econ-publish-ready` is the short scheduled publisher. It alone acquires
   the global publication lock and mutates merged output and the live site.
 - `wiki-econ-refresh` is retained as an unscheduled, on-demand compatibility
@@ -164,7 +166,7 @@ For a fresh Toolforge tool account:
    `WIKI_ECON_OUTPUT_DIR`, and `WIKI_ECON_SITE_DIST_DIR` values shown in the
    [Toolforge runbook](../deploy/toolforge/README.md#operator-prerequisites).
 4. Start the Build Service webservice from `Procfile`, run the allowlisted
-   `deploy/toolforge/load-scheduled-jobs.sh`, and confirm the three preparation
+   `deploy/toolforge/load-scheduled-jobs.sh`, and confirm the six preparation
    Jobs and publisher Job are waiting for their schedules, the legacy one-off
    Jobs are absent, and the webservice is healthy.
 5. Run one preparation Job manually and then invoke
