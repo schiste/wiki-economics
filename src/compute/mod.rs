@@ -2607,19 +2607,16 @@ mod tests {
             is_reverted: [false, false],
             is_minor: [false, true],
         })?;
-        ParquetWriter::new(&mut fs::File::create(
-            next_year_dir.join("part-000.parquet"),
-        )?)
-        .finish(&mut next_year)?;
+        let next_year_path = next_year_dir.join("part-000.parquet");
+        let mut next_year_file = fs::File::create(next_year_path)?;
+        ParquetWriter::new(&mut next_year_file).finish(&mut next_year)?;
 
         compute_all_incremental(wiki, data_dir.path(), output_dir.path(), None)?;
-        let tiers = ParquetReader::new(File::open(
-            output_dir
-                .path()
-                .join(wiki)
-                .join("gdp_activity_tiers.parquet"),
-        )?)
-        .finish()?;
+        let tiers_path = output_dir
+            .path()
+            .join(wiki)
+            .join("gdp_activity_tiers.parquet");
+        let tiers = ParquetReader::new(File::open(tiers_path)?).finish()?;
         assert!(
             tiers
                 .column("period")?
