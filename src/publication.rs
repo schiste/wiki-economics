@@ -1452,7 +1452,18 @@ pub(crate) fn prepare_ready_publication(
     lifecycle_path: &Path,
     run_id: &str,
 ) -> Result<()> {
-    let selection = activate_ready_candidates(data_dir, output_dir, lifecycle_path, run_id)?;
+    let mut selection = activate_ready_candidates(data_dir, output_dir, lifecycle_path, run_id)?;
+    if selection.entries.is_empty() {
+        let published: Candidate = read_json(&output_dir.join(CANDIDATE_FILE))
+            .context("unchanged publication has no current artifact inventory")?;
+        validate_artifact_inventory(output_dir, &published)
+            .context("unchanged publication artifacts are not reusable")?;
+        selection.state = "no_op".to_string();
+        atomic_json(&selection_path(output_dir, run_id)?, &selection)?;
+        crate::observability::record_stage_skipped("publication_prepare", None);
+        info!(run_id, "ready-candidate publication is unchanged");
+        return Ok(());
+    }
     let snapshots = selection
         .entries
         .iter()
@@ -2832,6 +2843,11 @@ mod tests {
                 .exists()
         );
 
+        let page_weekly = fixture.output.path().join("page_weekly_edits.parquet");
+        let page_weekly_before = fs::read(&page_weekly)?;
+        let candidate_before = fs::read(fixture.output.path().join(CANDIDATE_FILE))?;
+        let receipt_before = fs::read(fixture.output.path().join(RECEIPT_FILE))?;
+
         prepare_ready_publication(
             fixture.data.path(),
             fixture.output.path(),
@@ -2842,7 +2858,20 @@ mod tests {
         let no_op: PublicationSelection =
             read_json(&selection_path(fixture.output.path(), "publish-noop")?)?;
         assert!(no_op.entries.is_empty());
-        commit_ready_publication(fixture.data.path(), fixture.output.path(), "publish-noop")?;
+        assert_eq!(no_op.state, "no_op");
+        assert_eq!(fs::read(page_weekly)?, page_weekly_before);
+        assert_eq!(
+            fs::read(fixture.output.path().join(CANDIDATE_FILE))?,
+            candidate_before
+        );
+        assert_eq!(
+            fs::read(fixture.output.path().join(RECEIPT_FILE))?,
+            receipt_before
+        );
+        assert!(
+            commit_ready_publication(fixture.data.path(), fixture.output.path(), "publish-noop")
+                .is_err()
+        );
 
         let candidate_2 =
             wiki_candidate_dir(fixture.output.path(), "nlwiki", "2026-03", "candidate-2")?;

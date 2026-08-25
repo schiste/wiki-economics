@@ -41,7 +41,26 @@ trap 'failure_error="command failed: $BASH_COMMAND"' ERR
 
 wiki_econ_run_cli publication-prepare-ready \
   --lifecycle "$WIKI_ECON_WIKI_LIFECYCLE_FILE"
-selection_active=1
+selection_file="$WIKI_ECON_OUTPUT_DIR/_publication_transactions/$WIKI_ECON_RUN_ID/selection.json"
+selection_state="$(node -e '
+  const fs = require("node:fs");
+  const selection = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  if (selection.schema_version !== 1 || selection.run_id !== process.argv[2]) process.exit(2);
+  process.stdout.write(String(selection.state || ""));
+' "$selection_file" "$WIKI_ECON_RUN_ID")"
+case "$selection_state" in
+  no_op)
+    echo "==> No changed ready candidates; publication is a recorded no-op"
+    exit 0
+    ;;
+  selected)
+    selection_active=1
+    ;;
+  *)
+    echo "Unexpected publication selection state: $selection_state" >&2
+    exit 1
+    ;;
+esac
 
 export WIKI_ECON_REQUIRE_PUBLICATION_GATE=1
 "$ROOT/scripts/build-site.sh" \

@@ -8,6 +8,7 @@ const {spawnSync} = require("node:child_process");
 const test = require("node:test");
 
 const script = fs.readFileSync(path.join(__dirname, "run-publish-ready.sh"), "utf8");
+const transactionScript = fs.readFileSync(path.join(__dirname, "publish-ready-transaction.sh"), "utf8");
 const lockScript = path.join(__dirname, "run-with-lock.sh");
 
 test("publisher run records resolve the authoritative published wiki set", () => {
@@ -28,4 +29,20 @@ test("publisher uses a lock path accepted and released by the lock helper", (con
   });
   assert.equal(result.status, 0, result.stderr || result.stdout);
   assert.equal(fs.existsSync(lock), false);
+});
+
+test("publisher exits before the site build for an unchanged selection", () => {
+  const prepare = transactionScript.indexOf("publication-prepare-ready");
+  const noOpState = transactionScript.indexOf("no_op)");
+  const noOpExit = transactionScript.indexOf("exit 0", noOpState);
+  const siteBuild = transactionScript.indexOf('"$ROOT/scripts/build-site.sh"');
+  const commit = transactionScript.lastIndexOf("publication-commit-ready");
+
+  assert.ok(prepare >= 0);
+  assert.ok(noOpState > prepare);
+  assert.ok(noOpExit > noOpState);
+  assert.ok(siteBuild > noOpExit);
+  assert.ok(commit > siteBuild);
+  assert.match(transactionScript, /selection\.schema_version !== 1/);
+  assert.match(transactionScript, /selection\.run_id !== process\.argv\[2\]/);
 });
