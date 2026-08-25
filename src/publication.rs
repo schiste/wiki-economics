@@ -2999,20 +2999,21 @@ mod tests {
     fn preparation_planner_rebuilds_compute_while_bootstrapping_workload_profile() -> Result<()> {
         let fixture = Fixture::new()?;
         fixture.ready_candidate("profile-source")?;
-        fs::remove_file(crate::workload_profile::profile_path(
+        let profile =
+            crate::workload_profile::profile_path(fixture.data.path(), "nlwiki", "2026-03")
+                .expect("workload profile path should resolve");
+        fs::remove_file(profile)?;
+
+        let plan = plan_wiki_preparation(
             fixture.data.path(),
+            fixture.output.path(),
             "nlwiki",
             "2026-03",
-        )?)?;
-
+            "profile-bootstrap",
+        )
+        .expect("missing workload profile should conservatively invalidate compute reuse");
         assert_eq!(
-            plan_wiki_preparation(
-                fixture.data.path(),
-                fixture.output.path(),
-                "nlwiki",
-                "2026-03",
-                "profile-bootstrap",
-            )?,
+            plan,
             WikiPreparationPlan::Build {
                 same_snapshot_candidate: true,
                 compute_reused: false,
@@ -3024,7 +3025,8 @@ mod tests {
             "nlwiki",
             "2026-03",
             "profile-bootstrap",
-        )?;
+        )
+        .expect("bootstrap candidate path should resolve");
         assert!(!target.join("nlwiki/gdp.parquet").exists());
         assert!(!target.join("nlwiki/patrol.parquet").exists());
         Ok(())
