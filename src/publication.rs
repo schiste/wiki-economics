@@ -3578,18 +3578,20 @@ mod tests {
         // because RUN_CONTEXT_FILE now points at that other, unfinished run.
         let fixture = Fixture::new()?;
         fixture.prepare("run-good")?;
-        validate(
+        let validation = validate(
             fixture.data.path(),
             fixture.output.path(),
             &fixture.lifecycle_path,
             "run-good",
-        )?;
+        );
+        validation?;
 
-        begin_selected_run(
+        let concurrent_run = begin_selected_run(
             fixture.output.path(),
             "publish-ready-in-flight",
             &BTreeMap::new(),
-        )?;
+        );
+        concurrent_run?;
 
         verify(fixture.output.path(), "a-later-standalone-site-run")?;
         Ok(())
