@@ -13,7 +13,7 @@ use crate::storage;
 use crate::wiki_lifecycle;
 
 const MERGE_BATCH_ROWS: usize = 250_000;
-const MERGE_ALGORITHM_VERSION: &str = "merged-metrics-v6-partition-native-weekly";
+const MERGE_ALGORITHM_VERSION: &str = "merged-metrics-v7-all-wikis-default";
 const GENERATOR_DEPENDENCIES: [&str; 1] = ["manifest.json.cjs"];
 const MANIFEST_GENERATOR: &str = "manifest.json.sh";
 const PARTITION_ONLY_METRICS: [&str; 1] = ["page_weekly_edits.parquet"];

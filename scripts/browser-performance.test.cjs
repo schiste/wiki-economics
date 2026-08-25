@@ -33,6 +33,19 @@ test("profile budgets reject unrelated wiki downloads, latency, memory, and row 
   assert.throws(() => validateProfile({...valid, rows: 29}, budgets, index), /index declares/);
 });
 
+test("all-wiki profile accounts for every indexed partition from network or cache", () => {
+  const entries = ["nlwiki", "ptwiki"].flatMap(wiki =>
+    ["gdp", "gdp_activity_tiers", "gdp_user_type_share"].map(metric => ({
+      metric, wiki, rows: 10, file: `browser-data/${metric}/${wiki}.parquet`,
+    })));
+  const index = {entries};
+  const valid = {wiki: "all", duration_ms: 20, rows: 60, memory_headroom_ratio: 0.5,
+    cache_hits: 3, parquet_requests: entries.slice(3).map(entry => `https://example/${entry.file}`)};
+  assert.doesNotThrow(() => validateProfile(valid, budgets, index));
+  assert.throws(() => validateProfile({...valid, cache_hits: 2}, budgets, index), /exactly the indexed/);
+  assert.throws(() => validateProfile({...valid, parquet_requests: [...valid.parquet_requests, "https://example/other.parquet"]}, budgets, index), /exactly the indexed/);
+});
+
 test("argument parser requires a distribution directory", () => {
   assert.throws(() => parseArguments([]), /dist-dir/);
   assert.equal(parseArguments(["--dist-dir", "."])["dist-dir"], process.cwd());

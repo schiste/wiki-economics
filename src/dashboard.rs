@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{Duration, NaiveDate};
 use polars::prelude::*;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -12,6 +12,7 @@ use std::path::Path;
 use crate::{licensing, storage};
 
 const LARGE_METRIC_BATCH_ROWS: usize = 250_000;
+const ALL_WIKIS_SCOPE: &str = "all";
 
 pub const ARTIFACTS: [&str; 12] = [
     "defaults_business.json",
@@ -52,22 +53,29 @@ struct CommonMeta {
 #[derive(Default)]
 struct Average {
     sum: f64,
-    count: u64,
+    weight: f64,
 }
 
 impl Average {
+    #[cfg(test)]
     fn add(&mut self, value: Option<f64>) {
-        if let Some(value) = value {
-            self.sum += value;
-            self.count += 1;
+        self.add_weighted(value, 1.0);
+    }
+
+    fn add_weighted(&mut self, value: Option<f64>, weight: f64) {
+        if let Some(value) = value
+            && weight > 0.0
+        {
+            self.sum += value * weight;
+            self.weight += weight;
         }
     }
 
     fn value(&self) -> Value {
-        if self.count == 0 {
+        if self.weight == 0.0 {
             Value::Null
         } else {
-            number(self.sum / self.count as f64)
+            number(self.sum / self.weight)
         }
     }
 }
@@ -218,28 +226,6 @@ fn number(value: f64) -> Value {
     }
 }
 
-fn any_json(df: &DataFrame, column: &str, row: usize) -> Result<Value> {
-    match df.column(column)?.get(row)? {
-        AnyValue::Null => Ok(Value::Null),
-        AnyValue::Boolean(value) => Ok(json!(value)),
-        AnyValue::String(value) => Ok(json!(value)),
-        AnyValue::StringOwned(value) => Ok(json!(value.as_str())),
-        AnyValue::UInt32(value) => Ok(json!(value)),
-        AnyValue::Int32(value) => Ok(json!(value)),
-        AnyValue::Int64(value) => Ok(json!(value)),
-        AnyValue::Float64(value) => Ok(number(value)),
-        value => bail!("unsupported dashboard JSON value {value:?} in {column}"),
-    }
-}
-
-fn row_json(df: &DataFrame, row: usize, columns: &[&str]) -> Result<Value> {
-    let mut output = Map::new();
-    for column in columns {
-        output.insert((*column).to_string(), any_json(df, column, row)?);
-    }
-    Ok(Value::Object(output))
-}
-
 fn wiki_set(df: &DataFrame) -> Result<BTreeSet<String>> {
     let mut values = BTreeSet::new();
     for row in 0..df.height() {
@@ -254,7 +240,7 @@ fn common_meta(range_frame: &DataFrame, namespace_frame: Option<&DataFrame>) -> 
     common_meta_with_overrides(
         range_frame,
         namespace_frame,
-        env::var("DEFAULT_WIKI").ok(),
+        Some(ALL_WIKIS_SCOPE.to_string()),
         env::var("MAX_MONTH").ok(),
     )
 }
@@ -266,9 +252,12 @@ fn common_meta_with_overrides(
     max_month: Option<String>,
 ) -> Result<CommonMeta> {
     let wiki_names = wiki_set(range_frame)?;
-    let default_wiki = default_wiki
-        .or_else(|| wiki_names.first().cloned())
-        .context("dashboard input contains no wiki")?;
+    ensure!(!wiki_names.is_empty(), "dashboard input contains no wiki");
+    let default_wiki = default_wiki.unwrap_or_else(|| ALL_WIKIS_SCOPE.to_string());
+    ensure!(
+        default_wiki == ALL_WIKIS_SCOPE || wiki_names.contains(&default_wiki),
+        "DEFAULT_WIKI {default_wiki} is absent from dashboard inputs"
+    );
     let observed_max = (0..range_frame.height())
         .filter_map(|row| string(range_frame, "year_month", row).transpose())
         .collect::<Result<Vec<_>>>()?
@@ -319,7 +308,12 @@ fn common_meta_with_overrides(
         }
     }
 
-    let namespaces = namespaces
+    let all_namespaces = namespaces
+        .values()
+        .flat_map(|(values, _)| values.iter().copied())
+        .collect::<BTreeSet<_>>();
+    let all_has_null = namespaces.values().any(|(_, has_null)| *has_null);
+    let mut namespaces = namespaces
         .into_iter()
         .flat_map(|(wiki, (values, has_null))| {
             let mut rows = values
@@ -331,7 +325,25 @@ fn common_meta_with_overrides(
             }
             rows
         })
-        .collect();
+        .collect::<Vec<_>>();
+    namespaces.extend(
+        all_namespaces.into_iter().map(
+            |page_namespace| json!({"wiki": ALL_WIKIS_SCOPE, "page_namespace": page_namespace}),
+        ),
+    );
+    if all_has_null {
+        namespaces.push(json!({"wiki": ALL_WIKIS_SCOPE, "page_namespace": Value::Null}));
+    }
+
+    let all_min = ranges.values().map(|range| range.0.clone()).min();
+    let all_max = ranges.values().map(|range| range.1.clone()).max();
+    let mut ranges = ranges
+        .into_iter()
+        .map(|(wiki, (mn, mx))| json!({"wiki": wiki, "mn": mn, "mx": mx}))
+        .collect::<Vec<_>>();
+    if let (Some(mn), Some(mx)) = (all_min, all_max) {
+        ranges.push(json!({"wiki": ALL_WIKIS_SCOPE, "mn": mn, "mx": mx}));
+    }
 
     Ok(CommonMeta {
         default_wiki,
@@ -341,10 +353,7 @@ fn common_meta_with_overrides(
             .map(|wiki| json!({"wiki": wiki}))
             .collect(),
         namespaces,
-        ranges: ranges
-            .into_iter()
-            .map(|(wiki, (mn, mx))| json!({"wiki": wiki, "mn": mn, "mx": mx}))
-            .collect(),
+        ranges,
     })
 }
 
@@ -380,21 +389,14 @@ fn quarter(month: &str) -> Result<String> {
 }
 
 fn selected_month_row(df: &DataFrame, row: usize, wiki: &str, max_month: &str) -> Result<bool> {
-    Ok(string(df, "wiki", row)?.as_deref() == Some(wiki)
-        && string(df, "year_month", row)?.is_some_and(|month| month.as_str() <= max_month))
+    Ok(
+        (wiki == ALL_WIKIS_SCOPE || string(df, "wiki", row)?.as_deref() == Some(wiki))
+            && string(df, "year_month", row)?.is_some_and(|month| month.as_str() <= max_month),
+    )
 }
 
-fn direct_rows<F>(df: &DataFrame, columns: &[&str], mut keep: F) -> Result<Vec<Value>>
-where
-    F: FnMut(usize) -> Result<bool>,
-{
-    let mut rows = Vec::new();
-    for row in 0..df.height() {
-        if keep(row)? {
-            rows.push(row_json(df, row, columns)?);
-        }
-    }
-    Ok(rows)
+fn selected_wiki_row(df: &DataFrame, row: usize, wiki: &str) -> Result<bool> {
+    Ok(wiki == ALL_WIKIS_SCOPE || string(df, "wiki", row)?.as_deref() == Some(wiki))
 }
 
 /// Global landing-page snapshot: content-production totals summed across every
@@ -502,6 +504,10 @@ fn overview_from_gdp(gdp: &DataFrame, meta: &CommonMeta) -> Result<Value> {
 
 fn gdp_artifacts(frames: &Frames) -> Result<(Value, Value)> {
     let meta = common_meta(&frames.gdp, Some(&frames.gdp))?;
+    gdp_artifacts_with_meta(frames, meta)
+}
+
+fn gdp_artifacts_with_meta(frames: &Frames, meta: CommonMeta) -> Result<(Value, Value)> {
     let mut output: BTreeMap<String, [f64; 6]> = BTreeMap::new();
     let mut by_type: BTreeMap<(String, String), [f64; 5]> = BTreeMap::new();
     let mut by_namespace: BTreeMap<(String, i64), [f64; 3]> = BTreeMap::new();
@@ -640,6 +646,10 @@ fn gdp_artifacts(frames: &Frames) -> Result<(Value, Value)> {
 
 fn labor_artifacts(frames: &Frames) -> Result<(Value, Value)> {
     let meta = common_meta(&frames.labor, Some(&frames.labor))?;
+    labor_artifacts_with_meta(frames, meta)
+}
+
+fn labor_artifacts_with_meta(frames: &Frames, meta: CommonMeta) -> Result<(Value, Value)> {
     let mut workforce: BTreeMap<String, [f64; 4]> = BTreeMap::new();
     let mut by_type: BTreeMap<(String, String), f64> = BTreeMap::new();
 
@@ -674,29 +684,8 @@ fn labor_artifacts(frames: &Frames) -> Result<(Value, Value)> {
         }
     }
 
-    let mut churn = direct_rows(
-        &frames.churn,
-        &[
-            "period",
-            "period_type",
-            "active_editors",
-            "arrivals",
-            "departures",
-            "arrival_rate",
-            "departure_rate",
-        ],
-        |row| {
-            Ok(
-                string(&frames.churn, "wiki", row)?.as_deref() == Some(&meta.default_wiki)
-                    && string(&frames.churn, "period_type", row)?.as_deref() == Some("month")
-                    && string(&frames.churn, "period", row)?
-                        .is_some_and(|period| period <= meta.max_month),
-            )
-        },
-    )?;
-    churn.sort_by(|left, right| string_field(left, "period").cmp(string_field(right, "period")));
-    let mut cohorts = cohort_rows(frames, &meta.default_wiki)?;
-    sort_two_strings(&mut cohorts, "cohort_year", "year");
+    let churn = churn_rows(&frames.churn, &meta.default_wiki, "month", &meta.max_month)?;
+    let cohorts = cohort_rows(frames, &meta.default_wiki)?;
 
     let defaults = json!({
         "defaultWiki": meta.default_wiki,
@@ -723,17 +712,83 @@ fn labor_artifacts(frames: &Frames) -> Result<(Value, Value)> {
 }
 
 fn cohort_rows(frames: &Frames, wiki: &str) -> Result<Vec<Value>> {
-    direct_rows(
-        &frames.cohorts,
-        &["cohort_year", "year", "initial_editors", "survived_editors"],
-        |row| Ok(string(&frames.cohorts, "wiki", row)?.as_deref() == Some(wiki)),
-    )
+    let mut grouped: BTreeMap<(String, String), [i64; 2]> = BTreeMap::new();
+    for row in 0..frames.cohorts.height() {
+        if !selected_wiki_row(&frames.cohorts, row, wiki)? {
+            continue;
+        }
+        let key = (
+            string(&frames.cohorts, "cohort_year", row)?.context("cohort year is null")?,
+            string(&frames.cohorts, "year", row)?.context("cohort activity year is null")?,
+        );
+        let entry = grouped.entry(key).or_default();
+        entry[0] += integer(&frames.cohorts, "initial_editors", row)?.unwrap_or_default();
+        entry[1] += integer(&frames.cohorts, "survived_editors", row)?.unwrap_or_default();
+    }
+    Ok(grouped
+        .into_iter()
+        .map(|((cohort_year, year), values)| {
+            json!({
+                "cohort_year": cohort_year,
+                "year": year,
+                "initial_editors": values[0],
+                "survived_editors": values[1],
+            })
+        })
+        .collect())
+}
+
+#[derive(Default)]
+struct ChurnPeriod {
+    active_editors: i64,
+    arrivals: i64,
+    departures: i64,
+}
+
+fn churn_rows(
+    frame: &DataFrame,
+    wiki: &str,
+    period_type: &str,
+    max_period: &str,
+) -> Result<Vec<Value>> {
+    let mut grouped: BTreeMap<String, ChurnPeriod> = BTreeMap::new();
+    for row in 0..frame.height() {
+        if !selected_wiki_row(frame, row, wiki)?
+            || string(frame, "period_type", row)?.as_deref() != Some(period_type)
+        {
+            continue;
+        }
+        let period = string(frame, "period", row)?.context("churn period is null")?;
+        if period.as_str() > max_period {
+            continue;
+        }
+        let entry = grouped.entry(period).or_default();
+        entry.active_editors += integer(frame, "active_editors", row)?.unwrap_or_default();
+        entry.arrivals += integer(frame, "arrivals", row)?.unwrap_or_default();
+        entry.departures += integer(frame, "departures", row)?.unwrap_or_default();
+    }
+    Ok(grouped
+        .into_iter()
+        .map(|(period, entry)| {
+            let active = entry.active_editors as f64;
+            json!({
+                "period": period,
+                "period_type": period_type,
+                "active_editors": entry.active_editors,
+                "arrivals": entry.arrivals,
+                "departures": entry.departures,
+                "arrival_rate": number(if active > 0.0 { entry.arrivals as f64 / active } else { 0.0 }),
+                "departure_rate": number(if active > 0.0 { entry.departures as f64 / active } else { 0.0 }),
+            })
+        })
+        .collect())
 }
 
 fn string_field<'a>(value: &'a Value, field: &str) -> &'a str {
     value.get(field).and_then(Value::as_str).unwrap_or("")
 }
 
+#[cfg(test)]
 fn sort_two_strings(values: &mut [Value], first: &str, second: &str) {
     values.sort_by(|left, right| {
         string_field(left, first)
@@ -754,27 +809,7 @@ fn compare_optional_i64(left: Option<i64>, right: Option<i64>) -> Ordering {
 fn business_artifacts(frames: &Frames) -> Result<(Value, Value)> {
     let meta = common_meta(&frames.labor, Some(&frames.gdp))?;
     let max_quarter = quarter(&meta.max_month)?;
-    let mut churn = direct_rows(
-        &frames.churn,
-        &[
-            "period",
-            "period_type",
-            "active_editors",
-            "arrivals",
-            "departures",
-            "arrival_rate",
-            "departure_rate",
-        ],
-        |row| {
-            Ok(
-                string(&frames.churn, "wiki", row)?.as_deref() == Some(&meta.default_wiki)
-                    && string(&frames.churn, "period_type", row)?.as_deref() == Some("quarter")
-                    && string(&frames.churn, "period", row)?
-                        .is_some_and(|period| period.as_str() <= max_quarter.as_str()),
-            )
-        },
-    )?;
-    churn.sort_by(|left, right| string_field(left, "period").cmp(string_field(right, "period")));
+    let churn = churn_rows(&frames.churn, &meta.default_wiki, "quarter", &max_quarter)?;
 
     let mut tiers: BTreeMap<(String, String), [f64; 4]> = BTreeMap::new();
     for row in 0..frames.tiers.height() {
@@ -823,27 +858,8 @@ fn business_artifacts(frames: &Frames) -> Result<(Value, Value)> {
         }
     }
 
-    let mut cohorts = cohort_rows(frames, &meta.default_wiki)?;
-    sort_two_strings(&mut cohorts, "cohort_year", "year");
-    let mut funnel =
-        direct_rows(
-            &frames.business_funnel,
-            &[
-                "cohort_year",
-                "cohort_size",
-                "reached_5",
-                "reached_25",
-                "reached_100",
-                "wiki",
-            ],
-            |row| {
-                Ok(string(&frames.business_funnel, "wiki", row)?.as_deref()
-                    == Some(&meta.default_wiki))
-            },
-        )?;
-    funnel.sort_by(|left, right| {
-        string_field(left, "cohort_year").cmp(string_field(right, "cohort_year"))
-    });
+    let cohorts = cohort_rows(frames, &meta.default_wiki)?;
+    let funnel = funnel_rows(&frames.business_funnel, &meta.default_wiki)?;
 
     let mut equilibrium = equilibrium
         .into_iter()
@@ -899,6 +915,36 @@ fn business_artifacts(frames: &Frames) -> Result<(Value, Value)> {
     Ok((defaults, meta_json(&meta, true)))
 }
 
+fn funnel_rows(frame: &DataFrame, wiki: &str) -> Result<Vec<Value>> {
+    let mut grouped: BTreeMap<String, [i64; 4]> = BTreeMap::new();
+    for row in 0..frame.height() {
+        if !selected_wiki_row(frame, row, wiki)? {
+            continue;
+        }
+        let cohort_year =
+            string(frame, "cohort_year", row)?.context("funnel cohort year is null")?;
+        let entry = grouped.entry(cohort_year).or_default();
+        for (index, column) in ["cohort_size", "reached_5", "reached_25", "reached_100"]
+            .iter()
+            .enumerate()
+        {
+            entry[index] += integer(frame, column, row)?.unwrap_or_default();
+        }
+    }
+    Ok(grouped
+        .into_iter()
+        .map(|(cohort_year, values)| {
+            json!({
+                "cohort_year": cohort_year,
+                "cohort_size": values[0],
+                "reached_5": values[1],
+                "reached_25": values[2],
+                "reached_100": values[3],
+            })
+        })
+        .collect())
+}
+
 #[derive(Default)]
 struct InequalityYear {
     total_editors: f64,
@@ -921,13 +967,20 @@ fn inequality_artifacts(frames: &Frames) -> Result<(Value, Value)> {
         let month =
             string(&frames.inequality, "year_month", row)?.context("inequality month is null")?;
         let entry = yearly.entry(year(&month)?).or_default();
-        entry.total_editors += float(&frames.inequality, "total_editors", row)?.unwrap_or_default();
+        let editors = float(&frames.inequality, "total_editors", row)?.unwrap_or_default();
+        entry.total_editors += editors;
         entry.total_edits += float(&frames.inequality, "total_edits", row)?.unwrap_or_default();
         entry.min_editors_50pct +=
             float(&frames.inequality, "min_editors_50pct", row)?.unwrap_or_default();
-        entry.gini.add(float(&frames.inequality, "gini", row)?);
-        entry.theil.add(float(&frames.inequality, "theil", row)?);
-        entry.palma.add(float(&frames.inequality, "palma", row)?);
+        entry
+            .gini
+            .add_weighted(float(&frames.inequality, "gini", row)?, editors);
+        entry
+            .theil
+            .add_weighted(float(&frames.inequality, "theil", row)?, editors);
+        entry
+            .palma
+            .add_weighted(float(&frames.inequality, "palma", row)?, editors);
     }
     let data = yearly
         .into_iter()
@@ -964,8 +1017,6 @@ struct PatrolYear {
     patrolled_revisions: f64,
     autopatrolled_revisions: f64,
     total_revisions: f64,
-    patrol_coverage_pct: Average,
-    adjusted_coverage_pct: Average,
     top1_pct: Average,
     min_patrollers_50pct: f64,
 }
@@ -982,7 +1033,8 @@ fn patrol_artifacts(frames: &Frames) -> Result<(Value, Value)> {
         }
         let month = string(&frames.patrol, "year_month", row)?.context("patrol month is null")?;
         let entry = yearly.entry(year(&month)?).or_default();
-        entry.total_patrols += float(&frames.patrol, "total_patrols", row)?.unwrap_or_default();
+        let patrols = float(&frames.patrol, "total_patrols", row)?.unwrap_or_default();
+        entry.total_patrols += patrols;
         entry.unique_patrollers +=
             float(&frames.patrol, "unique_patrollers", row)?.unwrap_or_default();
         entry.patrol_new_pages +=
@@ -990,28 +1042,35 @@ fn patrol_artifacts(frames: &Frames) -> Result<(Value, Value)> {
         entry.patrol_diffs += float(&frames.patrol, "patrol_diffs", row)?.unwrap_or_default();
         entry
             .median_latency_hours
-            .add(float(&frames.patrol, "median_latency_hours", row)?);
+            .add_weighted(float(&frames.patrol, "median_latency_hours", row)?, patrols);
         entry
             .p90_latency_hours
-            .add(float(&frames.patrol, "p90_latency_hours", row)?);
+            .add_weighted(float(&frames.patrol, "p90_latency_hours", row)?, patrols);
         entry.patrolled_revisions +=
             float(&frames.patrol, "patrolled_revisions", row)?.unwrap_or_default();
         entry.autopatrolled_revisions +=
             float(&frames.patrol, "autopatrolled_revisions", row)?.unwrap_or_default();
         entry.total_revisions += float(&frames.patrol, "total_revisions", row)?.unwrap_or_default();
         entry
-            .patrol_coverage_pct
-            .add(float(&frames.patrol, "patrol_coverage_pct", row)?);
-        entry
-            .adjusted_coverage_pct
-            .add(float(&frames.patrol, "adjusted_coverage_pct", row)?);
-        entry.top1_pct.add(float(&frames.patrol, "top1_pct", row)?);
+            .top1_pct
+            .add_weighted(float(&frames.patrol, "top1_pct", row)?, patrols);
         entry.min_patrollers_50pct +=
             float(&frames.patrol, "min_patrollers_50pct", row)?.unwrap_or_default();
     }
     let patrol = yearly
         .into_iter()
         .map(|(period, entry)| {
+            let patrol_coverage_pct = if entry.total_revisions > 0.0 {
+                entry.patrolled_revisions / entry.total_revisions * 100.0
+            } else {
+                0.0
+            };
+            let adjusted_coverage_pct = if entry.total_revisions > 0.0 {
+                (entry.patrolled_revisions + entry.autopatrolled_revisions) / entry.total_revisions
+                    * 100.0
+            } else {
+                0.0
+            };
             json!({
                 "period": period,
                 "total_patrols": number(entry.total_patrols),
@@ -1023,8 +1082,8 @@ fn patrol_artifacts(frames: &Frames) -> Result<(Value, Value)> {
                 "patrolled_revisions": number(entry.patrolled_revisions),
                 "autopatrolled_revisions": number(entry.autopatrolled_revisions),
                 "total_revisions": number(entry.total_revisions),
-                "patrol_coverage_pct": entry.patrol_coverage_pct.value(),
-                "adjusted_coverage_pct": entry.adjusted_coverage_pct.value(),
+                "patrol_coverage_pct": number(patrol_coverage_pct),
+                "adjusted_coverage_pct": number(adjusted_coverage_pct),
                 "top1_pct": entry.top1_pct.value(),
                 "min_patrollers_50pct": number(entry.min_patrollers_50pct),
             })
@@ -1528,9 +1587,23 @@ mod tests {
             serde_json::from_slice::<Value>(&first_bytes)?;
         }
         let gdp = read_json(&first.path().join("defaults_gdp.json"))?;
-        assert_eq!(gdp["defaultWiki"], "frwiki");
+        assert_eq!(gdp["defaultWiki"], ALL_WIKIS_SCOPE);
         assert_eq!(gdp["maxMonth"], "2026-01");
-        assert_eq!(gdp["output"][1]["total_edits"], 12);
+        assert_eq!(gdp["output"][1]["total_edits"], 32);
+        assert_eq!(
+            gdp["rangeByWiki"]
+                .as_array()
+                .and_then(|ranges| ranges.iter().find(|range| range["wiki"] == ALL_WIKIS_SCOPE)),
+            Some(&json!({"wiki": ALL_WIKIS_SCOPE, "mn": "2025-12", "mx": "2026-01"}))
+        );
+
+        let inequality = read_json(&first.path().join("defaults_inequality.json"))?;
+        assert_eq!(inequality["data"][0]["total_editors"], 16);
+        assert_eq!(inequality["data"][0]["gini"], json!(0.425));
+
+        let labor = read_json(&first.path().join("defaults_labor.json"))?;
+        assert_eq!(labor["churn"][1]["active_editors"], 16);
+        assert_eq!(labor["churn"][1]["arrivals"], 5);
 
         let variation = read_json(&first.path().join("defaults_edit_variation.json"))?;
         assert_eq!(variation["summary"][0]["rows"], 2);
@@ -1547,6 +1620,56 @@ mod tests {
             manifest["toolforge_open_licensing"]["open_data_license_spdx"],
             "MIT"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn scoped_dashboard_reducers_enforce_bounds_and_zero_denominators() -> Result<()> {
+        let output = TestDir::new()?;
+        write_site_fixture(output.path())?;
+        let mut frames = Frames::read(output.path())?;
+
+        let gdp_meta = common_meta_with_overrides(
+            &frames.gdp,
+            Some(&frames.gdp),
+            Some("nlwiki".to_string()),
+            Some("2025-12".to_string()),
+        )
+        .expect("bounded GDP metadata is valid");
+        let (gdp, _) = gdp_artifacts_with_meta(&frames, gdp_meta)?;
+        assert_eq!(gdp["output"].as_array().map(Vec::len), Some(1));
+        assert_eq!(gdp["typeShare"].as_array().map(Vec::len), Some(0));
+
+        let labor_meta = common_meta_with_overrides(
+            &frames.labor,
+            Some(&frames.labor),
+            Some("nlwiki".to_string()),
+            Some("2025-12".to_string()),
+        )
+        .expect("bounded labor metadata is valid");
+        let (labor, _) = labor_artifacts_with_meta(&frames, labor_meta)?;
+        assert_eq!(labor["workforce"].as_array().map(Vec::len), Some(1));
+
+        assert_eq!(cohort_rows(&frames, "nlwiki")?.len(), 2);
+        assert_eq!(funnel_rows(&frames.business_funnel, "nlwiki")?.len(), 2);
+        assert_eq!(
+            churn_rows(&frames.churn, "nlwiki", "month", "2025-12")?.len(),
+            1
+        );
+
+        frames
+            .patrol
+            .replace(
+                "total_revisions",
+                Column::new(
+                    "total_revisions".into(),
+                    vec![0_i64; frames.patrol.height()],
+                ),
+            )
+            .expect("fixture patrol schema accepts a zero revision denominator");
+        let (patrol, _) = patrol_artifacts(&frames)?;
+        assert_eq!(patrol["patrol"][0]["patrol_coverage_pct"], 0);
+        assert_eq!(patrol["patrol"][0]["adjusted_coverage_pct"], 0);
         Ok(())
     }
 
@@ -1632,7 +1755,6 @@ mod tests {
             1,
             vec![
                 Column::new("null".into(), &[None::<i64>]),
-                Column::new("boolean".into(), &[true]),
                 Column::new("string".into(), &["value"]),
                 Column::new("u32".into(), &[7_u32]),
                 Column::new("u64".into(), &[11_u64]),
@@ -1659,15 +1781,6 @@ mod tests {
         assert!(float(&frame, "string", 0).is_err());
         assert!(float(&frame, "u64", 0).is_err());
 
-        assert_eq!(any_json(&frame, "null", 0)?, Value::Null);
-        assert_eq!(any_json(&frame, "boolean", 0)?, json!(true));
-        assert_eq!(any_json(&frame, "string", 0)?, json!("value"));
-        assert_eq!(any_json(&frame, "u32", 0)?, json!(7));
-        assert_eq!(any_json(&frame, "i32", 0)?, json!(-3));
-        assert_eq!(any_json(&frame, "i64", 0)?, json!(-9));
-        assert_eq!(any_json(&frame, "f64", 0)?, json!(1.5));
-        assert!(any_json(&frame, "u64", 0).is_err());
-
         assert_eq!(number(f64::NAN), Value::Null);
         assert_eq!(number(4.0), json!(4));
         assert_eq!(number(1.25), json!(1.25));
@@ -1688,10 +1801,13 @@ mod tests {
         )
         .expect("metadata fixture columns have equal lengths");
         let meta = common_meta(&range, Some(&range))?;
-        assert_eq!(meta.default_wiki, "awiki");
+        assert_eq!(meta.default_wiki, ALL_WIKIS_SCOPE);
         assert_eq!(
             meta.ranges,
-            vec![json!({"wiki":"awiki", "mn":"2026-01", "mx":"2026-03"})]
+            vec![
+                json!({"wiki":"awiki", "mn":"2026-01", "mx":"2026-03"}),
+                json!({"wiki":ALL_WIKIS_SCOPE, "mn":"2026-01", "mx":"2026-03"}),
+            ]
         );
         assert!(
             meta.namespaces

@@ -32,19 +32,29 @@ function validateStaticBudgets(distDir, budgets) {
 }
 
 function validateProfile(profile, budgets, index) {
-  if (profile.parquet_requests.some(request => !request.includes(`/${profile.wiki}.parquet`))) {
+  const metrics = new Set(["gdp", "gdp_activity_tiers", "gdp_user_type_share"]);
+  const selectedEntries = index.entries.filter(entry => metrics.has(entry.metric)
+    && (profile.wiki === "all" || entry.wiki === profile.wiki));
+  if (profile.wiki === "all") {
+    const requestedFiles = new Set(profile.parquet_requests.map(request => new URL(request).pathname.slice(1)));
+    const indexedFiles = new Set(selectedEntries.map(entry => entry.file));
+    if ([...requestedFiles].some(file => !indexedFiles.has(file))
+        || requestedFiles.size + profile.cache_hits !== selectedEntries.length) {
+      throw new Error("all-wiki query did not load exactly the indexed metric partitions");
+    }
+  } else if (profile.parquet_requests.some(request => !request.includes(`/${profile.wiki}.parquet`))) {
     throw new Error(`${profile.wiki} downloaded data for an unrelated wiki`);
   }
-  if (profile.parquet_requests.length === 0) throw new Error(`${profile.wiki} custom query downloaded no Parquet data`);
+  if (profile.wiki !== "all" && profile.parquet_requests.length === 0) {
+    throw new Error(`${profile.wiki} custom query downloaded no Parquet data`);
+  }
   if (profile.memory_headroom_ratio < budgets.reference_device.minimum_memory_headroom_ratio) {
     throw new Error(`${profile.wiki} browser memory headroom ${(profile.memory_headroom_ratio * 100).toFixed(1)}% is below budget`);
   }
   if (profile.duration_ms > budgets.custom_query.maximum_duration_ms) {
     throw new Error(`${profile.wiki} custom query took ${profile.duration_ms.toFixed(1)}ms`);
   }
-  const indexedRows = index.entries.filter(entry => entry.wiki === profile.wiki
-    && ["gdp", "gdp_activity_tiers", "gdp_user_type_share"].includes(entry.metric))
-    .reduce((total, entry) => total + entry.rows, 0);
+  const indexedRows = selectedEntries.reduce((total, entry) => total + entry.rows, 0);
   if (profile.rows !== indexedRows) throw new Error(`${profile.wiki} loaded ${profile.rows} rows; index declares ${indexedRows}`);
   const normalized = profile.duration_ms / Math.max(1, profile.rows / 1000);
   if (normalized > budgets.custom_query.maximum_duration_ms_per_1000_rows) {
@@ -195,6 +205,16 @@ async function runBrowserPerformance({distDir, budgets}) {
 
     let requestStart = requests.length;
     await navigate(cdp, `${origin}/gdp.html`);
+    const defaultWikiPicker = await evaluate(cdp, `(() => {
+      const select = document.querySelector(".filters-bar select");
+      return select ? {
+        label: select.selectedOptions[0]?.textContent?.trim(),
+        query: new URLSearchParams(location.search).get("wiki"),
+      } : null;
+    })()`);
+    if (defaultWikiPicker?.query !== "all" || defaultWikiPicker?.label !== "All wikis") {
+      throw new Error(`default wiki picker is invalid: ${JSON.stringify(defaultWikiPicker)}`);
+    }
     const defaultRequests = requests.slice(requestStart);
     if (defaultRequests.some(url => url.endsWith(".parquet") || url.endsWith(".wasm")
         || url.endsWith("/browser-data/index.json") || url.includes("/apache-arrow@")
@@ -203,7 +223,7 @@ async function runBrowserPerformance({distDir, budgets}) {
     }
 
     const profiles = [];
-    for (const wiki of Object.keys(budgets.fixtures).sort()) {
+    for (const wiki of [...Object.keys(budgets.fixtures).sort(), "all"]) {
       requestStart = requests.length;
       let peakHeapUsed = 0;
       const sampler = setInterval(() => {
