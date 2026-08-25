@@ -70,7 +70,7 @@ fi
 mkdir -p "$WIKI_ECON_OUTPUT_DIR" "$WIKI_ECON_SITE_DIST_DIR"
 for artifact in \\
   manifest.json defaults_business.json defaults_gdp.json defaults_inequality.json \\
-  defaults_labor.json defaults_patrol.json defaults_edit_variation.json \\
+  defaults_labor.json defaults_overview.json defaults_patrol.json defaults_edit_variation.json \\
   business_funnel.parquet gdp.parquet gdp_activity_tiers.parquet \\
   gdp_user_type_share.parquet inequality.parquet labor_churn.parquet \\
   labor_cohorts.parquet labor_monthly.parquet patrol.parquet

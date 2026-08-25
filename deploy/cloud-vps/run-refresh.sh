@@ -41,6 +41,7 @@ for required in \
   defaults_gdp.json \
   defaults_inequality.json \
   defaults_labor.json \
+  defaults_overview.json \
   defaults_patrol.json \
   meta_business.json \
   meta_gdp.json \

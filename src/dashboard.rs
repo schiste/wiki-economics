@@ -13,12 +13,13 @@ use crate::{licensing, storage};
 
 const LARGE_METRIC_BATCH_ROWS: usize = 250_000;
 
-pub const ARTIFACTS: [&str; 11] = [
+pub const ARTIFACTS: [&str; 12] = [
     "defaults_business.json",
     "defaults_edit_variation.json",
     "defaults_gdp.json",
     "defaults_inequality.json",
     "defaults_labor.json",
+    "defaults_overview.json",
     "defaults_patrol.json",
     "meta_business.json",
     "meta_gdp.json",
@@ -88,6 +89,7 @@ pub fn materialize(output_dir: &Path) -> Result<()> {
     let (defaults_business, meta_business) = business_artifacts(&frames)?;
     let (defaults_inequality, meta_inequality) = inequality_artifacts(&frames)?;
     let (defaults_patrol, meta_patrol) = patrol_artifacts(&frames)?;
+    let defaults_overview = overview_artifacts(&frames)?;
 
     artifacts.insert("defaults_business.json", defaults_business);
     artifacts.insert(
@@ -97,6 +99,7 @@ pub fn materialize(output_dir: &Path) -> Result<()> {
     artifacts.insert("defaults_gdp.json", defaults_gdp);
     artifacts.insert("defaults_inequality.json", defaults_inequality);
     artifacts.insert("defaults_labor.json", defaults_labor);
+    artifacts.insert("defaults_overview.json", defaults_overview);
     artifacts.insert("defaults_patrol.json", defaults_patrol);
     artifacts.insert("meta_business.json", meta_business);
     artifacts.insert("meta_gdp.json", meta_gdp);
@@ -392,6 +395,105 @@ where
         }
     }
     Ok(rows)
+}
+
+/// Global landing-page snapshot: content-production totals summed across every
+/// published wiki, plus a per-wiki breakdown for deep-linking into `/gdp`.
+fn overview_artifacts(frames: &Frames) -> Result<Value> {
+    let meta = common_meta(&frames.gdp, None)?;
+
+    let mut trend: BTreeMap<String, [f64; 5]> = BTreeMap::new();
+    let mut by_wiki_month: BTreeMap<(String, String), [f64; 5]> = BTreeMap::new();
+
+    for row in 0..frames.gdp.height() {
+        let Some(wiki) = string(&frames.gdp, "wiki", row)? else {
+            continue;
+        };
+        let Some(month) = string(&frames.gdp, "year_month", row)? else {
+            continue;
+        };
+        if month > meta.max_month {
+            continue;
+        }
+        let Some(namespace) = integer(&frames.gdp, "page_namespace", row)? else {
+            continue;
+        };
+        let user_type = string(&frames.gdp, "user_type", row)?.context("gdp user type is null")?;
+        if namespace != 0 || user_type != "registered" {
+            continue;
+        }
+
+        let period = year(&month)?;
+        let trend_entry = trend.entry(period).or_default();
+        let wiki_entry = by_wiki_month.entry((wiki, month)).or_default();
+        for (index, column) in [
+            "gross_bytes_added",
+            "net_bytes",
+            "total_edits",
+            "reverted_edits",
+            "unique_editors",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let value = float(&frames.gdp, column, row)?.unwrap_or_default();
+            trend_entry[index] += value;
+            wiki_entry[index] += value;
+        }
+    }
+
+    // Wikis currently reach the dashboard on different schedules (see
+    // config/wiki-lifecycle.json): some refresh live, others are frozen at an
+    // import cutoff. Rather than collapsing that into one global "as of"
+    // month -- which would either hide stale wikis behind a fresher headline
+    // or drag the headline down to the stalest wiki -- each row below reports
+    // the wiki's own latest available month, so the gap stays visible.
+    let mut latest_by_wiki: BTreeMap<String, String> = BTreeMap::new();
+    for (wiki, month) in by_wiki_month.keys() {
+        latest_by_wiki
+            .entry(wiki.clone())
+            .and_modify(|current: &mut String| {
+                if *month > *current {
+                    *current = month.clone();
+                }
+            })
+            .or_insert_with(|| month.clone());
+    }
+
+    let by_wiki: Vec<Value> = latest_by_wiki
+        .iter()
+        .map(|(wiki, month)| {
+            let values = by_wiki_month
+                .get(&(wiki.clone(), month.clone()))
+                .copied()
+                .unwrap_or_default();
+            json!({
+                "wiki": wiki,
+                "latestMonth": month,
+                "gross_bytes_added": number(values[0]),
+                "net_bytes": number(values[1]),
+                "total_edits": number(values[2]),
+                "reverted_edits": number(values[3]),
+                "unique_editors": number(values[4]),
+            })
+        })
+        .collect();
+
+    Ok(json!({
+        "defaultWiki": meta.default_wiki,
+        "maxMonth": meta.max_month,
+        "wikis": meta.wikis,
+        "rangeByWiki": meta.ranges,
+        "trend": trend.into_iter().map(|(period, values)| json!({
+            "period": period,
+            "gross_bytes_added": number(values[0]),
+            "net_bytes": number(values[1]),
+            "total_edits": number(values[2]),
+            "reverted_edits": number(values[3]),
+            "unique_editors": number(values[4]),
+        })).collect::<Vec<_>>(),
+        "byWiki": by_wiki,
+    }))
 }
 
 fn gdp_artifacts(frames: &Frames) -> Result<(Value, Value)> {

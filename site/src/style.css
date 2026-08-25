@@ -935,6 +935,14 @@ body.wk-loading .wk-progress-status {
   font-weight: 600;
 }
 
+/* Row-level flag for data that has fallen behind other rows in the same
+   table (e.g. a wiki whose import cutoff lags the rest). Unused until a
+   caller opts a row in -- see site/src/index.md. */
+.wk-stale-row {
+  background: color-mix(in srgb, var(--wk-amber) 12%, transparent);
+  box-shadow: inset 3px 0 0 var(--wk-amber);
+}
+
 /* ── Methodology collapsibles ───────────────────────────── */
 
 .methodology {

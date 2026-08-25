@@ -27,6 +27,7 @@ const REQUIRED_ATTACHMENTS = [
   "defaults_gdp.json",
   "defaults_inequality.json",
   "defaults_labor.json",
+  "defaults_overview.json",
   "defaults_patrol.json",
   "manifest.json",
   "meta_business.json",

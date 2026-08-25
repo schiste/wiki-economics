@@ -496,6 +496,7 @@ for required in \
   defaults_gdp.json \
   defaults_inequality.json \
   defaults_labor.json \
+  defaults_overview.json \
   defaults_patrol.json \
   defaults_edit_variation.json \
   business_funnel.parquet \

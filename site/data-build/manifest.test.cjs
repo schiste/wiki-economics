@@ -17,8 +17,8 @@ const metrics = [
 ];
 const dashboardJson = [
   "defaults_business", "defaults_edit_variation", "defaults_gdp", "defaults_inequality",
-  "defaults_labor", "defaults_patrol", "meta_business", "meta_gdp", "meta_inequality",
-  "meta_labor", "meta_patrol",
+  "defaults_labor", "defaults_overview", "defaults_patrol", "meta_business", "meta_gdp",
+  "meta_inequality", "meta_labor", "meta_patrol",
 ];
 const browserMetrics = metrics.filter((metric) => metric !== "page_weekly_edits");
 
