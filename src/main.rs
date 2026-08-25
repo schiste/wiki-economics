@@ -476,6 +476,7 @@ trait Ops {
         scratch_dir: &Path,
         report_path: &Path,
         wikis: &[String],
+        run_id: Option<&str>,
     ) -> Result<()>;
     fn merge_outputs(&self, output_dir: &std::path::Path, run_id: Option<&str>) -> Result<()>;
     fn finalize_snapshot(&self, wiki: &str, data_dir: &std::path::Path) -> Result<()>;
@@ -714,8 +715,16 @@ impl Ops for RealOps {
         scratch_dir: &Path,
         report_path: &Path,
         wikis: &[String],
+        run_id: Option<&str>,
     ) -> Result<()> {
-        let result = schema_benchmark::run(data_dir, scratch_dir, report_path, wikis)?;
+        let result = schema_benchmark::run(
+            data_dir,
+            scratch_dir,
+            report_path,
+            wikis,
+            std::env::var("WIKI_ECON_SOURCE_COMMIT").ok().as_deref(),
+            run_id,
+        )?;
         println!("{}", serde_json::to_string(&result)?);
         Ok(())
     }
@@ -1259,7 +1268,7 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             report,
         } => {
             run_timed_stage("schema_benchmark", None, || {
-                ops.schema_benchmark(&data_dir, &scratch_dir, &report, &wikis)
+                ops.schema_benchmark(&data_dir, &scratch_dir, &report, &wikis, run_id.as_deref())
             })?;
         }
 
@@ -1751,6 +1760,7 @@ mod tests {
             scratch_dir: &Path,
             report_path: &Path,
             wikis: &[String],
+            _run_id: Option<&str>,
         ) -> Result<()> {
             self.record(format!(
                 "schema_benchmark:{}:{}:{}",
@@ -1931,6 +1941,7 @@ mod tests {
             _scratch_dir: &Path,
             _report_path: &Path,
             _wikis: &[String],
+            _run_id: Option<&str>,
         ) -> Result<()> {
             if self.fail_stage == "schema_benchmark" {
                 anyhow::bail!("schema benchmark failed");
@@ -2925,6 +2936,7 @@ mod tests {
             &schema_scratch,
             &schema_report,
             &benchmark_wikis,
+            Some("schema-e2e"),
         );
         benchmark_result?;
         assert!(schema_report.is_file());
@@ -3579,6 +3591,7 @@ mod tests {
             Path::new("scratch"),
             Path::new("schema.json"),
             &wikis,
+            Some("schema-test"),
         );
         schema_result?;
         ops.merge_outputs(output_dir, None)?;

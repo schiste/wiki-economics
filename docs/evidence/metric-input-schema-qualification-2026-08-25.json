@@ -1,0 +1,84 @@
+{
+  "schema_version": 1,
+  "metric_input_schema": "qualified-metric-input-v1",
+  "columns": [
+    "event_timestamp",
+    "event_user_id",
+    "event_user_text",
+    "event_user_is_bot_by",
+    "event_user_is_anonymous",
+    "event_user_is_temporary",
+    "page_id",
+    "page_title",
+    "page_namespace",
+    "revision_id",
+    "revision_text_bytes_diff",
+    "is_reverted",
+    "is_minor"
+  ],
+  "generated_at_unix": 1787661450,
+  "source_commit": null,
+  "run_id": null,
+  "wikis": [
+    {
+      "wiki": "nlwiki",
+      "selected_snapshot": "2026-07",
+      "fragments": 1448,
+      "rows": 71518536,
+      "warehouse_bytes": 2044276556,
+      "analytical_bytes": 311605549,
+      "current_two_layer_bytes": 2355882105,
+      "projected_metric_input_bytes": 1415821775,
+      "projected_savings_bytes": 940060330,
+      "projected_savings_percent": 39.90268986741168,
+      "largest_temporary_fragment_bytes": 1467811,
+      "elapsed_ms": 129660,
+      "memory": {
+        "rss_bytes": 53563392,
+        "cgroup_current_bytes": 36257792,
+        "cgroup_peak_bytes": 39342080,
+        "cgroup_limit_bytes": 6442450944
+      }
+    },
+    {
+      "wiki": "ptwiki",
+      "selected_snapshot": "2026-07",
+      "fragments": 1531,
+      "rows": 72553673,
+      "warehouse_bytes": 2194456378,
+      "analytical_bytes": 338694371,
+      "current_two_layer_bytes": 2533150749,
+      "projected_metric_input_bytes": 1509890148,
+      "projected_savings_bytes": 1023260601,
+      "projected_savings_percent": 40.39477719215675,
+      "largest_temporary_fragment_bytes": 1423066,
+      "elapsed_ms": 129289,
+      "memory": {
+        "rss_bytes": 54521856,
+        "cgroup_current_bytes": 38744064,
+        "cgroup_peak_bytes": 42086400,
+        "cgroup_limit_bytes": 6442450944
+      }
+    },
+    {
+      "wiki": "frwiki",
+      "selected_snapshot": "2026-07",
+      "fragments": 4201,
+      "rows": 237798382,
+      "warehouse_bytes": 7376653715,
+      "analytical_bytes": 1156916105,
+      "current_two_layer_bytes": 8533569820,
+      "projected_metric_input_bytes": 4955746407,
+      "projected_savings_bytes": 3577823413,
+      "projected_savings_percent": 41.926456201421225,
+      "largest_temporary_fragment_bytes": 1646023,
+      "elapsed_ms": 468200,
+      "memory": {
+        "rss_bytes": 59887616,
+        "cgroup_current_bytes": 284200960,
+        "cgroup_peak_bytes": 514822144,
+        "cgroup_limit_bytes": 6442450944
+      }
+    }
+  ]
+}

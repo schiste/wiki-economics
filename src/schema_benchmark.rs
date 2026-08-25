@@ -204,6 +204,8 @@ pub(crate) fn run(
     scratch_root: &Path,
     report_path: &Path,
     wikis: &[String],
+    source_commit: Option<&str>,
+    run_id: Option<&str>,
 ) -> Result<SchemaBenchmarkReport> {
     ensure!(
         !wikis.is_empty(),
@@ -228,8 +230,14 @@ pub(crate) fn run(
         metric_input_schema: "qualified-metric-input-v1".to_string(),
         columns: schema::METRIC_INPUT_COLUMNS,
         generated_at_unix: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
-        source_commit: std::env::var("WIKI_ECON_SOURCE_COMMIT").ok(),
-        run_id: std::env::var("WIKI_ECON_RUN_ID").ok(),
+        source_commit: source_commit.map(str::to_string).or_else(|| {
+            std::env::var("WIKI_ECON_SOURCE_COMMIT")
+                .ok()
+                .or_else(crate::licensing::generating_commit)
+        }),
+        run_id: run_id
+            .map(str::to_string)
+            .or_else(|| std::env::var("WIKI_ECON_RUN_ID").ok()),
         wikis: reports,
     };
     atomic_json(report_path, &report)?;
@@ -349,12 +357,21 @@ mod tests {
         let report_path = reports.path().join("schema.json");
 
         let wikis = ["tinywiki".to_string()];
-        let report = run(data.path(), scratch.path(), &report_path, &wikis)?;
+        let report = run(
+            data.path(),
+            scratch.path(),
+            &report_path,
+            &wikis,
+            Some("aabbcc"),
+            Some("schema-test"),
+        )?;
 
         assert_eq!(report.schema_version, 1);
         assert_eq!(report.wikis.len(), 1);
         assert_eq!(report.wikis[0].rows, 2);
         assert!(report.wikis[0].projected_savings_bytes > 0);
+        assert_eq!(report.source_commit.as_deref(), Some("aabbcc"));
+        assert_eq!(report.run_id.as_deref(), Some("schema-test"));
         assert!(report_path.is_file());
         assert!(
             fs::read_dir(scratch.path())?.next().is_none(),
@@ -368,7 +385,7 @@ mod tests {
         let data = TestDir::new().expect("data fixture");
         let scratch = TestDir::new().expect("scratch fixture");
         let report = data.path().join("report.json");
-        assert!(run(data.path(), scratch.path(), &report, &[]).is_err());
+        assert!(run(data.path(), scratch.path(), &report, &[], None, None).is_err());
         assert!(!report.exists());
     }
 
@@ -414,7 +431,9 @@ mod tests {
                 root.path(),
                 &scratch,
                 &root.path().join("unused.json"),
-                &["tinywiki".to_string()]
+                &["tinywiki".to_string()],
+                None,
+                None,
             )
             .is_err()
         );
