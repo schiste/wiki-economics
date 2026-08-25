@@ -13,7 +13,7 @@ use crate::storage;
 use crate::wiki_lifecycle;
 
 const MERGE_BATCH_ROWS: usize = 250_000;
-const MERGE_ALGORITHM_VERSION: &str = "merged-metrics-v7-all-wikis-default";
+const MERGE_ALGORITHM_VERSION: &str = "merged-metrics-v8-all-wikis-variation-default";
 const GENERATOR_DEPENDENCIES: [&str; 1] = ["manifest.json.cjs"];
 const MANIFEST_GENERATOR: &str = "manifest.json.sh";
 const PARTITION_ONLY_METRICS: [&str; 1] = ["page_weekly_edits.parquet"];
@@ -568,6 +568,11 @@ mod tests {
         assert!(
             !output_dir.path().join("page_weekly_edits.parquet").exists(),
             "weekly publication must remain per-wiki instead of consuming a redundant root artifact"
+        );
+        let receipt = fingerprint::read_receipt(&output_dir.path().join("_stages/merge.json"))?;
+        assert_eq!(
+            receipt.algorithm_version,
+            "merged-metrics-v8-all-wikis-variation-default"
         );
 
         Ok(())
