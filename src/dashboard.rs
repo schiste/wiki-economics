@@ -401,24 +401,28 @@ where
 /// published wiki, plus a per-wiki breakdown for deep-linking into `/gdp`.
 fn overview_artifacts(frames: &Frames) -> Result<Value> {
     let meta = common_meta(&frames.gdp, None)?;
+    overview_from_gdp(&frames.gdp, &meta)
+}
 
+fn overview_row_in_range(df: &DataFrame, row: usize, max_month: &str) -> Result<bool> {
+    Ok(string(df, "wiki", row)?.is_some()
+        && string(df, "year_month", row)?.is_some_and(|month| month.as_str() <= max_month))
+}
+
+fn overview_from_gdp(gdp: &DataFrame, meta: &CommonMeta) -> Result<Value> {
     let mut trend: BTreeMap<String, [f64; 5]> = BTreeMap::new();
     let mut by_wiki_month: BTreeMap<(String, String), [f64; 5]> = BTreeMap::new();
 
-    for row in 0..frames.gdp.height() {
-        let Some(wiki) = string(&frames.gdp, "wiki", row)? else {
-            continue;
-        };
-        let Some(month) = string(&frames.gdp, "year_month", row)? else {
-            continue;
-        };
-        if month > meta.max_month {
+    for row in 0..gdp.height() {
+        if !overview_row_in_range(gdp, row, &meta.max_month)? {
             continue;
         }
-        let Some(namespace) = integer(&frames.gdp, "page_namespace", row)? else {
+        let wiki = string(gdp, "wiki", row)?.context("gdp wiki is null")?;
+        let month = string(gdp, "year_month", row)?.context("gdp month is null")?;
+        let Some(namespace) = integer(gdp, "page_namespace", row)? else {
             continue;
         };
-        let user_type = string(&frames.gdp, "user_type", row)?.context("gdp user type is null")?;
+        let user_type = string(gdp, "user_type", row)?.context("gdp user type is null")?;
         if namespace != 0 || user_type != "registered" {
             continue;
         }
@@ -436,7 +440,7 @@ fn overview_artifacts(frames: &Frames) -> Result<Value> {
         .iter()
         .enumerate()
         {
-            let value = float(&frames.gdp, column, row)?.unwrap_or_default();
+            let value = float(gdp, column, row)?.unwrap_or_default();
             trend_entry[index] += value;
             wiki_entry[index] += value;
         }
@@ -1815,6 +1819,39 @@ mod tests {
         let output = TestDir::new()?;
         fs::create_dir(output.path().join("business_funnel.parquet"))?;
         assert!(write_site_fixture(output.path()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn overview_from_gdp_skips_null_and_future_rows() -> Result<()> {
+        let gdp = df!(
+            "wiki" => &[None, Some("xwiki"), Some("xwiki"), Some("xwiki")],
+            "year_month" => &[Some("2026-01"), None, Some("2026-02"), Some("2026-01")],
+            "page_namespace" => &[Some(0_i32), Some(0), Some(0), Some(0)],
+            "user_type" => &["registered", "registered", "registered", "registered"],
+            "gross_bytes_added" => &[100_i64, 100, 100, 40],
+            "net_bytes" => &[80_i64, 80, 80, 30],
+            "total_edits" => &[10_u32, 10, 10, 4],
+            "reverted_edits" => &[2_u32, 2, 2, 1],
+            "unique_editors" => &[5_u32, 5, 5, 2],
+        )
+        .expect("overview fixture columns have equal lengths");
+        let meta = CommonMeta {
+            default_wiki: "xwiki".to_string(),
+            max_month: "2026-01".to_string(),
+            wikis: vec![json!("xwiki")],
+            namespaces: vec![],
+            ranges: vec![],
+        };
+
+        let overview = overview_from_gdp(&gdp, &meta)?;
+        assert_eq!(overview["maxMonth"], "2026-01");
+        assert_eq!(overview["trend"].as_array().map(Vec::len), Some(1));
+        assert_eq!(overview["trend"][0]["total_edits"], 4);
+        assert_eq!(overview["byWiki"].as_array().map(Vec::len), Some(1));
+        assert_eq!(overview["byWiki"][0]["wiki"], "xwiki");
+        assert_eq!(overview["byWiki"][0]["latestMonth"], "2026-01");
+        assert_eq!(overview["byWiki"][0]["total_edits"], 4);
         Ok(())
     }
 }
