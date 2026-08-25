@@ -852,10 +852,11 @@ fn gdp_activity_tiers_for_period(
         .i64()?
         .sum()
         .unwrap_or(0);
+    let period_name = period.name();
     anyhow::ensure!(
         input_edits == output_edits,
         "{} activity-tier edit conservation failed: input={input_edits}, output={output_edits}",
-        period.name()
+        period_name
     );
 
     let keys = frame.column("period_key")?.i32()?;
@@ -919,18 +920,10 @@ fn finish_activity_year(
         return Ok(());
     }
     let editor_months = concat_frames(std::mem::take(editor_month_frames))?;
-    output_frames.push(gdp_activity_tiers_for_period(
-        &editor_months,
-        ActivityPeriod::Month,
-    )?);
-    output_frames.push(gdp_activity_tiers_for_period(
-        &editor_months,
-        ActivityPeriod::Quarter,
-    )?);
-    output_frames.push(gdp_activity_tiers_for_period(
-        &editor_months,
-        ActivityPeriod::Year,
-    )?);
+    let monthly = gdp_activity_tiers_for_period(&editor_months, ActivityPeriod::Month)?;
+    let quarterly = gdp_activity_tiers_for_period(&editor_months, ActivityPeriod::Quarter)?;
+    let yearly = gdp_activity_tiers_for_period(&editor_months, ActivityPeriod::Year)?;
+    output_frames.extend([monthly, quarterly, yearly]);
     Ok(())
 }
 
@@ -2540,13 +2533,12 @@ mod tests {
     #[test]
     fn activity_tiers_reclassify_editors_and_conserve_edits_for_each_period() -> Result<()> {
         let months = [202401, 202402, 202403];
-        let frame = editor_months(
-            &[100, 100, 100, 99, 99, 99],
-            &[
-                months[0], months[1], months[2], months[0], months[1], months[2],
-            ],
-            &[1, 1, 1, 2, 2, 2],
-        )?;
+        let edits = [100, 100, 100, 99, 99, 99];
+        let month_keys = [
+            months[0], months[1], months[2], months[0], months[1], months[2],
+        ];
+        let user_ids = [1, 1, 1, 2, 2, 2];
+        let frame = editor_months(&edits, &month_keys, &user_ids)?;
         let quarterly = gdp_activity_tiers_for_period(&frame, ActivityPeriod::Quarter)?;
         assert_eq!(quarterly.column("total_edits")?.u32()?.sum(), Some(597));
         assert_eq!(quarterly.column("editors")?.u32()?.sum(), Some(2));
@@ -2588,6 +2580,54 @@ mod tests {
         let mut output = Vec::new();
         finish_activity_year(&mut empty, &mut output)?;
         assert!(output.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn activity_tier_incremental_compute_flushes_each_calendar_year() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let output_dir = TestDir::new()?;
+        let wiki = "two-year-wiki";
+        write_partitioned_base_parquet(&data_dir, wiki)?;
+
+        let next_year_dir = storage::month_partition_dir(
+            &storage::analytical_wiki_dir(data_dir.path(), wiki),
+            2025,
+            "2025-01",
+        );
+        fs::create_dir_all(&next_year_dir)?;
+        let mut next_year = analytical_partition_df(AnalyticalPartitionRows {
+            year_month: ["2025-01", "2025-01"],
+            year_month_key: [202501, 202501],
+            user_type: ["registered", "registered"],
+            event_user_id: [1, 4],
+            page_namespace: [0, 0],
+            revision_id: [14, 15],
+            revision_text_bytes_diff: [9, 11],
+            is_reverted: [false, false],
+            is_minor: [false, true],
+        })?;
+        ParquetWriter::new(&mut fs::File::create(
+            next_year_dir.join("part-000.parquet"),
+        )?)
+        .finish(&mut next_year)?;
+
+        compute_all_incremental(wiki, data_dir.path(), output_dir.path(), None)?;
+        let tiers = ParquetReader::new(File::open(
+            output_dir
+                .path()
+                .join(wiki)
+                .join("gdp_activity_tiers.parquet"),
+        )?)
+        .finish()?;
+        assert!(
+            tiers
+                .column("period")?
+                .str()?
+                .iter()
+                .flatten()
+                .any(|period| period == "2025")
+        );
         Ok(())
     }
 
