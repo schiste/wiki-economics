@@ -51,9 +51,12 @@ fn directory_bytes(path: &Path) -> Result<u64> {
             if entry.file_type()?.is_dir() {
                 pending.push(entry.path());
             } else if entry.file_type()?.is_file() {
-                total = total
-                    .checked_add(entry.metadata()?.len())
-                    .context("schema benchmark byte count overflow")?;
+                let bytes = entry.metadata()?.len();
+                ensure!(
+                    total <= u64::MAX - bytes,
+                    "schema benchmark byte count overflow"
+                );
+                total += bytes;
             }
         }
     }
@@ -67,20 +70,16 @@ fn project_fragment(source: &Path, destination: &Path) -> Result<(u64, u64)> {
         .collect::<Vec<_>>();
     let mut reader = storage::SequentialParquetReader::new(source, Some(projection), BATCH_ROWS)?;
     let expected_rows = u64::try_from(reader.rows())?;
-    let schema_frame = reader.schema_frame().with_context(|| {
-        format!(
-            "{} does not satisfy the qualified metric-input schema",
-            source.display()
-        )
-    })?;
+    let schema_frame = reader
+        .schema_frame()
+        .context("source does not satisfy the qualified metric-input schema")?;
     ensure!(
         schema_frame
             .get_column_names()
             .iter()
             .map(|name| name.as_str())
             .eq(schema::METRIC_INPUT_COLUMNS.iter().copied()),
-        "{} projected columns are not in the qualified schema order",
-        source.display()
+        "projected columns are not in the qualified schema order"
     );
     let output = File::create(destination)?;
     let writer = ParquetWriter::new(output)
@@ -100,8 +99,7 @@ fn project_fragment(source: &Path, destination: &Path) -> Result<(u64, u64)> {
     File::open(destination)?.sync_all()?;
     ensure!(
         rows == expected_rows,
-        "metric-input projection lost rows for {}: expected {expected_rows}, wrote {rows}",
-        source.display()
+        "metric-input projection lost rows: expected {expected_rows}, wrote {rows}"
     );
     let footer_rows = ParquetReader::new(File::open(destination)?).num_rows()?;
     ensure!(
@@ -215,8 +213,7 @@ pub(crate) fn run(
     let run_scratch = scratch_root.join(format!("metric-input-benchmark-{}", std::process::id()));
     ensure!(
         !run_scratch.exists(),
-        "schema benchmark scratch already exists: {}",
-        run_scratch.display()
+        "schema benchmark scratch already exists"
     );
     fs::create_dir(&run_scratch)?;
     let result: Result<Vec<WikiSchemaBenchmark>> = wikis
@@ -291,6 +288,81 @@ mod tests {
         Ok(())
     }
 
+    fn write_generation(data_dir: &Path, wiki: &str, snapshot: &str) -> Result<()> {
+        let warehouse = storage::snapshot_warehouse_wiki_dir(data_dir, wiki, snapshot)?;
+        let analytical = storage::snapshot_analytical_wiki_dir(data_dir, wiki, snapshot)?;
+        let warehouse_partition = storage::month_partition_dir(&warehouse, 2026, "2026-01");
+        let analytical_partition = storage::month_partition_dir(&analytical, 2026, "2026-01");
+        fs::create_dir_all(&warehouse_partition)?;
+        fs::create_dir_all(&analytical_partition)?;
+        let source = crate::snapshot_plan::SnapshotPlan::resolve(wiki, snapshot)?
+            .sources
+            .into_iter()
+            .next()
+            .context("test snapshot plan is empty")?;
+        let filename = format!("{}.part-00000.parquet", source.source_id);
+        let mut columns = Vec::new();
+        for name in schema::WAREHOUSE_COLUMNS {
+            let column = match *name {
+                "event_timestamp" => Column::new(
+                    (*name).into(),
+                    ["2026-01-01 00:00:00.0", "2026-01-02 00:00:00.0"],
+                ),
+                "event_user_text"
+                | "event_user_is_bot_by"
+                | "page_title"
+                | "year_month"
+                | "user_type" => Column::new((*name).into(), ["value", "value"]),
+                "event_user_is_anonymous"
+                | "event_user_is_temporary"
+                | "is_reverted"
+                | "is_minor"
+                | "page_namespace_is_content"
+                | "page_is_redirect"
+                | "revision_minor_edit"
+                | "revision_is_identity_reverted"
+                | "revision_is_identity_revert" => Column::new((*name).into(), [false, true]),
+                "page_namespace" | "year" | "year_month_key" => {
+                    Column::new((*name).into(), [0_i32, 1])
+                }
+                _ => Column::new((*name).into(), [1_i64, 2]),
+            };
+            columns.push(column);
+        }
+        let mut warehouse_frame = DataFrame::new(2, columns)?;
+        ParquetWriter::new(File::create(warehouse_partition.join(&filename))?)
+            .finish(&mut warehouse_frame)?;
+        let mut analytical_frame =
+            warehouse_frame.select(schema::ANALYTICAL_COLUMNS.iter().copied())?;
+        ParquetWriter::new(File::create(analytical_partition.join(filename))?)
+            .finish(&mut analytical_frame)?;
+        storage::write_test_generation_manifest_from_files(data_dir, wiki, snapshot)?;
+        storage::publish_test_snapshot_pointer(data_dir, wiki, snapshot)
+    }
+
+    #[test]
+    fn full_benchmark_reports_savings_and_reclaims_scratch() -> Result<()> {
+        let data = TestDir::new()?;
+        let scratch = TestDir::new()?;
+        let reports = TestDir::new()?;
+        write_generation(data.path(), "tinywiki", "2026-01")?;
+        let report_path = reports.path().join("schema.json");
+
+        let wikis = ["tinywiki".to_string()];
+        let report = run(data.path(), scratch.path(), &report_path, &wikis)?;
+
+        assert_eq!(report.schema_version, 1);
+        assert_eq!(report.wikis.len(), 1);
+        assert_eq!(report.wikis[0].rows, 2);
+        assert!(report.wikis[0].projected_savings_bytes > 0);
+        assert!(report_path.is_file());
+        assert!(
+            fs::read_dir(scratch.path())?.next().is_none(),
+            "benchmark scratch must be reclaimed after a successful run"
+        );
+        Ok(())
+    }
+
     #[test]
     fn run_rejects_empty_wiki_sets_without_leaving_scratch() {
         let data = TestDir::new().expect("data fixture");
@@ -298,5 +370,54 @@ mod tests {
         let report = data.path().join("report.json");
         assert!(run(data.path(), scratch.path(), &report, &[]).is_err());
         assert!(!report.exists());
+    }
+
+    #[test]
+    fn helpers_fail_closed_and_clean_atomic_temporaries() -> Result<()> {
+        let root = TestDir::new()?;
+        assert_eq!(directory_bytes(&root.path().join("missing"))?, 0);
+
+        let invalid_source = root.path().join("invalid.parquet");
+        let invalid_output = root.path().join("invalid-output.parquet");
+        let mut invalid = df!("unrelated" => &[1_i64])?;
+        ParquetWriter::new(File::create(&invalid_source)?).finish(&mut invalid)?;
+        assert!(project_fragment(&invalid_source, &invalid_output).is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&invalid_source, root.path().join("source-link"))?;
+            assert!(directory_bytes(root.path())? > 0);
+        }
+
+        let report = SchemaBenchmarkReport {
+            schema_version: 1,
+            metric_input_schema: "qualified-metric-input-v1".to_string(),
+            columns: schema::METRIC_INPUT_COLUMNS,
+            generated_at_unix: 0,
+            source_commit: None,
+            run_id: None,
+            wikis: Vec::new(),
+        };
+        let blocked = root.path().join("blocked-report");
+        fs::create_dir(&blocked)?;
+        assert!(atomic_json(&blocked, &report).is_err());
+        assert!(
+            !root
+                .path()
+                .join(format!(".blocked-report.{}.tmp", std::process::id()))
+                .exists()
+        );
+
+        let scratch = root.path().join("scratch");
+        fs::create_dir_all(scratch.join(format!("metric-input-benchmark-{}", std::process::id())))?;
+        assert!(
+            run(
+                root.path(),
+                &scratch,
+                &root.path().join("unused.json"),
+                &["tinywiki".to_string()]
+            )
+            .is_err()
+        );
+        Ok(())
     }
 }

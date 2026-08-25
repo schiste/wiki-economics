@@ -50,12 +50,7 @@ fn merge_outputs_from_dir(
                     .map(|path| {
                         path.strip_prefix(output_dir)
                             .map(|relative| relative.to_string_lossy().into_owned())
-                            .with_context(|| {
-                                format!(
-                                    "partitioned metric {} is outside output directory",
-                                    path.display()
-                                )
-                            })
+                            .context("partitioned metric is outside output directory")
                     })
                     .collect::<Vec<_>>()
             } else {
@@ -170,12 +165,7 @@ fn merge_outputs_from_dir(
 
     let obsolete_weekly = output_dir.join("page_weekly_edits.parquet");
     if obsolete_weekly.is_file() {
-        fs::remove_file(&obsolete_weekly).with_context(|| {
-            format!(
-                "failed to remove obsolete combined weekly metric {}",
-                obsolete_weekly.display()
-            )
-        })?;
+        fs::remove_file(&obsolete_weekly)?;
         File::open(output_dir)?.sync_all()?;
     }
 
@@ -565,10 +555,8 @@ mod tests {
         write_dashboard_fixture(output_dir.path())?;
         write_metric(output_dir.path(), "enwiki", "metric", 1)?;
         write_metric(output_dir.path(), "frwiki", "metric", 2)?;
-        fs::write(
-            output_dir.path().join("page_weekly_edits.parquet"),
-            b"obsolete combined weekly artifact",
-        )?;
+        let obsolete_weekly = output_dir.path().join("page_weekly_edits.parquet");
+        fs::write(obsolete_weekly, b"obsolete combined weekly artifact")?;
 
         merge_outputs_from_dir(output_dir.path(), generator_dir.path(), None)?;
 

@@ -470,6 +470,13 @@ trait Ops {
         quota_root: &std::path::Path,
         minimum_memory_headroom_percent: u8,
     ) -> Result<()>;
+    fn schema_benchmark(
+        &self,
+        data_dir: &Path,
+        scratch_dir: &Path,
+        report_path: &Path,
+        wikis: &[String],
+    ) -> Result<()>;
     fn merge_outputs(&self, output_dir: &std::path::Path, run_id: Option<&str>) -> Result<()>;
     fn finalize_snapshot(&self, wiki: &str, data_dir: &std::path::Path) -> Result<()>;
     fn prepare_candidate_snapshot(
@@ -699,6 +706,18 @@ impl Ops for RealOps {
             minimum_memory_headroom_percent,
             telemetry_override: None,
         })
+    }
+
+    fn schema_benchmark(
+        &self,
+        data_dir: &Path,
+        scratch_dir: &Path,
+        report_path: &Path,
+        wikis: &[String],
+    ) -> Result<()> {
+        let result = schema_benchmark::run(data_dir, scratch_dir, report_path, wikis)?;
+        println!("{}", serde_json::to_string(&result)?);
+        Ok(())
     }
 
     fn merge_outputs(&self, output_dir: &std::path::Path, run_id: Option<&str>) -> Result<()> {
@@ -1240,9 +1259,7 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             report,
         } => {
             run_timed_stage("schema_benchmark", None, || {
-                let result = schema_benchmark::run(&data_dir, &scratch_dir, &report, &wikis)?;
-                println!("{}", serde_json::to_string(&result)?);
-                Ok(())
+                ops.schema_benchmark(&data_dir, &scratch_dir, &report, &wikis)
             })?;
         }
 
@@ -1728,6 +1745,26 @@ mod tests {
             Ok(())
         }
 
+        fn schema_benchmark(
+            &self,
+            data_dir: &Path,
+            scratch_dir: &Path,
+            report_path: &Path,
+            wikis: &[String],
+        ) -> Result<()> {
+            self.record(format!(
+                "schema_benchmark:{}:{}:{}",
+                wikis.join(","),
+                data_dir.display(),
+                scratch_dir.display()
+            ));
+            anyhow::ensure!(
+                report_path == Path::new("reports/schema.json"),
+                "unexpected schema report path"
+            );
+            Ok(())
+        }
+
         fn merge_outputs(&self, output_dir: &Path, _run_id: Option<&str>) -> Result<()> {
             self.record(format!("merge:{}", output_dir.display()));
             Ok(())
@@ -1884,6 +1921,19 @@ mod tests {
         ) -> Result<()> {
             if self.fail_stage == "capacity" {
                 anyhow::bail!("capacity benchmark failed");
+            }
+            Ok(())
+        }
+
+        fn schema_benchmark(
+            &self,
+            _data_dir: &Path,
+            _scratch_dir: &Path,
+            _report_path: &Path,
+            _wikis: &[String],
+        ) -> Result<()> {
+            if self.fail_stage == "schema_benchmark" {
+                anyhow::bail!("schema benchmark failed");
             }
             Ok(())
         }
@@ -2722,6 +2772,32 @@ mod tests {
     }
 
     #[test]
+    fn run_with_ops_dispatches_schema_benchmark() -> Result<()> {
+        let cli = Cli::try_parse_from([
+            "wiki-econ",
+            "--data-dir",
+            "dataset",
+            "schema-benchmark",
+            "nlwiki",
+            "ptwiki",
+            "frwiki",
+            "--scratch-dir",
+            "scratch",
+            "--report",
+            "reports/schema.json",
+        ])?;
+        let ops = RecordingOps::default();
+
+        run_with_ops(cli, &ops)?;
+
+        assert_eq!(
+            ops.calls.into_inner(),
+            vec!["schema_benchmark:nlwiki,ptwiki,frwiki:dataset:scratch"]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn run_with_ops_dispatches_full_pipeline() -> Result<()> {
         init_test_tracing();
         let cli = Cli::try_parse_from([
@@ -2840,6 +2916,18 @@ mod tests {
             !crate::storage::collect_parquet_files(&active)?.is_empty()
         });
         ops.finalize_snapshot("ingestwiki", data_dir.path())?;
+
+        let schema_scratch = output_dir.path().join("schema-scratch");
+        let schema_report = output_dir.path().join("schema-benchmark.json");
+        let benchmark_wikis = ["ingestwiki".to_string()];
+        let benchmark_result = ops.schema_benchmark(
+            data_dir.path(),
+            &schema_scratch,
+            &schema_report,
+            &benchmark_wikis,
+        );
+        benchmark_result?;
+        assert!(schema_report.is_file());
 
         let raw_legacy_dir = data_dir.path().join("raw").join("legacywiki");
         fs::create_dir_all(&raw_legacy_dir)?;
@@ -3375,6 +3463,29 @@ mod tests {
     }
 
     #[test]
+    fn run_with_ops_propagates_schema_benchmark_errors() -> Result<()> {
+        init_test_tracing();
+        let cli = Cli::try_parse_from([
+            "wiki-econ",
+            "schema-benchmark",
+            "frwiki",
+            "--scratch-dir",
+            "scratch",
+            "--report",
+            "schema.json",
+        ])?;
+        let error = run_with_ops(
+            cli,
+            &FailingOps {
+                fail_stage: "schema_benchmark",
+            },
+        )
+        .expect_err("schema benchmark failure should propagate");
+        assert!(error.to_string().contains("schema benchmark failed"));
+        Ok(())
+    }
+
+    #[test]
     fn run_with_ops_propagates_patrol_compute_errors() -> Result<()> {
         init_test_tracing();
         let cli = Cli::try_parse_from(["wiki-econ", "compute", "frwiki"])?;
@@ -3463,6 +3574,13 @@ mod tests {
             25,
         )
         .expect("non-matching failing ops stage");
+        let schema_result = ops.schema_benchmark(
+            data_dir,
+            Path::new("scratch"),
+            Path::new("schema.json"),
+            &wikis,
+        );
+        schema_result?;
         ops.merge_outputs(output_dir, None)?;
         ops.finalize_snapshot("frwiki", data_dir)?;
         Ok(())

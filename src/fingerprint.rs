@@ -733,10 +733,8 @@ mod tests {
             site_is_reusable(&output, &site, &dist)?,
             "publication verification owns artifact validation; the site fingerprint consumes its receipt identity"
         );
-        fs::write(
-            output.join(crate::publication::RECEIPT_FILE),
-            r#"{"selected_snapshot_versions":{"nlwiki":"2026-08"}}"#,
-        )?;
+        let changed_gate = r#"{"selected_snapshot_versions":{"nlwiki":"2026-08"}}"#;
+        fs::write(output.join(crate::publication::RECEIPT_FILE), changed_gate)?;
         assert!(!site_is_reusable(&output, &site, &dist)?);
         Ok(())
     }
