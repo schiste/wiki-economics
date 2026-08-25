@@ -8,6 +8,7 @@ import {
   wikiMatches,
   withAllWikis,
 } from "./wiki-scope.js";
+export {activityTierLabels, activityTierMonths} from "./activity-tiers.js";
 export {makeRowsLoader} from "./browser-data.js";
 export {
   ALL_WIKIS,

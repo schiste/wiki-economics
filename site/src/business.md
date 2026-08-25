@@ -11,7 +11,7 @@ Wikipedia as a **[Knowledge-as-a-Service](https://en.wikipedia.org/wiki/As_a_ser
 </div>
 
 ```js
-import {queryGrouped, filterRows, makeRowsLoader, makeJsonLoader, toPeriod, fmtNum, fmtBytes, createFilterBar, isDefaultView, parseDefaultsMeta, startLoading, doneLoading, aggregateChurn, aggregateCohorts, aggregateFunnel, wikiMatches} from "./components/filters.js"
+import {queryGrouped, filterRows, makeRowsLoader, makeJsonLoader, toPeriod, activityTierLabels, fmtNum, fmtBytes, createFilterBar, isDefaultView, parseDefaultsMeta, startLoading, doneLoading, aggregateChurn, aggregateCohorts, aggregateFunnel, wikiMatches} from "./components/filters.js"
 import {withExport, pageExportBar} from "./components/exports.js"
 
 const meta = await FileAttachment("data/meta_business.json").json()
@@ -72,8 +72,8 @@ if (useDefaults) {
 } else {
   const {tiers: tiersRaw} = await loadBizRows(wiki)
   const tierFiltered = tiersRaw
-    .filter(d => wikiMatches(d, wiki) && userTypes.includes(d.user_type) && d.year_month >= startPeriod && d.year_month <= endPeriod)
-    .map(d => ({...d, period: toPeriod(d.year_month, granularity)}))
+    .filter(d => wikiMatches(d, wiki) && userTypes.includes(d.user_type)
+      && d.period_type === granularity && d.period_end >= startPeriod && d.period_start <= endPeriod)
   tierAgg = d3.rollups(tierFiltered, v => ({
     editors: d3.sum(v, d => d.editors),
     edits: d3.sum(v, d => d.total_edits),
@@ -87,7 +87,8 @@ if (useDefaults) {
   doneLoading()
 }
 
-const tierOrder = ["1-4 edits", "5-24 edits", "25-99 edits", "100+ edits"]
+const tierOrder = activityTierLabels(granularity)
+const powerTier = tierOrder[tierOrder.length - 1]
 ```
 
 ```js
@@ -212,7 +213,7 @@ const totalTalk = d3.sum(eqByPeriod, d => d.talk_edits)
 const totalContentReverts = d3.sum(eqByPeriod, d => d.content_reverts)
 const overallEqRatio = totalContentReverts > 0 ? totalTalk / totalContentReverts : null
 const totalAllEditors = d3.sum(tierAgg, d => d.editors)
-const totalPowerEditors = d3.sum(tierAgg.filter(d => d.tier === "100+ edits"), d => d.editors)
+const totalPowerEditors = d3.sum(tierAgg.filter(d => d.tier === powerTier), d => d.editors)
 const overallConversion = totalAllEditors > 0 ? totalPowerEditors / totalAllEditors : 0
 
 const tickStep = Math.max(1, Math.floor(churnData.length / 20))
@@ -238,7 +239,7 @@ pageExportBar([
   <div class="kpi-card">
     <div class="kpi-value">${(overallConversion * 100).toFixed(1)}%</div>
     <div class="kpi-label">Power Conversion</div>
-    <div class="kpi-sub">100+ edits share</div>
+    <div class="kpi-sub">${powerTier} share</div>
   </div>
   <div class="kpi-card">
     <div class="kpi-value">${overallSurvival != null ? (overallSurvival * 100).toFixed(1) + "%" : "—"}</div>
@@ -262,7 +263,7 @@ pageExportBar([
 
 <div class="note">
 
-How is the editing workforce distributed across activity levels? Each period's editors are bucketed by edit count: casual (1-4), regular (5-24), active (25-99), and power (100+). A stable or growing "100+ edits" band indicates a healthy core; a thinning top layer signals power-editor attrition even if overall numbers hold.
+How is the editing workforce distributed across activity levels? The five edit-count bands scale with the selected period: the power threshold is **${powerTier}**. A stable or growing top band indicates a healthy core; a thinning top layer signals power-editor attrition even if overall numbers hold.
 
 </div>
 
@@ -274,7 +275,7 @@ const funnelTick = Math.max(1, Math.floor(tierAgg.filter(d => d.tier === tierOrd
 withExport(Plot.plot({
   width,
   height: 400,
-  color: {legend: true, domain: tierOrder, range: ["#b8d4e3", "#6baed6", "#2171b5", "#08306b"]},
+  color: {legend: true, domain: tierOrder, range: ["#d8e8f0", "#b8d4e3", "#6baed6", "#2171b5", "#08306b"]},
   x: {type: "band", tickRotate: -45, tickFilter: (d, i) => i % funnelTick === 0},
   y: {grid: true, label: "Editors"},
   marks: [
@@ -291,9 +292,9 @@ withExport(Plot.plot({
 
 <details class="methodology"><summary>How is this calculated?</summary>
 
-`Tier(editor) = bucket(edit_count): 1–4 | 5–24 | 25–99 | 100+`
+`Tier(editor, period) = bucket(period_edit_count, period_months × [1, 5, 25, 100])`
 
-Each period, every editor matching the selected user types is placed into one bucket based on their edit count *in that period*: 1-4 (casual), 5-24 (regular), 25-99 (active), 100+ (power). The stacked area shows the workforce snapshot, not a progression funnel. An editor may appear in different tiers across periods.
+Each editor matching the selected user types is classified once per calendar period. The monthly power threshold is 100 edits, the quarterly threshold is 300, and the annual threshold is 1200. All lower boundaries scale by the same 1×, 5×, 25×, and 100× monthly rates. The stacked area is a workforce snapshot, not a progression funnel; an editor may appear in different tiers across periods.
 
 </details>
 </div>
@@ -444,7 +445,7 @@ Edit survival rate = (total edits - reverted edits) / total edits. The dashed gr
 
 <div class="note">
 
-**SaaS equivalent: [Net Revenue Retention](https://en.wikipedia.org/wiki/Customer_retention).** Are existing power editors producing *more* over time? This shows the output (net bytes) by activity tier. If the "100+ edits" tier's output grows even as casual editor output shrinks, the platform has strong net retention: its most engaged users are getting more productive.
+**SaaS equivalent: [Net Revenue Retention](https://en.wikipedia.org/wiki/Customer_retention).** Are existing power editors producing *more* over time? This shows the output (net bytes) by activity tier. If the top tier's output grows even as casual editor output shrinks, the platform has strong net retention: its most engaged users are getting more productive.
 
 </div>
 
@@ -452,7 +453,7 @@ Edit survival rate = (total edits - reverted edits) / total edits. The dashed gr
 withExport(Plot.plot({
   width,
   height: 400,
-  color: {legend: true, domain: tierOrder, range: ["#b8d4e3", "#6baed6", "#2171b5", "#08306b"]},
+  color: {legend: true, domain: tierOrder, range: ["#d8e8f0", "#b8d4e3", "#6baed6", "#2171b5", "#08306b"]},
   x: {type: "band", tickRotate: -45, tickFilter: (d, i) => i % funnelTick === 0},
   y: {grid: true, label: "Net bytes"},
   marks: [
@@ -471,7 +472,7 @@ withExport(Plot.plot({
 
 `Net Bytes(tier) = Σ byte_diff WHERE activity_tier = tier`
 
-Net bytes produced by each activity tier per period. Positive growth in the "100+ edits" tier over time indicates strong net retention. Respects selected user types.
+Net bytes produced by each activity tier per period. Positive growth in the top tier over time indicates strong net retention. Respects selected user types.
 
 </details>
 </div>
@@ -522,7 +523,7 @@ Talk page edits (namespaces 1, 3, 5, 7, etc.) divided by content page reverts (n
 
 <div class="note">
 
-**Bytes per editor** broken down by activity tier reveals whether power editors are becoming more or less efficient. If the "100+ edits" tier produces declining bytes per editor, it may signal burnout, increasingly administrative work, or a shift from content creation to maintenance.
+**Bytes per editor** broken down by activity tier reveals whether power editors are becoming more or less efficient. If the top tier produces declining bytes per editor, it may signal burnout, increasingly administrative work, or a shift from content creation to maintenance.
 
 </div>
 
@@ -536,7 +537,7 @@ const bytesPerEditorByTier = tierAgg
 withExport(Plot.plot({
   width,
   height: 400,
-  color: {legend: true, domain: tierOrder, range: ["#b8d4e3", "#6baed6", "#2171b5", "#08306b"]},
+  color: {legend: true, domain: tierOrder, range: ["#d8e8f0", "#b8d4e3", "#6baed6", "#2171b5", "#08306b"]},
   x: {type: "band", tickRotate: -45, tickFilter: (d, i) => i % funnelTick === 0},
   y: {grid: true, label: "Net bytes per editor"},
   marks: [

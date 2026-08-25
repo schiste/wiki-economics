@@ -11,7 +11,7 @@ In national economics, **[GDP](https://en.wikipedia.org/wiki/Gross_domestic_prod
 </div>
 
 ```js
-import {queryGrouped, filterRows, makeRowsLoader, makeJsonLoader, toPeriod, nsLabel, fmtNum, fmtBytes, createFilterBar, isDefaultView, parseDefaultsMeta, startLoading, doneLoading, wikiMatches} from "./components/filters.js"
+import {queryGrouped, filterRows, makeRowsLoader, makeJsonLoader, toPeriod, activityTierLabels, nsLabel, fmtNum, fmtBytes, createFilterBar, isDefaultView, parseDefaultsMeta, startLoading, doneLoading, wikiMatches} from "./components/filters.js"
 import {withExport, pageExportBar} from "./components/exports.js"
 
 const meta = await FileAttachment("data/meta_gdp.json").json()
@@ -255,10 +255,10 @@ withExport(breakdown
 
 ## Activity Tiers
 
-<div class="note">Editors bucketed by their monthly edit count. Shows how output concentrates among different activity levels. Filtered by selected user types and time range (namespace filter does not apply -- tiers are computed across all namespaces).</div>
+<div class="note">Editors are bucketed by their edit count in the selected calendar period, using monthly-rate-equivalent thresholds: 100+ per month, 300+ per quarter, or 1200+ per year. Filtered by selected user types and time range (namespace filter does not apply -- tiers are computed across all namespaces).</div>
 
 ```js
-const tierOrder = ["1 edit", "2-4 edits", "5-24 edits", "25-99 edits", "100+ edits"]
+const tierOrder = activityTierLabels(granularity)
 const tierColors = ["#bdd7e7", "#6baed6", "#3182bd", "#08519c", "#022a5a"]
 
 startLoading(useDefaults)
@@ -270,8 +270,8 @@ if (useDefaults) {
 } else {
   const {tiers: tiersRaw} = await loadGdpRows(wiki)
   const tiersFiltered = tiersRaw
-    .filter(d => wikiMatches(d, wiki) && userTypes.includes(d.user_type) && d.year_month >= startPeriod && d.year_month <= endPeriod)
-    .map(d => ({...d, period: toPeriod(d.year_month, granularity)}))
+    .filter(d => wikiMatches(d, wiki) && userTypes.includes(d.user_type)
+      && d.period_type === granularity && d.period_end >= startPeriod && d.period_start <= endPeriod)
   tiersAgg = d3.rollups(tiersFiltered, v => ({
       editors: d3.sum(v, d => d.editors),
       total_edits: d3.sum(v, d => d.total_edits),
@@ -344,9 +344,9 @@ withExport(Plot.plot({
 <details class="methodology">
 <summary>Methodology</summary>
 
-`Tier(editor) = bucket(edit_count): 1 | 2–4 | 5–24 | 25–99 | 100+`
+`Tier(editor, period) = bucket(period_edit_count, period_months × [1, 5, 25, 100])`
 
-Editors are bucketed by monthly edit count into five tiers: **1 edit** (one-time contributors), **2--4 edits**, **5--24 edits**, **25--99 edits**, and **100+ edits** (power users). The stacked bar shows absolute values; the stacked area shows shares. This reveals how output concentrates among activity levels -- typically a small number of power users produce a disproportionate share of total edits and bytes.
+The five boundaries scale with the selected period's fixed calendar length. Monthly tiers are **1**, **2–4**, **5–24**, **25–99**, and **100+** edits; quarterly tiers are **1–3**, **4–14**, **15–74**, **75–299**, and **300+**; annual tiers are **1–12**, **13–59**, **60–299**, **300–1199**, and **1200+**. Each editor is classified once per selected period, so changing granularity both changes the threshold and deduplicates that editor across its constituent months.
 
 </details>
 

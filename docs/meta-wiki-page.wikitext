@@ -69,7 +69,7 @@ In national economics, [[w:Gross domestic product|GDP]] measures the total value
 |-
 | '''Productivity per capita''' || Net bytes per active editor. The wiki equivalent of [[w:GDP per capita|GDP per capita]].
 |-
-| '''Activity tiers''' || Editors grouped by monthly edit count (1, 2–4, 5–24, 25–99, 100+). Shows how output and editor counts distribute across levels of engagement.
+| '''Activity tiers''' || Editors classified once per selected calendar period using monthly-rate-equivalent boundaries: 100+ edits/month, 300+/quarter, or 1200+/year (with every lower boundary scaled identically). Shows how output and editor counts distribute across levels of engagement without double-counting an editor across months.
 |-
 | '''Sectoral output''' || Breakdown by [[w:Wikipedia:Namespace|namespace]] (article, talk, user, project, template, etc.). Each namespace is an economic ''sector'' with different dynamics.
 |-
