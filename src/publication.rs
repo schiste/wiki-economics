@@ -2225,19 +2225,25 @@ pub fn validate(
 }
 
 pub fn verify(output_dir: &Path, run_id: &str) -> Result<()> {
-    let context: RunContext = read_json(&output_dir.join(RUN_CONTEXT_FILE))?;
     let candidate: Candidate = read_json(&output_dir.join(CANDIDATE_FILE))?;
     let receipt: GateReceipt = read_json(&output_dir.join(RECEIPT_FILE))?;
     let policy = licensing::publication_policy()?;
     // A standalone site build (the on-demand wiki-econ-site Toolforge Job) runs
     // under its own fresh run ID, separate from whichever compute run last
-    // validated the data. What must hold is that context/candidate/receipt all
-    // agree with EACH OTHER, not that they match this invocation's run ID.
+    // validated the data. What must hold is that the published candidate and
+    // its receipt agree with EACH OTHER, not that they match this invocation's
+    // run ID, and not that they match RUN_CONTEXT_FILE: that file is stamped by
+    // begin_run/begin_selected_run the moment ANY run starts (including one
+    // still in flight, or a no-op publish-ready tick), so it can legitimately
+    // point at a run that never produced (or hasn't yet produced) a matching
+    // candidate/receipt. Comparing against it here would fail verify() any
+    // time an unrelated job is mid-run, even though the last published state
+    // is perfectly valid.
     ensure!(
-        context.run_id == candidate.run_id && candidate.run_id == receipt.run_id,
-        "publication receipt (run {}) does not match run context (run {})",
+        candidate.run_id == receipt.run_id,
+        "publication receipt (run {}) does not match candidate (run {})",
         receipt.run_id,
-        context.run_id
+        candidate.run_id
     );
     // receipt.provenance.generating_commit records which build produced this
     // data; it is not compared against this process's own build commit here,
@@ -3560,6 +3566,32 @@ mod tests {
         atomic_json(&receipt_path, &mismatched_receipt)?;
         assert!(verify(fixture.output.path(), "a-later-standalone-site-run").is_err());
         atomic_json(&receipt_path, &receipt)?;
+        Ok(())
+    }
+
+    #[test]
+    fn publication_gate_verify_ignores_a_concurrent_unrelated_run_context() -> Result<()> {
+        // wiki-econ-publish-ready stamps RUN_CONTEXT_FILE via begin_selected_run
+        // the moment it starts, whether or not it ends up publishing anything
+        // new (a no-op tick, or a run still mid-merge). An unrelated on-demand
+        // wiki-econ-site verify() running at that moment must not fail just
+        // because RUN_CONTEXT_FILE now points at that other, unfinished run.
+        let fixture = Fixture::new()?;
+        fixture.prepare("run-good")?;
+        validate(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "run-good",
+        )?;
+
+        begin_selected_run(
+            fixture.output.path(),
+            "publish-ready-in-flight",
+            &BTreeMap::new(),
+        )?;
+
+        verify(fixture.output.path(), "a-later-standalone-site-run")?;
         Ok(())
     }
 
