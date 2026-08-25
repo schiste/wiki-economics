@@ -73,6 +73,15 @@ impl Average {
 
 pub fn materialize(output_dir: &Path) -> Result<()> {
     let frames = Frames::read(output_dir)?;
+    let dashboard_wikis = wiki_set(&frames.gdp)?;
+    let default_wiki = env::var("DEFAULT_WIKI")
+        .ok()
+        .or_else(|| dashboard_wikis.first().cloned())
+        .context("dashboard input contains no wiki")?;
+    ensure!(
+        dashboard_wikis.contains(&default_wiki),
+        "DEFAULT_WIKI {default_wiki} is absent from dashboard inputs"
+    );
     let mut artifacts = BTreeMap::new();
     let (defaults_gdp, meta_gdp) = gdp_artifacts(&frames)?;
     let (defaults_labor, meta_labor) = labor_artifacts(&frames)?;
@@ -83,7 +92,7 @@ pub fn materialize(output_dir: &Path) -> Result<()> {
     artifacts.insert("defaults_business.json", defaults_business);
     artifacts.insert(
         "defaults_edit_variation.json",
-        edit_variation_artifact(output_dir)?,
+        edit_variation_artifact(output_dir, &default_wiki)?,
     );
     artifacts.insert("defaults_gdp.json", defaults_gdp);
     artifacts.insert("defaults_inequality.json", defaults_inequality);
@@ -961,8 +970,10 @@ fn retain_top_variation(rows: &mut Vec<VariationRow>, candidate: VariationRow) {
     }
 }
 
-fn edit_variation_artifact(output_dir: &Path) -> Result<Value> {
-    let path = output_dir.join("page_weekly_edits.parquet");
+fn edit_variation_artifact(output_dir: &Path, default_wiki: &str) -> Result<Value> {
+    let path = output_dir
+        .join(default_wiki)
+        .join("page_weekly_edits.parquet");
     let columns = Some(
         [
             "wiki",
@@ -982,7 +993,6 @@ fn edit_variation_artifact(output_dir: &Path) -> Result<Value> {
         storage::SequentialParquetReader::new(&path, columns, LARGE_METRIC_BATCH_ROWS)?;
     let rows = reader.rows();
     ensure!(rows > 0, "page_weekly_edits.parquet is empty");
-    let mut default_wiki = env::var("DEFAULT_WIKI").ok();
     let mut matching_rows = 0_i64;
     let mut min_week: Option<String> = None;
     let mut max_week: Option<String> = None;
@@ -994,12 +1004,12 @@ fn edit_variation_artifact(output_dir: &Path) -> Result<Value> {
             .context("page-week dashboard row count overflow")?;
         for row in 0..batch.height() {
             let wiki = string(&batch, "wiki", row)?.context("variation wiki is null")?;
-            if default_wiki.is_none() {
-                default_wiki = Some(wiki.clone());
-            }
-            if default_wiki.as_deref() != Some(wiki.as_str())
-                || integer(&batch, "page_namespace", row)? != Some(0)
-            {
+            ensure!(
+                wiki == default_wiki,
+                "{} contains rows for unexpected wiki {wiki}",
+                path.display()
+            );
+            if integer(&batch, "page_namespace", row)? != Some(0) {
                 continue;
             }
             matching_rows = matching_rows
@@ -1040,7 +1050,6 @@ fn edit_variation_artifact(output_dir: &Path) -> Result<Value> {
         observed_rows == rows,
         "page-week dashboard row conservation failed: footer {rows}, scanned {observed_rows}"
     );
-    let default_wiki = default_wiki.context("page_weekly_edits.parquet has no wiki")?;
     top.sort_by(variation_order);
     let mut best = Vec::with_capacity(top.len());
     for row in top {
@@ -1466,11 +1475,16 @@ mod tests {
     fn empty_page_weekly_metric_fails_closed() -> Result<()> {
         let output = TestDir::new()?;
         write_site_fixture(output.path())?;
+        let default_weekly = output.path().join("frwiki/page_weekly_edits.parquet");
+        let empty = ParquetReader::new(File::open(&default_weekly)?)
+            .finish()?
+            .head(Some(0));
         write_parquet(
-            output.path(),
+            default_weekly
+                .parent()
+                .expect("default weekly fixture has a parent"),
             "page_weekly_edits",
-            DataFrame::new(0, vec![Column::new_empty("wiki".into(), &DataType::String)])
-                .expect("empty fixture schema is valid"),
+            empty,
         )
         .expect("the empty fixture is written to a valid temporary directory");
 
