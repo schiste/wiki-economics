@@ -371,6 +371,26 @@ TOOLFORGE_SSH_TARGET=login.toolforge.org \
     "$release_dir/wiki-econ-release-$release_sha.tar.gz.sha256"
 ```
 
+If online Sigstore root or attestation discovery is unavailable, download the
+GitHub attestation bundle while the operator has network access and pass it as
+the optional fourth argument. Verification remains fail-closed and covers the
+same artifact digest and repository identity:
+
+```sh
+release_archive="$release_dir/wiki-econ-release-$release_sha.tar.gz"
+(
+  cd "$release_dir"
+  gh attestation download "$release_archive" --repo schiste/wiki-economics
+)
+attestation_bundle=$(find "$release_dir" -maxdepth 1 -name 'sha256-*.jsonl' -print -quit)
+TOOLFORGE_SSH_TARGET=login.toolforge.org \
+  deploy/toolforge/deploy-binary.sh \
+    "$release_archive" \
+    "$release_sha" \
+    "$release_archive.sha256" \
+    "$attestation_bundle"
+```
+
 When site, Node, shared script, or Toolforge deployment files changed, rebuild
 the lightweight image from the exact release commit (Cargo remains skipped).
 Toolforge Build Service resolves named Git refs rather than detached commit
