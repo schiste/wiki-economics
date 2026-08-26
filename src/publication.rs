@@ -1,11 +1,12 @@
 use anyhow::{Context, Result, ensure};
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
 use crate::generation_lifecycle::GenerationState as GState;
@@ -13,6 +14,9 @@ use crate::{artifact_receipt, licensing, storage};
 
 const RUN_CONTEXT_FILE: &str = ".publication-run.json";
 const CANDIDATE_FILE: &str = ".publication-candidate.json";
+const READY_INDEX_DIR: &str = "_ready-index";
+const READY_INDEX_SCHEMA_VERSION: u8 = 1;
+const PUBLICATION_CONTRACT_VERSION: &str = "ready-candidate-publication-v2-noop-digest";
 pub const RECEIPT_FILE: &str = "publication-gate.json";
 const JSON_ARTIFACTS: [&str; 13] = [
     crate::browser_data::INDEX_FILENAME,
@@ -279,6 +283,28 @@ struct ReadyWikiCandidate {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+struct ReadyCandidateReference {
+    candidate_relative: String,
+    snapshot: String,
+    run_id: String,
+    core_family_receipt_identities: BTreeMap<String, String>,
+    patrol_receipt_identity: String,
+    #[serde(default)]
+    workload_profile: Option<crate::workload_profile::WorkloadProfile>,
+    ready_receipt_sha256: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+struct ReadyCandidateIndex {
+    schema_version: u8,
+    wiki: String,
+    newest_valid_ready: ReadyCandidateReference,
+    #[serde(default)]
+    active_published: Option<ReadyCandidateReference>,
+    updated_at_unix: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 struct QualificationReceipt {
     schema_version: u8,
     publication_eligible: bool,
@@ -517,6 +543,8 @@ struct GateReceipt {
     patrol_sources: BTreeMap<String, PatrolSourceReport>,
     browser_data: BrowserDataReport,
     artifacts: Vec<ArtifactRecord>,
+    #[serde(default)]
+    publication_noop_digest: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -941,7 +969,7 @@ pub(crate) fn mark_wiki_candidate_ready(
     let generation = CandidateGeneration::new(output_dir, wiki, snapshot, run_id);
     let reason = "recovered candidate preparation";
     let generation_state = generation.adopt(GState::Building, reason)?;
-    storage::read_generation_manifest(data_dir, wiki, snapshot)?;
+    storage::ensure_generation_manifest(data_dir, wiki, snapshot)?;
     let registry = load_lifecycle(lifecycle_path)?;
     let lifecycle = registry
         .wikis
@@ -1042,6 +1070,12 @@ pub(crate) fn mark_wiki_candidate_ready(
         let reason = "ready receipt was durably published";
         generation.transition(GState::Ready, reason, None)?;
     }
+    write_ready_index(
+        data_dir,
+        output_dir,
+        wiki,
+        &(ready.clone(), candidate_dir.clone()),
+    )?;
     info!(wiki, snapshot, run_id, path = %ready_path.display(), "wiki candidate is ready");
     Ok(ready_path)
 }
@@ -1071,7 +1105,7 @@ pub(crate) fn mark_wiki_qualification_ready(
     run_id: &str,
 ) -> Result<PathBuf> {
     ensure_qualification_wiki(lifecycle_path, wiki)?;
-    storage::read_generation_manifest(data_dir, wiki, snapshot)?;
+    storage::ensure_generation_manifest(data_dir, wiki, snapshot)?;
     let qualification_dir = wiki_qualification_dir(output_dir, wiki, snapshot, run_id)?;
     let generation = CandidateGeneration::new(output_dir, wiki, snapshot, run_id);
     let generation_state = generation.adopt(GState::Building, "recovered qualification run")?;
@@ -1176,7 +1210,7 @@ fn validate_ready_candidate_metadata(
         ),
         "ready candidate path does not match its identity"
     );
-    storage::read_generation_manifest(data_dir, &ready.wiki, &ready.snapshot)?;
+    storage::ensure_generation_manifest(data_dir, &ready.wiki, &ready.snapshot)?;
     if let Some(profile) = &ready.workload_profile {
         profile.validate(&ready.wiki, &ready.snapshot)?;
         profile.ensure_compute_qualified()?;
@@ -1366,6 +1400,194 @@ pub(crate) fn plan_wiki_preparation(
     })
 }
 
+fn ready_index_path(output_dir: &Path, wiki: &str) -> PathBuf {
+    output_dir
+        .join(READY_INDEX_DIR)
+        .join(format!("{wiki}.json"))
+}
+
+fn ready_candidate_reference(
+    output_dir: &Path,
+    candidate_dir: &Path,
+    ready: &ReadyWikiCandidate,
+) -> Result<ReadyCandidateReference> {
+    let candidate_relative = candidate_dir
+        .strip_prefix(output_dir)
+        .context("ready candidate is outside the output directory")?
+        .to_string_lossy()
+        .into_owned();
+    let mut core_family_receipt_identities = BTreeMap::new();
+    let mut patrol_receipt_identity = None;
+    for artifact in &ready.artifacts {
+        ensure!(
+            artifact.receipt_sha256.len() == 64,
+            "ready artifact has no authoritative receipt identity"
+        );
+        let name = Path::new(&artifact.path)
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .context("ready artifact path has no metric name")?;
+        if name == "patrol" {
+            patrol_receipt_identity = Some(artifact.receipt_sha256.clone());
+        } else {
+            ensure!(
+                core_family_receipt_identities
+                    .insert(name.to_string(), artifact.receipt_sha256.clone())
+                    .is_none(),
+                "ready candidate contains a duplicate core metric"
+            );
+        }
+    }
+    let ready_path = candidate_dir.join("ready.json");
+    let (_, ready_receipt_sha256) = storage::sha256_file(&ready_path)?;
+    Ok(ReadyCandidateReference {
+        candidate_relative,
+        snapshot: ready.snapshot.clone(),
+        run_id: ready.run_id.clone(),
+        core_family_receipt_identities,
+        patrol_receipt_identity: patrol_receipt_identity
+            .context("ready candidate has no patrol receipt identity")?,
+        workload_profile: ready.workload_profile.clone(),
+        ready_receipt_sha256,
+    })
+}
+
+fn ready_from_reference(
+    data_dir: &Path,
+    output_dir: &Path,
+    wiki: &str,
+    reference: &ReadyCandidateReference,
+) -> Result<(ReadyWikiCandidate, PathBuf)> {
+    let candidate_dir = output_dir.join(&reference.candidate_relative);
+    ensure!(
+        candidate_dir
+            == output_dir
+                .join("_candidates")
+                .join(wiki)
+                .join(&reference.snapshot)
+                .join(&reference.run_id),
+        "ready index candidate path does not match its identity"
+    );
+    let ready_path = candidate_dir.join("ready.json");
+    let (_, observed_sha256) = storage::sha256_file(&ready_path)?;
+    ensure!(
+        observed_sha256 == reference.ready_receipt_sha256,
+        "ready index receipt identity changed"
+    );
+    let ready: ReadyWikiCandidate = read_json(&ready_path)?;
+    ensure!(ready.wiki == wiki, "ready index wiki mismatch");
+    validate_ready_candidate_metadata(data_dir, &candidate_dir, &ready)?;
+    ensure!(
+        ready_candidate_reference(output_dir, &candidate_dir, &ready)? == *reference,
+        "ready index fields do not match the candidate receipt"
+    );
+    Ok((ready, candidate_dir))
+}
+
+fn active_ready_reference(
+    data_dir: &Path,
+    output_dir: &Path,
+    wiki: &str,
+) -> Result<Option<ReadyCandidateReference>> {
+    let Some(relative) = active_candidate_relative(output_dir, wiki)? else {
+        return Ok(None);
+    };
+    let candidate_dir = output_dir.join(relative);
+    let ready: ReadyWikiCandidate = read_json(&candidate_dir.join("ready.json"))?;
+    validate_ready_candidate_metadata(data_dir, &candidate_dir, &ready)?;
+    ready_candidate_reference(output_dir, &candidate_dir, &ready).map(Some)
+}
+
+fn write_ready_index(
+    data_dir: &Path,
+    output_dir: &Path,
+    wiki: &str,
+    newest: &(ReadyWikiCandidate, PathBuf),
+) -> Result<()> {
+    let index = ReadyCandidateIndex {
+        schema_version: READY_INDEX_SCHEMA_VERSION,
+        wiki: wiki.to_string(),
+        newest_valid_ready: ready_candidate_reference(output_dir, &newest.1, &newest.0)?,
+        active_published: active_ready_reference(data_dir, output_dir, wiki)?,
+        updated_at_unix: now_unix()?,
+    };
+    atomic_json(&ready_index_path(output_dir, wiki), &index)
+}
+
+fn discover_latest_ready_candidate(
+    data_dir: &Path,
+    output_dir: &Path,
+    wiki: &str,
+) -> Result<Option<(ReadyWikiCandidate, PathBuf)>> {
+    let root = output_dir.join("_candidates").join(wiki);
+    if !root.is_dir() {
+        return Ok(None);
+    }
+    let mut candidates = Vec::new();
+    for snapshot_entry in fs::read_dir(&root)? {
+        let snapshot_dir = snapshot_entry?.path();
+        if !snapshot_dir.is_dir() {
+            continue;
+        }
+        for run_entry in fs::read_dir(&snapshot_dir)? {
+            let candidate_dir = run_entry?.path();
+            let ready_path = candidate_dir.join("ready.json");
+            if !ready_path.is_file() {
+                continue;
+            }
+            let ready: ReadyWikiCandidate = read_json(&ready_path)?;
+            ensure!(ready.wiki == wiki, "ready candidate wiki mismatch");
+            validate_ready_candidate_metadata(data_dir, &candidate_dir, &ready)?;
+            reconcile_ready_generation_state(output_dir, &ready)?;
+            candidates.push((ready, candidate_dir));
+        }
+    }
+    candidates.sort_by_key(|(ready, _)| {
+        (
+            ready.snapshot.clone(),
+            ready.ready_at_unix,
+            ready.run_id.clone(),
+        )
+    });
+    Ok(candidates.pop())
+}
+
+fn indexed_latest_ready_candidate(
+    data_dir: &Path,
+    output_dir: &Path,
+    wiki: &str,
+) -> Result<Option<(ReadyWikiCandidate, PathBuf)>> {
+    let path = ready_index_path(output_dir, wiki);
+    let indexed = (|| -> Result<Option<(ReadyWikiCandidate, PathBuf)>> {
+        let index: ReadyCandidateIndex = read_json(&path)?;
+        ensure!(
+            index.schema_version == READY_INDEX_SCHEMA_VERSION && index.wiki == wiki,
+            "unsupported ready index identity"
+        );
+        let newest = ready_from_reference(data_dir, output_dir, wiki, &index.newest_valid_ready)?;
+        let observed_active = active_ready_reference(data_dir, output_dir, wiki)?;
+        ensure!(
+            observed_active == index.active_published,
+            "ready index active candidate is stale"
+        );
+        reconcile_ready_generation_state(output_dir, &newest.0)?;
+        Ok(Some(newest))
+    })();
+    if path.is_file() {
+        match indexed {
+            Ok(candidate) => return Ok(candidate),
+            Err(error) => {
+                warn!(wiki, path = %path.display(), error = %format!("{error:#}"), "rebuilding invalid ready index")
+            }
+        }
+    }
+    let discovered = discover_latest_ready_candidate(data_dir, output_dir, wiki)?;
+    if let Some(candidate) = &discovered {
+        write_ready_index(data_dir, output_dir, wiki, candidate)?;
+    }
+    Ok(discovered)
+}
+
 fn latest_ready_candidates(
     data_dir: &Path,
     output_dir: &Path,
@@ -1379,37 +1601,7 @@ fn latest_ready_candidates(
         {
             continue;
         }
-        let root = output_dir.join("_candidates").join(&wiki);
-        if !root.is_dir() {
-            continue;
-        }
-        let mut candidates = Vec::new();
-        for snapshot_entry in fs::read_dir(&root)? {
-            let snapshot_dir = snapshot_entry?.path();
-            if !snapshot_dir.is_dir() {
-                continue;
-            }
-            for run_entry in fs::read_dir(&snapshot_dir)? {
-                let candidate_dir = run_entry?.path();
-                let ready_path = candidate_dir.join("ready.json");
-                if !ready_path.is_file() {
-                    continue;
-                }
-                let ready: ReadyWikiCandidate = read_json(&ready_path)?;
-                ensure!(ready.wiki == wiki, "ready candidate wiki mismatch");
-                validate_ready_candidate_metadata(data_dir, &candidate_dir, &ready)?;
-                reconcile_ready_generation_state(output_dir, &ready)?;
-                candidates.push((ready, candidate_dir));
-            }
-        }
-        candidates.sort_by(|(left, _), (right, _)| {
-            (&left.snapshot, left.ready_at_unix, &left.run_id).cmp(&(
-                &right.snapshot,
-                right.ready_at_unix,
-                &right.run_id,
-            ))
-        });
-        let Some(candidate) = candidates.pop() else {
+        let Some(candidate) = indexed_latest_ready_candidate(data_dir, output_dir, &wiki)? else {
             continue;
         };
         let current = storage::current_snapshot_version(data_dir, &wiki)?;
@@ -1422,6 +1614,156 @@ fn latest_ready_candidates(
         selected.push(candidate);
     }
     Ok(selected)
+}
+
+#[derive(Serialize)]
+struct PublicationNoOpDigestSeed {
+    active_ready_receipt_identities: Vec<String>,
+    lifecycle_sha256: String,
+    merge_algorithm_versions: Vec<String>,
+    publication_contract_version: String,
+    site_source_fingerprint: String,
+}
+
+fn configured_site_dir() -> PathBuf {
+    std::env::var_os("WIKI_ECON_SITE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("site"))
+}
+
+fn publication_noop_digest(
+    data_dir: &Path,
+    output_dir: &Path,
+    lifecycle_path: &Path,
+    require_newest_active: bool,
+) -> Result<Option<String>> {
+    publication_noop_digest_for_site(
+        data_dir,
+        output_dir,
+        lifecycle_path,
+        require_newest_active,
+        &configured_site_dir(),
+    )
+}
+
+fn publication_noop_digest_for_site(
+    data_dir: &Path,
+    output_dir: &Path,
+    lifecycle_path: &Path,
+    require_newest_active: bool,
+    site_dir: &Path,
+) -> Result<Option<String>> {
+    let registry = load_lifecycle(lifecycle_path)?;
+    let mut identities = Vec::new();
+    for (wiki, lifecycle) in &registry.wikis {
+        if lifecycle.publication != "published" {
+            continue;
+        }
+        let Some(active_relative) = active_candidate_relative(output_dir, wiki)? else {
+            if !matches!(lifecycle.refresh.as_str(), "scheduled" | "manual") {
+                continue;
+            }
+            if require_newest_active {
+                return Ok(None);
+            }
+            let snapshot = storage::current_snapshot_version(data_dir, wiki)?
+                .with_context(|| format!("managed wiki {wiki} has no selected snapshot"))?;
+            identities.push(format!("legacy:{wiki}={snapshot}"));
+            continue;
+        };
+        let active_dir = output_dir.join(&active_relative);
+        let ready: ReadyWikiCandidate = read_json(&active_dir.join("ready.json"))?;
+        validate_ready_candidate_metadata(data_dir, &active_dir, &ready)?;
+        ensure!(
+            storage::current_snapshot_version(data_dir, wiki)?.as_deref()
+                == Some(ready.snapshot.as_str()),
+            "active ready candidate and snapshot pointer disagree for {wiki}"
+        );
+        let reference = ready_candidate_reference(output_dir, &active_dir, &ready)?;
+        if require_newest_active {
+            let (newest, newest_dir) = indexed_latest_ready_candidate(data_dir, output_dir, wiki)?
+                .context("active candidate has no indexed ready receipt")?;
+            if newest_dir != active_dir
+                || newest.snapshot != ready.snapshot
+                || newest.run_id != ready.run_id
+            {
+                return Ok(None);
+            }
+        }
+        identities.push(format!("{wiki}={}", reference.ready_receipt_sha256));
+    }
+    identities.sort();
+    let (_, lifecycle_sha256) = storage::sha256_file(lifecycle_path)?;
+    let seed = PublicationNoOpDigestSeed {
+        active_ready_receipt_identities: identities,
+        lifecycle_sha256,
+        merge_algorithm_versions: vec![crate::merge::MERGE_ALGORITHM_VERSION.to_string()],
+        publication_contract_version: PUBLICATION_CONTRACT_VERSION.to_string(),
+        site_source_fingerprint: crate::fingerprint::site_source_fingerprint(site_dir)?,
+    };
+    let bytes =
+        serde_json::to_vec(&seed).expect("publication no-op digest seed is always serializable");
+    Ok(Some(hex::encode(Sha256::digest(bytes))))
+}
+
+fn record_publication_noop(output_dir: &Path, run_id: &str) -> Result<()> {
+    let path = selection_path(output_dir, run_id)?;
+    let transaction_dir = path
+        .parent()
+        .context("publication no-op has no transaction directory")?;
+    ensure!(
+        !transaction_dir.exists(),
+        "publication transaction already exists"
+    );
+    atomic_json(
+        &path,
+        &PublicationSelection {
+            schema_version: 1,
+            run_id: run_id.to_string(),
+            state: "no_op".to_string(),
+            entries: Vec::new(),
+        },
+    )
+}
+
+fn publication_is_immediate_noop(
+    data_dir: &Path,
+    output_dir: &Path,
+    lifecycle_path: &Path,
+) -> Result<bool> {
+    let Some(digest) = publication_noop_digest(data_dir, output_dir, lifecycle_path, true)? else {
+        return Ok(false);
+    };
+    let gate: GateReceipt = match read_json(&output_dir.join(RECEIPT_FILE)) {
+        Ok(gate) => gate,
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), "publication receipt cannot authorize a no-op");
+            return Ok(false);
+        }
+    };
+    let candidate: Candidate = match read_json(&output_dir.join(CANDIDATE_FILE)) {
+        Ok(candidate) => candidate,
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), "publication candidate cannot authorize a no-op");
+            return Ok(false);
+        }
+    };
+    let artifact_metadata_matches = gate.artifacts.iter().all(|artifact| {
+        fs::metadata(output_dir.join(&artifact.name))
+            .ok()
+            .filter(|metadata| metadata.is_file() && metadata.len() == artifact.bytes)
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .is_some_and(|modified| {
+                modified.as_secs() == artifact.modified_secs
+                    && modified.subsec_nanos() == artifact.modified_nanos
+            })
+    });
+    Ok(gate.schema_version == 7
+        && gate.publication_noop_digest == digest
+        && gate.run_id == candidate.run_id
+        && gate.artifacts == candidate.artifacts
+        && artifact_metadata_matches)
 }
 
 fn selection_path(output_dir: &Path, run_id: &str) -> Result<PathBuf> {
@@ -2096,6 +2438,9 @@ fn rollback_selection_files(
             &entry.wiki,
             entry.previous_snapshot.as_deref(),
         )?;
+        discover_latest_ready_candidate(data_dir, output_dir, &entry.wiki)?
+            .map(|newest| write_ready_index(data_dir, output_dir, &entry.wiki, &newest))
+            .transpose()?;
     }
     Ok(())
 }
@@ -2295,33 +2640,28 @@ pub(crate) fn prepare_ready_publication(
     lifecycle_path: &Path,
     run_id: &str,
 ) -> Result<()> {
-    let mut selection = activate_ready_candidates(data_dir, output_dir, lifecycle_path, run_id)?;
+    let started = Instant::now();
+    if publication_is_immediate_noop(data_dir, output_dir, lifecycle_path)? {
+        record_publication_noop(output_dir, run_id)?;
+        crate::observability::record_stage_skipped("publication_prepare", None);
+        let memory = crate::observability::MemorySnapshot::capture();
+        info!(
+            run_id,
+            duration_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            rss_bytes = memory.rss_bytes,
+            cgroup_current_bytes = memory.cgroup_current_bytes,
+            "publication receipt digest is unchanged"
+        );
+        return Ok(());
+    }
+    let selection = activate_ready_candidates(data_dir, output_dir, lifecycle_path, run_id)?;
     if selection.entries.is_empty() {
-        let reusable = read_json::<Candidate>(&output_dir.join(CANDIDATE_FILE))
-            .context("unchanged publication has no current artifact inventory")
-            .and_then(|published| {
-                let registry = load_lifecycle(lifecycle_path)?;
-                validate_artifact_inventory(output_dir, &published, &registry)
-                    .context("unchanged publication artifacts are not reusable")
-            });
-        match reusable {
-            Ok(()) => {
-                selection.state = "no_op".to_string();
-                atomic_json(&selection_path(output_dir, run_id)?, &selection)?;
-                crate::observability::record_stage_skipped("publication_prepare", None);
-                info!(run_id, "ready-candidate publication is unchanged");
-                return Ok(());
-            }
-            Err(error) => {
-                warn!(
-                    run_id,
-                    error = %format!("{error:#}"),
-                    "published artifact inventory requires transactional repair"
-                );
-                validate_active_ready_candidates(data_dir, output_dir, lifecycle_path)
-                    .context("publication repair inputs are not reusable")?;
-            }
-        }
+        warn!(
+            run_id,
+            "publication identity changed without a newer wiki candidate; rebuilding publication artifacts"
+        );
+        validate_active_ready_candidates(data_dir, output_dir, lifecycle_path)
+            .context("publication repair inputs are not reusable")?;
     }
     let snapshots = selection
         .entries
@@ -2417,6 +2757,13 @@ pub(crate) fn commit_ready_publication(
         let retired_candidates = retire_superseded_candidates(output_dir, entry, run_id)?;
         storage::retire_inactive_snapshots(data_dir, &entry.wiki)?;
         remove_committed_backup(output_dir, entry.backup_relative.as_deref())?;
+        let selected_ready: ReadyWikiCandidate = read_json(&selected.join("ready.json"))?;
+        write_ready_index(
+            data_dir,
+            output_dir,
+            &entry.wiki,
+            &(selected_ready, selected.clone()),
+        )?;
         info!(
             wiki = entry.wiki,
             retired_candidates, "retired superseded wiki candidates"
@@ -3313,8 +3660,11 @@ pub fn validate(
     } else {
         BTreeMap::new()
     };
+    let publication_noop_digest =
+        publication_noop_digest(data_dir, output_dir, lifecycle_path, false)?
+            .context("publication has no digestable active ready-candidate set")?;
     let receipt = GateReceipt {
-        schema_version: 6,
+        schema_version: 7,
         run_id: run_id.to_string(),
         validated_at_unix,
         license: policy.license,
@@ -3338,6 +3688,7 @@ pub fn validate(
         patrol_sources,
         browser_data,
         artifacts: candidate.artifacts,
+        publication_noop_digest,
     };
     atomic_json(&output_dir.join(RECEIPT_FILE), &receipt)?;
     info!(run_id, receipt = %output_dir.join(RECEIPT_FILE).display(), "publication gate passed");
@@ -3370,7 +3721,7 @@ pub fn verify(output_dir: &Path, run_id: &str) -> Result<()> {
     // since an on-demand site build legitimately runs a newer (or older)
     // binary than whatever last validated the data.
     ensure!(
-        matches!(receipt.schema_version, 3..=6)
+        matches!(receipt.schema_version, 3..=7)
             && receipt.license == policy.license
             && receipt.attribution == policy.attribution
             && receipt.independence_notice == policy.independence_notice
@@ -3384,6 +3735,7 @@ pub fn verify(output_dir: &Path, run_id: &str) -> Result<()> {
             && (receipt.schema_version == 3
                 || receipt.provenance.determinism_contract.as_ref()
                     == Some(&crate::determinism::contract()?))
+            && (receipt.schema_version < 7 || receipt.publication_noop_digest.len() == 64)
             && receipt.artifacts == candidate.artifacts,
         "publication receipt does not match candidate artifacts"
     );
@@ -3839,7 +4191,11 @@ mod tests {
         verify(fixture.output.path(), "run-good")?;
 
         let receipt: Value = read_json(&fixture.output.path().join(RECEIPT_FILE))?;
-        assert_eq!(receipt["schema_version"], 6);
+        assert_eq!(receipt["schema_version"], 7);
+        assert_eq!(
+            receipt["publication_noop_digest"].as_str().map(str::len),
+            Some(64)
+        );
         assert_eq!(
             receipt["provenance"]["determinism_contract"]["contract_version"],
             "pipeline-byte-determinism-v1"
@@ -4350,6 +4706,13 @@ mod tests {
         cloned.run_id = "candidate-3".to_string();
         cloned.ready_at_unix += 1;
         atomic_json(&candidate_3.join("ready.json"), &cloned)?;
+        write_ready_index(
+            fixture.data.path(),
+            fixture.output.path(),
+            "nlwiki",
+            &(cloned, candidate_3.clone()),
+        )
+        .expect("manually cloned ready candidate should update its index");
         prepare_ready_publication(
             fixture.data.path(),
             fixture.output.path(),
@@ -4415,6 +4778,12 @@ mod tests {
         });
         atomic_json(&fixture.lifecycle_path, &lifecycle)?;
 
+        let index_path = ready_index_path(fixture.output.path(), "nlwiki");
+        let index: ReadyCandidateIndex = read_json(&index_path)?;
+        assert_eq!(index.newest_valid_ready.run_id, "candidate-1");
+        assert!(index.active_published.is_none());
+        fs::write(&index_path, b"{truncated")?;
+
         let wiki_root = fixture.output.path().join("_candidates/nlwiki");
         fs::write(wiki_root.join("not-a-snapshot-directory"), b"ignored")?;
         let empty_snapshot = wiki_root.join("2026-02");
@@ -4437,6 +4806,8 @@ mod tests {
             .len(),
             1
         );
+        let repaired_index: ReadyCandidateIndex = read_json(&index_path)?;
+        assert_eq!(repaired_index.newest_valid_ready.run_id, "candidate-1");
         assert!(active_candidate_target(fixture.output.path(), &"x".repeat(10_000)).is_err());
         assert_eq!(
             active_candidate_relative(fixture.output.path(), "missingwiki")?,
@@ -6189,6 +6560,201 @@ mod tests {
         )
         .expect_err("wrong wiki labels must fail");
         assert!(error.to_string().contains("authoritative receipt"));
+        Ok(())
+    }
+
+    #[test]
+    fn phase_two_indexes_and_digest_are_fast_recoverable_and_fail_closed() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let original_lifecycle: Value = read_json(&fixture.lifecycle_path)?;
+        let mut paused_lifecycle = original_lifecycle.clone();
+        paused_lifecycle["wikis"]["pausedwiki"] = json!({
+            "publication": "published",
+            "refresh": "paused"
+        });
+        atomic_json(&fixture.lifecycle_path, &paused_lifecycle)?;
+        assert!(
+            publication_noop_digest_for_site(
+                fixture.data.path(),
+                fixture.output.path(),
+                &fixture.lifecycle_path,
+                false,
+                Path::new("site"),
+            )
+            .expect("legacy publication digest should evaluate")
+            .is_some()
+        );
+        atomic_json(&fixture.lifecycle_path, &original_lifecycle)?;
+        fixture.ready_candidate("phase2-active")?;
+        prepare_ready_publication(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "phase2-publish",
+        )
+        .expect("initial phase-two publication should prepare");
+        commit_ready_publication(fixture.data.path(), fixture.output.path(), "phase2-publish")?;
+
+        let started = Instant::now();
+        assert!(
+            publication_is_immediate_noop(
+                fixture.data.path(),
+                fixture.output.path(),
+                &fixture.lifecycle_path,
+            )
+            .expect("matching publication digest should evaluate")
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+
+        let gate_path = fixture.output.path().join(RECEIPT_FILE);
+        let gate_bytes = fs::read(&gate_path)?;
+        fs::write(&gate_path, b"{invalid")?;
+        assert!(
+            !publication_is_immediate_noop(
+                fixture.data.path(),
+                fixture.output.path(),
+                &fixture.lifecycle_path,
+            )
+            .expect("invalid gate should produce a cache miss")
+        );
+        fs::write(&gate_path, &gate_bytes)?;
+
+        let candidate_path = fixture.output.path().join(CANDIDATE_FILE);
+        let candidate_bytes = fs::read(&candidate_path)?;
+        fs::write(&candidate_path, b"{invalid")?;
+        assert!(
+            !publication_is_immediate_noop(
+                fixture.data.path(),
+                fixture.output.path(),
+                &fixture.lifecycle_path,
+            )
+            .expect("invalid publication candidate should produce a cache miss")
+        );
+        fs::write(&candidate_path, &candidate_bytes)?;
+
+        let artifact = fixture.output.path().join("gdp.parquet");
+        let artifact_bytes = fs::read(&artifact)?;
+        fs::remove_file(&artifact)?;
+        assert!(
+            !publication_is_immediate_noop(
+                fixture.data.path(),
+                fixture.output.path(),
+                &fixture.lifecycle_path,
+            )
+            .expect("missing publication artifact should produce a cache miss")
+        );
+        fs::write(&artifact, artifact_bytes)?;
+
+        fixture.ready_candidate_from_current_generation("phase2-newest")?;
+        let index_path = ready_index_path(fixture.output.path(), "nlwiki");
+        fs::write(&index_path, b"{invalid")?;
+        let newest =
+            indexed_latest_ready_candidate(fixture.data.path(), fixture.output.path(), "nlwiki")?
+                .context("recovered ready index")?;
+        assert_eq!(newest.0.run_id, "phase2-newest");
+        assert!(
+            publication_noop_digest(
+                fixture.data.path(),
+                fixture.output.path(),
+                &fixture.lifecycle_path,
+                true,
+            )
+            .expect("newer indexed candidate should invalidate no-op")
+            .is_none()
+        );
+
+        let mut lifecycle: Value = read_json(&fixture.lifecycle_path)?;
+        lifecycle["wikis"]["hiddenwiki"] = json!({
+            "publication": "hidden",
+            "refresh": "manual"
+        });
+        atomic_json(&fixture.lifecycle_path, &lifecycle)?;
+        assert!(
+            publication_noop_digest_for_site(
+                fixture.data.path(),
+                fixture.output.path(),
+                &fixture.lifecycle_path,
+                false,
+                Path::new("missing-site-directory"),
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ready_index_publication_failures_remain_recoverable() -> Result<()> {
+        let successful_rollback = Fixture::new()?;
+        successful_rollback.ready_candidate("rollback-index-success")?;
+        prepare_ready_publication(
+            successful_rollback.data.path(),
+            successful_rollback.output.path(),
+            &successful_rollback.lifecycle_path,
+            "rollback-index-success-publication",
+        )
+        .expect("successful rollback fixture should prepare");
+        rollback_ready_publication(
+            successful_rollback.data.path(),
+            successful_rollback.output.path(),
+            &successful_rollback.lifecycle_path,
+            "rollback-index-success-publication",
+        )
+        .expect("successful rollback should refresh its ready index");
+        assert!(ready_index_path(successful_rollback.output.path(), "nlwiki").is_file());
+
+        let mark_fixture = Fixture::new()?;
+        mark_fixture.ready_candidate("index-base")?;
+        let mark_index = ready_index_path(mark_fixture.output.path(), "nlwiki");
+        fs::remove_file(&mark_index)?;
+        fs::create_dir(&mark_index)?;
+        assert!(
+            mark_fixture
+                .ready_candidate_from_current_generation("index-write-failure")
+                .is_err()
+        );
+
+        let rollback_fixture = Fixture::new()?;
+        rollback_fixture.ready_candidate("rollback-index")?;
+        prepare_ready_publication(
+            rollback_fixture.data.path(),
+            rollback_fixture.output.path(),
+            &rollback_fixture.lifecycle_path,
+            "rollback-index-publication",
+        )
+        .expect("rollback failure fixture should prepare");
+        let rollback_index = ready_index_path(rollback_fixture.output.path(), "nlwiki");
+        fs::remove_file(&rollback_index)?;
+        fs::create_dir(&rollback_index)?;
+        assert!(
+            rollback_ready_publication(
+                rollback_fixture.data.path(),
+                rollback_fixture.output.path(),
+                &rollback_fixture.lifecycle_path,
+                "rollback-index-publication",
+            )
+            .is_err()
+        );
+
+        let commit_fixture = Fixture::new()?;
+        commit_fixture.ready_candidate("commit-index")?;
+        prepare_ready_publication(
+            commit_fixture.data.path(),
+            commit_fixture.output.path(),
+            &commit_fixture.lifecycle_path,
+            "commit-index-publication",
+        )
+        .expect("commit failure fixture should prepare");
+        let commit_index = ready_index_path(commit_fixture.output.path(), "nlwiki");
+        fs::remove_file(&commit_index)?;
+        fs::create_dir(&commit_index)?;
+        assert!(
+            commit_ready_publication(
+                commit_fixture.data.path(),
+                commit_fixture.output.path(),
+                "commit-index-publication",
+            )
+            .is_err()
+        );
         Ok(())
     }
 }

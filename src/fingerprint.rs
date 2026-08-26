@@ -397,63 +397,73 @@ fn paths_match(records: &[ArtifactIdentity], paths: &[TrackedPath]) -> Result<bo
     let mut sorted = paths.to_vec();
     sorted.sort_by(|left, right| left.identity.cmp(&right.identity));
     for (record, path) in records.iter().zip(sorted) {
-        if record.identity != path.identity || !path.path.is_file() {
-            info!(
-                expected_identity = record.identity,
-                observed_identity = path.identity,
-                path = %path.path.display(),
-                exists = path.path.is_file(),
-                "stage artifact identity changed"
-            );
+        if !artifact_matches(record, &path)? {
             return Ok(false);
         }
-        let metadata = fs::metadata(&path.path)?;
-        let receipt_verified = if let Some(receipt_sha256) = &record.artifact_receipt_sha256 {
-            let document = match crate::artifact_receipt::read(&path.path) {
-                Ok(document) => document,
-                Err(error) => {
-                    info!(identity = record.identity, error = %error, "artifact receipt is invalid");
-                    return Ok(false);
-                }
-            };
-            if crate::artifact_receipt::verify(
-                &path.path,
-                &document.receipt.identity,
-                Some(receipt_sha256),
-                crate::artifact_receipt::VerificationMode::Fast,
-            )
-            .is_err()
-            {
-                info!(identity = record.identity, "artifact receipt pair changed");
+    }
+    Ok(true)
+}
+
+/// Validate one path against an identity already authenticated by a stage
+/// receipt. This is intentionally useful for compact control-plane artifacts:
+/// callers can verify a manifest without inspecting every data file it names.
+pub(crate) fn artifact_matches(record: &ArtifactIdentity, path: &TrackedPath) -> Result<bool> {
+    if record.identity != path.identity || !path.path.is_file() {
+        info!(
+            expected_identity = record.identity,
+            observed_identity = path.identity,
+            path = %path.path.display(),
+            exists = path.path.is_file(),
+            "stage artifact identity changed"
+        );
+        return Ok(false);
+    }
+    let metadata = fs::metadata(&path.path)?;
+    let receipt_verified = if let Some(receipt_sha256) = &record.artifact_receipt_sha256 {
+        let document = match crate::artifact_receipt::read(&path.path) {
+            Ok(document) => document,
+            Err(error) => {
+                info!(identity = record.identity, error = %error, "artifact receipt is invalid");
                 return Ok(false);
             }
+        };
+        if crate::artifact_receipt::verify(
+            &path.path,
+            &document.receipt.identity,
+            Some(receipt_sha256),
+            crate::artifact_receipt::VerificationMode::Fast,
+        )
+        .is_err()
+        {
+            info!(identity = record.identity, "artifact receipt pair changed");
+            return Ok(false);
+        }
+        true
+    } else {
+        false
+    };
+    if metadata.len() != record.bytes {
+        info!(
+            identity = record.identity,
+            expected_bytes = record.bytes,
+            observed_bytes = metadata.len(),
+            "stage artifact size changed"
+        );
+        return Ok(false);
+    }
+    if modified_nanos(&path.path)? != record.observed_modified_unix_nanos {
+        let content_matches = if receipt_verified {
             true
         } else {
-            false
+            sha256_file(&path.path)? == record.sha256
         };
-        if metadata.len() != record.bytes {
+        if !content_matches {
             info!(
                 identity = record.identity,
-                expected_bytes = record.bytes,
-                observed_bytes = metadata.len(),
-                "stage artifact size changed"
+                expected_sha256 = record.sha256,
+                "stage artifact content changed"
             );
             return Ok(false);
-        }
-        if modified_nanos(&path.path)? != record.observed_modified_unix_nanos {
-            let content_matches = if receipt_verified {
-                true
-            } else {
-                sha256_file(&path.path)? == record.sha256
-            };
-            if !content_matches {
-                info!(
-                    identity = record.identity,
-                    expected_sha256 = record.sha256,
-                    "stage artifact content changed"
-                );
-                return Ok(false);
-            }
         }
     }
     Ok(true)
@@ -520,6 +530,26 @@ fn receipt_matches_spec(receipt: &StageReceipt, spec: StageSpec<'_>) -> Result<b
         && receipt.algorithm_version == spec.algorithm_version
         && receipt.computation_version == env!("CARGO_PKG_VERSION")
         && receipt_fingerprint(receipt)? == receipt.fingerprint)
+}
+
+/// Read and authenticate only the receipt envelope. Artifact identities in the
+/// returned document are safe to use as expected values, but callers must still
+/// validate whichever concrete paths they consume with `artifact_matches`.
+pub(crate) fn validated_receipt(
+    receipt_path: &Path,
+    spec: StageSpec<'_>,
+) -> Result<Option<StageReceipt>> {
+    if !receipt_path.is_file() {
+        return Ok(None);
+    }
+    let receipt = match read_receipt(receipt_path) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            warn!(path = %receipt_path.display(), error = %error, "ignoring invalid stage receipt");
+            return Ok(None);
+        }
+    };
+    Ok(receipt_matches_spec(&receipt, spec)?.then_some(receipt))
 }
 
 pub fn read_receipt(path: &Path) -> Result<StageReceipt> {
@@ -622,21 +652,8 @@ fn site_selected_snapshots(output_dir: &Path) -> Result<String> {
     Ok(selected)
 }
 
-fn site_stage_inputs(output_dir: &Path, site_dir: &Path) -> Result<Vec<TrackedPath>> {
-    // scripts/build-site.sh verifies every candidate artifact against the
-    // publication gate before it reaches this fingerprint check. The two
-    // atomic receipts therefore form a compact, already-verified identity for
-    // the full data set and avoid hashing multi-gigabyte Parquets a second time.
-    let mut inputs = vec![
-        TrackedPath::new(
-            "data/.publication-candidate.json",
-            output_dir.join(".publication-candidate.json"),
-        ),
-        TrackedPath::new(
-            format!("data/{}", crate::publication::RECEIPT_FILE),
-            output_dir.join(crate::publication::RECEIPT_FILE),
-        ),
-    ];
+fn site_source_inputs(site_dir: &Path) -> Result<Vec<TrackedPath>> {
+    let mut inputs = Vec::new();
     let mut site_sources = collect_tracked_files(&site_dir.join("src"), "site/src")?;
     site_sources.retain(|source| !source.identity.starts_with("site/src/.observablehq/"));
     inputs.extend(site_sources);
@@ -657,6 +674,33 @@ fn site_stage_inputs(output_dir: &Path, site_dir: &Path) -> Result<Vec<TrackedPa
             workspace_dir.join(name),
         ));
     }
+    inputs.sort_by(|left, right| left.identity.cmp(&right.identity));
+    Ok(inputs)
+}
+
+pub(crate) fn site_source_fingerprint(site_dir: &Path) -> Result<String> {
+    let inspected = inspect_all(&site_source_inputs(site_dir)?)?;
+    let bytes = serde_json::to_vec(&deterministic_artifacts(&inspected))
+        .expect("deterministic site identities are always serializable");
+    Ok(hex::encode(Sha256::digest(bytes)))
+}
+
+fn site_stage_inputs(output_dir: &Path, site_dir: &Path) -> Result<Vec<TrackedPath>> {
+    // scripts/build-site.sh verifies every candidate artifact against the
+    // publication gate before it reaches this fingerprint check. The two
+    // atomic receipts therefore form a compact, already-verified identity for
+    // the full data set and avoid hashing multi-gigabyte Parquets a second time.
+    let mut inputs = vec![
+        TrackedPath::new(
+            "data/.publication-candidate.json",
+            output_dir.join(".publication-candidate.json"),
+        ),
+        TrackedPath::new(
+            format!("data/{}", crate::publication::RECEIPT_FILE),
+            output_dir.join(crate::publication::RECEIPT_FILE),
+        ),
+    ];
+    inputs.extend(site_source_inputs(site_dir)?);
     inputs.sort_by(|left, right| left.identity.cmp(&right.identity));
     Ok(inputs)
 }
@@ -854,6 +898,7 @@ mod tests {
         fs::write(&receipt_path, "not-json")?;
         assert!(!reusable(&receipt_path, spec, &inputs, &outputs)?);
         assert!(!outputs_reusable(&receipt_path, spec, &outputs)?);
+        assert!(validated_receipt(&receipt_path, spec)?.is_none());
         assert!(read_receipt(&receipt_path).is_err());
         let missing_outputs = outputs_reusable(&dir.path().join("missing.json"), spec, &outputs)
             .expect("missing upstream receipt is a cache miss");
