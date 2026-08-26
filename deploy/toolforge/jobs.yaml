@@ -112,6 +112,18 @@
   mem: 6Gi
   cpu: "1"
 
+# Independent full-byte verification is intentionally infrequent. It detects
+# corruption even when file size and mtime are unchanged, while normal
+# publications consume the receipt fast path.
+- name: wiki-econ-artifact-scrub
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: deploy/toolforge/run-artifact-scrub.sh
+  schedule: "0 5 15 * *"
+  filelog: true
+  mount: all
+  mem: 2Gi
+  cpu: "1"
+
 # Legacy on-demand-only jobs (no `schedule:`): trigger with
 # `toolforge jobs restart <name>`, e.g. after a site/docs-only change that
 # doesn't need a fresh fetch or compute. See README.md's "On-demand stage jobs"

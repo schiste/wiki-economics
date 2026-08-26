@@ -22,6 +22,7 @@ scheduled_jobs=(
   wiki-econ-prepare-svwiki
   wiki-econ-prepare-elwiki
   wiki-econ-publish-ready
+  wiki-econ-artifact-scrub
 )
 on_demand_jobs=(
   wiki-econ-refresh

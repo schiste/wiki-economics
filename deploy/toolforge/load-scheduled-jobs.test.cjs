@@ -39,6 +39,7 @@ esac
       `jobs load --job wiki-econ-prepare-svwiki ${manifest}`,
       `jobs load --job wiki-econ-prepare-elwiki ${manifest}`,
       `jobs load --job wiki-econ-publish-ready ${manifest}`,
+      `jobs load --job wiki-econ-artifact-scrub ${manifest}`,
     ]);
     for (const name of ["wiki-econ-refresh", "wiki-econ-ingest", "wiki-econ-compute", "wiki-econ-site"]) {
       assert.ok(invocations.includes(`jobs delete ${name}`));
