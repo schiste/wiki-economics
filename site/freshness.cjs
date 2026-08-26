@@ -8,6 +8,7 @@ const DEFAULT_THRESHOLDS = Object.freeze({
   memoryCriticalRatio: OPERATIONS_SLOS.memory.critical_ratio,
   minimumDiskFreeBytes: OPERATIONS_SLOS.storage.minimum_free_bytes,
   heartbeatStaleMs: OPERATIONS_SLOS.heartbeat.maximum_age_ms,
+  incrementalPublicationMaximumMs: OPERATIONS_SLOS.publication.incremental_maximum_duration_ms,
   maximumBrowserBytes: OPERATIONS_SLOS.browser_artifacts.maximum_total_bytes,
   maximumBrowserPartitionBytes: OPERATIONS_SLOS.browser_artifacts.maximum_partition_bytes,
   stageLimitsMs: Object.freeze(OPERATIONS_SLOS.stage_maximum_duration_ms),
@@ -34,7 +35,7 @@ function stageStart(record) {
   return timestamp(current?.startedAt);
 }
 
-function evaluateFreshness({last = null, history = [], lifecycle, now = Date.now(), thresholds = {}}) {
+function evaluateFreshness({last = null, history = [], lifecycle, scrubStatus = null, now = Date.now(), thresholds = {}}) {
   const settings = {
     ...DEFAULT_THRESHOLDS,
     ...thresholds,
@@ -49,6 +50,22 @@ function evaluateFreshness({last = null, history = [], lifecycle, now = Date.now
   const previousPublication = publicationSuccesses.at(-2) || null;
   const alerts = [];
   const alert = (code, severity, message, details = {}) => alerts.push({code, severity, message, ...details});
+
+  if (scrubStatus) {
+    const valid = scrubStatus.schema_version === 1
+      && ["succeeded", "failed"].includes(scrubStatus.state)
+      && typeof scrubStatus.run_id === "string"
+      && scrubStatus.run_id.length > 0
+      && Number.isSafeInteger(scrubStatus.updated_at_unix);
+    if (!valid) {
+      alert("artifact_scrub_status_invalid", "critical", "The durable artifact scrub status is malformed; publication is blocked.");
+    } else if (scrubStatus.state === "failed") {
+      alert("artifact_scrub_failed", "critical", `Artifact scrub ${scrubStatus.run_id} failed; publication is blocked.`, {
+        runId: scrubStatus.run_id,
+        error: scrubStatus.error || "unknown scrub failure",
+      });
+    }
+  }
 
   for (const [wiki, entry] of scheduledWikis) {
     const finished = timestamp(latestPublication?.finishedAt);
@@ -141,6 +158,17 @@ function evaluateFreshness({last = null, history = [], lifecycle, now = Date.now
   }
 
   if (latestPublication) {
+    const incrementalDuration = latestPublication.stageDurationsMs?.publication_prepare;
+    if (latestPublication.publication?.changePlan
+        && Number.isFinite(incrementalDuration)
+        && incrementalDuration > settings.incrementalPublicationMaximumMs) {
+      alert("incremental_publication_slow", "critical", "Incremental publication exceeded its three-minute SLO.", {
+        runId: latestPublication.runId,
+        durationMs: incrementalDuration,
+        thresholdMs: settings.incrementalPublicationMaximumMs,
+        changedFamilies: latestPublication.publication.changePlan.changed?.length ?? null,
+      });
+    }
     const browser = latestPublication.publication?.browserData;
     if (!browser || !Number.isFinite(browser.bytes) || !Number.isFinite(browser.largestPartitionBytes)) {
       alert("browser_artifact_evidence_missing", "critical", "The successful publication has no validated browser artifact size evidence.");
@@ -178,11 +206,13 @@ function evaluateFreshness({last = null, history = [], lifecycle, now = Date.now
       lastPublicationAt: latestPublication?.finishedAt || null,
       selectedSnapshot: last?.selectedSnapshot || latestSuccess?.selectedSnapshot || null,
       publishedSnapshots,
+      artifactScrub: scrubStatus,
       slos: {
         memoryWarningRatio: settings.memoryWarningRatio,
         memoryCriticalRatio: settings.memoryCriticalRatio,
         minimumDiskFreeBytes: settings.minimumDiskFreeBytes,
         heartbeatStaleMs: settings.heartbeatStaleMs,
+        incrementalPublicationMaximumMs: settings.incrementalPublicationMaximumMs,
         maximumBrowserBytes: settings.maximumBrowserBytes,
         maximumBrowserPartitionBytes: settings.maximumBrowserPartitionBytes,
       },

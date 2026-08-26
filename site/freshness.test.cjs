@@ -44,6 +44,36 @@ test("a recent, advancing, resource-safe publication is healthy", () => {
   assert.equal(successfulRuns(record, [record, {...record, state: "failed", exitCode: 1}]).length, 1);
 });
 
+test("a failed or malformed deep scrub is a publication-blocking alert", () => {
+  const record = success();
+  const failed = evaluateFreshness({
+    last: record,
+    history: [record],
+    lifecycle,
+    scrubStatus: {
+      schema_version: 1,
+      state: "failed",
+      run_id: "scrub-20260826",
+      updated_at_unix: 1_787_700_000,
+      report_sha256: null,
+      error: "semantic mismatch",
+    },
+    now: Date.parse("2026-08-22T03:00:00Z"),
+  });
+  assert.equal(failed.status, "critical");
+  assert.equal(failed.alerts[0].code, "artifact_scrub_failed");
+  assert.equal(failed.summary.artifactScrub.run_id, "scrub-20260826");
+
+  const malformed = evaluateFreshness({
+    last: record,
+    history: [record],
+    lifecycle,
+    scrubStatus: {invalid: true},
+    now: Date.parse("2026-08-22T03:00:00Z"),
+  });
+  assert.equal(malformed.alerts[0].code, "artifact_scrub_status_invalid");
+});
+
 test("a later site-only success retains the latest validated publication", () => {
   const publication = success({runId: "publish-1"});
   const siteOnly = success({
@@ -124,6 +154,24 @@ test("memory between 75 and 80 percent is a warning", () => {
   assert.equal(result.status, "warning");
   assert.equal(result.alerts[0].code, "memory_pressure");
   assert.equal(result.alerts[0].severity, "warning");
+});
+
+test("incremental publication has a three-minute SLO", () => {
+  const record = success({
+    stageDurationsMs: {publication_prepare: 180_001},
+    publication: {
+      ...success().publication,
+      changePlan: {changed: [{wiki: "nlwiki", family: "monthly"}], reused: []},
+    },
+  });
+  const result = evaluateFreshness({
+    last: record,
+    history: [record],
+    lifecycle,
+    now: Date.parse(record.finishedAt) + DAY_MS,
+  });
+  assert.equal(result.alerts[0].code, "incremental_publication_slow");
+  assert.equal(result.alerts[0].changedFamilies, 1);
 });
 
 test("browser publication size evidence is fail-closed and budgeted", () => {

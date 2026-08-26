@@ -11,6 +11,9 @@
   "heartbeat": {
     "maximum_age_ms": 180000
   },
+  "publication": {
+    "incremental_maximum_duration_ms": 180000
+  },
   "browser_artifacts": {
     "maximum_total_bytes": 2147483648,
     "maximum_partition_bytes": 536870912

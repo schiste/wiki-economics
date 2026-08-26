@@ -131,6 +131,11 @@ test("live and final records combine provenance, resources, publication, and sit
     selected_snapshot_versions: {nlwiki: "2026-07"},
     cutoff_dates: {nlwiki: "2026-08"},
     patrol_sources: {nlwiki: {patrol_events: 10, rights_events: 2}},
+    change_plan: {
+      schema_version: 1,
+      changed: [{wiki: "nlwiki", family: "monthly"}],
+      reused: [{wiki: "nlwiki", family: "page_week"}],
+    },
     browser_data: {generation: "d".repeat(64), partitions: 9, rows: 90, bytes: 900, largest_partition_bytes: 200},
     metrics: {
       page_weekly_edits: {
@@ -150,6 +155,10 @@ test("live and final records combine provenance, resources, publication, and sit
   assert.equal(final.publication.metrics.page_weekly_edits.edits, 70);
   assert.equal(final.publication.metrics.page_weekly_edits.maximumDate, "2026-07-27");
   assert.equal(final.publication.selectedSnapshots.nlwiki, "2026-07");
+  assert.deepEqual(final.publication.changePlan, {
+    changed: [{wiki: "nlwiki", family: "monthly"}],
+    reused: [{wiki: "nlwiki", family: "page_week"}],
+  });
   assert.equal(final.publication.browserData.bytes, 900);
   assert.equal(final.publication.browserData.largestPartitionBytes, 200);
 });

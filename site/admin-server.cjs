@@ -681,6 +681,16 @@ function readRefreshStatus() {
   return { schedule: REFRESH_SCHEDULE, last, history };
 }
 
+function readArtifactScrubStatus() {
+  const file = path.join(OUTPUT_DIR, "_scrubs", "status.json");
+  if (!fs.existsSync(file)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return {invalid: true};
+  }
+}
+
 function loadSupportedWikipedias() {
   if (supportedWikisCache) return supportedWikisCache;
   // Scrape the WIKIPEDIA_DATABASES constant from src/fetch.rs so the picker's
@@ -1048,7 +1058,11 @@ function buildStatusPayload(req, session) {
     wikiStates: wikiLifecycleStatus(),
     runner: runnerInfo(),
     scheduledRefresh,
-    freshness: evaluateFreshness({...scheduledRefresh, lifecycle: WIKI_LIFECYCLE}),
+    freshness: evaluateFreshness({
+      ...scheduledRefresh,
+      lifecycle: WIKI_LIFECYCLE,
+      scrubStatus: readArtifactScrubStatus(),
+    }),
     auth: authStatus(session, req),
   };
 }
@@ -1072,7 +1086,11 @@ async function handleRequest(req, res) {
   }
 
   if (req.method === "GET" && url.pathname === FRESHNESS_STATUS_PATH) {
-    writeJson(res, 200, evaluateFreshness({...readRefreshStatus(), lifecycle: WIKI_LIFECYCLE}));
+    writeJson(res, 200, evaluateFreshness({
+      ...readRefreshStatus(),
+      lifecycle: WIKI_LIFECYCLE,
+      scrubStatus: readArtifactScrubStatus(),
+    }));
     return;
   }
 

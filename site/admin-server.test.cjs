@@ -495,6 +495,19 @@ test("public freshness status is machine-readable without an admin session", asy
   assert.equal(health.statusCode, 200);
   assert.equal(JSON.parse(health.text()).status, "healthy");
 
+  fs.mkdirSync(path.join(outputDir, "_scrubs"), {recursive: true});
+  fs.writeFileSync(path.join(outputDir, "_scrubs", "status.json"), JSON.stringify({
+    schema_version: 1,
+    state: "failed",
+    run_id: "scrub-failed",
+    updated_at_unix: 1,
+    report_sha256: null,
+    error: "semantic mismatch",
+  }));
+  const unhealthy = await invoke(module, {url: "/health/freshness.json", headers: {host}});
+  assert.equal(unhealthy.statusCode, 200);
+  assert.equal(JSON.parse(unhealthy.text()).alerts[0].code, "artifact_scrub_failed");
+
   const admin = await invoke(module, {url: "/admin-api/status", headers: {host}});
   assert.equal(admin.statusCode, 401);
 });

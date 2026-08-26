@@ -204,6 +204,10 @@ function publicationSummary(gate, runId) {
   return {
     selectedSnapshots: gate.selected_snapshot_versions || {},
     cutoffDates: gate.cutoff_dates || {},
+    changePlan: gate.change_plan?.schema_version === 1 ? {
+      changed: Array.isArray(gate.change_plan.changed) ? gate.change_plan.changed : [],
+      reused: Array.isArray(gate.change_plan.reused) ? gate.change_plan.reused : [],
+    } : null,
     metrics,
     patrolSources: gate.patrol_sources || {},
     browserData: gate.browser_data ? {
