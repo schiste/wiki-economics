@@ -12,6 +12,9 @@ node scripts/verify-runtime.cjs
 echo "==> node scripts/generate-stack-reference.cjs --check"
 node scripts/generate-stack-reference.cjs --check
 
+echo "==> node scripts/check-compute-versions.cjs"
+node scripts/check-compute-versions.cjs
+
 echo "==> bash -n scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh deploy/toolforge/*.sh"
 bash -n scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh deploy/toolforge/*.sh
 
@@ -101,6 +104,7 @@ node --test scripts/verify-site-dependencies.test.cjs
 node --test scripts/verify-site-reproducibility.test.cjs
 node --test scripts/publish-browser-data.test.cjs
 node --test scripts/browser-performance.test.cjs
+node --test scripts/check-compute-versions.test.cjs
 node --test site/browser-cache.test.mjs
 node --test site/activity-tiers.test.mjs
 node --test site/wiki-scope.test.mjs

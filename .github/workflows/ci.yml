@@ -56,6 +56,8 @@ jobs:
     steps:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        with:
+          fetch-depth: 0
 
       - name: Install Node.js
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
@@ -74,6 +76,11 @@ jobs:
 
       - name: Verify generated stack documentation
         run: node scripts/generate-stack-reference.cjs --check
+
+      - name: Enforce compute-family algorithm versions
+        env:
+          COMPUTE_VERSION_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: node scripts/check-compute-versions.cjs
 
       - name: Check shell script syntax
         run: bash -n scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh deploy/toolforge/*.sh
@@ -107,6 +114,7 @@ jobs:
           node --check scripts/verify-site-reproducibility.cjs
           node --check scripts/publish-browser-data.cjs
           node --check scripts/browser-performance.cjs
+          node --check scripts/check-compute-versions.cjs
 
       - name: Run Node unit tests
         run: |
@@ -139,6 +147,7 @@ jobs:
           node --test scripts/verify-site-reproducibility.test.cjs
           node --test scripts/publish-browser-data.test.cjs
           node --test scripts/browser-performance.test.cjs
+          node --test scripts/check-compute-versions.test.cjs
           node --test site/browser-cache.test.mjs
           node --test site/activity-tiers.test.mjs
           node --test site/wiki-scope.test.mjs
