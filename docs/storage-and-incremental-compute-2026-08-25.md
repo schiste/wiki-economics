@@ -96,6 +96,13 @@ a 28-column warehouse layer. Schema-v2 ingest now writes one versioned,
 Rust metric. Readers select the layout from the immutable generation manifest,
 so active and rollback schema-v1 generations remain valid.
 
+The next real snapshot also compacts source-owned fragments transactionally by
+event month. The default compressed target is 192 MiB (configurable only within
+128–256 MiB), the hard maximum is 512 MiB, and only one writer is active. The
+committed allowlist—not directory traversal—owns the compacted fragments. This
+reduces NFS metadata pressure while retaining source-level restart until the
+generation and ingest receipts are durable.
+
 The production qualification covered nlwiki, ptwiki, and frwiki under the 6 GiB
 Toolforge cgroup. It measured 5,541,144,344 bytes (5.16 GiB, 41.28%) of aggregate
 savings with a 514,822,144-byte maximum cgroup peak. See the

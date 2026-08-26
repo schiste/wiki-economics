@@ -36,8 +36,9 @@ machine is:
 building -> validated -> ready -> published -> superseded -> retired
 ```
 
-Interrupted `building` or `validated` attempts remain resumable for the
-configured recovery window. Ready and published generations are never removed
+Exactly one interrupted `building` or `validated` attempt per wiki remains
+resumable for the configured recovery window; the active run wins that slot,
+otherwise the newest state receipt does. Ready and published generations are never removed
 by age-based cleanup. Publication marks the previous live candidate
 `superseded` only after the new site and data pass the publication gate, keeps
 that one generation as rollback material, and transitions older superseded
@@ -48,11 +49,13 @@ Before creating a new candidate, preparation compares the resolved snapshot
 with indexed ready candidates for that wiki and verifies four core-family
 fingerprints plus the independent patrol fingerprint. A complete match finishes
 as an explicit no-op and points its log at the existing `ready.json`. On a
-partial match, each receipt-covered family is copied atomically into the new
+partial match, each receipt-covered family is reused atomically in the new
 candidate and `ComputePlan` runs only invalid families. Reusable families may
 come from different immutable candidates; readiness is issued only after the
 new candidate contains and authenticates the complete family set. The original
-ready candidates remain immutable.
+ready candidates remain immutable. Reuse attempts a copy-on-write filesystem
+clone first, then an immutable hard link, and finally a byte copy. Files without
+a valid ready/stage/artifact-receipt chain are never link candidates.
 
 Preparation holds `output/_prepare-locks/<wiki>.lock`. Different wikis may run
 concurrently; a second preparation for the same wiki exits with status 75.
@@ -104,6 +107,9 @@ together and reports the exact run ID whose commit must be retried.
 Reclamation follows ownership receipts rather than directory names alone:
 strict ingest success authorizes raw-source deletion, durable bucket append
 authorizes scratch deletion, and lifecycle state authorizes candidate deletion.
+Committed compaction plus its ingest receipt authorizes retirement of the
+explicit source-fragment allowlist; an interrupted prepared compaction remains
+recoverable and an ambiguous staging/final pair fails closed for quarantine.
 Expired, well-identified site/run staging is removed by run ID. Malformed or
 unknown objects found inside pipeline-owned candidate/staging namespaces are
 moved to `_quarantine` with a JSON receipt instead of being deleted.

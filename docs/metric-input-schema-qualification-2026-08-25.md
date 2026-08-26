@@ -33,6 +33,12 @@ The change reduces persistent generation storage by about 40–42% for the quali
 
 The saving appears when a wiki builds and publishes its next snapshot generation. No active 2026-07 generation should be rewritten merely to realize the saving. After successful publication and rollback validation, lifecycle cleanup retires the superseded two-layer generation.
 
+That natural rollover now also performs deterministic, event-month compaction.
+The source transactions remain independently recoverable until the compaction
+manifest and ingest receipt commit. Only then are their fragments retired. The
+currently published schema-v1 generations are not rewritten to obtain either
+the schema or fragment-count saving.
+
 Qualification gates for rollout are:
 
 1. identical metric rows, edit totals, date ranges, and deterministic output hashes between schema-v1 and schema-v2 fixtures;

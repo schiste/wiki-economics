@@ -97,6 +97,7 @@ data/
   raw/<wiki>/                       transient history dumps, deleted after ingest
   patrol/<wiki>/                    logging source and parsed patrol/right data
   metric-input/<wiki>/_snapshots/<snapshot>/
+    _compacted/year=<YYYY>/year_month=<YYYY-MM>/
   warehouse/, parquet/              schema-v1 rollback generations only
   snapshots/<wiki>/current-snapshot.json
   stages/                           fetch/ingest stage receipts
@@ -117,13 +118,17 @@ capacity/                            isolated qualification reports/staging
 ```
 
 The active snapshot pointer selects exactly one immutable generation and its
-manifest selects one storage layout. Schema-v2 generations contain only the
-qualified metric-input layer; schema-v1 rollback generations remain readable.
+manifest selects one storage layout. New logical schema-v2 generations contain
+only the qualified metric-input layer; after transactional compaction their
+generation-manifest schema is 3 and its authenticated allowlist points only at
+`_compacted` fragments. Schema-v1 rollback generations remain readable.
 During rollover the prior generation remains available until compute, merge,
 validation, and the site switch succeed. Raw dumps are then disposable because
-strict ingest markers validate every Parquet output. Cleanup only removes
-well-identified, expired staging paths and never follows or deletes the live
-site symlink target.
+strict ingest markers or the receipt-authenticated compaction manifest prove
+every source transaction. Cleanup retains the published candidate, one
+rollback candidate, and one resumable building/validated candidate per wiki;
+it removes only lifecycle-owned retired or expired paths and never follows or
+deletes the live site symlink target.
 
 Scratch is configurable with `WIKI_ECON_SCRATCH_DIR`; production capacity and
 free-space gates must account for raw transport, the temporary second data

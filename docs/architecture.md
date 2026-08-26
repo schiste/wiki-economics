@@ -11,7 +11,7 @@ The project has these distinct data layers rooted under `data/` and `output/`:
 1. `data/raw/<wiki>/...tsv.bz2`
    Wikimedia MediaWiki History dump shards fetched from `dumps.wikimedia.org`.
 
-2. `data/metric-input/<wiki>/_snapshots/<snapshot>/year=<YYYY>/year_month=<YYYY-MM>/*.parquet`
+2. `data/metric-input/<wiki>/_snapshots/<snapshot>/_compacted/year=<YYYY>/year_month=<YYYY-MM>/*.parquet`
    The qualified 13-column input contract shared by core, weekly, and patrol
    compute for schema-v2 generations. Readers retain compatibility with the
    historical `warehouse/` plus `parquet/` schema-v1 layout.
@@ -100,15 +100,25 @@ Important decisions:
   plan, ordinary readers memoize the parsed allowlist and skip fragment hashes
   and footer reads. Independent artifact scrubs and recovery retain the strict
   physical validation path.
-- Fragment compaction is not currently performed. If introduced, it must be a
-  separately fingerprinted transaction that publishes a replacement generation
-  manifest rather than appending to or rewriting selected fragments in place.
+- After every source marker commits, finalization transactionally compacts the
+  immutable source fragments by event month. It deterministically sorts all 13
+  columns, packs source fragments toward a 192 MiB compressed target, caps each
+  output at 512 MiB, and uses only one active Parquet writer. The prepared
+  transaction is recoverable on either side of the directory rename. A
+  generation-manifest schema-3 allowlist is published only after row, footer,
+  size, and SHA-256 validation; the ingest receipt is then the authority that
+  permits deletion of the replaced source fragments.
+- `WIKI_ECON_COMPACTION_TARGET_BYTES` may select 128–256 MiB and
+  `WIKI_ECON_COMPACTION_MAX_BYTES` may select target–512 MiB. These values are
+  recorded in the compaction manifest. They are workload policy, never a
+  wiki-name branch.
 - Versioned Wikimedia filenames must form one complete expected snapshot before `current-snapshot.json` is published. Explicit `run --version` and `ingest --version` selections ignore abandoned raw files from older snapshots.
 - Readers retain a legacy-layout fallback only until the first generation pointer is published. Underscore-prefixed staging/generation directories are never recursively scanned as ordinary data.
 - Output is partitioned by `year=` and `year_month=` because the downstream metrics are monthly. This keeps month-scoped compute exact without loading an entire wiki.
-- New snapshots write one qualified metric-input fragment per logical output,
+- New snapshots first write one qualified metric-input fragment per logical source output,
   eliminating the duplicated 28-column warehouse and 10-column analytical
-  writes. Production qualification measured a 39.90–41.93% reduction across
+  writes, and then compact those fragments without changing logical rows.
+  Production schema qualification measured a 39.90–41.93% reduction across
   nlwiki, ptwiki, and frwiki.
 - Ingest failure cleanup removes partial outputs from every supported layout
   and never leaves a success marker behind.
