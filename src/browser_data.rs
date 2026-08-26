@@ -8,12 +8,11 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
 
-use crate::{licensing, storage};
+use crate::{artifact_receipt, licensing};
 
 pub const INDEX_FILENAME: &str = "browser-data-index.json";
 pub const INDEX_SCHEMA_VERSION: u32 = 1;
 pub const CACHE_SCHEMA_VERSION: u32 = 2;
-const SUMMARY_BATCH_ROWS: usize = 250_000;
 
 pub const BROWSER_METRICS: [(&str, &str); 9] = [
     ("business_funnel", "cohort_year"),
@@ -81,57 +80,6 @@ fn published_wikis(output_dir: &Path, allowlist: Option<&BTreeSet<String>>) -> R
     Ok(wikis)
 }
 
-fn summarize(path: &Path, wiki: &str, date_column: &str) -> Result<(u64, String, String)> {
-    let columns = Some(vec!["wiki".to_string(), date_column.to_string()]);
-    let mut reader = storage::SequentialParquetReader::new(path, columns, SUMMARY_BATCH_ROWS)?;
-    let rows = u64::try_from(reader.rows())?;
-    ensure!(
-        rows > 0,
-        "browser data partition is empty: {}",
-        path.display()
-    );
-    let mut observed_rows = 0_u64;
-    let mut minimum_date: Option<String> = None;
-    let mut maximum_date: Option<String> = None;
-    while let Some(batch) = reader.next_batch()? {
-        observed_rows = observed_rows
-            .checked_add(u64::try_from(batch.height())?)
-            .context("browser partition row count overflow")?;
-        for observed_wiki in batch.column("wiki")?.str()?.iter() {
-            let observed_wiki = observed_wiki
-                .with_context(|| format!("browser partition {} has null wiki", path.display()))?;
-            ensure!(
-                observed_wiki == wiki,
-                "browser partition {} contains rows outside {wiki}",
-                path.display()
-            );
-        }
-        for date in batch.column(date_column)?.str()?.iter() {
-            let date = date.with_context(|| {
-                format!(
-                    "browser partition {} has null {date_column}",
-                    path.display()
-                )
-            })?;
-            if minimum_date.as_deref().is_none_or(|minimum| date < minimum) {
-                minimum_date = Some(date.to_owned());
-            }
-            if maximum_date.as_deref().is_none_or(|maximum| date > maximum) {
-                maximum_date = Some(date.to_owned());
-            }
-        }
-    }
-    ensure!(
-        observed_rows == rows,
-        "browser partition row conservation failed",
-    );
-    Ok((
-        rows,
-        minimum_date.context("browser partition date minimum is null")?,
-        maximum_date.context("browser partition date maximum is null")?,
-    ))
-}
-
 fn build_index(
     output_dir: &Path,
     allowlist: Option<&BTreeSet<String>>,
@@ -148,17 +96,64 @@ fn build_index(
             if !source.is_file() {
                 continue;
             }
-            let (rows, minimum_date, maximum_date) = summarize(&source, &wiki, date_column)?;
-            let (bytes, sha256) = storage::sha256_file(&source)?;
+            let identity = format!("{wiki}/{metric}.parquet");
+            let document = if artifact_receipt::sidecar_path(&source)?.is_file() {
+                artifact_receipt::read(&source)?
+            } else {
+                artifact_receipt::scan_and_write(
+                    &source,
+                    &identity,
+                    "legacy-browser-index-migration-v1",
+                    "legacy-unreceipted-input",
+                )
+                .or_else(|_| {
+                    artifact_receipt::scan_and_write_with_spec(
+                        &source,
+                        &identity,
+                        "legacy-browser-index-migration-v1",
+                        "legacy-unreceipted-input",
+                        artifact_receipt::SemanticSpec {
+                            date_column: Some(date_column.to_string()),
+                            conservation_columns: Vec::new(),
+                            ordering_contract: "wiki-major/v1".to_string(),
+                            page_week_consistency: false,
+                        },
+                    )
+                })?
+            };
+            let receipt = artifact_receipt::verify(
+                &source,
+                &document.receipt.identity,
+                Some(&document.receipt_sha256),
+                artifact_receipt::VerificationMode::Fast,
+            )?
+            .receipt;
+            ensure!(
+                receipt.rows > 0 && receipt.minimum_wiki == wiki && receipt.maximum_wiki == wiki,
+                "browser partition receipt is empty or contains another wiki"
+            );
+            let minimum_date = receipt
+                .minimum_date
+                .context("browser partition date minimum is null")?;
+            let maximum_date = receipt
+                .maximum_date
+                .context("browser partition date maximum is null")?;
+            ensure!(
+                receipt
+                    .parquet_schema
+                    .iter()
+                    .any(|field| field.name == date_column),
+                "browser partition receipt is missing {date_column}"
+            );
             entries.push(BrowserDataEntry {
                 metric: metric.to_string(),
                 wiki: wiki.clone(),
                 minimum_date,
                 maximum_date,
                 file: format!("browser-data/{metric}/{wiki}.parquet"),
-                rows,
-                bytes,
-                sha256,
+                rows: receipt.rows,
+                bytes: receipt.bytes,
+                sha256: receipt.artifact_sha256,
             });
         }
     }

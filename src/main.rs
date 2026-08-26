@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod artifact_receipt;
 mod bench;
 mod browser_data;
 mod capacity;
@@ -259,6 +260,13 @@ enum Commands {
 
     /// Verify that the publication receipt still matches every artifact
     PublicationVerify,
+
+    /// Independently rehash every published Parquet and verify its receipt
+    ArtifactScrub {
+        /// Optional atomic JSON report retained by operations
+        #[arg(long)]
+        report: Option<PathBuf>,
+    },
 
     /// Retire non-current snapshot generations after successful publication
     SnapshotFinalize {
@@ -1224,6 +1232,16 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             run_timed_stage("publication_verify", None, || {
                 publication::verify(&output_dir, run_id)
             })?;
+        }
+
+        Commands::ArtifactScrub { report } => {
+            let scrub = run_timed_stage("artifact_scrub", None, || {
+                artifact_receipt::scrub_published(&output_dir)
+            })?;
+            if let Some(path) = report {
+                artifact_receipt::write_scrub_report(&path, &scrub)?;
+            }
+            println!("{}", serde_json::to_string_pretty(&scrub)?);
         }
 
         Commands::SnapshotFinalize { wikis } => {
@@ -3454,6 +3472,54 @@ mod tests {
             )
             .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn artifact_scrub_cli_rehashes_and_records_published_artifacts() -> Result<()> {
+        let output = TestDir::new()?;
+        let artifact = output.path().join("gdp.parquet");
+        let mut frame = df!(
+            "year_month" => &["2026-07"],
+            "total_edits" => &[3_u32],
+            "wiki" => &["nlwiki"],
+        )
+        .expect("valid scrub CLI fixture");
+        ParquetWriter::new(fs::File::create(&artifact)?).finish(&mut frame)?;
+        artifact_receipt::scan_and_write(&artifact, "gdp.parquet", "test-v1", "input")?;
+        let report = output.path().join("reports/scrub.json");
+        let cli = Cli::try_parse_from([
+            "wiki-econ",
+            "--output-dir",
+            output.path().to_str().context("UTF-8 output fixture")?,
+            "artifact-scrub",
+            "--report",
+            report.to_str().context("UTF-8 report fixture")?,
+        ])
+        .expect("valid artifact-scrub CLI");
+        run_with_ops(cli, &RecordingOps::default())?;
+        let value: Value = serde_json::from_slice(&fs::read(report)?)?;
+        assert_eq!(value["artifacts"].as_array().map(Vec::len), Some(1));
+
+        let stdout_only_cli = Cli::try_parse_from([
+            "wiki-econ",
+            "--output-dir",
+            output.path().to_str().context("UTF-8 output fixture")?,
+            "artifact-scrub",
+        ])
+        .expect("valid stdout-only artifact-scrub CLI");
+        run_with_ops(stdout_only_cli, &RecordingOps::default())?;
+
+        let invalid_report_cli = Cli::try_parse_from([
+            "wiki-econ",
+            "--output-dir",
+            output.path().to_str().context("UTF-8 output fixture")?,
+            "artifact-scrub",
+            "--report",
+            output.path().to_str().context("UTF-8 report fixture")?,
+        ])
+        .expect("valid artifact-scrub failure CLI");
+        assert!(run_with_ops(invalid_report_cli, &RecordingOps::default()).is_err());
         Ok(())
     }
 

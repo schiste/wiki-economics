@@ -9,12 +9,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{info, warn};
 
 use crate::generation_lifecycle::GenerationState as GState;
-use crate::{licensing, storage};
+use crate::{artifact_receipt, licensing, storage};
 
 const RUN_CONTEXT_FILE: &str = ".publication-run.json";
 const CANDIDATE_FILE: &str = ".publication-candidate.json";
 pub const RECEIPT_FILE: &str = "publication-gate.json";
-const VALIDATION_BATCH_ROWS: usize = 250_000;
 const JSON_ARTIFACTS: [&str; 13] = [
     crate::browser_data::INDEX_FILENAME,
     "defaults_business.json",
@@ -236,6 +235,10 @@ struct ArtifactRecord {
     modified_secs: u64,
     modified_nanos: u32,
     license_spdx: String,
+    #[serde(default)]
+    sha256: String,
+    #[serde(default)]
+    artifact_receipt_sha256: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -255,6 +258,10 @@ struct PreparedArtifact {
     bytes: u64,
     rows: u64,
     sha256: String,
+    #[serde(default)]
+    receipt_identity: String,
+    #[serde(default)]
+    receipt_sha256: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
@@ -598,12 +605,43 @@ fn artifact_record_named(path: &Path, name: impl Into<String>) -> Result<Artifac
         path.display()
     );
     let modified = metadata.modified()?.duration_since(UNIX_EPOCH)?;
+    let (sha256, artifact_receipt_sha256) = if path
+        .extension()
+        .is_some_and(|extension| extension == "parquet")
+    {
+        let sidecar = artifact_receipt::sidecar_path(path)?;
+        let document = if sidecar.is_file() {
+            let document = artifact_receipt::read(path)?;
+            artifact_receipt::verify(
+                path,
+                &document.receipt.identity,
+                Some(&document.receipt_sha256),
+                artifact_receipt::VerificationMode::Fast,
+            )?
+        } else {
+            artifact_receipt::scan_and_write(
+                path,
+                &name,
+                "legacy-publication-migration-v1",
+                "legacy-unreceipted-input",
+            )?
+        };
+        (
+            document.receipt.artifact_sha256,
+            Some(document.receipt_sha256),
+        )
+    } else {
+        let (_, sha256) = storage::sha256_file(path)?;
+        (sha256, None)
+    };
     Ok(ArtifactRecord {
         name,
         bytes: metadata.len(),
         modified_secs: modified.as_secs(),
         modified_nanos: modified.subsec_nanos(),
         license_spdx: licensing::ARTIFACT_LICENSE_SPDX.to_string(),
+        sha256,
+        artifact_receipt_sha256,
     })
 }
 
@@ -679,7 +717,7 @@ pub fn record_candidate(output_dir: &Path, run_id: Option<&str>, names: &[String
     atomic_json(
         &output_dir.join(CANDIDATE_FILE),
         &Candidate {
-            schema_version: 2,
+            schema_version: 3,
             run_id: run_id.to_string(),
             artifacts,
         },
@@ -737,14 +775,30 @@ fn prepared_artifact(candidate_dir: &Path, path: &Path) -> Result<PreparedArtifa
         .context("candidate artifact is outside candidate directory")?
         .to_string_lossy()
         .into_owned();
-    let mut reader = ParquetReader::new(File::open(path)?);
-    let rows = u64::try_from(reader.num_rows()?)?;
-    let (bytes, sha256) = storage::sha256_file(path)?;
+    let document = if artifact_receipt::sidecar_path(path)?.is_file() {
+        let document = artifact_receipt::read(path)?;
+        artifact_receipt::verify(
+            path,
+            &document.receipt.identity,
+            Some(&document.receipt_sha256),
+            artifact_receipt::VerificationMode::Fast,
+        )?
+    } else {
+        artifact_receipt::scan_and_write(
+            path,
+            &relative,
+            "legacy-ready-migration-v1",
+            "legacy-unreceipted-input",
+        )?
+    };
+    let receipt = document.receipt;
     Ok(PreparedArtifact {
         path: relative,
-        bytes,
-        rows,
-        sha256,
+        bytes: receipt.bytes,
+        rows: receipt.rows,
+        sha256: receipt.artifact_sha256,
+        receipt_identity: receipt.identity,
+        receipt_sha256: document.receipt_sha256,
     })
 }
 
@@ -758,14 +812,121 @@ fn validate_prepared_artifact(candidate_dir: &Path, artifact: &PreparedArtifact)
         "candidate artifact has an unsafe path"
     );
     let path = candidate_dir.join(relative);
-    let (bytes, sha256) = storage::sha256_file(&path)?;
-    let mut reader = ParquetReader::new(File::open(&path)?);
-    let rows = u64::try_from(reader.num_rows()?)?;
+    if artifact.receipt_sha256.is_empty() {
+        let (bytes, sha256) = storage::sha256_file(&path)?;
+        let mut reader = ParquetReader::new(File::open(&path)?);
+        let rows = u64::try_from(reader.num_rows()?)?;
+        ensure!(
+            bytes == artifact.bytes && sha256 == artifact.sha256 && rows == artifact.rows,
+            "legacy prepared candidate artifact identity changed"
+        );
+        return Ok(());
+    }
+    let document = artifact_receipt::verify(
+        &path,
+        &artifact.receipt_identity,
+        Some(&artifact.receipt_sha256),
+        artifact_receipt::VerificationMode::Fast,
+    )?;
     ensure!(
-        bytes == artifact.bytes && sha256 == artifact.sha256 && rows == artifact.rows,
+        document.receipt.bytes == artifact.bytes
+            && document.receipt.artifact_sha256 == artifact.sha256
+            && document.receipt.rows == artifact.rows,
         "prepared candidate artifact identity changed"
     );
     Ok(())
+}
+
+fn receipted_summary(path: &Path, identity: &str, spec: &MetricSpec) -> Result<(u64, FileSummary)> {
+    let document = if artifact_receipt::sidecar_path(path)?.is_file() {
+        let document = artifact_receipt::read(path)?;
+        artifact_receipt::verify(
+            path,
+            &document.receipt.identity,
+            Some(&document.receipt_sha256),
+            artifact_receipt::VerificationMode::Fast,
+        )?
+    } else {
+        artifact_receipt::scan_and_write(
+            path,
+            identity,
+            "legacy-semantic-migration-v1",
+            "legacy-unreceipted-input",
+        )?
+    };
+    let receipt = document.receipt;
+    ensure!(
+        receipt.parquet_schema.len() == spec.schema.len(),
+        "{} has {} receipt columns; expected {}",
+        path.display(),
+        receipt.parquet_schema.len(),
+        spec.schema.len()
+    );
+    for ((expected_name, expected_kind), observed) in
+        spec.schema.iter().zip(&receipt.parquet_schema)
+    {
+        let expected_type = match expected_kind {
+            Kind::String => "String",
+            Kind::I32 => "Int32",
+            Kind::I64 => "Int64",
+            Kind::U32 => "UInt32",
+            Kind::F64 => "Float64",
+        };
+        ensure!(
+            observed.name == *expected_name && observed.data_type == expected_type,
+            "{} receipt schema disagrees at {}",
+            path.display(),
+            expected_name
+        );
+    }
+    let conservation_total = spec
+        .conservation_column
+        .map(|column| {
+            receipt
+                .conservation_totals
+                .get(column)
+                .copied()
+                .with_context(|| format!("receipt is missing {column} conservation total"))
+                .and_then(|value| i64::try_from(value).context("conservation total exceeds i64"))
+        })
+        .transpose()?;
+    Ok((
+        receipt.rows,
+        FileSummary {
+            wiki_min: receipt.minimum_wiki,
+            wiki_max: receipt.maximum_wiki,
+            minimum_date: receipt.minimum_date,
+            maximum_date: receipt.maximum_date,
+            conservation_total,
+        },
+    ))
+}
+
+fn receipted_rows(path: &Path, identity: &str, algorithm_version: &str) -> Result<u64> {
+    let document = if artifact_receipt::sidecar_path(path)?.is_file() {
+        artifact_receipt::read(path)?
+    } else {
+        artifact_receipt::scan_and_write_with_spec(
+            path,
+            identity,
+            algorithm_version,
+            "legacy-unreceipted-input",
+            artifact_receipt::SemanticSpec {
+                date_column: None,
+                conservation_columns: Vec::new(),
+                ordering_contract: "source-row-order/v1".to_string(),
+                page_week_consistency: false,
+            },
+        )?
+    };
+    Ok(artifact_receipt::verify(
+        path,
+        &document.receipt.identity,
+        Some(&document.receipt_sha256),
+        artifact_receipt::VerificationMode::Fast,
+    )?
+    .receipt
+    .rows)
 }
 
 pub(crate) fn mark_wiki_candidate_ready(
@@ -805,14 +966,14 @@ pub(crate) fn mark_wiki_candidate_ready(
         let path = candidate_dir
             .join(wiki)
             .join(format!("{}.parquet", spec.name));
-        let rows = validate_schema(&path, spec)?;
+        let identity = format!("{wiki}/{}.parquet", spec.name);
+        let (rows, summary) = receipted_summary(&path, &identity, spec)?;
         let minimum_rows = contract.minimum_rows(wiki);
         ensure!(
             rows >= minimum_rows,
             "{} candidate has {rows} rows for {wiki}; minimum is {minimum_rows}",
             spec.name
         );
-        let summary = summarize(&path, spec)?;
         ensure!(
             summary.wiki_min == wiki && summary.wiki_max == wiki,
             "candidate metric contains rows for another wiki"
@@ -837,11 +998,10 @@ pub(crate) fn mark_wiki_candidate_ready(
     }
     let patrol_dir = data_dir.join("patrol").join(wiki);
     for name in ["patrol.parquet", "rights.parquet"] {
-        let mut reader = ParquetReader::new(File::open(patrol_dir.join(name))?);
-        ensure!(
-            reader.num_rows()? > 0,
-            "candidate patrol source {name} is empty"
-        );
+        let path = patrol_dir.join(name);
+        let identity = format!("patrol-source/{wiki}/{name}");
+        let rows = receipted_rows(&path, &identity, "patrol-source-v1")?;
+        ensure!(rows > 0, "candidate patrol source {name} is empty");
     }
     artifacts.sort_by(|left, right| left.path.cmp(&right.path));
     let workload_profile = crate::workload_profile::load(data_dir, wiki, snapshot)?;
@@ -850,7 +1010,7 @@ pub(crate) fn mark_wiki_candidate_ready(
         "qualified production candidate has no persisted workload profile"
     );
     let ready = ReadyWikiCandidate {
-        schema_version: 1,
+        schema_version: 2,
         wiki: wiki.to_string(),
         snapshot: snapshot.to_string(),
         run_id: run_id.to_string(),
@@ -921,13 +1081,13 @@ pub(crate) fn mark_wiki_qualification_ready(
         let path = qualification_dir
             .join(wiki)
             .join(format!("{}.parquet", spec.name));
-        let rows = validate_schema(&path, spec)?;
+        let identity = format!("{wiki}/{}.parquet", spec.name);
+        let (rows, summary) = receipted_summary(&path, &identity, spec)?;
         ensure!(
             rows > 0,
             "{} qualification output is empty for {wiki}",
             spec.name
         );
-        let summary = summarize(&path, spec)?;
         ensure!(
             summary.wiki_min == wiki && summary.wiki_max == wiki,
             "qualification metric contains rows for another wiki"
@@ -952,17 +1112,16 @@ pub(crate) fn mark_wiki_qualification_ready(
     }
     let patrol_dir = data_dir.join("patrol").join(wiki);
     for name in ["patrol.parquet", "rights.parquet"] {
-        let mut reader = ParquetReader::new(File::open(patrol_dir.join(name))?);
-        ensure!(
-            reader.num_rows()? > 0,
-            "qualification patrol source {name} is empty"
-        );
+        let path = patrol_dir.join(name);
+        let identity = format!("patrol-source/{wiki}/{name}");
+        let rows = receipted_rows(&path, &identity, "patrol-source-v1")?;
+        ensure!(rows > 0, "qualification patrol source {name} is empty");
     }
     artifacts.sort_by(|left, right| left.path.cmp(&right.path));
     let workload_profile = crate::workload_profile::load(data_dir, wiki, snapshot)?
         .context("qualification has no persisted workload profile")?;
     let receipt = QualificationReceipt {
-        schema_version: 1,
+        schema_version: 2,
         publication_eligible: false,
         wiki: wiki.to_string(),
         snapshot: snapshot.to_string(),
@@ -1006,7 +1165,7 @@ fn validate_ready_candidate_metadata(
     ready: &ReadyWikiCandidate,
 ) -> Result<()> {
     ensure!(
-        ready.schema_version == 1,
+        matches!(ready.schema_version, 1 | 2),
         "unsupported ready candidate schema"
     );
     ensure!(
@@ -2573,6 +2732,7 @@ fn expected_wikis(
     }
 }
 
+#[cfg(test)]
 fn kind_matches(kind: Kind, dtype: &DataType) -> bool {
     matches!(
         (kind, dtype),
@@ -2584,6 +2744,7 @@ fn kind_matches(kind: Kind, dtype: &DataType) -> bool {
     )
 }
 
+#[cfg(test)]
 fn validate_schema(path: &Path, spec: &MetricSpec) -> Result<u64> {
     let mut reader = ParquetReader::new(File::open(path)?);
     let rows = reader.num_rows()? as u64;
@@ -2611,6 +2772,7 @@ fn validate_schema(path: &Path, spec: &MetricSpec) -> Result<u64> {
     Ok(rows)
 }
 
+#[cfg(test)]
 fn summarize_batched(path: &Path, spec: &MetricSpec, batch_rows: usize) -> Result<FileSummary> {
     ensure!(
         batch_rows > 0,
@@ -2687,6 +2849,7 @@ fn summarize_batched(path: &Path, spec: &MetricSpec, batch_rows: usize) -> Resul
     })
 }
 
+#[cfg(test)]
 fn update_string_range(value: &str, minimum: &mut Option<String>, maximum: &mut Option<String>) {
     if minimum.as_deref().is_none_or(|current| value < current) {
         *minimum = Some(value.to_owned());
@@ -2696,6 +2859,7 @@ fn update_string_range(value: &str, minimum: &mut Option<String>, maximum: &mut 
     }
 }
 
+#[cfg(test)]
 fn sum_conservation_column(frame: &DataFrame, name: &str, _path: &Path) -> Result<i64> {
     let column = frame.column(name)?;
     ensure!(
@@ -2715,10 +2879,6 @@ fn sum_conservation_column(frame: &DataFrame, name: &str, _path: &Path) -> Resul
         }),
         dtype => anyhow::bail!("conservation column {name} has type {dtype:?}"),
     }
-}
-
-fn summarize(path: &Path, spec: &MetricSpec) -> Result<FileSummary> {
-    summarize_batched(path, spec, VALIDATION_BATCH_ROWS)
 }
 
 fn validate_date(value: &str, column: &str) -> Result<()> {
@@ -2775,9 +2935,21 @@ fn validate_artifact_inventory(
     registry: &LifecycleRegistry,
 ) -> Result<()> {
     ensure!(
-        candidate.schema_version == 2,
+        matches!(candidate.schema_version, 2 | 3),
         "unsupported publication candidate schema"
     );
+    if candidate.schema_version >= 3 {
+        ensure!(
+            candidate.artifacts.iter().all(|artifact| {
+                !artifact.sha256.is_empty()
+                    && (Path::new(&artifact.name)
+                        .extension()
+                        .is_none_or(|extension| extension != "parquet")
+                        || artifact.artifact_receipt_sha256.is_some())
+            }),
+            "publication candidate is missing authoritative content identities"
+        );
+    }
     let expected = expected_artifact_names(registry)?;
     let candidate_names: BTreeSet<_> = candidate
         .artifacts
@@ -2976,8 +3148,8 @@ pub fn validate(
             None
         } else {
             let root = output_dir.join(format!("{}.parquet", spec.name));
-            let rows = validate_schema(&root, spec)?;
-            Some((rows, summarize(&root, spec)?))
+            let identity = format!("{}.parquet", spec.name);
+            Some(receipted_summary(&root, &identity, spec)?)
         };
         let mut wiki_reports = BTreeMap::new();
         let mut source_rows = 0_u64;
@@ -2986,18 +3158,17 @@ pub fn validate(
             let path = output_dir
                 .join(&wiki)
                 .join(format!("{}.parquet", spec.name));
-            let rows = validate_schema(&path, spec)?;
+            let identity = format!("{wiki}/{}.parquet", spec.name);
+            let (rows, summary) = receipted_summary(&path, &identity, spec)?;
             let minimum_rows = contract.minimum_rows(&wiki);
             ensure!(
                 rows >= minimum_rows,
                 "{} has {rows} rows for {wiki}; minimum is {minimum_rows}",
                 spec.name
             );
-            let summary = summarize(&path, spec)?;
             ensure!(
                 summary.wiki_min == wiki && summary.wiki_max == wiki,
-                "{} contains rows for the wrong wiki",
-                path.display()
+                "{identity} contains rows for the wrong wiki"
             );
             if let (Some(column), Some(minimum), Some(maximum)) = (
                 spec.date_column,
@@ -3114,8 +3285,10 @@ pub fn validate(
     }) {
         let patrol_path = data_dir.join("patrol").join(&wiki).join("patrol.parquet");
         let rights_path = data_dir.join("patrol").join(&wiki).join("rights.parquet");
-        let patrol_rows = ParquetReader::new(File::open(patrol_path)?).num_rows()? as u64;
-        let rights_rows = ParquetReader::new(File::open(rights_path)?).num_rows()? as u64;
+        let patrol_identity = format!("patrol-source/{wiki}/patrol.parquet");
+        let rights_identity = format!("patrol-source/{wiki}/rights.parquet");
+        let patrol_rows = receipted_rows(&patrol_path, &patrol_identity, "patrol-source-v1")?;
+        let rights_rows = receipted_rows(&rights_path, &rights_identity, "patrol-source-v1")?;
         ensure!(
             patrol_rows > 0 && rights_rows > 0,
             "scheduled wiki {wiki} has empty patrol or rights source data"
@@ -3141,7 +3314,7 @@ pub fn validate(
         BTreeMap::new()
     };
     let receipt = GateReceipt {
-        schema_version: 5,
+        schema_version: 6,
         run_id: run_id.to_string(),
         validated_at_unix,
         license: policy.license,
@@ -3197,7 +3370,7 @@ pub fn verify(output_dir: &Path, run_id: &str) -> Result<()> {
     // since an on-demand site build legitimately runs a newer (or older)
     // binary than whatever last validated the data.
     ensure!(
-        matches!(receipt.schema_version, 3..=5)
+        matches!(receipt.schema_version, 3..=6)
             && receipt.license == policy.license
             && receipt.attribution == policy.attribution
             && receipt.independence_notice == policy.independence_notice
@@ -3464,12 +3637,116 @@ mod tests {
                 Kind::String => Column::new((*name).into(), [string_value(name)]),
                 Kind::I32 => Column::new((*name).into(), [1_i32]),
                 Kind::I64 => Column::new((*name).into(), [1_i64]),
-                Kind::U32 => Column::new((*name).into(), [1_u32]),
+                Kind::U32 => Column::new(
+                    (*name).into(),
+                    [if *name == "previous_week_edits" {
+                        0_u32
+                    } else {
+                        1_u32
+                    }],
+                ),
                 Kind::F64 => Column::new((*name).into(), [1_f64]),
             })
             .collect();
         let mut frame = DataFrame::new(1, columns)?;
         ParquetWriter::new(File::create(path)?).finish(&mut frame)?;
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_parquet_boundaries_migrate_once_to_authoritative_receipts() -> Result<()> {
+        let directory = TestDir::new()?;
+        let metric = directory.path().join("gdp.parquet");
+        let spec = METRICS
+            .iter()
+            .find(|spec| spec.name == "gdp")
+            .context("GDP metric contract")?;
+
+        write_metric(&metric, spec, "nlwiki")?;
+        let record = artifact_record_named(&metric, "gdp.parquet")?;
+        assert_eq!(record.sha256.len(), 64);
+        assert!(record.artifact_receipt_sha256.is_some());
+        let existing_prepared = prepared_artifact(directory.path(), &metric)?;
+        validate_prepared_artifact(directory.path(), &existing_prepared)?;
+        assert_eq!(validate_schema(&metric, spec)?, 1);
+
+        let original_metric = fs::read(&metric)?;
+        let mut corrupt_metric = original_metric.clone();
+        corrupt_metric[0] ^= 1;
+        fs::write(&metric, corrupt_metric)?;
+        assert!(prepared_artifact(directory.path(), &metric).is_err());
+        assert!(validate_prepared_artifact(directory.path(), &existing_prepared).is_err());
+        fs::write(&metric, original_metric)?;
+
+        fs::remove_file(artifact_receipt::sidecar_path(&metric)?)?;
+        let prepared = prepared_artifact(directory.path(), &metric)?;
+        validate_prepared_artifact(directory.path(), &prepared)?;
+
+        let mut legacy = prepared.clone();
+        legacy.receipt_sha256.clear();
+        validate_prepared_artifact(directory.path(), &legacy)?;
+        legacy.rows += 1;
+        assert!(validate_prepared_artifact(directory.path(), &legacy).is_err());
+
+        fs::remove_file(artifact_receipt::sidecar_path(&metric)?)?;
+        let (rows, summary) = receipted_summary(&metric, "gdp.parquet", spec)?;
+        assert_eq!(rows, 1);
+        assert_eq!(summary.wiki_min, "nlwiki");
+
+        let document = artifact_receipt::read(&metric)?;
+        let mut short_schema = document.receipt.clone();
+        short_schema.parquet_schema.pop();
+        artifact_receipt::write(&metric, short_schema)?;
+        assert!(receipted_summary(&metric, "gdp.parquet", spec).is_err());
+
+        let mut wrong_schema = document.receipt.clone();
+        wrong_schema.parquet_schema[0].data_type = "UInt64".to_string();
+        artifact_receipt::write(&metric, wrong_schema)?;
+        assert!(receipted_summary(&metric, "gdp.parquet", spec).is_err());
+        artifact_receipt::write(&metric, document.receipt)?;
+
+        let patrol = directory.path().join("patrol-source.parquet");
+        write_single_i64(&patrol)?;
+        assert_eq!(
+            receipted_rows(
+                &patrol,
+                "patrol-source/nlwiki/patrol.parquet",
+                "patrol-source-v1",
+            )
+            .expect("legacy patrol source migrates"),
+            1
+        );
+        assert!(artifact_receipt::sidecar_path(&patrol)?.is_file());
+        assert_eq!(
+            receipted_rows(
+                &patrol,
+                "patrol-source/nlwiki/patrol.parquet",
+                "patrol-source-v1",
+            )
+            .expect("receipted patrol source verifies"),
+            1
+        );
+
+        let patrol_bytes = fs::read(&patrol)?;
+        let mut corrupt_patrol = patrol_bytes.clone();
+        corrupt_patrol[0] ^= 1;
+        fs::write(&patrol, corrupt_patrol)?;
+        assert!(
+            receipted_rows(
+                &patrol,
+                "patrol-source/nlwiki/patrol.parquet",
+                "patrol-source-v1"
+            )
+            .is_err()
+        );
+        fs::write(&patrol, patrol_bytes)?;
+
+        let invalid = directory.path().join("invalid.parquet");
+        fs::write(&invalid, "not parquet")?;
+        assert!(artifact_record_named(&invalid, "invalid.parquet").is_err());
+        assert!(prepared_artifact(directory.path(), &invalid).is_err());
+        assert!(receipted_summary(&invalid, "gdp.parquet", spec).is_err());
+        assert!(receipted_rows(&invalid, "patrol-source/nlwiki/invalid.parquet", "v1").is_err());
         Ok(())
     }
 
@@ -3518,6 +3795,20 @@ mod tests {
         assert_eq!(summary.conservation_total, Some(15));
         assert!(summarize_batched(&path, &METRICS[8], 0).is_err());
 
+        let wiki_only_path = directory.path().join("wiki-only.parquet");
+        let mut wiki_only =
+            DataFrame::new_infer_height(vec![Column::new("wiki".into(), ["nlwiki"])])?;
+        ParquetWriter::new(File::create(&wiki_only_path)?).finish(&mut wiki_only)?;
+        let wiki_only_spec = MetricSpec {
+            name: "wiki_only",
+            date_column: None,
+            conservation_column: None,
+            schema: &[("wiki", Kind::String)],
+        };
+        let wiki_only_summary = summarize_batched(&wiki_only_path, &wiki_only_spec, 1)?;
+        assert_eq!(wiki_only_summary.minimum_date, None);
+        assert_eq!(wiki_only_summary.conservation_total, None);
+
         let nullable = df!("edits" => &[Some(1_u32), None])?;
         assert!(sum_conservation_column(&nullable, "edits", &path).is_err());
         let signed = df!("edits" => &[2_i64, -1_i64])?;
@@ -3532,6 +3823,12 @@ mod tests {
         let fixture = Fixture::new()?;
         fixture.prepare("run-good")?;
 
+        let mut legacy_candidate: Candidate =
+            read_json(&fixture.output.path().join(CANDIDATE_FILE))?;
+        legacy_candidate.schema_version = 2;
+        let registry = load_lifecycle(&fixture.lifecycle_path)?;
+        validate_artifact_inventory(fixture.output.path(), &legacy_candidate, &registry)?;
+
         validate(
             fixture.data.path(),
             fixture.output.path(),
@@ -3542,7 +3839,7 @@ mod tests {
         verify(fixture.output.path(), "run-good")?;
 
         let receipt: Value = read_json(&fixture.output.path().join(RECEIPT_FILE))?;
-        assert_eq!(receipt["schema_version"], 5);
+        assert_eq!(receipt["schema_version"], 6);
         assert_eq!(
             receipt["provenance"]["determinism_contract"]["contract_version"],
             "pipeline-byte-determinism-v1"
@@ -4036,15 +4333,18 @@ mod tests {
             wiki_candidate_dir(fixture.output.path(), "nlwiki", "2026-03", "candidate-3")?;
         fs::create_dir_all(candidate_3.join("nlwiki"))?;
         for spec in &METRICS {
+            let source = candidate_2
+                .join("nlwiki")
+                .join(format!("{}.parquet", spec.name));
+            let target = candidate_3
+                .join("nlwiki")
+                .join(format!("{}.parquet", spec.name));
+            fs::copy(&source, &target).expect("new candidate metric should copy");
             fs::copy(
-                candidate_2
-                    .join("nlwiki")
-                    .join(format!("{}.parquet", spec.name)),
-                candidate_3
-                    .join("nlwiki")
-                    .join(format!("{}.parquet", spec.name)),
+                crate::artifact_receipt::sidecar_path(&source)?,
+                crate::artifact_receipt::sidecar_path(&target)?,
             )
-            .expect("new candidate metric should copy");
+            .expect("new candidate receipt should copy");
         }
         let mut cloned: ReadyWikiCandidate = read_json(&candidate_2.join("ready.json"))?;
         cloned.run_id = "candidate-3".to_string();
@@ -5888,7 +6188,7 @@ mod tests {
             "wrong-wiki",
         )
         .expect_err("wrong wiki labels must fail");
-        assert!(error.to_string().contains("wrong wiki"));
+        assert!(error.to_string().contains("authoritative receipt"));
         Ok(())
     }
 }

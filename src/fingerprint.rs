@@ -58,6 +58,14 @@ pub struct ArtifactIdentity {
     pub minimum_date: Option<String>,
     pub maximum_date: Option<String>,
     pub observed_modified_unix_nanos: u128,
+    #[serde(default)]
+    pub artifact_receipt_sha256: Option<String>,
+    #[serde(default)]
+    pub conservation_totals: std::collections::BTreeMap<String, i128>,
+    #[serde(default)]
+    pub minimum_wiki: String,
+    #[serde(default)]
+    pub maximum_wiki: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -83,6 +91,10 @@ struct DeterministicArtifact<'a> {
     rows: Option<u64>,
     minimum_date: Option<&'a str>,
     maximum_date: Option<&'a str>,
+    artifact_receipt_sha256: Option<&'a str>,
+    conservation_totals: &'a std::collections::BTreeMap<String, i128>,
+    minimum_wiki: &'a str,
+    maximum_wiki: &'a str,
 }
 
 #[derive(Serialize)]
@@ -197,6 +209,39 @@ fn inspect(path: &TrackedPath) -> Result<ArtifactIdentity> {
         "stage artifact is not a file: {}",
         path.path.display()
     );
+    if path
+        .path
+        .extension()
+        .is_some_and(|extension| extension == "parquet")
+        && crate::artifact_receipt::sidecar_path(&path.path)?.is_file()
+    {
+        let document = crate::artifact_receipt::read(&path.path)?;
+        let document = crate::artifact_receipt::verify(
+            &path.path,
+            &document.receipt.identity,
+            Some(&document.receipt_sha256),
+            crate::artifact_receipt::VerificationMode::Fast,
+        )?;
+        let receipt = document.receipt;
+        return Ok(ArtifactIdentity {
+            identity: path.identity.clone(),
+            bytes: receipt.bytes,
+            sha256: receipt.artifact_sha256,
+            output_schema: receipt
+                .parquet_schema
+                .into_iter()
+                .map(|field| format!("{}:{}", field.name, field.data_type))
+                .collect(),
+            rows: Some(receipt.rows),
+            minimum_date: receipt.minimum_date,
+            maximum_date: receipt.maximum_date,
+            observed_modified_unix_nanos: modified_nanos(&path.path)?,
+            artifact_receipt_sha256: Some(document.receipt_sha256),
+            conservation_totals: receipt.conservation_totals,
+            minimum_wiki: receipt.minimum_wiki,
+            maximum_wiki: receipt.maximum_wiki,
+        });
+    }
     let (output_schema, rows, minimum_date, maximum_date) = if path
         .path
         .extension()
@@ -216,6 +261,71 @@ fn inspect(path: &TrackedPath) -> Result<ArtifactIdentity> {
         minimum_date,
         maximum_date,
         observed_modified_unix_nanos: modified_nanos(&path.path)?,
+        artifact_receipt_sha256: None,
+        conservation_totals: std::collections::BTreeMap::new(),
+        minimum_wiki: String::new(),
+        maximum_wiki: String::new(),
+    })
+}
+
+fn inspect_receipted_output(
+    path: &TrackedPath,
+    algorithm_version: &str,
+    input_fingerprint: &str,
+) -> Result<ArtifactIdentity> {
+    if path
+        .path
+        .extension()
+        .is_none_or(|extension| extension != "parquet")
+    {
+        return inspect(path);
+    }
+    let document = if crate::artifact_receipt::sidecar_path(&path.path)?.is_file() {
+        let existing = crate::artifact_receipt::read(&path.path)?;
+        let existing = crate::artifact_receipt::verify(
+            &path.path,
+            &existing.receipt.identity,
+            None,
+            crate::artifact_receipt::VerificationMode::Fast,
+        )?;
+        if existing.receipt.algorithm_version == algorithm_version
+            && existing.receipt.input_fingerprint == input_fingerprint
+        {
+            existing
+        } else {
+            crate::artifact_receipt::scan_and_write(
+                &path.path,
+                &path.identity,
+                algorithm_version,
+                input_fingerprint,
+            )?
+        }
+    } else {
+        crate::artifact_receipt::scan_and_write(
+            &path.path,
+            &path.identity,
+            algorithm_version,
+            input_fingerprint,
+        )?
+    };
+    let receipt = document.receipt;
+    Ok(ArtifactIdentity {
+        identity: path.identity.clone(),
+        bytes: receipt.bytes,
+        sha256: receipt.artifact_sha256,
+        output_schema: receipt
+            .parquet_schema
+            .into_iter()
+            .map(|field| format!("{}:{}", field.name, field.data_type))
+            .collect(),
+        rows: Some(receipt.rows),
+        minimum_date: receipt.minimum_date,
+        maximum_date: receipt.maximum_date,
+        observed_modified_unix_nanos: modified_nanos(&path.path)?,
+        artifact_receipt_sha256: Some(document.receipt_sha256),
+        conservation_totals: receipt.conservation_totals,
+        minimum_wiki: receipt.minimum_wiki,
+        maximum_wiki: receipt.maximum_wiki,
     })
 }
 
@@ -229,6 +339,19 @@ fn inspect_all(paths: &[TrackedPath]) -> Result<Vec<ArtifactIdentity>> {
     Ok(identities)
 }
 
+fn inspect_receipted_outputs(
+    paths: &[TrackedPath],
+    algorithm_version: &str,
+    input_fingerprint: &str,
+) -> Result<Vec<ArtifactIdentity>> {
+    let mut sorted = paths.to_vec();
+    sorted.sort_by(|left, right| left.identity.cmp(&right.identity));
+    sorted
+        .iter()
+        .map(|path| inspect_receipted_output(path, algorithm_version, input_fingerprint))
+        .collect()
+}
+
 fn deterministic_artifacts(records: &[ArtifactIdentity]) -> Vec<DeterministicArtifact<'_>> {
     records
         .iter()
@@ -240,6 +363,10 @@ fn deterministic_artifacts(records: &[ArtifactIdentity]) -> Vec<DeterministicArt
             rows: record.rows,
             minimum_date: record.minimum_date.as_deref(),
             maximum_date: record.maximum_date.as_deref(),
+            artifact_receipt_sha256: record.artifact_receipt_sha256.as_deref(),
+            conservation_totals: &record.conservation_totals,
+            minimum_wiki: &record.minimum_wiki,
+            maximum_wiki: &record.maximum_wiki,
         })
         .collect()
 }
@@ -281,6 +408,29 @@ fn paths_match(records: &[ArtifactIdentity], paths: &[TrackedPath]) -> Result<bo
             return Ok(false);
         }
         let metadata = fs::metadata(&path.path)?;
+        let receipt_verified = if let Some(receipt_sha256) = &record.artifact_receipt_sha256 {
+            let document = match crate::artifact_receipt::read(&path.path) {
+                Ok(document) => document,
+                Err(error) => {
+                    info!(identity = record.identity, error = %error, "artifact receipt is invalid");
+                    return Ok(false);
+                }
+            };
+            if crate::artifact_receipt::verify(
+                &path.path,
+                &document.receipt.identity,
+                Some(receipt_sha256),
+                crate::artifact_receipt::VerificationMode::Fast,
+            )
+            .is_err()
+            {
+                info!(identity = record.identity, "artifact receipt pair changed");
+                return Ok(false);
+            }
+            true
+        } else {
+            false
+        };
         if metadata.len() != record.bytes {
             info!(
                 identity = record.identity,
@@ -291,12 +441,15 @@ fn paths_match(records: &[ArtifactIdentity], paths: &[TrackedPath]) -> Result<bo
             return Ok(false);
         }
         if modified_nanos(&path.path)? != record.observed_modified_unix_nanos {
-            let observed_sha256 = sha256_file(&path.path)?;
-            if observed_sha256 != record.sha256 {
+            let content_matches = if receipt_verified {
+                true
+            } else {
+                sha256_file(&path.path)? == record.sha256
+            };
+            if !content_matches {
                 info!(
                     identity = record.identity,
                     expected_sha256 = record.sha256,
-                    observed_sha256,
                     "stage artifact content changed"
                 );
                 return Ok(false);
@@ -407,6 +560,10 @@ pub fn record(
         "stage {} produced no outputs",
         spec.stage
     );
+    let inspected_inputs = inspect_all(inputs)?;
+    let deterministic_inputs = deterministic_artifacts(&inspected_inputs);
+    let serialized_inputs = serde_json::to_vec(&deterministic_inputs)?;
+    let input_fingerprint = hex::encode(Sha256::digest(serialized_inputs));
     let mut receipt = StageReceipt {
         schema_version: RECEIPT_SCHEMA_VERSION,
         stage: spec.stage.to_string(),
@@ -415,8 +572,8 @@ pub fn record(
         algorithm_version: spec.algorithm_version.to_string(),
         computation_version: env!("CARGO_PKG_VERSION").to_string(),
         binary_commit: option_env!("WIKI_ECON_BUILD_COMMIT").map(str::to_string),
-        inputs: inspect_all(inputs)?,
-        outputs: inspect_all(outputs)?,
+        inputs: inspected_inputs,
+        outputs: inspect_receipted_outputs(outputs, spec.algorithm_version, &input_fingerprint)?,
         fingerprint: String::new(),
     };
     receipt.fingerprint = receipt_fingerprint(&receipt)?;
@@ -684,6 +841,7 @@ mod tests {
         };
         assert!(!reusable(&receipt_path, wrong_spec, &inputs, &outputs)?);
         assert!(!reusable(&receipt_path, spec, &inputs, &[])?);
+        assert!(record(&dir.path().join("empty-output.json"), spec, &inputs, &[]).is_err());
         let identity_mismatch = reusable(
             &receipt_path,
             spec,
@@ -721,6 +879,18 @@ mod tests {
                 .join(format!(".stage-receipt-{}.tmp", std::process::id()))
                 .exists()
         );
+
+        let invalid_parquet = dir.path().join("invalid.parquet");
+        fs::write(&invalid_parquet, "not parquet")?;
+        assert!(
+            record(
+                &dir.path().join("invalid-parquet.json"),
+                spec,
+                &inputs,
+                &[TrackedPath::new("invalid.parquet", &invalid_parquet)],
+            )
+            .is_err()
+        );
         Ok(())
     }
 
@@ -743,13 +913,106 @@ mod tests {
                 algorithm_version: "test-v1",
             },
             &[],
-            &[TrackedPath::new("metric", path)],
+            &[TrackedPath::new("metric", &path)],
         )
         .expect("Parquet receipt should record");
         assert_eq!(receipt.outputs[0].rows, Some(2));
         assert_eq!(receipt.outputs[0].minimum_date.as_deref(), Some("2026-01"));
         assert_eq!(receipt.outputs[0].maximum_date.as_deref(), Some("2026-02"));
         assert!(receipt.outputs[0].output_schema.len() == 2);
+
+        let receipt_path = dir.path().join("stage.json");
+        let tracked = [TrackedPath::new("metric", &path)];
+        let sidecar = crate::artifact_receipt::sidecar_path(&path)?;
+        let original_sidecar = fs::read(&sidecar)?;
+        fs::write(&sidecar, "truncated")?;
+        assert!(
+            !reusable(
+                &receipt_path,
+                StageSpec {
+                    stage: "merge",
+                    scope: "all",
+                    selected_snapshot: None,
+                    algorithm_version: "test-v1",
+                },
+                &[],
+                &tracked,
+            )
+            .expect("invalid sidecar is a cache miss")
+        );
+        assert!(
+            record(
+                &dir.path().join("bad-input-stage.json"),
+                StageSpec {
+                    stage: "merge",
+                    scope: "all",
+                    selected_snapshot: None,
+                    algorithm_version: "test-v1",
+                },
+                &tracked,
+                &[TrackedPath::new("plain-output", dir.path().join("missing"))],
+            )
+            .is_err()
+        );
+        fs::write(&sidecar, &original_sidecar)?;
+
+        let original = fs::read(&path)?;
+        let mut corrupt = original.clone();
+        corrupt[0] ^= 1;
+        fs::write(&path, corrupt)?;
+        assert!(
+            record(
+                &dir.path().join("corrupt-input-stage.json"),
+                StageSpec {
+                    stage: "merge",
+                    scope: "all",
+                    selected_snapshot: None,
+                    algorithm_version: "test-v1",
+                },
+                &tracked,
+                &[TrackedPath::new("plain-output", dir.path().join("missing"))],
+            )
+            .is_err()
+        );
+        assert!(inspect_receipted_output(&tracked[0], "different-v2", "inputs").is_err());
+        fs::write(&path, &original)?;
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        fs::write(&path, &original)?;
+        assert!(
+            reusable(
+                &receipt_path,
+                StageSpec {
+                    stage: "merge",
+                    scope: "all",
+                    selected_snapshot: None,
+                    algorithm_version: "test-v1",
+                },
+                &[],
+                &tracked,
+            )
+            .expect("metadata-only Parquet change reuses receipt identity")
+        );
+        inspect_receipted_output(&tracked[0], "different-v2", "inputs")
+            .expect("verified artifact can be reissued for a new algorithm version");
+        assert!(
+            inspect_receipted_output(
+                &TrackedPath::new("../unsafe", &path),
+                "different-v3",
+                "inputs",
+            )
+            .is_err()
+        );
+
+        let empty_path = dir.path().join("empty.parquet");
+        let mut empty = DataFrame::new_infer_height(vec![
+            Column::new("wiki".into(), Vec::<String>::new()),
+            Column::new("year_month".into(), Vec::<String>::new()),
+        ])
+        .expect("valid empty Parquet fixture");
+        ParquetWriter::new(File::create(&empty_path)?).finish(&mut empty)?;
+        let (_, rows, minimum, maximum) = parquet_summary(&empty_path)?;
+        assert_eq!((rows, minimum, maximum), (0, None, None));
         Ok(())
     }
 

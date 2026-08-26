@@ -1260,7 +1260,12 @@ fn edit_variation_artifact(
 }
 
 fn write_parquet(output_dir: &Path, name: &str, mut frame: DataFrame) -> Result<()> {
-    let mut file = File::create(output_dir.join(format!("{name}.parquet")))?;
+    let path = output_dir.join(format!("{name}.parquet"));
+    let sidecar = crate::artifact_receipt::sidecar_path(&path)?;
+    if sidecar.is_file() {
+        fs::remove_file(sidecar)?;
+    }
+    let mut file = File::create(path)?;
     ParquetWriter::new(&mut file)
         .with_compression(ParquetCompression::Zstd(None))
         .set_parallel(false)

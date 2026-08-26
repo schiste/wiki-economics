@@ -256,7 +256,12 @@ pub(crate) fn merge_metric_batched(
             .with_context(|| format!("failed to remove abandoned merge output {temp_path:?}"))?;
     }
 
-    let merge_result = (|| -> Result<(usize, usize, u64)> {
+    let merge_result = (|| -> Result<(
+        usize,
+        usize,
+        u64,
+        crate::artifact_receipt::SemanticAccumulator,
+    )> {
         let first_reader = storage::SequentialParquetReader::new(&paths[0], None, batch_rows)?;
         let schema_frame = first_reader.schema_frame()?;
         drop(first_reader);
@@ -270,6 +275,9 @@ pub(crate) fn merge_metric_batched(
         let mut total_rows = 0_usize;
         let mut expected_rows = 0_usize;
         let mut last_wiki: Option<String> = None;
+        let mut semantics = crate::artifact_receipt::SemanticAccumulator::new(
+            crate::artifact_receipt::SemanticSpec::for_identity(metric_name),
+        );
 
         for (input_index, path) in paths.iter().enumerate() {
             let mut reader = storage::SequentialParquetReader::new(path, None, batch_rows)?;
@@ -281,6 +289,7 @@ pub(crate) fn merge_metric_batched(
 
             while let Some(batch) = reader.next_batch()? {
                 validate_wiki_major_order(&batch, &mut last_wiki, path)?;
+                semantics.observe(&batch)?;
                 writer.write_batch(&batch)?;
                 total_rows = total_rows
                     .checked_add(batch.height())
@@ -318,10 +327,10 @@ pub(crate) fn merge_metric_batched(
             output_rows == total_rows,
             "{metric_name} output footer row count {output_rows} disagrees with {total_rows} written rows"
         );
-        Ok((total_rows, columns, bytes))
+        Ok((total_rows, columns, bytes, semantics))
     })();
 
-    let (rows, columns, bytes) = match merge_result {
+    let (rows, columns, bytes, semantics) = match merge_result {
         Ok(summary) => summary,
         Err(error) => {
             let _ = fs::remove_file(&temp_path);
@@ -329,6 +338,8 @@ pub(crate) fn merge_metric_batched(
         }
     };
     fs::rename(&temp_path, dest)?;
+    File::open(dest.parent().context("merge output has no parent")?)?.sync_all()?;
+    crate::artifact_receipt::write_semantic_draft(dest, semantics)?;
     // The merged output can be larger than a gigabyte. It has already been
     // synced above, so retaining its clean pages in the cgroup cache only
     // steals headroom from the fail-closed publication validator that reads
@@ -379,17 +390,25 @@ fn validate_wiki_major_order(
     Ok(())
 }
 
+fn manifest_receipt_identity(source_prefix: Option<&str>, wiki: &str, name: &str) -> String {
+    match source_prefix {
+        Some(prefix) => format!("{prefix}/{wiki}/{name}"),
+        None => format!("{wiki}/{name}"),
+    }
+}
+
 fn manifest_row_counts(output_dir: &Path) -> Result<BTreeMap<String, usize>> {
     let data_dir = env::var("WIKI_ECON_DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("data"));
     let mut paths = Vec::new();
-    for (root, names) in [
+    for (root, names, source_prefix) in [
         (
             data_dir.join("patrol"),
             &["patrol.parquet", "rights.parquet"][..],
+            Some("patrol-source"),
         ),
-        (output_dir.to_path_buf(), &["patrol.parquet"][..]),
+        (output_dir.to_path_buf(), &["patrol.parquet"][..], None),
     ] {
         if !root.is_dir() {
             continue;
@@ -402,16 +421,45 @@ fn manifest_row_counts(output_dir: &Path) -> Result<BTreeMap<String, usize>> {
             for name in names {
                 let path = directory.join(name);
                 if path.is_file() {
-                    paths.push(path);
+                    let wiki = directory
+                        .file_name()
+                        .context("patrol artifact has no wiki directory")?
+                        .to_string_lossy();
+                    let identity = manifest_receipt_identity(source_prefix, &wiki, name);
+                    paths.push((path, identity));
                 }
             }
         }
     }
-    paths.sort();
+    paths.sort_by(|left, right| left.0.cmp(&right.0));
     let mut counts = BTreeMap::new();
-    for path in paths {
-        let rows = ParquetReader::new(File::open(&path)?).num_rows()?;
-        counts.insert(path.to_string_lossy().into_owned(), rows);
+    for (path, identity) in paths {
+        let manifest_key = path.to_string_lossy().into_owned();
+        let document = if crate::artifact_receipt::sidecar_path(&path)?.is_file() {
+            crate::artifact_receipt::read(&path)?
+        } else {
+            crate::artifact_receipt::scan_and_write_with_spec(
+                &path,
+                &identity,
+                "legacy-manifest-row-migration-v1",
+                "legacy-unreceipted-input",
+                crate::artifact_receipt::SemanticSpec {
+                    date_column: None,
+                    conservation_columns: Vec::new(),
+                    ordering_contract: "source-row-order/v1".to_string(),
+                    page_week_consistency: false,
+                },
+            )?
+        };
+        let rows = crate::artifact_receipt::verify(
+            &path,
+            &document.receipt.identity,
+            Some(&document.receipt_sha256),
+            crate::artifact_receipt::VerificationMode::Fast,
+        )?
+        .receipt
+        .rows;
+        counts.insert(manifest_key, usize::try_from(rows)?);
     }
     Ok(counts)
 }
@@ -523,6 +571,44 @@ mod tests {
         let file = output.path().join("not-a-directory");
         fs::write(&file, "fixture")?;
         manifest_row_counts(&file)?;
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_row_counts_migrates_and_reuses_authoritative_receipts() -> Result<()> {
+        let output = TestDir::new()?;
+        write_metric(output.path(), "nlwiki", "patrol", 1)?;
+        let artifact = output.path().join("nlwiki/patrol.parquet");
+
+        let first = manifest_row_counts(output.path())?;
+        assert_eq!(
+            first.get(&artifact.to_string_lossy().into_owned()),
+            Some(&1)
+        );
+        assert!(crate::artifact_receipt::sidecar_path(&artifact)?.is_file());
+        assert_eq!(manifest_row_counts(output.path())?, first);
+
+        assert_eq!(
+            manifest_receipt_identity(Some("patrol-source"), "nlwiki", "rights.parquet"),
+            "patrol-source/nlwiki/rights.parquet"
+        );
+
+        let original = fs::read(&artifact)?;
+        let mut corrupt = original.clone();
+        corrupt[0] ^= 1;
+        fs::write(&artifact, corrupt)?;
+        assert!(manifest_row_counts(output.path()).is_err());
+        fs::write(&artifact, original)?;
+
+        fs::write(
+            crate::artifact_receipt::sidecar_path(&artifact)?,
+            "truncated",
+        )
+        .expect("truncate manifest receipt fixture");
+        assert!(manifest_row_counts(output.path()).is_err());
+        fs::remove_file(crate::artifact_receipt::sidecar_path(&artifact)?)?;
+        fs::write(&artifact, "not parquet")?;
+        assert!(manifest_row_counts(output.path()).is_err());
         Ok(())
     }
 

@@ -397,6 +397,10 @@ pub fn compute_patrol(
     rebuild: bool,
     limit_months: Option<usize>,
 ) -> Result<()> {
+    anyhow::ensure!(
+        !output_dir.join("ready.json").exists() && !output_dir.join("qualification.json").exists(),
+        "refusing to modify an immutable ready candidate"
+    );
     compute_patrol_selected(wiki, data_dir, output_dir, rebuild, limit_months, None)
 }
 
@@ -657,7 +661,10 @@ pub(crate) fn reusable_candidate_files(
     }
     let mut files = outputs
         .into_iter()
-        .map(|output| output.path)
+        .flat_map(|output| {
+            let receipt = crate::artifact_receipt::sidecar_path(&output.path).ok();
+            std::iter::once(output.path).chain(receipt)
+        })
         .collect::<Vec<_>>();
     files.push(receipt);
     Ok(Some(files))

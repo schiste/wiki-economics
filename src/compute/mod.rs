@@ -1995,10 +1995,16 @@ impl Drop for PendingOutput {
 struct AtomicBatchedParquetWriter {
     pending: PendingOutput,
     writer: Option<BatchedWriter<File>>,
+    semantics: crate::artifact_receipt::SemanticAccumulator,
 }
 
 impl AtomicBatchedParquetWriter {
     fn new(final_path: PathBuf, schema: &Schema) -> Result<Self> {
+        let identity = final_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("page_weekly_edits output has no UTF-8 filename")?
+            .to_string();
         let pending = PendingOutput::new(final_path)?;
         let file = File::create(&pending.temp_path)?;
         let writer = ParquetWriter::new(file)
@@ -2007,11 +2013,15 @@ impl AtomicBatchedParquetWriter {
         Ok(Self {
             pending,
             writer: Some(writer),
+            semantics: crate::artifact_receipt::SemanticAccumulator::new(
+                crate::artifact_receipt::SemanticSpec::for_identity(&identity),
+            ),
         })
     }
 
     fn write_batch(&mut self, df: &mut DataFrame) -> Result<()> {
         df.rechunk_mut();
+        self.semantics.observe(df)?;
         self.writer
             .as_mut()
             .context("page_weekly_edits output writer was already finished")?
@@ -2028,7 +2038,10 @@ impl AtomicBatchedParquetWriter {
             .take()
             .context("page_weekly_edits output writer was already finished")?
             .finish()?;
-        self.pending.publish()
+        let final_path = self.pending.final_path.clone();
+        let bytes = self.pending.publish()?;
+        crate::artifact_receipt::write_semantic_draft(&final_path, self.semantics)?;
+        Ok(bytes)
     }
 }
 
@@ -2065,6 +2078,10 @@ pub fn write_output(df: &mut DataFrame, wiki: &str, metric: &str, output_dir: &P
     let wiki_dir = output_dir.join(wiki);
     let path = wiki_dir.join(format!("{metric}.parquet"));
     let started = Instant::now();
+    let mut semantics = crate::artifact_receipt::SemanticAccumulator::new(
+        crate::artifact_receipt::SemanticSpec::for_identity(&format!("{metric}.parquet")),
+    );
+    semantics.observe(df)?;
     let pending = PendingOutput::new(path.clone())?;
     let mut file = File::create(&pending.temp_path)?;
     ParquetWriter::new(&mut file)
@@ -2072,6 +2089,7 @@ pub fn write_output(df: &mut DataFrame, wiki: &str, metric: &str, output_dir: &P
         .finish(df)?;
     drop(file);
     let bytes = pending.publish()?;
+    crate::artifact_receipt::write_semantic_draft(&path, semantics)?;
     info!(
         wiki = wiki,
         metric = metric,
@@ -2319,7 +2337,10 @@ pub(crate) fn reusable_candidate_files(
     }
     let mut files = outputs
         .into_iter()
-        .map(|output| output.path)
+        .flat_map(|output| {
+            let receipt = crate::artifact_receipt::sidecar_path(&output.path).ok();
+            std::iter::once(output.path).chain(receipt)
+        })
         .collect::<Vec<_>>();
     files.push(receipt);
     Ok(Some(files))
@@ -2372,6 +2393,10 @@ fn compute_all_selected(
     output_dir: &Path,
     snapshot: Option<&str>,
 ) -> Result<()> {
+    anyhow::ensure!(
+        !output_dir.join("ready.json").exists() && !output_dir.join("qualification.json").exists(),
+        "refusing to modify an immutable ready candidate"
+    );
     let weekly_config = WeeklyAggregationConfig::for_snapshot(data_dir, wiki, snapshot)?;
     let algorithm_version = weekly_config.algorithm_version();
     let inputs = compute_stage_inputs(wiki, data_dir, snapshot)?;
