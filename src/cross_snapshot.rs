@@ -1,6 +1,6 @@
 use anyhow::{Context, Result, ensure};
 use polars::prelude::{DataFrame, ParquetCompression, ParquetReader, ParquetWriter, SerReader};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -196,6 +196,49 @@ impl CrossSnapshotCache {
         *self.stats.borrow()
     }
 
+    pub(crate) fn load_json<T: DeserializeOwned>(
+        &self,
+        kind: &str,
+        algorithm_version: &str,
+        input_digest: &str,
+        artifact: &str,
+    ) -> Result<Option<T>> {
+        let path = self.artifact_path_with_extension(
+            kind,
+            algorithm_version,
+            input_digest,
+            artifact,
+            "json",
+        )?;
+        if !path.is_file() {
+            return Ok(None);
+        }
+        let value = serde_json::from_slice(&fs::read(&path)?)
+            .with_context(|| format!("invalid incremental checkpoint {}", path.display()))?;
+        self.stats.borrow_mut().reused_artifacts += 1;
+        Ok(Some(value))
+    }
+
+    pub(crate) fn store_json<T: Serialize>(
+        &self,
+        kind: &str,
+        algorithm_version: &str,
+        input_digest: &str,
+        artifact: &str,
+        value: &T,
+    ) -> Result<()> {
+        let path = self.artifact_path_with_extension(
+            kind,
+            algorithm_version,
+            input_digest,
+            artifact,
+            "json",
+        )?;
+        atomic_json(&path, value)?;
+        self.stats.borrow_mut().rebuilt_artifacts += 1;
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn for_test(
         root: &Path,
@@ -220,7 +263,28 @@ impl CrossSnapshotCache {
         input_digest: &str,
         artifact: &str,
     ) -> Result<PathBuf> {
-        for (label, value) in [("kind", kind), ("artifact", artifact)] {
+        self.artifact_path_with_extension(
+            kind,
+            algorithm_version,
+            input_digest,
+            artifact,
+            "parquet",
+        )
+    }
+
+    fn artifact_path_with_extension(
+        &self,
+        kind: &str,
+        algorithm_version: &str,
+        input_digest: &str,
+        artifact: &str,
+        extension: &str,
+    ) -> Result<PathBuf> {
+        for (label, value) in [
+            ("kind", kind),
+            ("artifact", artifact),
+            ("extension", extension),
+        ] {
             ensure!(
                 !value.is_empty()
                     && value
@@ -239,7 +303,7 @@ impl CrossSnapshotCache {
             .join(kind)
             .join(algorithm_digest)
             .join(input_digest)
-            .join(format!("{artifact}.parquet")))
+            .join(format!("{artifact}.{extension}")))
     }
 }
 
@@ -396,6 +460,22 @@ mod tests {
         fs::write(&artifact, b"corrupt")?;
         assert!(cache.load("monthly", "v1", digest, "gdp").is_err());
         assert!(cache.artifact_path("../bad", "v1", digest, "gdp").is_err());
+        let checkpoint = BTreeMap::from([("through".to_string(), "2024-12".to_string())]);
+        assert!(
+            cache
+                .load_json::<BTreeMap<String, String>>(
+                    "lifecycle_checkpoint",
+                    "v1",
+                    digest,
+                    "state",
+                )?
+                .is_none()
+        );
+        cache.store_json("lifecycle_checkpoint", "v1", digest, "state", &checkpoint)?;
+        assert_eq!(
+            cache.load_json("lifecycle_checkpoint", "v1", digest, "state")?,
+            Some(checkpoint)
+        );
         Ok(())
     }
 

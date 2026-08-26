@@ -4,26 +4,26 @@
     {
       "family": "monthly",
       "paths": ["src/compute/mod.rs"],
-      "reason": "Authenticate the compaction manifest as an ingest-stage input without changing monthly metric semantics or bytes.",
-      "base_commit": "9aaeca7245685c82682d9d885078351382f43db8"
+      "reason": "Add publication-invisible cross-snapshot cache reuse without changing monthly metric semantics or final bytes.",
+      "base_commit": "34d9129b16f377e6e5378b5a3f8ac3099ca22536"
     },
     {
       "family": "activity_tiers",
       "paths": ["src/compute/mod.rs"],
-      "reason": "Authenticate the compaction manifest as an ingest-stage input without changing activity-tier semantics or bytes.",
-      "base_commit": "9aaeca7245685c82682d9d885078351382f43db8"
+      "reason": "Add publication-invisible editor-month reuse without changing activity-tier semantics or final bytes.",
+      "base_commit": "34d9129b16f377e6e5378b5a3f8ac3099ca22536"
     },
     {
       "family": "lifecycle",
       "paths": ["src/compute/mod.rs"],
-      "reason": "Authenticate the compaction manifest as an ingest-stage input without changing lifecycle metric semantics or bytes.",
-      "base_commit": "9aaeca7245685c82682d9d885078351382f43db8"
+      "reason": "Add publication-invisible yearly state checkpoints without changing lifecycle metric semantics or final bytes.",
+      "base_commit": "34d9129b16f377e6e5378b5a3f8ac3099ca22536"
     },
     {
       "family": "page_week",
-      "paths": ["src/compute/mod.rs"],
-      "reason": "Authenticate the compaction manifest as an ingest-stage input without changing page-week metric semantics or bytes.",
-      "base_commit": "9aaeca7245685c82682d9d885078351382f43db8"
+      "paths": ["src/compute/mod.rs", "src/compute/weekly/mod.rs"],
+      "reason": "Add publication-invisible monthly contribution reuse without changing page-week semantics or final bytes.",
+      "base_commit": "34d9129b16f377e6e5378b5a3f8ac3099ca22536"
     }
   ]
 }

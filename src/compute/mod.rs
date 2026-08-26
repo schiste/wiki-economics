@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use chrono::{Duration, NaiveDate};
 use polars::io::parquet::write::BatchedWriter;
 use polars::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
@@ -330,6 +330,7 @@ fn max_option(left: Option<u64>, right: Option<u64>) -> Option<u64> {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct ChurnAccumulator {
     period_type: &'static str,
     seen: HashSet<(i64, i32)>,
@@ -418,6 +419,7 @@ impl ChurnAccumulator {
     }
 }
 
+#[derive(Clone)]
 struct RegisteredState {
     funnel_stats: HashMap<i64, (i32, u32)>,
     cohort_spans: HashMap<i64, (i32, i32)>,
@@ -529,6 +531,124 @@ impl RegisteredState {
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ChurnCheckpoint {
+    active: BTreeMap<i32, u32>,
+    spans: BTreeMap<i64, (i32, i32)>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LifecycleCheckpoint {
+    schema_version: u32,
+    algorithm_version: String,
+    through_month: String,
+    input_month_digest_prefix: String,
+    funnel_stats: BTreeMap<i64, (i32, u32)>,
+    cohort_spans: BTreeMap<i64, (i32, i32)>,
+    churn_month: ChurnCheckpoint,
+    churn_quarter: ChurnCheckpoint,
+    churn_year: ChurnCheckpoint,
+}
+
+impl LifecycleCheckpoint {
+    fn from_state(state: &RegisteredState, through_month: &str, prefix: &str) -> Self {
+        let churn = |value: &ChurnAccumulator| ChurnCheckpoint {
+            active: value.active.clone(),
+            spans: value
+                .spans
+                .iter()
+                .map(|(user, span)| (*user, *span))
+                .collect(),
+        };
+        Self {
+            schema_version: 1,
+            algorithm_version: lifecycle::ALGORITHM_VERSION.to_string(),
+            through_month: through_month.to_string(),
+            input_month_digest_prefix: prefix.to_string(),
+            funnel_stats: state
+                .funnel_stats
+                .iter()
+                .map(|(user, stats)| (*user, *stats))
+                .collect(),
+            cohort_spans: state
+                .cohort_spans
+                .iter()
+                .map(|(user, span)| (*user, *span))
+                .collect(),
+            churn_month: churn(&state.churn_month),
+            churn_quarter: churn(&state.churn_quarter),
+            churn_year: churn(&state.churn_year),
+        }
+    }
+
+    fn validate(&self, through_month: &str, prefix: &str) -> Result<()> {
+        anyhow::ensure!(
+            self.schema_version == 1
+                && self.algorithm_version == lifecycle::ALGORITHM_VERSION
+                && self.through_month == through_month
+                && self.input_month_digest_prefix == prefix,
+            "lifecycle checkpoint identity changed"
+        );
+        Ok(())
+    }
+
+    fn into_state(self) -> RegisteredState {
+        let churn = |period_type, value: ChurnCheckpoint| ChurnAccumulator {
+            period_type,
+            seen: HashSet::new(),
+            active: value.active,
+            spans: value.spans.into_iter().collect(),
+        };
+        RegisteredState {
+            funnel_stats: self.funnel_stats.into_iter().collect(),
+            cohort_spans: self.cohort_spans.into_iter().collect(),
+            churn_month: churn("month", self.churn_month),
+            churn_quarter: churn("quarter", self.churn_quarter),
+            churn_year: churn("year", self.churn_year),
+        }
+    }
+}
+
+fn lifecycle_prefix_digest(
+    cache: &crate::cross_snapshot::CrossSnapshotCache,
+    month_digests: &[String],
+) -> String {
+    let inputs = month_digests.iter().map(String::as_str).collect::<Vec<_>>();
+    cache.derived_digest("lifecycle_prefix", lifecycle::ALGORITHM_VERSION, &inputs)
+}
+
+fn load_latest_lifecycle_checkpoint(
+    cache: &crate::cross_snapshot::CrossSnapshotCache,
+    partitions: &[storage::PartitionSpec],
+) -> Result<Option<LifecycleCheckpoint>> {
+    let mut month_digests = Vec::with_capacity(partitions.len());
+    let mut boundaries = Vec::new();
+    for partition in partitions {
+        month_digests.push(cache.month_digest(&partition.year_month)?.to_string());
+        if partition.year_month.ends_with("-12") {
+            boundaries.push((
+                partition.year_month.clone(),
+                lifecycle_prefix_digest(cache, &month_digests),
+            ));
+        }
+    }
+    for (through_month, prefix) in boundaries.into_iter().rev() {
+        let checkpoint: Option<LifecycleCheckpoint> = cache.load_json(
+            "lifecycle_checkpoint",
+            lifecycle::ALGORITHM_VERSION,
+            &prefix,
+            "state",
+        )?;
+        if let Some(checkpoint) = checkpoint {
+            checkpoint.validate(&through_month, &prefix)?;
+            return Ok(Some(checkpoint));
+        }
+    }
+    Ok(None)
 }
 
 fn analytical_select_exprs() -> Vec<Expr> {
@@ -1200,6 +1320,19 @@ fn compute_page_weekly_edits_for_snapshot(
     config: &WeeklyAggregationConfig,
     snapshot: Option<&str>,
 ) -> Result<Option<WeeklyAggregationReport>> {
+    compute_page_weekly_edits_for_snapshot_cached(
+        wiki, data_dir, output_dir, config, snapshot, None,
+    )
+}
+
+fn compute_page_weekly_edits_for_snapshot_cached(
+    wiki: &str,
+    data_dir: &Path,
+    output_dir: &Path,
+    config: &WeeklyAggregationConfig,
+    snapshot: Option<&str>,
+    cross_snapshot: Option<&crate::cross_snapshot::CrossSnapshotCache>,
+) -> Result<Option<WeeklyAggregationReport>> {
     let aggregation_started = Instant::now();
     let governed_scratch_root = config
         .scratch_root
@@ -1277,24 +1410,37 @@ fn compute_page_weekly_edits_for_snapshot(
     let mut running_rows: usize = 0;
     for (idx, partition) in partitions.iter().enumerate() {
         let started = Instant::now();
-        let partition_weekly = warehouse_lazyframe(&partition.files)?
-            .with_column(
-                col("event_timestamp")
-                    .str()
-                    .slice(lit(0), lit(10))
-                    .str()
-                    .to_date(event_date_options.clone())
-                    .dt()
-                    .truncate(lit("1w"))
-                    .alias("week_start"),
-            )
-            .group_by(weekly_group_keys())
-            // Some historical revisions have a valid timestamp/revision ID
-            // but no recoverable page identity (for example a suppressed or
-            // deleted page). The weekly pipeline intentionally supports a
-            // null page key, so count rows rather than non-null page IDs.
-            .agg([len().alias("edits")])
-            .collect()?;
+        let input_digest = cross_snapshot
+            .map(|cache| cache.month_digest(&partition.year_month))
+            .transpose()?;
+        let partition_weekly = cached_or_compute(
+            cross_snapshot,
+            "page_week_contribution",
+            weekly::CONTRIBUTION_ALGORITHM_VERSION,
+            input_digest,
+            "weekly_contribution",
+            || {
+                let reduced = warehouse_lazyframe(&partition.files)?
+                    .with_column(
+                        col("event_timestamp")
+                            .str()
+                            .slice(lit(0), lit(10))
+                            .str()
+                            .to_date(event_date_options.clone())
+                            .dt()
+                            .truncate(lit("1w"))
+                            .alias("week_start"),
+                    )
+                    .group_by(weekly_group_keys())
+                    // Some historical revisions have a valid timestamp/revision ID
+                    // but no recoverable page identity (for example a suppressed or
+                    // deleted page). The weekly pipeline intentionally supports a
+                    // null page key, so count rows rather than non-null page IDs.
+                    .agg([len().alias("edits")])
+                    .collect()?;
+                sort_frame(reduced, weekly_sort_keys())
+            },
+        )?;
         running_rows += partition_weekly.height();
         let partition_edits = sum_edits_column(std::slice::from_ref(&partition_weekly))?;
         let source_rows = parquet_paths_row_count(&partition.files)?;
@@ -2311,7 +2457,23 @@ fn compute_all_incremental_cached(
     let mut gdp_activity_month_digests = Vec::new();
     let mut gdp_activity_year = None;
     let mut labor_monthly_frames = Vec::new();
-    let mut registered_state = plan.lifecycle.must_compute().then(RegisteredState::new);
+    let lifecycle_checkpoint = if plan.lifecycle.must_compute() {
+        cross_snapshot
+            .map(|cache| load_latest_lifecycle_checkpoint(cache, &partitions))
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    let lifecycle_resume_through = lifecycle_checkpoint
+        .as_ref()
+        .map(|checkpoint| checkpoint.through_month.clone());
+    let mut registered_state = plan.lifecycle.must_compute().then(|| {
+        lifecycle_checkpoint
+            .map(LifecycleCheckpoint::into_state)
+            .unwrap_or_else(RegisteredState::new)
+    });
+    let mut lifecycle_month_digests = Vec::new();
 
     let partition_count = partitions.len();
     for partition in partitions {
@@ -2335,6 +2497,11 @@ fn compute_all_incremental_cached(
             gdp_activity_year = Some(partition.year);
         }
         let base = load_partition(&partition.files)?;
+        if plan.lifecycle.must_compute()
+            && let Some(cache) = cross_snapshot
+        {
+            lifecycle_month_digests.push(cache.month_digest(&partition.year_month)?.to_string());
+        }
         let year_month_key = partition
             .year_month
             .split_once('-')
@@ -2398,8 +2565,28 @@ fn compute_all_incremental_cached(
                 gdp_activity_month_digests.push(input_digest.to_string());
             }
         }
-        if let Some(state) = registered_state.as_mut() {
+        if let Some(state) = registered_state.as_mut()
+            && lifecycle_resume_through
+                .as_deref()
+                .is_none_or(|through| partition.year_month.as_str() > through)
+        {
             state.observe_partition(&base, partition.year, year_month_key)?;
+        }
+        if partition.year_month.ends_with("-12")
+            && lifecycle_resume_through
+                .as_deref()
+                .is_none_or(|through| partition.year_month.as_str() > through)
+            && let (Some(cache), Some(state)) = (cross_snapshot, registered_state.as_ref())
+        {
+            let prefix = lifecycle_prefix_digest(cache, &lifecycle_month_digests);
+            let checkpoint = LifecycleCheckpoint::from_state(state, &partition.year_month, &prefix);
+            cache.store_json(
+                "lifecycle_checkpoint",
+                lifecycle::ALGORITHM_VERSION,
+                &prefix,
+                "state",
+                &checkpoint,
+            )?;
         }
         for file in &partition.files {
             storage::discard_path_cache(file);
@@ -3009,12 +3196,13 @@ pub(crate) fn compute_cross_snapshot_qualification_build(
         ComputePlan::all_recompute(),
         cache.as_ref(),
     )?;
-    compute_page_weekly_edits_for_snapshot(
+    compute_page_weekly_edits_for_snapshot_cached(
         wiki,
         data_dir,
         output_dir,
         &weekly_config,
         Some(snapshot),
+        cache.as_ref(),
     )?;
     Ok(cache.as_ref().map_or_default(|cache| cache.stats()))
 }
@@ -5009,6 +5197,37 @@ mod tests {
 
         assert_eq!(state.funnel_stats.get(&1), Some(&(2023, 3)));
         assert_eq!(state.cohort_spans.get(&1), Some(&(2023, 2025)));
+        Ok(())
+    }
+
+    #[test]
+    fn lifecycle_checkpoint_roundtrip_replays_the_suffix_exactly() -> Result<()> {
+        let mut continuous = RegisteredState::new();
+        let first =
+            registered_base_df(&[(Some(1), 2024, 202401, 10), (Some(2), 2024, 202412, 11)])?;
+        continuous.observe_partition(&first, 2024, 202412)?;
+        let checkpoint = LifecycleCheckpoint::from_state(&continuous, "2024-12", &"ab".repeat(32));
+        checkpoint.validate("2024-12", &"ab".repeat(32))?;
+        assert!(checkpoint.validate("2023-12", &"ab".repeat(32)).is_err());
+        let serialized = serde_json::to_vec(&checkpoint)?;
+        let restored: LifecycleCheckpoint = serde_json::from_slice(&serialized)?;
+        let mut resumed = restored.into_state();
+
+        let suffix =
+            registered_base_df(&[(Some(1), 2025, 202501, 12), (Some(3), 2025, 202502, 13)])?;
+        continuous.observe_partition(&suffix, 2025, 202502)?;
+        resumed.observe_partition(&suffix, 2025, 202502)?;
+        assert_eq!(resumed.funnel_stats, continuous.funnel_stats);
+        assert_eq!(resumed.cohort_spans, continuous.cohort_spans);
+        assert_eq!(resumed.churn_month.active, continuous.churn_month.active);
+        assert_eq!(resumed.churn_month.spans, continuous.churn_month.spans);
+        assert_eq!(
+            resumed.churn_quarter.active,
+            continuous.churn_quarter.active
+        );
+        assert_eq!(resumed.churn_quarter.spans, continuous.churn_quarter.spans);
+        assert_eq!(resumed.churn_year.active, continuous.churn_year.active);
+        assert_eq!(resumed.churn_year.spans, continuous.churn_year.spans);
         Ok(())
     }
 
