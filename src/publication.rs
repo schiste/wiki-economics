@@ -318,6 +318,52 @@ struct PublicationSelection {
     entries: Vec<SelectionEntry>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PublicationRecoveryClassification {
+    Committed,
+    RolledBack,
+    NoOp,
+    Reconciled,
+    NeedsCommit,
+    IncorporatedByLaterPublication,
+    NeedsRollback,
+    Ambiguous,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct PublicationRecoveryEvidence {
+    selected_candidates: usize,
+    live_candidate_matches: usize,
+    snapshot_pointer_matches: usize,
+    candidate_artifacts_valid: bool,
+    current_gate_valid: bool,
+    current_gate_run_id: Option<String>,
+    current_gate_covers_selection: bool,
+    current_site_matches_gate: bool,
+    current_site_receipt_valid: bool,
+    backups_recoverable: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct PublicationRecoveryTransaction {
+    schema_version: u8,
+    run_id: String,
+    journal_state: Option<String>,
+    classification: PublicationRecoveryClassification,
+    reasons: Vec<String>,
+    evidence: PublicationRecoveryEvidence,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct PublicationRecoveryReport {
+    schema_version: u8,
+    generated_at_unix: u64,
+    repaired: bool,
+    site_rebuild_required: bool,
+    transactions: Vec<PublicationRecoveryTransaction>,
+}
+
 #[derive(Clone, Copy)]
 struct CandidateGeneration<'a> {
     output_dir: &'a Path,
@@ -1229,6 +1275,385 @@ fn selection_path(output_dir: &Path, run_id: &str) -> Result<PathBuf> {
         .join("selection.json"))
 }
 
+fn publication_transaction_run_ids(output_dir: &Path) -> Result<Vec<String>> {
+    let root = output_dir.join("_publication_transactions");
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+    let mut run_ids = Vec::new();
+    for entry in fs::read_dir(root)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let run_id = entry.file_name().to_string_lossy().into_owned();
+        if file_type.is_dir()
+            && valid_component(&run_id)
+            && entry.path().join("selection.json").is_file()
+        {
+            run_ids.push(run_id);
+        }
+    }
+    run_ids.sort();
+    Ok(run_ids)
+}
+
+fn empty_recovery_evidence() -> PublicationRecoveryEvidence {
+    PublicationRecoveryEvidence {
+        selected_candidates: 0,
+        live_candidate_matches: 0,
+        snapshot_pointer_matches: 0,
+        candidate_artifacts_valid: false,
+        current_gate_valid: false,
+        current_gate_run_id: None,
+        current_gate_covers_selection: false,
+        current_site_matches_gate: false,
+        current_site_receipt_valid: false,
+        backups_recoverable: false,
+    }
+}
+
+fn validate_publication_selection(
+    output_dir: &Path,
+    expected_run_id: &str,
+    selection: &PublicationSelection,
+) -> Result<()> {
+    ensure!(
+        selection.schema_version == 1,
+        "unsupported publication selection schema"
+    );
+    ensure!(
+        selection.run_id == expected_run_id && valid_component(&selection.run_id),
+        "publication selection run identity mismatch"
+    );
+    ensure!(
+        matches!(
+            selection.state.as_str(),
+            "activating"
+                | "selected"
+                | "committing"
+                | "committed"
+                | "rolled_back"
+                | "no_op"
+                | "reconciled"
+        ),
+        "unsupported publication selection state {}",
+        selection.state
+    );
+    let mut wikis = BTreeSet::new();
+    for entry in &selection.entries {
+        ensure!(
+            wikis.insert(&entry.wiki),
+            "duplicate selected wiki {}",
+            entry.wiki
+        );
+        ensure!(
+            valid_component(&entry.wiki),
+            "unsafe selected wiki identity"
+        );
+        storage::validate_snapshot_version(&entry.snapshot)?;
+        let candidate = output_dir.join(&entry.candidate_relative);
+        let expected = wiki_candidate_dir(
+            output_dir,
+            &entry.wiki,
+            &entry.snapshot,
+            candidate
+                .file_name()
+                .and_then(|value| value.to_str())
+                .context("selected candidate has no valid run identity")?,
+        )?;
+        ensure!(
+            candidate == expected,
+            "selected candidate path does not match its identity"
+        );
+        if let Some(previous) = entry.previous_candidate_relative.as_deref() {
+            let previous = output_dir.join(previous);
+            let (snapshot, run_id) = candidate_identity(&previous)
+                .context("previous candidate path has no valid identity")?;
+            ensure!(
+                previous == wiki_candidate_dir(output_dir, &entry.wiki, snapshot, run_id)?,
+                "previous candidate path does not match its wiki"
+            );
+        }
+        if let Some(backup) = entry.backup_relative.as_deref() {
+            ensure!(
+                output_dir.join(backup)
+                    == output_dir
+                        .join("_publication_transactions")
+                        .join(expected_run_id)
+                        .join("backups")
+                        .join(&entry.wiki),
+                "publication backup path does not match its transaction"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn modified_unix_nanos(path: &Path) -> Result<u128> {
+    Ok(fs::metadata(path)?
+        .modified()?
+        .duration_since(UNIX_EPOCH)
+        .context("publication recovery artifact has a pre-epoch modification time")?
+        .as_nanos())
+}
+
+fn backups_recoverable(output_dir: &Path, selection: &PublicationSelection) -> Result<bool> {
+    for entry in &selection.entries {
+        let active = output_dir.join(&entry.wiki);
+        let selected_target = PathBuf::from(&entry.candidate_relative).join(&entry.wiki);
+        let selected_is_live =
+            active_candidate_target(output_dir, &entry.wiki)?.as_ref() == Some(&selected_target);
+        let Some(backup) = entry.backup_relative.as_deref() else {
+            continue;
+        };
+        let backup = output_dir.join(backup);
+        if !(backup.exists()
+            || backup.is_symlink()
+            || (!selected_is_live && (active.exists() || active.is_symlink())))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+fn audit_publication_transaction(
+    data_dir: &Path,
+    output_dir: &Path,
+    site_dist_dir: &Path,
+    run_id: &str,
+) -> PublicationRecoveryTransaction {
+    let path = match selection_path(output_dir, run_id) {
+        Ok(path) => path,
+        Err(error) => {
+            return PublicationRecoveryTransaction {
+                schema_version: 1,
+                run_id: run_id.to_string(),
+                journal_state: None,
+                classification: PublicationRecoveryClassification::Ambiguous,
+                reasons: vec![format!("unsafe transaction identity: {error:#}")],
+                evidence: empty_recovery_evidence(),
+            };
+        }
+    };
+    let selection: PublicationSelection = match read_json(&path) {
+        Ok(selection) => selection,
+        Err(error) => {
+            return PublicationRecoveryTransaction {
+                schema_version: 1,
+                run_id: run_id.to_string(),
+                journal_state: None,
+                classification: PublicationRecoveryClassification::Ambiguous,
+                reasons: vec![format!("selection journal is invalid: {error:#}")],
+                evidence: empty_recovery_evidence(),
+            };
+        }
+    };
+    let mut report = PublicationRecoveryTransaction {
+        schema_version: 1,
+        run_id: run_id.to_string(),
+        journal_state: Some(selection.state.clone()),
+        classification: PublicationRecoveryClassification::Ambiguous,
+        reasons: Vec::new(),
+        evidence: PublicationRecoveryEvidence {
+            selected_candidates: selection.entries.len(),
+            ..empty_recovery_evidence()
+        },
+    };
+    if let Err(error) = validate_publication_selection(output_dir, run_id, &selection) {
+        report
+            .reasons
+            .push(format!("selection validation failed: {error:#}"));
+        return report;
+    }
+    report.classification = match selection.state.as_str() {
+        "committed" => PublicationRecoveryClassification::Committed,
+        "rolled_back" => PublicationRecoveryClassification::RolledBack,
+        "no_op" => PublicationRecoveryClassification::NoOp,
+        "reconciled" => PublicationRecoveryClassification::Reconciled,
+        _ => PublicationRecoveryClassification::Ambiguous,
+    };
+    if !matches!(
+        selection.state.as_str(),
+        "activating" | "selected" | "committing"
+    ) {
+        report.reasons.push("transaction is terminal".to_string());
+        return report;
+    }
+
+    let mut candidate_artifacts_valid = true;
+    for entry in &selection.entries {
+        let candidate = output_dir.join(&entry.candidate_relative);
+        let validation =
+            read_json::<ReadyWikiCandidate>(&candidate.join("ready.json")).and_then(|ready| {
+                ensure!(
+                    ready.wiki == entry.wiki
+                        && ready.snapshot == entry.snapshot
+                        && candidate_identity(&candidate).map(|identity| identity.1)
+                            == Some(ready.run_id.as_str()),
+                    "ready candidate identity does not match selection"
+                );
+                validate_ready_candidate(data_dir, &candidate, &ready)
+            });
+        if let Err(error) = validation {
+            candidate_artifacts_valid = false;
+            report.reasons.push(format!(
+                "selected candidate {}/{} is invalid: {error:#}",
+                entry.wiki, entry.snapshot
+            ));
+        }
+        let expected_target = PathBuf::from(&entry.candidate_relative).join(&entry.wiki);
+        if active_candidate_target(output_dir, &entry.wiki)
+            .ok()
+            .flatten()
+            .as_ref()
+            == Some(&expected_target)
+        {
+            report.evidence.live_candidate_matches += 1;
+        }
+        if storage::current_snapshot_version(data_dir, &entry.wiki)
+            .ok()
+            .flatten()
+            .as_deref()
+            == Some(entry.snapshot.as_str())
+        {
+            report.evidence.snapshot_pointer_matches += 1;
+        }
+    }
+    report.evidence.candidate_artifacts_valid = candidate_artifacts_valid;
+    report.evidence.backups_recoverable =
+        backups_recoverable(output_dir, &selection).unwrap_or(false);
+
+    let gate = read_json::<GateReceipt>(&output_dir.join(RECEIPT_FILE)).ok();
+    report.evidence.current_gate_run_id = gate.as_ref().map(|gate| gate.run_id.clone());
+    report.evidence.current_gate_valid = verify(output_dir, "publication-recovery-audit").is_ok();
+    report.evidence.current_gate_covers_selection = gate.as_ref().is_some_and(|gate| {
+        selection
+            .entries
+            .iter()
+            .all(|entry| gate.selected_snapshot_versions.get(&entry.wiki) == Some(&entry.snapshot))
+    });
+    report.evidence.current_site_matches_gate =
+        crate::fingerprint::current_site_matches_publication(output_dir, site_dist_dir)
+            .unwrap_or(false);
+    report.evidence.current_site_receipt_valid =
+        crate::fingerprint::current_site_has_valid_receipt(output_dir, site_dist_dir)
+            .unwrap_or(false);
+
+    let all_selected_live = report.evidence.live_candidate_matches == selection.entries.len();
+    let all_snapshots_selected =
+        report.evidence.snapshot_pointer_matches == selection.entries.len();
+    let gate_run_id = gate.as_ref().map(|gate| gate.run_id.as_str());
+    let journal_modified = modified_unix_nanos(&path).ok();
+    let site_receipt_modified = modified_unix_nanos(&output_dir.join("_stages/site.json")).ok();
+    let later_gate = gate.as_ref().is_some_and(|gate| {
+        gate.run_id != selection.run_id
+            && journal_modified
+                .zip(site_receipt_modified)
+                .is_some_and(|(journal_modified, site_modified)| site_modified > journal_modified)
+    });
+    let same_gate = gate_run_id == Some(selection.run_id.as_str());
+    let publication_proven = report.evidence.current_gate_valid
+        && report.evidence.current_gate_covers_selection
+        && report.evidence.current_site_matches_gate;
+
+    if candidate_artifacts_valid
+        && all_selected_live
+        && all_snapshots_selected
+        && publication_proven
+        && same_gate
+    {
+        report.classification = PublicationRecoveryClassification::NeedsCommit;
+        report.reasons.push(
+            "selected candidates, gate, and site prove this transaction was published".to_string(),
+        );
+    } else if candidate_artifacts_valid
+        && all_selected_live
+        && all_snapshots_selected
+        && publication_proven
+        && later_gate
+    {
+        report.classification = PublicationRecoveryClassification::IncorporatedByLaterPublication;
+        report.reasons.push(format!(
+            "later publication {} incorporated every selected candidate",
+            gate_run_id.unwrap_or("unknown")
+        ));
+    } else {
+        let previous_site_is_valid = report.evidence.current_site_receipt_valid
+            && gate.as_ref().is_some_and(|gate| {
+                (!report.evidence.current_site_matches_gate && gate.run_id == selection.run_id)
+                    || (report.evidence.current_site_matches_gate
+                        && gate.run_id != selection.run_id
+                        && journal_modified.zip(site_receipt_modified).is_some_and(
+                            |(journal_modified, site_modified)| site_modified <= journal_modified,
+                        ))
+            });
+        if matches!(selection.state.as_str(), "activating" | "selected")
+            && candidate_artifacts_valid
+            && previous_site_is_valid
+            && report.evidence.backups_recoverable
+        {
+            report.classification = PublicationRecoveryClassification::NeedsRollback;
+            report.reasons.push(
+                "the previous site is still valid and this selection never reached publication"
+                    .to_string(),
+            );
+        } else {
+            report.reasons.push(
+                "filesystem, gate, and site evidence do not prove one safe transition".to_string(),
+            );
+        }
+    }
+    report
+}
+
+pub(crate) fn audit_publication_recovery(
+    data_dir: &Path,
+    output_dir: &Path,
+    site_dist_dir: &Path,
+    run_id: Option<&str>,
+) -> PublicationRecoveryReport {
+    let run_ids = match run_id {
+        Some(run_id) => vec![run_id.to_string()],
+        None => match publication_transaction_run_ids(output_dir) {
+            Ok(run_ids) => run_ids,
+            Err(error) => {
+                return PublicationRecoveryReport {
+                    schema_version: 1,
+                    generated_at_unix: now_unix().unwrap_or(0),
+                    repaired: false,
+                    site_rebuild_required: false,
+                    transactions: vec![PublicationRecoveryTransaction {
+                        schema_version: 1,
+                        run_id: "transaction-inventory".to_string(),
+                        journal_state: None,
+                        classification: PublicationRecoveryClassification::Ambiguous,
+                        reasons: vec![format!("transaction inventory is unreadable: {error:#}")],
+                        evidence: empty_recovery_evidence(),
+                    }],
+                };
+            }
+        },
+    };
+    let transactions = run_ids
+        .iter()
+        .map(|run_id| audit_publication_transaction(data_dir, output_dir, site_dist_dir, run_id))
+        .collect();
+    PublicationRecoveryReport {
+        schema_version: 1,
+        generated_at_unix: now_unix().unwrap_or(0),
+        repaired: false,
+        site_rebuild_required: false,
+        transactions,
+    }
+}
+
+pub(crate) fn write_publication_recovery_report(
+    path: &Path,
+    report: &PublicationRecoveryReport,
+) -> Result<()> {
+    atomic_json(path, report)
+}
+
 fn active_candidate_target(output_dir: &Path, wiki: &str) -> Result<Option<PathBuf>> {
     let path = output_dir.join(wiki);
     match fs::read_link(&path) {
@@ -1648,6 +2073,233 @@ pub(crate) fn commit_ready_publication(
     }
     selection.state = "committed".to_string();
     atomic_json(&path, &selection)
+}
+
+fn reconcile_generation_as_published(
+    output_dir: &Path,
+    entry: &SelectionEntry,
+    publication_run_id: &str,
+) -> Result<()> {
+    let selected = output_dir.join(&entry.candidate_relative);
+    let (snapshot, candidate_run_id) =
+        candidate_identity(&selected).context("selected candidate identity is invalid")?;
+    let generation = CandidateGeneration::new(output_dir, &entry.wiki, snapshot, candidate_run_id);
+    let record = generation.adopt(GState::Ready, "adopted recovered selected candidate")?;
+    match record.state {
+        GState::Ready => generation
+            .transition(
+                GState::Published,
+                "later valid site publication incorporated this candidate",
+                Some(publication_run_id),
+            )
+            .map(|_| ()),
+        GState::Published => Ok(()),
+        state => anyhow::bail!("live selected candidate is unexpectedly recorded as {state:?}"),
+    }
+}
+
+fn reconcile_previous_generation(
+    output_dir: &Path,
+    entry: &SelectionEntry,
+    publication_run_id: &str,
+) -> Result<()> {
+    let Some(previous) = entry.previous_candidate_relative.as_deref() else {
+        return Ok(());
+    };
+    let previous = output_dir.join(previous);
+    if !previous.is_dir() {
+        return Ok(());
+    }
+    let Some((snapshot, candidate_run_id)) = candidate_identity(&previous) else {
+        return Ok(());
+    };
+    let generation = CandidateGeneration::new(output_dir, &entry.wiki, snapshot, candidate_run_id);
+    let record = generation.adopt(GState::Published, "adopted recovered rollback candidate")?;
+    match record.state {
+        GState::Ready | GState::Published => generation
+            .transition(
+                GState::Superseded,
+                "later valid site publication superseded this candidate",
+                Some(publication_run_id),
+            )
+            .map(|_| ()),
+        GState::Superseded => Ok(()),
+        GState::Retired => {
+            anyhow::bail!("retired previous candidate is still inside the rollback window")
+        }
+        state => anyhow::bail!("previous candidate is unexpectedly recorded as {state:?}"),
+    }
+}
+
+fn reconcile_later_publication(
+    data_dir: &Path,
+    output_dir: &Path,
+    site_dist_dir: &Path,
+    run_id: &str,
+) -> Result<()> {
+    let path = selection_path(output_dir, run_id)?;
+    let mut selection: PublicationSelection = read_json(&path)?;
+    validate_publication_selection(output_dir, run_id, &selection)?;
+    ensure!(
+        matches!(selection.state.as_str(), "selected" | "committing"),
+        "publication selection is not recoverable by reconciliation"
+    );
+    verify(output_dir, "publication-recovery")?;
+    ensure!(
+        crate::fingerprint::current_site_matches_publication(output_dir, site_dist_dir)?,
+        "current site does not match the publication gate"
+    );
+    let receipt: GateReceipt = read_json(&output_dir.join(RECEIPT_FILE))?;
+    ensure!(
+        receipt.run_id != selection.run_id,
+        "reconciliation requires a later publication"
+    );
+    for entry in &selection.entries {
+        ensure!(
+            active_candidate_relative(output_dir, &entry.wiki)?.as_deref()
+                == Some(entry.candidate_relative.as_str()),
+            "selected candidate changed before reconciliation"
+        );
+        ensure!(
+            storage::current_snapshot_version(data_dir, &entry.wiki)?.as_deref()
+                == Some(entry.snapshot.as_str()),
+            "selected snapshot changed before reconciliation"
+        );
+        reconcile_generation_as_published(output_dir, entry, &receipt.run_id)?;
+        reconcile_previous_generation(output_dir, entry, &receipt.run_id)?;
+        let retired_candidates = retire_superseded_candidates(output_dir, entry, &receipt.run_id)?;
+        storage::retire_inactive_snapshots(data_dir, &entry.wiki)?;
+        remove_committed_backup(output_dir, entry.backup_relative.as_deref())?;
+        info!(
+            wiki = entry.wiki,
+            recovered_transaction = run_id,
+            incorporated_by = receipt.run_id,
+            retired_candidates,
+            "reconciled interrupted publication transaction"
+        );
+    }
+    selection.state = "reconciled".to_string();
+    atomic_json(&path, &selection)
+}
+
+fn rollback_unpublished_selection(
+    data_dir: &Path,
+    output_dir: &Path,
+    lifecycle_path: &Path,
+    run_id: &str,
+    recovery_run_id: &str,
+) -> Result<()> {
+    let path = selection_path(output_dir, run_id)?;
+    let mut selection: PublicationSelection = read_json(&path)?;
+    validate_publication_selection(output_dir, run_id, &selection)?;
+    ensure!(
+        matches!(selection.state.as_str(), "activating" | "selected"),
+        "publication selection is not recoverable by rollback"
+    );
+    rollback_selection_files(data_dir, output_dir, &selection)?;
+    begin_selected_run(output_dir, recovery_run_id, &BTreeMap::new())?;
+    crate::merge::merge_outputs(output_dir, Some(recovery_run_id))?;
+    validate(data_dir, output_dir, lifecycle_path, recovery_run_id)?;
+    selection.state = "rolled_back".to_string();
+    atomic_json(&path, &selection)
+}
+
+#[derive(Serialize)]
+struct PublicationRecoveryQuarantine<'a> {
+    schema_version: u8,
+    quarantined_at_unix: u64,
+    transaction_run_id: &'a str,
+    reason: &'a str,
+    audit: &'a PublicationRecoveryTransaction,
+}
+
+fn quarantine_ambiguous_publication(
+    output_dir: &Path,
+    transaction: &PublicationRecoveryTransaction,
+) -> Result<()> {
+    let path = output_dir
+        .join("_quarantine")
+        .join("publication-recovery")
+        .join(&transaction.run_id)
+        .join("recovery.json");
+    atomic_json(
+        &path,
+        &PublicationRecoveryQuarantine {
+            schema_version: 1,
+            quarantined_at_unix: now_unix()?,
+            transaction_run_id: &transaction.run_id,
+            reason: "recovery evidence does not prove one safe transition",
+            audit: transaction,
+        },
+    )
+}
+
+pub(crate) fn recover_publication_transactions(
+    data_dir: &Path,
+    output_dir: &Path,
+    lifecycle_path: &Path,
+    site_dist_dir: &Path,
+    transaction_run_id: Option<&str>,
+    recovery_run_id: &str,
+) -> Result<PublicationRecoveryReport> {
+    ensure!(
+        valid_component(recovery_run_id),
+        "unsafe publication recovery run ID"
+    );
+    let initial =
+        audit_publication_recovery(data_dir, output_dir, site_dist_dir, transaction_run_id);
+    let mut repaired = false;
+    let mut site_rebuild_required = false;
+    for planned in &initial.transactions {
+        let current =
+            audit_publication_recovery(data_dir, output_dir, site_dist_dir, Some(&planned.run_id));
+        let transaction = current
+            .transactions
+            .first()
+            .context("publication recovery re-audit returned no transaction")?;
+        match transaction.classification {
+            PublicationRecoveryClassification::NeedsCommit => {
+                commit_ready_publication(data_dir, output_dir, &transaction.run_id)?;
+                repaired = true;
+            }
+            PublicationRecoveryClassification::IncorporatedByLaterPublication => {
+                reconcile_later_publication(
+                    data_dir,
+                    output_dir,
+                    site_dist_dir,
+                    &transaction.run_id,
+                )?;
+                repaired = true;
+            }
+            PublicationRecoveryClassification::NeedsRollback => {
+                rollback_unpublished_selection(
+                    data_dir,
+                    output_dir,
+                    lifecycle_path,
+                    &transaction.run_id,
+                    recovery_run_id,
+                )?;
+                repaired = true;
+                site_rebuild_required = true;
+            }
+            PublicationRecoveryClassification::Ambiguous => {
+                quarantine_ambiguous_publication(output_dir, transaction)?;
+                anyhow::bail!(
+                    "publication transaction {} is ambiguous and was quarantined",
+                    transaction.run_id
+                );
+            }
+            PublicationRecoveryClassification::Committed
+            | PublicationRecoveryClassification::RolledBack
+            | PublicationRecoveryClassification::NoOp
+            | PublicationRecoveryClassification::Reconciled => {}
+        }
+    }
+    let mut report =
+        audit_publication_recovery(data_dir, output_dir, site_dist_dir, transaction_run_id);
+    report.repaired = repaired;
+    report.site_rebuild_required = site_rebuild_required;
+    Ok(report)
 }
 
 fn load_lifecycle(path: &Path) -> Result<LifecycleRegistry> {
@@ -2374,6 +3026,7 @@ mod tests {
     use super::*;
     use crate::test_support::TestDir;
     use serde_json::{Value, json};
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
     struct Fixture {
@@ -2540,6 +3193,36 @@ mod tests {
                 "2026-03",
                 run_id,
             )
+        }
+
+        fn published_site(&self, run_id: &str) -> Result<(TestDir, PathBuf)> {
+            self.prepare(run_id)?;
+            validate(
+                self.data.path(),
+                self.output.path(),
+                &self.lifecycle_path,
+                run_id,
+            )
+            .expect("published site fixture gate should validate");
+            let site_root = TestDir::new()?;
+            let site = site_root.path().join("site");
+            let dist = site_root.path().join("dist");
+            fs::create_dir_all(site.join("src"))?;
+            fs::create_dir_all(site.join("data-build"))?;
+            fs::create_dir_all(&dist)?;
+            fs::write(site.join("src/index.md"), "# Publication recovery")?;
+            fs::write(site.join("data-build/manifest.sh"), "true")?;
+            fs::write(site.join("observablehq.config.js"), "export default {}")?;
+            fs::write(site.join("package.json"), "{}")?;
+            fs::write(
+                site_root.path().join("package.json"),
+                "{\"workspaces\":[\"site\"]}",
+            )
+            .expect("published site workspace fixture should write");
+            fs::write(site_root.path().join("package-lock.json"), "{}")?;
+            fs::write(dist.join("index.html"), "published")?;
+            crate::fingerprint::record_site(self.output.path(), &site, &dist)?;
+            Ok((site_root, dist))
         }
     }
 
@@ -3737,6 +4420,679 @@ mod tests {
         let selection: PublicationSelection =
             read_json(&journal).expect("rolled-back selection journal should remain readable");
         assert_eq!(selection.state, "rolled_back");
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_converges_for_every_pre_site_publication_kill_point() -> Result<()> {
+        for fault in [
+            "after_active_symlink_switch",
+            "after_snapshot_pointer_switch",
+            "during_merge",
+            "after_gate_validation",
+        ] {
+            let fixture = Fixture::new()?;
+            let (_site_root, dist) = fixture.published_site("baseline")?;
+            fixture.ready_candidate("candidate")?;
+            let run_id = format!("fault-{fault}");
+            if fault == "after_active_symlink_switch" {
+                let mut selection = activate_ready_candidates(
+                    fixture.data.path(),
+                    fixture.output.path(),
+                    &fixture.lifecycle_path,
+                    &run_id,
+                )
+                .expect("active-link fault fixture should activate");
+                storage::restore_current_snapshot(fixture.data.path(), "nlwiki", None)?;
+                selection.state = "activating".to_string();
+                atomic_json(&selection_path(fixture.output.path(), &run_id)?, &selection)?;
+            } else if fault == "after_snapshot_pointer_switch" {
+                let mut selection = activate_ready_candidates(
+                    fixture.data.path(),
+                    fixture.output.path(),
+                    &fixture.lifecycle_path,
+                    &run_id,
+                )
+                .expect("snapshot-pointer fault fixture should activate");
+                selection.state = "activating".to_string();
+                atomic_json(&selection_path(fixture.output.path(), &run_id)?, &selection)?;
+            } else if fault == "during_merge" {
+                activate_ready_candidates(
+                    fixture.data.path(),
+                    fixture.output.path(),
+                    &fixture.lifecycle_path,
+                    &run_id,
+                )
+                .expect("merge fault fixture should activate");
+                fs::write(
+                    fixture.output.path().join("gdp.parquet"),
+                    "partial merge output",
+                )
+                .expect("partial merge fixture should write");
+            } else {
+                prepare_ready_publication(
+                    fixture.data.path(),
+                    fixture.output.path(),
+                    &fixture.lifecycle_path,
+                    &run_id,
+                )
+                .expect("gate fault fixture should prepare");
+            }
+
+            let audit = audit_publication_recovery(
+                fixture.data.path(),
+                fixture.output.path(),
+                &dist,
+                Some(&run_id),
+            );
+            assert_eq!(
+                audit.transactions[0].classification,
+                PublicationRecoveryClassification::NeedsRollback
+            );
+            let recovered = recover_publication_transactions(
+                fixture.data.path(),
+                fixture.output.path(),
+                &fixture.lifecycle_path,
+                &dist,
+                Some(&run_id),
+                &format!("recover-{fault}"),
+            )
+            .expect("pre-site transaction should recover");
+            assert!(recovered.repaired);
+            assert!(recovered.site_rebuild_required);
+            assert_eq!(
+                recovered.transactions[0].classification,
+                PublicationRecoveryClassification::RolledBack
+            );
+            assert!(!fixture.output.path().join("nlwiki").is_symlink());
+            let second = recover_publication_transactions(
+                fixture.data.path(),
+                fixture.output.path(),
+                &fixture.lifecycle_path,
+                &dist,
+                Some(&run_id),
+                &format!("recover-{fault}-again"),
+            )
+            .expect("second pre-site recovery should be a no-op");
+            assert!(!second.repaired, "recovery must be idempotent for {fault}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_finishes_site_switch_commit_and_backup_retirement_kills() -> Result<()> {
+        for fault in [
+            "after_site_switch",
+            "during_commit",
+            "during_backup_retirement",
+        ] {
+            let fixture = Fixture::new()?;
+            let (_site_root, dist) = fixture.published_site("baseline")?;
+            fixture.ready_candidate("candidate")?;
+            let run_id = format!("fault-{fault}");
+            prepare_ready_publication(
+                fixture.data.path(),
+                fixture.output.path(),
+                &fixture.lifecycle_path,
+                &run_id,
+            )
+            .expect("post-site fault fixture should prepare");
+            let site = _site_root.path().join("site");
+            crate::fingerprint::record_site(fixture.output.path(), &site, &dist)?;
+            if fault != "after_site_switch" {
+                let path = selection_path(fixture.output.path(), &run_id)?;
+                let mut selection: PublicationSelection = read_json(&path)?;
+                selection.state = "committing".to_string();
+                if fault == "during_backup_retirement" {
+                    remove_committed_backup(
+                        fixture.output.path(),
+                        selection.entries[0].backup_relative.as_deref(),
+                    )
+                    .expect("backup-retirement fault fixture should remove its backup");
+                }
+                atomic_json(&path, &selection)?;
+            }
+
+            let audit = audit_publication_recovery(
+                fixture.data.path(),
+                fixture.output.path(),
+                &dist,
+                Some(&run_id),
+            );
+            assert_eq!(
+                audit.transactions[0].classification,
+                PublicationRecoveryClassification::NeedsCommit
+            );
+            let recovered = recover_publication_transactions(
+                fixture.data.path(),
+                fixture.output.path(),
+                &fixture.lifecycle_path,
+                &dist,
+                Some(&run_id),
+                &format!("recover-{fault}"),
+            )
+            .expect("post-site transaction should recover");
+            assert!(recovered.repaired);
+            assert!(!recovered.site_rebuild_required);
+            assert_eq!(
+                recovered.transactions[0].classification,
+                PublicationRecoveryClassification::Committed
+            );
+            let state = crate::generation_lifecycle::load(
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                "candidate",
+            )
+            .expect("published generation state should load")
+            .context("published generation state should exist")
+            .expect("published generation state should exist");
+            assert_eq!(state.state, GState::Published);
+            let second = recover_publication_transactions(
+                fixture.data.path(),
+                fixture.output.path(),
+                &fixture.lifecycle_path,
+                &dist,
+                Some(&run_id),
+                &format!("recover-{fault}-again"),
+            )
+            .expect("second post-site recovery should be a no-op");
+            assert!(!second.repaired, "recovery must be idempotent for {fault}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn later_publication_reconciles_old_selection_and_retains_one_rollback() -> Result<()> {
+        let fixture = Fixture::new()?;
+        fixture.ready_candidate("candidate-1")?;
+        prepare_ready_publication(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "publish-1",
+        )
+        .expect("first candidate should prepare");
+        let (site_root, dist) = {
+            let site_root = TestDir::new()?;
+            let site = site_root.path().join("site");
+            let dist = site_root.path().join("dist");
+            fs::create_dir_all(site.join("src"))?;
+            fs::create_dir_all(site.join("data-build"))?;
+            fs::create_dir_all(&dist)?;
+            fs::write(site.join("src/index.md"), "# Site")?;
+            fs::write(site.join("data-build/manifest.sh"), "true")?;
+            fs::write(site.join("observablehq.config.js"), "export default {}")?;
+            fs::write(site.join("package.json"), "{}")?;
+            fs::write(
+                site_root.path().join("package.json"),
+                "{\"workspaces\":[\"site\"]}",
+            )
+            .expect("site workspace fixture should write");
+            fs::write(site_root.path().join("package-lock.json"), "{}")?;
+            fs::write(dist.join("index.html"), "published")?;
+            crate::fingerprint::record_site(fixture.output.path(), &site, &dist)?;
+            (site_root, dist)
+        };
+        commit_ready_publication(fixture.data.path(), fixture.output.path(), "publish-1")?;
+
+        fixture.ready_candidate("candidate-2")?;
+        prepare_ready_publication(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "interrupted-publication",
+        )
+        .expect("interrupted candidate should prepare");
+        begin_selected_run(fixture.output.path(), "later-publication", &BTreeMap::new())?;
+        crate::merge::merge_outputs(fixture.output.path(), Some("later-publication"))?;
+        validate(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "later-publication",
+        )
+        .expect("later publication should validate");
+        crate::fingerprint::record_site(
+            fixture.output.path(),
+            &site_root.path().join("site"),
+            &dist,
+        )
+        .expect("later publication site receipt should record");
+
+        let journal_path = selection_path(fixture.output.path(), "interrupted-publication")?;
+        let journal_before = fs::read(&journal_path)?;
+        let audit = audit_publication_recovery(
+            fixture.data.path(),
+            fixture.output.path(),
+            &dist,
+            Some("interrupted-publication"),
+        );
+        assert_eq!(
+            fs::read(&journal_path)?,
+            journal_before,
+            "audit must be read-only"
+        );
+        assert_eq!(
+            audit.transactions[0].classification,
+            PublicationRecoveryClassification::IncorporatedByLaterPublication
+        );
+        let recovered = recover_publication_transactions(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            &dist,
+            Some("interrupted-publication"),
+            "reconcile-later",
+        )
+        .expect("later publication should reconcile the interrupted journal");
+        assert_eq!(
+            recovered.transactions[0].classification,
+            PublicationRecoveryClassification::Reconciled
+        );
+        assert_eq!(
+            crate::generation_lifecycle::load(
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                "candidate-2",
+            )
+            .expect("live generation state should load")
+            .context("live generation state should exist")
+            .expect("live generation state should exist")
+            .state,
+            GState::Published
+        );
+        assert_eq!(
+            crate::generation_lifecycle::load(
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                "candidate-1",
+            )
+            .expect("rollback generation state should load")
+            .context("rollback generation state should exist")
+            .expect("rollback generation state should exist")
+            .state,
+            GState::Superseded
+        );
+        let retained = fs::read_dir(fixture.output.path().join("_candidates/nlwiki/2026-03"))?
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.path().is_dir())
+            .count();
+        assert_eq!(retained, 2, "one live and exactly one rollback generation");
+        assert!(
+            !fixture
+                .output
+                .path()
+                .join("_publication_transactions/interrupted-publication/backups/nlwiki")
+                .exists()
+        );
+
+        let reconciled: PublicationSelection = read_json(&journal_path)?;
+        let entry = reconciled.entries[0].clone();
+        reconcile_generation_as_published(fixture.output.path(), &entry, "later-publication")?;
+        reconcile_previous_generation(fixture.output.path(), &entry, "later-publication")?;
+
+        let mut no_previous = entry.clone();
+        no_previous.previous_candidate_relative = None;
+        reconcile_previous_generation(fixture.output.path(), &no_previous, "later-publication")?;
+        let mut missing_previous = entry.clone();
+        missing_previous.previous_candidate_relative =
+            Some("_candidates/nlwiki/2026-03/missing".to_string());
+        reconcile_previous_generation(
+            fixture.output.path(),
+            &missing_previous,
+            "later-publication",
+        )
+        .expect("missing previous generation is already retired");
+        let invalid_previous = fixture
+            .output
+            .path()
+            .join("_candidates/nlwiki/invalid/invalid");
+        fs::create_dir_all(&invalid_previous)?;
+        let mut invalid_previous_entry = entry.clone();
+        invalid_previous_entry.previous_candidate_relative =
+            Some("_candidates/nlwiki/invalid/invalid".to_string());
+        reconcile_previous_generation(
+            fixture.output.path(),
+            &invalid_previous_entry,
+            "later-publication",
+        )
+        .expect("invalid previous generation identity is ignored safely");
+
+        let retired_dir = fixture
+            .output
+            .path()
+            .join("_candidates/nlwiki/2026-03/retired-previous");
+        fs::create_dir_all(&retired_dir)?;
+        let retired = CandidateGeneration::new(
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            "retired-previous",
+        );
+        retired.adopt(GState::Ready, "test")?;
+        retired.transition(GState::Superseded, "test", None)?;
+        retired.transition(GState::Retired, "test", None)?;
+        let mut retired_entry = entry.clone();
+        retired_entry.previous_candidate_relative =
+            Some("_candidates/nlwiki/2026-03/retired-previous".to_string());
+        assert!(
+            reconcile_previous_generation(
+                fixture.output.path(),
+                &retired_entry,
+                "later-publication",
+            )
+            .is_err()
+        );
+
+        let building_dir = fixture
+            .output
+            .path()
+            .join("_candidates/nlwiki/2026-03/building-previous");
+        fs::create_dir_all(&building_dir)?;
+        crate::generation_lifecycle::begin(
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            "building-previous",
+        )
+        .expect("building previous generation fixture should start");
+        let mut building_entry = entry.clone();
+        building_entry.previous_candidate_relative =
+            Some("_candidates/nlwiki/2026-03/building-previous".to_string());
+        assert!(
+            reconcile_previous_generation(
+                fixture.output.path(),
+                &building_entry,
+                "later-publication",
+            )
+            .is_err()
+        );
+
+        let mut building_selected = entry;
+        building_selected.candidate_relative =
+            "_candidates/nlwiki/2026-03/building-previous".to_string();
+        assert!(
+            reconcile_generation_as_published(
+                fixture.output.path(),
+                &building_selected,
+                "later-publication",
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ambiguous_recovery_is_quarantined_without_deleting_evidence() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let run_id = "ambiguous-publication";
+        let path = selection_path(fixture.output.path(), run_id)?;
+        fs::create_dir_all(path.parent().context("selection parent")?)?;
+        fs::write(&path, "{truncated")?;
+
+        let audit = audit_publication_recovery(
+            fixture.data.path(),
+            fixture.output.path(),
+            fixture.output.path(),
+            Some(run_id),
+        );
+        assert_eq!(
+            audit.transactions[0].classification,
+            PublicationRecoveryClassification::Ambiguous
+        );
+        assert!(
+            recover_publication_transactions(
+                fixture.data.path(),
+                fixture.output.path(),
+                &fixture.lifecycle_path,
+                fixture.output.path(),
+                Some(run_id),
+                "recover-ambiguous",
+            )
+            .is_err()
+        );
+        assert_eq!(fs::read_to_string(&path)?, "{truncated");
+        assert!(
+            fixture
+                .output
+                .path()
+                .join("_quarantine/publication-recovery/ambiguous-publication/recovery.json")
+                .is_file()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_audit_discovers_transactions_and_rejects_invalid_evidence() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let empty = audit_publication_recovery(
+            fixture.data.path(),
+            fixture.output.path(),
+            fixture.output.path(),
+            None,
+        );
+        assert!(empty.transactions.is_empty());
+
+        let root = fixture.output.path().join("_publication_transactions");
+        fs::create_dir_all(&root)?;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o000))?;
+        let unreadable = audit_publication_recovery(
+            fixture.data.path(),
+            fixture.output.path(),
+            fixture.output.path(),
+            None,
+        );
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755))?;
+        assert_eq!(
+            unreadable.transactions[0].classification,
+            PublicationRecoveryClassification::Ambiguous
+        );
+        fs::create_dir_all(root.join("ignored-without-journal"))?;
+        fs::write(root.join("ignored-file"), "not a transaction")?;
+        let terminal_path = selection_path(fixture.output.path(), "terminal")?;
+        atomic_json(
+            &terminal_path,
+            &PublicationSelection {
+                schema_version: 1,
+                run_id: "terminal".to_string(),
+                state: "no_op".to_string(),
+                entries: Vec::new(),
+            },
+        )
+        .expect("terminal journal should write");
+        let discovered = audit_publication_recovery(
+            fixture.data.path(),
+            fixture.output.path(),
+            fixture.output.path(),
+            None,
+        );
+        assert_eq!(discovered.transactions.len(), 1);
+        assert_eq!(
+            discovered.transactions[0].classification,
+            PublicationRecoveryClassification::NoOp
+        );
+
+        let unsafe_run = audit_publication_transaction(
+            fixture.data.path(),
+            fixture.output.path(),
+            fixture.output.path(),
+            "unsafe/run",
+        );
+        assert_eq!(
+            unsafe_run.classification,
+            PublicationRecoveryClassification::Ambiguous
+        );
+
+        let mut invalid: PublicationSelection = read_json(&terminal_path)?;
+        invalid.schema_version = 2;
+        atomic_json(&terminal_path, &invalid)?;
+        let invalid = audit_publication_transaction(
+            fixture.data.path(),
+            fixture.output.path(),
+            fixture.output.path(),
+            "terminal",
+        );
+        assert_eq!(
+            invalid.classification,
+            PublicationRecoveryClassification::Ambiguous
+        );
+
+        fixture.ready_candidate("candidate-audit")?;
+        fs::remove_dir_all(fixture.output.path().join("nlwiki"))?;
+        let selection = activate_ready_candidates(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "active-audit",
+        )
+        .expect("audit candidate should activate");
+        assert!(selection.entries[0].backup_relative.is_none());
+        let ambiguous = audit_publication_transaction(
+            fixture.data.path(),
+            fixture.output.path(),
+            fixture.output.path(),
+            "active-audit",
+        );
+        assert_eq!(
+            ambiguous.classification,
+            PublicationRecoveryClassification::Ambiguous
+        );
+        let mut missing_backup = selection.clone();
+        missing_backup.entries[0].backup_relative =
+            Some("_publication_transactions/active-audit/backups/nlwiki".to_string());
+        atomic_json(
+            &selection_path(fixture.output.path(), "active-audit")?,
+            &missing_backup,
+        )
+        .expect("missing backup journal should write");
+        let missing_backup_audit = audit_publication_transaction(
+            fixture.data.path(),
+            fixture.output.path(),
+            fixture.output.path(),
+            "active-audit",
+        );
+        assert!(!missing_backup_audit.evidence.backups_recoverable);
+        fs::write(
+            fixture
+                .output
+                .path()
+                .join(&selection.entries[0].candidate_relative)
+                .join("ready.json"),
+            "invalid",
+        )
+        .expect("invalid ready receipt should write");
+        let invalid_candidate = audit_publication_transaction(
+            fixture.data.path(),
+            fixture.output.path(),
+            fixture.output.path(),
+            "active-audit",
+        );
+        assert!(!invalid_candidate.evidence.candidate_artifacts_valid);
+
+        let mut unsafe_candidate: PublicationSelection = read_json(&terminal_path)?;
+        unsafe_candidate.schema_version = 1;
+        unsafe_candidate.state = "selected".to_string();
+        unsafe_candidate.entries.push(SelectionEntry {
+            wiki: "nlwiki".to_string(),
+            snapshot: "2026-03".to_string(),
+            candidate_relative: "_candidates/nlwiki/2026-03/unsafe run".to_string(),
+            previous_candidate_relative: None,
+            previous_snapshot: None,
+            backup_relative: None,
+            workload_profile: None,
+        });
+        atomic_json(&terminal_path, &unsafe_candidate)?;
+        assert_eq!(
+            audit_publication_transaction(
+                fixture.data.path(),
+                fixture.output.path(),
+                fixture.output.path(),
+                "terminal",
+            )
+            .classification,
+            PublicationRecoveryClassification::Ambiguous
+        );
+
+        let blocked_report = fixture.output.path().join("blocked-report");
+        fs::create_dir(&blocked_report)?;
+        assert!(
+            write_publication_recovery_report(&blocked_report, &discovered).is_err(),
+            "atomic report publication must propagate an unwritable target"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_propagates_reconciliation_and_rollback_failures() -> Result<()> {
+        let reconcile_fixture = Fixture::new()?;
+        let (_site_root, dist) = reconcile_fixture.published_site("baseline")?;
+        reconcile_fixture.ready_candidate("candidate")?;
+        prepare_ready_publication(
+            reconcile_fixture.data.path(),
+            reconcile_fixture.output.path(),
+            &reconcile_fixture.lifecycle_path,
+            "interrupted",
+        )
+        .expect("reconciliation failure fixture should prepare");
+        begin_selected_run(reconcile_fixture.output.path(), "later", &BTreeMap::new())?;
+        crate::merge::merge_outputs(reconcile_fixture.output.path(), Some("later"))?;
+        validate(
+            reconcile_fixture.data.path(),
+            reconcile_fixture.output.path(),
+            &reconcile_fixture.lifecycle_path,
+            "later",
+        )
+        .expect("later failure fixture should validate");
+        crate::fingerprint::record_site(
+            reconcile_fixture.output.path(),
+            &_site_root.path().join("site"),
+            &dist,
+        )
+        .expect("later failure fixture site should record");
+        CandidateGeneration::new(
+            reconcile_fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            "candidate",
+        )
+        .transition(GState::Superseded, "injected invalid live state", None)?;
+        assert!(
+            recover_publication_transactions(
+                reconcile_fixture.data.path(),
+                reconcile_fixture.output.path(),
+                &reconcile_fixture.lifecycle_path,
+                &dist,
+                Some("interrupted"),
+                "failed-reconcile",
+            )
+            .is_err()
+        );
+
+        let rollback_fixture = Fixture::new()?;
+        let (_site_root, dist) = rollback_fixture.published_site("baseline")?;
+        rollback_fixture.ready_candidate("candidate")?;
+        activate_ready_candidates(
+            rollback_fixture.data.path(),
+            rollback_fixture.output.path(),
+            &rollback_fixture.lifecycle_path,
+            "interrupted",
+        )
+        .expect("rollback failure fixture should activate");
+        fs::write(&rollback_fixture.lifecycle_path, "invalid")?;
+        assert!(
+            recover_publication_transactions(
+                rollback_fixture.data.path(),
+                rollback_fixture.output.path(),
+                &rollback_fixture.lifecycle_path,
+                &dist,
+                Some("interrupted"),
+                "failed-rollback",
+            )
+            .is_err()
+        );
         Ok(())
     }
 

@@ -508,6 +508,92 @@ fn site_receipt_path(output_dir: &Path) -> PathBuf {
     output_dir.join("_stages").join("site.json")
 }
 
+/// Prove that the currently served distribution was built from the current
+/// publication candidate and gate. Unlike `site_is_reusable`, this deliberately
+/// ignores site source files: recovery is concerned with publication identity,
+/// not whether a fresh build can be skipped after source-code changes.
+pub(crate) fn current_site_matches_publication(output_dir: &Path, dist_dir: &Path) -> Result<bool> {
+    let path = site_receipt_path(output_dir);
+    if !path.is_file() || !dist_dir.is_dir() {
+        return Ok(false);
+    }
+    let receipt = match read_receipt(&path) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            warn!(path = %path.display(), error = %error, "invalid site receipt during publication recovery");
+            return Ok(false);
+        }
+    };
+    let selected = site_selected_snapshots(output_dir)?;
+    if receipt.schema_version != RECEIPT_SCHEMA_VERSION
+        || receipt.stage != "site"
+        || receipt.scope != "published-site"
+        || receipt.selected_snapshot.as_deref() != Some(&selected)
+        || receipt_fingerprint(&receipt)? != receipt.fingerprint
+    {
+        return Ok(false);
+    }
+
+    let publication_inputs = [
+        TrackedPath::new(
+            "data/.publication-candidate.json",
+            output_dir.join(".publication-candidate.json"),
+        ),
+        TrackedPath::new(
+            format!("data/{}", crate::publication::RECEIPT_FILE),
+            output_dir.join(crate::publication::RECEIPT_FILE),
+        ),
+    ];
+    for input in publication_inputs {
+        let Some(record) = receipt
+            .inputs
+            .iter()
+            .find(|record| record.identity == input.identity)
+        else {
+            return Ok(false);
+        };
+        if !paths_match(std::slice::from_ref(record), std::slice::from_ref(&input))? {
+            return Ok(false);
+        }
+    }
+    let outputs = collect_tracked_files(dist_dir, "site-dist")?;
+    paths_match(&receipt.outputs, &outputs)
+}
+
+/// Validate the deployed bytes against their own signed-by-hash stage receipt,
+/// even when an interrupted publisher has already replaced the data gate that
+/// originally fed the site. This is the evidence recovery needs before it may
+/// restore the site's previous data generation.
+pub(crate) fn current_site_has_valid_receipt(output_dir: &Path, dist_dir: &Path) -> Result<bool> {
+    let path = site_receipt_path(output_dir);
+    if !path.is_file() || !dist_dir.is_dir() {
+        return Ok(false);
+    }
+    let receipt = match read_receipt(&path) {
+        Ok(receipt) => receipt,
+        Err(_) => return Ok(false),
+    };
+    let required_inputs = [
+        "data/.publication-candidate.json",
+        "data/publication-gate.json",
+    ];
+    if receipt.schema_version != RECEIPT_SCHEMA_VERSION
+        || receipt.stage != "site"
+        || receipt.scope != "published-site"
+        || receipt_fingerprint(&receipt)? != receipt.fingerprint
+        || required_inputs.iter().any(|required| {
+            !receipt
+                .inputs
+                .iter()
+                .any(|input| input.identity == *required)
+        })
+    {
+        return Ok(false);
+    }
+    let outputs = collect_tracked_files(dist_dir, "site-dist")?;
+    paths_match(&receipt.outputs, &outputs)
+}
+
 pub fn site_is_reusable(output_dir: &Path, site_dir: &Path, dist_dir: &Path) -> Result<bool> {
     let selected = site_selected_snapshots(output_dir)?;
     let spec = StageSpec {
@@ -704,6 +790,15 @@ mod tests {
         fs::write(dir.path().join("package-lock.json"), "{}")?;
         fs::write(dist.join("index.html"), "published")?;
 
+        assert!(
+            !current_site_matches_publication(&output, &site.join("missing"))
+                .expect("missing distribution is not a current publication")
+        );
+        assert!(
+            !current_site_has_valid_receipt(&output, &site.join("missing"))
+                .expect("missing distribution has no valid receipt")
+        );
+
         let receipt = record_site(&output, &site, &dist)?;
         assert_eq!(receipt.selected_snapshot.as_deref(), Some("nlwiki=2026-07"));
         assert!(
@@ -719,11 +814,29 @@ mod tests {
                 .any(|input| input.identity == "workspace/package-lock.json")
         );
         assert!(site_is_reusable(&output, &site, &dist)?);
+        assert!(current_site_matches_publication(&output, &dist)?);
+        assert!(current_site_has_valid_receipt(&output, &dist)?);
+        let receipt_path = site_receipt_path(&output);
+        let original_receipt = fs::read(&receipt_path)?;
+        fs::write(&receipt_path, "not-json")?;
+        assert!(!current_site_matches_publication(&output, &dist)?);
+        assert!(!current_site_has_valid_receipt(&output, &dist)?);
+        fs::write(&receipt_path, &original_receipt)?;
+        let mut missing_input: StageReceipt = read_receipt(&receipt_path)?;
+        missing_input
+            .inputs
+            .retain(|input| input.identity != "data/publication-gate.json");
+        missing_input.fingerprint = receipt_fingerprint(&missing_input)?;
+        fs::write(&receipt_path, serde_json::to_vec_pretty(&missing_input)?)?;
+        assert!(!current_site_matches_publication(&output, &dist)?);
+        assert!(!current_site_has_valid_receipt(&output, &dist)?);
+        fs::write(&receipt_path, original_receipt)?;
         fs::remove_dir_all(site.join("src/.observablehq"))?;
         assert!(site_is_reusable(&output, &site, &dist)?);
 
         fs::write(site.join("src/nested/index.md"), "# Changed")?;
         assert!(!site_is_reusable(&output, &site, &dist)?);
+        assert!(current_site_matches_publication(&output, &dist)?);
         fs::write(site.join("src/nested/index.md"), "# Site")?;
         fs::write(dir.path().join("package-lock.json"), "{\"changed\":true}")?;
         assert!(!site_is_reusable(&output, &site, &dist)?);
@@ -733,9 +846,14 @@ mod tests {
             site_is_reusable(&output, &site, &dist)?,
             "publication verification owns artifact validation; the site fingerprint consumes its receipt identity"
         );
+        assert!(current_site_matches_publication(&output, &dist)?);
         let changed_gate = r#"{"selected_snapshot_versions":{"nlwiki":"2026-08"}}"#;
         fs::write(output.join(crate::publication::RECEIPT_FILE), changed_gate)?;
         assert!(!site_is_reusable(&output, &site, &dist)?);
+        assert!(!current_site_matches_publication(&output, &dist)?);
+        assert!(current_site_has_valid_receipt(&output, &dist)?);
+        fs::write(dist.join("index.html"), "corrupt")?;
+        assert!(!current_site_has_valid_receipt(&output, &dist)?);
         Ok(())
     }
 }

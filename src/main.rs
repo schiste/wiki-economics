@@ -29,7 +29,7 @@ mod test_support;
 mod wiki_lifecycle;
 mod workload_profile;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Datelike, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::env;
@@ -215,6 +215,40 @@ enum Commands {
         /// Wiki lifecycle and publication contract
         #[arg(long, default_value = "config/wiki-lifecycle.json")]
         lifecycle: PathBuf,
+    },
+
+    /// Audit interrupted publication transactions without changing them
+    PublicationRecoveryAudit {
+        /// Published site distribution whose receipt must match the data gate
+        #[arg(long, default_value = "site/dist")]
+        site_dist_dir: PathBuf,
+
+        /// Restrict the audit to one transaction
+        #[arg(long = "run-id")]
+        transaction_run_id: Option<String>,
+    },
+
+    /// Repair one or all interrupted publication transactions
+    PublicationRecover {
+        /// Wiki lifecycle and publication contract
+        #[arg(long, default_value = "config/wiki-lifecycle.json")]
+        lifecycle: PathBuf,
+
+        /// Published site distribution whose receipt must match the data gate
+        #[arg(long, default_value = "site/dist")]
+        site_dist_dir: PathBuf,
+
+        /// Interrupted transaction to repair
+        #[arg(long = "run-id", conflicts_with = "all")]
+        transaction_run_id: Option<String>,
+
+        /// Repair every non-terminal transaction; used at publisher startup
+        #[arg(long, conflicts_with = "transaction_run_id")]
+        all: bool,
+
+        /// Optional atomic JSON report for orchestration
+        #[arg(long = "report")]
+        report_path: Option<PathBuf>,
     },
 
     /// Merge per-wiki outputs into combined parquet files
@@ -1118,6 +1152,50 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             run_timed_stage("publication_rollback", None, || {
                 ops.rollback_ready_publication(&data_dir, &output_dir, &lifecycle, run_id)
             })?;
+        }
+
+        Commands::PublicationRecoveryAudit {
+            site_dist_dir,
+            transaction_run_id,
+        } => {
+            let report = publication::audit_publication_recovery(
+                &data_dir,
+                &output_dir,
+                &site_dist_dir,
+                transaction_run_id.as_deref(),
+            );
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
+
+        Commands::PublicationRecover {
+            lifecycle,
+            site_dist_dir,
+            transaction_run_id,
+            all,
+            report_path,
+        } => {
+            ensure!(
+                all || transaction_run_id.is_some(),
+                "publication recovery requires --run-id or --all"
+            );
+            let recovery_run_id = run_id.as_deref().map(str::to_string).unwrap_or_else(|| {
+                format!(
+                    "recovery-{}",
+                    transaction_run_id.as_deref().unwrap_or("all")
+                )
+            });
+            let report = publication::recover_publication_transactions(
+                &data_dir,
+                &output_dir,
+                &lifecycle,
+                &site_dist_dir,
+                transaction_run_id.as_deref(),
+                &recovery_run_id,
+            )?;
+            if let Some(path) = report_path.as_ref() {
+                publication::write_publication_recovery_report(path, &report)?;
+            }
+            println!("{}", serde_json::to_string_pretty(&report)?);
         }
 
         Commands::Merge => {
@@ -2334,6 +2412,114 @@ mod tests {
                 "publication_rollback:publish-9",
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn publication_recovery_cli_audits_and_repairs_empty_transaction_sets() -> Result<()> {
+        let root = TestDir::new()?;
+        let data = root.path().join("data");
+        let output = root.path().join("output");
+        let site = root.path().join("site-dist");
+        let report = root.path().join("recovery.json");
+        fs::create_dir_all(&data)?;
+        fs::create_dir_all(&output)?;
+        fs::create_dir_all(&site)?;
+
+        let audit = Cli::try_parse_from([
+            "wiki-econ",
+            "--data-dir",
+            data.to_str().context("data path")?,
+            "--output-dir",
+            output.to_str().context("output path")?,
+            "publication-recovery-audit",
+            "--site-dist-dir",
+            site.to_str().context("site path")?,
+        ])
+        .expect("recovery audit CLI should parse");
+        run_with_ops(audit, &RecordingOps::default())?;
+
+        let recover = Cli::try_parse_from([
+            "wiki-econ",
+            "--data-dir",
+            data.to_str().context("data path")?,
+            "--output-dir",
+            output.to_str().context("output path")?,
+            "publication-recover",
+            "--all",
+            "--site-dist-dir",
+            site.to_str().context("site path")?,
+            "--report",
+            report.to_str().context("report path")?,
+        ])
+        .expect("recovery repair CLI should parse");
+        run_with_ops(recover, &RecordingOps::default())?;
+        assert!(report.is_file());
+
+        let missing_selector = Cli::try_parse_from([
+            "wiki-econ",
+            "--data-dir",
+            data.to_str().context("data path")?,
+            "--output-dir",
+            output.to_str().context("output path")?,
+            "publication-recover",
+            "--site-dist-dir",
+            site.to_str().context("site path")?,
+        ])
+        .expect("recovery CLI without a selector should parse before validation");
+        assert!(run_with_ops(missing_selector, &RecordingOps::default()).is_err());
+
+        let broken_transaction = output.join("_publication_transactions/broken");
+        fs::create_dir_all(&broken_transaction)?;
+        fs::write(broken_transaction.join("selection.json"), "invalid")?;
+        let ambiguous = Cli::try_parse_from([
+            "wiki-econ",
+            "--data-dir",
+            data.to_str().context("data path")?,
+            "--output-dir",
+            output.to_str().context("output path")?,
+            "publication-recover",
+            "--run-id",
+            "broken",
+            "--site-dist-dir",
+            site.to_str().context("site path")?,
+        ])
+        .expect("ambiguous recovery CLI should parse");
+        assert!(run_with_ops(ambiguous, &RecordingOps::default()).is_err());
+
+        fs::remove_dir_all(output.join("_publication_transactions"))?;
+        let blocked_report = root.path().join("blocked-report");
+        fs::create_dir(&blocked_report)?;
+        let report_failure = Cli::try_parse_from([
+            "wiki-econ",
+            "--data-dir",
+            data.to_str().context("data path")?,
+            "--output-dir",
+            output.to_str().context("output path")?,
+            "publication-recover",
+            "--all",
+            "--site-dist-dir",
+            site.to_str().context("site path")?,
+            "--report",
+            blocked_report.to_str().context("blocked report path")?,
+        ])
+        .expect("blocked report recovery CLI should parse");
+        assert!(run_with_ops(report_failure, &RecordingOps::default()).is_err());
+
+        let no_report = Cli::try_parse_from([
+            "wiki-econ",
+            "--data-dir",
+            data.to_str().context("data path")?,
+            "--output-dir",
+            output.to_str().context("output path")?,
+            "publication-recover",
+            "--all",
+            "--site-dist-dir",
+            site.to_str().context("site path")?,
+        ])
+        .expect("no-report recovery CLI should parse");
+        run_with_ops(no_report, &RecordingOps::default())
+            .expect("no-report recovery should succeed");
         Ok(())
     }
 
