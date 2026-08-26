@@ -140,6 +140,10 @@ and higher resource envelope are being qualified.
   fallback is controlled by `WIKI_ECON_MAX_SNAPSHOT_LAG_MONTHS` (default `2`);
   exceeding it fails closed. Receipt layout and invalidation rules are
   documented in [stage fingerprints](../../docs/stage-fingerprints.md).
+  A separate `wiki-econ-artifact-scrub` job runs monthly under the publication
+  lock and independently rehashes every published Parquet against its canonical
+  semantic receipt. Reports are retained under `output/_scrubs/`; this does not
+  deploy or republish data.
   The one-CPU Toolforge job also defaults `RAYON_NUM_THREADS` and
   `POLARS_MAX_THREADS` to `1`, because the container currently sees eight host
   CPUs despite its one-CPU quota. Sequential raw/hash/ingest I/O uses Linux

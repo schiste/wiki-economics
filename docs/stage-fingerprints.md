@@ -17,6 +17,20 @@ output/_stages/merge.json
 output/_stages/site.json
 ```
 
+Every Parquet emitted by compute, patrol compute, or merge also has an adjacent
+`<artifact>.receipt.json`. This is the authoritative semantic receipt for that
+artifact, not another stage cache. It contains the artifact SHA-256 and byte
+count, exact Parquet fields, rows, date/wiki bounds, additive conservation
+totals, ordering contract, algorithm version, and input fingerprint. The
+receipt body has its own canonical SHA-256.
+
+Writers accumulate those semantic fields from the batches already passing
+through them. After the Parquet is closed and synced, the stage recorder makes
+one sequential SHA-256 pass, publishes the receipt atomically, and removes the
+short-lived semantic draft. Legacy artifacts are migrated by one bounded
+semantic scan; later layers consume the receipt and do not rediscover rows or
+dates from Parquet.
+
 Each receipt records the selected snapshot, sorted logical input identities,
 an explicit stage algorithm version, the Cargo computation version, the build
 commit when supplied, and a deterministic fingerprint. The commit is retained
@@ -43,7 +57,7 @@ fast validation index and is deliberately excluded from the fingerprint.
   locally validated patrol inputs (`patrol.parquet`, `rights.parquet`, and the
   autopatrol-group metadata). A changed algorithm or input invalidates patrol
   without invalidating core metrics.
-- **candidate discovery** validates `ready.json`, every artifact hash, and the
+- **candidate discovery** validates `ready.json`, every artifact-receipt identity, and the
   current compute and patrol receipts. A complete hit is a recorded no-op. On
   a partial hit, only receipt-covered stage files are copied atomically into
   the new immutable candidate; invalidated stages alone execute.
@@ -74,3 +88,21 @@ corrections, and historical changes must remain observable. Repeated weekly
 preparation runs against the same snapshot validate the current and ready
 candidate fingerprints and exit as recorded no-ops when they are unchanged.
 An explicit algorithm-version change can invalidate compute or patrol alone.
+
+## Corruption checks
+
+The fast path always validates the canonical receipt hash. Matching artifact
+size and mtime allow it to reuse the recorded content hash; either metadata
+change triggers a byte hash. Ready candidates are immutable: compute and patrol
+refuse to write after `ready.json` or `qualification.json` exists.
+
+A monthly Toolforge job independently rehashes every published Parquet even
+when metadata is unchanged:
+
+```sh
+wiki-econ --output-dir "$WIKI_ECON_OUTPUT_DIR" \
+  artifact-scrub --report "$WIKI_ECON_OUTPUT_DIR/_scrubs/manual.json"
+```
+
+Any missing sidecar, modified receipt, or artifact/receipt mismatch fails the
+scrub and leaves the published generation untouched.

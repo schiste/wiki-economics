@@ -12,12 +12,14 @@ output directory:
 - `.publication-run.json` records the run ID, selected refresh wikis, and
   requested snapshot version before work begins.
 - `.publication-candidate.json` is written only after every merged Parquet,
-  Rust dashboard artifact, and the critical manifest validator succeed. It inventories file sizes
-  and modification timestamps for the exact artifact set produced by merge.
+  Rust dashboard artifact, and the critical manifest validator succeed. Schema
+  3 inventories SHA-256 identities for every artifact and the canonical
+  artifact-receipt hash for each Parquet; size and mtime are retained only as a
+  fast corruption index.
 - `publication-gate.json` is the public operator receipt. It is written only
   after semantic validation passes and includes snapshot versions, per-wiki
   cutoffs, metric row and conservation totals, patrol source counts, and the
-  candidate artifact inventory. Receipt schema 2 also records the MIT SPDX
+  candidate artifact inventory. Receipt schema 6 also records the MIT SPDX
   identifier on every artifact plus the generating commit, run ID, source
   datasets, attribution, trademark status, privacy notice, and Toolforge open
   source/open data declaration.
@@ -47,11 +49,14 @@ The Rust gate validates:
 - non-zero patrol and rights source rows for scheduled patrol datasets;
 - the exact root metric set, rejecting missing and unexpected stale Parquets;
 - non-empty Rust dashboard JSON objects plus a valid publication manifest; and
-- unchanged size/modification metadata from candidate creation through site
-  publication.
+- a valid canonical semantic receipt for every Parquet, with unchanged
+  artifact/receipt pairing from candidate readiness through site publication.
 
-The gate scans only the columns needed for aggregates. In particular, weekly
-edit validation does not load page titles or build a page-sized hash table.
+The gate consumes semantic receipts and does not reopen unchanged Parquets to
+rediscover schemas, rows, dates, wiki ranges, or conservation totals. Page-week
+receipts validate edit conservation, stable ordering, and
+`previous_week_edits` while bounded reconciliation batches pass through the
+writer. A first migration of a legacy artifact performs one sequential scan.
 
 ## Operator checks
 
