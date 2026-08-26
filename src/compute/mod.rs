@@ -65,13 +65,19 @@ impl MetricFamily {
         }
     }
 
-    fn metrics(self) -> &'static [&'static str] {
+    pub(crate) fn metrics(self) -> &'static [&'static str] {
         match self {
             Self::Monthly => &monthly::METRICS,
             Self::ActivityTiers => &activity::METRICS,
             Self::Lifecycle => &lifecycle::METRICS,
             Self::PageWeek => &weekly::METRICS,
         }
+    }
+
+    pub(crate) fn for_metric(metric: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|family| family.metrics().contains(&metric))
     }
 
     fn algorithm_version(self, weekly_config: &WeeklyAggregationConfig) -> String {
@@ -2776,6 +2782,23 @@ pub(crate) fn family_receipt_identities(
             let receipt =
                 fingerprint::read_receipt(&family_stage_receipt(candidate_dir, wiki, family))?;
             Ok((family.name().to_string(), receipt.fingerprint))
+        })
+        .collect()
+}
+
+pub(crate) fn family_receipt_algorithms(
+    wiki: &str,
+    snapshot: &str,
+    data_dir: &Path,
+    candidate_dir: &Path,
+) -> Result<BTreeMap<String, String>> {
+    family_receipt_identities(wiki, snapshot, data_dir, candidate_dir)?;
+    MetricFamily::ALL
+        .into_iter()
+        .map(|family| {
+            let receipt =
+                fingerprint::read_receipt(&family_stage_receipt(candidate_dir, wiki, family))?;
+            Ok((family.name().to_string(), receipt.algorithm_version))
         })
         .collect()
 }

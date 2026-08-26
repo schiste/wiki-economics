@@ -1655,7 +1655,7 @@ mod tests {
         assert_eq!(manifest["generated_at"], "2026-01-31T00:00:00Z");
         assert_eq!(manifest["license"]["spdx_identifier"], "MIT");
         assert_eq!(manifest["provenance"]["run_id"], "site-fixture");
-        assert_eq!(manifest["browser_data"]["schema_version"], 1);
+        assert_eq!(manifest["browser_data"]["schema_version"], 2);
         assert_eq!(manifest["downloadable_artifacts"][0]["license_spdx"], "MIT");
         assert_eq!(
             manifest["toolforge_open_licensing"]["open_data_license_spdx"],

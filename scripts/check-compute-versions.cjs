@@ -111,8 +111,9 @@ function gitShow(base, file) {
 function main() {
   const baseFlag = process.argv.indexOf("--base");
   const explicitBase = baseFlag >= 0 ? process.argv[baseFlag + 1] : null;
-  const base = explicitBase || process.env.COMPUTE_VERSION_BASE || "HEAD";
-  if (!base) throw new Error("--base requires a Git revision");
+  const baseReference = explicitBase || process.env.COMPUTE_VERSION_BASE || "HEAD";
+  if (!baseReference) throw new Error("--base requires a Git revision");
+  const base = git(["rev-parse", "--verify", `${baseReference}^{commit}`]);
   const tracked = git(["diff", "--name-only", "--diff-filter=ACMR", base, "--"])
     .split("\n")
     .filter(Boolean);

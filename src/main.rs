@@ -1245,11 +1245,26 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
         }
 
         Commands::ArtifactScrub { report } => {
-            let scrub = run_timed_stage("artifact_scrub", None, || {
+            let scrub_run_id = run_id.as_deref().unwrap_or("manual-artifact-scrub");
+            let scrub_result = run_timed_stage("artifact_scrub", None, || {
                 artifact_receipt::scrub_published(&output_dir)
-            })?;
-            if let Some(path) = report {
-                artifact_receipt::write_scrub_report(&path, &scrub)?;
+            });
+            let scrub = match scrub_result {
+                Ok(scrub) => scrub,
+                Err(error) => {
+                    artifact_receipt::record_scrub_failure(&output_dir, scrub_run_id, &error)?;
+                    return Err(error);
+                }
+            };
+            let publication = (|| -> Result<()> {
+                if let Some(path) = report {
+                    artifact_receipt::write_scrub_report(&path, &scrub)?;
+                }
+                artifact_receipt::record_scrub_success(&output_dir, scrub_run_id, &scrub)
+            })();
+            if let Err(error) = publication {
+                artifact_receipt::record_scrub_failure(&output_dir, scrub_run_id, &error)?;
+                return Err(error);
             }
             println!("{}", serde_json::to_string_pretty(&scrub)?);
         }
@@ -3535,6 +3550,25 @@ mod tests {
         ])
         .expect("valid artifact-scrub failure CLI");
         assert!(run_with_ops(invalid_report_cli, &RecordingOps::default()).is_err());
+
+        let empty = TestDir::new().expect("empty scrub fixture");
+        let empty_cli = Cli::try_parse_from([
+            "wiki-econ",
+            "--output-dir",
+            empty.path().to_str().expect("UTF-8 empty output"),
+            "--run-id",
+            "scrub-empty",
+            "artifact-scrub",
+        ])
+        .expect("valid failing artifact-scrub CLI");
+        assert!(run_with_ops(empty_cli, &RecordingOps::default()).is_err());
+        let status: Value = serde_json::from_slice(
+            &fs::read(empty.path().join("_scrubs/status.json"))
+                .expect("failed scrub status should exist"),
+        )
+        .expect("failed scrub status should be valid JSON");
+        assert_eq!(status["state"], "failed");
+        assert_eq!(status["run_id"], "scrub-empty");
         Ok(())
     }
 

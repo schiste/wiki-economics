@@ -681,6 +681,10 @@ pub(crate) fn candidate_receipt_identity(
     Ok(fingerprint::read_receipt(&patrol_stage_receipt(candidate_dir, wiki))?.fingerprint)
 }
 
+pub(crate) const fn algorithm_version() -> &'static str {
+    PATROL_COMPUTE_ALGORITHM_VERSION
+}
+
 pub(crate) fn cached_sources_available(data_dir: &Path, wiki: &str) -> bool {
     let patrol_dir = data_dir.join("patrol").join(wiki);
     let metadata_valid = fs::read(patrol_dir.join("autopatrol_groups.json"))

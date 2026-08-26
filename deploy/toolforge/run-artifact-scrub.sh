@@ -23,6 +23,7 @@ echo "=== artifact scrub start run_id=$run_id at=$(date -u +%Y-%m-%dT%H:%M:%SZ) 
   "$WIKI_ECON_BIN" \
   --data-dir "$WIKI_ECON_DATA_DIR" \
   --output-dir "$WIKI_ECON_OUTPUT_DIR" \
+  --run-id "$run_id" \
   artifact-scrub \
   --report "$report_dir/$run_id.json"
 echo "=== artifact scrub end run_id=$run_id at=$(date -u +%Y-%m-%dT%H:%M:%SZ) ==="

@@ -23,7 +23,7 @@ function sha256(file) {
 function publishBrowserData({dataDir, distDir}) {
   const indexPath = path.join(dataDir, INDEX_FILENAME);
   const index = JSON.parse(fs.readFileSync(indexPath, "utf8"));
-  if (index?.schema_version !== 1
+  if (index?.schema_version !== 2
       || index?.cache_schema_version !== 2
       || !/^[0-9a-f]{64}$/.test(index?.generation || "")
       || index?.license_spdx !== "MIT"
@@ -38,6 +38,9 @@ function publishBrowserData({dataDir, distDir}) {
   for (const entry of index.entries) {
     const source = safeSource(dataDir, entry);
     const identity = `${entry.metric}/${entry.wiki}`;
+    if (!/^[0-9a-f]{64}$/.test(entry?.artifact_receipt_sha256 || "")) {
+      throw new Error(`browser data entry has no artifact receipt: ${identity}`);
+    }
     if (identities.has(identity)) throw new Error(`duplicate browser data entry: ${identity}`);
     identities.add(identity);
     const stat = fs.statSync(source, {throwIfNoEntry: false});

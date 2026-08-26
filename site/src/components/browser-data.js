@@ -26,13 +26,14 @@ function arrowRowToObject(row) {
 }
 
 export function validateBrowserIndex(index) {
-  if (index?.schema_version !== 1
+  if (index?.schema_version !== 2
       || !Number.isSafeInteger(index?.cache_schema_version)
       || index.cache_schema_version <= 0
       || !/^[0-9a-f]{64}$/.test(index?.generation || "")
       || index?.license_spdx !== "MIT"
       || !Array.isArray(index?.entries)
-      || index.entries.length === 0) {
+      || index.entries.length === 0
+      || index.entries.some((entry) => !/^[0-9a-f]{64}$/.test(entry?.artifact_receipt_sha256 || ""))) {
     throw new Error("Invalid browser data index");
   }
   return index;

@@ -3,7 +3,7 @@ use anyhow::{Context, Result, ensure};
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
@@ -11,7 +11,7 @@ use std::path::Path;
 use crate::{artifact_receipt, licensing};
 
 pub const INDEX_FILENAME: &str = "browser-data-index.json";
-pub const INDEX_SCHEMA_VERSION: u32 = 1;
+pub const INDEX_SCHEMA_VERSION: u32 = 2;
 pub const CACHE_SCHEMA_VERSION: u32 = 2;
 
 pub const BROWSER_METRICS: [(&str, &str); 9] = [
@@ -37,6 +37,7 @@ pub struct BrowserDataEntry {
     pub rows: u64,
     pub bytes: u64,
     pub sha256: String,
+    pub artifact_receipt_sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -84,12 +85,27 @@ fn build_index(
     output_dir: &Path,
     allowlist: Option<&BTreeSet<String>>,
 ) -> Result<BrowserDataIndex> {
+    build_index_with_previous(output_dir, allowlist, None).map(|(index, _, _)| index)
+}
+
+fn build_index_with_previous(
+    output_dir: &Path,
+    allowlist: Option<&BTreeSet<String>>,
+    previous: Option<&BrowserDataIndex>,
+) -> Result<(BrowserDataIndex, usize, usize)> {
     let wikis = published_wikis(output_dir, allowlist)?;
     ensure!(
         !wikis.is_empty(),
         "no published wiki outputs found for browser data"
     );
+    let previous = previous
+        .into_iter()
+        .flat_map(|index| &index.entries)
+        .map(|entry| ((entry.metric.as_str(), entry.wiki.as_str()), entry))
+        .collect::<BTreeMap<_, _>>();
     let mut entries = Vec::new();
+    let mut reused = 0_usize;
+    let mut rebuilt = 0_usize;
     for wiki in wikis {
         for (metric, date_column) in BROWSER_METRICS {
             let source = output_dir.join(&wiki).join(format!("{metric}.parquet"));
@@ -121,13 +137,14 @@ fn build_index(
                     )
                 })?
             };
-            let receipt = artifact_receipt::verify(
+            let document = artifact_receipt::verify(
                 &source,
                 &document.receipt.identity,
                 Some(&document.receipt_sha256),
                 artifact_receipt::VerificationMode::Fast,
-            )?
-            .receipt;
+            )?;
+            let receipt_sha256 = document.receipt_sha256;
+            let receipt = document.receipt;
             ensure!(
                 receipt.rows > 0 && receipt.minimum_wiki == wiki && receipt.maximum_wiki == wiki,
                 "browser partition receipt is empty or contains another wiki"
@@ -145,7 +162,7 @@ fn build_index(
                     .any(|field| field.name == date_column),
                 "browser partition receipt is missing {date_column}"
             );
-            entries.push(BrowserDataEntry {
+            let expected = BrowserDataEntry {
                 metric: metric.to_string(),
                 wiki: wiki.clone(),
                 minimum_date,
@@ -154,7 +171,17 @@ fn build_index(
                 rows: receipt.rows,
                 bytes: receipt.bytes,
                 sha256: receipt.artifact_sha256,
-            });
+                artifact_receipt_sha256: receipt_sha256,
+            };
+            if let Some(existing) = previous.get(&(metric, wiki.as_str()))
+                && **existing == expected
+            {
+                entries.push((*existing).clone());
+                reused += 1;
+            } else {
+                entries.push(expected);
+                rebuilt += 1;
+            }
         }
     }
     entries.sort_by(|left, right| {
@@ -177,18 +204,34 @@ fn build_index(
         entries: &entries,
     };
     let generation = hex::encode(Sha256::digest(serde_json::to_vec(&seed)?));
-    Ok(BrowserDataIndex {
-        schema_version: INDEX_SCHEMA_VERSION,
-        cache_schema_version: CACHE_SCHEMA_VERSION,
-        generation,
-        license_spdx: licensing::ARTIFACT_LICENSE_SPDX.to_string(),
-        entries,
-    })
+    Ok((
+        BrowserDataIndex {
+            schema_version: INDEX_SCHEMA_VERSION,
+            cache_schema_version: CACHE_SCHEMA_VERSION,
+            generation,
+            license_spdx: licensing::ARTIFACT_LICENSE_SPDX.to_string(),
+            entries,
+        },
+        reused,
+        rebuilt,
+    ))
 }
 
 pub fn materialize(output_dir: &Path, allowlist: Option<&BTreeSet<String>>) -> Result<()> {
-    let index = build_index(output_dir, allowlist)?;
     let destination = output_dir.join(INDEX_FILENAME);
+    let previous = if destination.is_file() {
+        match read_index(&destination) {
+            Ok(index) => Some(index),
+            Err(error) => {
+                tracing::warn!(path = %destination.display(), error = %error, "rebuilding an obsolete or invalid derived browser index");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let (index, reused, rebuilt) =
+        build_index_with_previous(output_dir, allowlist, previous.as_ref())?;
     let temporary = output_dir.join(format!(".{INDEX_FILENAME}.{}.tmp", std::process::id()));
     let result = (|| -> Result<()> {
         let mut file = File::create(&temporary)?;
@@ -202,7 +245,9 @@ pub fn materialize(output_dir: &Path, allowlist: Option<&BTreeSet<String>>) -> R
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
-    result.with_context(|| format!("failed to publish {}", destination.display()))
+    result.with_context(|| format!("failed to publish {}", destination.display()))?;
+    tracing::info!(reused, rebuilt, "published incremental browser data index");
+    Ok(())
 }
 
 pub fn read_index(path: &Path) -> Result<BrowserDataIndex> {
@@ -298,6 +343,44 @@ mod tests {
                 .iter()
                 .all(|entry| entry.file.contains(&entry.wiki))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn index_reuses_only_entries_with_the_same_artifact_receipt() -> Result<()> {
+        let output = TestDir::new()?;
+        write_complete_wiki(output.path(), "nlwiki")?;
+        let allowlist = BTreeSet::from(["nlwiki".to_string()]);
+        materialize(output.path(), Some(&allowlist))?;
+        let previous = read_index(&output.path().join(INDEX_FILENAME))?;
+        let (_, reused, rebuilt) =
+            build_index_with_previous(output.path(), Some(&allowlist), Some(&previous))?;
+        assert_eq!((reused, rebuilt), (BROWSER_METRICS.len(), 0));
+
+        let changed = output.path().join("nlwiki/gdp.parquet");
+        fs::remove_file(artifact_receipt::sidecar_path(&changed)?)?;
+        let mut changed_frame = df!(
+            "wiki" => &["nlwiki", "nlwiki", "nlwiki"],
+            "year_month" => &["2025-12", "2026-01", "2026-02"],
+            "value" => &[1_i64, 2, 3],
+        )
+        .expect("changed browser fixture should be valid");
+        ParquetWriter::new(File::create(&changed)?)
+            .set_parallel(false)
+            .finish(&mut changed_frame)?;
+        let (_, reused, rebuilt) =
+            build_index_with_previous(output.path(), Some(&allowlist), Some(&previous))?;
+        assert_eq!((reused, rebuilt), (BROWSER_METRICS.len() - 1, 1));
+
+        fs::write(
+            output.path().join(INDEX_FILENAME),
+            b"{\"schema_version\":1}",
+        )
+        .expect("obsolete browser index should be writable");
+        materialize(output.path(), Some(&allowlist))?;
+        let rebuilt = read_index(&output.path().join(INDEX_FILENAME))?;
+        assert_eq!(rebuilt.schema_version, INDEX_SCHEMA_VERSION);
+        assert_eq!(rebuilt.entries.len(), BROWSER_METRICS.len());
         Ok(())
     }
 

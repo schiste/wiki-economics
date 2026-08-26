@@ -13,7 +13,8 @@ use crate::storage;
 use crate::wiki_lifecycle;
 
 const MERGE_BATCH_ROWS: usize = 250_000;
-pub(crate) const MERGE_ALGORITHM_VERSION: &str = "merged-metrics-v8-all-wikis-variation-default";
+pub(crate) const MERGE_ALGORITHM_VERSION: &str = "merged-metrics-v9-incremental-family-publication";
+const METRIC_MERGE_ALGORITHM_VERSION: &str = "merged-wiki-runs-v1";
 const GENERATOR_DEPENDENCIES: [&str; 1] = ["manifest.json.cjs"];
 const MANIFEST_GENERATOR: &str = "manifest.json.sh";
 const PARTITION_ONLY_METRICS: [&str; 1] = ["page_weekly_edits.parquet"];
@@ -102,15 +103,14 @@ fn merge_outputs_from_dir(
         "config/wiki-lifecycle.json",
         lifecycle_file,
     ));
-    let outputs: Vec<_> = metric_files
-        .keys()
-        .filter(|name| !is_partition_only_metric(name))
-        .cloned()
-        .chain(
-            crate::dashboard::ARTIFACTS
-                .iter()
-                .map(|name| (*name).to_string()),
-        )
+    // Root Parquets are owned by their per-metric merge receipts. Keeping
+    // them out of this orchestration receipt prevents a broader stage from
+    // replacing the authoritative artifact sidecar with another algorithm
+    // identity. The per-wiki inputs above still invalidate this stage when a
+    // metric changes.
+    let outputs: Vec<_> = crate::dashboard::ARTIFACTS
+        .iter()
+        .map(|name| (*name).to_string())
         .chain([
             "manifest.json".to_string(),
             crate::browser_data::INDEX_FILENAME.to_string(),
@@ -144,6 +144,28 @@ fn merge_outputs_from_dir(
         selected_snapshot: selected_snapshot.as_deref(),
         algorithm_version: MERGE_ALGORITHM_VERSION,
     };
+
+    // Per-metric receipts own the root Parquets, so validate or repair those
+    // outputs before considering the broader dashboard/manifest receipt. This
+    // preserves cheap global reuse while allowing a damaged derived root file
+    // to self-heal from immutable per-wiki runs.
+    for (metric_name, unsorted_paths) in &metric_files {
+        if is_partition_only_metric(metric_name) {
+            continue;
+        }
+        let mut paths = unsorted_paths.clone();
+        paths.sort();
+        let dest = output_dir.join(metric_name);
+        merge_metric_if_invalid(
+            output_dir,
+            metric_name,
+            &paths,
+            &dest,
+            MERGE_BATCH_ROWS,
+            run_id,
+        )?;
+    }
+
     if fingerprint::reusable(&receipt_path, spec, &inputs, &outputs)? {
         crate::observability::record_stage_reused("merge", None);
         crate::publication::record_candidate(output_dir, run_id, &artifact_names)?;
@@ -152,15 +174,6 @@ fn merge_outputs_from_dir(
             "reusing deterministic merge stage"
         );
         return Ok(());
-    }
-
-    for (metric_name, mut paths) in metric_files {
-        if is_partition_only_metric(&metric_name) {
-            continue;
-        }
-        paths.sort();
-        let dest = output_dir.join(&metric_name);
-        merge_metric_batched(&metric_name, &paths, &dest, MERGE_BATCH_ROWS, run_id)?;
     }
 
     let obsolete_weekly = output_dir.join("page_weekly_edits.parquet");
@@ -177,6 +190,62 @@ fn merge_outputs_from_dir(
 
     info!(output_dir = %output_dir.display(), "finished merge");
     Ok(())
+}
+
+fn metric_merge_receipt_path(output_dir: &Path, metric_name: &str) -> Result<PathBuf> {
+    let stem = Path::new(metric_name)
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .context("merged metric has no UTF-8 stem")?;
+    ensure!(
+        stem.bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+        "unsafe merged metric identity {metric_name:?}"
+    );
+    Ok(output_dir
+        .join("_stages")
+        .join("merge-metrics")
+        .join(format!("{stem}.json")))
+}
+
+fn merge_metric_if_invalid(
+    output_dir: &Path,
+    metric_name: &str,
+    paths: &[PathBuf],
+    dest: &Path,
+    batch_rows: usize,
+    run_id: Option<&str>,
+) -> Result<bool> {
+    let inputs = paths
+        .iter()
+        .map(|path| {
+            let wiki = path
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                .context("metric input has no wiki directory")?;
+            Ok(TrackedPath::new(
+                format!("wiki-output/{wiki}/{metric_name}"),
+                path,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let outputs = [TrackedPath::new(format!("merged/{metric_name}"), dest)];
+    let algorithm = format!("{METRIC_MERGE_ALGORITHM_VERSION}/{metric_name}");
+    let spec = StageSpec {
+        stage: "merge_metric",
+        scope: metric_name,
+        selected_snapshot: None,
+        algorithm_version: &algorithm,
+    };
+    let receipt_path = metric_merge_receipt_path(output_dir, metric_name)?;
+    if fingerprint::reusable(&receipt_path, spec, &inputs, &outputs)? {
+        info!(metric = metric_name, "reusing unchanged merged metric");
+        return Ok(false);
+    }
+    merge_metric_batched(metric_name, paths, dest, batch_rows, run_id)?;
+    fingerprint::record(&receipt_path, spec, &inputs, &outputs)?;
+    Ok(true)
 }
 
 fn collect_metric_files(
@@ -656,10 +725,8 @@ mod tests {
             "weekly publication must remain per-wiki instead of consuming a redundant root artifact"
         );
         let receipt = fingerprint::read_receipt(&output_dir.path().join("_stages/merge.json"))?;
-        assert_eq!(
-            receipt.algorithm_version,
-            "merged-metrics-v8-all-wikis-variation-default"
-        );
+        assert_eq!(receipt.algorithm_version, MERGE_ALGORITHM_VERSION);
+        assert!(metric_merge_receipt_path(output_dir.path(), "metric.parquet")?.is_file());
 
         Ok(())
     }
@@ -672,6 +739,7 @@ mod tests {
         write_generators(generator_dir.path())?;
         write_dashboard_fixture(output_dir.path())?;
         write_metric(output_dir.path(), "testwiki", "metric", 1)?;
+        write_metric(output_dir.path(), "testwiki", "other", 10)?;
         let metric_input = output_dir.path().join("testwiki/metric.parquet");
         fingerprint::record(
             &output_dir.path().join("_stages/compute/testwiki.json"),
@@ -698,6 +766,12 @@ mod tests {
         merge_outputs_from_dir(output_dir.path(), generator_dir.path(), Some("run-one"))?;
         let merged = output_dir.path().join("metric.parquet");
         let modified = fs::metadata(&merged)?.modified()?;
+        let unchanged = output_dir.path().join("other.parquet");
+        let unchanged_modified = fs::metadata(&unchanged)?.modified()?;
+
+        let changed_input = output_dir.path().join("testwiki/metric.parquet");
+        fs::remove_file(crate::artifact_receipt::sidecar_path(&changed_input)?)?;
+        write_metric(output_dir.path(), "testwiki", "metric", 2)?;
 
         crate::publication::begin_run(
             output_dir.path(),
@@ -708,7 +782,8 @@ mod tests {
         .expect("second publication run should begin");
         merge_outputs_from_dir(output_dir.path(), generator_dir.path(), Some("run-two"))?;
 
-        assert_eq!(fs::metadata(merged)?.modified()?, modified);
+        assert_ne!(fs::metadata(merged)?.modified()?, modified);
+        assert_eq!(fs::metadata(unchanged)?.modified()?, unchanged_modified);
         let candidate_bytes = fs::read(output_dir.path().join(".publication-candidate.json"))?;
         let candidate: serde_json::Value = serde_json::from_slice(&candidate_bytes)?;
         assert_eq!(candidate["run_id"], "run-two");

@@ -80,6 +80,11 @@ pub struct ScrubbedArtifact {
     pub artifact_sha256: String,
     pub bytes: u64,
     pub rows: u64,
+    pub minimum_date: Option<String>,
+    pub maximum_date: Option<String>,
+    pub conservation_totals: BTreeMap<String, i128>,
+    pub minimum_wiki: String,
+    pub maximum_wiki: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -90,6 +95,18 @@ pub struct ScrubReport {
     pub total_bytes: u64,
     pub total_rows: u64,
 }
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ScrubStatus {
+    pub schema_version: u32,
+    pub state: String,
+    pub run_id: String,
+    pub updated_at_unix: u64,
+    pub report_sha256: Option<String>,
+    pub error: Option<String>,
+}
+
+const SCRUB_STATUS_PATH: &str = "_scrubs/status.json";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SemanticSpec {
@@ -724,17 +741,22 @@ pub fn scrub_published(output_dir: &Path) -> Result<ScrubReport> {
     let mut total_rows = 0_u64;
     for artifact in artifacts {
         let document = read(&artifact)?;
-        let verified = verify(
+        let scanned = scan(
             &artifact,
             &document.receipt.identity,
-            Some(&document.receipt_sha256),
-            VerificationMode::Scrub,
+            &document.receipt.algorithm_version,
+            &document.receipt.input_fingerprint,
         )?;
+        ensure!(
+            scanned == document.receipt,
+            "deep semantic scrub disagrees with authoritative receipt for {}",
+            artifact.display()
+        );
         total_bytes = total_bytes
-            .checked_add(verified.receipt.bytes)
+            .checked_add(scanned.bytes)
             .context("scrub byte total overflow")?;
         total_rows = total_rows
-            .checked_add(verified.receipt.rows)
+            .checked_add(scanned.rows)
             .context("scrub row total overflow")?;
         scrubbed.push(ScrubbedArtifact {
             path: artifact
@@ -742,19 +764,105 @@ pub fn scrub_published(output_dir: &Path) -> Result<ScrubReport> {
                 .context("scrub artifact escaped output directory")?
                 .to_string_lossy()
                 .into_owned(),
-            receipt_sha256: verified.receipt_sha256,
-            artifact_sha256: verified.receipt.artifact_sha256,
-            bytes: verified.receipt.bytes,
-            rows: verified.receipt.rows,
+            receipt_sha256: document.receipt_sha256,
+            artifact_sha256: scanned.artifact_sha256,
+            bytes: scanned.bytes,
+            rows: scanned.rows,
+            minimum_date: scanned.minimum_date,
+            maximum_date: scanned.maximum_date,
+            conservation_totals: scanned.conservation_totals,
+            minimum_wiki: scanned.minimum_wiki,
+            maximum_wiki: scanned.maximum_wiki,
         });
     }
     Ok(ScrubReport {
-        schema_version: 1,
+        schema_version: 2,
         scrubbed_at_unix: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
         artifacts: scrubbed,
         total_bytes,
         total_rows,
     })
+}
+
+fn scrub_status_path(output_dir: &Path) -> PathBuf {
+    output_dir.join(SCRUB_STATUS_PATH)
+}
+
+fn write_scrub_status(output_dir: &Path, status: &ScrubStatus) -> Result<()> {
+    let path = scrub_status_path(output_dir);
+    let parent = path.parent().context("scrub status path has no parent")?;
+    fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(".scrub-status-{}.tmp", std::process::id()));
+    let result = (|| -> Result<()> {
+        let mut file = File::create(&temporary)?;
+        serde_json::to_writer_pretty(&mut file, status)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        fs::rename(&temporary, &path)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+pub fn record_scrub_success(output_dir: &Path, run_id: &str, report: &ScrubReport) -> Result<()> {
+    ensure!(!run_id.trim().is_empty(), "scrub run ID cannot be empty");
+    let report_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(report)?));
+    write_scrub_status(
+        output_dir,
+        &ScrubStatus {
+            schema_version: 1,
+            state: "succeeded".to_string(),
+            run_id: run_id.to_string(),
+            updated_at_unix: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+            report_sha256: Some(report_sha256),
+            error: None,
+        },
+    )
+}
+
+pub fn record_scrub_failure(output_dir: &Path, run_id: &str, error: &anyhow::Error) -> Result<()> {
+    ensure!(!run_id.trim().is_empty(), "scrub run ID cannot be empty");
+    let concise = format!("{error:#}")
+        .lines()
+        .next()
+        .unwrap_or("artifact scrub failed")
+        .chars()
+        .take(500)
+        .collect();
+    write_scrub_status(
+        output_dir,
+        &ScrubStatus {
+            schema_version: 1,
+            state: "failed".to_string(),
+            run_id: run_id.to_string(),
+            updated_at_unix: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+            report_sha256: None,
+            error: Some(concise),
+        },
+    )
+}
+
+pub fn ensure_publication_allowed(output_dir: &Path) -> Result<()> {
+    let path = scrub_status_path(output_dir);
+    if !path.is_file() {
+        return Ok(());
+    }
+    let status: ScrubStatus = serde_json::from_slice(&fs::read(&path)?)?;
+    ensure!(
+        status.schema_version == 1 && matches!(status.state.as_str(), "succeeded" | "failed"),
+        "invalid artifact scrub status"
+    );
+    ensure!(
+        status.state != "failed",
+        "publication is blocked by failed artifact scrub {}: {}",
+        status.run_id,
+        status.error.as_deref().unwrap_or("unknown scrub failure")
+    );
+    Ok(())
 }
 
 pub fn write_scrub_report(path: &Path, report: &ScrubReport) -> Result<()> {
@@ -990,13 +1098,30 @@ mod tests {
         fs::write(directory.path().join("notes.txt"), "not an artifact")?;
 
         let report = scrub_published(directory.path())?;
+        assert_eq!(report.schema_version, 2);
         assert_eq!(report.artifacts.len(), 2);
         assert_eq!(report.total_rows, 4);
         assert!(report.total_bytes > 0);
+        assert!(report.artifacts.iter().all(|artifact| {
+            artifact.minimum_wiki == "nlwiki"
+                && artifact.maximum_wiki == "nlwiki"
+                && artifact.conservation_totals.get("total_edits") == Some(&8)
+        }));
         let report_path = directory.path().join("reports/scrub.json");
         write_scrub_report(&report_path, &report)?;
         let reread: ScrubReport = serde_json::from_slice(&fs::read(report_path)?)?;
         assert_eq!(reread, report);
+
+        record_scrub_success(directory.path(), "scrub-success", &report)?;
+        ensure_publication_allowed(directory.path())?;
+        let failure = anyhow::anyhow!("semantic mismatch");
+        record_scrub_failure(directory.path(), "scrub-failure", &failure)?;
+        assert!(ensure_publication_allowed(directory.path()).is_err());
+        record_scrub_success(directory.path(), "scrub-recovery", &report)?;
+        ensure_publication_allowed(directory.path())?;
+        fs::write(scrub_status_path(directory.path()), b"{invalid")?;
+        assert!(ensure_publication_allowed(directory.path()).is_err());
+        record_scrub_success(directory.path(), "scrub-restored", &report)?;
 
         let blocked_report = directory.path().join("blocked-report");
         fs::create_dir(&blocked_report)?;
@@ -1016,8 +1141,24 @@ mod tests {
         fs::write(&root_artifact, corrupt)?;
         assert!(scrub_published(directory.path()).is_err());
         fs::write(&root_artifact, original)?;
+        let valid_root = fs::read(&root_artifact)?;
+        fs::write(&root_artifact, b"not parquet")?;
+        assert!(scrub_published(directory.path()).is_err());
+        fs::write(&root_artifact, valid_root)?;
         fs::remove_file(sidecar_path(&wiki_artifact)?)?;
         assert!(scrub_published(directory.path()).is_err());
+
+        let status_path = scrub_status_path(directory.path());
+        fs::remove_file(&status_path)?;
+        fs::create_dir(&status_path)?;
+        assert!(record_scrub_success(directory.path(), "blocked-status", &report).is_err());
+        assert!(
+            !status_path
+                .parent()
+                .context("scrub status parent")?
+                .join(format!(".scrub-status-{}.tmp", std::process::id()))
+                .exists()
+        );
         Ok(())
     }
 }

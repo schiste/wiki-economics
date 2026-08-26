@@ -16,7 +16,8 @@ const RUN_CONTEXT_FILE: &str = ".publication-run.json";
 const CANDIDATE_FILE: &str = ".publication-candidate.json";
 const READY_INDEX_DIR: &str = "_ready-index";
 const READY_INDEX_SCHEMA_VERSION: u8 = 2;
-const PUBLICATION_CONTRACT_VERSION: &str = "ready-candidate-publication-v2-noop-digest";
+const PUBLICATION_CONTRACT_VERSION: &str =
+    "ready-candidate-publication-v3-incremental-receipt-composition";
 pub const RECEIPT_FILE: &str = "publication-gate.json";
 const JSON_ARTIFACTS: [&str; 13] = [
     crate::browser_data::INDEX_FILENAME,
@@ -494,7 +495,7 @@ struct LifecycleWiki {
     freshness_sla_days: Option<u64>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct WikiMetricReport {
     rows: u64,
     minimum_date: Option<String>,
@@ -502,26 +503,56 @@ struct WikiMetricReport {
     conservation_total: Option<i64>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct MetricReport {
     rows: u64,
     conservation_total: Option<i64>,
     wikis: BTreeMap<String, WikiMetricReport>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct PatrolSourceReport {
     patrol_events: u64,
     rights_events: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct BrowserDataReport {
     generation: String,
     partitions: usize,
     rows: u64,
     bytes: u64,
     largest_partition_bytes: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct FamilyPublicationProof {
+    receipt_identity: String,
+    algorithm_version: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct WikiPublicationProof {
+    snapshot: String,
+    candidate_run_id: String,
+    candidate_relative: String,
+    ready_receipt_sha256: String,
+    families: BTreeMap<String, FamilyPublicationProof>,
+    artifacts: BTreeMap<String, PreparedArtifact>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+struct PublicationChange {
+    wiki: String,
+    family: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct PublicationChangePlan {
+    schema_version: u8,
+    run_id: String,
+    changed: Vec<PublicationChange>,
+    reused: Vec<PublicationChange>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -545,6 +576,10 @@ struct GateReceipt {
     artifacts: Vec<ArtifactRecord>,
     #[serde(default)]
     publication_noop_digest: String,
+    #[serde(default)]
+    wiki_proofs: BTreeMap<String, WikiPublicationProof>,
+    #[serde(default)]
+    change_plan: Option<PublicationChangePlan>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -866,13 +901,27 @@ fn validate_prepared_artifact(candidate_dir: &Path, artifact: &PreparedArtifact)
 }
 
 fn receipted_summary(path: &Path, identity: &str, spec: &MetricSpec) -> Result<(u64, FileSummary)> {
+    receipted_summary_with_mode(
+        path,
+        identity,
+        spec,
+        artifact_receipt::VerificationMode::Fast,
+    )
+}
+
+fn receipted_summary_with_mode(
+    path: &Path,
+    identity: &str,
+    spec: &MetricSpec,
+    mode: artifact_receipt::VerificationMode,
+) -> Result<(u64, FileSummary)> {
     let document = if artifact_receipt::sidecar_path(path)?.is_file() {
         let document = artifact_receipt::read(path)?;
         artifact_receipt::verify(
             path,
             &document.receipt.identity,
             Some(&document.receipt_sha256),
-            artifact_receipt::VerificationMode::Fast,
+            mode,
         )?
     } else {
         artifact_receipt::scan_and_write(
@@ -1458,6 +1507,221 @@ fn ready_candidate_reference(
     })
 }
 
+fn publication_family_for_metric(metric: &str) -> Result<&'static str> {
+    if metric == "patrol" {
+        return Ok("patrol");
+    }
+    crate::compute::MetricFamily::for_metric(metric)
+        .map(crate::compute::MetricFamily::name)
+        .with_context(|| format!("metric {metric} has no publication family"))
+}
+
+fn expected_metrics_for_wiki(registry: &LifecycleRegistry, wiki: &str) -> Result<BTreeSet<String>> {
+    METRICS
+        .iter()
+        .filter_map(|spec| {
+            let contract = registry.publication_contract.datasets.get(spec.name)?;
+            Some((spec, contract))
+        })
+        .filter_map(
+            |(spec, contract)| match expected_wikis(registry, contract) {
+                Ok(wikis) if wikis.contains(wiki) => Some(Ok(spec.name.to_string())),
+                Ok(_) => None,
+                Err(error) => Some(Err(error)),
+            },
+        )
+        .collect()
+}
+
+fn prepared_metric_name(artifact: &PreparedArtifact) -> Result<String> {
+    Path::new(&artifact.path)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+        .context("prepared artifact has no UTF-8 metric name")
+}
+
+fn legacy_wiki_publication_proof(
+    data_dir: &Path,
+    output_dir: &Path,
+    registry: &LifecycleRegistry,
+    wiki: &str,
+) -> Result<WikiPublicationProof> {
+    let lifecycle = registry
+        .wikis
+        .get(wiki)
+        .context("legacy publication proof wiki is not registered")?;
+    let snapshot = storage::current_snapshot_version(data_dir, wiki)?
+        .or_else(|| lifecycle.imported_cutoff.clone())
+        .with_context(|| format!("legacy published wiki {wiki} has no snapshot identity"))?;
+    let mut artifacts = BTreeMap::new();
+    let mut family_receipts: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut family_algorithms: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for metric in expected_metrics_for_wiki(registry, wiki)? {
+        let path = output_dir.join(wiki).join(format!("{metric}.parquet"));
+        let prepared = prepared_artifact(output_dir, &path)?;
+        let document = artifact_receipt::read(&path)?;
+        let family = publication_family_for_metric(&metric)?.to_string();
+        family_receipts
+            .entry(family.clone())
+            .or_default()
+            .push(prepared.receipt_sha256.clone());
+        family_algorithms
+            .entry(family)
+            .or_default()
+            .insert(document.receipt.algorithm_version);
+        ensure!(
+            artifacts.insert(metric, prepared).is_none(),
+            "legacy publication proof contains a duplicate metric"
+        );
+    }
+    let mut families = BTreeMap::new();
+    for (family, mut identities) in family_receipts {
+        identities.sort();
+        let receipt_identity = hex::encode(Sha256::digest(serde_json::to_vec(&identities)?));
+        let algorithm_version = family_algorithms
+            .remove(&family)
+            .context("legacy family algorithms are missing")?
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join("+");
+        families.insert(
+            family,
+            FamilyPublicationProof {
+                receipt_identity,
+                algorithm_version,
+            },
+        );
+    }
+    let ready_receipt_sha256 = hex::encode(Sha256::digest(serde_json::to_vec(&artifacts)?));
+    Ok(WikiPublicationProof {
+        snapshot,
+        candidate_run_id: "legacy-import".to_string(),
+        candidate_relative: wiki.to_string(),
+        ready_receipt_sha256,
+        families,
+        artifacts,
+    })
+}
+
+fn current_wiki_publication_proof(
+    data_dir: &Path,
+    output_dir: &Path,
+    registry: &LifecycleRegistry,
+    wiki: &str,
+) -> Result<WikiPublicationProof> {
+    let Some(candidate_relative) = active_candidate_relative(output_dir, wiki)? else {
+        return legacy_wiki_publication_proof(data_dir, output_dir, registry, wiki);
+    };
+    let candidate_dir = output_dir.join(&candidate_relative);
+    let ready: ReadyWikiCandidate = read_json(&candidate_dir.join("ready.json"))?;
+    ensure!(ready.wiki == wiki, "active candidate ready wiki mismatch");
+    validate_ready_candidate(data_dir, &candidate_dir, &ready)?;
+    ensure!(
+        storage::current_snapshot_version(data_dir, wiki)?.as_deref()
+            == Some(ready.snapshot.as_str()),
+        "active candidate and snapshot pointer disagree for {wiki}"
+    );
+    let reference = ready_candidate_reference(data_dir, output_dir, &candidate_dir, &ready)?;
+    let algorithms =
+        crate::compute::family_receipt_algorithms(wiki, &ready.snapshot, data_dir, &candidate_dir)?;
+    let mut families = reference
+        .core_family_receipt_identities
+        .into_iter()
+        .map(|(family, receipt_identity)| {
+            let algorithm_version = algorithms
+                .get(&family)
+                .cloned()
+                .with_context(|| format!("candidate family {family} has no algorithm version"))?;
+            Ok((
+                family,
+                FamilyPublicationProof {
+                    receipt_identity,
+                    algorithm_version,
+                },
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    families.insert(
+        "patrol".to_string(),
+        FamilyPublicationProof {
+            receipt_identity: reference.patrol_receipt_identity,
+            algorithm_version: crate::patrol::algorithm_version().to_string(),
+        },
+    );
+    let mut artifacts = BTreeMap::new();
+    for artifact in ready.artifacts {
+        let metric = prepared_metric_name(&artifact)?;
+        ensure!(
+            artifacts.insert(metric, artifact).is_none(),
+            "ready candidate contains a duplicate metric"
+        );
+    }
+    ensure!(
+        artifacts.keys().cloned().collect::<BTreeSet<_>>()
+            == expected_metrics_for_wiki(registry, wiki)?,
+        "ready candidate metric set is incomplete or stale for {wiki}"
+    );
+    Ok(WikiPublicationProof {
+        snapshot: ready.snapshot,
+        candidate_run_id: ready.run_id,
+        candidate_relative,
+        ready_receipt_sha256: reference.ready_receipt_sha256,
+        families,
+        artifacts,
+    })
+}
+
+fn current_publication_proofs(
+    data_dir: &Path,
+    output_dir: &Path,
+    registry: &LifecycleRegistry,
+) -> Result<BTreeMap<String, WikiPublicationProof>> {
+    registry
+        .wikis
+        .iter()
+        .filter(|(_, lifecycle)| lifecycle.publication == "published")
+        .map(|(wiki, _)| {
+            Ok((
+                wiki.clone(),
+                current_wiki_publication_proof(data_dir, output_dir, registry, wiki)?,
+            ))
+        })
+        .collect()
+}
+
+fn derive_publication_change_plan(
+    run_id: &str,
+    current: &BTreeMap<String, WikiPublicationProof>,
+    previous: Option<&BTreeMap<String, WikiPublicationProof>>,
+) -> PublicationChangePlan {
+    let mut changed = Vec::new();
+    let mut reused = Vec::new();
+    for (wiki, proof) in current {
+        for (family, family_proof) in &proof.families {
+            let item = PublicationChange {
+                wiki: wiki.clone(),
+                family: family.clone(),
+            };
+            if previous
+                .and_then(|proofs| proofs.get(wiki))
+                .and_then(|previous| previous.families.get(family))
+                == Some(family_proof)
+            {
+                reused.push(item);
+            } else {
+                changed.push(item);
+            }
+        }
+    }
+    PublicationChangePlan {
+        schema_version: 1,
+        run_id: run_id.to_string(),
+        changed,
+        reused,
+    }
+}
+
 fn ready_from_reference(
     data_dir: &Path,
     output_dir: &Path,
@@ -1765,7 +2029,7 @@ fn publication_is_immediate_noop(
                     && modified.subsec_nanos() == artifact.modified_nanos
             })
     });
-    Ok(gate.schema_version == 7
+    Ok(gate.schema_version == 8
         && gate.publication_noop_digest == digest
         && gate.run_id == candidate.run_id
         && gate.artifacts == candidate.artifacts
@@ -2647,6 +2911,7 @@ pub(crate) fn prepare_ready_publication(
     run_id: &str,
 ) -> Result<()> {
     let started = Instant::now();
+    artifact_receipt::ensure_publication_allowed(output_dir)?;
     if publication_is_immediate_noop(data_dir, output_dir, lifecycle_path)? {
         record_publication_noop(output_dir, run_id)?;
         crate::observability::record_stage_skipped("publication_prepare", None);
@@ -3488,6 +3753,30 @@ pub fn validate(
     );
     let registry = load_lifecycle(lifecycle_path)?;
     validate_artifact_inventory(output_dir, &candidate, &registry)?;
+    let previous_gate = read_json::<GateReceipt>(&output_dir.join(RECEIPT_FILE))
+        .ok()
+        .filter(|receipt| receipt.schema_version >= 8);
+    let wiki_proofs = current_publication_proofs(data_dir, output_dir, &registry)?;
+    let expected_proof_wikis = registry
+        .wikis
+        .iter()
+        .filter(|(_, lifecycle)| lifecycle.publication == "published")
+        .map(|(wiki, _)| wiki.clone())
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        wiki_proofs.keys().cloned().collect::<BTreeSet<_>>() == expected_proof_wikis,
+        "publication proof set does not cover every published wiki"
+    );
+    let change_plan = derive_publication_change_plan(
+        run_id,
+        &wiki_proofs,
+        previous_gate.as_ref().map(|receipt| &receipt.wiki_proofs),
+    );
+    let changed = change_plan
+        .changed
+        .iter()
+        .map(|item| (item.wiki.as_str(), item.family.as_str()))
+        .collect::<BTreeSet<_>>();
     let mut reports = BTreeMap::new();
     let mut cutoffs = BTreeMap::new();
     for spec in &METRICS {
@@ -3497,22 +3786,107 @@ pub fn validate(
             .get(spec.name)
             .context("missing dataset contract")?;
         let wikis = expected_wikis(&registry, contract)?;
+        let family = publication_family_for_metric(spec.name)?;
+        let family_changed = wikis
+            .iter()
+            .any(|wiki| changed.contains(&(wiki.as_str(), family)));
         let root_metric = if partition_only_metric(spec) {
             None
         } else {
             let root = output_dir.join(format!("{}.parquet", spec.name));
             let identity = format!("{}.parquet", spec.name);
-            Some(receipted_summary(&root, &identity, spec)?)
+            let mode = if family_changed {
+                artifact_receipt::VerificationMode::Scrub
+            } else {
+                artifact_receipt::VerificationMode::Fast
+            };
+            Some(receipted_summary_with_mode(&root, &identity, spec, mode)?)
         };
         let mut wiki_reports = BTreeMap::new();
         let mut source_rows = 0_u64;
         let mut source_total = 0_i64;
         for wiki in wikis {
+            if !changed.contains(&(wiki.as_str(), family)) {
+                let reused = previous_gate
+                    .as_ref()
+                    .and_then(|receipt| receipt.metrics.get(spec.name))
+                    .and_then(|metric| metric.wikis.get(&wiki))
+                    .cloned()
+                    .with_context(|| {
+                        format!(
+                            "unchanged publication proof has no prior {} report for {wiki}",
+                            spec.name
+                        )
+                    })?;
+                let path = output_dir
+                    .join(&wiki)
+                    .join(format!("{}.parquet", spec.name));
+                let identity = format!("{wiki}/{}.parquet", spec.name);
+                let (authenticated_rows, authenticated_summary) = receipted_summary_with_mode(
+                    &path,
+                    &identity,
+                    spec,
+                    artifact_receipt::VerificationMode::Fast,
+                )?;
+                ensure!(
+                    authenticated_summary.wiki_min == wiki
+                        && authenticated_summary.wiki_max == wiki,
+                    "{identity} contains rows for the wrong wiki"
+                );
+                let authenticated = WikiMetricReport {
+                    rows: authenticated_rows,
+                    minimum_date: authenticated_summary.minimum_date,
+                    maximum_date: authenticated_summary.maximum_date,
+                    conservation_total: authenticated_summary.conservation_total,
+                };
+                ensure!(
+                    reused == authenticated,
+                    "{} prior gate report for {wiki} disagrees with its authenticated artifact receipt",
+                    spec.name
+                );
+                let minimum_rows = contract.minimum_rows(&wiki);
+                ensure!(
+                    reused.rows >= minimum_rows,
+                    "{} reused report has {} rows for {wiki}; minimum is {minimum_rows}",
+                    spec.name,
+                    reused.rows
+                );
+                if let (Some(column), Some(minimum), Some(maximum)) = (
+                    spec.date_column,
+                    reused.minimum_date.as_deref(),
+                    reused.maximum_date.as_deref(),
+                ) {
+                    validate_date(minimum, column)?;
+                    validate_date(maximum, column)?;
+                }
+                if spec.name == "gdp" {
+                    cutoffs.insert(
+                        wiki.clone(),
+                        reused
+                            .maximum_date
+                            .clone()
+                            .context("reused GDP maximum date is missing")?,
+                    );
+                }
+                source_rows = source_rows
+                    .checked_add(reused.rows)
+                    .context("reused source row total overflow")?;
+                source_total = source_total
+                    .checked_add(reused.conservation_total.unwrap_or(0))
+                    .context("reused conservation total overflow")?;
+                wiki_reports.insert(wiki, reused);
+                continue;
+            }
             let path = output_dir
                 .join(&wiki)
                 .join(format!("{}.parquet", spec.name));
             let identity = format!("{wiki}/{}.parquet", spec.name);
-            let (rows, summary) = receipted_summary(&path, &identity, spec)?;
+            let (rows, summary) = receipted_summary_with_mode(
+                &path,
+                &identity,
+                spec,
+                artifact_receipt::VerificationMode::Scrub,
+            )?;
             let minimum_rows = contract.minimum_rows(&wiki);
             ensure!(
                 rows >= minimum_rows,
@@ -3540,8 +3914,12 @@ pub fn validate(
                         .context("GDP maximum date is missing")?,
                 );
             }
-            source_rows += rows;
-            source_total += summary.conservation_total.unwrap_or(0);
+            source_rows = source_rows
+                .checked_add(rows)
+                .context("source row total overflow")?;
+            source_total = source_total
+                .checked_add(summary.conservation_total.unwrap_or(0))
+                .context("source conservation total overflow")?;
             wiki_reports.insert(
                 wiki,
                 WikiMetricReport {
@@ -3669,8 +4047,13 @@ pub fn validate(
     let publication_noop_digest =
         publication_noop_digest(data_dir, output_dir, lifecycle_path, false)?
             .context("publication has no digestable active ready-candidate set")?;
+    atomic_json(
+        &output_dir.join("publication-change-plan.json"),
+        &change_plan,
+    )
+    .context("publish incremental publication change plan")?;
     let receipt = GateReceipt {
-        schema_version: 7,
+        schema_version: 8,
         run_id: run_id.to_string(),
         validated_at_unix,
         license: policy.license,
@@ -3695,6 +4078,8 @@ pub fn validate(
         browser_data,
         artifacts: candidate.artifacts,
         publication_noop_digest,
+        wiki_proofs,
+        change_plan: Some(change_plan),
     };
     atomic_json(&output_dir.join(RECEIPT_FILE), &receipt)?;
     info!(run_id, receipt = %output_dir.join(RECEIPT_FILE).display(), "publication gate passed");
@@ -3727,7 +4112,7 @@ pub fn verify(output_dir: &Path, run_id: &str) -> Result<()> {
     // since an on-demand site build legitimately runs a newer (or older)
     // binary than whatever last validated the data.
     ensure!(
-        matches!(receipt.schema_version, 3..=7)
+        matches!(receipt.schema_version, 3..=8)
             && receipt.license == policy.license
             && receipt.attribution == policy.attribution
             && receipt.independence_notice == policy.independence_notice
@@ -3742,6 +4127,12 @@ pub fn verify(output_dir: &Path, run_id: &str) -> Result<()> {
                 || receipt.provenance.determinism_contract.as_ref()
                     == Some(&crate::determinism::contract()?))
             && (receipt.schema_version < 7 || receipt.publication_noop_digest.len() == 64)
+            && (receipt.schema_version < 8
+                || (!receipt.wiki_proofs.is_empty()
+                    && receipt
+                        .change_plan
+                        .as_ref()
+                        .is_some_and(|plan| plan.run_id == receipt.run_id)))
             && receipt.artifacts == candidate.artifacts,
         "publication receipt does not match candidate artifacts"
     );
@@ -4038,6 +4429,7 @@ mod tests {
         fs::write(&metric, corrupt_metric)?;
         assert!(prepared_artifact(directory.path(), &metric).is_err());
         assert!(validate_prepared_artifact(directory.path(), &existing_prepared).is_err());
+        assert!(receipted_summary(&metric, "gdp.parquet", spec).is_err());
         fs::write(&metric, original_metric)?;
 
         fs::remove_file(artifact_receipt::sidecar_path(&metric)?)?;
@@ -4201,7 +4593,18 @@ mod tests {
         verify(fixture.output.path(), "run-good")?;
 
         let receipt: Value = read_json(&fixture.output.path().join(RECEIPT_FILE))?;
-        assert_eq!(receipt["schema_version"], 7);
+        let standalone_plan: PublicationChangePlan =
+            read_json(&fixture.output.path().join("publication-change-plan.json"))?;
+        assert_eq!(receipt["schema_version"], 8);
+        assert_eq!(standalone_plan.run_id, "run-good");
+        assert_eq!(
+            receipt["wiki_proofs"]["nlwiki"]["candidate_run_id"],
+            "legacy-import"
+        );
+        assert_eq!(
+            receipt["change_plan"]["changed"].as_array().map(Vec::len),
+            Some(5)
+        );
         assert_eq!(
             receipt["publication_noop_digest"].as_str().map(str::len),
             Some(64)
@@ -4251,6 +4654,99 @@ mod tests {
         atomic_json(&receipt_path, &receipt)?;
         verify(fixture.output.path(), "run-good")?;
 
+        let mut missing_summary = receipt.clone();
+        missing_summary["metrics"]["gdp"]["wikis"]
+            .as_object_mut()
+            .expect("GDP wiki reports should be an object")
+            .remove("nlwiki");
+        atomic_json(&receipt_path, &missing_summary)?;
+        begin_run(
+            fixture.output.path(),
+            Some("run-missing-summary"),
+            &[],
+            None,
+        )
+        .expect("missing-summary run should initialize");
+        record_candidate(
+            fixture.output.path(),
+            Some("run-missing-summary"),
+            &fixture.names(),
+        )
+        .expect("missing-summary candidate should record");
+        let error = validate(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "run-missing-summary",
+        )
+        .expect_err("a missing prior report must fail closed");
+        assert!(format!("{error:#}").contains("has no prior gdp report"));
+        atomic_json(&receipt_path, &receipt)?;
+
+        let wiki_gdp = fixture.output.path().join("nlwiki/gdp.parquet");
+        let original_document = artifact_receipt::read(&wiki_gdp)?;
+        let mut invalid_schema = original_document.receipt.clone();
+        invalid_schema.parquet_schema.pop();
+        artifact_receipt::write(&wiki_gdp, invalid_schema)?;
+        let registry = load_lifecycle(&fixture.lifecycle_path)?;
+        let current_proofs =
+            current_publication_proofs(fixture.data.path(), fixture.output.path(), &registry)?;
+        let current_monthly = current_proofs["nlwiki"].families["monthly"].clone();
+        let mut forged_unchanged = receipt.clone();
+        forged_unchanged["wiki_proofs"]["nlwiki"]["families"]["monthly"] =
+            serde_json::to_value(current_monthly)?;
+        atomic_json(&receipt_path, &forged_unchanged)?;
+        begin_run(
+            fixture.output.path(),
+            Some("run-invalid-unchanged-receipt"),
+            &[],
+            None,
+        )
+        .expect("invalid unchanged run should initialize");
+        record_candidate(
+            fixture.output.path(),
+            Some("run-invalid-unchanged-receipt"),
+            &fixture.names(),
+        )
+        .expect("invalid unchanged candidate should record");
+        assert!(
+            validate(
+                fixture.data.path(),
+                fixture.output.path(),
+                &fixture.lifecycle_path,
+                "run-invalid-unchanged-receipt",
+            )
+            .is_err()
+        );
+        artifact_receipt::write(&wiki_gdp, original_document.receipt)?;
+        atomic_json(&receipt_path, &receipt)?;
+
+        let mut tampered_summary = receipt.clone();
+        tampered_summary["metrics"]["gdp"]["wikis"]["nlwiki"]["rows"] = json!(2);
+        atomic_json(&receipt_path, &tampered_summary)?;
+        begin_run(
+            fixture.output.path(),
+            Some("run-tampered-summary"),
+            &[],
+            None,
+        )
+        .expect("tampered-summary run should initialize");
+        record_candidate(
+            fixture.output.path(),
+            Some("run-tampered-summary"),
+            &fixture.names(),
+        )
+        .expect("tampered-summary candidate should record");
+        let error = validate(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "run-tampered-summary",
+        )
+        .expect_err("a prior report that disagrees with its receipt must fail closed");
+        assert!(format!("{error:#}").contains("authenticated artifact receipt"));
+        atomic_json(&receipt_path, &receipt)?;
+
         begin_run(fixture.output.path(), Some("run-merge-only"), &[], None)?;
         let merge_candidate = record_candidate(
             fixture.output.path(),
@@ -4265,6 +4761,12 @@ mod tests {
             "run-merge-only",
         );
         merge_validation?;
+        let incremental: GateReceipt = read_json(&fixture.output.path().join(RECEIPT_FILE))?;
+        let plan = incremental
+            .change_plan
+            .context("incremental gate must contain a change plan")?;
+        assert!(plan.changed.is_empty());
+        assert_eq!(plan.reused.len(), 5);
 
         let registry = load_lifecycle(&fixture.lifecycle_path)?;
         let merge_only = RunContext {
@@ -4283,6 +4785,169 @@ mod tests {
             Some("2026-03")
         );
         assert!(fixture.lifecycle.path().is_dir());
+        Ok(())
+    }
+
+    #[test]
+    fn changed_artifact_and_change_plan_failures_stop_publication() -> Result<()> {
+        let invalid_artifact = Fixture::new()?;
+        let wiki_gdp = invalid_artifact.output.path().join("nlwiki/gdp.parquet");
+        let document = artifact_receipt::read(&wiki_gdp)?;
+        let mut invalid_schema = document.receipt;
+        invalid_schema.parquet_schema.pop();
+        artifact_receipt::write(&wiki_gdp, invalid_schema)?;
+        invalid_artifact.prepare("invalid-changed-artifact")?;
+        assert!(
+            validate(
+                invalid_artifact.data.path(),
+                invalid_artifact.output.path(),
+                &invalid_artifact.lifecycle_path,
+                "invalid-changed-artifact",
+            )
+            .is_err()
+        );
+
+        let blocked_plan = Fixture::new()?;
+        blocked_plan.prepare("blocked-change-plan")?;
+        fs::create_dir(
+            blocked_plan
+                .output
+                .path()
+                .join("publication-change-plan.json"),
+        )
+        .expect("blocking change-plan directory should be created");
+        let error = validate(
+            blocked_plan.data.path(),
+            blocked_plan.output.path(),
+            &blocked_plan.lifecycle_path,
+            "blocked-change-plan",
+        )
+        .expect_err("change-plan publication failure must fail the gate");
+        assert!(format!("{error:#}").contains("publish incremental publication change plan"));
+        Ok(())
+    }
+
+    #[test]
+    fn publication_change_plan_invalidates_only_the_changed_wiki_family() {
+        let families = [
+            "monthly",
+            "activity_tiers",
+            "lifecycle",
+            "page_week",
+            "patrol",
+        ];
+        let wikis = ["dewiki", "frwiki", "itwiki", "nlwiki", "ptwiki", "svwiki"];
+        let previous = wikis
+            .into_iter()
+            .map(|wiki| {
+                let families = families
+                    .into_iter()
+                    .map(|family| {
+                        (
+                            family.to_string(),
+                            FamilyPublicationProof {
+                                receipt_identity: format!("{wiki}-{family}-receipt"),
+                                algorithm_version: format!("{family}-v1"),
+                            },
+                        )
+                    })
+                    .collect();
+                (
+                    wiki.to_string(),
+                    WikiPublicationProof {
+                        snapshot: "2026-07".to_string(),
+                        candidate_run_id: format!("prepare-{wiki}"),
+                        candidate_relative: format!("_candidates/{wiki}/2026-07/prepare-{wiki}"),
+                        ready_receipt_sha256: format!("ready-{wiki}"),
+                        families,
+                        artifacts: BTreeMap::new(),
+                    },
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let mut current = previous.clone();
+        current
+            .get_mut("itwiki")
+            .expect("itwiki proof")
+            .families
+            .get_mut("lifecycle")
+            .expect("lifecycle family")
+            .receipt_identity = "itwiki-lifecycle-recomputed".to_string();
+
+        let plan = derive_publication_change_plan("publish-incremental", &current, Some(&previous));
+        assert_eq!(
+            plan.changed,
+            vec![PublicationChange {
+                wiki: "itwiki".to_string(),
+                family: "lifecycle".to_string(),
+            }]
+        );
+        assert_eq!(plan.reused.len(), wikis.len() * families.len() - 1);
+    }
+
+    #[test]
+    fn receipt_composition_matches_an_independent_semantic_scrub() -> Result<()> {
+        let fixture = Fixture::new()?;
+        fixture.prepare("receipt-composition")?;
+        validate(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "receipt-composition",
+        )
+        .expect("receipt-composition gate should validate");
+        let gate: GateReceipt = read_json(&fixture.output.path().join(RECEIPT_FILE))?;
+        let scrub = artifact_receipt::scrub_published(fixture.output.path())?;
+
+        for artifact in scrub
+            .artifacts
+            .iter()
+            .filter(|artifact| artifact.path.starts_with("nlwiki/"))
+        {
+            let metric = Path::new(&artifact.path)
+                .file_stem()
+                .and_then(|name| name.to_str())
+                .context("scrubbed metric path")?;
+            let report = gate
+                .metrics
+                .get(metric)
+                .and_then(|metric| metric.wikis.get("nlwiki"))
+                .with_context(|| format!("gate has no nlwiki report for {metric}"))?;
+            assert_eq!(artifact.rows, report.rows, "row mismatch for {metric}");
+            assert_eq!(artifact.minimum_date, report.minimum_date);
+            assert_eq!(artifact.maximum_date, report.maximum_date);
+            let spec = METRICS
+                .iter()
+                .find(|spec| spec.name == metric)
+                .context("metric contract")?;
+            if let Some(column) = spec.conservation_column {
+                assert_eq!(
+                    artifact.conservation_totals.get(column).copied(),
+                    report.conservation_total.map(i128::from),
+                    "conservation mismatch for {metric}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn failed_deep_scrub_blocks_the_next_publication() -> Result<()> {
+        let fixture = Fixture::new()?;
+        artifact_receipt::record_scrub_failure(
+            fixture.output.path(),
+            "scrub-failed",
+            &anyhow::anyhow!("independent semantic mismatch"),
+        )
+        .expect("failed scrub status should persist");
+        let error = prepare_ready_publication(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "publish-blocked",
+        )
+        .expect_err("failed scrub must block publication");
+        assert!(format!("{error:#}").contains("scrub-failed"));
         Ok(())
     }
 
@@ -6460,7 +7125,7 @@ mod tests {
         assert!(!kind_matches(Kind::String, &DataType::Int64));
 
         let fixture = Fixture::new()?;
-        let registry = load_lifecycle(&fixture.lifecycle_path)?;
+        let mut registry = load_lifecycle(&fixture.lifecycle_path)?;
         let invalid = DatasetContract {
             coverage: None,
             wikis: None,
@@ -6481,6 +7146,28 @@ mod tests {
             expected_wikis(&registry, &explicit)?,
             BTreeSet::from(["nlwiki".to_string()])
         );
+        registry.wikis.insert(
+            "frwiki".to_string(),
+            LifecycleWiki {
+                publication: "published".to_string(),
+                refresh: "paused".to_string(),
+                imported_cutoff: Some("2026-03".to_string()),
+                freshness_sla_days: None,
+            },
+        );
+        let frwiki_metrics = expected_metrics_for_wiki(&registry, "frwiki")?;
+        assert!(frwiki_metrics.contains("gdp"));
+        assert!(!frwiki_metrics.contains("patrol"));
+        registry.publication_contract.datasets.insert(
+            "gdp".to_string(),
+            DatasetContract {
+                coverage: None,
+                wikis: None,
+                minimum_rows_per_wiki: 1,
+                minimum_rows_by_wiki: BTreeMap::new(),
+            },
+        );
+        assert!(expected_metrics_for_wiki(&registry, "frwiki").is_err());
         Ok(())
     }
 

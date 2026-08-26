@@ -143,7 +143,7 @@ function fileList(directory, extension = ".parquet") {
 function browserDataSummary(outputDir) {
   const indexPath = path.join(outputDir, BROWSER_INDEX);
   const index = readJson(indexPath);
-  if (index?.schema_version !== 1
+  if (index?.schema_version !== 2
       || index?.cache_schema_version !== 2
       || !/^[0-9a-f]{64}$/.test(index?.generation || "")
       || index?.license_spdx !== ARTIFACT_LICENSE_SPDX
@@ -153,6 +153,9 @@ function browserDataSummary(outputDir) {
   }
   const identities = new Set();
   const artifacts = index.entries.map((entry) => {
+    if (!/^[0-9a-f]{64}$/.test(entry?.artifact_receipt_sha256 || "")) {
+      throw new Error(`browser data entry has no artifact receipt: ${entry?.metric}/${entry?.wiki}`);
+    }
     if (!/^[a-z0-9_]+$/.test(entry?.metric || "")
         || !/^[a-z0-9_]+wiki$/.test(entry?.wiki || "")
         || entry.file !== `browser-data/${entry.metric}/${entry.wiki}.parquet`
