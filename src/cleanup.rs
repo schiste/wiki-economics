@@ -177,6 +177,7 @@ fn clean_candidate_generations(
         }
     });
     let mut protected = BTreeSet::new();
+    let mut resumable = Vec::new();
     for snapshot_entry in read_dir_if_present(&root)? {
         let snapshot_entry = snapshot_entry?;
         if !snapshot_entry.file_type()?.is_dir() {
@@ -243,6 +244,15 @@ fn clean_candidate_generations(
                 || (!expired && matches!(state.state, GState::Building | GState::Validated));
             if retained {
                 protected.insert(snapshot.clone());
+                if matches!(state.state, GState::Building | GState::Validated) {
+                    resumable.push((
+                        current_run_id == Some(run_id.as_str()),
+                        state.updated_at_unix,
+                        snapshot.clone(),
+                        run_id.clone(),
+                        candidate,
+                    ));
+                }
             } else {
                 if state.state != GState::Retired {
                     generation.retire("resumable candidate exceeded its recovery window")?;
@@ -255,6 +265,34 @@ fn clean_candidate_generations(
             fs::remove_dir(snapshot_entry.path())?;
         }
     }
+    resumable.sort_by(|left, right| {
+        (left.0, left.1, &left.2, &left.3).cmp(&(right.0, right.1, &right.2, &right.3))
+    });
+    if let Some(keep) = resumable.pop() {
+        for (_, _, snapshot, run_id, candidate) in resumable {
+            let generation = CandidateGeneration {
+                output_dir,
+                wiki,
+                snapshot: &snapshot,
+                run_id: &run_id,
+            };
+            generation.retire("newer resumable candidate retained")?;
+            remove_dir(candidate, &mut report.removed)?;
+            report.candidate_generations += 1;
+            let snapshot_root = root.join(&snapshot);
+            if snapshot_root.is_dir() && fs::read_dir(&snapshot_root)?.next().is_none() {
+                fs::remove_dir(snapshot_root)?;
+            }
+        }
+        protected.insert(keep.2);
+    }
+    protected.retain(|snapshot| {
+        read_dir_if_present(&root.join(snapshot)).is_ok_and(|entries| {
+            entries
+                .into_iter()
+                .any(|entry| entry.is_ok_and(|entry| entry.path().is_dir()))
+        })
+    });
     Ok(protected)
 }
 
@@ -857,13 +895,48 @@ mod tests {
         .expect("lifecycle cleanup should succeed");
 
         assert!(protected.contains("2026-08"));
-        assert!(output.join("_candidates/nlwiki/2026-08/building").is_dir());
+        assert!(!output.join("_candidates/nlwiki/2026-08/building").exists());
         assert!(output.join("_candidates/nlwiki/2026-08/validated").is_dir());
         assert!(
             !output
                 .join("_candidates/nlwiki/2026-08/already-retired")
                 .exists()
         );
+        assert_eq!(report.candidate_generations, 2);
+        Ok(())
+    }
+
+    #[test]
+    fn current_run_wins_the_single_resumable_candidate_slot() -> Result<()> {
+        let root = TestDir::new()?;
+        let output = root.path().join("output");
+        for (snapshot, run) in [("2026-08", "current-run"), ("2026-07", "newer-looking-run")] {
+            fs::create_dir_all(output.join(format!("_candidates/nlwiki/{snapshot}/{run}")))?;
+            crate::generation_lifecycle::begin(&output, "nlwiki", snapshot, run)?;
+        }
+        let mut report = CleanupReport::default();
+
+        clean_candidate_generations(
+            &output,
+            "nlwiki",
+            Some("current-run"),
+            Duration::from_secs(3_600),
+            SystemTime::now(),
+            &mut report,
+        )
+        .expect("current candidate cleanup should succeed");
+
+        assert!(
+            output
+                .join("_candidates/nlwiki/2026-08/current-run")
+                .is_dir()
+        );
+        assert!(
+            !output
+                .join("_candidates/nlwiki/2026-07/newer-looking-run")
+                .exists()
+        );
+        assert!(!output.join("_candidates/nlwiki/2026-07").exists());
         assert_eq!(report.candidate_generations, 1);
         Ok(())
     }
