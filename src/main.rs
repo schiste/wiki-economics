@@ -3,6 +3,7 @@
 mod artifact_receipt;
 mod bench;
 mod browser_data;
+mod canonical_month;
 mod capacity;
 mod cleanup;
 mod compaction;

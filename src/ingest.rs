@@ -935,6 +935,7 @@ fn compact_snapshot_generation_if_needed(
         &compaction,
     );
     published?;
+    crate::canonical_month::ensure_snapshot_inventory(data_dir, wiki, snapshot_version)?;
     Ok(())
 }
 
