@@ -39,6 +39,25 @@ rollback_on_failure() {
 trap rollback_on_failure EXIT
 trap 'failure_error="command failed: $BASH_COMMAND"' ERR
 
+echo "==> Auditing and recovering interrupted publication transactions"
+recovery_report="${WIKI_ECON_RUN_STATE_FILE%.state}.recovery.json"
+wiki_econ_run_cli publication-recover \
+  --all \
+  --lifecycle "$WIKI_ECON_WIKI_LIFECYCLE_FILE" \
+  --site-dist-dir "$WIKI_ECON_SITE_DIST_DIR" \
+  --report "$recovery_report"
+if node -e '
+  const fs = require("node:fs");
+  const report = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  process.exit(report.schema_version === 1 && report.site_rebuild_required === true ? 0 : 1);
+' "$recovery_report"; then
+  echo "==> Recovery restored an earlier data generation; rebuilding its matching site"
+  export WIKI_ECON_REQUIRE_PUBLICATION_GATE=1
+  "$ROOT/scripts/build-site.sh" \
+    --output-dir "$WIKI_ECON_OUTPUT_DIR" \
+    --dist-dir "$WIKI_ECON_SITE_DIST_DIR"
+fi
+
 wiki_econ_run_cli publication-prepare-ready \
   --lifecycle "$WIKI_ECON_WIKI_LIFECYCLE_FILE"
 selection_file="$WIKI_ECON_OUTPUT_DIR/_publication_transactions/$WIKI_ECON_RUN_ID/selection.json"

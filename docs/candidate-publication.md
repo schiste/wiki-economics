@@ -137,7 +137,40 @@ never loaded as a scheduled Toolforge Job.
 
 ## Recovery
 
-Inspect locks and transactions with:
+Every publisher first runs the same fail-closed recovery engine used by the
+operator CLI. It validates each journal's schema and run identity, then
+correlates live candidate symlinks, snapshot pointers, candidate hashes, the
+publication gate, and the deployed site's content-addressed receipt. Terminal
+transactions are skipped. A transaction proven to have reached the site is
+committed; one proven to have been incorporated by a later publication is
+marked `reconciled`; one proven not to have reached the site is rolled back and
+its previous aggregate/site generation is rebuilt. Evidence that admits more
+than one interpretation is retained and described below
+`output/_quarantine/publication-recovery/`; it is never deleted automatically.
+
+The read-only audit command is safe to run without acquiring the publication
+lock:
+
+```sh
+wiki-econ --data-dir DATA --output-dir OUTPUT \
+  publication-recovery-audit --site-dist-dir SITE_DIST
+```
+
+Repair must run under the publication lock. Select one journal explicitly:
+
+```sh
+wiki-econ --data-dir DATA --output-dir OUTPUT publication-recover \
+  --run-id publish-20260825T214725Z-7 \
+  --lifecycle config/wiki-lifecycle.json \
+  --site-dist-dir SITE_DIST
+```
+
+The JSON result reports `site_rebuild_required=true` when rollback regenerated
+the previous aggregate gate. The production wrapper consumes an atomic report,
+rebuilds that matching site before continuing, and then runs normal candidate
+selection. Re-running either audit or repair is idempotent.
+
+Inspect locks and retained journals with:
 
 ```sh
 become wiki-economics find /data/project/wiki-economics/output/_prepare-locks -name owner.json -maxdepth 2 -print
@@ -145,8 +178,6 @@ become wiki-economics jq . /data/project/wiki-economics/output/.publication.lock
 become wiki-economics find /data/project/wiki-economics/output/_publication_transactions -name selection.json -print
 ```
 
-For a failed pre-site-switch publication, the wrapper runs rollback
-automatically. To retry explicitly, use the original run ID with
-`publication-rollback-ready`. For a post-site-switch commit failure, use the
-original run ID with `publication-commit-ready`; do not roll back only the data
-after the site has changed.
+Do not manually remove a journal or its backups, and do not guess between
+`publication-rollback-ready` and `publication-commit-ready`. The recovery audit
+exists specifically to prove which transition preserves data/site identity.
