@@ -12,6 +12,8 @@ data/stages/<wiki>/<snapshot>/fetch.json
 data/stages/<wiki>/<snapshot>/ingest.json
 data/snapshots/<wiki>/<snapshot>/remote-inventory.json
 data/snapshots/<wiki>/<snapshot>/workload-profile.json
+data/incremental/month-identities/<wiki>/<snapshot>/inventory.json
+data/incremental/metric-cache/<wiki>/<kind>/<algorithm-hash>/<input-digest>/...
 output/_ready-index/<wiki>.json
 output/_stages/compute/monthly/<wiki>.json
 output/_stages/compute/activity_tiers/<wiki>.json
@@ -125,6 +127,17 @@ corrections, and historical changes must remain observable. Repeated weekly
 preparation runs against the same snapshot validate the current and ready
 candidate fingerprints and exit as recorded no-ops when they are unchanged.
 An explicit algorithm-version change can invalidate compute or patrol alone.
+
+Schema-v3 ingest additionally records a logical identity for every event
+month. The identity is computed by a bounded k-way merge of the compacted,
+sorted 13-column runs and hashes a canonical binary row encoding. It is
+independent of source filenames, fragment boundaries, worker completion order,
+and Parquet metadata. Cross-snapshot qualification uses these identities for
+content-addressed stateless month outputs, editor-month inputs, weekly month
+contributions, complete lifecycle outputs, and prefix-authenticated yearly
+lifecycle checkpoints. These caches are not publication receipts and cannot
+make a candidate eligible by themselves; exact candidate-vs-clean artifact and
+semantic receipt equality is mandatory.
 
 ## Corruption checks
 

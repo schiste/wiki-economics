@@ -148,10 +148,12 @@ Important decisions:
   - tests and small-wiki workflows
 - Compatibility with older parquet files is deliberate. Both `load_wiki()` and partition loading can still derive missing analytical columns from legacy data, which makes migrations safer and keeps old test fixtures useful.
 - `compute_all()` prefers the partitioned incremental path whenever the selected generation is laid out under `year=/year_month=` directories.
-- Here, “incremental” means bounded partition-at-a-time memory use inside one
-  selected snapshot. Cross-snapshot metric reuse is not yet implemented; its
-  content-digest contract and measured storage baseline are documented in
-  [Storage footprint and incremental-compute assessment](storage-and-incremental-compute-2026-08-25.md).
+- Production “incremental” execution still means bounded partition-at-a-time
+  memory use inside one selected snapshot. Cross-snapshot metric reuse now has
+  a publication-invisible implementation and exact clean-build qualification
+  command; it is deliberately not eligible for production publication until
+  multiple real rollovers pass. See
+  [Cross-snapshot incremental computation](cross-snapshot-incremental.md).
 - Incremental compute processes one month partition at a time, computes exact month-scoped outputs, and maintains only the cross-month state needed for:
   - business funnel
   - labor cohorts
