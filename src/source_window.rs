@@ -347,7 +347,7 @@ where
     let mut unresolved = Vec::new();
     let mut unresolved_indices = Vec::new();
     for (index, source) in plan.sources.iter().enumerate() {
-        if crate::storage::marker_manifest_is_valid_in(data_dir, &analytical, &source.source_id)?
+        if crate::compaction::source_is_represented(data_dir, wiki, snapshot, &source.source_id)?
             && let Some(marker) =
                 crate::storage::read_marker_manifest_in(data_dir, &analytical, &source.source_id)?
         {
@@ -1114,9 +1114,14 @@ mod tests {
         SnapshotPlan::load_or_resolve(data_dir.path(), wiki, candidate)?;
         let error = RealSourceTransactionOps
             .finalize(wiki, candidate, data_dir.path(), false)
-            .expect_err("candidate without a strict source marker must fail validation");
+            .expect_err("candidate without an ingest generation must fail validation");
 
-        assert!(error.to_string().contains("marker"));
+        assert!(
+            error
+                .to_string()
+                .contains("no committed ingest or compaction proof"),
+            "unexpected candidate validation error: {error:#}"
+        );
         assert_eq!(
             crate::storage::current_snapshot_version(data_dir.path(), wiki)?.as_deref(),
             Some(current)

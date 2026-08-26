@@ -5,6 +5,7 @@ mod bench;
 mod browser_data;
 mod capacity;
 mod cleanup;
+mod compaction;
 mod compute;
 mod dashboard;
 mod determinism;
@@ -3157,11 +3158,13 @@ mod tests {
         fs::create_dir_all(&raw_ingest_dir)?;
         write_bz2_dump(&raw_ingest_dir.join("2026-02.ingestwiki.all-time.tsv.bz2"))?;
         ops.ingest_wiki("ingestwiki", Some("2026-02"), data_dir.path())?;
-        assert!({
-            let active =
-                crate::storage::active_metric_input_wiki_dir(data_dir.path(), "ingestwiki")?;
-            !crate::storage::collect_parquet_files(&active)?.is_empty()
-        });
+        let active_fragments = crate::storage::active_fragment_files(
+            data_dir.path(),
+            "ingestwiki",
+            crate::storage::GenerationLayer::MetricInput,
+        )
+        .expect("compacted ingest fragments should resolve");
+        assert!(!active_fragments.is_empty());
         ops.finalize_snapshot("ingestwiki", data_dir.path())?;
 
         let schema_scratch = output_dir.path().join("schema-scratch");

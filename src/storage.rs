@@ -25,7 +25,8 @@ const CURRENT_SNAPSHOT_FILENAME: &str = "current-snapshot.json";
 const GENERATION_MANIFEST_FILENAME: &str = "generation-manifest.json";
 const SNAPSHOT_POINTER_SCHEMA_VERSION: u64 = 1;
 const MARKER_SCHEMA_VERSION: u64 = 2;
-const GENERATION_MANIFEST_SCHEMA_VERSION: u64 = 2;
+const DIRECT_METRIC_INPUT_MANIFEST_SCHEMA_VERSION: u64 = 2;
+const COMPACTED_METRIC_INPUT_MANIFEST_SCHEMA_VERSION: u64 = 3;
 static GENERATION_MANIFEST_TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
 static GENERATION_VALIDATION_CACHE: OnceLock<
     Mutex<BTreeMap<GenerationValidationKey, GenerationManifest>>,
@@ -73,6 +74,10 @@ pub(crate) struct GenerationManifest {
     pub(crate) wiki: String,
     pub(crate) snapshot_version: String,
     pub(crate) source_plan_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) compaction_manifest_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) compaction_manifest_sha256: Option<String>,
     pub(crate) fragments: Vec<GenerationFragment>,
 }
 
@@ -336,6 +341,20 @@ pub(crate) fn write_generation_manifest(
     {
         return Ok(path);
     }
+    if path.is_file()
+        && current_snapshot_version(data_dir, wiki)?.as_deref() == Some(snapshot_version)
+    {
+        let selected = read_generation_manifest(data_dir, wiki, snapshot_version)
+            .context("selected generation manifest is immutable and invalid")?;
+        validate_selected_generation(data_dir, wiki, snapshot_version, &selected)?;
+        return Ok(path);
+    }
+    if path.is_file() {
+        let existing = read_generation_manifest(data_dir, wiki, snapshot_version)?;
+        if existing.schema_version == COMPACTED_METRIC_INPUT_MANIFEST_SCHEMA_VERSION {
+            return Ok(path);
+        }
+    }
     validate_snapshot_generation(data_dir, wiki, snapshot_version)?;
     let (plan, plan_path) =
         crate::snapshot_plan::SnapshotPlan::load_or_resolve(data_dir, wiki, snapshot_version)?;
@@ -398,27 +417,23 @@ pub(crate) fn write_generation_manifest(
     );
     let manifest = GenerationManifest {
         schema_version: if metric_input_generation {
-            GENERATION_MANIFEST_SCHEMA_VERSION
+            DIRECT_METRIC_INPUT_MANIFEST_SCHEMA_VERSION
         } else {
             1
         },
         wiki: wiki.to_string(),
         snapshot_version: snapshot_version.to_string(),
         source_plan_sha256,
+        compaction_manifest_path: None,
+        compaction_manifest_sha256: None,
         fragments,
     };
     let parent = path.parent().context("generation manifest has no parent")?;
     fs::create_dir_all(parent)?;
     let mut bytes = serde_json::to_vec_pretty(&manifest)?;
     bytes.push(b'\n');
-    if path.is_file() {
-        if fs::read(&path)? == bytes {
-            return Ok(path);
-        }
-        ensure!(
-            current_snapshot_version(data_dir, wiki)?.as_deref() != Some(snapshot_version),
-            "selected generation manifest is immutable; build a new candidate generation"
-        );
+    if path.is_file() && fs::read(&path)? == bytes {
+        return Ok(path);
     }
     let temporary = parent.join(format!(
         ".{GENERATION_MANIFEST_FILENAME}.{}.{}.tmp",
@@ -437,6 +452,89 @@ pub(crate) fn write_generation_manifest(
         let _ = fs::remove_file(&temporary);
     }
     write_result?;
+    Ok(path)
+}
+
+fn validate_selected_generation(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot_version: &str,
+    selected: &GenerationManifest,
+) -> Result<()> {
+    if selected.schema_version == COMPACTED_METRIC_INPUT_MANIFEST_SCHEMA_VERSION {
+        return Ok(());
+    }
+    validate_snapshot_generation(data_dir, wiki, snapshot_version)
+        .context("selected generation manifest is immutable and invalid")?;
+    Ok(())
+}
+
+/// Replace an unselected direct schema-v2 source-fragment allowlist with the
+/// independently validated compacted allowlist. The source manifest identity
+/// is retained inside the compaction receipt, so this transition cannot mix
+/// fragments from another generation.
+pub(crate) fn publish_compacted_generation_manifest(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot_version: &str,
+    source_manifest: &GenerationManifest,
+    compaction: &crate::compaction::CompactionManifest,
+) -> Result<PathBuf> {
+    ensure!(
+        current_snapshot_version(data_dir, wiki)?.as_deref() != Some(snapshot_version),
+        "selected generation manifest is immutable; compact the next snapshot instead"
+    );
+    ensure!(
+        source_manifest.schema_version == DIRECT_METRIC_INPUT_MANIFEST_SCHEMA_VERSION
+            && source_manifest.compaction_manifest_path.is_none()
+            && source_manifest.compaction_manifest_sha256.is_none(),
+        "compaction source must be a direct schema-v2 metric-input manifest"
+    );
+    crate::compaction::validate_structure(data_dir, wiki, snapshot_version, compaction)?;
+    ensure!(
+        crate::compaction::canonical_sha256(source_manifest)? == compaction.source_manifest_sha256,
+        "compaction was prepared from another source manifest"
+    );
+    let compaction_path = crate::compaction::manifest_path(data_dir, wiki, snapshot_version)?;
+    let (_, compaction_sha256) = sha256_file(&compaction_path)?;
+    let mut fragments = compaction.compacted_fragments.clone();
+    fragments.sort();
+    let manifest = GenerationManifest {
+        schema_version: COMPACTED_METRIC_INPUT_MANIFEST_SCHEMA_VERSION,
+        wiki: wiki.to_string(),
+        snapshot_version: snapshot_version.to_string(),
+        source_plan_sha256: source_manifest.source_plan_sha256.clone(),
+        compaction_manifest_path: {
+            let relative = relative_path(data_dir, &compaction_path)?;
+            Some(path_to_string(&relative)?)
+        },
+        compaction_manifest_sha256: Some(compaction_sha256),
+        fragments,
+    };
+    validate_generation_manifest(data_dir, wiki, snapshot_version, &manifest)?;
+
+    let path = generation_manifest_path(data_dir, wiki, snapshot_version)?;
+    let parent = path.parent().context("generation manifest has no parent")?;
+    fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(
+        ".{GENERATION_MANIFEST_FILENAME}.{}.{}.compact.tmp",
+        std::process::id(),
+        GENERATION_MANIFEST_TEMP_NONCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut bytes = serde_json::to_vec_pretty(&manifest)?;
+    bytes.push(b'\n');
+    let result = (|| -> Result<()> {
+        let mut file = File::create(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, &path)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result?;
     Ok(path)
 }
 
@@ -470,13 +568,12 @@ fn validate_generation_manifest_structure(
     snapshot_version: &str,
     manifest: &GenerationManifest,
 ) -> Result<()> {
-    ensure!(
-        matches!(
-            manifest.schema_version,
-            1 | GENERATION_MANIFEST_SCHEMA_VERSION
-        ),
-        "unsupported generation manifest schema"
+    let supported_schema = matches!(
+        manifest.schema_version,
+        1 | DIRECT_METRIC_INPUT_MANIFEST_SCHEMA_VERSION
+            | COMPACTED_METRIC_INPUT_MANIFEST_SCHEMA_VERSION
     );
+    ensure!(supported_schema, "unsupported generation manifest schema");
     ensure!(
         manifest.wiki == wiki && manifest.snapshot_version == snapshot_version,
         "generation manifest identity mismatch"
@@ -536,12 +633,57 @@ fn validate_generation_manifest_structure(
                 && metric_input_sources.is_empty(),
             "schema-v1 generation does not cover every planned source in both legacy layers"
         );
-    } else {
+        ensure!(
+            manifest.compaction_manifest_path.is_none()
+                && manifest.compaction_manifest_sha256.is_none(),
+            "schema-v1 generation cannot reference compaction"
+        );
+    } else if manifest.schema_version == DIRECT_METRIC_INPUT_MANIFEST_SCHEMA_VERSION {
         ensure!(
             metric_input_sources == expected_sources
                 && analytical_sources.is_empty()
                 && warehouse_sources.is_empty(),
             "schema-v2 generation must contain exactly one metric-input layer"
+        );
+        ensure!(
+            manifest.compaction_manifest_path.is_none()
+                && manifest.compaction_manifest_sha256.is_none(),
+            "direct schema-v2 generation cannot reference compaction"
+        );
+    } else {
+        ensure!(
+            analytical_sources.is_empty()
+                && warehouse_sources.is_empty()
+                && metric_input_sources
+                    .iter()
+                    .all(|source| source.starts_with("compacted-")),
+            "schema-v3 generation must contain only compacted metric-input fragments"
+        );
+        let compaction_relative = manifest
+            .compaction_manifest_path
+            .as_deref()
+            .context("schema-v3 generation has no compaction manifest path")?;
+        let expected_compaction_path =
+            crate::compaction::manifest_path(data_dir, wiki, snapshot_version)?;
+        ensure!(
+            checked_stored_path(data_dir, compaction_relative)? == expected_compaction_path,
+            "schema-v3 generation references the wrong compaction manifest"
+        );
+        let expected_hash = manifest
+            .compaction_manifest_sha256
+            .as_deref()
+            .context("schema-v3 generation has no compaction manifest hash")?;
+        let (_, actual_hash) = sha256_file(&expected_compaction_path)?;
+        ensure!(
+            expected_hash == actual_hash,
+            "schema-v3 compaction manifest hash changed"
+        );
+        let compaction: crate::compaction::CompactionManifest =
+            serde_json::from_slice(&fs::read(&expected_compaction_path)?)?;
+        crate::compaction::validate_structure(data_dir, wiki, snapshot_version, &compaction)?;
+        ensure!(
+            compaction.compacted_fragments == manifest.fragments,
+            "generation and compaction fragment allowlists disagree"
         );
     }
     Ok(())
@@ -718,13 +860,11 @@ pub(crate) fn snapshot_compute_layer(
     legacy_layer: GenerationLayer,
 ) -> Result<GenerationLayer> {
     let manifest = ensure_generation_manifest(data_dir, wiki, snapshot_version)?;
-    Ok(
-        if manifest.schema_version == GENERATION_MANIFEST_SCHEMA_VERSION {
-            GenerationLayer::MetricInput
-        } else {
-            legacy_layer
-        },
-    )
+    Ok(if manifest.schema_version != 1 {
+        GenerationLayer::MetricInput
+    } else {
+        legacy_layer
+    })
 }
 
 pub(crate) fn active_compute_layer(
@@ -928,6 +1068,8 @@ pub(crate) fn write_test_generation_manifest_from_files(
         wiki: wiki.to_string(),
         snapshot_version: snapshot_version.to_string(),
         source_plan_sha256,
+        compaction_manifest_path: None,
+        compaction_manifest_sha256: None,
         fragments,
     };
     let path = generation_manifest_path(data_dir, wiki, snapshot_version)?;
@@ -2098,6 +2240,14 @@ fn partition_specs_from_generation_files(
             .strip_prefix(root)
             .context("active generation fragment is outside its layer root")?;
         let parts: Vec<_> = relative.components().collect();
+        let parts = if parts
+            .first()
+            .is_some_and(|component| component.as_os_str() == "_compacted")
+        {
+            &parts[1..]
+        } else {
+            &parts[..]
+        };
         ensure!(
             parts.len() == 3,
             "generation fragment has an invalid partition path"
@@ -2475,6 +2625,10 @@ mod tests {
         fs::write(&manifest_path, &first_bytes)?;
 
         publish_current_snapshot(data.path(), wiki, snapshot)?;
+        assert_eq!(
+            write_generation_manifest(data.path(), wiki, snapshot)?,
+            manifest_path
+        );
         fs::write(&manifest_path, b"{}\n")?;
         let immutable = write_generation_manifest(data.path(), wiki, snapshot)
             .expect_err("selected manifest must not be replaced with different bytes");

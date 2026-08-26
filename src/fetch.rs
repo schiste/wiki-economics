@@ -1807,14 +1807,9 @@ pub(crate) fn pending_snapshot_sources(
     data_dir: &Path,
 ) -> Result<Vec<SourceSpec>> {
     let (plan, _) = SnapshotPlan::load_or_resolve(data_dir, wiki, version)?;
-    let analytical_root = crate::storage::snapshot_analytical_wiki_dir(data_dir, wiki, version)?;
     let mut pending = Vec::new();
     for source in plan.sources {
-        if !crate::storage::marker_manifest_is_valid_in(
-            data_dir,
-            &analytical_root,
-            &source.source_id,
-        )? {
+        if !crate::compaction::source_is_represented(data_dir, wiki, version, &source.source_id)? {
             pending.push(source);
         }
     }
@@ -1974,16 +1969,11 @@ fn fetch_snapshot_source_window_with_transport<T: HttpTransport>(
 pub(crate) fn finalize_snapshot_fetch(wiki: &str, version: &str, data_dir: &Path) -> Result<()> {
     let (plan, plan_path) = SnapshotPlan::load_or_resolve(data_dir, wiki, version)?;
     let expected = plan.filenames()?;
-    let analytical_root = crate::storage::snapshot_analytical_wiki_dir(data_dir, wiki, version)?;
     for source in &plan.sources {
         anyhow::ensure!(
-            crate::storage::marker_manifest_is_valid_in(
-                data_dir,
-                &analytical_root,
-                &source.source_id,
-            )
-            .unwrap_or(false),
-            "cannot finalize fetch: source {} has no valid ingest marker",
+            crate::compaction::source_is_represented(data_dir, wiki, version, &source.source_id,)
+                .unwrap_or(false),
+            "cannot finalize fetch: source {} has no committed ingest or compaction proof",
             source.source_id
         );
     }
@@ -2003,15 +1993,10 @@ pub(crate) fn cleanup_committed_source_window_inputs(
         return Ok(0);
     }
     let (plan, _) = SnapshotPlan::load_or_resolve(data_dir, wiki, version)?;
-    let analytical_root = crate::storage::snapshot_analytical_wiki_dir(data_dir, wiki, version)?;
     let mut removed = 0_usize;
     for source in plan.sources {
-        if !crate::storage::marker_manifest_is_valid_in(
-            data_dir,
-            &analytical_root,
-            &source.source_id,
-        )
-        .unwrap_or(false)
+        if !crate::compaction::source_is_represented(data_dir, wiki, version, &source.source_id)
+            .unwrap_or(false)
         {
             continue;
         }
@@ -2049,11 +2034,10 @@ fn fetch_wiki_with_transport<T: HttpTransport>(
 ) -> Result<Vec<PathBuf>> {
     let (plan, plan_path) = SnapshotPlan::load_or_resolve(data_dir, wiki, version)?;
     let expected = plan.filenames()?;
-    let analytical_root = crate::storage::snapshot_analytical_wiki_dir(data_dir, wiki, version)?;
     let mut files = Vec::new();
     for filename in &expected {
         let source_id = crate::ingest::ingest_source_id(Path::new(filename))?;
-        if crate::storage::marker_manifest_is_valid_in(data_dir, &analytical_root, &source_id)? {
+        if crate::compaction::source_is_represented(data_dir, wiki, version, &source_id)? {
             debug!(
                 wiki = wiki,
                 version = version,
@@ -2109,8 +2093,7 @@ fn record_fetch_stage(
         let source_id = crate::ingest::ingest_source_id(Path::new(filename))?;
         let marker = crate::storage::marker_path_in(&analytical_root, &source_id);
         let (identity, path) =
-            if crate::storage::marker_manifest_is_valid_in(data_dir, &analytical_root, &source_id)?
-            {
+            if crate::compaction::source_is_represented(data_dir, wiki, version, &source_id)? {
                 (format!("ingest-marker/{source_id}"), marker)
             } else {
                 (

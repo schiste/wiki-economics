@@ -2467,10 +2467,17 @@ pub(crate) fn compute_stage_inputs(
         // generation, safely migrates) the authoritative allowlist.
         storage::ensure_generation_manifest(data_dir, wiki, &snapshot)?;
         let manifest = storage::generation_manifest_path(data_dir, wiki, &snapshot)?;
-        let generation_outputs = vec![fingerprint::TrackedPath::new(
+        let mut generation_outputs = vec![fingerprint::TrackedPath::new(
             "generation-manifest",
             manifest,
         )];
+        let compaction = crate::compaction::manifest_path(data_dir, wiki, &snapshot)?;
+        if compaction.is_file() {
+            generation_outputs.push(fingerprint::TrackedPath::new(
+                "compaction-manifest",
+                compaction,
+            ));
+        }
         let receipt = fingerprint::data_stage_receipt_path(data_dir, wiki, &snapshot, "ingest");
         let spec = fingerprint::StageSpec {
             stage: "ingest",

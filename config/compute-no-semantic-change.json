@@ -4,26 +4,26 @@
     {
       "family": "monthly",
       "paths": ["src/compute/mod.rs"],
-      "reason": "Expose existing family receipt metadata to publication without changing computation semantics or bytes.",
-      "base_commit": "c7e5dc15351573463366010d25d04d8a8d6dc8b1"
+      "reason": "Authenticate the compaction manifest as an ingest-stage input without changing monthly metric semantics or bytes.",
+      "base_commit": "9aaeca7245685c82682d9d885078351382f43db8"
     },
     {
       "family": "activity_tiers",
       "paths": ["src/compute/mod.rs"],
-      "reason": "Expose existing family receipt metadata to publication without changing computation semantics or bytes.",
-      "base_commit": "c7e5dc15351573463366010d25d04d8a8d6dc8b1"
+      "reason": "Authenticate the compaction manifest as an ingest-stage input without changing activity-tier semantics or bytes.",
+      "base_commit": "9aaeca7245685c82682d9d885078351382f43db8"
     },
     {
       "family": "lifecycle",
       "paths": ["src/compute/mod.rs"],
-      "reason": "Expose existing family receipt metadata to publication without changing computation semantics or bytes.",
-      "base_commit": "c7e5dc15351573463366010d25d04d8a8d6dc8b1"
+      "reason": "Authenticate the compaction manifest as an ingest-stage input without changing lifecycle metric semantics or bytes.",
+      "base_commit": "9aaeca7245685c82682d9d885078351382f43db8"
     },
     {
       "family": "page_week",
       "paths": ["src/compute/mod.rs"],
-      "reason": "Expose existing family receipt metadata to publication without changing computation semantics or bytes.",
-      "base_commit": "c7e5dc15351573463366010d25d04d8a8d6dc8b1"
+      "reason": "Authenticate the compaction manifest as an ingest-stage input without changing page-week metric semantics or bytes.",
+      "base_commit": "9aaeca7245685c82682d9d885078351382f43db8"
     }
   ]
 }

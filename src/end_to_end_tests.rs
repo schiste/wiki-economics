@@ -279,7 +279,8 @@ fn snapshot_rollover_computes_only_the_new_generation() -> Result<()> {
     )?;
     ingest::ingest_wiki_snapshot("tinywiki", "2026-07", &data_dir)?;
     let july_manifest = storage::read_generation_manifest(&data_dir, "tinywiki", "2026-07")?;
-    assert_eq!(july_manifest.schema_version, 2);
+    assert_eq!(july_manifest.schema_version, 3);
+    assert!(july_manifest.compaction_manifest_path.is_some());
     assert!(
         july_manifest
             .fragments

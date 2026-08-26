@@ -777,7 +777,8 @@ fn ingest_wiki_for_snapshot(
 
     if let Some(snapshot_version) = snapshot_version.as_deref() {
         storage::write_generation_manifest(data_dir, wiki, snapshot_version)?;
-        let inputs = ingest_stage_inputs(data_dir, wiki, &roots, &src_files)?;
+        compact_snapshot_generation_if_needed(data_dir, wiki, snapshot_version)?;
+        let inputs = snapshot_marker_inputs(data_dir, wiki, snapshot_version)?;
         let outputs = ingest_stage_outputs(data_dir, wiki, &roots)?;
         fingerprint::record(
             &fingerprint::data_stage_receipt_path(data_dir, wiki, snapshot_version, "ingest"),
@@ -790,19 +791,12 @@ fn ingest_wiki_for_snapshot(
             &inputs,
             &outputs,
         )?;
+        crate::compaction::retire_source_fragments(data_dir, wiki, snapshot_version)?;
         storage::publish_current_snapshot(data_dir, wiki, snapshot_version)?;
     }
 
     let output_root = roots.metric_input.as_deref().unwrap_or(&roots.analytical);
-    let output_paths = storage::collect_parquet_files(output_root)?;
-    info!(
-        wiki = wiki,
-        snapshot_version = snapshot_version.as_deref().unwrap_or("legacy"),
-        files = output_paths.len(),
-        output_dir = %output_root.display(),
-        "finished ingest"
-    );
-    if let Some(snapshot) = snapshot_version.as_deref() {
+    let output_paths = if let Some(snapshot) = snapshot_version.as_deref() {
         let layer_result = storage::snapshot_compute_layer(
             data_dir,
             wiki,
@@ -810,10 +804,18 @@ fn ingest_wiki_for_snapshot(
             storage::GenerationLayer::Analytical,
         );
         let layer = layer_result?;
-        storage::snapshot_fragment_files(data_dir, wiki, snapshot, layer)
+        storage::snapshot_fragment_files(data_dir, wiki, snapshot, layer)?
     } else {
-        Ok(output_paths)
-    }
+        storage::collect_parquet_files(output_root)?
+    };
+    info!(
+        wiki = wiki,
+        snapshot_version = snapshot_version.as_deref().unwrap_or("legacy"),
+        files = output_paths.len(),
+        output_dir = %output_root.display(),
+        "finished ingest"
+    );
+    Ok(output_paths)
 }
 
 fn ingest_stage_outputs(
@@ -824,7 +826,12 @@ fn ingest_stage_outputs(
     if let Some(snapshot_version) = roots.snapshot_version.as_deref() {
         let manifest = storage::generation_manifest_path(data_dir, wiki, snapshot_version)?;
         if manifest.is_file() {
-            return Ok(vec![TrackedPath::new("generation-manifest", manifest)]);
+            let mut outputs = vec![TrackedPath::new("generation-manifest", manifest)];
+            let compaction = crate::compaction::manifest_path(data_dir, wiki, snapshot_version)?;
+            if compaction.is_file() {
+                outputs.push(TrackedPath::new("compaction-manifest", compaction));
+            }
+            return Ok(outputs);
         }
     }
     let mut outputs = Vec::new();
@@ -854,6 +861,7 @@ fn ingest_stage_outputs(
     Ok(outputs)
 }
 
+#[cfg(test)]
 fn ingest_stage_inputs(
     data_dir: &Path,
     wiki: &str,
@@ -863,7 +871,8 @@ fn ingest_stage_inputs(
     let mut inputs = Vec::new();
     if let Some(snapshot) = roots.snapshot_version.as_deref() {
         let (_, plan_path) = SnapshotPlan::load_or_resolve(data_dir, wiki, snapshot)?;
-        inputs.push(TrackedPath::new("snapshot-plan", plan_path));
+        let plan_input = TrackedPath::new("snapshot-plan", plan_path);
+        inputs.push(plan_input);
     }
     for source in raw_sources {
         let source_id = ingest_source_id(source)?;
@@ -879,20 +888,54 @@ fn snapshot_marker_inputs(
 ) -> Result<Vec<TrackedPath>> {
     let (plan, plan_path) = SnapshotPlan::load_or_resolve(data_dir, wiki, snapshot_version)?;
     let analytical_root = storage::snapshot_analytical_wiki_dir(data_dir, wiki, snapshot_version)?;
+    let compacted = if crate::compaction::manifest_path(data_dir, wiki, snapshot_version)?.is_file()
+    {
+        let manifest_result = crate::compaction::read_manifest(data_dir, wiki, snapshot_version);
+        Some(manifest_result?)
+    } else {
+        None
+    };
     let mut inputs = vec![TrackedPath::new("snapshot-plan", plan_path)];
     for source in plan.sources {
         let marker = storage::marker_path_in(&analytical_root, &source.source_id);
-        ensure!(
-            storage::marker_manifest_is_valid_in(data_dir, &analytical_root, &source.source_id,)?,
-            "snapshot source {} has no valid ingest marker",
-            source.source_id
-        );
+        if compacted.is_none() {
+            let marker_result =
+                storage::marker_manifest_is_valid_in(data_dir, &analytical_root, &source.source_id);
+            let marker_valid = marker_result?;
+            ensure!(
+                marker_valid,
+                "snapshot source {} has no valid ingest marker",
+                source.source_id
+            );
+        }
         inputs.push(TrackedPath::new(
             format!("ingest-marker/{}", source.source_id),
             marker,
         ));
     }
     Ok(inputs)
+}
+
+fn compact_snapshot_generation_if_needed(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot_version: &str,
+) -> Result<()> {
+    let source_manifest = storage::read_generation_manifest(data_dir, wiki, snapshot_version)?;
+    if source_manifest.schema_version != 2 {
+        return Ok(());
+    }
+    let compaction =
+        crate::compaction::compact_generation(data_dir, wiki, snapshot_version, &source_manifest)?;
+    let published = storage::publish_compacted_generation_manifest(
+        data_dir,
+        wiki,
+        snapshot_version,
+        &source_manifest,
+        &compaction,
+    );
+    published?;
+    Ok(())
 }
 
 /// Convert and commit one planned source, then release its compressed input.
@@ -1018,7 +1061,21 @@ fn finalize_snapshot_ingest_with_selection(
     select_generation: bool,
 ) -> Result<Vec<PathBuf>> {
     let roots = IngestRoots::snapshot(data_dir, wiki, snapshot_version)?;
+    if crate::compaction::receipted_manifest(data_dir, wiki, snapshot_version)?.is_some() {
+        if select_generation {
+            storage::publish_current_snapshot(data_dir, wiki, snapshot_version)?;
+        }
+        let fragment_result = storage::snapshot_fragment_files(
+            data_dir,
+            wiki,
+            snapshot_version,
+            storage::GenerationLayer::MetricInput,
+        );
+        let fragments = fragment_result?;
+        return Ok(fragments);
+    }
     storage::write_generation_manifest(data_dir, wiki, snapshot_version)?;
+    compact_snapshot_generation_if_needed(data_dir, wiki, snapshot_version)?;
     let inputs = snapshot_marker_inputs(data_dir, wiki, snapshot_version)?;
     let outputs = ingest_stage_outputs(data_dir, wiki, &roots)?;
     fingerprint::record(
@@ -1032,6 +1089,7 @@ fn finalize_snapshot_ingest_with_selection(
         &inputs,
         &outputs,
     )?;
+    crate::compaction::retire_source_fragments(data_dir, wiki, snapshot_version)?;
     if select_generation {
         storage::publish_current_snapshot(data_dir, wiki, snapshot_version)?;
     }
@@ -1117,6 +1175,39 @@ mod tests {
         }
         encoder.finish()?;
         Ok(())
+    }
+
+    fn prepare_compaction_fixture(
+        data_dir: &Path,
+        wiki: &str,
+        version: &str,
+    ) -> Result<storage::GenerationManifest> {
+        let (plan, _) = SnapshotPlan::load_or_resolve(data_dir, wiki, version)?;
+        let source = data_dir
+            .join("raw")
+            .join(wiki)
+            .join(plan.sources[0].filename()?);
+        source.parent().map(fs::create_dir_all).transpose()?;
+        write_bz2_dump(
+            &source,
+            &[
+                sample_row("2026-08-03 00:00:00.0", "43", "101", "revision", "create"),
+                sample_row("2026-08-01 00:00:00.0", "42", "100", "revision", "create"),
+                sample_row("2026-08-02 00:00:00.0", "44", "102", "revision", "create"),
+            ],
+        )
+        .expect("compaction fixture should compress");
+        convert_file_with_chunk_limit(
+            &source,
+            wiki,
+            data_dir,
+            &IngestRoots::snapshot(data_dir, wiki, version)?,
+            128,
+            Some("compaction-fixture"),
+        )
+        .expect("compaction fixture should ingest");
+        storage::write_generation_manifest(data_dir, wiki, version)?;
+        storage::read_generation_manifest(data_dir, wiki, version)
     }
 
     fn build_concurrency_qualification_generation(
@@ -1728,6 +1819,10 @@ mod tests {
         fs::write(&plan_path, b"{truncated")?;
 
         assert!(ingest_stage_inputs(data_dir.path(), wiki, &roots, &[]).is_err());
+        fs::remove_file(&plan_path)?;
+        SnapshotPlan::load_or_resolve(data_dir.path(), wiki, version)?;
+        let planned_inputs = ingest_stage_inputs(data_dir.path(), wiki, &roots, &[])?;
+        assert_eq!(planned_inputs[0].identity, "snapshot-plan");
 
         let legacy_source = data_dir.path().join("legacy.tsv.bz2");
         fs::write(&legacy_source, b"BZhfixture")?;
@@ -1913,6 +2008,211 @@ mod tests {
                 .expect_err("selected generation fragments must not be rebuilt in place");
         assert!(immutable.to_string().contains("immutable"));
         assert!(source.is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn compaction_recovers_both_commit_windows_and_is_byte_deterministic() -> Result<()> {
+        init_test_tracing();
+        let wiki = "testwiki";
+        let version = "2026-08";
+        let mut output_hashes = Vec::new();
+
+        for after_rename in [false, true] {
+            let data_dir = TestDir::new()?;
+            let source_manifest = prepare_compaction_fixture(data_dir.path(), wiki, version)?;
+            assert!(source_manifest.fragments.len() > 1);
+            let source_paths: Vec<_> = source_manifest
+                .fragments
+                .iter()
+                .map(|fragment| data_dir.path().join(&fragment.path))
+                .collect();
+
+            let mut invalid_manifest = source_manifest.clone();
+            invalid_manifest.fragments[0].path = "missing-partitions.parquet".to_string();
+            assert!(
+                crate::compaction::compact_generation(
+                    data_dir.path(),
+                    wiki,
+                    version,
+                    &invalid_manifest,
+                )
+                .is_err()
+            );
+            assert!(
+                !data_dir
+                    .path()
+                    .join(format!(
+                        "metric-input/{wiki}/_snapshots/{version}/_compaction-staging"
+                    ))
+                    .exists()
+            );
+
+            let injected = crate::compaction::compact_generation_for_test(
+                data_dir.path(),
+                wiki,
+                version,
+                &source_manifest,
+                after_rename,
+            )
+            .expect_err("fault injection must interrupt the compaction commit");
+            assert!(injected.to_string().contains("injected fault"));
+            assert!(
+                data_dir
+                    .path()
+                    .join(format!(
+                        "snapshots/{wiki}/{version}/compaction-transaction.json"
+                    ))
+                    .is_file()
+            );
+
+            let recovered = crate::compaction::compact_generation(
+                data_dir.path(),
+                wiki,
+                version,
+                &source_manifest,
+            )
+            .expect("prepared compaction transaction should recover");
+            let committed = crate::compaction::compact_generation(
+                data_dir.path(),
+                wiki,
+                version,
+                &source_manifest,
+            )
+            .expect("committed compaction should be reusable");
+            assert_eq!(committed, recovered);
+            assert_eq!(recovered.source_rows, recovered.compacted_rows);
+            assert_eq!(recovered.compacted_fragments.len(), 1);
+            assert!(
+                !data_dir
+                    .path()
+                    .join(format!(
+                        "snapshots/{wiki}/{version}/compaction-transaction.json"
+                    ))
+                    .exists()
+            );
+            output_hashes.push(
+                recovered
+                    .compacted_fragments
+                    .iter()
+                    .map(|fragment| fragment.sha256.clone())
+                    .collect::<Vec<_>>(),
+            );
+            if !after_rename {
+                let retained_unknown = source_paths[0]
+                    .parent()
+                    .context("source fragment month")?
+                    .join("operator-note");
+                fs::write(retained_unknown, b"must not be guessed or removed")?;
+            }
+
+            let published_manifest = storage::publish_compacted_generation_manifest(
+                data_dir.path(),
+                wiki,
+                version,
+                &source_manifest,
+                &recovered,
+            );
+            published_manifest?;
+            storage::write_generation_manifest(data_dir.path(), wiki, version)?;
+            let active = finalize_snapshot_ingest_candidate(wiki, version, data_dir.path())?;
+            assert_eq!(active.len(), 1);
+            assert!(source_paths.iter().all(|path| !path.exists()));
+            assert_eq!(
+                finalize_snapshot_ingest_candidate(wiki, version, data_dir.path())?,
+                active
+            );
+            assert_eq!(
+                finalize_snapshot_ingest(wiki, version, data_dir.path())?,
+                active
+            );
+
+            let generation_path =
+                storage::generation_manifest_path(data_dir.path(), wiki, version)?;
+            let generation_bytes = fs::read(&generation_path)?;
+            let mut changed_bytes = generation_bytes.clone();
+            changed_bytes.push(b'\n');
+            fs::write(&generation_path, changed_bytes)?;
+            crate::compaction::clear_manifest_cache_for_test();
+            assert!(
+                crate::compaction::receipted_manifest(data_dir.path(), wiki, version)?.is_none()
+            );
+            fs::write(&generation_path, generation_bytes)?;
+            crate::compaction::clear_manifest_cache_for_test();
+            let representation = crate::compaction::source_is_represented(
+                data_dir.path(),
+                wiki,
+                version,
+                &source_manifest.fragments[0].source_id,
+            );
+            let represented = representation?;
+            assert!(represented);
+            assert_eq!(
+                crate::compaction::retire_source_fragments(data_dir.path(), wiki, version,)?,
+                0
+            );
+            assert_eq!(
+                storage::read_generation_manifest(data_dir.path(), wiki, version)?.schema_version,
+                3
+            );
+            let ingest_receipt =
+                fingerprint::data_stage_receipt_path(data_dir.path(), wiki, version, "ingest");
+            fs::remove_file(&ingest_receipt)?;
+            crate::compaction::clear_manifest_cache_for_test();
+            assert_eq!(
+                finalize_snapshot_ingest_candidate(wiki, version, data_dir.path())?,
+                active
+            );
+            assert!(ingest_receipt.is_file());
+            crate::compaction::clear_manifest_cache_for_test();
+            assert!(
+                crate::compaction::receipted_manifest(data_dir.path(), wiki, version)?.is_some()
+            );
+            let source_marker = data_dir.path().join(&recovered.sources[0].marker_path);
+            let marker_bytes = fs::read(&source_marker)?;
+            fs::remove_file(&ingest_receipt)?;
+            fs::write(&source_marker, b"{tampered")?;
+            crate::compaction::clear_manifest_cache_for_test();
+            let tampered = finalize_snapshot_ingest_candidate(wiki, version, data_dir.path())
+                .expect_err("changed source proof must block receipt recovery");
+            assert!(tampered.to_string().contains("marker hash changed"));
+            fs::write(source_marker, marker_bytes)?;
+        }
+        assert_eq!(output_hashes[0], output_hashes[1]);
+        Ok(())
+    }
+
+    #[test]
+    fn compacted_generation_manifest_commit_failure_cleans_its_temporary() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let wiki = "testwiki";
+        let version = "2026-08";
+        let source_manifest = prepare_compaction_fixture(data_dir.path(), wiki, version)?;
+        let compacted =
+            crate::compaction::compact_generation(data_dir.path(), wiki, version, &source_manifest)
+                .expect("valid fixture should compact");
+        let generation_path = storage::generation_manifest_path(data_dir.path(), wiki, version)?;
+        let generation_bytes = fs::read(&generation_path)?;
+        fs::remove_file(&generation_path)?;
+        fs::create_dir(&generation_path)?;
+
+        assert!(
+            storage::publish_compacted_generation_manifest(
+                data_dir.path(),
+                wiki,
+                version,
+                &source_manifest,
+                &compacted,
+            )
+            .is_err()
+        );
+        let state_root = generation_path.parent().context("generation state root")?;
+        assert!(fs::read_dir(state_root)?.all(|entry| {
+            entry.is_ok_and(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp"))
+        }));
+
+        fs::remove_dir(&generation_path)?;
+        fs::write(generation_path, generation_bytes)?;
         Ok(())
     }
 
