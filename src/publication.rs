@@ -335,6 +335,7 @@ pub(crate) enum PublicationRecoveryClassification {
 pub(crate) struct PublicationRecoveryEvidence {
     selected_candidates: usize,
     live_candidate_matches: usize,
+    superseded_candidate_matches: usize,
     snapshot_pointer_matches: usize,
     candidate_artifacts_valid: bool,
     current_gate_valid: bool,
@@ -1300,6 +1301,7 @@ fn empty_recovery_evidence() -> PublicationRecoveryEvidence {
     PublicationRecoveryEvidence {
         selected_candidates: 0,
         live_candidate_matches: 0,
+        superseded_candidate_matches: 0,
         snapshot_pointer_matches: 0,
         candidate_artifacts_valid: false,
         current_gate_valid: false,
@@ -1309,6 +1311,160 @@ fn empty_recovery_evidence() -> PublicationRecoveryEvidence {
         current_site_receipt_valid: false,
         backups_recoverable: false,
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CommittedCandidateEdge {
+    wiki: String,
+    candidate_relative: String,
+    previous_candidate_relative: String,
+    publication_run_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RecoveryCandidateLineage {
+    live_candidate_relative: String,
+    live_snapshot: String,
+    rollback_candidate_relative: Option<String>,
+    superseding_run_ids: Vec<String>,
+}
+
+impl RecoveryCandidateLineage {
+    fn selected_is_live(&self) -> bool {
+        self.superseding_run_ids.is_empty()
+    }
+}
+
+fn committed_candidate_edges_after(
+    output_dir: &Path,
+    journal_modified: u128,
+) -> Result<Vec<CommittedCandidateEdge>> {
+    let mut edges = Vec::new();
+    for later_run_id in publication_transaction_run_ids(output_dir)? {
+        let later_path = selection_path(output_dir, &later_run_id)?;
+        if modified_unix_nanos(&later_path)? <= journal_modified {
+            continue;
+        }
+        let later: PublicationSelection = read_json(&later_path)?;
+        validate_publication_selection(output_dir, &later_run_id, &later)?;
+        if later.state != "committed" {
+            continue;
+        }
+        for entry in later.entries {
+            let Some(previous_candidate_relative) = entry.previous_candidate_relative else {
+                continue;
+            };
+            edges.push(CommittedCandidateEdge {
+                wiki: entry.wiki,
+                candidate_relative: entry.candidate_relative,
+                previous_candidate_relative,
+                publication_run_id: later.run_id.clone(),
+            });
+        }
+    }
+    Ok(edges)
+}
+
+fn generation_record_for_candidate(
+    output_dir: &Path,
+    wiki: &str,
+    candidate_relative: &str,
+) -> Result<crate::generation_lifecycle::GenerationRecord> {
+    let candidate = output_dir.join(candidate_relative);
+    let (snapshot, run_id) = candidate_identity(&candidate)
+        .context("recovery candidate has no valid generation identity")?;
+    crate::generation_lifecycle::load(output_dir, wiki, snapshot, run_id)?
+        .context("recovery candidate has no generation state")
+}
+
+fn transition_was_recorded(
+    record: &crate::generation_lifecycle::GenerationRecord,
+    state: GState,
+    publication_run_id: &str,
+) -> bool {
+    record.history.iter().any(|transition| {
+        transition.state == state
+            && transition.publication_run_id.as_deref() == Some(publication_run_id)
+    })
+}
+
+fn prove_recovery_candidate_lineage(
+    output_dir: &Path,
+    entry: &SelectionEntry,
+    edges: &[CommittedCandidateEdge],
+) -> Result<RecoveryCandidateLineage> {
+    let live_candidate_relative = active_candidate_relative(output_dir, &entry.wiki)?
+        .with_context(|| format!("{} has no qualified live candidate", entry.wiki))?;
+    if live_candidate_relative == entry.candidate_relative {
+        return Ok(RecoveryCandidateLineage {
+            live_candidate_relative,
+            live_snapshot: entry.snapshot.clone(),
+            rollback_candidate_relative: entry.previous_candidate_relative.clone(),
+            superseding_run_ids: Vec::new(),
+        });
+    }
+
+    let mut cursor = live_candidate_relative.clone();
+    let mut rollback_candidate_relative = None;
+    let mut superseding_run_ids = Vec::new();
+    let mut visited = BTreeSet::new();
+    while cursor != entry.candidate_relative {
+        ensure!(
+            visited.insert(cursor.clone()),
+            "committed candidate lineage contains a cycle"
+        );
+        let matching = edges
+            .iter()
+            .filter(|edge| edge.wiki == entry.wiki && edge.candidate_relative == cursor)
+            .collect::<Vec<_>>();
+        let predecessor_count = matching.len();
+        ensure!(
+            predecessor_count == 1,
+            "{} has {predecessor_count} committed predecessors for candidate {cursor}",
+            entry.wiki
+        );
+        let edge = matching[0];
+        if rollback_candidate_relative.is_none() {
+            rollback_candidate_relative = Some(edge.previous_candidate_relative.clone());
+        }
+        superseding_run_ids.push(edge.publication_run_id.clone());
+        cursor.clone_from(&edge.previous_candidate_relative);
+    }
+    superseding_run_ids.reverse();
+
+    let first_publication = superseding_run_ids
+        .first()
+        .context("superseded lineage has no first publication")?;
+    let selected =
+        generation_record_for_candidate(output_dir, &entry.wiki, &entry.candidate_relative)?;
+    ensure!(
+        matches!(selected.state, GState::Superseded | GState::Retired)
+            && transition_was_recorded(&selected, GState::Superseded, first_publication),
+        "selected candidate is not linked to its first committed superseding publication"
+    );
+
+    let final_publication = superseding_run_ids
+        .last()
+        .context("superseded lineage has no final publication")?;
+    let live = generation_record_for_candidate(output_dir, &entry.wiki, &live_candidate_relative)?;
+    ensure!(
+        live.state == GState::Published
+            && transition_was_recorded(&live, GState::Published, final_publication),
+        "live candidate is not linked to the final committed publication"
+    );
+    let ready: ReadyWikiCandidate =
+        read_json(&output_dir.join(&live_candidate_relative).join("ready.json"))?;
+    ensure!(
+        ready.wiki == entry.wiki,
+        "live ready candidate wiki mismatch"
+    );
+
+    Ok(RecoveryCandidateLineage {
+        live_candidate_relative,
+        live_snapshot: ready.snapshot,
+        rollback_candidate_relative,
+        superseding_run_ids,
+    })
 }
 
 fn validate_publication_selection(
@@ -1480,43 +1636,65 @@ fn audit_publication_transaction(
         return report;
     }
 
+    let journal_modified = modified_unix_nanos(&path).ok();
+    let committed_edges = journal_modified
+        .map(|modified| committed_candidate_edges_after(output_dir, modified))
+        .transpose();
+    let (committed_edges, committed_edges_error) = match committed_edges {
+        Ok(edges) => (edges.unwrap_or_default(), None),
+        Err(error) => (Vec::new(), Some(format!("{error:#}"))),
+    };
     let mut candidate_artifacts_valid = true;
+    let mut effective_snapshots = BTreeMap::new();
     for entry in &selection.entries {
         let candidate = output_dir.join(&entry.candidate_relative);
-        let validation =
-            read_json::<ReadyWikiCandidate>(&candidate.join("ready.json")).and_then(|ready| {
-                ensure!(
-                    ready.wiki == entry.wiki
-                        && ready.snapshot == entry.snapshot
-                        && candidate_identity(&candidate).map(|identity| identity.1)
-                            == Some(ready.run_id.as_str()),
-                    "ready candidate identity does not match selection"
-                );
-                validate_ready_candidate(data_dir, &candidate, &ready)
-            });
-        if let Err(error) = validation {
-            candidate_artifacts_valid = false;
-            report.reasons.push(format!(
-                "selected candidate {}/{} is invalid: {error:#}",
-                entry.wiki, entry.snapshot
-            ));
-        }
-        let expected_target = PathBuf::from(&entry.candidate_relative).join(&entry.wiki);
-        if active_candidate_target(output_dir, &entry.wiki)
-            .ok()
-            .flatten()
-            .as_ref()
-            == Some(&expected_target)
-        {
-            report.evidence.live_candidate_matches += 1;
-        }
-        if storage::current_snapshot_version(data_dir, &entry.wiki)
-            .ok()
-            .flatten()
-            .as_deref()
-            == Some(entry.snapshot.as_str())
-        {
-            report.evidence.snapshot_pointer_matches += 1;
+        let lineage = prove_recovery_candidate_lineage(output_dir, entry, &committed_edges);
+        match lineage {
+            Ok(lineage) => {
+                if lineage.selected_is_live() {
+                    let validation = read_json::<ReadyWikiCandidate>(&candidate.join("ready.json"))
+                        .and_then(|ready| {
+                            ensure!(
+                                ready.wiki == entry.wiki
+                                    && ready.snapshot == entry.snapshot
+                                    && candidate_identity(&candidate).map(|identity| identity.1)
+                                        == Some(ready.run_id.as_str()),
+                                "ready candidate identity does not match selection"
+                            );
+                            validate_ready_candidate(data_dir, &candidate, &ready)
+                        });
+                    if let Err(error) = validation {
+                        candidate_artifacts_valid = false;
+                        report.reasons.push(format!(
+                            "selected candidate {}/{} is invalid: {error:#}",
+                            entry.wiki, entry.snapshot
+                        ));
+                    }
+                    report.evidence.live_candidate_matches += 1;
+                } else {
+                    report.evidence.superseded_candidate_matches += 1;
+                }
+                if storage::current_snapshot_version(data_dir, &entry.wiki)
+                    .ok()
+                    .flatten()
+                    .as_deref()
+                    == Some(lineage.live_snapshot.as_str())
+                {
+                    report.evidence.snapshot_pointer_matches += 1;
+                }
+                effective_snapshots.insert(entry.wiki.clone(), lineage.live_snapshot);
+            }
+            Err(error) => {
+                candidate_artifacts_valid = false;
+                let edge_context = committed_edges_error
+                    .as_deref()
+                    .map(|edge_error| format!("; committed journal scan failed: {edge_error}"))
+                    .unwrap_or_default();
+                report.reasons.push(format!(
+                    "selected candidate {}/{} has no proven live lineage: {error:#}{edge_context}",
+                    entry.wiki, entry.snapshot
+                ));
+            }
         }
     }
     report.evidence.candidate_artifacts_valid = candidate_artifacts_valid;
@@ -1527,10 +1705,10 @@ fn audit_publication_transaction(
     report.evidence.current_gate_run_id = gate.as_ref().map(|gate| gate.run_id.clone());
     report.evidence.current_gate_valid = verify(output_dir, "publication-recovery-audit").is_ok();
     report.evidence.current_gate_covers_selection = gate.as_ref().is_some_and(|gate| {
-        selection
-            .entries
-            .iter()
-            .all(|entry| gate.selected_snapshot_versions.get(&entry.wiki) == Some(&entry.snapshot))
+        effective_snapshots.len() == selection.entries.len()
+            && effective_snapshots
+                .iter()
+                .all(|(wiki, snapshot)| gate.selected_snapshot_versions.get(wiki) == Some(snapshot))
     });
     report.evidence.current_site_matches_gate =
         crate::fingerprint::current_site_matches_publication(output_dir, site_dist_dir)
@@ -1539,11 +1717,12 @@ fn audit_publication_transaction(
         crate::fingerprint::current_site_has_valid_receipt(output_dir, site_dist_dir)
             .unwrap_or(false);
 
-    let all_selected_live = report.evidence.live_candidate_matches == selection.entries.len();
+    let all_candidates_accounted = report.evidence.live_candidate_matches
+        + report.evidence.superseded_candidate_matches
+        == selection.entries.len();
     let all_snapshots_selected =
         report.evidence.snapshot_pointer_matches == selection.entries.len();
     let gate_run_id = gate.as_ref().map(|gate| gate.run_id.as_str());
-    let journal_modified = modified_unix_nanos(&path).ok();
     let site_receipt_modified = modified_unix_nanos(&output_dir.join("_stages/site.json")).ok();
     let later_gate = gate.as_ref().is_some_and(|gate| {
         gate.run_id != selection.run_id
@@ -1557,7 +1736,7 @@ fn audit_publication_transaction(
         && report.evidence.current_site_matches_gate;
 
     if candidate_artifacts_valid
-        && all_selected_live
+        && report.evidence.live_candidate_matches == selection.entries.len()
         && all_snapshots_selected
         && publication_proven
         && same_gate
@@ -1567,7 +1746,7 @@ fn audit_publication_transaction(
             "selected candidates, gate, and site prove this transaction was published".to_string(),
         );
     } else if candidate_artifacts_valid
-        && all_selected_live
+        && all_candidates_accounted
         && all_snapshots_selected
         && publication_proven
         && later_gate
@@ -1774,12 +1953,25 @@ fn retire_superseded_candidates(
     entry: &SelectionEntry,
     publication_run_id: &str,
 ) -> Result<usize> {
-    let root = output_dir.join("_candidates").join(&entry.wiki);
-    let retained = output_dir.join(&entry.candidate_relative);
-    let rollback = entry
-        .previous_candidate_relative
-        .as_deref()
-        .map(|relative| output_dir.join(relative));
+    retire_candidates_outside_rollback(
+        output_dir,
+        &entry.wiki,
+        &entry.candidate_relative,
+        entry.previous_candidate_relative.as_deref(),
+        publication_run_id,
+    )
+}
+
+fn retire_candidates_outside_rollback(
+    output_dir: &Path,
+    wiki: &str,
+    retained_relative: &str,
+    rollback_relative: Option<&str>,
+    publication_run_id: &str,
+) -> Result<usize> {
+    let root = output_dir.join("_candidates").join(wiki);
+    let retained = output_dir.join(retained_relative);
+    let rollback = rollback_relative.map(|relative| output_dir.join(relative));
     let mut removed = 0;
     if !root.is_dir() {
         return Ok(0);
@@ -1801,7 +1993,7 @@ fn retire_superseded_candidates(
             let Some((snapshot, run_id)) = candidate_identity(&candidate_dir) else {
                 continue;
             };
-            let generation = CandidateGeneration::new(output_dir, &entry.wiki, snapshot, run_id);
+            let generation = CandidateGeneration::new(output_dir, wiki, snapshot, run_id);
             let reason = "adopted legacy ready candidate";
             let record = generation.adopt(GState::Ready, reason)?;
             if matches!(
@@ -2154,20 +2346,33 @@ fn reconcile_later_publication(
         receipt.run_id != selection.run_id,
         "reconciliation requires a later publication"
     );
+    let journal_modified = modified_unix_nanos(&path)?;
+    let committed_edges = committed_candidate_edges_after(output_dir, journal_modified)?;
     for entry in &selection.entries {
+        let lineage = prove_recovery_candidate_lineage(output_dir, entry, &committed_edges)?;
         ensure!(
             active_candidate_relative(output_dir, &entry.wiki)?.as_deref()
-                == Some(entry.candidate_relative.as_str()),
-            "selected candidate changed before reconciliation"
+                == Some(lineage.live_candidate_relative.as_str()),
+            "live candidate changed before reconciliation"
         );
         ensure!(
             storage::current_snapshot_version(data_dir, &entry.wiki)?.as_deref()
-                == Some(entry.snapshot.as_str()),
-            "selected snapshot changed before reconciliation"
+                == Some(lineage.live_snapshot.as_str())
+                && receipt.selected_snapshot_versions.get(&entry.wiki)
+                    == Some(&lineage.live_snapshot),
+            "live snapshot changed before reconciliation"
         );
-        reconcile_generation_as_published(output_dir, entry, &receipt.run_id)?;
-        reconcile_previous_generation(output_dir, entry, &receipt.run_id)?;
-        let retired_candidates = retire_superseded_candidates(output_dir, entry, &receipt.run_id)?;
+        if lineage.selected_is_live() {
+            reconcile_generation_as_published(output_dir, entry, &receipt.run_id)?;
+            reconcile_previous_generation(output_dir, entry, &receipt.run_id)?;
+        }
+        let retired_candidates = retire_candidates_outside_rollback(
+            output_dir,
+            &entry.wiki,
+            &lineage.live_candidate_relative,
+            lineage.rollback_candidate_relative.as_deref(),
+            &receipt.run_id,
+        )?;
         storage::retire_inactive_snapshots(data_dir, &entry.wiki)?;
         remove_committed_backup(output_dir, entry.backup_relative.as_deref())?;
         info!(
@@ -3158,6 +3363,10 @@ mod tests {
                 crate::snapshot_plan::SnapshotPlan::load_or_resolve(data_dir, "nlwiki", snapshot)?;
             let source_sizes = vec![Some(1); plan.sources.len()];
             crate::workload_profile::load_or_select(self.data.path(), &plan, &source_sizes)?;
+            self.ready_candidate_from_current_generation(run_id)
+        }
+
+        fn ready_candidate_from_current_generation(&self, run_id: &str) -> Result<PathBuf> {
             let candidate = wiki_candidate_dir(self.output.path(), "nlwiki", "2026-03", run_id)?;
             let candidate_wiki = candidate.join("nlwiki");
             fs::create_dir_all(&candidate_wiki)?;
@@ -4826,6 +5035,168 @@ mod tests {
     }
 
     #[test]
+    fn later_committed_successor_reconciles_superseded_selection() -> Result<()> {
+        let fixture = Fixture::new()?;
+        fixture.ready_candidate("candidate-1")?;
+        prepare_ready_publication(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "publish-1",
+        )
+        .expect("first publication should prepare");
+        let site_root = TestDir::new()?;
+        let site = site_root.path().join("site");
+        let dist = site_root.path().join("dist");
+        fs::create_dir_all(site.join("src"))?;
+        fs::create_dir_all(site.join("data-build"))?;
+        fs::create_dir_all(&dist)?;
+        fs::write(site.join("src/index.md"), "# Site")?;
+        fs::write(site.join("data-build/manifest.sh"), "true")?;
+        fs::write(site.join("observablehq.config.js"), "export default {}")?;
+        fs::write(site.join("package.json"), "{}")?;
+        fs::write(
+            site_root.path().join("package.json"),
+            "{\"workspaces\":[\"site\"]}",
+        )
+        .expect("site workspace should write");
+        fs::write(site_root.path().join("package-lock.json"), "{}")?;
+        fs::write(dist.join("index.html"), "published")?;
+        crate::fingerprint::record_site(fixture.output.path(), &site, &dist)?;
+        commit_ready_publication(fixture.data.path(), fixture.output.path(), "publish-1")?;
+
+        fixture.ready_candidate("candidate-2")?;
+        prepare_ready_publication(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "interrupted-publication",
+        )
+        .expect("interrupted publication should prepare");
+
+        fixture.ready_candidate_from_current_generation("candidate-3")?;
+        prepare_ready_publication(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "publish-3",
+        )
+        .expect("successor publication should prepare");
+        crate::fingerprint::record_site(fixture.output.path(), &site, &dist)?;
+        commit_ready_publication(fixture.data.path(), fixture.output.path(), "publish-3")?;
+
+        atomic_json(
+            &selection_path(fixture.output.path(), "later-no-op")?,
+            &PublicationSelection {
+                schema_version: 1,
+                run_id: "later-no-op".to_string(),
+                state: "no_op".to_string(),
+                entries: Vec::new(),
+            },
+        )
+        .expect("later terminal no-op journal should write");
+        atomic_json(
+            &selection_path(fixture.output.path(), "later-initial-commit")?,
+            &PublicationSelection {
+                schema_version: 1,
+                run_id: "later-initial-commit".to_string(),
+                state: "committed".to_string(),
+                entries: vec![SelectionEntry {
+                    wiki: "nlwiki".to_string(),
+                    snapshot: "2026-03".to_string(),
+                    candidate_relative: "_candidates/nlwiki/2026-03/candidate-3".to_string(),
+                    previous_candidate_relative: None,
+                    previous_snapshot: None,
+                    backup_relative: None,
+                    workload_profile: None,
+                }],
+            },
+        )
+        .expect("later committed journal without a predecessor should write");
+
+        let audit = audit_publication_recovery(
+            fixture.data.path(),
+            fixture.output.path(),
+            &dist,
+            Some("interrupted-publication"),
+        );
+        assert_eq!(audit.transactions[0].evidence.live_candidate_matches, 0);
+        let superseded_matches = audit.transactions[0].evidence.superseded_candidate_matches;
+        assert_eq!(superseded_matches, 1);
+        assert_eq!(
+            audit.transactions[0].classification,
+            PublicationRecoveryClassification::IncorporatedByLaterPublication
+        );
+
+        let recovered = recover_publication_transactions(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            &dist,
+            Some("interrupted-publication"),
+            "recover-superseded",
+        )
+        .expect("superseded selection should recover");
+        assert!(recovered.repaired);
+        assert_eq!(
+            recovered.transactions[0].classification,
+            PublicationRecoveryClassification::Reconciled
+        );
+        assert_eq!(
+            active_candidate_relative(fixture.output.path(), "nlwiki")?.as_deref(),
+            Some("_candidates/nlwiki/2026-03/candidate-3")
+        );
+        assert_eq!(
+            crate::generation_lifecycle::load(
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                "candidate-3",
+            )
+            .expect("live successor state should load")
+            .context("live successor state should exist")?
+            .state,
+            GState::Published
+        );
+        assert_eq!(
+            crate::generation_lifecycle::load(
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                "candidate-2",
+            )
+            .expect("rollback predecessor state should load")
+            .context("rollback predecessor state should exist")?
+            .state,
+            GState::Superseded
+        );
+        let retained = fs::read_dir(fixture.output.path().join("_candidates/nlwiki/2026-03"))?
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| entry.path().is_dir())
+            .count();
+        assert_eq!(retained, 2, "live successor plus one rollback must remain");
+        assert!(
+            !fixture
+                .output
+                .path()
+                .join("_publication_transactions/interrupted-publication/backups/nlwiki")
+                .exists()
+        );
+
+        let second = recover_publication_transactions(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            &dist,
+            Some("interrupted-publication"),
+            "recover-superseded-again",
+        )
+        .expect("repeated superseded recovery should be idempotent");
+        assert!(!second.repaired);
+        Ok(())
+    }
+
+    #[test]
     fn ambiguous_recovery_is_quarantined_without_deleting_evidence() -> Result<()> {
         let fixture = Fixture::new()?;
         let run_id = "ambiguous-publication";
@@ -4992,6 +5363,32 @@ mod tests {
         );
         assert!(!invalid_candidate.evidence.candidate_artifacts_valid);
 
+        let later_corrupt = selection_path(fixture.output.path(), "later-corrupt")?;
+        fs::create_dir_all(later_corrupt.parent().context("later journal parent")?)?;
+        fs::write(later_corrupt, "{truncated")?;
+        fs::remove_file(fixture.output.path().join("nlwiki"))?;
+        std::os::unix::fs::symlink(
+            "_candidates/nlwiki/2026-03/unknown/nlwiki",
+            fixture.output.path().join("nlwiki"),
+        )
+        .expect("unproven live candidate link should write");
+        let broken_lineage = audit_publication_transaction(
+            fixture.data.path(),
+            fixture.output.path(),
+            fixture.output.path(),
+            "active-audit",
+        );
+        assert_eq!(
+            broken_lineage.classification,
+            PublicationRecoveryClassification::Ambiguous
+        );
+        assert!(
+            broken_lineage
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("committed journal scan failed"))
+        );
+
         let mut unsafe_candidate: PublicationSelection = read_json(&terminal_path)?;
         unsafe_candidate.schema_version = 1;
         unsafe_candidate.state = "selected".to_string();
@@ -5070,6 +5467,48 @@ mod tests {
             )
             .is_err()
         );
+
+        let retirement_fixture = Fixture::new()?;
+        let (site_root, retirement_dist) = retirement_fixture.published_site("baseline")?;
+        retirement_fixture.ready_candidate("candidate")?;
+        prepare_ready_publication(
+            retirement_fixture.data.path(),
+            retirement_fixture.output.path(),
+            &retirement_fixture.lifecycle_path,
+            "interrupted",
+        )
+        .expect("retirement failure publication should prepare");
+        begin_selected_run(retirement_fixture.output.path(), "later", &BTreeMap::new())?;
+        crate::merge::merge_outputs(retirement_fixture.output.path(), Some("later"))?;
+        validate(
+            retirement_fixture.data.path(),
+            retirement_fixture.output.path(),
+            &retirement_fixture.lifecycle_path,
+            "later",
+        )
+        .expect("retirement failure later gate should validate");
+        crate::fingerprint::record_site(
+            retirement_fixture.output.path(),
+            &site_root.path().join("site"),
+            &retirement_dist,
+        )
+        .expect("retirement failure later site should record");
+        let blocked_snapshot = retirement_fixture
+            .output
+            .path()
+            .join("_candidates/nlwiki/2025-01");
+        fs::create_dir_all(&blocked_snapshot)?;
+        fs::set_permissions(&blocked_snapshot, fs::Permissions::from_mode(0o000))?;
+        let retirement_error = recover_publication_transactions(
+            retirement_fixture.data.path(),
+            retirement_fixture.output.path(),
+            &retirement_fixture.lifecycle_path,
+            &retirement_dist,
+            Some("interrupted"),
+            "failed-retirement",
+        );
+        fs::set_permissions(&blocked_snapshot, fs::Permissions::from_mode(0o755))?;
+        assert!(retirement_error.is_err());
 
         let rollback_fixture = Fixture::new()?;
         let (_site_root, dist) = rollback_fixture.published_site("baseline")?;
