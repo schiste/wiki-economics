@@ -637,12 +637,13 @@ fn load_latest_lifecycle_checkpoint(
         }
     }
     for (through_month, prefix) in boundaries.into_iter().rev() {
-        let checkpoint: Option<LifecycleCheckpoint> = cache.load_json(
+        let checkpoint_result = cache.load_json(
             "lifecycle_checkpoint",
             lifecycle::ALGORITHM_VERSION,
             &prefix,
             "state",
-        )?;
+        );
+        let checkpoint: Option<LifecycleCheckpoint> = checkpoint_result?;
         if let Some(checkpoint) = checkpoint {
             checkpoint.validate(&through_month, &prefix)?;
             return Ok(Some(checkpoint));
@@ -668,13 +669,13 @@ fn load_cached_lifecycle_outputs(
 ) -> Result<Option<Vec<(&'static str, DataFrame)>>> {
     let mut outputs = Vec::new();
     for metric in lifecycle::METRICS {
-        let Some(frame) = cache.load(
+        let cached = cache.load(
             "lifecycle_final",
             lifecycle::ALGORITHM_VERSION,
             input_digest,
             metric,
-        )?
-        else {
+        );
+        let Some(frame) = cached? else {
             return Ok(None);
         };
         outputs.push((metric, frame));
@@ -693,13 +694,14 @@ fn store_lifecycle_outputs(
         let mut frame = ParquetReader::new(File::open(path)?)
             .set_low_memory(true)
             .finish()?;
-        cache.store(
+        let store_result = cache.store(
             "lifecycle_final",
             lifecycle::ALGORITHM_VERSION,
             input_digest,
             metric,
             &mut frame,
-        )?;
+        );
+        store_result?;
     }
     Ok(())
 }
@@ -1769,7 +1771,10 @@ fn weekly_group_keys() -> [Expr; 4] {
     ]
 }
 
+#[cfg(not(test))]
 const WEEKLY_EXTERNAL_BATCH_ROWS: usize = 100_000;
+#[cfg(test)]
+const WEEKLY_EXTERNAL_BATCH_ROWS: usize = 2;
 const WEEKLY_EXTERNAL_READ_ROWS: usize = 4_096;
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -1799,23 +1804,23 @@ struct WeeklyContributionCursor {
 
 impl WeeklyContributionCursor {
     fn new(path: &Path) -> Result<Self> {
+        let projection = [
+            "page_id",
+            "page_namespace",
+            "page_title",
+            "week_start",
+            "edits",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let reader_result = storage::SequentialParquetReader::new(
+            path,
+            Some(projection),
+            WEEKLY_EXTERNAL_READ_ROWS,
+        );
         Ok(Self {
-            reader: storage::SequentialParquetReader::new(
-                path,
-                Some(
-                    [
-                        "page_id",
-                        "page_namespace",
-                        "page_title",
-                        "week_start",
-                        "edits",
-                    ]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-                ),
-                WEEKLY_EXTERNAL_READ_ROWS,
-            )?,
+            reader: reader_result?,
             batch: None,
             row: 0,
             previous: None,
@@ -1959,16 +1964,18 @@ fn compute_page_weekly_external_qualification(
 ) -> Result<Option<WeeklyAggregationReport>> {
     let started = Instant::now();
     let snapshot = snapshot.context("external weekly qualification requires a snapshot")?;
-    let layer = storage::snapshot_compute_layer(
+    let layer_result = storage::snapshot_compute_layer(
         data_dir,
         wiki,
         snapshot,
         storage::GenerationLayer::Warehouse,
-    )?;
+    );
+    let layer = layer_result?;
     let partitions = storage::snapshot_partition_specs(data_dir, wiki, snapshot, layer)?;
-    if partitions.is_empty() {
-        return Ok(None);
-    }
+    anyhow::ensure!(
+        !partitions.is_empty(),
+        "external weekly qualification requires at least one input partition"
+    );
     let runs = WeeklyRunDir::new(output_dir, wiki, config.scratch_root.as_deref())?;
     let event_date_options = StrptimeOptions {
         format: Some("%Y-%m-%d".into()),
@@ -1984,7 +1991,7 @@ fn compute_page_weekly_external_qualification(
         let input_digest = cross_snapshot
             .map(|cache| cache.month_digest(&partition.year_month))
             .transpose()?;
-        let mut contribution = cached_or_compute(
+        let contribution_result = cached_or_compute(
             cross_snapshot,
             "page_week_contribution",
             weekly::CONTRIBUTION_ALGORITHM_VERSION,
@@ -2007,7 +2014,8 @@ fn compute_page_weekly_external_qualification(
                     .collect()?;
                 sort_frame(reduced, weekly_sort_keys())
             },
-        )?;
+        );
+        let mut contribution = contribution_result?;
         let edits = sum_edits_column(std::slice::from_ref(&contribution))?;
         let source_rows = parquet_paths_row_count(&partition.files)?;
         anyhow::ensure!(
@@ -2050,15 +2058,10 @@ fn compute_page_weekly_external_qualification(
     let flush = |batch: &mut WeeklyFinalBatch,
                  writer: &mut Option<AtomicBatchedParquetWriter>|
      -> Result<()> {
-        if batch.len() == 0 {
-            return Ok(());
-        }
         let mut frame = batch.take_frame(wiki)?;
         if writer.is_none() {
-            *writer = Some(AtomicBatchedParquetWriter::new(
-                final_path.clone(),
-                frame.schema(),
-            )?);
+            let writer_result = AtomicBatchedParquetWriter::new(final_path.clone(), frame.schema());
+            *writer = Some(writer_result?);
         }
         writer
             .as_mut()
@@ -2092,15 +2095,15 @@ fn compute_page_weekly_external_qualification(
             }
         }
     }
-    if let Some(completed) = current {
-        minimum_week = minimum_week.into_iter().chain([completed.week_start]).min();
-        maximum_week = maximum_week.into_iter().chain([completed.week_start]).max();
-        total_edits_after = total_edits_after
-            .checked_add(i64::from(completed.edits))
-            .context("external weekly output edit overflow")?;
-        output_rows += 1;
-        batch.push(completed)?;
-    }
+    let completed = current.context("external weekly merge produced no rows")?;
+    minimum_week = minimum_week.into_iter().chain([completed.week_start]).min();
+    maximum_week = maximum_week.into_iter().chain([completed.week_start]).max();
+    total_edits_after = total_edits_after
+        .checked_add(i64::from(completed.edits))
+        .context("external weekly output edit overflow")?;
+    output_rows += 1;
+    let push_result = batch.push(completed);
+    push_result?;
     flush(&mut batch, &mut writer)?;
     anyhow::ensure!(
         total_edits_before == total_edits_after,
@@ -2923,12 +2926,13 @@ fn compute_all_incremental_cached(
                 "analytical partitions are not ordered chronologically"
             );
             if partition.year != current_year {
-                finish_activity_year_cached(
+                let finish_result = finish_activity_year_cached(
                     &mut gdp_editor_month_frames,
                     &mut gdp_tier_frames,
                     &mut gdp_activity_month_digests,
                     cross_snapshot,
-                )?;
+                );
+                finish_result?;
             }
         }
         if plan.activity_tiers.must_compute() {
@@ -2954,51 +2958,56 @@ fn compute_all_incremental_cached(
             let input_digest = cross_snapshot
                 .map(|cache| cache.month_digest(&partition.year_month))
                 .transpose()?;
-            inequality_frames.push(cached_or_compute(
+            let inequality = cached_or_compute(
                 cross_snapshot,
                 "monthly",
                 monthly::ALGORITHM_VERSION,
                 input_digest,
                 "inequality",
                 || inequality::compute_frame(&base),
-            )?);
-            gdp_frames.push(cached_or_compute(
+            );
+            inequality_frames.push(inequality?);
+            let gdp = cached_or_compute(
                 cross_snapshot,
                 "monthly",
                 monthly::ALGORITHM_VERSION,
                 input_digest,
                 "gdp",
                 || gdp_monthly_frame(&base),
-            )?);
-            gdp_type_frames.push(cached_or_compute(
+            );
+            gdp_frames.push(gdp?);
+            let gdp_type = cached_or_compute(
                 cross_snapshot,
                 "monthly",
                 monthly::ALGORITHM_VERSION,
                 input_digest,
                 "gdp_user_type_share",
                 || gdp_type_share_frame(&base),
-            )?);
-            labor_monthly_frames.push(cached_or_compute(
+            );
+            gdp_type_frames.push(gdp_type?);
+            let labor_monthly = cached_or_compute(
                 cross_snapshot,
                 "monthly",
                 monthly::ALGORITHM_VERSION,
                 input_digest,
                 "labor_monthly",
                 || labor_monthly_frame(&base),
-            )?);
+            );
+            labor_monthly_frames.push(labor_monthly?);
         }
         if plan.activity_tiers.must_compute() {
             let input_digest = cross_snapshot
                 .map(|cache| cache.month_digest(&partition.year_month))
                 .transpose()?;
-            gdp_editor_month_frames.push(cached_or_compute(
+            let editor_month = cached_or_compute(
                 cross_snapshot,
                 "editor_month",
                 activity::ALGORITHM_VERSION,
                 input_digest,
                 "editor_month",
                 || gdp_editor_month_frame(&base),
-            )?);
+            );
+            gdp_editor_month_frames.push(editor_month?);
             if let Some(input_digest) = input_digest {
                 gdp_activity_month_digests.push(input_digest.to_string());
             }
@@ -3018,13 +3027,14 @@ fn compute_all_incremental_cached(
         {
             let prefix = lifecycle_prefix_digest(cache, &lifecycle_month_digests);
             let checkpoint = LifecycleCheckpoint::from_state(state, &partition.year_month, &prefix);
-            cache.store_json(
+            let checkpoint_result = cache.store_json(
                 "lifecycle_checkpoint",
                 lifecycle::ALGORITHM_VERSION,
                 &prefix,
                 "state",
                 &checkpoint,
-            )?;
+            );
+            checkpoint_result?;
         }
         for file in &partition.files {
             storage::discard_path_cache(file);
@@ -3042,12 +3052,13 @@ fn compute_all_incremental_cached(
         result.context("failed to write partitioned monthly-family outputs")?;
     }
     if plan.activity_tiers.must_compute() {
-        finish_activity_year_cached(
+        let finish_result = finish_activity_year_cached(
             &mut gdp_editor_month_frames,
             &mut gdp_tier_frames,
             &mut gdp_activity_month_digests,
             cross_snapshot,
-        )?;
+        );
+        finish_result?;
         write_activity_outputs(wiki, output_dir, gdp_tier_frames)?;
     }
     if let Some(outputs) = cached_lifecycle_outputs.as_mut() {
@@ -3107,12 +3118,13 @@ fn finish_activity_year_cached(
         let digest_refs = month_digests.iter().map(String::as_str).collect::<Vec<_>>();
         let input_digest =
             cache.derived_digest("activity_year", activity::ALGORITHM_VERSION, &digest_refs);
-        if let Some(frame) = cache.load(
+        let cached = cache.load(
             "activity_year",
             activity::ALGORITHM_VERSION,
             &input_digest,
             "gdp_activity_tiers",
-        )? {
+        );
+        if let Some(frame) = cached? {
             editor_month_frames.clear();
             month_digests.clear();
             output_frames.push(frame);
@@ -3121,13 +3133,14 @@ fn finish_activity_year_cached(
         let mut frames = Vec::new();
         finish_activity_year(editor_month_frames, &mut frames)?;
         let mut frame = concat_frames(frames)?;
-        cache.store(
+        let store_result = cache.store(
             "activity_year",
             activity::ALGORITHM_VERSION,
             &input_digest,
             "gdp_activity_tiers",
             &mut frame,
-        )?;
+        );
+        store_result?;
         month_digests.clear();
         output_frames.push(frame);
         return Ok(());
@@ -3635,22 +3648,24 @@ pub(crate) fn compute_cross_snapshot_qualification_build(
     let cache = use_cache
         .then(|| crate::cross_snapshot::CrossSnapshotCache::new(data_dir, wiki, snapshot))
         .transpose()?;
-    compute_all_incremental_cached(
+    let compute_result = compute_all_incremental_cached(
         wiki,
         data_dir,
         output_dir,
         Some(snapshot),
         ComputePlan::all_recompute(),
         cache.as_ref(),
-    )?;
-    compute_page_weekly_external_qualification(
+    );
+    compute_result?;
+    let weekly_result = compute_page_weekly_external_qualification(
         wiki,
         data_dir,
         output_dir,
         &weekly_config,
         Some(snapshot),
         cache.as_ref(),
-    )?;
+    );
+    weekly_result?;
     Ok(cache.as_ref().map_or_default(|cache| cache.stats()))
 }
 
@@ -5623,6 +5638,66 @@ mod tests {
         let frame = concat_frames(Vec::new())?;
         assert_eq!(frame.height(), 0);
         assert_eq!(frame.width(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn cross_snapshot_helpers_fail_closed_and_clear_empty_periods() -> Result<()> {
+        let root = TestDir::new()?;
+        let identity = crate::canonical_month::MonthIdentity {
+            schema_version: 1,
+            wiki: "testwiki".to_string(),
+            event_month: "2024-02".to_string(),
+            logical_schema_version: crate::canonical_month::LOGICAL_SCHEMA_VERSION,
+            encoding_version: crate::canonical_month::ENCODING_VERSION.to_string(),
+            ordering_contract: "test".to_string(),
+            digest: "ab".repeat(32),
+            rows: 1,
+            edits: 1,
+        };
+        let cache = crate::cross_snapshot::CrossSnapshotCache::for_test(
+            root.path(),
+            "testwiki",
+            vec![identity],
+        );
+
+        let mut editor_month_frames = Vec::new();
+        let mut output_frames = Vec::new();
+        let mut month_digests = vec!["stale".to_string()];
+        let empty_finish = finish_activity_year_cached(
+            &mut editor_month_frames,
+            &mut output_frames,
+            &mut month_digests,
+            Some(&cache),
+        );
+        empty_finish?;
+        assert!(month_digests.is_empty());
+        assert!(output_frames.is_empty());
+
+        editor_month_frames.push(editor_months(&[1], &[202402], &[1])?);
+        assert!(
+            finish_activity_year_cached(
+                &mut editor_month_frames,
+                &mut output_frames,
+                &mut month_digests,
+                Some(&cache),
+            )
+            .is_err()
+        );
+        assert!(WeeklyContributionCursor::new(&root.path().join("missing.parquet")).is_err());
+
+        let existing_output = root.path().join("existing-output");
+        fs::create_dir(&existing_output)?;
+        assert!(
+            compute_cross_snapshot_qualification_build(
+                "testwiki",
+                "2026-08",
+                root.path(),
+                &existing_output,
+                true,
+            )
+            .is_err()
+        );
         Ok(())
     }
 

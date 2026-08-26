@@ -966,14 +966,15 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             work_dir,
             report,
         } => {
-            let qualification = cross_snapshot::qualify(
+            let qualification_result = cross_snapshot::qualify(
                 &data_dir,
                 &wiki,
                 &baseline_version,
                 &candidate_version,
                 &work_dir,
                 &report,
-            )?;
+            );
+            let qualification = qualification_result?;
             println!("{}", serde_json::to_string(&qualification)?);
         }
         Commands::CleanupStale {

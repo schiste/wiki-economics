@@ -171,7 +171,7 @@ struct SortedRun {
 
 impl SortedRun {
     fn new(path: &Path) -> Result<Self> {
-        let reader = storage::SequentialParquetReader::new(
+        let reader_result = storage::SequentialParquetReader::new(
             path,
             Some(
                 schema::METRIC_INPUT_COLUMNS
@@ -180,7 +180,8 @@ impl SortedRun {
                     .collect(),
             ),
             BATCH_ROWS,
-        )?;
+        );
+        let reader = reader_result?;
         validate_schema(&reader.schema_frame()?)?;
         Ok(Self {
             reader,
@@ -440,29 +441,32 @@ pub(crate) fn ensure_snapshot_inventory(
     let (_, generation_manifest_sha256) = storage::sha256_file(&manifest_path)?;
     let inventory_path = inventory_path(data_dir, wiki, snapshot)?;
     if inventory_path.is_file() {
-        let inventory: MonthInventory = serde_json::from_slice(&fs::read(&inventory_path)?)
-            .with_context(|| {
-                format!(
-                    "invalid canonical month inventory {}",
-                    inventory_path.display()
-                )
-            })?;
-        validate_inventory(
+        let bytes = fs::read(&inventory_path)?;
+        let parsed = serde_json::from_slice(&bytes);
+        let inventory: MonthInventory = parsed.with_context(|| {
+            format!(
+                "invalid canonical month inventory {}",
+                inventory_path.display()
+            )
+        })?;
+        let validation = validate_inventory(
             data_dir,
             wiki,
             snapshot,
             &generation_manifest_sha256,
             &inventory,
-        )?;
+        );
+        validation?;
         return Ok(inventory);
     }
 
-    let partitions = storage::snapshot_partition_specs(
+    let partitions_result = storage::snapshot_partition_specs(
         data_dir,
         wiki,
         snapshot,
         storage::GenerationLayer::MetricInput,
-    )?;
+    );
+    let partitions = partitions_result?;
     ensure!(
         !partitions.is_empty(),
         "compacted generation has no metric-input months"
@@ -481,13 +485,14 @@ pub(crate) fn ensure_snapshot_inventory(
         generation_manifest_sha256,
         identities,
     };
-    validate_inventory(
+    let validation = validate_inventory(
         data_dir,
         wiki,
         snapshot,
         &inventory.generation_manifest_sha256,
         &inventory,
-    )?;
+    );
+    validation?;
     write_receipt_json(&inventory_path, &inventory)?;
     Ok(inventory)
 }
@@ -567,10 +572,15 @@ mod tests {
     fn parquet(path: &Path, revisions: &[i64]) -> Result<()> {
         path.parent().map(fs::create_dir_all).transpose()?;
         let mut frame = frame(revisions)?;
+        write_frame(path, &mut frame)
+    }
+
+    fn write_frame(path: &Path, frame: &mut DataFrame) -> Result<()> {
+        path.parent().map(fs::create_dir_all).transpose()?;
         let mut file = File::create(path)?;
         ParquetWriter::new(&mut file)
             .with_compression(ParquetCompression::Zstd(None))
-            .finish(&mut frame)?;
+            .finish(frame)?;
         Ok(())
     }
 
@@ -586,7 +596,8 @@ mod tests {
             "testwiki",
             "2024-02",
             vec![first.join("b.parquet"), first.join("a.parquet")],
-        )?;
+        );
+        let left = left?;
         let right = compute("testwiki", "2024-02", vec![second.join("renamed.parquet")])?;
         assert_eq!(left.digest, right.digest);
         assert_eq!(left.rows, 4);
@@ -599,7 +610,8 @@ mod tests {
                 second.join("renamed.parquet"),
                 second.join("duplicate.parquet"),
             ],
-        )?;
+        );
+        let duplicate = duplicate?;
         assert_ne!(duplicate.digest, left.digest);
         assert_eq!(duplicate.rows, 5);
         Ok(())
@@ -611,9 +623,36 @@ mod tests {
         let unsorted = root.path().join("unsorted.parquet");
         parquet(&unsorted, &[2, 1])?;
         assert!(compute("testwiki", "2024-02", vec![unsorted]).is_err());
+        assert!(
+            compute(
+                "testwiki",
+                "2024-02",
+                vec![root.path().join("missing.parquet")],
+            )
+            .is_err()
+        );
         let ordered = root.path().join("ordered.parquet");
         parquet(&ordered, &[1])?;
         assert!(compute("testwiki", "2024-03", vec![ordered]).is_err());
+        assert!(compute("testwiki", "bad", Vec::new()).is_err());
+        assert!(compute("testwiki", "2024-02", Vec::new()).is_err());
+
+        let wrong_type = root.path().join("wrong-type.parquet");
+        let mut wrong_type_frame = frame(&[1])?;
+        wrong_type_frame
+            .replace(
+                "page_namespace",
+                Column::new("page_namespace".into(), ["zero"]),
+            )
+            .expect("test column replacement should succeed");
+        write_frame(&wrong_type, &mut wrong_type_frame)?;
+        assert!(compute("testwiki", "2024-02", vec![wrong_type]).is_err());
+
+        let missing = root.path().join("missing.parquet");
+        let mut missing_frame = frame(&[1])?;
+        missing_frame.drop_in_place("is_minor")?;
+        write_frame(&missing, &mut missing_frame)?;
+        assert!(compute("testwiki", "2024-02", vec![missing]).is_err());
         Ok(())
     }
 
@@ -626,6 +665,13 @@ mod tests {
         let path = receipt_path(root.path(), "testwiki", "2026-08", "2024-02")?;
         write_receipt(&path, &identity)?;
         assert_eq!(read_receipt(&path)?, identity);
+        assert!(receipt_path(root.path(), "testwiki", "2026-08", "../bad").is_err());
+        let blocked = root.path().join("blocked.json");
+        fs::create_dir(&blocked)?;
+        assert!(write_receipt(&blocked, &identity).is_err());
+        let blocked_inventory = root.path().join("blocked-inventory.json");
+        fs::create_dir(&blocked_inventory)?;
+        assert!(write_receipt_json(&blocked_inventory, &identity).is_err());
         fs::write(&path, b"{\"schema_version\":1}")?;
         assert!(read_receipt(&path).is_err());
         Ok(())

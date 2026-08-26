@@ -4,26 +4,26 @@
     {
       "family": "monthly",
       "paths": ["src/compute/mod.rs"],
-      "reason": "Add publication-invisible semantic equivalence reporting without changing monthly metric semantics or final bytes.",
-      "base_commit": "c8c9ce2513293573f209840fa80bd0564b5dcfbc"
+      "reason": "Harden and fully cover the publication-invisible qualification path without changing production monthly metric semantics or bytes.",
+      "base_commit": "b6d9530b0800803270aa75762821b007c23fe588"
     },
     {
       "family": "activity_tiers",
       "paths": ["src/compute/mod.rs"],
-      "reason": "Add publication-invisible semantic equivalence reporting without changing activity-tier semantics or final bytes.",
-      "base_commit": "c8c9ce2513293573f209840fa80bd0564b5dcfbc"
+      "reason": "Harden and fully cover the publication-invisible qualification path without changing production activity-tier semantics or bytes.",
+      "base_commit": "b6d9530b0800803270aa75762821b007c23fe588"
     },
     {
       "family": "lifecycle",
       "paths": ["src/compute/mod.rs"],
-      "reason": "Reuse fully identical lifecycle outputs in qualification without changing lifecycle semantics or final bytes.",
-      "base_commit": "c8c9ce2513293573f209840fa80bd0564b5dcfbc"
+      "reason": "Harden and fully cover qualification-only lifecycle reuse without changing production lifecycle semantics or bytes.",
+      "base_commit": "b6d9530b0800803270aa75762821b007c23fe588"
     },
     {
       "family": "page_week",
       "paths": ["src/compute/mod.rs", "src/compute/weekly/mod.rs"],
-      "reason": "Add publication-invisible semantic equivalence reporting without changing production page-week semantics.",
-      "base_commit": "c8c9ce2513293573f209840fa80bd0564b5dcfbc"
+      "reason": "Fail closed on empty qualification inputs and fully cover the publication-invisible external merge without changing production page-week semantics.",
+      "base_commit": "b6d9530b0800803270aa75762821b007c23fe588"
     }
   ]
 }

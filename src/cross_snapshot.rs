@@ -407,27 +407,30 @@ pub(crate) fn qualify(
     let incremental_root = work_root.join("candidate-incremental");
     let clean_root = work_root.join("candidate-clean");
     let result = (|| -> Result<QualificationReport> {
-        let baseline_cache = crate::compute::compute_cross_snapshot_qualification_build(
+        let baseline_result = crate::compute::compute_cross_snapshot_qualification_build(
             wiki,
             baseline_snapshot,
             data_dir,
             &baseline_root,
             true,
-        )?;
-        let candidate_cache = crate::compute::compute_cross_snapshot_qualification_build(
+        );
+        let baseline_cache = baseline_result?;
+        let candidate_result = crate::compute::compute_cross_snapshot_qualification_build(
             wiki,
             candidate_snapshot,
             data_dir,
             &incremental_root,
             true,
-        )?;
-        crate::compute::compute_cross_snapshot_qualification_build(
+        );
+        let candidate_cache = candidate_result?;
+        let clean_result = crate::compute::compute_cross_snapshot_qualification_build(
             wiki,
             candidate_snapshot,
             data_dir,
             &clean_root,
             false,
-        )?;
+        );
+        clean_result?;
         let incremental = crate::determinism::collect_artifacts(&incremental_root, "parquet")?;
         let clean = crate::determinism::collect_artifacts(&clean_root, "parquet")?;
         ensure!(
@@ -442,18 +445,20 @@ pub(crate) fn qualify(
         for artifact in &clean {
             let incremental_path = incremental_root.join(&artifact.identity);
             let clean_path = clean_root.join(&artifact.identity);
-            let incremental_receipt = crate::artifact_receipt::scan_and_write(
+            let incremental_receipt_result = crate::artifact_receipt::scan_and_write(
                 &incremental_path,
                 &artifact.identity,
                 "cross-snapshot-equivalence-v1",
                 candidate_snapshot,
-            )?;
-            let clean_receipt = crate::artifact_receipt::scan_and_write(
+            );
+            let incremental_receipt = incremental_receipt_result?;
+            let clean_receipt_result = crate::artifact_receipt::scan_and_write(
                 &clean_path,
                 &artifact.identity,
                 "cross-snapshot-equivalence-v1",
                 candidate_snapshot,
-            )?;
+            );
+            let clean_receipt = clean_receipt_result?;
             ensure!(
                 incremental_receipt.receipt == clean_receipt.receipt,
                 "incremental and clean semantic receipts disagree for {}",
@@ -541,24 +546,74 @@ mod tests {
         );
 
         let artifact = cache.artifact_path("monthly", "v1", digest, "gdp")?;
+        let receipt = receipt_path(&artifact);
+        let receipt_bytes = fs::read(&receipt)?;
+        fs::write(&receipt, b"not json")?;
+        assert!(cache.load("monthly", "v1", digest, "gdp").is_err());
+        fs::write(&receipt, receipt_bytes)?;
         fs::write(&artifact, b"corrupt")?;
         assert!(cache.load("monthly", "v1", digest, "gdp").is_err());
         assert!(cache.artifact_path("../bad", "v1", digest, "gdp").is_err());
-        let checkpoint = BTreeMap::from([("through".to_string(), "2024-12".to_string())]);
         assert!(
             cache
-                .load_json::<BTreeMap<String, String>>(
-                    "lifecycle_checkpoint",
+                .load_json::<BTreeMap<String, String>>("../bad", "v1", digest, "state")
+                .is_err()
+        );
+        assert!(
+            cache
+                .store_json(
+                    "../bad",
                     "v1",
                     digest,
                     "state",
-                )?
-                .is_none()
+                    &BTreeMap::<String, String>::new(),
+                )
+                .is_err()
         );
+        let checkpoint = BTreeMap::from([("through".to_string(), "2024-12".to_string())]);
+        let missing_checkpoint = cache.load_json::<BTreeMap<String, String>>(
+            "lifecycle_checkpoint",
+            "v1",
+            digest,
+            "state",
+        );
+        assert!(missing_checkpoint?.is_none());
         cache.store_json("lifecycle_checkpoint", "v1", digest, "state", &checkpoint)?;
         assert_eq!(
             cache.load_json("lifecycle_checkpoint", "v1", digest, "state")?,
             Some(checkpoint)
+        );
+
+        let mut failed_frame =
+            DataFrame::new_infer_height(vec![Column::new("value".into(), [3_i64])])?;
+        let failed_artifact = cache.artifact_path("monthly", "v1", digest, "failed")?;
+        fs::create_dir_all(receipt_path(&failed_artifact))?;
+        assert!(
+            cache
+                .store("monthly", "v1", digest, "failed", &mut failed_frame)
+                .is_err()
+        );
+        assert!(!failed_artifact.exists());
+
+        let blocked_checkpoint_result = cache.artifact_path_with_extension(
+            "lifecycle_checkpoint",
+            "v1",
+            digest,
+            "blocked",
+            "json",
+        );
+        let blocked_checkpoint = blocked_checkpoint_result?;
+        fs::create_dir_all(&blocked_checkpoint)?;
+        assert!(
+            cache
+                .store_json(
+                    "lifecycle_checkpoint",
+                    "v1",
+                    digest,
+                    "blocked",
+                    &BTreeMap::from([("value", 1_u64)]),
+                )
+                .is_err()
         );
         Ok(())
     }
@@ -571,5 +626,35 @@ mod tests {
         assert_eq!(a, cache.derived_digest("activity_year", "v1", &["a", "b"]));
         assert_ne!(a, cache.derived_digest("activity_year", "v1", &["b", "a"]));
         assert_ne!(a, cache.derived_digest("activity_year", "v2", &["a", "b"]));
+    }
+
+    #[test]
+    fn qualification_rejects_reversed_versions_and_existing_workspaces() -> Result<()> {
+        let root = TestDir::new()?;
+        let work = root.path().join("work");
+        assert!(
+            qualify(
+                root.path(),
+                "testwiki",
+                "2026-08",
+                "2026-07",
+                &work,
+                &root.path().join("report.json"),
+            )
+            .is_err()
+        );
+        fs::create_dir(&work)?;
+        assert!(
+            qualify(
+                root.path(),
+                "testwiki",
+                "2026-07",
+                "2026-08",
+                &work,
+                &root.path().join("report.json"),
+            )
+            .is_err()
+        );
+        Ok(())
     }
 }

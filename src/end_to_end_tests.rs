@@ -17,7 +17,7 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::test_support::{TestDir, init_test_tracing};
-use crate::{compute, cross_snapshot, ingest, merge, schema, storage};
+use crate::{canonical_month, compute, cross_snapshot, ingest, merge, schema, storage};
 
 fn fixture_row(timestamp: &str, user_id: &str, revision_id: &str) -> String {
     let mut row = vec![String::new(); schema::COLUMNS.len()];
@@ -273,6 +273,7 @@ fn snapshot_rollover_computes_only_the_new_generation() -> Result<()> {
     write_bz2(
         &july_source,
         &[
+            fixture_row("2023-12-15 12:00:00.0", "4", "99"),
             fixture_row("2024-01-01 12:00:00.0", "1", "100"),
             fixture_row("2024-01-31 12:00:00.0", "1", "101"),
             fixture_row("2024-02-01 12:00:00.0", "2", "102"),
@@ -293,12 +294,30 @@ fn snapshot_rollover_computes_only_the_new_generation() -> Result<()> {
         storage::current_snapshot_version(&data_dir, "tinywiki")?.as_deref(),
         Some("2026-07")
     );
+    let july_inventory_path = canonical_month::inventory_path(&data_dir, "tinywiki", "2026-07")?;
+    let july_inventory_bytes = fs::read(&july_inventory_path)?;
+    fs::write(&july_inventory_path, b"not json")?;
+    assert!(canonical_month::ensure_snapshot_inventory(&data_dir, "tinywiki", "2026-07").is_err());
+    fs::write(&july_inventory_path, &july_inventory_bytes)?;
+    let july_inventory =
+        canonical_month::ensure_snapshot_inventory(&data_dir, "tinywiki", "2026-07")?;
+    let january_receipt_path =
+        canonical_month::receipt_path(&data_dir, "tinywiki", "2026-07", "2024-01")?;
+    let january_receipt_bytes = fs::read(&january_receipt_path)?;
+    fs::write(&january_receipt_path, b"not json")?;
+    assert!(canonical_month::ensure_snapshot_inventory(&data_dir, "tinywiki", "2026-07").is_err());
+    fs::write(&january_receipt_path, january_receipt_bytes)?;
+    assert_eq!(
+        canonical_month::ensure_snapshot_inventory(&data_dir, "tinywiki", "2026-07")?,
+        july_inventory
+    );
 
     fs::remove_file(july_source)?;
     let august_source = raw_dir.join("2026-08.tinywiki.all-time.tsv.bz2");
     write_bz2(
         &august_source,
         &[
+            fixture_row("2023-12-15 12:00:00.0", "4", "99"),
             fixture_row("2024-01-01 12:00:00.0", "1", "100"),
             fixture_row("2024-01-31 12:00:00.0", "1", "101"),
             fixture_row("2024-02-01 12:00:00.0", "2", "102"),
@@ -321,11 +340,11 @@ fn snapshot_rollover_computes_only_the_new_generation() -> Result<()> {
     let total_edits: u32 = weekly.column("edits")?.u32()?.into_no_null_iter().sum();
     assert_eq!(
         weekly.height(),
-        3,
+        4,
         "the week crossing January and February must be reconciled once"
     );
     assert_eq!(
-        total_edits, 4,
+        total_edits, 5,
         "July and August histories must not be added together"
     );
 
@@ -341,7 +360,7 @@ fn snapshot_rollover_computes_only_the_new_generation() -> Result<()> {
     )?;
     assert!(!qualification.publication_eligible);
     assert_eq!(qualification.artifact_count, 9);
-    assert_eq!(qualification.unchanged_months, ["2024-01"]);
+    assert_eq!(qualification.unchanged_months, ["2023-12", "2024-01"]);
     assert_eq!(qualification.changed_months, ["2024-02"]);
     assert!(qualification.removed_months.is_empty());
     assert_eq!(qualification.semantic_summaries.len(), 9);
@@ -361,6 +380,7 @@ fn snapshot_rollover_computes_only_the_new_generation() -> Result<()> {
     write_bz2(
         &september_source,
         &[
+            fixture_row("2023-12-15 12:00:00.0", "4", "99"),
             fixture_row("2024-01-01 12:00:00.0", "1", "100"),
             fixture_row("2024-01-31 12:00:00.0", "1", "101"),
             fixture_row("2024-02-01 12:00:00.0", "2", "102"),
@@ -368,24 +388,59 @@ fn snapshot_rollover_computes_only_the_new_generation() -> Result<()> {
         ],
     )?;
     ingest::ingest_wiki_snapshot("tinywiki", "2026-09", &data_dir)?;
-    let identical = cross_snapshot::qualify(
-        &data_dir,
-        "tinywiki",
-        "2026-08",
-        "2026-09",
-        &temp.path().join("identical-cross-snapshot-qualification"),
-        &temp.path().join("identical-cross-snapshot-report.json"),
+    let identical_work = temp.path().join("identical-cross-snapshot-qualification");
+    let identical_report = temp.path().join("identical-cross-snapshot-report.json");
+    crate::run_with_ops(
+        crate::Cli {
+            data_dir: data_dir.clone(),
+            output_dir: temp.path().join("unused-output"),
+            run_id: None,
+            command: crate::Commands::CrossSnapshotQualify {
+                wiki: "tinywiki".to_string(),
+                baseline_version: "2026-08".to_string(),
+                candidate_version: "2026-09".to_string(),
+                work_dir: identical_work,
+                report: identical_report.clone(),
+            },
+        },
+        &crate::RealOps,
     )?;
-    assert_eq!(identical.unchanged_months, ["2024-01", "2024-02"]);
+    let identical: cross_snapshot::QualificationReport =
+        serde_json::from_slice(&fs::read(identical_report)?)?;
+    assert_eq!(
+        identical.unchanged_months,
+        ["2023-12", "2024-01", "2024-02"]
+    );
     assert!(identical.changed_months.is_empty());
     assert_eq!(
         identical.candidate_cache.rebuilt_artifacts, 0,
         "an identical logical snapshot should reuse every cached metric partition"
     );
-    assert!(identical.candidate_cache.reused_artifacts >= 16);
+    assert!(identical.candidate_cache.reused_artifacts >= 22);
     assert_eq!(
         storage::current_snapshot_version(&data_dir, "tinywiki")?.as_deref(),
         Some("2026-09")
+    );
+
+    let failed_work = temp.path().join("failed-cross-snapshot-qualification");
+    let blocked_report = temp.path().join("blocked-cross-snapshot-report");
+    fs::create_dir(&blocked_report)?;
+    assert!(
+        cross_snapshot::qualify(
+            &data_dir,
+            "tinywiki",
+            "2026-08",
+            "2026-09",
+            &failed_work,
+            &blocked_report,
+        )
+        .is_err()
+    );
+    assert!(failed_work.join("qualification-failed").is_file());
+    assert_eq!(
+        storage::current_snapshot_version(&data_dir, "tinywiki")?.as_deref(),
+        Some("2026-09"),
+        "failed qualification must leave the live generation untouched"
     );
 
     assert_eq!(
