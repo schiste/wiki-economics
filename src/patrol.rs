@@ -27,7 +27,7 @@ const PATROL_DUMP_BASE: &str = "https://dumps.wikimedia.org";
 const PARQUET_BATCH_ROWS: usize = 50_000;
 const SUBSTANTIAL_LOGGING_DUMP_BYTES: u64 = 1024 * 1024;
 const SUBSTANTIAL_LOG_ITEMS: usize = 10_000;
-const PATROL_COMPUTE_ALGORITHM_VERSION: &str = "patrol-metrics-v2-fingerprinted";
+const PATROL_COMPUTE_ALGORITHM_VERSION: &str = "patrol-metrics-v3-monthly-generations";
 const PATROL_PARSER_VERSION: &str = "patrol-logging-multigzip-monthly-v1";
 const REVISION_COLUMNS: &[&str] = &[
     "revision_id",
@@ -76,6 +76,7 @@ struct MetricKey {
 #[derive(Clone, Copy, Debug)]
 struct RevisionMeta {
     timestamp_seconds: i64,
+    year_month_key: i32,
     page_namespace: i32,
     user_type: UserType,
 }
@@ -177,6 +178,45 @@ struct LoggingSourceIdentity {
     etag: Option<String>,
     last_modified: Option<String>,
     downloaded_sha256: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PatrolSourceSummary {
+    pub(crate) remote_url: String,
+    pub(crate) content_length: u64,
+    pub(crate) etag: Option<String>,
+    pub(crate) last_modified: Option<String>,
+    pub(crate) downloaded_sha256: String,
+    pub(crate) parser_version: String,
+    pub(crate) total_log_items: u64,
+    pub(crate) patrol_events: u64,
+    pub(crate) rights_events: u64,
+    pub(crate) skipped_events: u64,
+    pub(crate) manifest_sha256: String,
+}
+
+pub(crate) fn source_generation_summary(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot: &str,
+) -> Result<Option<PatrolSourceSummary>> {
+    if !generation::exists(data_dir, wiki, snapshot) {
+        return Ok(None);
+    }
+    let source = generation::load(data_dir, wiki, snapshot)?;
+    Ok(Some(PatrolSourceSummary {
+        remote_url: source.source.remote_url,
+        content_length: source.source.content_length,
+        etag: source.source.etag,
+        last_modified: source.source.last_modified,
+        downloaded_sha256: source.source.downloaded_sha256,
+        parser_version: source.parser_version,
+        total_log_items: u64::try_from(source.stats.total_log_items)?,
+        patrol_events: u64::try_from(source.stats.patrol_events)?,
+        rights_events: u64::try_from(source.stats.rights_events)?,
+        skipped_events: u64::try_from(source.stats.skipped_events)?,
+        manifest_sha256: source.manifest_sha256,
+    }))
 }
 
 struct PatrolWriter {
@@ -527,6 +567,11 @@ fn compute_patrol_selected(
     limit_months: Option<usize>,
     snapshot: Option<&str>,
 ) -> Result<()> {
+    if let Some(snapshot) = snapshot
+        && generation::exists(data_dir, wiki, snapshot)
+    {
+        return incremental::compute(wiki, snapshot, data_dir, output_dir, rebuild, limit_months);
+    }
     let patrol_dir = data_dir.join("patrol").join(wiki);
     let patrol_path = patrol_dir.join("patrol.parquet");
     let rights_path = patrol_dir.join("rights.parquet");
@@ -698,12 +743,18 @@ fn patrol_stage_inputs(
     snapshot: Option<&str>,
 ) -> Result<Vec<fingerprint::TrackedPath>> {
     let mut inputs = compute::compute_stage_inputs(wiki, data_dir, snapshot)?;
-    let patrol_dir = data_dir.join("patrol").join(wiki);
-    for name in ["autopatrol_groups.json", "patrol.parquet", "rights.parquet"] {
-        inputs.push(fingerprint::TrackedPath::new(
-            format!("patrol-source/{wiki}/{name}"),
-            patrol_dir.join(name),
-        ));
+    if let Some(snapshot) = snapshot
+        && generation::exists(data_dir, wiki, snapshot)
+    {
+        inputs.extend(generation::tracked_inputs(data_dir, wiki, snapshot)?);
+    } else {
+        let patrol_dir = data_dir.join("patrol").join(wiki);
+        for name in ["autopatrol_groups.json", "patrol.parquet", "rights.parquet"] {
+            inputs.push(fingerprint::TrackedPath::new(
+                format!("patrol-source/{wiki}/{name}"),
+                patrol_dir.join(name),
+            ));
+        }
     }
     inputs.sort_by(|left, right| left.identity.cmp(&right.identity));
     Ok(inputs)
@@ -923,11 +974,14 @@ fn download_logging_dump<T: PatrolTransport + ?Sized>(
     }
 
     let (content_length, downloaded_sha256) = storage::sha256_file(dest_path)?;
-    anyhow::ensure!(
-        expected_length.is_none_or(|expected| expected == content_length),
-        "patrol logging source length changed during download (expected {}, received {content_length})",
-        expected_length.unwrap_or_default()
-    );
+    if let Some(expected) = expected_length
+        && expected != content_length
+    {
+        let _ = fs::remove_file(dest_path);
+        anyhow::bail!(
+            "patrol logging source length changed during download (expected {expected}, received {content_length})"
+        );
+    }
 
     info!(wiki = wiki, path = %dest_path.display(), "downloaded patrol log dump");
     Ok(LoggingSourceIdentity {
@@ -1613,6 +1667,7 @@ fn process_revision_file(
                 revision_id,
                 RevisionMeta {
                     timestamp_seconds,
+                    year_month_key: revision_month_key,
                     page_namespace,
                     user_type,
                 },
@@ -1746,6 +1801,7 @@ fn index_revision_lookup_df(
             revision_id,
             RevisionMeta {
                 timestamp_seconds,
+                year_month_key: parse_year_month_key(timestamp).unwrap_or_default(),
                 page_namespace: namespaces.get(idx).unwrap_or_default(),
                 user_type: classify_user_type(
                     bot_by.get(idx),
@@ -1831,44 +1887,8 @@ fn write_patrol_month_parts(
     summary: &RevisionSummary,
     patrol_stats: &HashMap<MetricKey, PatrolAccumulator>,
 ) -> Result<()> {
-    let mut rows_by_month: BTreeMap<i32, Vec<(MetricKey, PatrolRowMetrics)>> = BTreeMap::new();
-    let keys: BTreeSet<MetricKey> = patrol_stats
-        .keys()
-        .copied()
-        .chain(summary.total_revisions.keys().copied())
-        .filter(|key| pending_months.contains(&key.year_month_key))
-        .collect();
-
-    for key in keys {
-        let patrol = patrol_stats.get(&key);
-        let total_revisions = summary
-            .total_revisions
-            .get(&key)
-            .copied()
-            .unwrap_or_default();
-        let patrolled_revisions = summary
-            .patrolled_revisions
-            .get(&key)
-            .copied()
-            .unwrap_or_default();
-        let autopatrolled_revisions = summary
-            .autopatrolled_revisions
-            .get(&key)
-            .copied()
-            .unwrap_or_default();
-        rows_by_month.entry(key.year_month_key).or_default().push((
-            key,
-            PatrolRowMetrics::from_parts(
-                patrol,
-                total_revisions,
-                patrolled_revisions,
-                autopatrolled_revisions,
-            ),
-        ));
-    }
-
     for year_month_key in pending_months {
-        let rows = rows_by_month.remove(year_month_key).unwrap_or_default();
+        let rows = patrol_month_rows(*year_month_key, summary, patrol_stats);
         let path = patrol_part_path(output_dir, wiki, *year_month_key);
         ensure_parent_dir(&path)?;
         let temp_path = path.with_extension("parquet.tmp");
@@ -1877,6 +1897,48 @@ fn write_patrol_month_parts(
     }
 
     Ok(())
+}
+
+fn patrol_month_rows(
+    year_month_key: i32,
+    summary: &RevisionSummary,
+    patrol_stats: &HashMap<MetricKey, PatrolAccumulator>,
+) -> Vec<(MetricKey, PatrolRowMetrics)> {
+    let keys: BTreeSet<MetricKey> = patrol_stats
+        .keys()
+        .copied()
+        .chain(summary.total_revisions.keys().copied())
+        .filter(|key| key.year_month_key == year_month_key)
+        .collect();
+    keys.into_iter()
+        .map(|key| {
+            let patrol = patrol_stats.get(&key);
+            let total_revisions = summary
+                .total_revisions
+                .get(&key)
+                .copied()
+                .unwrap_or_default();
+            let patrolled_revisions = summary
+                .patrolled_revisions
+                .get(&key)
+                .copied()
+                .unwrap_or_default();
+            let autopatrolled_revisions = summary
+                .autopatrolled_revisions
+                .get(&key)
+                .copied()
+                .unwrap_or_default();
+            (
+                key,
+                PatrolRowMetrics::from_parts(
+                    patrol,
+                    total_revisions,
+                    patrolled_revisions,
+                    autopatrolled_revisions,
+                ),
+            )
+        })
+        .collect()
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1961,6 +2023,15 @@ fn write_patrol_metrics_df(
     wiki: &str,
     rows: &[(MetricKey, PatrolRowMetrics)],
 ) -> Result<()> {
+    let mut df = patrol_metrics_frame(wiki, rows)?;
+    let mut file = File::create(path)?;
+    ParquetWriter::new(&mut file)
+        .with_compression(ParquetCompression::Zstd(None))
+        .finish(&mut df)?;
+    Ok(())
+}
+
+fn patrol_metrics_frame(wiki: &str, rows: &[(MetricKey, PatrolRowMetrics)]) -> Result<DataFrame> {
     let year_month: Vec<String> = rows
         .iter()
         .map(|(key, _)| format_year_month(key.year_month_key))
@@ -2035,12 +2106,7 @@ fn write_patrol_metrics_df(
         Column::new("top1_pct".into(), top1_pct),
         Column::new("min_patrollers_50pct".into(), min_patrollers_50pct),
     ];
-    let mut df = DataFrame::new_infer_height(columns)?;
-    let mut file = File::create(path)?;
-    ParquetWriter::new(&mut file)
-        .with_compression(ParquetCompression::Zstd(None))
-        .finish(&mut df)?;
-    Ok(())
+    DataFrame::new_infer_height(columns).map_err(Into::into)
 }
 
 fn summarize_patroller_concentration(entry: &PatrolAccumulator) -> (u32, f64, u32) {
@@ -2350,6 +2416,7 @@ fn round1(value: f64) -> f64 {
 }
 
 mod generation;
+mod incremental;
 
 #[cfg(test)]
 mod tests;

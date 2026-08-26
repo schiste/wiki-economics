@@ -1,7 +1,18 @@
 use super::*;
 
-const GENERATION_SCHEMA_VERSION: u32 = 1;
+const GENERATION_SCHEMA_VERSION: u32 = 2;
 const ARTIFACT_ORDERING: &str = "timestamp-logical-fields-v1";
+
+#[derive(Debug, Serialize)]
+struct CurrentPatrolGeneration {
+    schema_version: u32,
+    wiki: String,
+    snapshot: String,
+    parser_version: String,
+    manifest_relative_path: String,
+    manifest_sha256: String,
+    manifest_file_sha256: String,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -11,6 +22,7 @@ pub(super) struct MonthArtifact {
     pub(super) artifact_sha256: String,
     pub(super) bytes: u64,
     pub(super) rows: u64,
+    pub(super) observed_modified_unix_nanos: u128,
     pub(super) ordering_contract: String,
 }
 
@@ -27,6 +39,15 @@ pub(super) struct PatrolGeneration {
     pub(super) patrol_months: Vec<MonthArtifact>,
     pub(super) rights_months: Vec<MonthArtifact>,
     pub(super) rights_timeline_digest: String,
+    pub(super) manifest_sha256: String,
+}
+
+impl PatrolGeneration {
+    fn canonical_hash(&self) -> Result<String> {
+        let mut canonical = self.clone();
+        canonical.manifest_sha256.clear();
+        Ok(hex::encode(Sha256::digest(serde_json::to_vec(&canonical)?)))
+    }
 }
 
 struct ActivePatrolMonth {
@@ -100,13 +121,11 @@ impl MonthlyPatrolWriter {
         active.writer.finish()?;
         File::open(&active.temporary)?.sync_all()?;
         fs::rename(&active.temporary, &active.final_path)?;
-        File::open(
-            active
-                .final_path
-                .parent()
-                .context("patrol month has no parent")?,
-        )?
-        .sync_all()?;
+        let parent = active
+            .final_path
+            .parent()
+            .expect("constructed patrol month always has a parent");
+        File::open(parent)?.sync_all()?;
         self.completed.push(active.final_path);
         Ok(())
     }
@@ -174,13 +193,11 @@ impl MonthlyRightsWriter {
         active.writer.finish()?;
         File::open(&active.temporary)?.sync_all()?;
         fs::rename(&active.temporary, &active.final_path)?;
-        File::open(
-            active
-                .final_path
-                .parent()
-                .context("rights month has no parent")?,
-        )?
-        .sync_all()?;
+        let parent = active
+            .final_path
+            .parent()
+            .expect("constructed rights month always has a parent");
+        File::open(parent)?.sync_all()?;
         self.completed.push(active.final_path);
         Ok(())
     }
@@ -216,7 +233,10 @@ pub(super) fn generation_dir(data_dir: &Path, wiki: &str, snapshot: &str) -> Res
         .join("patrol")
         .join(wiki)
         .join("generations")
-        .join(snapshot))
+        .join(snapshot)
+        .join(hex::encode(Sha256::digest(
+            PATROL_PARSER_VERSION.as_bytes(),
+        ))))
 }
 
 pub(super) fn manifest_path(data_dir: &Path, wiki: &str, snapshot: &str) -> Result<PathBuf> {
@@ -236,6 +256,23 @@ pub(super) fn load(data_dir: &Path, wiki: &str, snapshot: &str) -> Result<Patrol
     Ok(generation)
 }
 
+pub(super) fn artifact_path(root: &Path, artifact: &MonthArtifact) -> Result<PathBuf> {
+    checked_artifact_path(root, &artifact.relative_path)
+}
+
+pub(super) fn tracked_inputs(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot: &str,
+) -> Result<Vec<fingerprint::TrackedPath>> {
+    let root = generation_dir(data_dir, wiki, snapshot)?;
+    load(data_dir, wiki, snapshot)?;
+    Ok(vec![fingerprint::TrackedPath::new(
+        format!("patrol-generation/{wiki}/{snapshot}/manifest"),
+        root.join("generation.json"),
+    )])
+}
+
 pub(super) fn fetch<T: PatrolTransport + ?Sized>(
     transport: &T,
     wiki: &str,
@@ -244,7 +281,9 @@ pub(super) fn fetch<T: PatrolTransport + ?Sized>(
 ) -> Result<PatrolGeneration> {
     let final_root = generation_dir(data_dir, wiki, snapshot)?;
     if final_root.join("generation.json").is_file() {
-        return load(data_dir, wiki, snapshot);
+        let generation = load(data_dir, wiki, snapshot)?;
+        publish_current_pointer(data_dir, wiki, &generation)?;
+        return Ok(generation);
     }
     anyhow::ensure!(
         !final_root.exists(),
@@ -260,7 +299,7 @@ pub(super) fn fetch<T: PatrolTransport + ?Sized>(
         .as_nanos();
     let staging = generations.join(format!(".{snapshot}.{}.{}.tmp", std::process::id(), nonce));
     fs::create_dir(&staging)?;
-    let result = build_generation(transport, wiki, snapshot, &staging);
+    let result = build_generation(transport, wiki, snapshot, data_dir, &staging);
     let generation = match result {
         Ok(generation) => generation,
         Err(error) => {
@@ -271,21 +310,52 @@ pub(super) fn fetch<T: PatrolTransport + ?Sized>(
     fs::rename(&staging, &final_root)?;
     File::open(generations)?.sync_all()?;
     validate(&final_root, wiki, snapshot, &generation)?;
+    publish_current_pointer(data_dir, wiki, &generation)?;
     Ok(generation)
+}
+
+fn publish_current_pointer(
+    data_dir: &Path,
+    wiki: &str,
+    generation: &PatrolGeneration,
+) -> Result<()> {
+    let parser_identity = hex::encode(Sha256::digest(PATROL_PARSER_VERSION.as_bytes()));
+    let manifest_path =
+        generation_dir(data_dir, wiki, &generation.snapshot)?.join("generation.json");
+    let (_, manifest_file_sha256) = storage::sha256_file(&manifest_path)?;
+    let pointer = CurrentPatrolGeneration {
+        schema_version: 1,
+        wiki: wiki.to_string(),
+        snapshot: generation.snapshot.clone(),
+        parser_version: generation.parser_version.clone(),
+        manifest_relative_path: format!(
+            "generations/{}/{parser_identity}/generation.json",
+            generation.snapshot
+        ),
+        manifest_sha256: generation.manifest_sha256.clone(),
+        manifest_file_sha256,
+    };
+    atomic_json(
+        &data_dir
+            .join("patrol")
+            .join(wiki)
+            .join("current-generation.json"),
+        &pointer,
+    )
 }
 
 fn build_generation<T: PatrolTransport + ?Sized>(
     transport: &T,
     wiki: &str,
     snapshot: &str,
+    data_dir: &Path,
     staging: &Path,
 ) -> Result<PatrolGeneration> {
     let source_path = staging.join("source.xml.gz");
     let source = download_logging_dump(transport, wiki, &source_path)?;
-    let legacy_meta = staging
-        .parent()
-        .and_then(Path::parent)
-        .context("patrol staging path has no wiki root")?
+    let legacy_meta = data_dir
+        .join("patrol")
+        .join(wiki)
         .join("autopatrol_groups.json");
     let mut autopatrol_groups = fetch_autopatrol_groups(transport, wiki)?;
     if autopatrol_groups.is_empty() {
@@ -311,7 +381,7 @@ fn build_generation<T: PatrolTransport + ?Sized>(
     let patrol_months = artifact_receipts(staging, &patrol_files)?;
     let rights_months = artifact_receipts(staging, &rights_files)?;
     let rights_timeline_digest = timeline_digest(&rights_months);
-    let generation = PatrolGeneration {
+    let mut generation = PatrolGeneration {
         schema_version: GENERATION_SCHEMA_VERSION,
         wiki: wiki.to_string(),
         snapshot: snapshot.to_string(),
@@ -322,7 +392,9 @@ fn build_generation<T: PatrolTransport + ?Sized>(
         patrol_months,
         rights_months,
         rights_timeline_digest,
+        manifest_sha256: String::new(),
     };
+    generation.manifest_sha256 = generation.canonical_hash()?;
     validate(staging, wiki, snapshot, &generation)?;
     atomic_json(&staging.join("generation.json"), &generation)?;
     fs::remove_file(&source_path).context("failed to release committed patrol logging source")?;
@@ -345,7 +417,8 @@ fn validate(root: &Path, wiki: &str, snapshot: &str, generation: &PatrolGenerati
                 .source
                 .downloaded_sha256
                 .bytes()
-                .all(|byte| byte.is_ascii_hexdigit()),
+                .all(|byte| byte.is_ascii_hexdigit())
+            && generation.manifest_sha256 == generation.canonical_hash()?,
         "patrol generation identity changed"
     );
     validate_artifacts(root, &generation.patrol_months)?;
@@ -369,16 +442,23 @@ fn validate_artifacts(root: &Path, artifacts: &[MonthArtifact]) -> Result<()> {
             "patrol monthly artifact inventory is invalid"
         );
         let path = checked_artifact_path(root, &artifact.relative_path)?;
-        let (bytes, sha256) = storage::sha256_file(&path)?;
+        let metadata = fs::metadata(&path)?;
         anyhow::ensure!(
-            bytes == artifact.bytes && sha256 == artifact.artifact_sha256,
-            "patrol monthly artifact identity changed"
+            metadata.is_file() && metadata.len() == artifact.bytes,
+            "patrol monthly artifact size changed"
         );
-        let rows = ParquetReader::new(File::open(&path)?).num_rows()?;
-        anyhow::ensure!(
-            u64::try_from(rows)? == artifact.rows,
-            "patrol monthly row count changed"
-        );
+        if modified_nanos(&metadata)? != artifact.observed_modified_unix_nanos {
+            let (_, sha256) = storage::sha256_file(&path)?;
+            anyhow::ensure!(
+                sha256 == artifact.artifact_sha256,
+                "patrol monthly artifact identity changed"
+            );
+            let rows = ParquetReader::new(File::open(&path)?).num_rows()?;
+            anyhow::ensure!(
+                u64::try_from(rows)? == artifact.rows,
+                "patrol monthly row count changed"
+            );
+        }
         previous = Some(artifact.event_month.clone());
     }
     Ok(())
@@ -399,6 +479,7 @@ fn artifact_receipts(root: &Path, paths: &[PathBuf]) -> Result<Vec<MonthArtifact
             .to_str()
             .context("monthly patrol artifact path is not UTF-8")?
             .to_string();
+        let metadata = fs::metadata(path)?;
         let (bytes, artifact_sha256) = storage::sha256_file(path)?;
         let rows = ParquetReader::new(File::open(path)?).num_rows()?;
         artifacts.push(MonthArtifact {
@@ -407,6 +488,7 @@ fn artifact_receipts(root: &Path, paths: &[PathBuf]) -> Result<Vec<MonthArtifact
             artifact_sha256,
             bytes,
             rows: u64::try_from(rows)?,
+            observed_modified_unix_nanos: modified_nanos(&metadata)?,
             ordering_contract: ARTIFACT_ORDERING.to_string(),
         });
     }
@@ -442,6 +524,14 @@ fn update_string(digest: &mut Sha256, value: &str) {
     digest.update(value.as_bytes());
 }
 
+fn modified_nanos(metadata: &fs::Metadata) -> Result<u128> {
+    Ok(metadata
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("patrol monthly artifact has a pre-epoch modification time")?
+        .as_nanos())
+}
+
 fn month_path(root: &Path, kind: &str, month: &str) -> Result<PathBuf> {
     let (year, month_number) = month
         .split_once('-')
@@ -469,7 +559,7 @@ fn event_month(timestamp: &str) -> Result<String> {
     Ok(month.to_string())
 }
 
-fn atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
+pub(super) fn atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     let parent = path
         .parent()
         .context("patrol generation receipt has no parent")?;

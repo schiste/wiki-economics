@@ -954,6 +954,15 @@ fn write_current_snapshot_pointer(
 }
 
 #[cfg(test)]
+pub(crate) fn write_current_snapshot_pointer_for_test(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot_version: &str,
+) -> Result<()> {
+    write_current_snapshot_pointer(data_dir, wiki, snapshot_version)
+}
+
+#[cfg(test)]
 pub(crate) fn publish_test_snapshot_pointer(
     data_dir: &Path,
     wiki: &str,

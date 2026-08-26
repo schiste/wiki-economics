@@ -3349,7 +3349,7 @@ mod tests {
                 }
             })],
         ));
-        let _guard = crate::patrol::install_test_transport(fake_transport);
+        let guard = crate::patrol::install_test_transport(fake_transport);
         ops.fetch_patrol("patrolwiki", data_dir.path())?;
         assert!(
             data_dir
@@ -3359,6 +3359,7 @@ mod tests {
                 .join("patrol.parquet")
                 .exists()
         );
+        drop(guard);
 
         write_patrol_compute_input(data_dir.path(), "patrolcomputewiki")?;
         let result = ops.compute_patrol(
@@ -3397,6 +3398,25 @@ mod tests {
             patrol_snapshot,
         )
         .expect("patrol generation manifest should be writable");
+        let snapshot_transport = Arc::new(FakePatrolTransport::new(
+            vec![gzip_bytes(patrol_xml)?],
+            vec![json!({"query": {"usergroups": []}})],
+        ));
+        let snapshot_guard = crate::patrol::install_test_transport(snapshot_transport);
+        ops.fetch_patrol_for_snapshot("patrolsnapshotwiki", patrol_snapshot, data_dir.path())?;
+        assert!(ops.cached_patrol_generation_available(
+            "patrolsnapshotwiki",
+            patrol_snapshot,
+            data_dir.path()
+        ));
+        crate::storage::write_current_snapshot_pointer_for_test(
+            data_dir.path(),
+            "patrolsnapshotwiki",
+            patrol_snapshot,
+        )
+        .expect("test snapshot pointer should be writable");
+        ops.fetch_patrol("patrolsnapshotwiki", data_dir.path())?;
+        drop(snapshot_guard);
         let patrol_candidate = output_dir.path().join("patrol-candidate");
         ops.compute_candidate_patrol(
             "patrolcomputewiki",

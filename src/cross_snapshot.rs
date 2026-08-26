@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use crate::{canonical_month, storage};
 
-const CACHE_RECEIPT_SCHEMA_VERSION: u32 = 1;
+const CACHE_RECEIPT_SCHEMA_VERSION: u32 = 3;
 const CACHE_WRITER_VERSION: &str = "polars-parquet-zstd-row-group-100000-v1";
 const ROW_GROUP_ROWS: usize = 100_000;
 
@@ -32,6 +32,18 @@ struct CacheReceipt {
     artifact_sha256: String,
     bytes: u64,
     rows: u64,
+    #[serde(default)]
+    observed_modified_unix_nanos: u128,
+    #[serde(default)]
+    receipt_sha256: String,
+}
+
+impl CacheReceipt {
+    fn canonical_hash(&self) -> Result<String> {
+        let mut canonical = self.clone();
+        canonical.receipt_sha256.clear();
+        Ok(hex::encode(Sha256::digest(serde_json::to_vec(&canonical)?)))
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -122,32 +134,7 @@ impl CrossSnapshotCache {
         if !path.is_file() || !receipt_path.is_file() {
             return Ok(None);
         }
-        let receipt: CacheReceipt = serde_json::from_slice(&fs::read(&receipt_path)?)
-            .with_context(|| {
-                format!(
-                    "invalid incremental cache receipt {}",
-                    receipt_path.display()
-                )
-            })?;
-        ensure!(
-            receipt.schema_version == CACHE_RECEIPT_SCHEMA_VERSION
-                && receipt.wiki == self.wiki
-                && receipt.kind == kind
-                && receipt.algorithm_version == algorithm_version
-                && receipt.input_digest == input_digest
-                && receipt.writer_version == CACHE_WRITER_VERSION,
-            "incremental cache receipt identity changed"
-        );
-        let metadata = fs::metadata(&path)?;
-        ensure!(
-            metadata.is_file() && metadata.len() == receipt.bytes,
-            "incremental cache artifact size changed"
-        );
-        let (_, sha256) = storage::sha256_file(&path)?;
-        ensure!(
-            sha256 == receipt.artifact_sha256,
-            "incremental cache artifact hash changed"
-        );
+        let receipt = self.validate_artifact(&path, kind, algorithm_version, input_digest)?;
         let frame = ParquetReader::new(File::open(&path)?)
             .set_low_memory(true)
             .finish()?;
@@ -157,6 +144,21 @@ impl CrossSnapshotCache {
         );
         self.stats.borrow_mut().reused_artifacts += 1;
         Ok(Some(frame))
+    }
+
+    pub(crate) fn reusable(
+        &self,
+        kind: &str,
+        algorithm_version: &str,
+        input_digest: &str,
+        artifact: &str,
+    ) -> Result<bool> {
+        let path = self.artifact_path(kind, algorithm_version, input_digest, artifact)?;
+        if !path.is_file() || !receipt_path(&path).is_file() {
+            return Ok(false);
+        }
+        self.validate_artifact(&path, kind, algorithm_version, input_digest)?;
+        Ok(true)
     }
 
     pub(crate) fn store(
@@ -184,7 +186,7 @@ impl CrossSnapshotCache {
             fs::rename(&temporary, &path)?;
             File::open(parent)?.sync_all()?;
             let (bytes, artifact_sha256) = storage::sha256_file(&path)?;
-            let receipt = CacheReceipt {
+            let mut receipt = CacheReceipt {
                 schema_version: CACHE_RECEIPT_SCHEMA_VERSION,
                 wiki: self.wiki.clone(),
                 kind: kind.to_string(),
@@ -194,7 +196,10 @@ impl CrossSnapshotCache {
                 artifact_sha256,
                 bytes,
                 rows: u64::try_from(frame.height())?,
+                observed_modified_unix_nanos: modified_nanos(&path)?,
+                receipt_sha256: String::new(),
             };
+            receipt.receipt_sha256 = receipt.canonical_hash()?;
             atomic_json(&receipt_path(&path), &receipt)
         })();
         if result.is_err() {
@@ -287,6 +292,52 @@ impl CrossSnapshotCache {
         )
     }
 
+    fn validate_artifact(
+        &self,
+        path: &Path,
+        kind: &str,
+        algorithm_version: &str,
+        input_digest: &str,
+    ) -> Result<CacheReceipt> {
+        let receipt_path = receipt_path(path);
+        let receipt: CacheReceipt = serde_json::from_slice(&fs::read(&receipt_path)?)
+            .with_context(|| {
+                format!(
+                    "invalid incremental cache receipt {}",
+                    receipt_path.display()
+                )
+            })?;
+        ensure!(
+            matches!(receipt.schema_version, 1 | 2 | CACHE_RECEIPT_SCHEMA_VERSION)
+                && receipt.wiki == self.wiki
+                && receipt.kind == kind
+                && receipt.algorithm_version == algorithm_version
+                && receipt.input_digest == input_digest
+                && receipt.writer_version == CACHE_WRITER_VERSION,
+            "incremental cache receipt identity changed"
+        );
+        ensure!(
+            receipt.schema_version < CACHE_RECEIPT_SCHEMA_VERSION
+                || receipt.receipt_sha256 == receipt.canonical_hash()?,
+            "incremental cache receipt hash changed"
+        );
+        let metadata = fs::metadata(path)?;
+        ensure!(
+            metadata.is_file() && metadata.len() == receipt.bytes,
+            "incremental cache artifact size changed"
+        );
+        if receipt.schema_version < CACHE_RECEIPT_SCHEMA_VERSION
+            || receipt.observed_modified_unix_nanos != modified_nanos(path)?
+        {
+            let (_, sha256) = storage::sha256_file(path)?;
+            ensure!(
+                sha256 == receipt.artifact_sha256,
+                "incremental cache artifact hash changed"
+            );
+        }
+        Ok(receipt)
+    }
+
     fn artifact_path_with_extension(
         &self,
         kind: &str,
@@ -329,6 +380,14 @@ fn update_string(digest: &mut Sha256, value: &str) {
 
 fn receipt_path(artifact: &Path) -> PathBuf {
     artifact.with_extension("parquet.cache.json")
+}
+
+fn modified_nanos(path: &Path) -> Result<u128> {
+    Ok(fs::metadata(path)?
+        .modified()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .with_context(|| format!("{} has a pre-epoch mtime", path.display()))?
+        .as_nanos())
 }
 
 fn atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
@@ -547,9 +606,17 @@ mod tests {
 
         let artifact = cache.artifact_path("monthly", "v1", digest, "gdp")?;
         let receipt = receipt_path(&artifact);
+        let artifact_bytes = fs::read(&artifact)?;
+        fs::write(&artifact, &artifact_bytes)?;
+        assert!(cache.reusable("monthly", "v1", digest, "gdp")?);
         let receipt_bytes = fs::read(&receipt)?;
         fs::write(&receipt, b"not json")?;
         assert!(cache.load("monthly", "v1", digest, "gdp").is_err());
+        fs::write(&receipt, &receipt_bytes)?;
+        let mut changed_receipt: CacheReceipt = serde_json::from_slice(&receipt_bytes)?;
+        changed_receipt.rows += 1;
+        fs::write(&receipt, serde_json::to_vec(&changed_receipt)?)?;
+        assert!(cache.reusable("monthly", "v1", digest, "gdp").is_err());
         fs::write(&receipt, receipt_bytes)?;
         fs::write(&artifact, b"corrupt")?;
         assert!(cache.load("monthly", "v1", digest, "gdp").is_err());

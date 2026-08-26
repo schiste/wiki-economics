@@ -1,6 +1,8 @@
 use super::*;
 use crate::storage;
 use crate::test_support::{TestDir, init_test_tracing};
+use bzip2::Compression as BzCompression;
+use bzip2::write::BzEncoder;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use serde_json::json;
@@ -33,6 +35,7 @@ struct FakePatrolTransport {
     json_calls: Mutex<Vec<String>>,
     response_etag: Option<String>,
     response_last_modified: Option<String>,
+    response_content_length: Option<u64>,
 }
 
 impl FakePatrolTransport {
@@ -44,12 +47,18 @@ impl FakePatrolTransport {
             json_calls: Mutex::new(Vec::new()),
             response_etag: None,
             response_last_modified: None,
+            response_content_length: None,
         }
     }
 
     fn with_response_identity(mut self, etag: &str, last_modified: &str) -> Self {
         self.response_etag = Some(etag.to_string());
         self.response_last_modified = Some(last_modified.to_string());
+        self
+    }
+
+    fn with_response_content_length(mut self, content_length: u64) -> Self {
+        self.response_content_length = Some(content_length);
         self
     }
 
@@ -80,10 +89,11 @@ impl PatrolTransport for FakePatrolTransport {
             .expect("transport bodies lock should not be poisoned")
             .pop_front()
             .expect("test transport should have a queued body");
-        let content_length = self
-            .response_etag
-            .as_ref()
-            .and_then(|_| u64::try_from(bytes.len()).ok());
+        let content_length = self.response_content_length.or_else(|| {
+            self.response_etag
+                .as_ref()
+                .and_then(|_| u64::try_from(bytes.len()).ok())
+        });
         Ok(PatrolTransportResponse::from_bytes_with_identity(
             bytes,
             content_length,
@@ -109,6 +119,61 @@ fn gzip_bytes(content: &str) -> Result<Vec<u8>> {
     let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(content.as_bytes())?;
     encoder.finish().map_err(Into::into)
+}
+
+fn history_row(wiki: &str, timestamp: &str, username: &str, revision_id: &str) -> String {
+    let mut row = vec![String::new(); crate::schema::COLUMNS.len()];
+    for (name, value) in [
+        ("wiki_db", wiki),
+        ("event_entity", "revision"),
+        ("event_type", "create"),
+        ("event_timestamp", timestamp),
+        ("event_user_id", "1"),
+        ("event_user_text", username),
+        ("event_user_is_anonymous", "false"),
+        ("event_user_is_temporary", "false"),
+        ("event_user_registration_timestamp", "2023-01-01 00:00:00.0"),
+        ("event_user_first_edit_timestamp", timestamp),
+        ("page_id", "10"),
+        ("page_title", "ExamplePage"),
+        ("page_namespace", "0"),
+        ("page_namespace_is_content", "true"),
+        ("page_is_redirect", "false"),
+        ("revision_id", revision_id),
+        ("revision_parent_id", "0"),
+        ("revision_minor_edit", "false"),
+        ("revision_text_bytes", "1200"),
+        ("revision_text_bytes_diff", "100"),
+        ("revision_is_identity_reverted", "false"),
+        ("revision_is_identity_revert", "false"),
+    ] {
+        let index = crate::schema::COLUMNS
+            .iter()
+            .position(|column| column == &name)
+            .expect("history fixture column should exist");
+        row[index] = value.to_string();
+    }
+    row.join("\t")
+}
+
+fn ingest_history_snapshot(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot: &str,
+    rows: &[String],
+) -> Result<()> {
+    let raw_dir = data_dir.join("raw").join(wiki);
+    fs::create_dir_all(&raw_dir)?;
+    let path = raw_dir.join(format!("{snapshot}.{wiki}.all-time.tsv.bz2"));
+    let file = File::create(path)?;
+    let mut encoder = BzEncoder::new(file, BzCompression::best());
+    for row in rows {
+        encoder.write_all(row.as_bytes())?;
+        encoder.write_all(b"\n")?;
+    }
+    encoder.finish()?;
+    crate::ingest::ingest_wiki_snapshot(wiki, snapshot, data_dir)?;
+    Ok(())
 }
 
 fn write_gz(path: &Path, content: &str) -> Result<()> {
@@ -294,6 +359,26 @@ fn serve_once(response: String) -> Result<(String, std::thread::JoinHandle<Vec<u
 
 #[test]
 fn params_and_helper_functions_cover_edge_cases() {
+    let mut headers = HeaderMap::new();
+    headers.insert(ETAG, reqwest::header::HeaderValue::from_static("etag-v1"));
+    headers.insert(
+        CONTENT_RANGE,
+        reqwest::header::HeaderValue::from_static("bytes 10-19/100"),
+    );
+    assert_eq!(header_string(&headers, ETAG), Some("etag-v1".to_string()));
+    assert_eq!(response_total_length(&headers, Some(10)), Some(100));
+    headers.insert(
+        CONTENT_RANGE,
+        reqwest::header::HeaderValue::from_static("bytes */100"),
+    );
+    assert_eq!(unsatisfied_range_total(&headers), Some(100));
+    headers.remove(CONTENT_RANGE);
+    headers.insert(
+        CONTENT_LENGTH,
+        reqwest::header::HeaderValue::from_static("90"),
+    );
+    assert_eq!(response_total_length(&headers, Some(10)), Some(100));
+
     assert_eq!(UserType::Registered.as_str(), "registered");
     assert_eq!(UserType::Anonymous.as_str(), "anonymous");
     assert_eq!(UserType::Temporary.as_str(), "temporary");
@@ -359,6 +444,7 @@ fn params_and_helper_functions_cover_edge_cases() {
 
     let revision_meta = RevisionMeta {
         timestamp_seconds: parse_timestamp_seconds("2026-01-01 00:00:00").expect("timestamp"),
+        year_month_key: 202601,
         page_namespace: 0,
         user_type: UserType::Registered,
     };
@@ -549,6 +635,21 @@ fn download_logging_dump_rejects_short_payload() -> Result<()> {
     let err = download_logging_dump(&transport, "testwiki", &dest)
         .expect_err("1-byte payload must fail magic check");
     assert!(err.to_string().contains("gzip magic"));
+    assert!(!dest.exists());
+    Ok(())
+}
+
+#[test]
+fn download_logging_dump_rejects_a_mismatched_transport_length() -> Result<()> {
+    let temp_dir = TestDir::new()?;
+    let dest = temp_dir.path().join("patrol.xml.gz");
+    let body = gzip_bytes("<mediawiki></mediawiki>")?;
+    let expected = u64::try_from(body.len())? + 1;
+    let transport =
+        FakePatrolTransport::new(vec![body], Vec::new()).with_response_content_length(expected);
+    let error = download_logging_dump(&transport, "testwiki", &dest)
+        .expect_err("a mismatched response length must fail closed");
+    assert!(error.to_string().contains("length changed"));
     assert!(!dest.exists());
     Ok(())
 }
@@ -804,14 +905,499 @@ editor</params></logitem>
             .join("patrol/testwiki/patrol.parquet")
             .exists()
     );
+    let pointer: Value = serde_json::from_slice(&fs::read(
+        data_dir
+            .path()
+            .join("patrol/testwiki/current-generation.json"),
+    )?)?;
+    assert_eq!(pointer["snapshot"], "2026-08");
+    assert_eq!(pointer["manifest_sha256"], generation.manifest_sha256);
+    assert_eq!(
+        pointer["manifest_file_sha256"].as_str().map(str::len),
+        Some(64)
+    );
+    let summary = source_generation_summary(data_dir.path(), "testwiki", "2026-08")?
+        .context("test patrol generation summary is missing")?;
+    assert_eq!(summary.total_log_items, 4);
+    assert_eq!(summary.patrol_events, 2);
+    assert_eq!(summary.rights_events, 2);
+    assert_eq!(summary.skipped_events, 0);
+    assert_eq!(summary.manifest_sha256, generation.manifest_sha256);
+    assert!(source_generation_summary(data_dir.path(), "testwiki", "2026-07")?.is_none());
 
     let reused = generation::fetch(&transport, "testwiki", "2026-08", data_dir.path())?;
     assert_eq!(reused, generation);
     assert_eq!(transport.get_calls().len(), 1);
 
     let first_patrol = root.join(&generation.patrol_months[0].relative_path);
+    let original_patrol = fs::read(&first_patrol)?;
+    fs::write(&first_patrol, &original_patrol)?;
+    assert_eq!(
+        generation::load(data_dir.path(), "testwiki", "2026-08")?,
+        generation
+    );
     fs::write(&first_patrol, b"corrupt")?;
     assert!(generation::load(data_dir.path(), "testwiki", "2026-08").is_err());
+    Ok(())
+}
+
+#[test]
+fn patrol_generation_handles_empty_sources_and_cleans_failed_staging() -> Result<()> {
+    let data_dir = TestDir::new()?;
+    let empty = FakePatrolTransport::new(
+        vec![gzip_bytes("<mediawiki></mediawiki>")?],
+        vec![json!({"query": {"usergroups": []}})],
+    );
+    let generation = generation::fetch(&empty, "emptywiki", "2026-08", data_dir.path())?;
+    assert!(generation.patrol_months.is_empty());
+    assert!(generation.rights_months.is_empty());
+
+    let out_of_order = r#"<mediawiki>
+<logitem><id>1</id><timestamp>2024-02-02T00:00:00Z</timestamp><contributor><username>P</username></contributor><type>patrol</type><params>2
+1
+0</params></logitem>
+<logitem><id>2</id><timestamp>2024-01-02T00:00:00Z</timestamp><contributor><username>P</username></contributor><type>patrol</type><params>1
+0
+0</params></logitem>
+</mediawiki>"#;
+    let failed = FakePatrolTransport::new(
+        vec![gzip_bytes(out_of_order)?],
+        vec![json!({"query": {"usergroups": []}})],
+    );
+    assert!(generation::fetch(&failed, "orderwiki", "2026-08", data_dir.path()).is_err());
+    let snapshot_root = data_dir.path().join("patrol/orderwiki/generations/2026-08");
+    assert!(fs::read_dir(snapshot_root)?.all(|entry| {
+        !entry
+            .expect("directory entry")
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")
+    }));
+
+    let incomplete = generation::generation_dir(data_dir.path(), "incompletewiki", "2026-08")?;
+    fs::create_dir_all(&incomplete)?;
+    let unused = FakePatrolTransport::new(Vec::new(), Vec::new());
+    assert!(generation::fetch(&unused, "incompletewiki", "2026-08", data_dir.path()).is_err());
+
+    let blocked = data_dir.path().join("blocked-generation.json");
+    fs::create_dir(&blocked)?;
+    assert!(generation::atomic_json(&blocked, &json!({"value": 1})).is_err());
+    assert!(fs::read_dir(data_dir.path())?.all(|entry| {
+        !entry
+            .expect("directory entry")
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")
+    }));
+    Ok(())
+}
+
+#[test]
+fn snapshot_patrol_fetch_wrapper_and_readiness_use_the_generation_receipt() -> Result<()> {
+    let data_dir = TestDir::new()?;
+    let transport = Arc::new(FakePatrolTransport::new(
+        vec![gzip_bytes(
+            r#"<mediawiki><logitem><id>1</id><timestamp>2026-01-01T00:00:00Z</timestamp><contributor><username>P</username></contributor><type>patrol</type><params>1
+0
+0</params></logitem></mediawiki>"#,
+        )?],
+        vec![json!({"query": {"usergroups": []}})],
+    ));
+    let _guard = install_test_transport(transport);
+    fetch_patrol_for_snapshot("wrapperwiki", "2026-08", data_dir.path())?;
+    assert!(cached_sources_available_for_snapshot(
+        data_dir.path(),
+        "wrapperwiki",
+        "2026-08"
+    ));
+    assert!(!cached_sources_available_for_snapshot(
+        data_dir.path(),
+        "wrapperwiki",
+        "2026-07"
+    ));
+    Ok(())
+}
+
+#[test]
+fn incremental_patrol_reuses_months_and_replays_rights_suffix() -> Result<()> {
+    init_test_tracing();
+    let root = TestDir::new()?;
+    let data_dir = root.path().join("data");
+    let wiki = "patrolincrementalwiki";
+    let jan = history_row(wiki, "2024-01-10 12:00:00.0", "AutoUser", "101");
+    let feb = history_row(wiki, "2024-02-10 12:00:00.0", "AutoUser", "102");
+    let march = history_row(wiki, "2024-03-10 12:00:00.0", "AutoUser", "103");
+    let groups = || {
+        json!({
+            "query": { "usergroups": [
+                { "name": "autopatrolled", "rights": ["autopatrol"] }
+            ] }
+        })
+    };
+    let first_xml = r#"<mediawiki>
+<logitem><id>1</id><timestamp>2024-01-01T00:00:00Z</timestamp><type>rights</type><logtitle>User:AutoUser</logtitle><params>editor
+autopatrolled</params></logitem>
+<logitem><id>2</id><timestamp>2024-01-15T00:00:00Z</timestamp><contributor><username>Patroller</username><id>2</id></contributor><type>patrol</type><logtitle>Page</logtitle><params>101
+100
+0</params></logitem>
+</mediawiki>"#;
+
+    ingest_history_snapshot(&data_dir, wiki, "2026-07", &[jan.clone(), feb.clone()])?;
+    let first_transport = FakePatrolTransport::new(vec![gzip_bytes(first_xml)?], vec![groups()]);
+    generation::fetch(&first_transport, wiki, "2026-07", &data_dir)?;
+    let first_output = root.path().join("first-output");
+    compute_patrol_for_snapshot(wiki, "2026-07", &data_dir, &first_output, false, None)?;
+    compute_patrol_for_snapshot(wiki, "2026-07", &data_dir, &first_output, false, None)?;
+    compute_patrol_for_snapshot(
+        wiki,
+        "2026-07",
+        &data_dir,
+        &root.path().join("limited-output"),
+        false,
+        Some(1),
+    )?;
+    let first = read_parquet_df(&first_output.join(wiki).join("patrol.parquet"), None)?;
+    let feb_row = first
+        .column("year_month")?
+        .str()?
+        .iter()
+        .position(|value| value == Some("2024-02"))
+        .context("first patrol output should contain February")?;
+    assert_eq!(
+        first.column("autopatrolled_revisions")?.i64()?.get(feb_row),
+        Some(1)
+    );
+    let cache_root = data_dir
+        .join("incremental/metric-cache")
+        .join(wiki)
+        .join("patrol_month");
+    assert_eq!(storage::collect_parquet_files(&cache_root)?.len(), 2);
+
+    let changed_rights_xml = r#"<mediawiki>
+<logitem><id>1</id><timestamp>2024-01-01T00:00:00Z</timestamp><type>rights</type><logtitle>User:AutoUser</logtitle><params>editor
+autopatrolled</params></logitem>
+<logitem><id>2</id><timestamp>2024-01-15T00:00:00Z</timestamp><contributor><username>Patroller</username><id>2</id></contributor><type>patrol</type><logtitle>Page</logtitle><params>101
+100
+0</params></logitem>
+<logitem><id>3</id><timestamp>2024-02-01T00:00:00Z</timestamp><type>rights</type><logtitle>User:AutoUser</logtitle><params>autopatrolled
+editor</params></logitem>
+</mediawiki>"#;
+    ingest_history_snapshot(&data_dir, wiki, "2026-08", &[jan.clone(), feb.clone()])?;
+    let second_transport =
+        FakePatrolTransport::new(vec![gzip_bytes(changed_rights_xml)?], vec![groups()]);
+    generation::fetch(&second_transport, wiki, "2026-08", &data_dir)?;
+    let second_output = root.path().join("second-output");
+    compute_patrol_for_snapshot(wiki, "2026-08", &data_dir, &second_output, false, None)?;
+    assert_eq!(
+        storage::collect_parquet_files(&cache_root)?.len(),
+        3,
+        "January should reuse while the changed rights suffix rebuilds February"
+    );
+    let second = read_parquet_df(&second_output.join(wiki).join("patrol.parquet"), None)?;
+    let feb_row = second
+        .column("year_month")?
+        .str()?
+        .iter()
+        .position(|value| value == Some("2024-02"))
+        .context("second patrol output should contain February")?;
+    assert_eq!(
+        second
+            .column("autopatrolled_revisions")?
+            .i64()?
+            .get(feb_row),
+        Some(0)
+    );
+
+    ingest_history_snapshot(&data_dir, wiki, "2026-09", &[jan, feb, march])?;
+    let appended_xml = format!(
+        "{}{}",
+        changed_rights_xml.trim_end_matches("</mediawiki>"),
+        r#"<logitem><id>4</id><timestamp>2024-03-15T00:00:00Z</timestamp><contributor><username>Patroller</username><id>2</id></contributor><type>patrol</type><logtitle>Page</logtitle><params>103
+102
+0</params></logitem></mediawiki>"#
+    );
+    let third_transport =
+        FakePatrolTransport::new(vec![gzip_bytes(&appended_xml)?], vec![groups()]);
+    generation::fetch(&third_transport, wiki, "2026-09", &data_dir)?;
+    let third_output = root.path().join("third-output");
+    compute_patrol_for_snapshot(wiki, "2026-09", &data_dir, &third_output, false, None)?;
+    assert_eq!(
+        storage::collect_parquet_files(&cache_root)?.len(),
+        4,
+        "an appended logging month should add one metric cache artifact"
+    );
+
+    let historical_patrol_xml = r#"<mediawiki>
+<logitem><id>1</id><timestamp>2024-01-01T00:00:00Z</timestamp><type>rights</type><logtitle>User:AutoUser</logtitle><params>editor
+autopatrolled</params></logitem>
+<logitem><id>2</id><timestamp>2024-01-15T00:00:00Z</timestamp><contributor><username>Patroller</username><id>2</id></contributor><type>patrol</type><logtitle>Page</logtitle><params>101
+100
+0</params></logitem>
+<logitem><id>5</id><timestamp>2024-01-20T00:00:00Z</timestamp><contributor><username>Patroller</username><id>2</id></contributor><type>patrol</type><logtitle>Page</logtitle><params>101
+100
+0</params></logitem>
+<logitem><id>3</id><timestamp>2024-02-01T00:00:00Z</timestamp><type>rights</type><logtitle>User:AutoUser</logtitle><params>autopatrolled
+editor</params></logitem>
+<logitem><id>4</id><timestamp>2024-03-15T00:00:00Z</timestamp><contributor><username>Patroller</username><id>2</id></contributor><type>patrol</type><logtitle>Page</logtitle><params>103
+102
+0</params></logitem></mediawiki>"#;
+    let july_rows = [
+        history_row(wiki, "2024-01-10 12:00:00.0", "AutoUser", "101"),
+        history_row(wiki, "2024-02-10 12:00:00.0", "AutoUser", "102"),
+        history_row(wiki, "2024-03-10 12:00:00.0", "AutoUser", "103"),
+    ];
+    ingest_history_snapshot(&data_dir, wiki, "2026-10", &july_rows)?;
+    let fourth_transport =
+        FakePatrolTransport::new(vec![gzip_bytes(historical_patrol_xml)?], vec![groups()]);
+    generation::fetch(&fourth_transport, wiki, "2026-10", &data_dir)?;
+    let fourth_output = root.path().join("fourth-output");
+    compute_patrol_for_snapshot(wiki, "2026-10", &data_dir, &fourth_output, false, None)?;
+    assert_eq!(
+        storage::collect_parquet_files(&cache_root)?.len(),
+        5,
+        "a historical January patrol change should rebuild January but reuse later months"
+    );
+
+    let clean_output = root.path().join("clean-output");
+    compute_patrol_for_snapshot(wiki, "2026-10", &data_dir, &clean_output, true, None)?;
+    let incremental_digest =
+        storage::sha256_file(&fourth_output.join(wiki).join("patrol.parquet"))?;
+    let clean_digest = storage::sha256_file(&clean_output.join(wiki).join("patrol.parquet"))?;
+    assert_eq!(incremental_digest, clean_digest);
+    Ok(())
+}
+
+#[test]
+fn incremental_patrol_restores_and_authenticates_rights_checkpoints() -> Result<()> {
+    let root = TestDir::new()?;
+    let data_dir = root.path().join("data");
+    let wiki = "patrolcheckpointwiki";
+    let december = history_row(wiki, "2024-12-10 12:00:00.0", "AutoUser", "201");
+    let january = history_row(wiki, "2025-01-10 12:00:00.0", "AutoUser", "202");
+    let february = history_row(wiki, "2025-02-10 12:00:00.0", "AutoUser", "203");
+    let logging_xml = r#"<mediawiki>
+<logitem><id>1</id><timestamp>2024-01-01T00:00:00Z</timestamp><type>rights</type><logtitle>User:AutoUser</logtitle><params>editor
+autopatrolled</params></logitem>
+<logitem><id>2</id><timestamp>2024-01-02T00:00:00Z</timestamp><type>rights</type><logtitle>User:AutoUser</logtitle><params>autopatrolled
+autopatrolled</params></logitem>
+</mediawiki>"#;
+    let groups = || {
+        json!({
+            "query": { "usergroups": [
+                { "name": "autopatrolled", "rights": ["autopatrol"] }
+            ] }
+        })
+    };
+    let fetch = |snapshot: &str| -> Result<()> {
+        let transport = FakePatrolTransport::new(vec![gzip_bytes(logging_xml)?], vec![groups()]);
+        generation::fetch(&transport, wiki, snapshot, &data_dir)?;
+        Ok(())
+    };
+
+    ingest_history_snapshot(&data_dir, wiki, "2026-07", std::slice::from_ref(&december))?;
+    fetch("2026-07")?;
+    compute_patrol_for_snapshot(
+        wiki,
+        "2026-07",
+        &data_dir,
+        &root.path().join("first"),
+        false,
+        None,
+    )?;
+    let checkpoint_root = data_dir
+        .join("incremental/metric-cache")
+        .join(wiki)
+        .join("patrol_rights_checkpoint");
+    let checkpoint_files = fingerprint::collect_tracked_files(&checkpoint_root, "checkpoint")?;
+    assert_eq!(checkpoint_files.len(), 1);
+    let checkpoint_path = checkpoint_files[0].path.clone();
+    let checkpoint_bytes = fs::read(&checkpoint_path)?;
+
+    ingest_history_snapshot(
+        &data_dir,
+        wiki,
+        "2026-08",
+        &[december.clone(), january.clone()],
+    )?;
+    fetch("2026-08")?;
+    let second_output = root.path().join("second");
+    compute_patrol_for_snapshot(wiki, "2026-08", &data_dir, &second_output, false, None)?;
+    let second = read_parquet_df(&second_output.join(wiki).join("patrol.parquet"), None)?;
+    let january_row = second
+        .column("year_month")?
+        .str()?
+        .iter()
+        .position(|month| month == Some("2025-01"))
+        .context("checkpoint patrol output should contain January 2025")?;
+    assert_eq!(
+        second
+            .column("autopatrolled_revisions")?
+            .i64()?
+            .get(january_row),
+        Some(1),
+        "the year-end checkpoint must restore the active autopatrol grant"
+    );
+
+    let mut corrupt_checkpoint: Value = serde_json::from_slice(&checkpoint_bytes)?;
+    corrupt_checkpoint["active_users"] = json!(["WrongUser"]);
+    fs::write(
+        &checkpoint_path,
+        serde_json::to_vec_pretty(&corrupt_checkpoint)?,
+    )?;
+    ingest_history_snapshot(&data_dir, wiki, "2026-09", &[december, january, february])?;
+    fetch("2026-09")?;
+    let third_output = root.path().join("third");
+    let error = compute_patrol_for_snapshot(wiki, "2026-09", &data_dir, &third_output, false, None)
+        .expect_err("a modified rights checkpoint must fail closed");
+    assert!(error.to_string().contains("state hash changed"));
+
+    fs::write(checkpoint_path, checkpoint_bytes)?;
+    compute_patrol_for_snapshot(wiki, "2026-09", &data_dir, &third_output, false, None)?;
+    let third = read_parquet_df(&third_output.join(wiki).join("patrol.parquet"), None)?;
+    let february_row = third
+        .column("year_month")?
+        .str()?
+        .iter()
+        .position(|month| month == Some("2025-02"))
+        .context("checkpoint patrol output should contain February 2025")?;
+    assert_eq!(
+        third
+            .column("autopatrolled_revisions")?
+            .i64()?
+            .get(february_row),
+        Some(1)
+    );
+    Ok(())
+}
+
+#[test]
+fn incremental_patrol_invalidates_the_referenced_revision_month() -> Result<()> {
+    let root = TestDir::new()?;
+    let data_dir = root.path().join("data");
+    let wiki = "patrolcrossmonthwiki";
+    let first_revision = history_row(wiki, "2024-01-10 12:00:00.0", "Editor", "301");
+    let second_revision = history_row(wiki, "2024-01-20 12:00:00.0", "Editor", "302");
+    let first_xml = r#"<mediawiki>
+<logitem><id>1</id><timestamp>2024-01-15T00:00:00Z</timestamp><contributor><username>Patroller</username><id>2</id></contributor><type>patrol</type><logtitle>Page</logtitle><params>301
+300
+0</params></logitem>
+</mediawiki>"#;
+    let second_xml = format!(
+        "{}{}",
+        first_xml.trim_end_matches("</mediawiki>"),
+        r#"<logitem><id>2</id><timestamp>2024-02-02T00:00:00Z</timestamp><contributor><username>Patroller</username><id>2</id></contributor><type>patrol</type><logtitle>Page</logtitle><params>302
+301
+0</params></logitem>
+<logitem><id>3</id><timestamp>2024-02-03T00:00:00Z</timestamp><contributor><username>Patroller</username><id>2</id></contributor><type>patrol</type><logtitle>Missing</logtitle><params>999
+998
+0</params></logitem></mediawiki>"#
+    );
+    let groups = || json!({"query": {"usergroups": []}});
+
+    ingest_history_snapshot(
+        &data_dir,
+        wiki,
+        "2026-07",
+        &[first_revision.clone(), second_revision.clone()],
+    )?;
+    generation::fetch(
+        &FakePatrolTransport::new(vec![gzip_bytes(first_xml)?], vec![groups()]),
+        wiki,
+        "2026-07",
+        &data_dir,
+    )?;
+    let first_output = root.path().join("first-cross-month");
+    compute_patrol_for_snapshot(wiki, "2026-07", &data_dir, &first_output, false, None)?;
+    let first = read_parquet_df(&first_output.join(wiki).join("patrol.parquet"), None)?;
+    assert_eq!(first.column("patrolled_revisions")?.i64()?.get(0), Some(1));
+
+    ingest_history_snapshot(
+        &data_dir,
+        wiki,
+        "2026-08",
+        &[first_revision, second_revision],
+    )?;
+    generation::fetch(
+        &FakePatrolTransport::new(vec![gzip_bytes(&second_xml)?], vec![groups()]),
+        wiki,
+        "2026-08",
+        &data_dir,
+    )?;
+    let second_output = root.path().join("second-cross-month");
+    compute_patrol_for_snapshot(wiki, "2026-08", &data_dir, &second_output, false, None)?;
+    let second = read_parquet_df(&second_output.join(wiki).join("patrol.parquet"), None)?;
+    let january_row = second
+        .column("year_month")?
+        .str()?
+        .iter()
+        .position(|month| month == Some("2024-01"))
+        .context("cross-month patrol output should contain January")?;
+    assert_eq!(
+        second
+            .column("patrolled_revisions")?
+            .i64()?
+            .get(january_row),
+        Some(2),
+        "a February patrol must invalidate coverage for its January revision"
+    );
+    let metric_cache = data_dir
+        .join("incremental/metric-cache")
+        .join(wiki)
+        .join("patrol_month");
+    assert_eq!(
+        storage::collect_parquet_files(&metric_cache)?.len(),
+        3,
+        "only the referenced January and new February metric months should rebuild"
+    );
+
+    let clean_output = root.path().join("clean-cross-month");
+    compute_patrol_for_snapshot(wiki, "2026-08", &data_dir, &clean_output, true, None)?;
+    assert_eq!(
+        storage::sha256_file(&second_output.join(wiki).join("patrol.parquet"))?,
+        storage::sha256_file(&clean_output.join(wiki).join("patrol.parquet"))?
+    );
+    Ok(())
+}
+
+#[test]
+fn incremental_patrol_advances_rights_through_a_month_without_metrics() -> Result<()> {
+    let root = TestDir::new()?;
+    let data_dir = root.path().join("data");
+    let wiki = "patrolsparsemonthwiki";
+    let january = history_row(wiki, "2024-01-10 12:00:00.0", "AutoUser", "401");
+    let march = history_row(wiki, "2024-03-10 12:00:00.0", "AutoUser", "403");
+    ingest_history_snapshot(&data_dir, wiki, "2026-08", &[january, march])?;
+    let logging_xml = r#"<mediawiki>
+<logitem><id>1</id><timestamp>2024-02-01T00:00:00Z</timestamp><type>rights</type><logtitle>User:AutoUser</logtitle><params>editor
+autopatrolled</params></logitem>
+</mediawiki>"#;
+    generation::fetch(
+        &FakePatrolTransport::new(
+            vec![gzip_bytes(logging_xml)?],
+            vec![json!({"query": {"usergroups": [
+                {"name": "autopatrolled", "rights": ["autopatrol"]}
+            ]}})],
+        ),
+        wiki,
+        "2026-08",
+        &data_dir,
+    )?;
+    let output = root.path().join("sparse-output");
+    compute_patrol_for_snapshot(wiki, "2026-08", &data_dir, &output, false, None)?;
+    let patrol = read_parquet_df(&output.join(wiki).join("patrol.parquet"), None)?;
+    let march_row = patrol
+        .column("year_month")?
+        .str()?
+        .iter()
+        .position(|month| month == Some("2024-03"))
+        .context("sparse patrol output should contain March")?;
+    assert_eq!(
+        patrol
+            .column("autopatrolled_revisions")?
+            .i64()?
+            .get(march_row),
+        Some(1)
+    );
     Ok(())
 }
 
@@ -1221,6 +1807,7 @@ fn aggregate_stats_and_row_metrics_cover_edge_branches() -> Result<()> {
             RevisionMeta {
                 timestamp_seconds: parse_timestamp_seconds("2025-01-01 00:00:00")
                     .expect("timestamp"),
+                year_month_key: 202501,
                 page_namespace: 0,
                 user_type: UserType::Registered,
             },
@@ -1230,6 +1817,7 @@ fn aggregate_stats_and_row_metrics_cover_edge_branches() -> Result<()> {
             RevisionMeta {
                 timestamp_seconds: parse_timestamp_seconds("2026-01-01 00:00:00")
                     .expect("timestamp"),
+                year_month_key: 202601,
                 page_namespace: 1,
                 user_type: UserType::Temporary,
             },
