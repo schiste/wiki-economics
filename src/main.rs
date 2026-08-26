@@ -8,6 +8,7 @@ mod capacity;
 mod cleanup;
 mod compaction;
 mod compute;
+mod cpu_qualification;
 mod cross_snapshot;
 mod dashboard;
 mod determinism;
@@ -409,6 +410,21 @@ enum Commands {
         /// Required cgroup memory headroom at the observed peak
         #[arg(long, default_value_t = 25_u8)]
         minimum_memory_headroom_percent: u8,
+
+        /// CPU quota requested for this independently scheduled matrix cell
+        #[arg(long, default_value_t = 1)]
+        requested_cpu: usize,
+    },
+
+    /// Validate the complete CPU/resource qualification matrix from capacity receipts
+    CpuQualify {
+        /// Capacity benchmark receipt paths, one per required matrix cell
+        #[arg(long = "capacity-report", required = true)]
+        capacity_reports: Vec<PathBuf>,
+
+        /// Atomic qualification report path
+        #[arg(long)]
+        report: PathBuf,
     },
 
     /// Qualify the single metric-input schema against active warehouse data
@@ -549,7 +565,11 @@ trait Ops {
         storage_reserve_bytes: u64,
         quota_root: &std::path::Path,
         minimum_memory_headroom_percent: u8,
+        requested_cpu: usize,
     ) -> Result<()>;
+    fn cpu_qualification(&self, capacity_reports: &[PathBuf], report: &Path) -> Result<()> {
+        cpu_qualification::run(capacity_reports, report).map(drop)
+    }
     fn schema_benchmark(
         &self,
         data_dir: &Path,
@@ -793,6 +813,7 @@ impl Ops for RealOps {
         storage_reserve_bytes: u64,
         quota_root: &std::path::Path,
         minimum_memory_headroom_percent: u8,
+        requested_cpu: usize,
     ) -> Result<()> {
         execute_capacity_benchmark(capacity::CapacityBenchmarkOptions {
             wiki,
@@ -807,6 +828,7 @@ impl Ops for RealOps {
             nfs_quota_bytes,
             storage_reserve_bytes,
             minimum_memory_headroom_percent,
+            requested_cpu,
             telemetry_override: None,
         })
     }
@@ -1424,6 +1446,7 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             storage_reserve_bytes,
             quota_root,
             minimum_memory_headroom_percent,
+            requested_cpu,
         } => {
             let bucket_label = if weekly_secondary_buckets == 1 {
                 format!("weekly-buckets-{weekly_buckets}")
@@ -1457,7 +1480,17 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
                     storage_reserve_bytes,
                     &quota_root,
                     minimum_memory_headroom_percent,
+                    requested_cpu,
                 )
+            })?;
+        }
+
+        Commands::CpuQualify {
+            capacity_reports,
+            report,
+        } => {
+            run_timed_stage("cpu_qualification", None, || {
+                ops.cpu_qualification(&capacity_reports, &report)
             })?;
         }
 
@@ -1943,9 +1976,10 @@ mod tests {
             storage_reserve_bytes: u64,
             quota_root: &Path,
             minimum_memory_headroom_percent: u8,
+            requested_cpu: usize,
         ) -> Result<()> {
             self.record(format!(
-                "capacity:{wiki}:{}:{}:{}:{}:{weekly_buckets}x{weekly_secondary_buckets}:{raw_transient_bytes}:{}:{storage_reserve_bytes}:{}:{minimum_memory_headroom_percent}",
+                "capacity:{wiki}:{}:{}:{}:{}:{weekly_buckets}x{weekly_secondary_buckets}:{raw_transient_bytes}:{}:{storage_reserve_bytes}:{}:{minimum_memory_headroom_percent}:{requested_cpu}",
                 data_dir.display(),
                 output_dir.display(),
                 scratch_dir.display(),
@@ -1954,6 +1988,19 @@ mod tests {
                     .map(|quota| quota.to_string())
                     .unwrap_or_else(|| "shared".to_string()),
                 quota_root.display(),
+            ));
+            Ok(())
+        }
+
+        fn cpu_qualification(&self, capacity_reports: &[PathBuf], report: &Path) -> Result<()> {
+            self.record(format!(
+                "cpu-qualification:{}:{}",
+                capacity_reports
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                report.display()
             ));
             Ok(())
         }
@@ -2132,6 +2179,7 @@ mod tests {
             _storage_reserve_bytes: u64,
             _quota_root: &Path,
             _minimum_memory_headroom_percent: u8,
+            _requested_cpu: usize,
         ) -> Result<()> {
             if self.fail_stage == "capacity" {
                 anyhow::bail!("capacity benchmark failed");
@@ -2909,6 +2957,7 @@ mod tests {
                 storage_reserve_bytes: 53_687_091_200,
                 quota_root,
                 minimum_memory_headroom_percent: 25,
+                requested_cpu: 1,
             } if wiki == "frwiki"
                 && scratch_dir == Path::new("/scratch")
                 && report.as_deref() == Some(Path::new("/reports/frwiki-512.json"))
@@ -2931,6 +2980,39 @@ mod tests {
                 ..
             }
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn cpu_qualification_cli_requires_explicit_receipts_and_output() -> Result<()> {
+        let cli = Cli::try_parse_from([
+            "wiki-econ",
+            "cpu-qualify",
+            "--capacity-report",
+            "/reports/nl.json",
+            "--capacity-report",
+            "/reports/pt.json",
+            "--report",
+            "/reports/qualification.json",
+        ])?;
+        assert!(matches!(
+            cli.command,
+            Commands::CpuQualify {
+                capacity_reports,
+                report,
+            } if capacity_reports
+                == vec![PathBuf::from("/reports/nl.json"), PathBuf::from("/reports/pt.json")]
+                && report == Path::new("/reports/qualification.json")
+        ));
+        assert!(
+            Cli::try_parse_from([
+                "wiki-econ",
+                "cpu-qualify",
+                "--report",
+                "/reports/qualification.json",
+            ])
+            .is_err()
+        );
         Ok(())
     }
 
@@ -3025,6 +3107,7 @@ mod tests {
             nfs_quota_bytes: Some(1_000_000_000),
             storage_reserve_bytes: 0,
             minimum_memory_headroom_percent: 25,
+            requested_cpu: 1,
             telemetry_override: Some(observability::MemorySnapshot {
                 rss_bytes: Some(25),
                 cgroup_current_bytes: Some(50),
@@ -3049,6 +3132,7 @@ mod tests {
             0,
             data.path(),
             25,
+            1,
         );
         Ok(())
     }
@@ -3088,7 +3172,32 @@ mod tests {
         assert_eq!(
             ops.calls.into_inner(),
             vec![
-                "capacity:frwiki:dataset:capacity-out/capacity/frwiki/weekly-buckets-1024x32:scratch:capacity-out/capacity/frwiki/weekly-buckets-1024x32.json:1024x32:31000000000:100000000000:40000000000:tool-root:30"
+                "capacity:frwiki:dataset:capacity-out/capacity/frwiki/weekly-buckets-1024x32:scratch:capacity-out/capacity/frwiki/weekly-buckets-1024x32.json:1024x32:31000000000:100000000000:40000000000:tool-root:30:1"
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn run_with_ops_dispatches_cpu_qualification() -> Result<()> {
+        let cli = Cli::try_parse_from([
+            "wiki-econ",
+            "cpu-qualify",
+            "--capacity-report",
+            "reports/nlwiki.json",
+            "--capacity-report",
+            "reports/ptwiki.json",
+            "--report",
+            "reports/cpu-qualification.json",
+        ])?;
+        let ops = RecordingOps::default();
+
+        run_with_ops(cli, &ops)?;
+
+        assert_eq!(
+            ops.calls.into_inner(),
+            vec![
+                "cpu-qualification:reports/nlwiki.json,reports/ptwiki.json:reports/cpu-qualification.json"
             ]
         );
         Ok(())
@@ -3962,6 +4071,7 @@ mod tests {
     #[test]
     fn failing_ops_succeeds_for_non_matching_stages() -> Result<()> {
         let ops = FailingOps { fail_stage: "none" };
+        let qualification = TestDir::new()?;
         let data_dir = Path::new("data");
         let output_dir = Path::new("output");
         let wikis = vec!["frwiki".to_string()];
@@ -3986,8 +4096,15 @@ mod tests {
             0,
             data_dir,
             25,
+            1,
         )
         .expect("non-matching failing ops stage");
+        let qualification_report = qualification.path().join("cpu.json");
+        assert!(
+            ops.cpu_qualification(&[], &qualification_report).is_err(),
+            "an incomplete qualification matrix must fail closed"
+        );
+        assert!(qualification_report.is_file());
         let schema_result = ops.schema_benchmark(
             data_dir,
             Path::new("scratch"),

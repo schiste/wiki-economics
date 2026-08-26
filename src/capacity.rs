@@ -10,7 +10,7 @@ use crate::compute::{
 };
 use crate::{observability::MemorySnapshot, storage};
 
-const REPORT_SCHEMA_VERSION: u32 = 4;
+const REPORT_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct CapacityBenchmarkReport {
@@ -24,8 +24,14 @@ pub struct CapacityBenchmarkReport {
     pub bucket_count: usize,
     pub primary_bucket_count: usize,
     pub secondary_bucket_count: usize,
+    pub requested_cpu: usize,
     pub rayon_threads: usize,
     pub polars_threads: usize,
+    pub weekly_workers: usize,
+    pub cgroup_cpu_limit_cores: Option<f64>,
+    pub cpu_utilization_cores: Option<f64>,
+    pub read_bytes_per_second: Option<u64>,
+    pub write_bytes_per_second: Option<u64>,
     pub scratch_root: String,
     pub raw_transient_requirement_bytes: u64,
     pub current_generation_bytes: u64,
@@ -64,6 +70,7 @@ pub struct CapacityBenchmarkOptions<'a> {
     pub nfs_quota_bytes: Option<u64>,
     pub storage_reserve_bytes: u64,
     pub minimum_memory_headroom_percent: u8,
+    pub requested_cpu: usize,
     pub telemetry_override: Option<MemorySnapshot>,
 }
 
@@ -72,6 +79,7 @@ pub fn run(options: CapacityBenchmarkOptions<'_>) -> Result<CapacityBenchmarkRep
         options.minimum_memory_headroom_percent <= 100,
         "minimum memory headroom percent must be at most 100"
     );
+    anyhow::ensure!(options.requested_cpu > 0, "requested CPU must be positive");
     if let Some(nfs_quota_bytes) = options.nfs_quota_bytes {
         anyhow::ensure!(nfs_quota_bytes > 0, "configured NFS quota must be positive");
     }
@@ -155,8 +163,24 @@ pub fn run(options: CapacityBenchmarkOptions<'_>) -> Result<CapacityBenchmarkRep
         bucket_count: aggregation.bucket_count,
         primary_bucket_count: aggregation.primary_bucket_count,
         secondary_bucket_count: aggregation.secondary_bucket_count,
+        requested_cpu: options.requested_cpu,
         rayon_threads: configured_threads("RAYON_NUM_THREADS"),
         polars_threads: configured_threads("POLARS_MAX_THREADS"),
+        weekly_workers: configured_threads(crate::resource_governor::WEEKLY_WORKERS_ENV),
+        cgroup_cpu_limit_cores: cgroup_cpu_limit_cores(),
+        cpu_utilization_cores: rate_per_millisecond(
+            aggregation.resources.cpu_usage_usec,
+            aggregation.elapsed_ms,
+            1_000,
+        ),
+        read_bytes_per_second: integer_rate(
+            aggregation.resources.read_bytes,
+            aggregation.elapsed_ms,
+        ),
+        write_bytes_per_second: integer_rate(
+            aggregation.resources.write_bytes,
+            aggregation.elapsed_ms,
+        ),
         scratch_root: options.scratch_root.to_string_lossy().into_owned(),
         raw_transient_requirement_bytes: options.raw_transient_requirement_bytes,
         current_generation_bytes,
@@ -202,6 +226,54 @@ fn configured_threads(name: &str) -> usize {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(1)
+}
+
+fn rate_per_millisecond(value: Option<u64>, elapsed_ms: u64, divisor: u64) -> Option<f64> {
+    value
+        .filter(|_| elapsed_ms > 0)
+        .map(|value| value as f64 / (elapsed_ms as f64 * divisor as f64))
+}
+
+fn integer_rate(value: Option<u64>, elapsed_ms: u64) -> Option<u64> {
+    value
+        .filter(|_| elapsed_ms > 0)
+        .map(|value| value.saturating_mul(1_000) / elapsed_ms)
+}
+
+#[cfg(not(coverage))]
+fn cgroup_cpu_limit_cores() -> Option<f64> {
+    fs::read_to_string("/sys/fs/cgroup/cpu.max")
+        .ok()
+        .and_then(|value| parse_cpu_max(&value))
+        .or_else(|| {
+            let quota = fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").ok()?;
+            let period = fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_period_us").ok()?;
+            parse_cpu_quota(&quota, &period)
+        })
+}
+
+#[cfg(coverage)]
+fn cgroup_cpu_limit_cores() -> Option<f64> {
+    None
+}
+
+fn parse_cpu_max(value: &str) -> Option<f64> {
+    let mut fields = value.split_whitespace();
+    let quota = fields.next()?;
+    let period = fields.next()?.parse::<u64>().ok()?;
+    if quota == "max" || period == 0 {
+        return None;
+    }
+    quota
+        .parse::<u64>()
+        .ok()
+        .map(|quota| quota as f64 / period as f64)
+}
+
+fn parse_cpu_quota(quota: &str, period: &str) -> Option<f64> {
+    let quota = quota.trim().parse::<i64>().ok()?;
+    let period = period.trim().parse::<u64>().ok()?;
+    (quota > 0 && period > 0).then(|| quota as f64 / period as f64)
 }
 
 fn observed_memory_peak(report: &WeeklyAggregationReport) -> Result<u64> {
@@ -330,6 +402,14 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn parses_v1_and_v2_cgroup_cpu_quotas() {
+        assert_eq!(parse_cpu_max("400000 100000\n"), Some(4.0));
+        assert_eq!(parse_cpu_max("max 100000\n"), None);
+        assert_eq!(parse_cpu_quota("200000\n", "100000\n"), Some(2.0));
+        assert_eq!(parse_cpu_quota("-1\n", "100000\n"), None);
+    }
+
     fn telemetry(peak: u64, limit: u64) -> MemorySnapshot {
         MemorySnapshot {
             rss_bytes: Some(peak / 2),
@@ -386,6 +466,7 @@ mod tests {
             nfs_quota_bytes: Some(1_000_000_000),
             storage_reserve_bytes: 0,
             minimum_memory_headroom_percent: 25,
+            requested_cpu: 1,
             telemetry_override: Some(telemetry(50, 100)),
         })?;
         assert!(report.memory_gate_passed);
@@ -418,6 +499,7 @@ mod tests {
             nfs_quota_bytes: Some(1),
             storage_reserve_bytes: 0,
             minimum_memory_headroom_percent: 25,
+            requested_cpu: 1,
             telemetry_override: Some(telemetry(50, 100)),
         })
         .expect_err("exhausted confirmed quota should fail the storage gate");
@@ -438,6 +520,7 @@ mod tests {
             nfs_quota_bytes: Some(1_000_000_000),
             storage_reserve_bytes: 0,
             minimum_memory_headroom_percent: 25,
+            requested_cpu: 1,
             telemetry_override: Some(telemetry(80, 100)),
         })
         .expect_err("20% memory headroom should fail a 25% gate");
@@ -501,6 +584,7 @@ mod tests {
                 nfs_quota_bytes: quota,
                 storage_reserve_bytes: 0,
                 minimum_memory_headroom_percent: minimum_headroom,
+                requested_cpu: 1,
                 telemetry_override: Some(telemetry(50, 100)),
             });
             assert!(result.is_err());
@@ -519,6 +603,7 @@ mod tests {
             nfs_quota_bytes: Some(u64::MAX),
             storage_reserve_bytes: 0,
             minimum_memory_headroom_percent: 25,
+            requested_cpu: 1,
             telemetry_override: Some(telemetry(50, 100)),
         })
         .expect_err("rollover arithmetic must fail closed on overflow");
@@ -537,6 +622,7 @@ mod tests {
             nfs_quota_bytes: Some(1_000_000_000),
             storage_reserve_bytes: 0,
             minimum_memory_headroom_percent: 25,
+            requested_cpu: 1,
             telemetry_override: Some(MemorySnapshot::default()),
         })
         .expect_err("missing cgroup telemetry must fail closed");
@@ -560,6 +646,7 @@ mod tests {
             nfs_quota_bytes: None,
             storage_reserve_bytes: 1024,
             minimum_memory_headroom_percent: 25,
+            requested_cpu: 1,
             telemetry_override: Some(telemetry(50, 100)),
         })?;
         assert_eq!(

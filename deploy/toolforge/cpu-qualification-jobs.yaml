@@ -1,0 +1,104 @@
+# Publication-invisible, on-demand CPU qualification cells. Load exactly one
+# definition at a time and wait for it to finish before loading the next one;
+# overlapping cells would invalidate CPU and NFS throughput measurements.
+# These jobs reuse active immutable generations and delete isolated output and
+# scratch on exit. Only their compact capacity receipts are retained.
+# The 4-CPU cells require a per-job CPU limit of at least 4. Toolforge reported
+# a 3-CPU per-job limit for this tool on 2026-08-26; request the increase before
+# attempting to load those definitions.
+
+- name: wiki-econ-cpu-nl-c1-t1-w1
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: deploy/toolforge/run-cpu-qualification-cell.sh nlwiki 1 1 1
+  filelog: true
+  mount: all
+  mem: 6Gi
+  cpu: "1"
+
+- name: wiki-econ-cpu-nl-c2-t2-w1
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: deploy/toolforge/run-cpu-qualification-cell.sh nlwiki 2 2 1
+  filelog: true
+  mount: all
+  mem: 6Gi
+  cpu: "2"
+
+- name: wiki-econ-cpu-nl-c4-t3-w1
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: deploy/toolforge/run-cpu-qualification-cell.sh nlwiki 4 3 1
+  filelog: true
+  mount: all
+  mem: 6Gi
+  cpu: "4"
+
+- name: wiki-econ-cpu-nl-c4-t3-w2
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: deploy/toolforge/run-cpu-qualification-cell.sh nlwiki 4 3 2
+  filelog: true
+  mount: all
+  mem: 6Gi
+  cpu: "4"
+
+- name: wiki-econ-cpu-pt-c1-t1-w1
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: deploy/toolforge/run-cpu-qualification-cell.sh ptwiki 1 1 1
+  filelog: true
+  mount: all
+  mem: 6Gi
+  cpu: "1"
+
+- name: wiki-econ-cpu-pt-c2-t2-w1
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: deploy/toolforge/run-cpu-qualification-cell.sh ptwiki 2 2 1
+  filelog: true
+  mount: all
+  mem: 6Gi
+  cpu: "2"
+
+- name: wiki-econ-cpu-pt-c4-t3-w1
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: deploy/toolforge/run-cpu-qualification-cell.sh ptwiki 4 3 1
+  filelog: true
+  mount: all
+  mem: 6Gi
+  cpu: "4"
+
+- name: wiki-econ-cpu-pt-c4-t3-w2
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: deploy/toolforge/run-cpu-qualification-cell.sh ptwiki 4 3 2
+  filelog: true
+  mount: all
+  mem: 6Gi
+  cpu: "4"
+
+- name: wiki-econ-cpu-fr-c1-t1-w1
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: deploy/toolforge/run-cpu-qualification-cell.sh frwiki 1 1 1
+  filelog: true
+  mount: all
+  mem: 6Gi
+  cpu: "1"
+
+- name: wiki-econ-cpu-fr-c2-t2-w1
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: deploy/toolforge/run-cpu-qualification-cell.sh frwiki 2 2 1
+  filelog: true
+  mount: all
+  mem: 6Gi
+  cpu: "2"
+
+- name: wiki-econ-cpu-fr-c4-t3-w1
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: deploy/toolforge/run-cpu-qualification-cell.sh frwiki 4 3 1
+  filelog: true
+  mount: all
+  mem: 6Gi
+  cpu: "4"
+
+- name: wiki-econ-cpu-fr-c4-t3-w2
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: deploy/toolforge/run-cpu-qualification-cell.sh frwiki 4 3 2
+  filelog: true
+  mount: all
+  mem: 6Gi
+  cpu: "4"

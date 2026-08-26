@@ -51,3 +51,37 @@ for (const [name, exitCode] of [["success", 0], ["failure", 9]]) {
     });
   });
 }
+
+test("capacity wrapper accepts only the explicit CPU qualification matrix", () => {
+  const root = path.join(fixtureRoot, "cpu-matrix");
+  const common = {
+    ...process.env,
+    WIKI_ECON_BIN: writeFakeBinary(path.join(root, "bin")),
+    WIKI_ECON_CAPACITY_ROOT: path.join(root, "capacity"),
+    WIKI_ECON_DATA_DIR: path.join(root, "data"),
+    WIKI_ECON_CAPACITY_POLICY: path.join(__dirname, "../../config/capacity-qualification.json"),
+  };
+  const accepted = spawnSync("bash", [script, "nlwiki", "256"], {
+    encoding: "utf8",
+    env: {
+      ...common,
+      WIKI_ECON_REQUESTED_CPU: "4",
+      WIKI_ECON_QUALIFICATION_THREADS: "3",
+      WIKI_ECON_WEEKLY_WORKERS: "2",
+    },
+  });
+  assert.equal(accepted.status, 0, `${accepted.stdout}\n${accepted.stderr}`);
+  assert.match(accepted.stdout, /cpu=4 threads=3 weekly_workers=2/);
+
+  const rejected = spawnSync("bash", [script, "nlwiki", "256"], {
+    encoding: "utf8",
+    env: {
+      ...common,
+      WIKI_ECON_REQUESTED_CPU: "4",
+      WIKI_ECON_QUALIFICATION_THREADS: "4",
+      WIKI_ECON_WEEKLY_WORKERS: "2",
+    },
+  });
+  assert.equal(rejected.status, 2);
+  assert.match(rejected.stderr, /Unsupported qualification cell/);
+});
