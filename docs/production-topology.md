@@ -18,7 +18,7 @@ this narrative document.
 | Snapshot resolution and history fetch | Rust `wiki-econ` | raw Wikimedia dump shards, then strict fetch receipts |
 | History ingest | Rust + Polars | immutable qualified metric-input Parquet generations |
 | Core metric compute | Rust + Polars | per-wiki Parquet metrics |
-| Patrol/rights fetch and compute | Rust streaming multi-member gzip/XML path + Polars | parsed patrol/right Parquet and per-wiki patrol metrics |
+| Patrol/rights fetch and compute | Rust streaming multi-member gzip/XML path + bounded monthly Polars frames | immutable monthly patrol/right generations, rights checkpoints, and per-wiki patrol metrics |
 | Cross-wiki merge and dashboard defaults | Rust + Polars | merged Parquet, `defaults_*.json`, and `meta_*.json` |
 | Publication manifest | checked-in Node manifest validator invoked by Rust merge | atomic `manifest.json` with licensing and provenance |
 | Site compile | Observable Framework in the Toolforge Build Service image | staged static HTML, JavaScript, CSS, WASM, and data attachments |
@@ -95,7 +95,7 @@ app/
 
 data/
   raw/<wiki>/                       transient history dumps, deleted after ingest
-  patrol/<wiki>/                    logging source and parsed patrol/right data
+  patrol/<wiki>/                    selected pointer + immutable monthly patrol/right generations
   metric-input/<wiki>/_snapshots/<snapshot>/
     _compacted/year=<YYYY>/year_month=<YYYY-MM>/
   warehouse/, parquet/              schema-v1 rollback generations only

@@ -44,6 +44,14 @@ cargo run --release -- merge
 ./scripts/build-site.sh
 ```
 
+Snapshot-aware patrol fetches no longer retain the gzip or mutable source
+Parquets after commit. Readiness comes from
+`data/patrol/<wiki>/current-generation.json` and its authenticated monthly
+generation. If the site reports `needs_patrol_fetch`, verify that the patrol
+pointer snapshot matches the core snapshot and that its manifest-file hash is
+unchanged. See [incremental-patrol.md](incremental-patrol.md) before removing
+any generation or cache artifact.
+
 ## Ingest "marker is valid" skip when you expect a rebuild
 
 Ingest is idempotent based on the marker manifest at

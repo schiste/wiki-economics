@@ -17,8 +17,9 @@ The project has these distinct data layers rooted under `data/` and `output/`:
    historical `warehouse/` plus `parquet/` schema-v1 layout.
 
 4. `data/patrol/<wiki>/`
-   Logging XML transport plus parsed patrol and rights Parquet inputs used by
-   the Rust patrol compute path.
+   An atomic patrol-generation pointer plus immutable, snapshot/parser-aware
+   monthly patrol and rights Parquet inputs used by the bounded incremental
+   Rust compute path. See [incremental-patrol.md](incremental-patrol.md).
 
 5. `output/<wiki>/*.parquet`
    Final per-metric outputs, later merged into `output/*.parquet`.
