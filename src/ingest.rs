@@ -1692,11 +1692,15 @@ mod tests {
         let receipt =
             fingerprint::data_stage_receipt_path(temp_dir.path(), wiki, version, "ingest");
         let receipt_before = fs::read(&receipt)?;
+        let fragment = paths[0].clone();
+        let fragment_bytes = fs::read(&fragment)?;
+        fs::write(&fragment, vec![0_u8; fragment_bytes.len()])?;
         let reused = ingest_wiki_snapshot(wiki, version, temp_dir.path())?;
 
         assert_eq!(paths.len(), 1);
         assert_eq!(reused, paths);
         assert_eq!(fs::read(receipt)?, receipt_before);
+        assert!(storage::read_generation_manifest(temp_dir.path(), wiki, version).is_err());
         assert_eq!(
             storage::current_snapshot_version(temp_dir.path(), wiki)?.as_deref(),
             Some(version)

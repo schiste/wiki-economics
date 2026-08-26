@@ -2,14 +2,16 @@ use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 use reqwest::StatusCode;
-use reqwest::header::{ACCEPT_RANGES, CONTENT_LENGTH, HeaderMap, RANGE, RETRY_AFTER};
+use reqwest::header::{
+    ACCEPT_RANGES, CONTENT_LENGTH, ETAG, HeaderMap, LAST_MODIFIED, RANGE, RETRY_AFTER,
+};
 use reqwest::redirect::Policy;
+use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
-use std::fs;
-use std::fs::OpenOptions;
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
 use crate::fingerprint::{self, StageSpec, TrackedPath};
@@ -43,6 +45,8 @@ const FETCH_RETRY_AFTER_MAX_SECS: u64 = 30;
 const FETCH_MAX_PARALLELISM_ENV: &str = "WIKI_ECON_FETCH_MAX_PARALLELISM";
 const SNAPSHOT_MAX_LAG_ENV: &str = "WIKI_ECON_MAX_SNAPSHOT_LAG_MONTHS";
 const DEFAULT_SNAPSHOT_MAX_LAG_MONTHS: u32 = 2;
+const REMOTE_INVENTORY_SCHEMA_VERSION: u32 = 1;
+const REMOTE_INVENTORY_FILENAME: &str = "remote-inventory.json";
 const FETCH_ALGORITHM_VERSION: &str = "wikimedia-history-fetch-v4-source-window";
 const SOURCE_WINDOW_STAGING_DIR: &str = ".source-window";
 const SOURCE_WINDOW_DOWNLOAD_SUFFIX: &str = ".download";
@@ -455,12 +459,37 @@ struct AttemptError {
     retry_after: Option<Duration>,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct TransportHead {
     status: StatusCode,
     content_length: Option<u64>,
     accepts_ranges: bool,
     retry_after: Option<Duration>,
+    etag: Option<String>,
+    last_modified: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteInventorySource {
+    source_id: String,
+    url: String,
+    content_length: Option<u64>,
+    accepts_ranges: bool,
+    etag: Option<String>,
+    last_modified: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct CompletedSnapshotReceipt {
+    schema_version: u32,
+    wiki: String,
+    snapshot: String,
+    plan_sha256: String,
+    source_count: usize,
+    completion_check_timestamp: u64,
+    sources: Vec<RemoteInventorySource>,
 }
 
 struct TransportResponse {
@@ -503,11 +532,25 @@ fn snapshot_max_lag_months(value: Option<&OsStr>) -> Result<u32> {
     }
 }
 
+#[cfg(test)]
 fn snapshot_source_exists<T: HttpTransport>(transport: &T, url: &str) -> Result<bool> {
-    snapshot_source_exists_with_sleep(transport, url, sleep_before_retry)
+    Ok(snapshot_source_head_with_sleep(transport, url, sleep_before_retry)?.is_some())
 }
 
+#[cfg(test)]
 fn snapshot_source_exists_with_sleep<T, F>(transport: &T, url: &str, mut sleep: F) -> Result<bool>
+where
+    T: HttpTransport,
+    F: FnMut(usize, bool, Option<Duration>),
+{
+    Ok(snapshot_source_head_with_sleep(transport, url, &mut sleep)?.is_some())
+}
+
+fn snapshot_source_head_with_sleep<T, F>(
+    transport: &T,
+    url: &str,
+    mut sleep: F,
+) -> Result<Option<TransportHead>>
 where
     T: HttpTransport,
     F: FnMut(usize, bool, Option<Duration>),
@@ -517,8 +560,8 @@ where
         let mut rate_limited = false;
         let mut retry_after = None;
         match transport.head(url) {
-            Ok(response) if response.status.is_success() => return Ok(true),
-            Ok(response) if response.status == StatusCode::NOT_FOUND => return Ok(false),
+            Ok(response) if response.status.is_success() => return Ok(Some(response)),
+            Ok(response) if response.status == StatusCode::NOT_FOUND => return Ok(None),
             Ok(response) if is_retryable_status(response.status) => {
                 rate_limited = response.status == StatusCode::TOO_MANY_REQUESTS;
                 retry_after = response.retry_after;
@@ -538,6 +581,162 @@ where
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("metadata probe failed for {url}")))
 }
 
+fn remote_inventory_path(data_dir: &Path, wiki: &str, snapshot: &str) -> Result<PathBuf> {
+    Ok(crate::snapshot_plan::plan_path(data_dir, wiki, snapshot)?
+        .parent()
+        .context("snapshot plan has no state directory")?
+        .join(REMOTE_INVENTORY_FILENAME))
+}
+
+fn validate_remote_inventory(
+    data_dir: &Path,
+    plan: &SnapshotPlan,
+    receipt: &CompletedSnapshotReceipt,
+) -> Result<()> {
+    let plan_path =
+        crate::snapshot_plan::plan_path(data_dir, plan.wiki.as_str(), plan.snapshot.as_str())?;
+    let (_, plan_sha256) = crate::storage::sha256_file(&plan_path)?;
+    anyhow::ensure!(
+        receipt.schema_version == REMOTE_INVENTORY_SCHEMA_VERSION
+            && receipt.wiki == plan.wiki.as_str()
+            && receipt.snapshot == plan.snapshot.as_str()
+            && receipt.plan_sha256 == plan_sha256
+            && receipt.source_count == plan.sources.len()
+            && receipt.sources.len() == plan.sources.len(),
+        "completed-snapshot receipt identity mismatch"
+    );
+    anyhow::ensure!(
+        receipt.completion_check_timestamp > 0,
+        "completed-snapshot receipt has no completion timestamp"
+    );
+    for (observed, expected) in receipt.sources.iter().zip(&plan.sources) {
+        anyhow::ensure!(
+            observed.source_id == expected.source_id
+                && observed.url == expected.url.as_str()
+                && observed.content_length != Some(0),
+            "completed-snapshot remote inventory does not match its source plan"
+        );
+    }
+    Ok(())
+}
+
+fn read_remote_inventory(
+    data_dir: &Path,
+    plan: &SnapshotPlan,
+) -> Result<Option<CompletedSnapshotReceipt>> {
+    let path = remote_inventory_path(data_dir, plan.wiki.as_str(), plan.snapshot.as_str())?;
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let receipt: CompletedSnapshotReceipt = match serde_json::from_slice(&fs::read(&path)?) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            warn!(path = %path.display(), error = %error, "ignoring invalid completed-snapshot receipt");
+            return Ok(None);
+        }
+    };
+    if let Err(error) = validate_remote_inventory(data_dir, plan, &receipt) {
+        warn!(path = %path.display(), error = %format!("{error:#}"), "ignoring stale completed-snapshot receipt");
+        return Ok(None);
+    }
+    Ok(Some(receipt))
+}
+
+fn write_remote_inventory(
+    data_dir: &Path,
+    plan: &SnapshotPlan,
+    receipt: &CompletedSnapshotReceipt,
+) -> Result<()> {
+    validate_remote_inventory(data_dir, plan, receipt)?;
+    let path = remote_inventory_path(data_dir, plan.wiki.as_str(), plan.snapshot.as_str())?;
+    let parent = path.parent().context("remote inventory has no parent")?;
+    fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(
+        ".{REMOTE_INVENTORY_FILENAME}.{}.tmp",
+        std::process::id()
+    ));
+    let result = (|| -> Result<()> {
+        let mut file = File::create(&temporary)?;
+        serde_json::to_writer_pretty(&mut file, receipt)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        fs::rename(&temporary, &path)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn snapshot_wiki_is_complete_cached<T: HttpTransport>(
+    transport: &T,
+    base_url: &str,
+    data_dir: &Path,
+    wiki: &str,
+    version: &str,
+) -> Result<bool> {
+    let plan = SnapshotPlan::resolve_from_base(base_url, wiki, version)?;
+    plan.persist(data_dir)?;
+    if read_remote_inventory(data_dir, &plan)?.is_some() {
+        info!(wiki, version, "reusing completed-snapshot remote inventory");
+        return Ok(true);
+    }
+    let mut sources = Vec::with_capacity(plan.sources.len());
+    for source in plan.sources.iter().rev() {
+        let Some(head) =
+            snapshot_source_head_with_sleep(transport, source.url.as_str(), sleep_before_retry)?
+        else {
+            info!(
+                wiki,
+                version,
+                source = source.source_id,
+                "snapshot is not complete"
+            );
+            return Ok(false);
+        };
+        sources.push(RemoteInventorySource {
+            source_id: source.source_id.clone(),
+            url: source.url.to_string(),
+            content_length: head.content_length,
+            accepts_ranges: head.accepts_ranges,
+            etag: head.etag,
+            last_modified: head.last_modified,
+        });
+    }
+    sources.reverse();
+    let plan_path = crate::snapshot_plan::plan_path(data_dir, wiki, version)?;
+    let (_, plan_sha256) = crate::storage::sha256_file(&plan_path)?;
+    let receipt = CompletedSnapshotReceipt {
+        schema_version: REMOTE_INVENTORY_SCHEMA_VERSION,
+        wiki: wiki.to_string(),
+        snapshot: version.to_string(),
+        plan_sha256,
+        source_count: plan.sources.len(),
+        completion_check_timestamp: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
+        sources,
+    };
+    write_remote_inventory(data_dir, &plan, &receipt)?;
+    Ok(true)
+}
+
+fn snapshot_is_complete_cached<T: HttpTransport>(
+    transport: &T,
+    base_url: &str,
+    data_dir: &Path,
+    wikis: &[String],
+    version: &str,
+) -> Result<bool> {
+    for wiki in wikis {
+        if !snapshot_wiki_is_complete_cached(transport, base_url, data_dir, wiki, version)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+#[cfg(test)]
 fn snapshot_is_complete<T: HttpTransport>(
     transport: &T,
     base_url: &str,
@@ -561,6 +760,7 @@ fn snapshot_is_complete<T: HttpTransport>(
     Ok(true)
 }
 
+#[cfg(test)]
 fn resolve_latest_completed_snapshot_with_transport<T: HttpTransport>(
     transport: &T,
     base_url: &str,
@@ -593,13 +793,49 @@ fn resolve_latest_completed_snapshot_with_transport<T: HttpTransport>(
     )
 }
 
+fn resolve_latest_completed_snapshot_cached_with_transport<T: HttpTransport>(
+    transport: &T,
+    base_url: &str,
+    data_dir: &Path,
+    wikis: &[String],
+    now: chrono::DateTime<chrono::Utc>,
+    max_lag_months: u32,
+) -> Result<String> {
+    anyhow::ensure!(
+        !wikis.is_empty(),
+        "snapshot resolution requires at least one wiki"
+    );
+    anyhow::ensure!(max_lag_months > 0, "maximum snapshot lag must be positive");
+    for lag_months in 1..=max_lag_months {
+        let version = snapshot_version_at_lag(now, lag_months);
+        if snapshot_is_complete_cached(transport, base_url, data_dir, wikis, &version)? {
+            let _ = (lag_months > 1).then(|| {
+                warn!(
+                    version,
+                    lag_months, "latest expected snapshot is incomplete; using bounded fallback"
+                )
+            });
+            info!(version, lag_months, "selected completed Wikimedia snapshot");
+            return Ok(version);
+        }
+    }
+    anyhow::bail!(
+        "no completed Wikimedia snapshot found for {} within the configured {} month lag",
+        wikis.join(","),
+        max_lag_months
+    )
+}
+
 pub fn resolve_latest_completed_snapshot(
+    data_dir: &Path,
     wikis: &[String],
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<String> {
     let max_lag = snapshot_max_lag_months(std::env::var_os(SNAPSHOT_MAX_LAG_ENV).as_deref())?;
     let transport = build_transport()?;
-    resolve_latest_completed_snapshot_with_transport(&transport, BASE_URL, wikis, now, max_lag)
+    resolve_latest_completed_snapshot_cached_with_transport(
+        &transport, BASE_URL, data_dir, wikis, now, max_lag,
+    )
 }
 
 #[derive(Clone)]
@@ -816,6 +1052,14 @@ fn parse_transport_head(
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.eq_ignore_ascii_case("bytes")),
         retry_after: parse_retry_after(headers),
+        etag: headers
+            .get(ETAG)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string),
+        last_modified: headers
+            .get(LAST_MODIFIED)
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_string),
     }
 }
 
@@ -1002,7 +1246,34 @@ fn probe_remote_file<T: HttpTransport>(transport: &T, url: &str) -> Result<Optio
 /// Resolve compressed source sizes once for resource preflight. Keeping this
 /// separate from download means the orchestrator can reject an oversized
 /// snapshot before opening a candidate-generation transaction.
-pub(crate) fn snapshot_source_sizes(sources: &[SourceSpec]) -> Result<Vec<Option<u64>>> {
+pub(crate) fn snapshot_source_sizes(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot: &str,
+    sources: &[SourceSpec],
+) -> Result<Vec<Option<u64>>> {
+    let plan_path = crate::snapshot_plan::plan_path(data_dir, wiki, snapshot)?;
+    let plan = if plan_path.is_file() {
+        SnapshotPlan::load(&plan_path)?
+    } else {
+        SnapshotPlan::load_or_resolve(data_dir, wiki, snapshot)?.0
+    };
+    if let Some(inventory) = read_remote_inventory(data_dir, &plan)? {
+        let sizes = inventory
+            .sources
+            .into_iter()
+            .map(|source| (source.source_id, source.content_length))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        return sources
+            .iter()
+            .map(|source| {
+                sizes
+                    .get(&source.source_id)
+                    .copied()
+                    .context("requested source is absent from the remote inventory")
+            })
+            .collect();
+    }
     let transport = build_transport()?;
     snapshot_source_sizes_with_transport(&transport, sources)
 }
@@ -1932,6 +2203,7 @@ mod tests {
     struct FakeTransportState {
         head_outcomes: VecDeque<FakeHeadOutcome>,
         get_outcomes: VecDeque<FakeGetOutcome>,
+        head_requests: usize,
         get_requests: usize,
         requested_ranges: Vec<Option<u64>>,
     }
@@ -1997,6 +2269,13 @@ mod tests {
                 .get_requests
         }
 
+        fn head_requests(&self) -> usize {
+            self.state
+                .lock()
+                .expect("fake transport state")
+                .head_requests
+        }
+
         fn requested_ranges(&self) -> Vec<Option<u64>> {
             self.state
                 .lock()
@@ -2008,13 +2287,9 @@ mod tests {
 
     impl HttpTransport for FakeTransport {
         fn head(&self, _url: &str) -> Result<TransportHead> {
-            match self
-                .state
-                .lock()
-                .expect("fake transport state")
-                .head_outcomes
-                .pop_front()
-            {
+            let mut state = self.state.lock().expect("fake transport state");
+            state.head_requests += 1;
+            match state.head_outcomes.pop_front() {
                 Some(FakeHeadOutcome::Response(response)) => Ok(response),
                 Some(FakeHeadOutcome::Error(message)) => Err(anyhow::anyhow!(message)),
                 None => Err(anyhow::anyhow!("unexpected HEAD request")),
@@ -2081,6 +2356,8 @@ mod tests {
             content_length,
             accepts_ranges,
             retry_after: None,
+            etag: None,
+            last_modified: None,
         })
     }
 
@@ -2090,6 +2367,8 @@ mod tests {
             content_length: None,
             accepts_ranges: false,
             retry_after: None,
+            etag: None,
+            last_modified: None,
         })
     }
 
@@ -2099,6 +2378,8 @@ mod tests {
             content_length: None,
             accepts_ranges: false,
             retry_after: Some(retry_after),
+            etag: None,
+            last_modified: None,
         })
     }
 
@@ -2605,11 +2886,18 @@ mod tests {
             ACCEPT_RANGES,
             "bytes".parse().expect("accept ranges header"),
         );
+        headers.insert(ETAG, "fixture-etag".parse().expect("etag header"));
+        headers.insert(
+            LAST_MODIFIED,
+            "fixture-date".parse().expect("last-modified header"),
+        );
 
         let head = parse_transport_head(StatusCode::OK, &headers, None);
         assert_eq!(head.status, StatusCode::OK);
         assert_eq!(head.content_length, Some(13));
         assert!(head.accepts_ranges);
+        assert_eq!(head.etag.as_deref(), Some("fixture-etag"));
+        assert_eq!(head.last_modified.as_deref(), Some("fixture-date"));
     }
 
     #[test]
@@ -2877,6 +3165,109 @@ mod tests {
     }
 
     #[test]
+    fn cached_snapshot_resolution_reuses_completed_fallback_inventory() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let now = Utc.with_ymd_and_hms(2026, 8, 22, 0, 0, 0).unwrap();
+        let wikis = ["simplewiki".to_string()];
+        let first = FakeTransport::with_head_outcomes([
+            status_head(StatusCode::NOT_FOUND),
+            ok_head(Some(42), false),
+        ]);
+        assert_eq!(
+            resolve_latest_completed_snapshot_cached_with_transport(
+                &first,
+                "http://example.invalid",
+                data_dir.path(),
+                &wikis,
+                now,
+                2,
+            )
+            .expect("cached fallback should resolve"),
+            "2026-06"
+        );
+        assert_eq!(first.head_requests(), 2);
+
+        let second = FakeTransport::with_head_outcomes([status_head(StatusCode::NOT_FOUND)]);
+        assert_eq!(
+            resolve_latest_completed_snapshot_cached_with_transport(
+                &second,
+                "http://example.invalid",
+                data_dir.path(),
+                &wikis,
+                now,
+                2,
+            )
+            .expect("completed fallback inventory should be reusable"),
+            "2026-06"
+        );
+        assert_eq!(second.head_requests(), 1);
+
+        let inventory = remote_inventory_path(data_dir.path(), "simplewiki", "2026-06")?;
+        fs::write(&inventory, b"{truncated")?;
+        let repaired = FakeTransport::with_head_outcomes([
+            status_head(StatusCode::NOT_FOUND),
+            ok_head(Some(43), false),
+        ]);
+        assert_eq!(
+            resolve_latest_completed_snapshot_cached_with_transport(
+                &repaired,
+                "http://example.invalid",
+                data_dir.path(),
+                &wikis,
+                now,
+                2,
+            )
+            .expect("invalid inventory should be repaired"),
+            "2026-06"
+        );
+        assert_eq!(repaired.head_requests(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn cached_snapshot_resolution_fails_closed_on_invalid_bounds_and_missing_sources() {
+        let data_dir = TestDir::new().expect("cache fixture");
+        let now = Utc.with_ymd_and_hms(2026, 8, 22, 0, 0, 0).unwrap();
+        assert!(
+            resolve_latest_completed_snapshot_cached_with_transport(
+                &FakeTransport::default(),
+                "http://example.invalid",
+                data_dir.path(),
+                &[],
+                now,
+                2,
+            )
+            .is_err()
+        );
+        assert!(
+            resolve_latest_completed_snapshot_cached_with_transport(
+                &FakeTransport::default(),
+                "http://example.invalid",
+                data_dir.path(),
+                &["simplewiki".to_string()],
+                now,
+                0,
+            )
+            .is_err()
+        );
+        let missing = FakeTransport::with_head_outcomes([
+            status_head(StatusCode::NOT_FOUND),
+            status_head(StatusCode::NOT_FOUND),
+        ]);
+        assert!(
+            resolve_latest_completed_snapshot_cached_with_transport(
+                &missing,
+                "http://example.invalid",
+                data_dir.path(),
+                &["simplewiki".to_string()],
+                now,
+                2,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn snapshot_resolution_fails_closed_on_configuration_or_stale_dumps() {
         let now = Utc.with_ymd_and_hms(2026, 8, 22, 0, 0, 0).unwrap();
         assert!(snapshot_max_lag_months(Some(OsStr::new("0"))).is_err());
@@ -3087,6 +3478,84 @@ mod tests {
                 "2001-01",
             )
             .expect("monthly completeness probe should return a result")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn completed_snapshot_inventory_eliminates_repeated_monthly_head_probes() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let wiki = "enwiki";
+        let version = "2001-01";
+        let first = FakeTransport::with_head_outcomes([
+            FakeHeadOutcome::Response(TransportHead {
+                status: StatusCode::OK,
+                content_length: Some(22),
+                accepts_ranges: false,
+                retry_after: None,
+                etag: Some("fixture-etag".to_string()),
+                last_modified: Some("fixture-date".to_string()),
+            }),
+            ok_head(Some(11), true),
+        ]);
+        assert!(
+            snapshot_wiki_is_complete_cached(
+                &first,
+                "http://example.invalid",
+                data_dir.path(),
+                wiki,
+                version,
+            )
+            .expect("monthly inventory should be complete")
+        );
+        assert_eq!(first.head_requests(), 2);
+
+        let second = FakeTransport::default();
+        assert!(
+            snapshot_wiki_is_complete_cached(
+                &second,
+                "http://example.invalid",
+                data_dir.path(),
+                wiki,
+                version,
+            )
+            .expect("monthly inventory should be reused")
+        );
+        assert_eq!(second.head_requests(), 0);
+
+        let plan_path = crate::snapshot_plan::plan_path(data_dir.path(), wiki, version)?;
+        let plan = SnapshotPlan::load(&plan_path)?;
+        assert_eq!(
+            snapshot_source_sizes(data_dir.path(), wiki, version, &plan.sources)?,
+            vec![Some(11), Some(22)]
+        );
+        let inventory_path = remote_inventory_path(data_dir.path(), wiki, version)?;
+        let inventory: CompletedSnapshotReceipt =
+            serde_json::from_slice(&fs::read(&inventory_path)?)?;
+        assert_eq!(inventory.sources[1].etag.as_deref(), Some("fixture-etag"));
+        assert_eq!(
+            inventory.sources[1].last_modified.as_deref(),
+            Some("fixture-date")
+        );
+
+        let mut stale = inventory.clone();
+        stale.source_count += 1;
+        fs::write(&inventory_path, serde_json::to_vec(&stale)?)?;
+        assert!(read_remote_inventory(data_dir.path(), &plan)?.is_none());
+        write_remote_inventory(data_dir.path(), &plan, &inventory)?;
+
+        fs::remove_file(&inventory_path)?;
+        fs::create_dir(&inventory_path)?;
+        assert!(write_remote_inventory(data_dir.path(), &plan, &inventory).is_err());
+        assert!(
+            !inventory_path
+                .parent()
+                .context("inventory parent")?
+                .join(format!(
+                    ".{REMOTE_INVENTORY_FILENAME}.{}.tmp",
+                    std::process::id()
+                ))
+                .exists()
         );
         Ok(())
     }
@@ -3752,7 +4221,11 @@ mod tests {
         );
 
         sources.truncate(1);
-        assert_eq!(snapshot_source_sizes(&sources)?, vec![Some(11)]);
+        let data_dir = TestDir::new()?;
+        assert_eq!(
+            snapshot_source_sizes(data_dir.path(), "enwiki", "2001-02", &sources)?,
+            vec![Some(11)]
+        );
         Ok(())
     }
 

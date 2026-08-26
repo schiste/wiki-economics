@@ -41,7 +41,13 @@ trait SourceTransactionOps: Sync {
         snapshot: &str,
         data_dir: &Path,
     ) -> Result<Vec<SourceSpec>>;
-    fn source_sizes(&self, sources: &[SourceSpec]) -> Result<Vec<Option<u64>>>;
+    fn source_sizes(
+        &self,
+        data_dir: &Path,
+        wiki: &str,
+        snapshot: &str,
+        sources: &[SourceSpec],
+    ) -> Result<Vec<Option<u64>>>;
     fn fetch_source(
         &self,
         wiki: &str,
@@ -90,8 +96,14 @@ impl SourceTransactionOps for RealSourceTransactionOps {
         fetch::pending_snapshot_sources(wiki, snapshot, data_dir)
     }
 
-    fn source_sizes(&self, sources: &[SourceSpec]) -> Result<Vec<Option<u64>>> {
-        fetch::snapshot_source_sizes(sources)
+    fn source_sizes(
+        &self,
+        data_dir: &Path,
+        wiki: &str,
+        snapshot: &str,
+        sources: &[SourceSpec],
+    ) -> Result<Vec<Option<u64>>> {
+        fetch::snapshot_source_sizes(data_dir, wiki, snapshot, sources)
     }
 
     fn fetch_source(
@@ -315,7 +327,7 @@ fn governed_snapshot(
     window_size: usize,
 ) -> Result<ResourceGovernor> {
     governed_snapshot_with_sizes(data_dir, wiki, snapshot, window_size, |sources| {
-        fetch::snapshot_source_sizes(sources)
+        fetch::snapshot_source_sizes(data_dir, wiki, snapshot, sources)
     })
 }
 
@@ -393,7 +405,7 @@ fn prepare_snapshot_with_ops<O: SourceTransactionOps>(
     let planned_sources = ops.planned_sources(wiki, snapshot, data_dir)?;
     let recovered_inputs = ops.cleanup_committed(wiki, snapshot, data_dir)?;
     let pending = ops.pending_sources(wiki, snapshot, data_dir)?;
-    let source_sizes = ops.source_sizes(&pending)?;
+    let source_sizes = ops.source_sizes(data_dir, wiki, snapshot, &pending)?;
     anyhow::ensure!(
         source_sizes.len() == pending.len(),
         "resource preflight returned an incomplete source-size inventory"
@@ -523,7 +535,13 @@ mod tests {
             Ok(self.pending.clone())
         }
 
-        fn source_sizes(&self, sources: &[SourceSpec]) -> Result<Vec<Option<u64>>> {
+        fn source_sizes(
+            &self,
+            _data_dir: &Path,
+            _wiki: &str,
+            _snapshot: &str,
+            sources: &[SourceSpec],
+        ) -> Result<Vec<Option<u64>>> {
             Ok(vec![Some(1); sources.len()])
         }
 
@@ -974,7 +992,10 @@ mod tests {
         );
         let mut pinned = SnapshotPlan::resolve("testwiki", "2026-08")?.sources;
         pinned[0].expected_size = Some(9);
-        assert_eq!(ops.source_sizes(&pinned)?, vec![Some(9)]);
+        assert_eq!(
+            ops.source_sizes(data_dir.path(), "testwiki", "2026-08", &pinned)?,
+            vec![Some(9)]
+        );
         assert_eq!(
             single_source_path(vec![std::path::PathBuf::from("only")])?,
             std::path::PathBuf::from("only")

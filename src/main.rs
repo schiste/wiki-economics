@@ -441,7 +441,12 @@ impl RunStage {
 }
 
 trait Ops {
-    fn resolve_snapshot(&self, _wikis: &[String], now: DateTime<Utc>) -> Result<String> {
+    fn resolve_snapshot(
+        &self,
+        _wikis: &[String],
+        now: DateTime<Utc>,
+        _data_dir: &Path,
+    ) -> Result<String> {
         Ok(snapshot_version_for(now))
     }
     fn persist_snapshot_plans(
@@ -629,8 +634,13 @@ trait Ops {
 struct RealOps;
 
 impl Ops for RealOps {
-    fn resolve_snapshot(&self, wikis: &[String], now: DateTime<Utc>) -> Result<String> {
-        fetch::resolve_latest_completed_snapshot(wikis, now)
+    fn resolve_snapshot(
+        &self,
+        wikis: &[String],
+        now: DateTime<Utc>,
+        data_dir: &Path,
+    ) -> Result<String> {
+        fetch::resolve_latest_completed_snapshot(data_dir, wikis, now)
     }
 
     fn persist_snapshot_plans(
@@ -948,7 +958,7 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
 
         Commands::SnapshotResolve { wikis } => {
             let version = run_timed_stage("snapshot_resolve", None, || {
-                ops.resolve_snapshot(&wikis, Utc::now())
+                ops.resolve_snapshot(&wikis, Utc::now(), &data_dir)
             })?;
             ops.persist_snapshot_plans(&wikis, &version, &data_dir)?;
             println!("{version}");
@@ -958,7 +968,7 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             let version = match version {
                 Some(version) => version,
                 None => run_timed_stage("snapshot_resolve", None, || {
-                    ops.resolve_snapshot(&wikis, Utc::now())
+                    ops.resolve_snapshot(&wikis, Utc::now(), &data_dir)
                 })?,
             };
             ops.persist_snapshot_plans(&wikis, &version, &data_dir)?;
@@ -1006,7 +1016,7 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             let version = match version {
                 Some(version) => version,
                 None => run_timed_stage("snapshot_resolve", Some(&wiki), || {
-                    ops.resolve_snapshot(std::slice::from_ref(&wiki), Utc::now())
+                    ops.resolve_snapshot(std::slice::from_ref(&wiki), Utc::now(), &data_dir)
                 })?,
             };
             let source_window_size = source_window::configured_window_size(source_window_size)?;
@@ -1097,7 +1107,7 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             let version = match version {
                 Some(version) => version,
                 None => run_timed_stage("snapshot_resolve", Some(&wiki), || {
-                    ops.resolve_snapshot(std::slice::from_ref(&wiki), Utc::now())
+                    ops.resolve_snapshot(std::slice::from_ref(&wiki), Utc::now(), &data_dir)
                 })?,
             };
             let source_window_size = source_window::configured_window_size(source_window_size)?;
@@ -1378,7 +1388,7 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             let version = match version {
                 Some(version) => version,
                 None => run_timed_stage("snapshot_resolve", None, || {
-                    ops.resolve_snapshot(&wikis, Utc::now())
+                    ops.resolve_snapshot(&wikis, Utc::now(), &data_dir)
                 })?,
             };
             let source_window_size = source_window::configured_window_size(source_window_size)?;
@@ -1708,7 +1718,12 @@ mod tests {
     }
 
     impl Ops for RecordingOps {
-        fn resolve_snapshot(&self, wikis: &[String], _now: DateTime<Utc>) -> Result<String> {
+        fn resolve_snapshot(
+            &self,
+            wikis: &[String],
+            _now: DateTime<Utc>,
+            _data_dir: &Path,
+        ) -> Result<String> {
             self.record(format!("resolve_snapshot:{}", wikis.join(",")));
             Ok("2026-07".to_string())
         }
@@ -3117,7 +3132,7 @@ mod tests {
         let output_dir = TestDir::new()?;
 
         let now = chrono::TimeZone::with_ymd_and_hms(&chrono::Utc, 2026, 8, 22, 0, 0, 0).unwrap();
-        assert!(ops.resolve_snapshot(&[], now).is_err());
+        assert!(ops.resolve_snapshot(&[], now, data_dir.path()).is_err());
         ops.persist_snapshot_plans(&["simplewiki".to_string()], "2026-07", data_dir.path())?;
         assert!(
             crate::snapshot_plan::plan_path(data_dir.path(), "simplewiki", "2026-07")?.is_file()

@@ -9,6 +9,7 @@ use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 #[cfg(target_os = "linux")]
@@ -26,6 +27,17 @@ const SNAPSHOT_POINTER_SCHEMA_VERSION: u64 = 1;
 const MARKER_SCHEMA_VERSION: u64 = 2;
 const GENERATION_MANIFEST_SCHEMA_VERSION: u64 = 2;
 static GENERATION_MANIFEST_TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
+static GENERATION_VALIDATION_CACHE: OnceLock<
+    Mutex<BTreeMap<GenerationValidationKey, GenerationManifest>>,
+> = OnceLock::new();
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct GenerationValidationKey {
+    data_dir: PathBuf,
+    wiki: String,
+    snapshot_version: String,
+    manifest_fingerprint: String,
+}
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct PartitionSpec {
@@ -318,6 +330,12 @@ pub(crate) fn write_generation_manifest(
     wiki: &str,
     snapshot_version: &str,
 ) -> Result<PathBuf> {
+    let path = generation_manifest_path(data_dir, wiki, snapshot_version)?;
+    if path.is_file()
+        && read_receipted_generation_manifest(data_dir, wiki, snapshot_version)?.is_some()
+    {
+        return Ok(path);
+    }
     validate_snapshot_generation(data_dir, wiki, snapshot_version)?;
     let (plan, plan_path) =
         crate::snapshot_plan::SnapshotPlan::load_or_resolve(data_dir, wiki, snapshot_version)?;
@@ -389,7 +407,6 @@ pub(crate) fn write_generation_manifest(
         source_plan_sha256,
         fragments,
     };
-    let path = generation_manifest_path(data_dir, wiki, snapshot_version)?;
     let parent = path.parent().context("generation manifest has no parent")?;
     fs::create_dir_all(parent)?;
     let mut bytes = serde_json::to_vec_pretty(&manifest)?;
@@ -424,6 +441,30 @@ pub(crate) fn write_generation_manifest(
 }
 
 fn validate_generation_manifest(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot_version: &str,
+    manifest: &GenerationManifest,
+) -> Result<()> {
+    validate_generation_manifest_structure(data_dir, wiki, snapshot_version, manifest)?;
+    for fragment in &manifest.fragments {
+        let path = checked_stored_path(data_dir, &fragment.path)?;
+        let metadata = fs::metadata(&path)
+            .with_context(|| format!("generation fragment is missing: {}", path.display()))?;
+        ensure!(
+            metadata.is_file() && metadata.len() == fragment.bytes,
+            "generation fragment size changed"
+        );
+        let rows = ParquetReader::new(File::open(&path)?).num_rows()?;
+        ensure!(
+            u64::try_from(rows)? == fragment.rows,
+            "generation fragment row count changed"
+        );
+    }
+    Ok(())
+}
+
+fn validate_generation_manifest_structure(
     data_dir: &Path,
     wiki: &str,
     snapshot_version: &str,
@@ -480,17 +521,6 @@ fn validate_generation_manifest(
             path.starts_with(&root) && is_source_output(&path, &fragment.source_id),
             "generation manifest contains a fragment outside its declared layer or source"
         );
-        let metadata = fs::metadata(&path)
-            .with_context(|| format!("generation fragment is missing: {}", path.display()))?;
-        ensure!(
-            metadata.is_file() && metadata.len() == fragment.bytes,
-            "generation fragment size changed"
-        );
-        let rows = ParquetReader::new(File::open(&path)?).num_rows()?;
-        ensure!(
-            u64::try_from(rows)? == fragment.rows,
-            "generation fragment row count changed"
-        );
         match fragment.layer {
             GenerationLayer::Analytical => analytical_sources.insert(fragment.source_id.as_str()),
             GenerationLayer::Warehouse => warehouse_sources.insert(fragment.source_id.as_str()),
@@ -517,6 +547,99 @@ fn validate_generation_manifest(
     Ok(())
 }
 
+fn generation_validation_cache()
+-> &'static Mutex<BTreeMap<GenerationValidationKey, GenerationManifest>> {
+    GENERATION_VALIDATION_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+/// Authenticate the compact generation manifest through the ingest receipt.
+/// This proves the immutable allowlist without reopening or hashing any of the
+/// Parquet fragments. `None` means an older generation needs the strict
+/// compatibility path.
+fn read_receipted_generation_manifest(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot_version: &str,
+) -> Result<Option<GenerationManifest>> {
+    let receipt_path =
+        crate::fingerprint::data_stage_receipt_path(data_dir, wiki, snapshot_version, "ingest");
+    let spec = crate::fingerprint::StageSpec {
+        stage: "ingest",
+        scope: wiki,
+        selected_snapshot: Some(snapshot_version),
+        algorithm_version: crate::ingest::INGEST_ALGORITHM_VERSION,
+    };
+    let Some(receipt) = crate::fingerprint::validated_receipt(&receipt_path, spec)? else {
+        return Ok(None);
+    };
+    let Some(manifest_identity) = receipt
+        .outputs
+        .iter()
+        .find(|identity| identity.identity == "generation-manifest")
+    else {
+        return Ok(None);
+    };
+    let manifest_path = generation_manifest_path(data_dir, wiki, snapshot_version)?;
+    if !crate::fingerprint::artifact_matches(
+        manifest_identity,
+        &crate::fingerprint::TrackedPath::new("generation-manifest", &manifest_path),
+    )
+    .is_ok_and(|matches| matches)
+    {
+        return Ok(None);
+    }
+    let key = GenerationValidationKey {
+        data_dir: data_dir.to_path_buf(),
+        wiki: wiki.to_string(),
+        snapshot_version: snapshot_version.to_string(),
+        manifest_fingerprint: manifest_identity.sha256.clone(),
+    };
+    if let Some(manifest) = generation_validation_cache()
+        .lock()
+        .expect("generation validation cache lock poisoned")
+        .get(&key)
+        .cloned()
+    {
+        return Ok(Some(manifest));
+    }
+    let Some(plan_identity) = receipt
+        .inputs
+        .iter()
+        .find(|identity| identity.identity == "snapshot-plan")
+    else {
+        return Ok(None);
+    };
+    let (_, plan_path) =
+        crate::snapshot_plan::SnapshotPlan::load_or_resolve(data_dir, wiki, snapshot_version)?;
+    if !crate::fingerprint::artifact_matches(
+        plan_identity,
+        &crate::fingerprint::TrackedPath::new("snapshot-plan", plan_path),
+    )
+    .is_ok_and(|matches| matches)
+    {
+        return Ok(None);
+    }
+    let manifest_bytes = fs::read(&manifest_path).with_context(|| {
+        format!(
+            "failed to read receipted generation manifest {}",
+            manifest_path.display()
+        )
+    })?;
+    let manifest: GenerationManifest =
+        serde_json::from_slice(&manifest_bytes).with_context(|| {
+            format!(
+                "invalid receipted generation manifest JSON in {}",
+                manifest_path.display()
+            )
+        })?;
+    validate_generation_manifest_structure(data_dir, wiki, snapshot_version, &manifest)?;
+    generation_validation_cache()
+        .lock()
+        .expect("generation validation cache lock poisoned")
+        .insert(key, manifest.clone());
+    Ok(Some(manifest))
+}
+
 pub(crate) fn read_generation_manifest(
     data_dir: &Path,
     wiki: &str,
@@ -537,6 +660,9 @@ pub(crate) fn ensure_generation_manifest(
     wiki: &str,
     snapshot_version: &str,
 ) -> Result<GenerationManifest> {
+    if let Some(manifest) = read_receipted_generation_manifest(data_dir, wiki, snapshot_version)? {
+        return Ok(manifest);
+    }
     let path = generation_manifest_path(data_dir, wiki, snapshot_version)?;
     if !path.is_file() {
         // One-time migration for generations published before manifest-owned
@@ -574,7 +700,7 @@ pub(crate) fn snapshot_fragment_files(
     snapshot_version: &str,
     layer: GenerationLayer,
 ) -> Result<Vec<PathBuf>> {
-    let manifest = read_generation_manifest(data_dir, wiki, snapshot_version)?;
+    let manifest = ensure_generation_manifest(data_dir, wiki, snapshot_version)?;
     manifest
         .fragments
         .into_iter()
@@ -591,7 +717,7 @@ pub(crate) fn snapshot_compute_layer(
     snapshot_version: &str,
     legacy_layer: GenerationLayer,
 ) -> Result<GenerationLayer> {
-    let manifest = read_generation_manifest(data_dir, wiki, snapshot_version)?;
+    let manifest = ensure_generation_manifest(data_dir, wiki, snapshot_version)?;
     Ok(
         if manifest.schema_version == GENERATION_MANIFEST_SCHEMA_VERSION {
             GenerationLayer::MetricInput
@@ -614,7 +740,7 @@ pub(crate) fn active_compute_layer(
 
 pub fn publish_current_snapshot(data_dir: &Path, wiki: &str, snapshot_version: &str) -> Result<()> {
     validate_snapshot_version(snapshot_version)?;
-    let manifest = read_generation_manifest(data_dir, wiki, snapshot_version)
+    let manifest = ensure_generation_manifest(data_dir, wiki, snapshot_version)
         .context("cannot publish snapshot without a valid generation manifest")?;
     let required_layers: BTreeSet<_> = manifest
         .fragments
@@ -2076,6 +2202,7 @@ mod tests {
     use super::*;
     use crate::test_support::TestDir;
     use polars::prelude::*;
+    use std::os::unix::fs::PermissionsExt;
 
     type MarkerMutation = Box<dyn FnOnce(&mut Value)>;
 
@@ -2364,6 +2491,74 @@ mod tests {
 
         fs::write(&manifest_path, b"{truncated")?;
         assert!(active_fragment_files(data.path(), wiki, GenerationLayer::Analytical).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn receipted_generation_fast_path_rejects_every_control_plane_mismatch() -> Result<()> {
+        let data = TestDir::new()?;
+        let wiki = "testwiki";
+        let snapshot = "2026-08";
+        let (plan, plan_path) =
+            crate::snapshot_plan::SnapshotPlan::load_or_resolve(data.path(), wiki, snapshot)?;
+        let analytical = snapshot_analytical_wiki_dir(data.path(), wiki, snapshot)?;
+        write_test_marker_in(data.path(), &analytical, &plan.sources[0].source_id)?;
+        let manifest_path = write_generation_manifest(data.path(), wiki, snapshot)?;
+        let receipt_path =
+            crate::fingerprint::data_stage_receipt_path(data.path(), wiki, snapshot, "ingest");
+        let spec = crate::fingerprint::StageSpec {
+            stage: "ingest",
+            scope: wiki,
+            selected_snapshot: Some(snapshot),
+            algorithm_version: crate::ingest::INGEST_ALGORITHM_VERSION,
+        };
+        let record = |input_identity: &str, output_identity: &str| {
+            crate::fingerprint::record(
+                &receipt_path,
+                spec,
+                &[crate::fingerprint::TrackedPath::new(
+                    input_identity,
+                    &plan_path,
+                )],
+                &[crate::fingerprint::TrackedPath::new(
+                    output_identity,
+                    &manifest_path,
+                )],
+            )
+        };
+
+        record("snapshot-plan", "wrong-manifest")?;
+        assert!(read_receipted_generation_manifest(data.path(), wiki, snapshot)?.is_none());
+
+        record("snapshot-plan", "generation-manifest")?;
+        let manifest_bytes = fs::read(&manifest_path)?;
+        fs::write(&manifest_path, b"changed-generation-manifest")?;
+        assert!(read_receipted_generation_manifest(data.path(), wiki, snapshot)?.is_none());
+        fs::write(&manifest_path, &manifest_bytes)?;
+
+        record("wrong-plan", "generation-manifest")?;
+        assert!(read_receipted_generation_manifest(data.path(), wiki, snapshot)?.is_none());
+
+        record("snapshot-plan", "generation-manifest")?;
+        let plan_bytes = fs::read(&plan_path)?;
+        let mut reformatted_plan = plan_bytes.clone();
+        reformatted_plan.push(b'\n');
+        fs::write(&plan_path, reformatted_plan)?;
+        assert!(read_receipted_generation_manifest(data.path(), wiki, snapshot)?.is_none());
+        fs::write(&plan_path, &plan_bytes)?;
+
+        record("snapshot-plan", "generation-manifest")?;
+        let mut unreadable_permissions = fs::metadata(&manifest_path)?.permissions();
+        unreadable_permissions.set_mode(0o000);
+        fs::set_permissions(&manifest_path, unreadable_permissions)?;
+        assert!(read_receipted_generation_manifest(data.path(), wiki, snapshot).is_err());
+        let mut readable_permissions = fs::metadata(&manifest_path)?.permissions();
+        readable_permissions.set_mode(0o600);
+        fs::set_permissions(&manifest_path, readable_permissions)?;
+
+        fs::write(&manifest_path, b"{invalid")?;
+        record("snapshot-plan", "generation-manifest")?;
+        assert!(read_receipted_generation_manifest(data.path(), wiki, snapshot).is_err());
         Ok(())
     }
 

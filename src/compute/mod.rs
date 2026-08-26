@@ -2238,7 +2238,7 @@ pub(crate) fn compute_stage_inputs(
     if let Some(snapshot) = snapshot {
         // Resolving the fragments validates (and, for a pre-manifest
         // generation, safely migrates) the authoritative allowlist.
-        storage::read_generation_manifest(data_dir, wiki, &snapshot)?;
+        storage::ensure_generation_manifest(data_dir, wiki, &snapshot)?;
         let manifest = storage::generation_manifest_path(data_dir, wiki, &snapshot)?;
         let generation_outputs = vec![fingerprint::TrackedPath::new(
             "generation-manifest",
