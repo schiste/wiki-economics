@@ -1304,6 +1304,77 @@ fn reconcile_ready_generation_state(output_dir: &Path, ready: &ReadyWikiCandidat
     Ok(())
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CandidateReuseMethod {
+    Reflink,
+    HardLink,
+    Copy,
+}
+
+#[cfg(target_os = "linux")]
+fn try_reflink(source: &Path, target: &Path) -> std::io::Result<()> {
+    let source = File::open(source)?;
+    let target_file = File::create(target)?;
+    match rustix::fs::ioctl_ficlone(&target_file, &source) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            drop(target_file);
+            let _ = fs::remove_file(target);
+            Err(error.into())
+        }
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+fn try_reflink(source: &Path, target: &Path) -> std::io::Result<()> {
+    let source = File::open(source)?;
+    let parent = target
+        .parent()
+        .ok_or_else(|| std::io::Error::other("reflink target has no parent"))?;
+    let parent = File::open(parent)?;
+    let filename = target
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("reflink target has no filename"))?;
+    rustix::fs::fclonefileat(&source, &parent, filename, rustix::fs::CloneFlags::empty())
+        .map_err(Into::into)
+}
+
+#[cfg(not(any(target_os = "linux", target_vendor = "apple")))]
+fn try_reflink(_source: &Path, _target: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "reflinks are not available on this platform",
+    ))
+}
+
+fn reuse_candidate_file(source: &Path, temporary: &Path) -> Result<CandidateReuseMethod> {
+    select_candidate_reuse(
+        || try_reflink(source, temporary),
+        || fs::hard_link(source, temporary),
+        || fs::copy(source, temporary).map(|_| ()),
+    )
+}
+
+fn select_candidate_reuse<R, H, C>(
+    reflink: R,
+    hard_link: H,
+    copy: C,
+) -> Result<CandidateReuseMethod>
+where
+    R: FnOnce() -> std::io::Result<()>,
+    H: FnOnce() -> std::io::Result<()>,
+    C: FnOnce() -> std::io::Result<()>,
+{
+    if reflink().is_ok() {
+        return Ok(CandidateReuseMethod::Reflink);
+    }
+    if hard_link().is_ok() {
+        return Ok(CandidateReuseMethod::HardLink);
+    }
+    copy()?;
+    Ok(CandidateReuseMethod::Copy)
+}
+
 fn copy_candidate_files(
     source_candidate: &Path,
     target_candidate: &Path,
@@ -1326,11 +1397,20 @@ fn copy_candidate_files(
                 .to_string_lossy(),
             std::process::id()
         ));
+        if temporary.is_file() {
+            fs::remove_file(&temporary)?;
+        }
         let copied = (|| -> Result<()> {
-            fs::copy(source, &temporary)?;
+            let method = reuse_candidate_file(source, &temporary)?;
             File::open(&temporary)?.sync_all()?;
             fs::rename(&temporary, &target)?;
             File::open(parent)?.sync_all()?;
+            info!(
+                source = %source.display(),
+                target = %target.display(),
+                method = ?method,
+                "reused immutable candidate artifact"
+            );
             Ok(())
         })();
         if copied.is_err() {
@@ -4156,6 +4236,17 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
 
+    fn reuse_success() -> std::io::Result<()> {
+        std::fs::metadata(".").map(|_| ())
+    }
+
+    fn reuse_unsupported() -> std::io::Result<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "fixture",
+        ))
+    }
+
     struct Fixture {
         data: TestDir,
         output: TestDir,
@@ -4364,6 +4455,40 @@ mod tests {
     fn write_single_i64(path: &Path) -> Result<()> {
         let mut frame = DataFrame::new_infer_height(vec![Column::new("value".into(), [1_i64])])?;
         ParquetWriter::new(File::create(path)?).finish(&mut frame)?;
+        Ok(())
+    }
+
+    #[test]
+    fn candidate_reuse_prefers_reflink_then_hard_link_then_copy() -> Result<()> {
+        assert_eq!(
+            select_candidate_reuse(reuse_success, reuse_unsupported, reuse_unsupported)?,
+            CandidateReuseMethod::Reflink
+        );
+        assert_eq!(
+            select_candidate_reuse(reuse_unsupported, reuse_success, reuse_unsupported)?,
+            CandidateReuseMethod::HardLink
+        );
+        assert_eq!(
+            select_candidate_reuse(reuse_unsupported, reuse_unsupported, reuse_success)?,
+            CandidateReuseMethod::Copy
+        );
+        assert!(
+            select_candidate_reuse(reuse_unsupported, reuse_unsupported, reuse_unsupported)
+                .is_err()
+        );
+
+        let root = TestDir::new()?;
+        let source = root.path().join("source");
+        let target = root.path().join("target");
+        fs::write(&source, b"receipt-covered immutable bytes")?;
+        let method = reuse_candidate_file(&source, &target)?;
+        assert!(matches!(
+            method,
+            CandidateReuseMethod::Reflink
+                | CandidateReuseMethod::HardLink
+                | CandidateReuseMethod::Copy
+        ));
+        assert_eq!(fs::read(target)?, fs::read(source)?);
         Ok(())
     }
 
@@ -5152,14 +5277,15 @@ mod tests {
 
         let copy_root = fixture.output.path().join("copy-error");
         fs::create_dir_all(&copy_root)?;
+        let copy_target = fixture.output.path().join("copy-target");
+        fs::create_dir_all(&copy_target)?;
+        let abandoned_temporary =
+            copy_target.join(format!(".missing.{}.reuse.tmp", std::process::id()));
+        fs::write(&abandoned_temporary, b"abandoned")?;
         assert!(
-            copy_candidate_files(
-                &copy_root,
-                &fixture.output.path().join("copy-target"),
-                &[copy_root.join("missing")],
-            )
-            .is_err()
+            copy_candidate_files(&copy_root, &copy_target, &[copy_root.join("missing")],).is_err()
         );
+        assert!(!abandoned_temporary.exists());
         Ok(())
     }
 
