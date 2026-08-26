@@ -162,7 +162,7 @@ fn validate_extension(extension: &str) -> Result<()> {
     Ok(())
 }
 
-fn collect_artifacts(root: &Path, extension: &str) -> Result<Vec<ArtifactDigest>> {
+pub(crate) fn collect_artifacts(root: &Path, extension: &str) -> Result<Vec<ArtifactDigest>> {
     ensure!(
         root.is_dir(),
         "artifact root is not a directory: {}",
@@ -217,7 +217,7 @@ fn collect_artifacts(root: &Path, extension: &str) -> Result<Vec<ArtifactDigest>
     Ok(artifacts)
 }
 
-fn aggregate_digest(artifacts: &[ArtifactDigest]) -> String {
+pub(crate) fn aggregate_digest(artifacts: &[ArtifactDigest]) -> String {
     let mut digest = Sha256::new();
     for artifact in artifacts {
         digest.update(artifact.identity.as_bytes());

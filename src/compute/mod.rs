@@ -2260,6 +2260,17 @@ fn compute_all_incremental(
     snapshot: Option<&str>,
     plan: ComputePlan,
 ) -> Result<usize> {
+    compute_all_incremental_cached(wiki, data_dir, output_dir, snapshot, plan, None)
+}
+
+fn compute_all_incremental_cached(
+    wiki: &str,
+    data_dir: &Path,
+    output_dir: &Path,
+    snapshot: Option<&str>,
+    plan: ComputePlan,
+    cross_snapshot: Option<&crate::cross_snapshot::CrossSnapshotCache>,
+) -> Result<usize> {
     if !plan.any_nonweekly() {
         return Ok(0);
     }
@@ -2297,6 +2308,7 @@ fn compute_all_incremental(
     let mut gdp_type_frames = Vec::new();
     let mut gdp_tier_frames = Vec::new();
     let mut gdp_editor_month_frames = Vec::new();
+    let mut gdp_activity_month_digests = Vec::new();
     let mut gdp_activity_year = None;
     let mut labor_monthly_frames = Vec::new();
     let mut registered_state = plan.lifecycle.must_compute().then(RegisteredState::new);
@@ -2311,7 +2323,12 @@ fn compute_all_incremental(
                 "analytical partitions are not ordered chronologically"
             );
             if partition.year != current_year {
-                finish_activity_year(&mut gdp_editor_month_frames, &mut gdp_tier_frames)?;
+                finish_activity_year_cached(
+                    &mut gdp_editor_month_frames,
+                    &mut gdp_tier_frames,
+                    &mut gdp_activity_month_digests,
+                    cross_snapshot,
+                )?;
             }
         }
         if plan.activity_tiers.must_compute() {
@@ -2329,13 +2346,57 @@ fn compute_all_incremental(
             .context("invalid partition year_month format")?;
 
         if plan.monthly.must_compute() {
-            inequality_frames.push(inequality::compute_frame(&base)?);
-            gdp_frames.push(gdp_monthly_frame(&base)?);
-            gdp_type_frames.push(gdp_type_share_frame(&base)?);
-            labor_monthly_frames.push(labor_monthly_frame(&base)?);
+            let input_digest = cross_snapshot
+                .map(|cache| cache.month_digest(&partition.year_month))
+                .transpose()?;
+            inequality_frames.push(cached_or_compute(
+                cross_snapshot,
+                "monthly",
+                monthly::ALGORITHM_VERSION,
+                input_digest,
+                "inequality",
+                || inequality::compute_frame(&base),
+            )?);
+            gdp_frames.push(cached_or_compute(
+                cross_snapshot,
+                "monthly",
+                monthly::ALGORITHM_VERSION,
+                input_digest,
+                "gdp",
+                || gdp_monthly_frame(&base),
+            )?);
+            gdp_type_frames.push(cached_or_compute(
+                cross_snapshot,
+                "monthly",
+                monthly::ALGORITHM_VERSION,
+                input_digest,
+                "gdp_user_type_share",
+                || gdp_type_share_frame(&base),
+            )?);
+            labor_monthly_frames.push(cached_or_compute(
+                cross_snapshot,
+                "monthly",
+                monthly::ALGORITHM_VERSION,
+                input_digest,
+                "labor_monthly",
+                || labor_monthly_frame(&base),
+            )?);
         }
         if plan.activity_tiers.must_compute() {
-            gdp_editor_month_frames.push(gdp_editor_month_frame(&base)?);
+            let input_digest = cross_snapshot
+                .map(|cache| cache.month_digest(&partition.year_month))
+                .transpose()?;
+            gdp_editor_month_frames.push(cached_or_compute(
+                cross_snapshot,
+                "editor_month",
+                activity::ALGORITHM_VERSION,
+                input_digest,
+                "editor_month",
+                || gdp_editor_month_frame(&base),
+            )?);
+            if let Some(input_digest) = input_digest {
+                gdp_activity_month_digests.push(input_digest.to_string());
+            }
         }
         if let Some(state) = registered_state.as_mut() {
             state.observe_partition(&base, partition.year, year_month_key)?;
@@ -2356,7 +2417,12 @@ fn compute_all_incremental(
         result.context("failed to write partitioned monthly-family outputs")?;
     }
     if plan.activity_tiers.must_compute() {
-        finish_activity_year(&mut gdp_editor_month_frames, &mut gdp_tier_frames)?;
+        finish_activity_year_cached(
+            &mut gdp_editor_month_frames,
+            &mut gdp_tier_frames,
+            &mut gdp_activity_month_digests,
+            cross_snapshot,
+        )?;
         write_activity_outputs(wiki, output_dir, gdp_tier_frames)?;
     }
     if let Some(state) = registered_state {
@@ -2364,6 +2430,75 @@ fn compute_all_incremental(
     }
 
     Ok(partition_count)
+}
+
+fn cached_or_compute<F>(
+    cache: Option<&crate::cross_snapshot::CrossSnapshotCache>,
+    kind: &str,
+    algorithm_version: &str,
+    input_digest: Option<&str>,
+    artifact: &str,
+    compute: F,
+) -> Result<DataFrame>
+where
+    F: FnOnce() -> Result<DataFrame>,
+{
+    let Some(cache) = cache else {
+        return compute();
+    };
+    let input_digest = input_digest.context("cross-snapshot cache has no input digest")?;
+    if let Some(frame) = cache.load(kind, algorithm_version, input_digest, artifact)? {
+        return Ok(frame);
+    }
+    let mut frame = compute()?;
+    cache.store(kind, algorithm_version, input_digest, artifact, &mut frame)?;
+    Ok(frame)
+}
+
+fn finish_activity_year_cached(
+    editor_month_frames: &mut Vec<DataFrame>,
+    output_frames: &mut Vec<DataFrame>,
+    month_digests: &mut Vec<String>,
+    cache: Option<&crate::cross_snapshot::CrossSnapshotCache>,
+) -> Result<()> {
+    if editor_month_frames.is_empty() {
+        month_digests.clear();
+        return Ok(());
+    }
+    if let Some(cache) = cache {
+        anyhow::ensure!(
+            editor_month_frames.len() == month_digests.len(),
+            "activity cache month inputs and identities disagree"
+        );
+        let digest_refs = month_digests.iter().map(String::as_str).collect::<Vec<_>>();
+        let input_digest =
+            cache.derived_digest("activity_year", activity::ALGORITHM_VERSION, &digest_refs);
+        if let Some(frame) = cache.load(
+            "activity_year",
+            activity::ALGORITHM_VERSION,
+            &input_digest,
+            "gdp_activity_tiers",
+        )? {
+            editor_month_frames.clear();
+            month_digests.clear();
+            output_frames.push(frame);
+            return Ok(());
+        }
+        let mut frames = Vec::new();
+        finish_activity_year(editor_month_frames, &mut frames)?;
+        let mut frame = concat_frames(frames)?;
+        cache.store(
+            "activity_year",
+            activity::ALGORITHM_VERSION,
+            &input_digest,
+            "gdp_activity_tiers",
+            &mut frame,
+        )?;
+        month_digests.clear();
+        output_frames.push(frame);
+        return Ok(());
+    }
+    finish_activity_year(editor_month_frames, output_frames)
 }
 
 fn write_monthly_outputs(
@@ -2846,6 +2981,42 @@ pub(crate) fn compute_all_for_snapshot(
 ) -> Result<()> {
     storage::validate_snapshot_version(snapshot)?;
     compute_all_selected(wiki, data_dir, output_dir, Some(snapshot))
+}
+
+pub(crate) fn compute_cross_snapshot_qualification_build(
+    wiki: &str,
+    snapshot: &str,
+    data_dir: &Path,
+    output_dir: &Path,
+    use_cache: bool,
+) -> Result<crate::cross_snapshot::CacheStats> {
+    storage::validate_snapshot_version(snapshot)?;
+    anyhow::ensure!(
+        !output_dir.exists(),
+        "cross-snapshot qualification output already exists: {}",
+        output_dir.display()
+    );
+    fs::create_dir_all(output_dir)?;
+    let weekly_config = WeeklyAggregationConfig::for_snapshot(data_dir, wiki, Some(snapshot))?;
+    let cache = use_cache
+        .then(|| crate::cross_snapshot::CrossSnapshotCache::new(data_dir, wiki, snapshot))
+        .transpose()?;
+    compute_all_incremental_cached(
+        wiki,
+        data_dir,
+        output_dir,
+        Some(snapshot),
+        ComputePlan::all_recompute(),
+        cache.as_ref(),
+    )?;
+    compute_page_weekly_edits_for_snapshot(
+        wiki,
+        data_dir,
+        output_dir,
+        &weekly_config,
+        Some(snapshot),
+    )?;
+    Ok(cache.as_ref().map_or_default(|cache| cache.stats()))
 }
 
 fn compute_all_selected(

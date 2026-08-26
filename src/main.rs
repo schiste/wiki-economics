@@ -8,6 +8,7 @@ mod capacity;
 mod cleanup;
 mod compaction;
 mod compute;
+mod cross_snapshot;
 mod dashboard;
 mod determinism;
 #[cfg(test)]
@@ -108,6 +109,28 @@ enum Commands {
         algorithm_version: String,
 
         /// Atomic deterministic qualification report path
+        #[arg(long)]
+        report: PathBuf,
+    },
+
+    /// Compare a content-reusing cross-snapshot build with a clean rebuild
+    CrossSnapshotQualify {
+        /// Wiki database name with two immutable schema-v3 generations
+        wiki: String,
+
+        /// Older generation used to seed content-addressed metric partitions
+        #[arg(long)]
+        baseline_version: String,
+
+        /// Newer generation built both incrementally and from empty
+        #[arg(long)]
+        candidate_version: String,
+
+        /// New, publication-invisible workspace retained as qualification evidence
+        #[arg(long)]
+        work_dir: PathBuf,
+
+        /// Atomic qualification report path
         #[arg(long)]
         report: PathBuf,
     },
@@ -932,6 +955,23 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
                 baseline_workers,
                 candidate_workers,
                 &algorithm_version,
+                &report,
+            )?;
+            println!("{}", serde_json::to_string(&qualification)?);
+        }
+        Commands::CrossSnapshotQualify {
+            wiki,
+            baseline_version,
+            candidate_version,
+            work_dir,
+            report,
+        } => {
+            let qualification = cross_snapshot::qualify(
+                &data_dir,
+                &wiki,
+                &baseline_version,
+                &candidate_version,
+                &work_dir,
                 &report,
             )?;
             println!("{}", serde_json::to_string(&qualification)?);
