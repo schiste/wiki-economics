@@ -21,7 +21,7 @@ use tracing::info;
 use crate::{
     determinism, fingerprint,
     observability::MemorySnapshot,
-    resource_governor::{GovernorPaths, ResourceGovernor},
+    resource_governor::{GovernorPaths, ResourceGovernor, ResourceObservation},
     schema, storage, workload_profile,
 };
 
@@ -29,6 +29,9 @@ const LEGACY_COMPUTE_ALGORITHM_VERSION: &str = "core-metrics-v8-period-aware-act
 const DEFAULT_WEEKLY_BUCKET_COUNT: usize = 256;
 const DEFAULT_SECONDARY_BUCKET_COUNT: usize = 1;
 const WEEKLY_ROUTING_BATCH_ROWS: usize = 250_000;
+const WEEKLY_BUCKET_MIN_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
+const WEEKLY_BUCKET_ESTIMATED_BYTES_PER_ROW: u64 = 256;
+const WEEKLY_RESULT_ESTIMATED_BYTES_PER_ROW: u64 = 128;
 const SUPPORTED_PRIMARY_BUCKET_COUNTS: [usize; 6] = [32, 64, 128, 256, 512, 1024];
 #[cfg(test)]
 const FLAT_BENCHMARK_BUCKET_COUNTS: [usize; 3] = [256, 512, 1024];
@@ -321,6 +324,7 @@ pub(crate) struct WeeklyAggregationReport {
     pub reduction_elapsed_ms: u64,
     pub reconciliation_elapsed_ms: u64,
     pub elapsed_ms: u64,
+    pub resources: ResourceObservation,
 }
 
 fn max_option(left: Option<u64>, right: Option<u64>) -> Option<u64> {
@@ -1585,11 +1589,44 @@ fn compute_page_weekly_edits_for_snapshot_cached(
         nonempty_buckets = bucket_rows.iter().filter(|&&rows| rows > 0).count(),
         "page_weekly_edits: reconciling staged buckets"
     );
-    for primary_bucket in 0..config.primary_bucket_count {
-        if primary_bucket_rows[primary_bucket] == 0 {
-            continue;
+    if config.secondary_bucket_count == 1 {
+        for primary_start in
+            (0..config.primary_bucket_count).step_by(governor.budget().weekly_worker_limit)
+        {
+            let primary_end = (primary_start + governor.budget().weekly_worker_limit)
+                .min(config.primary_bucket_count);
+            let prepared = (primary_start..primary_end)
+                .filter(|&primary_bucket| primary_bucket_rows[primary_bucket] > 0)
+                .map(|primary_bucket| PreparedWeeklyBucket {
+                    logical_bucket: primary_bucket,
+                    primary_bucket,
+                    secondary_bucket: 0,
+                    staged_rows: primary_bucket_rows[primary_bucket],
+                    staged_path: None,
+                })
+                .collect::<Vec<_>>();
+            let results =
+                reconcile_weekly_bucket_batch(&runs, &staged_paths, prepared, wiki, &governor)?;
+            let append = append_weekly_bucket_results(
+                &runs,
+                results,
+                &final_path,
+                &mut output,
+                &mut total_edits_after,
+                &mut output_rows,
+                &mut min_week_start,
+                &mut max_week_start,
+                &mut scratch_peak_bytes,
+                &mut working_storage_peak_bytes,
+                &mut reconciliation_peak,
+            );
+            append?;
         }
-        let secondary_paths = if config.secondary_bucket_count > 1 {
+    } else {
+        for primary_bucket in 0..config.primary_bucket_count {
+            if primary_bucket_rows[primary_bucket] == 0 {
+                continue;
+            }
             let primary_path = primary_paths[primary_bucket]
                 .as_ref()
                 .with_context(|| format!("missing non-empty primary bucket {primary_bucket}"))?;
@@ -1616,94 +1653,57 @@ fn compute_page_weekly_edits_for_snapshot_cached(
             for (secondary, &rows) in routed.rows.iter().enumerate() {
                 bucket_rows[primary_bucket * config.secondary_bucket_count + secondary] = rows;
             }
-            Some(routed.paths)
-        } else {
-            None
-        };
-
-        for secondary_bucket in 0..config.secondary_bucket_count {
-            let bucket = primary_bucket * config.secondary_bucket_count + secondary_bucket;
-            let staged_rows = bucket_rows[bucket];
-            if staged_rows == 0 {
-                continue;
+            for secondary_start in
+                (0..config.secondary_bucket_count).step_by(governor.budget().weekly_worker_limit)
+            {
+                let secondary_end = (secondary_start + governor.budget().weekly_worker_limit)
+                    .min(config.secondary_bucket_count);
+                let prepared = (secondary_start..secondary_end)
+                    .filter_map(|secondary_bucket| {
+                        let logical_bucket =
+                            primary_bucket * config.secondary_bucket_count + secondary_bucket;
+                        let staged_rows = bucket_rows[logical_bucket];
+                        (staged_rows > 0).then(|| {
+                            routed.paths[secondary_bucket].clone().map(|staged_path| {
+                                PreparedWeeklyBucket {
+                                    logical_bucket,
+                                    primary_bucket,
+                                    secondary_bucket,
+                                    staged_rows,
+                                    staged_path: Some(staged_path),
+                                }
+                            })
+                        })?
+                    })
+                    .collect::<Vec<_>>();
+                anyhow::ensure!(
+                    prepared.len()
+                        == (secondary_start..secondary_end)
+                            .filter(|&secondary_bucket| {
+                                bucket_rows[primary_bucket * config.secondary_bucket_count
+                                    + secondary_bucket]
+                                    > 0
+                            })
+                            .count(),
+                    "missing non-empty secondary bucket path"
+                );
+                let results =
+                    reconcile_weekly_bucket_batch(&runs, &staged_paths, prepared, wiki, &governor)?;
+                let append = append_weekly_bucket_results(
+                    &runs,
+                    results,
+                    &final_path,
+                    &mut output,
+                    &mut total_edits_after,
+                    &mut output_rows,
+                    &mut min_week_start,
+                    &mut max_week_start,
+                    &mut scratch_peak_bytes,
+                    &mut working_storage_peak_bytes,
+                    &mut reconciliation_peak,
+                );
+                append?;
             }
-            let started = Instant::now();
-            let staged_path = match &secondary_paths {
-                Some(paths) => Some(
-                    paths[secondary_bucket]
-                        .clone()
-                        .context("missing non-empty secondary bucket")?,
-                ),
-                None => None,
-            };
-            let staged = match staged_path.as_deref() {
-                Some(path) => ParquetReader::new(File::open(path)?).finish()?,
-                None => read_staged_weekly_bucket(&staged_paths, primary_bucket)?,
-            };
-            let actual_staged_rows = staged.height();
-            anyhow::ensure!(
-                actual_staged_rows == staged_rows,
-                "page_weekly_edits bucket {primary_bucket}/{secondary_bucket} row count changed: expected {staged_rows}, read {actual_staged_rows}"
-            );
-            let bucket_edits_before = sum_edits_column(std::slice::from_ref(&staged))?;
-            let merged = staged
-                .lazy()
-                .group_by(weekly_group_keys())
-                .agg([col("edits").sum()])
-                .collect()?;
-            let merged = sort_frame(merged, weekly_sort_keys())?;
-            let weeks = merged.column("week_start")?.date()?.physical();
-            min_week_start = min_week_start.into_iter().chain(weeks.min()).min();
-            max_week_start = max_week_start.into_iter().chain(weeks.max()).max();
-            let bucket_edits_after = sum_edits_column(std::slice::from_ref(&merged))?;
-            anyhow::ensure!(
-                bucket_edits_before == bucket_edits_after,
-                "page_weekly_edits bucket {primary_bucket}/{secondary_bucket} lost or duplicated edits: {bucket_edits_before} before, {bucket_edits_after} after"
-            );
-            let mut result = add_weekly_change_columns(merged, wiki)?;
-            if output.is_none() {
-                let schema = result.schema();
-                let writer = AtomicBatchedParquetWriter::new(final_path.clone(), schema)?;
-                output = Some(writer);
-            }
-            output
-                .as_mut()
-                .context("page_weekly_edits output writer was not initialized")?
-                .write_batch(&mut result)?;
-            reclaim_completed_weekly_scratch(staged_path.as_deref())?;
-            output_rows += result.height();
-            total_edits_after = total_edits_after
-                .checked_add(bucket_edits_after)
-                .context("page_weekly_edits output edit count overflow")?;
-            let working_bytes = runs
-                .size_bytes()?
-                .checked_add(
-                    output
-                        .as_ref()
-                        .context("page_weekly_edits output writer was not initialized")?
-                        .current_bytes()?,
-                )
-                .context("page_weekly_edits working storage byte count overflow")?;
-            working_storage_peak_bytes = working_storage_peak_bytes.max(working_bytes);
-            let memory = MemorySnapshot::capture();
-            reconciliation_peak.observe(memory, None);
-            governor.checkpoint("page_weekly_edits_reconcile_bucket")?;
-            info!(
-                wiki = wiki,
-                primary_bucket,
-                secondary_bucket,
-                logical_bucket = bucket,
-                total_buckets = config.logical_bucket_count(),
-                staged_rows = staged_rows,
-                merged_rows = result.height(),
-                output_rows = output_rows,
-                elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
-                rss_bytes = ?memory.rss_bytes,
-                cgroup_current_bytes = ?memory.cgroup_current_bytes,
-                cgroup_peak_bytes = ?memory.cgroup_peak_bytes,
-                cgroup_limit_bytes = ?memory.cgroup_limit_bytes,
-                "page_weekly_edits: reconciled and wrote bucket"
-            );
         }
     }
 
@@ -1716,6 +1716,7 @@ fn compute_page_weekly_edits_for_snapshot_cached(
     working_storage_peak_bytes = working_storage_peak_bytes.max(bytes);
     let reconciliation_elapsed_ms = reconciliation_started.elapsed().as_millis() as u64;
     let memory = MemorySnapshot::capture();
+    governor.checkpoint("page_weekly_edits_complete")?;
     reconciliation_peak.scratch_bytes = Some(scratch_peak_bytes);
     let minimum_week_start = min_week_start.and_then(format_epoch_day);
     let maximum_week_start = max_week_start.and_then(format_epoch_day);
@@ -1759,6 +1760,7 @@ fn compute_page_weekly_edits_for_snapshot_cached(
         reduction_elapsed_ms,
         reconciliation_elapsed_ms,
         elapsed_ms: aggregation_started.elapsed().as_millis() as u64,
+        resources: governor.observation(),
     }))
 }
 
@@ -2138,6 +2140,7 @@ fn compute_page_weekly_external_qualification(
         reduction_elapsed_ms,
         reconciliation_elapsed_ms,
         elapsed_ms: started.elapsed().as_millis() as u64,
+        resources: ResourceObservation::default(),
     }))
 }
 
@@ -2493,6 +2496,210 @@ fn reclaim_completed_weekly_scratch(path: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Debug)]
+struct PreparedWeeklyBucket {
+    logical_bucket: usize,
+    primary_bucket: usize,
+    secondary_bucket: usize,
+    staged_rows: usize,
+    staged_path: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct WeeklyBucketResult {
+    logical_bucket: usize,
+    primary_bucket: usize,
+    secondary_bucket: usize,
+    staged_rows: usize,
+    output_rows: usize,
+    edits: i64,
+    minimum_week_start: Option<i32>,
+    maximum_week_start: Option<i32>,
+    result_path: PathBuf,
+    elapsed_ms: u64,
+    memory: MemorySnapshot,
+}
+
+fn reconcile_weekly_bucket_batch(
+    runs: &WeeklyRunDir,
+    staged_paths: &[PathBuf],
+    prepared: Vec<PreparedWeeklyBucket>,
+    wiki: &str,
+    governor: &ResourceGovernor,
+) -> Result<Vec<WeeklyBucketResult>> {
+    if prepared.is_empty() {
+        return Ok(Vec::new());
+    }
+    anyhow::ensure!(
+        prepared.len() <= governor.budget().weekly_worker_limit,
+        "weekly bucket batch exceeds the governed worker limit"
+    );
+    let mut results = std::thread::scope(|scope| -> Result<Vec<WeeklyBucketResult>> {
+        let handles = prepared
+            .into_iter()
+            .map(|bucket| {
+                scope.spawn(move || {
+                    reconcile_weekly_bucket(runs, staged_paths, bucket, wiki, governor)
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("weekly bucket worker panicked"))?
+            })
+            .collect()
+    })?;
+    results.sort_by_key(|result| result.logical_bucket);
+    Ok(results)
+}
+
+fn reconcile_weekly_bucket(
+    runs: &WeeklyRunDir,
+    staged_paths: &[PathBuf],
+    bucket: PreparedWeeklyBucket,
+    wiki: &str,
+    governor: &ResourceGovernor,
+) -> Result<WeeklyBucketResult> {
+    let estimated_rows = u64::try_from(bucket.staged_rows)?;
+    let estimated_memory_bytes = estimated_rows
+        .checked_mul(WEEKLY_BUCKET_ESTIMATED_BYTES_PER_ROW)
+        .context("weekly bucket memory estimate overflow")?
+        .max(WEEKLY_BUCKET_MIN_MEMORY_BYTES);
+    let estimated_scratch_bytes = estimated_rows
+        .checked_mul(WEEKLY_RESULT_ESTIMATED_BYTES_PER_ROW)
+        .context("weekly bucket scratch estimate overflow")?;
+    let _permit = governor.admit_bucket(estimated_memory_bytes, estimated_scratch_bytes)?;
+    let started = Instant::now();
+    let staged = match bucket.staged_path.as_deref() {
+        Some(path) => ParquetReader::new(File::open(path)?).finish()?,
+        None => read_staged_weekly_bucket(staged_paths, bucket.primary_bucket)?,
+    };
+    anyhow::ensure!(
+        staged.height() == bucket.staged_rows,
+        "page_weekly_edits bucket {}/{} row count changed: expected {}",
+        bucket.primary_bucket,
+        bucket.secondary_bucket,
+        bucket.staged_rows
+    );
+    let edits_before = sum_edits_column(std::slice::from_ref(&staged))?;
+    let merged = staged
+        .lazy()
+        .group_by(weekly_group_keys())
+        .agg([col("edits").sum()])
+        .collect()?;
+    let merged = sort_frame(merged, weekly_sort_keys())?;
+    let weeks = merged.column("week_start")?.date()?.physical();
+    let minimum_week_start = weeks.min();
+    let maximum_week_start = weeks.max();
+    let edits_after = sum_edits_column(std::slice::from_ref(&merged))?;
+    anyhow::ensure!(
+        edits_before == edits_after,
+        "page_weekly_edits bucket {}/{} lost or duplicated edits: {edits_before} before, {edits_after} after",
+        bucket.primary_bucket,
+        bucket.secondary_bucket
+    );
+    let mut result = add_weekly_change_columns(merged, wiki)?;
+    let output_rows = result.height();
+    let result_path = runs.result_path(bucket.logical_bucket);
+    let pending = PendingOutput::new(result_path.clone())?;
+    let mut file = File::create(&pending.temp_path)?;
+    ParquetWriter::new(&mut file)
+        .with_compression(ParquetCompression::Zstd(None))
+        .finish(&mut result)?;
+    drop(file);
+    pending.publish()?;
+    reclaim_completed_weekly_scratch(bucket.staged_path.as_deref())?;
+    let memory = MemorySnapshot::capture();
+    governor.checkpoint("page_weekly_edits_reconcile_bucket")?;
+    Ok(WeeklyBucketResult {
+        logical_bucket: bucket.logical_bucket,
+        primary_bucket: bucket.primary_bucket,
+        secondary_bucket: bucket.secondary_bucket,
+        staged_rows: bucket.staged_rows,
+        output_rows,
+        edits: edits_after,
+        minimum_week_start,
+        maximum_week_start,
+        result_path,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+        memory,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_weekly_bucket_results(
+    runs: &WeeklyRunDir,
+    results: Vec<WeeklyBucketResult>,
+    final_path: &Path,
+    output: &mut Option<AtomicBatchedParquetWriter>,
+    total_edits_after: &mut i64,
+    output_rows: &mut usize,
+    min_week_start: &mut Option<i32>,
+    max_week_start: &mut Option<i32>,
+    scratch_peak_bytes: &mut u64,
+    working_storage_peak_bytes: &mut u64,
+    reconciliation_peak: &mut ResourcePeak,
+) -> Result<()> {
+    *scratch_peak_bytes = (*scratch_peak_bytes).max(runs.size_bytes()?);
+    for result in results {
+        let mut frame = ParquetReader::new(File::open(&result.result_path)?).finish()?;
+        anyhow::ensure!(
+            frame.height() == result.output_rows,
+            "weekly bucket result row count changed before final merge"
+        );
+        if output.is_none() {
+            let writer = AtomicBatchedParquetWriter::new(final_path.to_path_buf(), frame.schema());
+            *output = Some(writer?);
+        }
+        output
+            .as_mut()
+            .context("page_weekly_edits output writer was not initialized")?
+            .write_batch(&mut frame)?;
+        fs::remove_file(&result.result_path)?;
+        *output_rows = output_rows
+            .checked_add(result.output_rows)
+            .context("page_weekly_edits output row count overflow")?;
+        *total_edits_after = total_edits_after
+            .checked_add(result.edits)
+            .context("page_weekly_edits output edit count overflow")?;
+        *min_week_start = (*min_week_start)
+            .into_iter()
+            .chain(result.minimum_week_start)
+            .min();
+        *max_week_start = (*max_week_start)
+            .into_iter()
+            .chain(result.maximum_week_start)
+            .max();
+        let working_bytes = runs
+            .size_bytes()?
+            .checked_add(
+                output
+                    .as_ref()
+                    .context("page_weekly_edits output writer was not initialized")?
+                    .current_bytes()?,
+            )
+            .context("page_weekly_edits working storage byte count overflow")?;
+        *working_storage_peak_bytes = (*working_storage_peak_bytes).max(working_bytes);
+        reconciliation_peak.observe(result.memory, Some(*scratch_peak_bytes));
+        info!(
+            primary_bucket = result.primary_bucket,
+            secondary_bucket = result.secondary_bucket,
+            logical_bucket = result.logical_bucket,
+            staged_rows = result.staged_rows,
+            merged_rows = result.output_rows,
+            output_rows = *output_rows,
+            elapsed_ms = result.elapsed_ms,
+            rss_bytes = ?result.memory.rss_bytes,
+            cgroup_current_bytes = ?result.memory.cgroup_current_bytes,
+            "page_weekly_edits: merged reconciled bucket in deterministic order"
+        );
+    }
+    Ok(())
+}
+
 fn add_weekly_change_columns(mut weekly: DataFrame, wiki: &str) -> Result<DataFrame> {
     let previous_week_edits = previous_week_edits(&weekly)?;
     let previous_column = Column::new("previous_week_edits".into(), previous_week_edits);
@@ -2618,6 +2825,11 @@ impl WeeklyRunDir {
         self.path.join(format!(
             "primary-{primary:04}-secondary-{secondary:04}.parquet"
         ))
+    }
+
+    fn result_path(&self, logical_bucket: usize) -> PathBuf {
+        self.path
+            .join(format!("result-{logical_bucket:06}.parquet"))
     }
 
     fn size_bytes(&self) -> Result<u64> {
@@ -5351,6 +5563,88 @@ mod tests {
                 .collect()
         })
         .map_err(Into::into)
+    }
+
+    fn governed_worker_fixture(output: &Path, workers: usize) -> Result<Vec<u8>> {
+        let runs = WeeklyRunDir::new(output, "testwiki", None)?;
+        let fixture = [
+            weekly_batch_df(&[
+                (Some(1), Some(0), Some("Alpha"), Some(0), Some(3)),
+                (Some(1), Some(0), Some("Alpha"), Some(7), Some(5)),
+            ])?,
+            weekly_batch_df(&[
+                (Some(2), Some(0), Some("Beta"), Some(0), Some(7)),
+                (Some(2), Some(0), Some("Beta"), Some(7), Some(11)),
+            ])?,
+        ];
+        let mut prepared = Vec::new();
+        for (logical_bucket, mut frame) in fixture.into_iter().enumerate() {
+            let staged_path = runs.secondary_path(0, logical_bucket);
+            ParquetWriter::new(File::create(&staged_path)?).finish(&mut frame)?;
+            prepared.push(PreparedWeeklyBucket {
+                logical_bucket,
+                primary_bucket: 0,
+                secondary_bucket: logical_bucket,
+                staged_rows: 2,
+                staged_path: Some(staged_path),
+            });
+        }
+        let mut budget = ResourceBudget::from_environment()?;
+        budget.memory_ceiling_bytes = u64::MAX;
+        budget.memory_reserve_bytes = 0;
+        budget.scratch_limit_bytes = u64::MAX;
+        budget.max_open_files = usize::MAX;
+        budget.thread_limit = workers;
+        budget.weekly_worker_limit = workers;
+        let governor = ResourceGovernor::new(
+            budget,
+            GovernorPaths::new(output.to_path_buf(), Some(runs.path().to_path_buf())),
+        );
+        let mut results = Vec::new();
+        for batch in prepared.chunks(workers) {
+            let reconciled =
+                reconcile_weekly_bucket_batch(&runs, &[], batch.to_vec(), "testwiki", &governor);
+            results.extend(reconciled?);
+        }
+        let final_path = output.join(format!("workers-{workers}.parquet"));
+        let mut writer = None;
+        let mut total_edits = 0;
+        let mut output_rows = 0;
+        let mut minimum = None;
+        let mut maximum = None;
+        let mut scratch_peak = 0;
+        let mut working_peak = 0;
+        let mut resource_peak = ResourcePeak::default();
+        let append = append_weekly_bucket_results(
+            &runs,
+            results,
+            &final_path,
+            &mut writer,
+            &mut total_edits,
+            &mut output_rows,
+            &mut minimum,
+            &mut maximum,
+            &mut scratch_peak,
+            &mut working_peak,
+            &mut resource_peak,
+        );
+        append?;
+        writer
+            .context("worker fixture produced no output")?
+            .finish()?;
+        assert_eq!(total_edits, 26);
+        assert_eq!(output_rows, 4);
+        assert_eq!(governor.sample()?.active_bucket_workers, 0);
+        fs::read(final_path).map_err(Into::into)
+    }
+
+    #[test]
+    fn weekly_output_bytes_are_identical_with_one_and_two_bucket_workers() -> Result<()> {
+        let output = TestDir::new()?;
+        let serial = governed_worker_fixture(output.path(), 1)?;
+        let parallel = governed_worker_fixture(output.path(), 2)?;
+        assert_eq!(serial, parallel);
+        Ok(())
     }
 
     #[test]

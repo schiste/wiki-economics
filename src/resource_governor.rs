@@ -22,6 +22,7 @@ pub(crate) const SOURCE_WORKERS_ENV: &str = "WIKI_ECON_SOURCE_WORKERS";
 pub(crate) const THREAD_LIMIT_ENV: &str = "WIKI_ECON_THREAD_LIMIT";
 pub(crate) const MAX_LOGICAL_PARTITION_ENV: &str = "WIKI_ECON_MAX_LOGICAL_PARTITION_BYTES";
 pub(crate) const MAX_PARQUET_WRITERS_ENV: &str = "WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS";
+pub(crate) const WEEKLY_WORKERS_ENV: &str = "WIKI_ECON_WEEKLY_WORKERS";
 
 const GIB: u64 = 1024 * 1024 * 1024;
 const DEFAULT_MEMORY_CEILING_BYTES: u64 = 16 * GIB;
@@ -30,6 +31,7 @@ const DEFAULT_MAX_OPEN_FILES: usize = 512;
 const DEFAULT_MAX_LOGICAL_PARTITION_BYTES: u64 = 8 * GIB;
 const DEFAULT_MAX_ACTIVE_PARQUET_WRITERS: usize = 16;
 const SOURCE_FD_ALLOWANCE: usize = 8;
+const BUCKET_FD_ALLOWANCE: usize = 4;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub(crate) struct ResourceBudget {
@@ -44,6 +46,7 @@ pub(crate) struct ResourceBudget {
     pub(crate) thread_limit: usize,
     pub(crate) max_logical_partition_bytes: u64,
     pub(crate) max_active_parquet_writers: usize,
+    pub(crate) weekly_worker_limit: usize,
 }
 
 impl ResourceBudget {
@@ -86,6 +89,7 @@ impl ResourceBudget {
                 .unwrap_or(DEFAULT_MAX_LOGICAL_PARTITION_BYTES),
             max_active_parquet_writers: parse_usize_env(MAX_PARQUET_WRITERS_ENV)?
                 .unwrap_or(DEFAULT_MAX_ACTIVE_PARQUET_WRITERS),
+            weekly_worker_limit: parse_usize_env(WEEKLY_WORKERS_ENV)?.unwrap_or(1),
         };
         budget.validate()?;
         budget.validate_external_thread_pools()?;
@@ -121,6 +125,10 @@ impl ResourceBudget {
         anyhow::ensure!(
             self.max_active_parquet_writers > 0,
             "maximum active Parquet writers must be positive"
+        );
+        anyhow::ensure!(
+            self.weekly_worker_limit > 0 && self.weekly_worker_limit <= self.thread_limit,
+            "weekly worker limit must be positive and no greater than the governed thread limit"
         );
         Ok(())
     }
@@ -178,8 +186,17 @@ impl GovernorPaths {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub(crate) struct CpuSnapshot {
     pub(crate) usage_usec: Option<u64>,
+    pub(crate) user_usec: Option<u64>,
+    pub(crate) system_usec: Option<u64>,
+    pub(crate) nr_periods: Option<u64>,
     pub(crate) throttled_usec: Option<u64>,
     pub(crate) nr_throttled: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub(crate) struct IoSnapshot {
+    pub(crate) read_bytes: Option<u64>,
+    pub(crate) write_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -187,12 +204,17 @@ pub(crate) struct ResourceSample {
     pub(crate) sampled_at_epoch_ms: u128,
     pub(crate) memory: MemorySnapshot,
     pub(crate) cpu: CpuSnapshot,
+    pub(crate) page_cache_bytes: Option<u64>,
+    pub(crate) io: IoSnapshot,
     pub(crate) scratch_bytes: u64,
     pub(crate) persistent_filesystem_used_bytes: Option<u64>,
     pub(crate) persistent_available_bytes: Option<u64>,
     pub(crate) open_file_descriptors: Option<usize>,
     pub(crate) active_source_workers: usize,
+    pub(crate) active_bucket_workers: usize,
     pub(crate) reserved_persistent_bytes: u64,
+    pub(crate) reserved_bucket_memory_bytes: u64,
+    pub(crate) reserved_bucket_scratch_bytes: u64,
     pub(crate) downloaded_bytes: u64,
     pub(crate) ingested_rows: u64,
     pub(crate) download_elapsed_ms: u64,
@@ -204,11 +226,41 @@ pub(crate) struct ResourceSample {
 #[derive(Debug, Default)]
 struct GovernorState {
     active_source_workers: usize,
+    active_bucket_workers: usize,
     reserved_persistent_bytes: u64,
+    reserved_bucket_memory_bytes: u64,
+    reserved_bucket_scratch_bytes: u64,
     downloaded_bytes: u64,
     ingested_rows: u64,
     download_elapsed_ms: u64,
     ingest_elapsed_ms: u64,
+    observation: ResourceObservation,
+    first_observation: Option<ObservationBoundary>,
+    latest_observation: Option<ObservationBoundary>,
+}
+
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct ResourceObservation {
+    pub(crate) samples: u64,
+    pub(crate) rss_peak_bytes: Option<u64>,
+    pub(crate) cgroup_current_peak_bytes: Option<u64>,
+    pub(crate) cgroup_reported_peak_bytes: Option<u64>,
+    pub(crate) page_cache_peak_bytes: Option<u64>,
+    pub(crate) scratch_peak_bytes: u64,
+    pub(crate) cpu_usage_usec: Option<u64>,
+    pub(crate) cpu_user_usec: Option<u64>,
+    pub(crate) cpu_system_usec: Option<u64>,
+    pub(crate) cpu_periods: Option<u64>,
+    pub(crate) cpu_throttled_periods: Option<u64>,
+    pub(crate) cpu_throttled_usec: Option<u64>,
+    pub(crate) read_bytes: Option<u64>,
+    pub(crate) write_bytes: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ObservationBoundary {
+    cpu: CpuSnapshot,
+    io: IoSnapshot,
 }
 
 #[derive(Clone, Debug)]
@@ -254,6 +306,11 @@ impl ResourceGovernor {
 
     pub(crate) fn budget(&self) -> &ResourceBudget {
         &self.budget
+    }
+
+    pub(crate) fn observation(&self) -> ResourceObservation {
+        let state = self.state.lock().expect("resource governor mutex poisoned");
+        state.completed_observation()
     }
 
     pub(crate) fn preflight_snapshot(
@@ -314,6 +371,7 @@ impl ResourceGovernor {
             "resource governor source-worker limit reached"
         );
         let sample = self.sample_with_state(&state)?;
+        state.observe(&sample);
         let additional_bytes = state
             .reserved_persistent_bytes
             .checked_add(expected_raw_bytes)
@@ -330,9 +388,53 @@ impl ResourceGovernor {
         })
     }
 
+    pub(crate) fn admit_bucket(
+        &self,
+        estimated_memory_bytes: u64,
+        estimated_scratch_bytes: u64,
+    ) -> Result<BucketPermit> {
+        let mut state = self.state.lock().expect("resource governor mutex poisoned");
+        anyhow::ensure!(
+            state.active_bucket_workers < self.budget.weekly_worker_limit,
+            "resource governor weekly-worker limit reached"
+        );
+        let sample = self.sample_with_state(&state)?;
+        state.observe(&sample);
+        let admission = self.validate_bucket_admission(
+            &state,
+            &sample,
+            estimated_memory_bytes,
+            estimated_scratch_bytes,
+        );
+        admission?;
+        state.active_bucket_workers += 1;
+        state.reserved_bucket_memory_bytes = state
+            .reserved_bucket_memory_bytes
+            .checked_add(estimated_memory_bytes)
+            .context("bucket memory reservation overflow")?;
+        state.reserved_bucket_scratch_bytes = state
+            .reserved_bucket_scratch_bytes
+            .checked_add(estimated_scratch_bytes)
+            .context("bucket scratch reservation overflow")?;
+        info!(
+            estimated_memory_bytes,
+            estimated_scratch_bytes,
+            active_bucket_workers = state.active_bucket_workers,
+            "resource governor admitted weekly bucket"
+        );
+        Ok(BucketPermit {
+            governor: self.clone(),
+            reserved_memory_bytes: estimated_memory_bytes,
+            reserved_scratch_bytes: estimated_scratch_bytes,
+            started: Instant::now(),
+        })
+    }
+
     pub(crate) fn sample(&self) -> Result<ResourceSample> {
-        let state = self.state.lock().expect("resource governor mutex poisoned");
-        self.sample_with_state(&state)
+        let mut state = self.state.lock().expect("resource governor mutex poisoned");
+        let sample = self.sample_with_state(&state)?;
+        state.observe(&sample);
+        Ok(sample)
     }
 
     pub(crate) fn checkpoint(&self, stage: &str) -> Result<ResourceSample> {
@@ -372,12 +474,17 @@ impl ResourceGovernor {
                 .as_millis(),
             memory: MemorySnapshot::capture(),
             cpu: capture_cpu(),
+            page_cache_bytes: capture_page_cache(),
+            io: capture_io(),
             scratch_bytes,
             persistent_filesystem_used_bytes,
             persistent_available_bytes,
             open_file_descriptors: open_file_descriptors(),
             active_source_workers: state.active_source_workers,
+            active_bucket_workers: state.active_bucket_workers,
             reserved_persistent_bytes: state.reserved_persistent_bytes,
+            reserved_bucket_memory_bytes: state.reserved_bucket_memory_bytes,
+            reserved_bucket_scratch_bytes: state.reserved_bucket_scratch_bytes,
             downloaded_bytes: state.downloaded_bytes,
             ingested_rows: state.ingested_rows,
             download_elapsed_ms: state.download_elapsed_ms,
@@ -436,6 +543,70 @@ impl ResourceGovernor {
         Ok(())
     }
 
+    fn validate_bucket_admission(
+        &self,
+        state: &GovernorState,
+        sample: &ResourceSample,
+        estimated_memory_bytes: u64,
+        estimated_scratch_bytes: u64,
+    ) -> Result<()> {
+        let current_memory = sample
+            .memory
+            .cgroup_current_bytes
+            .or(sample.memory.rss_bytes);
+        #[cfg(target_os = "linux")]
+        let current_memory = current_memory.context(
+            "resource governor requires current cgroup or RSS memory for bucket admission",
+        )?;
+        #[cfg(not(target_os = "linux"))]
+        let current_memory = current_memory.unwrap_or(0);
+        let admitted_memory = current_memory
+            .checked_add(state.reserved_bucket_memory_bytes)
+            .and_then(|value| value.checked_add(estimated_memory_bytes))
+            .and_then(|value| value.checked_add(self.budget.memory_reserve_bytes))
+            .context("bucket memory admission overflow")?;
+        anyhow::ensure!(
+            admitted_memory <= self.budget.memory_ceiling_bytes,
+            "resource governor bucket memory gate closed: {admitted_memory} bytes including reserve exceeds {} bytes",
+            self.budget.memory_ceiling_bytes
+        );
+        let admitted_scratch = sample
+            .scratch_bytes
+            .checked_add(state.reserved_bucket_scratch_bytes)
+            .and_then(|value| value.checked_add(estimated_scratch_bytes))
+            .context("bucket scratch admission overflow")?;
+        anyhow::ensure!(
+            admitted_scratch <= self.budget.scratch_limit_bytes,
+            "resource governor bucket scratch gate closed: {admitted_scratch} bytes exceeds {} bytes",
+            self.budget.scratch_limit_bytes
+        );
+        if let Some(open) = sample.open_file_descriptors {
+            let required = BUCKET_FD_ALLOWANCE
+                .checked_mul(state.active_bucket_workers.saturating_add(1))
+                .and_then(|allowance| open.checked_add(allowance))
+                .context("bucket file-descriptor admission overflow")?;
+            anyhow::ensure!(
+                required <= self.budget.max_open_files,
+                "resource governor bucket file-descriptor gate closed at {required}; limit is {}",
+                self.budget.max_open_files
+            );
+        }
+        let available = sample
+            .persistent_available_bytes
+            .context("resource governor bucket admission requires filesystem availability")?;
+        let required = self
+            .budget
+            .persistent_admission_reserve_bytes()?
+            .checked_add(state.reserved_bucket_scratch_bytes)
+            .and_then(|value| value.checked_add(estimated_scratch_bytes))
+            .context("bucket persistent-storage admission overflow")?;
+        anyhow::ensure!(
+            available >= required,
+            "resource governor bucket storage gate closed: {available} bytes available, {required} required"
+        );
+        Ok(())
+    }
+
     pub(crate) fn record_source_progress(
         &self,
         downloaded_bytes: u64,
@@ -461,8 +632,56 @@ impl ResourceGovernor {
             .checked_add(ingest_elapsed_ms)
             .context("ingest duration counter overflow")?;
         let sample = self.sample_with_state(&state)?;
+        state.observe(&sample);
         info!(sample = %serde_json::to_string(&sample)?, "resource governor source progress");
         Ok(sample)
+    }
+}
+
+impl GovernorState {
+    fn observe(&mut self, sample: &ResourceSample) {
+        self.observation.samples = self.observation.samples.saturating_add(1);
+        self.observation.rss_peak_bytes =
+            max_option(self.observation.rss_peak_bytes, sample.memory.rss_bytes);
+        self.observation.cgroup_current_peak_bytes = max_option(
+            self.observation.cgroup_current_peak_bytes,
+            sample.memory.cgroup_current_bytes,
+        );
+        self.observation.cgroup_reported_peak_bytes = max_option(
+            self.observation.cgroup_reported_peak_bytes,
+            sample.memory.cgroup_peak_bytes,
+        );
+        self.observation.page_cache_peak_bytes = max_option(
+            self.observation.page_cache_peak_bytes,
+            sample.page_cache_bytes,
+        );
+        self.observation.scratch_peak_bytes = self
+            .observation
+            .scratch_peak_bytes
+            .max(sample.scratch_bytes);
+        let boundary = ObservationBoundary {
+            cpu: sample.cpu,
+            io: sample.io,
+        };
+        self.first_observation.get_or_insert(boundary);
+        self.latest_observation = Some(boundary);
+    }
+
+    fn completed_observation(&self) -> ResourceObservation {
+        let mut observation = self.observation.clone();
+        if let (Some(first), Some(last)) = (self.first_observation, self.latest_observation) {
+            observation.cpu_usage_usec = option_delta(last.cpu.usage_usec, first.cpu.usage_usec);
+            observation.cpu_user_usec = option_delta(last.cpu.user_usec, first.cpu.user_usec);
+            observation.cpu_system_usec = option_delta(last.cpu.system_usec, first.cpu.system_usec);
+            observation.cpu_periods = option_delta(last.cpu.nr_periods, first.cpu.nr_periods);
+            observation.cpu_throttled_periods =
+                option_delta(last.cpu.nr_throttled, first.cpu.nr_throttled);
+            observation.cpu_throttled_usec =
+                option_delta(last.cpu.throttled_usec, first.cpu.throttled_usec);
+            observation.read_bytes = option_delta(last.io.read_bytes, first.io.read_bytes);
+            observation.write_bytes = option_delta(last.io.write_bytes, first.io.write_bytes);
+        }
+        observation
     }
 }
 
@@ -471,6 +690,35 @@ pub(crate) struct SourcePermit {
     reserved_persistent_bytes: u64,
     started: Instant,
     completed: bool,
+}
+
+pub(crate) struct BucketPermit {
+    governor: ResourceGovernor,
+    reserved_memory_bytes: u64,
+    reserved_scratch_bytes: u64,
+    started: Instant,
+}
+
+impl Drop for BucketPermit {
+    fn drop(&mut self) {
+        let mut state = self
+            .governor
+            .state
+            .lock()
+            .expect("resource governor mutex poisoned");
+        state.active_bucket_workers = state.active_bucket_workers.saturating_sub(1);
+        state.reserved_bucket_memory_bytes = state
+            .reserved_bucket_memory_bytes
+            .saturating_sub(self.reserved_memory_bytes);
+        state.reserved_bucket_scratch_bytes = state
+            .reserved_bucket_scratch_bytes
+            .saturating_sub(self.reserved_scratch_bytes);
+        info!(
+            elapsed_ms = self.started.elapsed().as_millis() as u64,
+            active_bucket_workers = state.active_bucket_workers,
+            "resource governor released weekly bucket"
+        );
+    }
 }
 
 impl SourcePermit {
@@ -543,6 +791,16 @@ fn throughput(units: u64, elapsed_ms: u64) -> Option<u64> {
     (elapsed_ms > 0).then(|| units.saturating_mul(1_000) / elapsed_ms)
 }
 
+fn max_option(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    left.into_iter().chain(right).max()
+}
+
+fn option_delta(after: Option<u64>, before: Option<u64>) -> Option<u64> {
+    after
+        .zip(before)
+        .map(|(after, before)| after.saturating_sub(before))
+}
+
 fn capture_cpu() -> CpuSnapshot {
     fs::read_to_string("/sys/fs/cgroup/cpu.stat")
         .ok()
@@ -561,9 +819,52 @@ fn parse_cpu_stat(value: &str) -> CpuSnapshot {
     };
     CpuSnapshot {
         usage_usec: read("usage_usec"),
+        user_usec: read("user_usec"),
+        system_usec: read("system_usec"),
+        nr_periods: read("nr_periods"),
         throttled_usec: read("throttled_usec"),
         nr_throttled: read("nr_throttled"),
     }
+}
+
+fn capture_page_cache() -> Option<u64> {
+    fs::read_to_string("/sys/fs/cgroup/memory.stat")
+        .ok()
+        .and_then(|value| parse_named_counter(&value, "file"))
+        .or_else(|| {
+            fs::read_to_string("/sys/fs/cgroup/memory/memory.stat")
+                .ok()
+                .and_then(|value| parse_named_counter(&value, "cache"))
+        })
+}
+
+#[cfg(not(coverage))]
+fn capture_io() -> IoSnapshot {
+    fs::read_to_string("/proc/self/io")
+        .ok()
+        .map(|value| parse_io_snapshot(&value))
+        .unwrap_or_default()
+}
+
+#[cfg(coverage)]
+fn capture_io() -> IoSnapshot {
+    IoSnapshot::default()
+}
+
+fn parse_io_snapshot(value: &str) -> IoSnapshot {
+    IoSnapshot {
+        read_bytes: parse_named_counter(value, "read_bytes:"),
+        write_bytes: parse_named_counter(value, "write_bytes:"),
+    }
+}
+
+fn parse_named_counter(value: &str, key: &str) -> Option<u64> {
+    value.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        (fields.next()? == key)
+            .then(|| fields.next()?.parse::<u64>().ok())
+            .flatten()
+    })
 }
 
 fn open_file_descriptors() -> Option<usize> {
@@ -613,6 +914,7 @@ mod tests {
             thread_limit: 4,
             max_logical_partition_bytes: 100,
             max_active_parquet_writers: 16,
+            weekly_worker_limit: 2,
         }
     }
 
@@ -696,15 +998,119 @@ mod tests {
     #[test]
     fn parses_cpu_throttling_and_rates() {
         assert_eq!(
-            parse_cpu_stat("usage_usec 42\nnr_throttled 3\nthrottled_usec 7\n"),
+            parse_cpu_stat(
+                "usage_usec 42\nuser_usec 30\nsystem_usec 12\nnr_periods 9\nnr_throttled 3\nthrottled_usec 7\n"
+            ),
             CpuSnapshot {
                 usage_usec: Some(42),
+                user_usec: Some(30),
+                system_usec: Some(12),
+                nr_periods: Some(9),
                 throttled_usec: Some(7),
                 nr_throttled: Some(3),
             }
         );
+        assert_eq!(
+            parse_named_counter("anon 2\nfile 4096\n", "file"),
+            Some(4096)
+        );
+        assert_eq!(
+            parse_named_counter("read_bytes: 1024\nwrite_bytes: 2048\n", "write_bytes:"),
+            Some(2048)
+        );
+        assert_eq!(
+            parse_io_snapshot("read_bytes: 1024\nwrite_bytes: 2048\n"),
+            IoSnapshot {
+                read_bytes: Some(1024),
+                write_bytes: Some(2048),
+            }
+        );
         assert_eq!(throughput(1_000, 250), Some(4_000));
         assert_eq!(throughput(10, 0), None);
+    }
+
+    #[test]
+    fn bucket_admission_reserves_before_work_and_releases_on_drop() -> Result<()> {
+        let root = TestDir::new()?;
+        let mut permissive = budget();
+        permissive.memory_ceiling_bytes = u64::MAX;
+        permissive.memory_reserve_bytes = 0;
+        permissive.scratch_limit_bytes = u64::MAX;
+        let governor = ResourceGovernor::new(
+            permissive,
+            GovernorPaths::new(root.path().to_path_buf(), None),
+        );
+        let first = governor.admit_bucket(100, 20)?;
+        let second = governor.admit_bucket(200, 30)?;
+        let sample = governor.sample()?;
+        assert_eq!(sample.active_bucket_workers, 2);
+        assert_eq!(sample.reserved_bucket_memory_bytes, 300);
+        assert_eq!(sample.reserved_bucket_scratch_bytes, 50);
+        assert!(governor.admit_bucket(1, 1).is_err());
+        drop(first);
+        drop(second);
+        let sample = governor.sample()?;
+        assert_eq!(sample.active_bucket_workers, 0);
+        assert_eq!(sample.reserved_bucket_memory_bytes, 0);
+        assert_eq!(sample.reserved_bucket_scratch_bytes, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn bucket_admission_fails_before_memory_or_scratch_exhaustion() -> Result<()> {
+        let root = TestDir::new()?;
+        let governor = ResourceGovernor::new(
+            budget(),
+            GovernorPaths::new(root.path().to_path_buf(), None),
+        );
+        let mut sample = ResourceSample {
+            sampled_at_epoch_ms: 0,
+            memory: MemorySnapshot {
+                rss_bytes: Some(600_000_000),
+                cgroup_current_bytes: Some(600_000_000),
+                cgroup_peak_bytes: Some(600_000_000),
+                cgroup_limit_bytes: Some(1_000_000_000),
+            },
+            cpu: CpuSnapshot::default(),
+            page_cache_bytes: Some(0),
+            io: IoSnapshot::default(),
+            scratch_bytes: 0,
+            persistent_filesystem_used_bytes: Some(0),
+            persistent_available_bytes: Some(1_000_000_000),
+            open_file_descriptors: Some(1),
+            active_source_workers: 0,
+            active_bucket_workers: 0,
+            reserved_persistent_bytes: 0,
+            reserved_bucket_memory_bytes: 0,
+            reserved_bucket_scratch_bytes: 0,
+            downloaded_bytes: 0,
+            ingested_rows: 0,
+            download_elapsed_ms: 0,
+            ingest_elapsed_ms: 0,
+            download_bytes_per_second: None,
+            ingest_rows_per_second: None,
+        };
+        assert!(
+            governor
+                .validate_bucket_admission(&GovernorState::default(), &sample, 150_000_001, 0)
+                .is_err()
+        );
+        sample.memory.rss_bytes = Some(1);
+        sample.memory.cgroup_current_bytes = Some(1);
+        sample.scratch_bytes = 900_000;
+        assert!(
+            governor
+                .validate_bucket_admission(&GovernorState::default(), &sample, 1, 100_001)
+                .is_err()
+        );
+        sample.scratch_bytes = 0;
+        sample.open_file_descriptors = Some(125);
+        assert!(
+            governor
+                .validate_bucket_admission(&GovernorState::default(), &sample, 1, 1)
+                .is_err()
+        );
+        Ok(())
     }
 
     #[test]
@@ -761,12 +1167,17 @@ mod tests {
                 cgroup_limit_bytes: Some(1_000_000_000),
             },
             cpu: CpuSnapshot::default(),
+            page_cache_bytes: None,
+            io: IoSnapshot::default(),
             scratch_bytes: 0,
             persistent_filesystem_used_bytes: Some(0),
             persistent_available_bytes: Some(1_000_000),
             open_file_descriptors: Some(1),
             active_source_workers: 0,
+            active_bucket_workers: 0,
             reserved_persistent_bytes: 0,
+            reserved_bucket_memory_bytes: 0,
+            reserved_bucket_scratch_bytes: 0,
             downloaded_bytes: 0,
             ingested_rows: 0,
             download_elapsed_ms: 0,

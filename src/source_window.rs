@@ -768,6 +768,7 @@ mod tests {
                 thread_limit: 2,
                 max_logical_partition_bytes: u64::MAX,
                 max_active_parquet_writers: 16,
+                weekly_worker_limit: 1,
             },
             GovernorPaths::new(data_dir.path().to_path_buf(), None),
         );
@@ -841,6 +842,7 @@ mod tests {
                 thread_limit: 1,
                 max_logical_partition_bytes: u64::MAX,
                 max_active_parquet_writers: 16,
+                weekly_worker_limit: 1,
             },
             GovernorPaths::new(data_dir.path().to_path_buf(), None),
         )
