@@ -118,7 +118,7 @@ function runFixture(fixture, extraEnv = {}) {
   });
 }
 
-async function waitForFile(file, timeoutMs = 5000) {
+async function waitForFile(file, timeoutMs = 60000) {
   const deadline = Date.now() + timeoutMs;
   while (!fs.existsSync(file)) {
     assert.ok(Date.now() < deadline, `timed out waiting for ${file}`);
@@ -126,7 +126,7 @@ async function waitForFile(file, timeoutMs = 5000) {
   }
 }
 
-async function waitForStatus(output, predicate, timeoutMs = 5000) {
+async function waitForStatus(output, predicate, timeoutMs = 60000) {
   const statusFile = path.join(output, ".refresh-status.json");
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {

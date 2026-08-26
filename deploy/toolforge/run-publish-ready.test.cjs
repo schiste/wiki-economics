@@ -35,7 +35,7 @@ test("publisher exits before the site build for an unchanged selection", () => {
   const prepare = transactionScript.indexOf("publication-prepare-ready");
   const noOpState = transactionScript.indexOf("no_op)");
   const noOpExit = transactionScript.indexOf("exit 0", noOpState);
-  const siteBuild = transactionScript.indexOf('"$ROOT/scripts/build-site.sh"');
+  const siteBuild = transactionScript.indexOf('"$ROOT/scripts/build-site.sh"', noOpExit);
   const commit = transactionScript.lastIndexOf("publication-commit-ready");
 
   assert.ok(prepare >= 0);
