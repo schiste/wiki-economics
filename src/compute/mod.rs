@@ -1,6 +1,10 @@
+pub mod activity;
 pub mod gdp;
 pub mod inequality;
 pub mod labor;
+pub mod lifecycle;
+pub mod monthly;
+pub mod weekly;
 
 use anyhow::{Context, Result};
 use chrono::{Duration, NaiveDate};
@@ -21,7 +25,7 @@ use crate::{
     schema, storage, workload_profile,
 };
 
-const COMPUTE_ALGORITHM_VERSION: &str = "core-metrics-v8-period-aware-activity-tiers";
+const LEGACY_COMPUTE_ALGORITHM_VERSION: &str = "core-metrics-v8-period-aware-activity-tiers";
 const DEFAULT_WEEKLY_BUCKET_COUNT: usize = 256;
 const DEFAULT_SECONDARY_BUCKET_COUNT: usize = 1;
 const WEEKLY_ROUTING_BATCH_ROWS: usize = 250_000;
@@ -33,17 +37,105 @@ const WEEKLY_BUCKET_COUNT_ENV: &str = "WIKI_ECON_WEEKLY_BUCKET_COUNT";
 const WEEKLY_PRIMARY_BUCKET_COUNT_ENV: &str = "WIKI_ECON_WEEKLY_PRIMARY_BUCKET_COUNT";
 const WEEKLY_SECONDARY_BUCKET_COUNT_ENV: &str = "WIKI_ECON_WEEKLY_SECONDARY_BUCKET_COUNT";
 const SCRATCH_DIR_ENV: &str = "WIKI_ECON_SCRATCH_DIR";
-const CORE_METRICS: [&str; 9] = [
-    "business_funnel",
-    "gdp",
-    "gdp_activity_tiers",
-    "gdp_user_type_share",
-    "inequality",
-    "labor_churn",
-    "labor_cohorts",
-    "labor_monthly",
-    "page_weekly_edits",
-];
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum MetricFamily {
+    Monthly,
+    ActivityTiers,
+    Lifecycle,
+    PageWeek,
+}
+
+impl MetricFamily {
+    pub(crate) const ALL: [Self; 4] = [
+        Self::Monthly,
+        Self::ActivityTiers,
+        Self::Lifecycle,
+        Self::PageWeek,
+    ];
+
+    const NONWEEKLY: [Self; 3] = [Self::Monthly, Self::ActivityTiers, Self::Lifecycle];
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Monthly => "monthly",
+            Self::ActivityTiers => "activity_tiers",
+            Self::Lifecycle => "lifecycle",
+            Self::PageWeek => "page_week",
+        }
+    }
+
+    fn metrics(self) -> &'static [&'static str] {
+        match self {
+            Self::Monthly => &monthly::METRICS,
+            Self::ActivityTiers => &activity::METRICS,
+            Self::Lifecycle => &lifecycle::METRICS,
+            Self::PageWeek => &weekly::METRICS,
+        }
+    }
+
+    fn algorithm_version(self, weekly_config: &WeeklyAggregationConfig) -> String {
+        match self {
+            Self::Monthly => monthly::ALGORITHM_VERSION.to_string(),
+            Self::ActivityTiers => activity::ALGORITHM_VERSION.to_string(),
+            Self::Lifecycle => lifecycle::ALGORITHM_VERSION.to_string(),
+            Self::PageWeek => weekly_config.algorithm_version(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Invalidation {
+    Reuse,
+    Recompute,
+}
+
+impl Invalidation {
+    fn must_compute(self) -> bool {
+        self == Self::Recompute
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct ComputePlan {
+    pub(crate) monthly: Invalidation,
+    pub(crate) activity_tiers: Invalidation,
+    pub(crate) lifecycle: Invalidation,
+    pub(crate) page_week: Invalidation,
+}
+
+impl ComputePlan {
+    fn all_recompute() -> Self {
+        Self {
+            monthly: Invalidation::Recompute,
+            activity_tiers: Invalidation::Recompute,
+            lifecycle: Invalidation::Recompute,
+            page_week: Invalidation::Recompute,
+        }
+    }
+
+    fn invalidation(self, family: MetricFamily) -> Invalidation {
+        match family {
+            MetricFamily::Monthly => self.monthly,
+            MetricFamily::ActivityTiers => self.activity_tiers,
+            MetricFamily::Lifecycle => self.lifecycle,
+            MetricFamily::PageWeek => self.page_week,
+        }
+    }
+
+    fn all_reused(self) -> bool {
+        MetricFamily::ALL
+            .into_iter()
+            .all(|family| self.invalidation(family) == Invalidation::Reuse)
+    }
+
+    fn any_nonweekly(self) -> bool {
+        MetricFamily::NONWEEKLY
+            .into_iter()
+            .any(|family| self.invalidation(family).must_compute())
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WeeklyAggregationConfig {
@@ -150,7 +242,19 @@ impl WeeklyAggregationConfig {
             self.primary_bucket_count,
             self.secondary_bucket_count,
         );
-        format!("{COMPUTE_ALGORITHM_VERSION}-{selection}-{partition}")
+        format!("{}-{selection}-{partition}", weekly::ALGORITHM_VERSION)
+    }
+
+    fn legacy_algorithm_version(&self) -> String {
+        let selection = self
+            .workload_algorithm_version
+            .as_deref()
+            .unwrap_or("explicit-qualification-configuration");
+        let partition = determinism::partition_algorithm_version(
+            self.primary_bucket_count,
+            self.secondary_bucket_count,
+        );
+        format!("{LEGACY_COMPUTE_ALGORITHM_VERSION}-{selection}-{partition}")
     }
 
     fn logical_bucket_count(&self) -> usize {
@@ -377,6 +481,46 @@ impl RegisteredState {
             self.churn_year.observe(user_id, year);
         }
 
+        Ok(())
+    }
+
+    fn observe_history(&mut self, base: &DataFrame) -> Result<()> {
+        let registered = base
+            .clone()
+            .lazy()
+            .filter(col("user_type").eq(lit("registered")))
+            .select([col("event_user_id"), col("year"), col("year_month_key")])
+            .collect()?;
+        let user_ids = registered.column("event_user_id")?.i64()?;
+        let years = registered.column("year")?.i32()?;
+        let months = registered.column("year_month_key")?.i32()?;
+        for row in 0..registered.height() {
+            let (Some(user_id), Some(year), Some(year_month_key)) =
+                (user_ids.get(row), years.get(row), months.get(row))
+            else {
+                continue;
+            };
+            self.funnel_stats
+                .entry(user_id)
+                .and_modify(|(first_year, edits)| {
+                    *first_year = (*first_year).min(year);
+                    *edits += 1;
+                })
+                .or_insert((year, 1));
+            self.cohort_spans
+                .entry(user_id)
+                .and_modify(|(first_year, last_year)| {
+                    *first_year = (*first_year).min(year);
+                    *last_year = (*last_year).max(year);
+                })
+                .or_insert((year, year));
+            self.churn_month.observe(user_id, year_month_key);
+            self.churn_quarter.observe(
+                user_id,
+                labor::normalize_period_key(year_month_key, "quarter")?,
+            );
+            self.churn_year.observe(user_id, year);
+        }
         Ok(())
     }
 }
@@ -2108,7 +2252,11 @@ fn compute_all_incremental(
     data_dir: &Path,
     output_dir: &Path,
     snapshot: Option<&str>,
-) -> Result<()> {
+    plan: ComputePlan,
+) -> Result<usize> {
+    if !plan.any_nonweekly() {
+        return Ok(0);
+    }
     let partitions = match snapshot {
         Some(snapshot) => {
             let layer_result = storage::snapshot_compute_layer(
@@ -2134,10 +2282,8 @@ fn compute_all_incremental(
             "snapshot generation contains no analytical partitions"
         );
         let base = load_wiki(wiki, data_dir)?;
-        inequality::compute(wiki, &base, output_dir)?;
-        labor::compute(wiki, &base, output_dir)?;
-        gdp::compute(wiki, &base, output_dir)?;
-        return Ok(());
+        compute_nonweekly_flat(wiki, &base, output_dir, plan)?;
+        return Ok(1);
     }
 
     let mut inequality_frames = Vec::new();
@@ -2147,10 +2293,13 @@ fn compute_all_incremental(
     let mut gdp_editor_month_frames = Vec::new();
     let mut gdp_activity_year = None;
     let mut labor_monthly_frames = Vec::new();
-    let mut registered_state = RegisteredState::new();
+    let mut registered_state = plan.lifecycle.must_compute().then(RegisteredState::new);
 
+    let partition_count = partitions.len();
     for partition in partitions {
-        if let Some(current_year) = gdp_activity_year {
+        if plan.activity_tiers.must_compute()
+            && let Some(current_year) = gdp_activity_year
+        {
             anyhow::ensure!(
                 partition.year >= current_year,
                 "analytical partitions are not ordered chronologically"
@@ -2159,7 +2308,9 @@ fn compute_all_incremental(
                 finish_activity_year(&mut gdp_editor_month_frames, &mut gdp_tier_frames)?;
             }
         }
-        gdp_activity_year = Some(partition.year);
+        if plan.activity_tiers.must_compute() {
+            gdp_activity_year = Some(partition.year);
+        }
         let base = load_partition(&partition.files)?;
         let year_month_key = partition
             .year_month
@@ -2171,18 +2322,52 @@ fn compute_all_incremental(
             })
             .context("invalid partition year_month format")?;
 
-        inequality_frames.push(inequality::compute_frame(&base)?);
-        gdp_frames.push(gdp_monthly_frame(&base)?);
-        gdp_type_frames.push(gdp_type_share_frame(&base)?);
-        gdp_editor_month_frames.push(gdp_editor_month_frame(&base)?);
-        labor_monthly_frames.push(labor_monthly_frame(&base)?);
-        registered_state.observe_partition(&base, partition.year, year_month_key)?;
+        if plan.monthly.must_compute() {
+            inequality_frames.push(inequality::compute_frame(&base)?);
+            gdp_frames.push(gdp_monthly_frame(&base)?);
+            gdp_type_frames.push(gdp_type_share_frame(&base)?);
+            labor_monthly_frames.push(labor_monthly_frame(&base)?);
+        }
+        if plan.activity_tiers.must_compute() {
+            gdp_editor_month_frames.push(gdp_editor_month_frame(&base)?);
+        }
+        if let Some(state) = registered_state.as_mut() {
+            state.observe_partition(&base, partition.year, year_month_key)?;
+        }
         for file in &partition.files {
             storage::discard_path_cache(file);
         }
     }
-    finish_activity_year(&mut gdp_editor_month_frames, &mut gdp_tier_frames)?;
+    if plan.monthly.must_compute() {
+        let result = write_monthly_outputs(
+            wiki,
+            output_dir,
+            inequality_frames,
+            gdp_frames,
+            gdp_type_frames,
+            labor_monthly_frames,
+        );
+        result.context("failed to write partitioned monthly-family outputs")?;
+    }
+    if plan.activity_tiers.must_compute() {
+        finish_activity_year(&mut gdp_editor_month_frames, &mut gdp_tier_frames)?;
+        write_activity_outputs(wiki, output_dir, gdp_tier_frames)?;
+    }
+    if let Some(state) = registered_state {
+        write_lifecycle_outputs(wiki, output_dir, state)?;
+    }
 
+    Ok(partition_count)
+}
+
+fn write_monthly_outputs(
+    wiki: &str,
+    output_dir: &Path,
+    inequality_frames: Vec<DataFrame>,
+    gdp_frames: Vec<DataFrame>,
+    gdp_type_frames: Vec<DataFrame>,
+    labor_monthly_frames: Vec<DataFrame>,
+) -> Result<()> {
     let mut inequality_out = concat_frames(inequality_frames)?;
     inequality_out =
         inequality_out.sort(["year_month", "user_type"], SortMultipleOptions::default())?;
@@ -2190,7 +2375,7 @@ fn compute_all_incremental(
     write_output(&mut inequality_out, wiki, "inequality", output_dir)?;
 
     let mut gdp_out = concat_frames(gdp_frames)?;
-    gdp_out = sort_frame(gdp_out, ["year_month", "page_namespace"])?;
+    gdp_out = sort_frame(gdp_out, ["year_month", "page_namespace", "user_type"])?;
     add_wiki_column(&mut gdp_out, wiki)?;
     write_output(&mut gdp_out, wiki, "gdp", output_dir)?;
 
@@ -2200,29 +2385,65 @@ fn compute_all_incremental(
     add_wiki_column(&mut gdp_type_out, wiki)?;
     write_output(&mut gdp_type_out, wiki, "gdp_user_type_share", output_dir)?;
 
-    let mut gdp_tier_out = concat_frames(gdp_tier_frames)?;
-    gdp_tier_out = sort_frame(gdp_tier_out, ["period", "user_type", "tier_rank"])?;
-    add_wiki_column(&mut gdp_tier_out, wiki)?;
-    write_output(&mut gdp_tier_out, wiki, "gdp_activity_tiers", output_dir)?;
-
-    finalize_funnel(registered_state.funnel_stats, wiki, output_dir)?;
-
     let mut labor_monthly_out = concat_frames(labor_monthly_frames)?;
-    labor_monthly_out = sort_frame(labor_monthly_out, ["year_month", "page_namespace"])?;
+    labor_monthly_out = sort_frame(
+        labor_monthly_out,
+        ["year_month", "page_namespace", "user_type"],
+    )?;
     add_wiki_column(&mut labor_monthly_out, wiki)?;
-    write_output(&mut labor_monthly_out, wiki, "labor_monthly", output_dir)?;
+    write_output(&mut labor_monthly_out, wiki, "labor_monthly", output_dir)
+}
 
-    finalize_labor_cohorts(registered_state.cohort_spans, wiki, output_dir)?;
+fn write_activity_outputs(wiki: &str, output_dir: &Path, frames: Vec<DataFrame>) -> Result<()> {
+    let mut output = concat_frames(frames)?;
+    output = sort_frame(output, ["period", "user_type", "tier_rank"])?;
+    add_wiki_column(&mut output, wiki)?;
+    write_output(&mut output, wiki, "gdp_activity_tiers", output_dir)
+}
 
+fn write_lifecycle_outputs(wiki: &str, output_dir: &Path, state: RegisteredState) -> Result<()> {
+    finalize_funnel(state.funnel_stats, wiki, output_dir)?;
+    finalize_labor_cohorts(state.cohort_spans, wiki, output_dir)?;
     let churn_frames = vec![
-        registered_state.churn_month.finish()?,
-        registered_state.churn_quarter.finish()?,
-        registered_state.churn_year.finish()?,
+        state.churn_month.finish()?,
+        state.churn_quarter.finish()?,
+        state.churn_year.finish()?,
     ];
     let mut churn = concat_frames(churn_frames)?;
     add_wiki_column(&mut churn, wiki)?;
-    write_output(&mut churn, wiki, "labor_churn", output_dir)?;
+    write_output(&mut churn, wiki, "labor_churn", output_dir)
+}
 
+fn compute_nonweekly_flat(
+    wiki: &str,
+    base: &DataFrame,
+    output_dir: &Path,
+    plan: ComputePlan,
+) -> Result<()> {
+    if plan.monthly.must_compute() {
+        let result = write_monthly_outputs(
+            wiki,
+            output_dir,
+            vec![inequality::compute_frame(base)?],
+            vec![gdp_monthly_frame(base)?],
+            vec![gdp_type_share_frame(base)?],
+            vec![labor_monthly_frame(base)?],
+        );
+        result.context("failed to write flat monthly-family outputs")?;
+    }
+    if plan.activity_tiers.must_compute() {
+        let result = write_activity_outputs(
+            wiki,
+            output_dir,
+            vec![activity_tiers_all_periods(base.clone())?],
+        );
+        result.context("failed to write flat activity-tier outputs")?;
+    }
+    if plan.lifecycle.must_compute() {
+        let mut state = RegisteredState::new();
+        state.observe_history(base)?;
+        write_lifecycle_outputs(wiki, output_dir, state)?;
+    }
     Ok(())
 }
 
@@ -2259,13 +2480,6 @@ pub(crate) fn compute_stage_inputs(
         } else {
             generation_outputs
         };
-        let profile = workload_profile::profile_path(data_dir, wiki, &snapshot)?;
-        if profile.is_file() {
-            inputs.push(fingerprint::TrackedPath::new(
-                format!("workload-profile/{wiki}/{snapshot}"),
-                profile,
-            ));
-        }
         inputs.sort_by(|left, right| left.identity.cmp(&right.identity));
         return Ok(inputs);
     }
@@ -2287,8 +2501,54 @@ pub(crate) fn compute_stage_inputs(
     Ok(inputs)
 }
 
-fn compute_stage_outputs(wiki: &str, output_dir: &Path) -> Vec<fingerprint::TrackedPath> {
-    CORE_METRICS
+fn family_inputs(
+    family: MetricFamily,
+    wiki: &str,
+    data_dir: &Path,
+    snapshot: Option<&str>,
+) -> Result<Vec<fingerprint::TrackedPath>> {
+    let mut inputs = compute_stage_inputs(wiki, data_dir, snapshot)?;
+    if family == MetricFamily::PageWeek
+        && let Some(snapshot) = snapshot
+    {
+        let profile = workload_profile::profile_path(data_dir, wiki, snapshot)?;
+        if profile.is_file() {
+            inputs.push(fingerprint::TrackedPath::new(
+                format!("workload-profile/{wiki}/{snapshot}"),
+                profile,
+            ));
+        }
+    }
+    inputs.sort_by(|left, right| left.identity.cmp(&right.identity));
+    Ok(inputs)
+}
+
+fn legacy_compute_inputs(
+    wiki: &str,
+    data_dir: &Path,
+    snapshot: Option<&str>,
+) -> Result<Vec<fingerprint::TrackedPath>> {
+    let mut inputs = compute_stage_inputs(wiki, data_dir, snapshot)?;
+    if let Some(snapshot) = snapshot {
+        let profile = workload_profile::profile_path(data_dir, wiki, snapshot)?;
+        if profile.is_file() {
+            inputs.push(fingerprint::TrackedPath::new(
+                format!("workload-profile/{wiki}/{snapshot}"),
+                profile,
+            ));
+        }
+    }
+    inputs.sort_by(|left, right| left.identity.cmp(&right.identity));
+    Ok(inputs)
+}
+
+fn family_outputs(
+    family: MetricFamily,
+    wiki: &str,
+    output_dir: &Path,
+) -> Vec<fingerprint::TrackedPath> {
+    family
+        .metrics()
         .iter()
         .map(|metric| {
             fingerprint::TrackedPath::new(
@@ -2296,54 +2556,228 @@ fn compute_stage_outputs(wiki: &str, output_dir: &Path) -> Vec<fingerprint::Trac
                 output_dir.join(wiki).join(format!("{metric}.parquet")),
             )
         })
+        .collect()
+}
+
+fn compute_stage_outputs(wiki: &str, output_dir: &Path) -> Vec<fingerprint::TrackedPath> {
+    MetricFamily::ALL
+        .into_iter()
+        .flat_map(|family| family_outputs(family, wiki, output_dir))
         .filter(|output| output.path.is_file())
         .collect()
 }
 
-fn compute_stage_receipt(output_dir: &Path, wiki: &str) -> PathBuf {
+fn legacy_compute_stage_receipt(output_dir: &Path, wiki: &str) -> PathBuf {
     output_dir
         .join("_stages")
         .join("compute")
         .join(format!("{wiki}.json"))
 }
 
-pub(crate) fn reusable_candidate_files(
+fn family_stage_receipt(output_dir: &Path, wiki: &str, family: MetricFamily) -> PathBuf {
+    output_dir
+        .join("_stages")
+        .join("compute")
+        .join(family.name())
+        .join(format!("{wiki}.json"))
+}
+
+fn family_stage_spec<'a>(
+    family: MetricFamily,
+    wiki: &'a str,
+    snapshot: Option<&'a str>,
+    algorithm_version: &'a str,
+) -> fingerprint::StageSpec<'a> {
+    fingerprint::StageSpec {
+        stage: match family {
+            MetricFamily::Monthly => "compute_monthly",
+            MetricFamily::ActivityTiers => "compute_activity_tiers",
+            MetricFamily::Lifecycle => "compute_lifecycle",
+            MetricFamily::PageWeek => "compute_page_week",
+        },
+        scope: wiki,
+        selected_snapshot: snapshot,
+        algorithm_version,
+    }
+}
+
+fn migrate_legacy_compute_receipt(
+    wiki: &str,
+    snapshot: &str,
+    data_dir: &Path,
+    output_dir: &Path,
+    weekly_config: &WeeklyAggregationConfig,
+) -> Result<()> {
+    let legacy_path = legacy_compute_stage_receipt(output_dir, wiki);
+    if !legacy_path.is_file() {
+        return Ok(());
+    }
+    let legacy_inputs = legacy_compute_inputs(wiki, data_dir, Some(snapshot))?;
+    let legacy_outputs = compute_stage_outputs(wiki, output_dir);
+    let legacy_algorithm = weekly_config.legacy_algorithm_version();
+    let legacy_spec = fingerprint::StageSpec {
+        stage: "compute",
+        scope: wiki,
+        selected_snapshot: Some(snapshot),
+        algorithm_version: &legacy_algorithm,
+    };
+    if !fingerprint::reusable(&legacy_path, legacy_spec, &legacy_inputs, &legacy_outputs)? {
+        return Ok(());
+    }
+    let source = fingerprint::read_receipt(&legacy_path)?;
+    // Monthly outputs gained a total user-type tie-break order with the family
+    // split, so they must be rebuilt once. The remaining families are byte-
+    // compatible with the authenticated legacy core receipt.
+    for family in [
+        MetricFamily::ActivityTiers,
+        MetricFamily::Lifecycle,
+        MetricFamily::PageWeek,
+    ] {
+        let algorithm = family.algorithm_version(weekly_config);
+        let receipt_path = family_stage_receipt(output_dir, wiki, family);
+        let inputs = family_inputs(family, wiki, data_dir, Some(snapshot))?;
+        let outputs = family_outputs(family, wiki, output_dir);
+        let spec = family_stage_spec(family, wiki, Some(snapshot), &algorithm);
+        if !fingerprint::reusable(&receipt_path, spec, &inputs, &outputs)? {
+            fingerprint::record_from_verified_receipt(
+                &receipt_path,
+                spec,
+                &inputs,
+                &outputs,
+                &source,
+            )?;
+        }
+    }
+    info!(
+        wiki,
+        snapshot, "split legacy core compute receipt into metric families"
+    );
+    Ok(())
+}
+
+fn family_is_reusable(
+    family: MetricFamily,
+    wiki: &str,
+    snapshot: Option<&str>,
+    data_dir: &Path,
+    output_dir: &Path,
+    weekly_config: &WeeklyAggregationConfig,
+) -> Result<bool> {
+    let algorithm = family.algorithm_version(weekly_config);
+    let inputs = family_inputs(family, wiki, data_dir, snapshot)?;
+    let outputs = family_outputs(family, wiki, output_dir);
+    fingerprint::reusable(
+        &family_stage_receipt(output_dir, wiki, family),
+        family_stage_spec(family, wiki, snapshot, &algorithm),
+        &inputs,
+        &outputs,
+    )
+}
+
+pub(crate) fn reusable_candidate_families(
     wiki: &str,
     snapshot: &str,
     data_dir: &Path,
     candidate_dir: &Path,
-) -> Result<Option<Vec<PathBuf>>> {
+) -> Result<Vec<(MetricFamily, Vec<PathBuf>)>> {
     storage::validate_snapshot_version(snapshot)?;
-    if workload_profile::load(data_dir, wiki, snapshot)?.is_none() {
+    let profile_exists = workload_profile::load(data_dir, wiki, snapshot)?.is_some();
+    if !profile_exists {
         info!(
             wiki,
-            snapshot, "compute candidate cannot be reused before workload profile selection"
+            snapshot, "page-week candidate cannot be reused before workload profile selection"
         );
-        return Ok(None);
     }
-    let weekly_config = WeeklyAggregationConfig::for_snapshot(data_dir, wiki, Some(snapshot))?;
-    let algorithm_version = weekly_config.algorithm_version();
-    let inputs = compute_stage_inputs(wiki, data_dir, Some(snapshot))?;
-    let outputs = compute_stage_outputs(wiki, candidate_dir);
-    let receipt = compute_stage_receipt(candidate_dir, wiki);
-    let spec = fingerprint::StageSpec {
-        stage: "compute",
-        scope: wiki,
-        selected_snapshot: Some(snapshot),
-        algorithm_version: &algorithm_version,
+    let weekly_config = if profile_exists {
+        WeeklyAggregationConfig::for_snapshot(data_dir, wiki, Some(snapshot))?
+    } else {
+        WeeklyAggregationConfig::from_environment()?
     };
-    if !fingerprint::reusable(&receipt, spec, &inputs, &outputs)? {
-        return Ok(None);
+    if profile_exists {
+        migrate_legacy_compute_receipt(wiki, snapshot, data_dir, candidate_dir, &weekly_config)?;
     }
-    let mut files = outputs
-        .into_iter()
-        .flat_map(|output| {
-            let receipt = crate::artifact_receipt::sidecar_path(&output.path).ok();
-            std::iter::once(output.path).chain(receipt)
-        })
+    let mut reusable = Vec::new();
+    for family in MetricFamily::ALL {
+        if family == MetricFamily::PageWeek && !profile_exists {
+            continue;
+        }
+        if !family_is_reusable(
+            family,
+            wiki,
+            Some(snapshot),
+            data_dir,
+            candidate_dir,
+            &weekly_config,
+        )? {
+            continue;
+        }
+        let mut files = family_outputs(family, wiki, candidate_dir)
+            .into_iter()
+            .flat_map(|output| {
+                let receipt = crate::artifact_receipt::sidecar_path(&output.path).ok();
+                std::iter::once(output.path).chain(receipt)
+            })
+            .collect::<Vec<_>>();
+        files.push(family_stage_receipt(candidate_dir, wiki, family));
+        reusable.push((family, files));
+    }
+    Ok(reusable)
+}
+
+fn compute_plan(
+    wiki: &str,
+    snapshot: Option<&str>,
+    data_dir: &Path,
+    output_dir: &Path,
+    weekly_config: &WeeklyAggregationConfig,
+) -> Result<ComputePlan> {
+    let mut plan = ComputePlan::all_recompute();
+    for family in MetricFamily::ALL {
+        let invalidation =
+            if family_is_reusable(family, wiki, snapshot, data_dir, output_dir, weekly_config)? {
+                Invalidation::Reuse
+            } else {
+                Invalidation::Recompute
+            };
+        match family {
+            MetricFamily::Monthly => plan.monthly = invalidation,
+            MetricFamily::ActivityTiers => plan.activity_tiers = invalidation,
+            MetricFamily::Lifecycle => plan.lifecycle = invalidation,
+            MetricFamily::PageWeek => plan.page_week = invalidation,
+        }
+    }
+    Ok(plan)
+}
+
+pub(crate) fn family_receipt_identities(
+    wiki: &str,
+    snapshot: &str,
+    data_dir: &Path,
+    candidate_dir: &Path,
+) -> Result<BTreeMap<String, String>> {
+    let reusable = reusable_candidate_families(wiki, snapshot, data_dir, candidate_dir)?;
+    let reusable_names = reusable
+        .iter()
+        .map(|(family, _)| family.name())
         .collect::<Vec<_>>();
-    files.push(receipt);
-    Ok(Some(files))
+    let missing_names = MetricFamily::ALL
+        .into_iter()
+        .filter(|family| !reusable_names.contains(&family.name()))
+        .map(MetricFamily::name)
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        reusable.len() == MetricFamily::ALL.len(),
+        "candidate does not have a complete reusable compute-family receipt set; missing {}",
+        missing_names.join(", ")
+    );
+    MetricFamily::ALL
+        .into_iter()
+        .map(|family| {
+            let receipt =
+                fingerprint::read_receipt(&family_stage_receipt(candidate_dir, wiki, family))?;
+            Ok((family.name().to_string(), receipt.fingerprint))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2354,21 +2788,18 @@ pub(crate) fn record_candidate_fingerprint_for_test(
     candidate_dir: &Path,
 ) -> Result<()> {
     let weekly_config = WeeklyAggregationConfig::for_snapshot(data_dir, wiki, Some(snapshot))?;
-    let algorithm_version = weekly_config.algorithm_version();
-    let inputs = compute_stage_inputs(wiki, data_dir, Some(snapshot))?;
-    let outputs = compute_stage_outputs(wiki, candidate_dir);
-    fingerprint::record(
-        &compute_stage_receipt(candidate_dir, wiki),
-        fingerprint::StageSpec {
-            stage: "compute",
-            scope: wiki,
-            selected_snapshot: Some(snapshot),
-            algorithm_version: &algorithm_version,
-        },
-        &inputs,
-        &outputs,
-    )
-    .map(|_| ())
+    for family in MetricFamily::ALL {
+        let algorithm = family.algorithm_version(&weekly_config);
+        let inputs = family_inputs(family, wiki, data_dir, Some(snapshot))?;
+        let outputs = family_outputs(family, wiki, candidate_dir);
+        fingerprint::record(
+            &family_stage_receipt(candidate_dir, wiki, family),
+            family_stage_spec(family, wiki, Some(snapshot), &algorithm),
+            &inputs,
+            &outputs,
+        )?;
+    }
+    Ok(())
 }
 
 /// Run all metric families for a wiki.
@@ -2398,37 +2829,71 @@ fn compute_all_selected(
         "refusing to modify an immutable ready candidate"
     );
     let weekly_config = WeeklyAggregationConfig::for_snapshot(data_dir, wiki, snapshot)?;
-    let algorithm_version = weekly_config.algorithm_version();
-    let inputs = compute_stage_inputs(wiki, data_dir, snapshot)?;
-    let outputs = compute_stage_outputs(wiki, output_dir);
-    let receipt_path = compute_stage_receipt(output_dir, wiki);
-    let spec = fingerprint::StageSpec {
-        stage: "compute",
-        scope: wiki,
-        selected_snapshot: snapshot,
-        algorithm_version: &algorithm_version,
-    };
-    if fingerprint::reusable(&receipt_path, spec, &inputs, &outputs)? {
+    if let Some(snapshot) = snapshot {
+        migrate_legacy_compute_receipt(wiki, snapshot, data_dir, output_dir, &weekly_config)?;
+    }
+    let plan = compute_plan(wiki, snapshot, data_dir, output_dir, &weekly_config)?;
+    if plan.all_reused() {
         crate::observability::record_stage_reused("compute", Some(wiki));
         info!(
             wiki,
             snapshot = snapshot.unwrap_or("legacy"),
-            receipt = %receipt_path.display(),
+            families = MetricFamily::ALL.len(),
             "reusing deterministic compute stage"
         );
         return Ok(());
     }
 
-    info!(wiki = wiki, "computing metrics");
+    info!(wiki = wiki, ?plan, "computing invalidated metric families");
     let started = Instant::now();
 
-    compute_all_incremental(wiki, data_dir, output_dir, snapshot)?;
-    compute_page_weekly_edits_for_snapshot(wiki, data_dir, output_dir, &weekly_config, snapshot)?;
-    let outputs = compute_stage_outputs(wiki, output_dir);
-    fingerprint::record(&receipt_path, spec, &inputs, &outputs)?;
+    let analytical_partitions_scanned =
+        compute_all_incremental(wiki, data_dir, output_dir, snapshot, plan)?;
+    if plan.page_week.must_compute() {
+        compute_page_weekly_edits_for_snapshot(
+            wiki,
+            data_dir,
+            output_dir,
+            &weekly_config,
+            snapshot,
+        )?;
+    }
+    for family in MetricFamily::ALL {
+        if !plan.invalidation(family).must_compute() {
+            crate::observability::record_stage_reused(
+                &format!("compute_{}", family.name()),
+                Some(wiki),
+            );
+            continue;
+        }
+        let algorithm = family.algorithm_version(&weekly_config);
+        let inputs = family_inputs(family, wiki, data_dir, snapshot)?;
+        let outputs = family_outputs(family, wiki, output_dir);
+        if outputs.iter().any(|output| !output.path.is_file()) {
+            info!(
+                wiki,
+                family = family.name(),
+                "metric family produced no output for this input layout"
+            );
+            continue;
+        }
+        fingerprint::record(
+            &family_stage_receipt(output_dir, wiki, family),
+            family_stage_spec(family, wiki, snapshot, &algorithm),
+            &inputs,
+            &outputs,
+        )
+        .with_context(|| {
+            format!(
+                "failed to record {} compute-family receipt for {wiki}",
+                family.name()
+            )
+        })?;
+    }
 
     info!(
         wiki = wiki,
+        analytical_partitions_scanned,
         elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
         "finished metric computation"
     );
@@ -2643,7 +3108,14 @@ mod tests {
         let mut next_year_file = fs::File::create(next_year_path)?;
         ParquetWriter::new(&mut next_year_file).finish(&mut next_year)?;
 
-        compute_all_incremental(wiki, data_dir.path(), output_dir.path(), None)?;
+        compute_all_incremental(
+            wiki,
+            data_dir.path(),
+            output_dir.path(),
+            None,
+            ComputePlan::all_recompute(),
+        )
+        .expect("partitioned activity-tier fixture should compute");
         let tiers_path = output_dir
             .path()
             .join(wiki)
@@ -3128,13 +3600,348 @@ mod tests {
         compute_all(wiki, data_dir.path(), output_dir.path())?;
         let metric = output_dir.path().join(wiki).join("gdp.parquet");
         let before = fs::metadata(&metric)?.modified()?;
-        let receipt = compute_stage_receipt(output_dir.path(), wiki);
+        let receipt = family_stage_receipt(output_dir.path(), wiki, MetricFamily::Monthly);
         let receipt_before = fs::read(&receipt)?;
 
         compute_all(wiki, data_dir.path(), output_dir.path())?;
 
         assert_eq!(fs::metadata(metric)?.modified()?, before);
         assert_eq!(fs::read(receipt)?, receipt_before);
+        Ok(())
+    }
+
+    fn invalidate_family_receipt(
+        output_dir: &Path,
+        wiki: &str,
+        family: MetricFamily,
+    ) -> Result<()> {
+        let path = family_stage_receipt(output_dir, wiki, family);
+        let mut receipt = fingerprint::read_receipt(&path)?;
+        receipt.algorithm_version = "test-invalidated-family".to_string();
+        fs::write(path, serde_json::to_vec_pretty(&receipt)?)?;
+        Ok(())
+    }
+
+    #[test]
+    fn family_invalidation_does_not_touch_unrelated_metrics_or_patrol() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let output_dir = TestDir::new()?;
+        let wiki = "family-wiki";
+        write_input_parquet(&data_dir, wiki)?;
+        write_partitioned_warehouse_parquet(&data_dir, wiki)?;
+        compute_all(wiki, data_dir.path(), output_dir.path())?;
+
+        let metric = |name: &str| output_dir.path().join(wiki).join(format!("{name}.parquet"));
+        let gdp = metric("gdp");
+        let activity = metric("gdp_activity_tiers");
+        let lifecycle = metric("business_funnel");
+        let page_week = metric("page_weekly_edits");
+        let gdp_before = fs::metadata(&gdp)?.modified()?;
+        let lifecycle_before = fs::metadata(&lifecycle)?.modified()?;
+        let page_week_before = fs::metadata(&page_week)?.modified()?;
+        let activity_before = fs::metadata(&activity)?.modified()?;
+        let gdp_bytes = fs::read(&gdp)?;
+        let activity_bytes = fs::read(&activity)?;
+        let lifecycle_bytes = fs::read(&lifecycle)?;
+        let page_week_bytes = fs::read(&page_week)?;
+
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        invalidate_family_receipt(output_dir.path(), wiki, MetricFamily::ActivityTiers)?;
+        compute_all(wiki, data_dir.path(), output_dir.path())?;
+        assert_eq!(fs::metadata(&gdp)?.modified()?, gdp_before);
+        assert_eq!(fs::metadata(&lifecycle)?.modified()?, lifecycle_before);
+        assert_eq!(fs::metadata(&page_week)?.modified()?, page_week_before);
+        assert!(fs::metadata(&activity)?.modified()? > activity_before);
+        assert_eq!(fs::read(&activity)?, activity_bytes);
+
+        let gdp_after_activity = fs::metadata(&gdp)?.modified()?;
+        let lifecycle_after_activity = fs::metadata(&lifecycle)?.modified()?;
+        let page_week_after_activity = fs::metadata(&page_week)?.modified()?;
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        invalidate_family_receipt(output_dir.path(), wiki, MetricFamily::PageWeek)?;
+        compute_all(wiki, data_dir.path(), output_dir.path())?;
+        assert_eq!(fs::metadata(&gdp)?.modified()?, gdp_after_activity);
+        assert_eq!(
+            fs::metadata(&lifecycle)?.modified()?,
+            lifecycle_after_activity
+        );
+        assert!(fs::metadata(&page_week)?.modified()? > page_week_after_activity);
+        assert_eq!(fs::read(&page_week)?, page_week_bytes);
+
+        let gdp_after_page_week = fs::metadata(&gdp)?.modified()?;
+        let page_week_after_page_week = fs::metadata(&page_week)?.modified()?;
+        let lifecycle_before_rebuild = fs::metadata(&lifecycle)?.modified()?;
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        invalidate_family_receipt(output_dir.path(), wiki, MetricFamily::Lifecycle)?;
+        compute_all(wiki, data_dir.path(), output_dir.path())?;
+        assert_eq!(fs::metadata(&gdp)?.modified()?, gdp_after_page_week);
+        assert_eq!(
+            fs::metadata(&page_week)?.modified()?,
+            page_week_after_page_week
+        );
+        assert!(fs::metadata(&lifecycle)?.modified()? > lifecycle_before_rebuild);
+        assert_eq!(fs::read(&lifecycle)?, lifecycle_bytes);
+
+        let lifecycle_after_rebuild = fs::metadata(&lifecycle)?.modified()?;
+        let page_week_after_lifecycle = fs::metadata(&page_week)?.modified()?;
+        let gdp_before_rebuild = fs::metadata(&gdp)?.modified()?;
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        invalidate_family_receipt(output_dir.path(), wiki, MetricFamily::Monthly)?;
+        compute_all(wiki, data_dir.path(), output_dir.path())?;
+        assert!(fs::metadata(&gdp)?.modified()? > gdp_before_rebuild);
+        assert_eq!(
+            fs::metadata(&lifecycle)?.modified()?,
+            lifecycle_after_rebuild
+        );
+        assert_eq!(
+            fs::metadata(&page_week)?.modified()?,
+            page_week_after_lifecycle
+        );
+        assert_eq!(fs::read(&gdp)?, gdp_bytes);
+
+        let family_receipts_before = MetricFamily::ALL
+            .into_iter()
+            .map(|family| fs::read(family_stage_receipt(output_dir.path(), wiki, family)))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let patrol_dir = data_dir.path().join("patrol").join(wiki);
+        fs::create_dir_all(&patrol_dir)?;
+        fs::write(patrol_dir.join("parser-input.changed"), "patrol-only")?;
+        compute_all(wiki, data_dir.path(), output_dir.path())?;
+        let family_receipts_after = MetricFamily::ALL
+            .into_iter()
+            .map(|family| fs::read(family_stage_receipt(output_dir.path(), wiki, family)))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(family_receipts_after, family_receipts_before);
+        Ok(())
+    }
+
+    #[test]
+    fn complete_nonweekly_rebuild_scans_each_partition_once() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let output_dir = TestDir::new()?;
+        let wiki = "scan-fusion-wiki";
+        write_partitioned_base_parquet(&data_dir, wiki)?;
+        let layer = storage::active_compute_layer(
+            data_dir.path(),
+            wiki,
+            storage::GenerationLayer::Analytical,
+        )
+        .expect("test generation should expose an analytical layer");
+        let expected = storage::active_partition_specs(data_dir.path(), wiki, layer)
+            .expect("test generation should expose partition specs")
+            .len();
+        let scanned = compute_all_incremental(
+            wiki,
+            data_dir.path(),
+            output_dir.path(),
+            None,
+            ComputePlan::all_recompute(),
+        )
+        .expect("complete nonweekly rebuild should succeed");
+        assert_eq!(scanned, expected);
+        Ok(())
+    }
+
+    fn only_family(family: MetricFamily) -> ComputePlan {
+        let mut plan = ComputePlan {
+            monthly: Invalidation::Reuse,
+            activity_tiers: Invalidation::Reuse,
+            lifecycle: Invalidation::Reuse,
+            page_week: Invalidation::Reuse,
+        };
+        match family {
+            MetricFamily::Monthly => plan.monthly = Invalidation::Recompute,
+            MetricFamily::ActivityTiers => plan.activity_tiers = Invalidation::Recompute,
+            MetricFamily::Lifecycle => plan.lifecycle = Invalidation::Recompute,
+            MetricFamily::PageWeek => plan.page_week = Invalidation::Recompute,
+        }
+        plan
+    }
+
+    #[test]
+    fn partitioned_scan_fusion_runs_only_the_requested_nonweekly_accumulators() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let wiki = "selective-scan-wiki";
+        write_partitioned_base_parquet(&data_dir, wiki)?;
+
+        let reused_output = TestDir::new()?;
+        assert_eq!(
+            compute_all_incremental(
+                wiki,
+                data_dir.path(),
+                reused_output.path(),
+                None,
+                only_family(MetricFamily::PageWeek),
+            )
+            .expect("page-week-only plan should skip the nonweekly scan"),
+            0
+        );
+
+        for (family, present, absent) in [
+            (MetricFamily::Monthly, "gdp", "gdp_activity_tiers"),
+            (
+                MetricFamily::ActivityTiers,
+                "gdp_activity_tiers",
+                "business_funnel",
+            ),
+            (MetricFamily::Lifecycle, "business_funnel", "gdp"),
+        ] {
+            let output = TestDir::new()?;
+            assert_eq!(
+                compute_all_incremental(
+                    wiki,
+                    data_dir.path(),
+                    output.path(),
+                    None,
+                    only_family(family),
+                )
+                .expect("selected nonweekly family should compute"),
+                2
+            );
+            assert!(
+                output
+                    .path()
+                    .join(wiki)
+                    .join(format!("{present}.parquet"))
+                    .is_file()
+            );
+            assert!(
+                !output
+                    .path()
+                    .join(wiki)
+                    .join(format!("{absent}.parquet"))
+                    .exists()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn selective_compute_propagates_family_writer_weekly_and_receipt_failures() -> Result<()> {
+        let base = analytical_partition_df(AnalyticalPartitionRows {
+            year_month: ["2024-01", "2024-01"],
+            year_month_key: [202401, 202401],
+            user_type: ["registered", "registered"],
+            event_user_id: [1, 2],
+            page_namespace: [0, 0],
+            revision_id: [1, 2],
+            revision_text_bytes_diff: [10, 20],
+            is_reverted: [false, false],
+            is_minor: [false, true],
+        })
+        .expect("analytical failure fixture should be valid");
+        let monthly_output = TestDir::new()?;
+        fs::create_dir_all(
+            monthly_output
+                .path()
+                .join("failure-wiki/inequality.parquet"),
+        )
+        .expect("monthly output conflict fixture should be created");
+        assert!(
+            compute_nonweekly_flat(
+                "failure-wiki",
+                &base,
+                monthly_output.path(),
+                only_family(MetricFamily::Monthly),
+            )
+            .is_err()
+        );
+
+        let malformed_monthly_output =
+            TestDir::new().expect("malformed output fixture should be creatable");
+        let malformed_labor =
+            DataFrame::new_infer_height(vec![Column::new("unexpected".into(), [1_i64])])
+                .expect("malformed labor fixture should still be a valid DataFrame");
+        assert!(
+            write_monthly_outputs(
+                "malformed-monthly",
+                malformed_monthly_output.path(),
+                vec![inequality::compute_frame(&base).expect("inequality fixture should compute")],
+                vec![gdp_monthly_frame(&base).expect("GDP fixture should compute")],
+                vec![gdp_type_share_frame(&base).expect("GDP share fixture should compute")],
+                vec![malformed_labor],
+            )
+            .is_err(),
+            "missing labor sort keys must fail before publication"
+        );
+
+        let partitioned_data =
+            TestDir::new().expect("partitioned input fixture should be creatable");
+        let partitioned_output =
+            TestDir::new().expect("partitioned output fixture should be creatable");
+        write_partitioned_base_parquet(&partitioned_data, "partitioned-failure")
+            .expect("partitioned failure fixture should be writable");
+        fs::create_dir_all(
+            partitioned_output
+                .path()
+                .join("partitioned-failure/inequality.parquet"),
+        )
+        .expect("partitioned output conflict fixture should be created");
+        assert!(
+            compute_all_incremental(
+                "partitioned-failure",
+                partitioned_data.path(),
+                partitioned_output.path(),
+                None,
+                only_family(MetricFamily::Monthly),
+            )
+            .is_err(),
+            "partitioned monthly writer failures must propagate"
+        );
+
+        let activity_output = TestDir::new()?;
+        fs::create_dir_all(
+            activity_output
+                .path()
+                .join("failure-wiki/gdp_activity_tiers.parquet"),
+        )
+        .expect("activity output conflict fixture should be created");
+        assert!(
+            compute_nonweekly_flat(
+                "failure-wiki",
+                &base,
+                activity_output.path(),
+                only_family(MetricFamily::ActivityTiers),
+            )
+            .is_err()
+        );
+
+        let invalid_weekly_data = TestDir::new()?;
+        let invalid_weekly_output = TestDir::new()?;
+        write_input_parquet(&invalid_weekly_data, "invalid-weekly")?;
+        let invalid_partition = storage::month_partition_dir(
+            &storage::warehouse_wiki_dir(invalid_weekly_data.path(), "invalid-weekly"),
+            2024,
+            "2024-01",
+        );
+        fs::create_dir_all(&invalid_partition)?;
+        fs::write(invalid_partition.join("broken.parquet"), "not parquet")?;
+        assert!(
+            compute_all(
+                "invalid-weekly",
+                invalid_weekly_data.path(),
+                invalid_weekly_output.path(),
+            )
+            .is_err()
+        );
+
+        let receipt_data = TestDir::new()?;
+        let receipt_output = TestDir::new()?;
+        write_input_parquet(&receipt_data, "receipt-failure")?;
+        write_partitioned_warehouse_parquet(&receipt_data, "receipt-failure")?;
+        fs::create_dir_all(family_stage_receipt(
+            receipt_output.path(),
+            "receipt-failure",
+            MetricFamily::Monthly,
+        ))
+        .expect("receipt publication conflict fixture should be created");
+        let error = compute_all(
+            "receipt-failure",
+            receipt_data.path(),
+            receipt_output.path(),
+        )
+        .expect_err("receipt publication conflict should fail compute");
+        assert!(error.to_string().contains("failed to record monthly"));
         Ok(())
     }
 
@@ -3145,6 +3952,11 @@ mod tests {
         let wiki = "testwiki";
         write_input_parquet(&data_dir, wiki)?;
         write_partitioned_warehouse_parquet(&data_dir, wiki)?;
+        assert!(
+            !legacy_compute_inputs(wiki, data_dir.path(), None)
+                .expect("legacy unversioned inputs should resolve")
+                .is_empty()
+        );
         let version = "2026-08";
         let analytical = storage::snapshot_analytical_wiki_dir(data_dir.path(), wiki, version)?;
         let warehouse = storage::snapshot_warehouse_wiki_dir(data_dir.path(), wiki, version)?;
@@ -3220,6 +4032,201 @@ mod tests {
         assert!(output_dir.path().join(wiki).join("gdp.parquet").is_file());
         assert!(
             compute_all_for_snapshot(wiki, "invalid", data_dir.path(), output_dir.path()).is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_core_receipt_migrates_to_authenticated_family_receipts_without_recompute()
+    -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let output_dir = TestDir::new()?;
+        let wiki = "migrationwiki";
+        let version = "2026-08";
+        write_partitioned_base_parquet(&data_dir, wiki)?;
+        write_partitioned_warehouse_parquet(&data_dir, wiki)?;
+
+        for (source, destination) in [
+            (
+                storage::analytical_wiki_dir(data_dir.path(), wiki),
+                storage::snapshot_analytical_wiki_dir(data_dir.path(), wiki, version)?,
+            ),
+            (
+                storage::warehouse_wiki_dir(data_dir.path(), wiki),
+                storage::snapshot_warehouse_wiki_dir(data_dir.path(), wiki, version)?,
+            ),
+        ] {
+            for path in storage::collect_parquet_files(&source)? {
+                let target = destination.join(path.strip_prefix(&source)?);
+                target.parent().map(fs::create_dir_all).transpose()?;
+                fs::copy(path, target)?;
+            }
+        }
+        storage::write_test_generation_manifest_from_files(data_dir.path(), wiki, version)?;
+        storage::publish_test_snapshot_pointer(data_dir.path(), wiki, version)?;
+        let (snapshot_plan, _) =
+            crate::snapshot_plan::SnapshotPlan::load_or_resolve(data_dir.path(), wiki, version)?;
+        let source_sizes = vec![Some(1); snapshot_plan.sources.len()];
+        workload_profile::load_or_select(data_dir.path(), &snapshot_plan, &source_sizes)?;
+        compute_all_for_snapshot(wiki, version, data_dir.path(), output_dir.path())?;
+
+        let weekly_config =
+            WeeklyAggregationConfig::for_snapshot(data_dir.path(), wiki, Some(version))?;
+        let legacy_algorithm = weekly_config.legacy_algorithm_version();
+        let legacy_inputs = legacy_compute_inputs(wiki, data_dir.path(), Some(version))?;
+        let legacy_outputs = compute_stage_outputs(wiki, output_dir.path());
+        fingerprint::record(
+            &legacy_compute_stage_receipt(output_dir.path(), wiki),
+            fingerprint::StageSpec {
+                stage: "compute",
+                scope: wiki,
+                selected_snapshot: Some(version),
+                algorithm_version: &legacy_algorithm,
+            },
+            &legacy_inputs,
+            &legacy_outputs,
+        )
+        .expect("legacy combined receipt should be recorded");
+        fs::remove_dir_all(output_dir.path().join("_stages/compute/monthly"))?;
+        fs::remove_dir_all(output_dir.path().join("_stages/compute/activity_tiers"))?;
+        fs::remove_dir_all(output_dir.path().join("_stages/compute/lifecycle"))?;
+        fs::remove_dir_all(output_dir.path().join("_stages/compute/page_week"))?;
+        let artifacts_before = legacy_outputs
+            .iter()
+            .map(|output| fs::read(&output.path))
+            .collect::<std::io::Result<Vec<_>>>()?;
+
+        let blocked_receipt =
+            family_stage_receipt(output_dir.path(), wiki, MetricFamily::ActivityTiers);
+        fs::create_dir_all(&blocked_receipt)?;
+        assert!(
+            migrate_legacy_compute_receipt(
+                wiki,
+                version,
+                data_dir.path(),
+                output_dir.path(),
+                &weekly_config,
+            )
+            .is_err()
+        );
+        fs::remove_dir(blocked_receipt)?;
+
+        migrate_legacy_compute_receipt(
+            wiki,
+            version,
+            data_dir.path(),
+            output_dir.path(),
+            &weekly_config,
+        )
+        .expect("compatible legacy family receipts should migrate");
+        assert_eq!(
+            legacy_outputs
+                .iter()
+                .map(|output| fs::read(&output.path))
+                .collect::<std::io::Result<Vec<_>>>()?,
+            artifacts_before
+        );
+        assert!(
+            !family_stage_receipt(output_dir.path(), wiki, MetricFamily::Monthly).exists(),
+            "monthly must rebuild once because its total ordering changed"
+        );
+        for family in [
+            MetricFamily::ActivityTiers,
+            MetricFamily::Lifecycle,
+            MetricFamily::PageWeek,
+        ] {
+            assert!(family_stage_receipt(output_dir.path(), wiki, family).is_file());
+        }
+        let nonmonthly_before = [
+            MetricFamily::ActivityTiers,
+            MetricFamily::Lifecycle,
+            MetricFamily::PageWeek,
+        ]
+        .into_iter()
+        .flat_map(|family| family_outputs(family, wiki, output_dir.path()))
+        .map(|output| fs::read(output.path))
+        .collect::<std::io::Result<Vec<_>>>()?;
+
+        compute_all_for_snapshot(wiki, version, data_dir.path(), output_dir.path())?;
+        assert_eq!(
+            [
+                MetricFamily::ActivityTiers,
+                MetricFamily::Lifecycle,
+                MetricFamily::PageWeek,
+            ]
+            .into_iter()
+            .flat_map(|family| family_outputs(family, wiki, output_dir.path()))
+            .map(|output| fs::read(output.path))
+            .collect::<std::io::Result<Vec<_>>>()?,
+            nonmonthly_before
+        );
+        let receipts_before = MetricFamily::ALL
+            .into_iter()
+            .map(|family| fs::read(family_stage_receipt(output_dir.path(), wiki, family)))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        for family in MetricFamily::ALL {
+            assert!(
+                family_is_reusable(
+                    family,
+                    wiki,
+                    Some(version),
+                    data_dir.path(),
+                    output_dir.path(),
+                    &weekly_config,
+                )
+                .expect("fresh family receipt should validate")
+            );
+        }
+
+        migrate_legacy_compute_receipt(
+            wiki,
+            version,
+            data_dir.path(),
+            output_dir.path(),
+            &weekly_config,
+        )
+        .expect("repeated legacy migration should be idempotent");
+        assert_eq!(
+            MetricFamily::ALL
+                .into_iter()
+                .map(|family| fs::read(family_stage_receipt(output_dir.path(), wiki, family)))
+                .collect::<std::io::Result<Vec<_>>>()?,
+            receipts_before
+        );
+
+        for family in MetricFamily::ALL {
+            let receipt = family_stage_receipt(output_dir.path(), wiki, family);
+            let parent = receipt
+                .parent()
+                .expect("family receipt should have a parent");
+            fs::remove_dir_all(parent).expect("family receipt directory should be removable");
+        }
+        let legacy_path = legacy_compute_stage_receipt(output_dir.path(), wiki);
+        let mut invalid_legacy = fingerprint::read_receipt(&legacy_path)?;
+        invalid_legacy.algorithm_version = "obsolete-legacy-version".to_string();
+        fs::write(&legacy_path, serde_json::to_vec_pretty(&invalid_legacy)?)?;
+        migrate_legacy_compute_receipt(
+            wiki,
+            version,
+            data_dir.path(),
+            output_dir.path(),
+            &weekly_config,
+        )
+        .expect("incompatible legacy receipt should remain a safe no-op");
+        assert!(
+            family_receipt_identities(wiki, version, data_dir.path(), output_dir.path(),).is_err()
+        );
+
+        fs::remove_file(&legacy_path).expect("invalid legacy receipt should be removable");
+
+        fs::write(
+            storage::generation_manifest_path(data_dir.path(), wiki, version)?,
+            "corrupt generation manifest",
+        )
+        .expect("generation corruption fixture should be written");
+        assert!(
+            reusable_candidate_families(wiki, version, data_dir.path(), output_dir.path(),)
+                .is_err()
         );
         Ok(())
     }
@@ -3610,7 +4617,7 @@ mod tests {
             256
         );
         let default_version = WeeklyAggregationConfig::new(256, None)?.algorithm_version();
-        assert!(default_version.starts_with(COMPUTE_ALGORITHM_VERSION));
+        assert!(default_version.starts_with(weekly::ALGORITHM_VERSION));
         assert!(default_version.contains("splitmix64-finalizer-v1-seed0000000000000000"));
         assert!(default_version.ends_with("-primary256-secondary1"));
         assert!(
@@ -3788,6 +4795,8 @@ mod tests {
         let mut state = RegisteredState::new();
         let null_only = registered_base_df(&[(None, 2024, 202401, 1)])?;
         state.observe_partition(&null_only, 2024, 202401)?;
+        assert!(state.funnel_stats.is_empty());
+        state.observe_history(&null_only)?;
         assert!(state.funnel_stats.is_empty());
 
         let early = registered_base_df(&[(Some(1), 2024, 202401, 10)])?;

@@ -670,6 +670,17 @@ pub(crate) fn reusable_candidate_files(
     Ok(Some(files))
 }
 
+pub(crate) fn candidate_receipt_identity(
+    wiki: &str,
+    snapshot: &str,
+    data_dir: &Path,
+    candidate_dir: &Path,
+) -> Result<String> {
+    reusable_candidate_files(wiki, snapshot, data_dir, candidate_dir)?
+        .context("candidate does not have a reusable patrol receipt")?;
+    Ok(fingerprint::read_receipt(&patrol_stage_receipt(candidate_dir, wiki))?.fingerprint)
+}
+
 pub(crate) fn cached_sources_available(data_dir: &Path, wiki: &str) -> bool {
     let patrol_dir = data_dir.join("patrol").join(wiki);
     let metadata_valid = fs::read(patrol_dir.join("autopatrol_groups.json"))

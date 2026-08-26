@@ -454,7 +454,7 @@ pub fn write_semantic_draft(artifact: &Path, accumulator: SemanticAccumulator) -
     Ok(())
 }
 
-fn finalize_semantic_draft(
+pub(crate) fn finalize_semantic_draft(
     artifact: &Path,
     identity: &str,
     algorithm_version: &str,

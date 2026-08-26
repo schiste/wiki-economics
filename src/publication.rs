@@ -15,7 +15,7 @@ use crate::{artifact_receipt, licensing, storage};
 const RUN_CONTEXT_FILE: &str = ".publication-run.json";
 const CANDIDATE_FILE: &str = ".publication-candidate.json";
 const READY_INDEX_DIR: &str = "_ready-index";
-const READY_INDEX_SCHEMA_VERSION: u8 = 1;
+const READY_INDEX_SCHEMA_VERSION: u8 = 2;
 const PUBLICATION_CONTRACT_VERSION: &str = "ready-candidate-publication-v2-noop-digest";
 pub const RECEIPT_FILE: &str = "publication-gate.json";
 const JSON_ARTIFACTS: [&str; 13] = [
@@ -1330,22 +1330,22 @@ pub(crate) fn plan_wiki_preparation(
         (left.ready_at_unix, &left.run_id).cmp(&(right.ready_at_unix, &right.run_id))
     });
 
-    let mut reusable_compute = None;
+    let mut reusable_compute = BTreeMap::new();
     let mut reusable_patrol = None;
     for (_, candidate_dir) in candidates.iter().rev() {
         let compute =
-            crate::compute::reusable_candidate_files(wiki, snapshot, data_dir, candidate_dir)?;
+            crate::compute::reusable_candidate_families(wiki, snapshot, data_dir, candidate_dir)?;
         let patrol =
             crate::patrol::reusable_candidate_files(wiki, snapshot, data_dir, candidate_dir)?;
-        if compute.is_some() && patrol.is_some() {
+        if compute.len() == crate::compute::MetricFamily::ALL.len() && patrol.is_some() {
             let ready_path = candidate_dir.join("ready.json");
             info!(wiki, snapshot, path = %ready_path.display(), "snapshot candidate fingerprints are unchanged");
             return Ok(WikiPreparationPlan::NoOp { ready_path });
         }
-        if reusable_compute.is_none()
-            && let Some(files) = compute
-        {
-            reusable_compute = Some((candidate_dir.clone(), files));
+        for (family, files) in compute {
+            reusable_compute
+                .entry(family)
+                .or_insert_with(|| (candidate_dir.clone(), files));
         }
         if reusable_patrol.is_none()
             && let Some(files) = patrol
@@ -1363,11 +1363,12 @@ pub(crate) fn plan_wiki_preparation(
         && active_output.is_dir()
         && storage::current_snapshot_version(data_dir, wiki)?.as_deref() == Some(snapshot);
     if legacy_same_snapshot {
-        if reusable_compute.is_none()
-            && let Some(files) =
-                crate::compute::reusable_candidate_files(wiki, snapshot, data_dir, output_dir)?
+        for (family, files) in
+            crate::compute::reusable_candidate_families(wiki, snapshot, data_dir, output_dir)?
         {
-            reusable_compute = Some((output_dir.to_path_buf(), files));
+            reusable_compute
+                .entry(family)
+                .or_insert_with(|| (output_dir.to_path_buf(), files));
         }
         if reusable_patrol.is_none()
             && let Some(files) =
@@ -1379,19 +1380,21 @@ pub(crate) fn plan_wiki_preparation(
 
     crate::generation_lifecycle::begin(output_dir, wiki, snapshot, run_id)?;
 
-    reusable_compute
-        .as_ref()
-        .map_or(Ok(()), |(source, files)| {
-            copy_candidate_files(source, &target_candidate, files)
-        })?;
+    for (source, files) in reusable_compute.values() {
+        copy_candidate_files(source, &target_candidate, files)?;
+    }
     reusable_patrol.as_ref().map_or(Ok(()), |(source, files)| {
         copy_candidate_files(source, &target_candidate, files)
     })?;
-    let compute_reused = reusable_compute.is_some();
+    let compute_reused = reusable_compute.len() == crate::compute::MetricFamily::ALL.len();
     let patrol_reused = reusable_patrol.is_some();
     info!(
         wiki,
-        snapshot, compute_reused, patrol_reused, "planned invalidated candidate stages"
+        snapshot,
+        compute_reused,
+        compute_families_reused = reusable_compute.len(),
+        patrol_reused,
+        "planned invalidated candidate stages"
     );
     Ok(WikiPreparationPlan::Build {
         same_snapshot_candidate: !candidates.is_empty() || legacy_same_snapshot,
@@ -1407,6 +1410,7 @@ fn ready_index_path(output_dir: &Path, wiki: &str) -> PathBuf {
 }
 
 fn ready_candidate_reference(
+    data_dir: &Path,
     output_dir: &Path,
     candidate_dir: &Path,
     ready: &ReadyWikiCandidate,
@@ -1416,28 +1420,31 @@ fn ready_candidate_reference(
         .context("ready candidate is outside the output directory")?
         .to_string_lossy()
         .into_owned();
-    let mut core_family_receipt_identities = BTreeMap::new();
-    let mut patrol_receipt_identity = None;
-    for artifact in &ready.artifacts {
-        ensure!(
-            artifact.receipt_sha256.len() == 64,
-            "ready artifact has no authoritative receipt identity"
-        );
-        let name = Path::new(&artifact.path)
-            .file_stem()
-            .and_then(|name| name.to_str())
-            .context("ready artifact path has no metric name")?;
-        if name == "patrol" {
-            patrol_receipt_identity = Some(artifact.receipt_sha256.clone());
-        } else {
-            ensure!(
-                core_family_receipt_identities
-                    .insert(name.to_string(), artifact.receipt_sha256.clone())
-                    .is_none(),
-                "ready candidate contains a duplicate core metric"
-            );
-        }
-    }
+    ensure!(
+        ready
+            .artifacts
+            .iter()
+            .all(|artifact| artifact.receipt_sha256.len() == 64),
+        "ready artifact has no authoritative receipt identity"
+    );
+    let core_family_receipt_identities = crate::compute::family_receipt_identities(
+        &ready.wiki,
+        &ready.snapshot,
+        data_dir,
+        candidate_dir,
+    )
+    .with_context(|| {
+        format!(
+            "candidate {} does not have an authenticated compute-family receipt set",
+            candidate_dir.display()
+        )
+    })?;
+    let patrol_receipt_identity = crate::patrol::candidate_receipt_identity(
+        &ready.wiki,
+        &ready.snapshot,
+        data_dir,
+        candidate_dir,
+    )?;
     let ready_path = candidate_dir.join("ready.json");
     let (_, ready_receipt_sha256) = storage::sha256_file(&ready_path)?;
     Ok(ReadyCandidateReference {
@@ -1445,8 +1452,7 @@ fn ready_candidate_reference(
         snapshot: ready.snapshot.clone(),
         run_id: ready.run_id.clone(),
         core_family_receipt_identities,
-        patrol_receipt_identity: patrol_receipt_identity
-            .context("ready candidate has no patrol receipt identity")?,
+        patrol_receipt_identity,
         workload_profile: ready.workload_profile.clone(),
         ready_receipt_sha256,
     })
@@ -1478,7 +1484,7 @@ fn ready_from_reference(
     ensure!(ready.wiki == wiki, "ready index wiki mismatch");
     validate_ready_candidate_metadata(data_dir, &candidate_dir, &ready)?;
     ensure!(
-        ready_candidate_reference(output_dir, &candidate_dir, &ready)? == *reference,
+        ready_candidate_reference(data_dir, output_dir, &candidate_dir, &ready)? == *reference,
         "ready index fields do not match the candidate receipt"
     );
     Ok((ready, candidate_dir))
@@ -1495,7 +1501,7 @@ fn active_ready_reference(
     let candidate_dir = output_dir.join(relative);
     let ready: ReadyWikiCandidate = read_json(&candidate_dir.join("ready.json"))?;
     validate_ready_candidate_metadata(data_dir, &candidate_dir, &ready)?;
-    ready_candidate_reference(output_dir, &candidate_dir, &ready).map(Some)
+    ready_candidate_reference(data_dir, output_dir, &candidate_dir, &ready).map(Some)
 }
 
 fn write_ready_index(
@@ -1507,7 +1513,7 @@ fn write_ready_index(
     let index = ReadyCandidateIndex {
         schema_version: READY_INDEX_SCHEMA_VERSION,
         wiki: wiki.to_string(),
-        newest_valid_ready: ready_candidate_reference(output_dir, &newest.1, &newest.0)?,
+        newest_valid_ready: ready_candidate_reference(data_dir, output_dir, &newest.1, &newest.0)?,
         active_published: active_ready_reference(data_dir, output_dir, wiki)?,
         updated_at_unix: now_unix()?,
     };
@@ -1679,7 +1685,7 @@ fn publication_noop_digest_for_site(
                 == Some(ready.snapshot.as_str()),
             "active ready candidate and snapshot pointer disagree for {wiki}"
         );
-        let reference = ready_candidate_reference(output_dir, &active_dir, &ready)?;
+        let reference = ready_candidate_reference(data_dir, output_dir, &active_dir, &ready)?;
         if require_newest_active {
             let (newest, newest_dir) = indexed_latest_ready_candidate(data_dir, output_dir, wiki)?
                 .context("active candidate has no indexed ready receipt")?;
@@ -3875,13 +3881,17 @@ mod tests {
         fn ready_candidate(&self, run_id: &str) -> Result<PathBuf> {
             let analytical =
                 storage::snapshot_analytical_wiki_dir(self.data.path(), "nlwiki", "2026-03")?;
-            write_single_i64(&analytical.join("template.parquet"))?;
-            storage::write_test_generation_manifest_from_files(
-                self.data.path(),
-                "nlwiki",
-                "2026-03",
-            )
-            .expect("candidate generation manifest should be writable");
+            let manifest =
+                storage::generation_manifest_path(self.data.path(), "nlwiki", "2026-03")?;
+            if !manifest.is_file() {
+                write_single_i64(&analytical.join("template.parquet"))?;
+                storage::write_test_generation_manifest_from_files(
+                    self.data.path(),
+                    "nlwiki",
+                    "2026-03",
+                )
+                .expect("candidate generation manifest should be writable");
+            }
             let snapshot = "2026-03";
             let data_dir = self.data.path();
             let (plan, _) =
@@ -4385,7 +4395,7 @@ mod tests {
             "candidate-reusable",
         )
         .expect("candidate source path should resolve");
-        let compute_receipt = source.join("_stages/compute/nlwiki.json");
+        let compute_receipt = source.join("_stages/compute/monthly/nlwiki.json");
         let mut receipt: Value = read_json(&compute_receipt)?;
         receipt["algorithm_version"] = Value::String("superseded-algorithm".to_string());
         atomic_json(&compute_receipt, &receipt)?;
@@ -4535,7 +4545,15 @@ mod tests {
         .expect("adopted candidate path should resolve");
         assert!(adopted.join("nlwiki/page_weekly_edits.parquet").is_file());
         assert!(adopted.join("nlwiki/patrol.parquet").is_file());
-        assert!(adopted.join("_stages/compute/nlwiki.json").is_file());
+        for family in ["monthly", "activity_tiers", "lifecycle", "page_week"] {
+            assert!(
+                adopted
+                    .join("_stages/compute")
+                    .join(family)
+                    .join("nlwiki.json")
+                    .is_file()
+            );
+        }
         assert!(adopted.join("_stages/patrol_compute/nlwiki.json").is_file());
         Ok(())
     }
@@ -4562,7 +4580,7 @@ mod tests {
             WikiPreparationPlan::Build {
                 same_snapshot_candidate: true,
                 compute_reused: false,
-                patrol_reused: false,
+                patrol_reused: true,
             }
         );
         let target = wiki_candidate_dir(
@@ -4572,8 +4590,61 @@ mod tests {
             "profile-bootstrap",
         )
         .expect("bootstrap candidate path should resolve");
-        assert!(!target.join("nlwiki/gdp.parquet").exists());
-        assert!(!target.join("nlwiki/patrol.parquet").exists());
+        assert!(target.join("nlwiki/gdp.parquet").is_file());
+        assert!(target.join("nlwiki/patrol.parquet").is_file());
+        assert!(!target.join("nlwiki/page_weekly_edits.parquet").exists());
+        assert!(
+            crate::compute::record_candidate_fingerprint_for_test(
+                "nlwiki",
+                "2026-03",
+                fixture.data.path(),
+                &target,
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ready_index_reference_reports_missing_compute_and_patrol_receipts() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let ready_path = fixture.ready_candidate("receipt-errors")?;
+        let candidate = ready_path
+            .parent()
+            .context("ready receipt should have a candidate directory")?
+            .to_path_buf();
+        let ready: ReadyWikiCandidate = read_json(&candidate.join("ready.json"))?;
+
+        fs::remove_file(candidate.join("_stages/compute/monthly/nlwiki.json"))?;
+        let compute_error = ready_candidate_reference(
+            fixture.data.path(),
+            fixture.output.path(),
+            &candidate,
+            &ready,
+        )
+        .expect_err("missing compute-family receipt must fail the ready index");
+        assert!(
+            compute_error
+                .to_string()
+                .contains("does not have an authenticated compute-family receipt set")
+        );
+
+        crate::compute::record_candidate_fingerprint_for_test(
+            "nlwiki",
+            "2026-03",
+            fixture.data.path(),
+            &candidate,
+        )
+        .expect("complete compute-family receipts should be recordable");
+        fs::remove_file(candidate.join("_stages/patrol_compute/nlwiki.json"))?;
+        let patrol_error = ready_candidate_reference(
+            fixture.data.path(),
+            fixture.output.path(),
+            &candidate,
+            &ready,
+        )
+        .expect_err("missing patrol receipt must fail the ready index");
+        assert!(patrol_error.to_string().contains("reusable patrol receipt"));
         Ok(())
     }
 
@@ -4701,6 +4772,17 @@ mod tests {
                 crate::artifact_receipt::sidecar_path(&target)?,
             )
             .expect("new candidate receipt should copy");
+        }
+        for relative in [
+            "_stages/compute/monthly/nlwiki.json",
+            "_stages/compute/activity_tiers/nlwiki.json",
+            "_stages/compute/lifecycle/nlwiki.json",
+            "_stages/compute/page_week/nlwiki.json",
+            "_stages/patrol_compute/nlwiki.json",
+        ] {
+            let target = candidate_3.join(relative);
+            fs::create_dir_all(target.parent().context("cloned receipt parent")?)?;
+            fs::copy(candidate_2.join(relative), target)?;
         }
         let mut cloned: ReadyWikiCandidate = read_json(&candidate_2.join("ready.json"))?;
         cloned.run_id = "candidate-3".to_string();
@@ -6594,6 +6676,19 @@ mod tests {
         )
         .expect("initial phase-two publication should prepare");
         commit_ready_publication(fixture.data.path(), fixture.output.path(), "phase2-publish")?;
+        let index: ReadyCandidateIndex =
+            read_json(&ready_index_path(fixture.output.path(), "nlwiki"))?;
+        assert_eq!(index.schema_version, READY_INDEX_SCHEMA_VERSION);
+        assert_eq!(
+            index
+                .newest_valid_ready
+                .core_family_receipt_identities
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            vec!["activity_tiers", "lifecycle", "monthly", "page_week"]
+        );
+        assert_eq!(index.newest_valid_ready.patrol_receipt_identity.len(), 64);
 
         let started = Instant::now();
         assert!(

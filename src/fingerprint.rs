@@ -280,7 +280,14 @@ fn inspect_receipted_output(
     {
         return inspect(path);
     }
-    let document = if crate::artifact_receipt::sidecar_path(&path.path)?.is_file() {
+    let document = if let Some(document) = crate::artifact_receipt::finalize_semantic_draft(
+        &path.path,
+        &path.identity,
+        algorithm_version,
+        input_fingerprint,
+    )? {
+        document
+    } else if crate::artifact_receipt::sidecar_path(&path.path)?.is_file() {
         let existing = crate::artifact_receipt::read(&path.path)?;
         let existing = crate::artifact_receipt::verify(
             &path.path,
@@ -607,24 +614,7 @@ pub fn record(
         fingerprint: String::new(),
     };
     receipt.fingerprint = receipt_fingerprint(&receipt)?;
-    let parent = receipt_path
-        .parent()
-        .context("stage receipt has no parent")?;
-    fs::create_dir_all(parent)?;
-    let temp = parent.join(format!(".stage-receipt-{}.tmp", std::process::id()));
-    let write_result = (|| -> Result<()> {
-        let mut file = File::create(&temp)?;
-        serde_json::to_writer_pretty(&mut file, &receipt)?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-        fs::rename(&temp, receipt_path)?;
-        File::open(parent)?.sync_all()?;
-        Ok(())
-    })();
-    if write_result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    write_result?;
+    atomic_write_receipt(receipt_path, &receipt)?;
     info!(
         stage = spec.stage,
         scope = spec.scope,
@@ -634,6 +624,81 @@ pub fn record(
         "recorded deterministic stage fingerprint"
     );
     Ok(receipt)
+}
+
+/// Split an already authenticated stage into a narrower receipt without
+/// decoding or re-hashing its Parquet outputs. Every requested output must be
+/// present in the source receipt and still match its authoritative artifact
+/// receipt. Inputs are independently inspected for the narrower stage.
+pub(crate) fn record_from_verified_receipt(
+    receipt_path: &Path,
+    spec: StageSpec<'_>,
+    inputs: &[TrackedPath],
+    outputs: &[TrackedPath],
+    source: &StageReceipt,
+) -> Result<StageReceipt> {
+    ensure!(
+        !outputs.is_empty(),
+        "stage {} produced no outputs",
+        spec.stage
+    );
+    let inspected_inputs = inspect_all(inputs)?;
+    let mut inspected_outputs = Vec::with_capacity(outputs.len());
+    for output in outputs {
+        let identity = source
+            .outputs
+            .iter()
+            .find(|identity| identity.identity == output.identity)
+            .with_context(|| {
+                format!(
+                    "verified source receipt does not contain {}",
+                    output.identity
+                )
+            })?;
+        ensure!(
+            artifact_matches(identity, output)?,
+            "verified source output {} changed during receipt split",
+            output.identity
+        );
+        inspected_outputs.push(identity.clone());
+    }
+    inspected_outputs.sort_by(|left, right| left.identity.cmp(&right.identity));
+    let mut receipt = StageReceipt {
+        schema_version: RECEIPT_SCHEMA_VERSION,
+        stage: spec.stage.to_string(),
+        scope: spec.scope.to_string(),
+        selected_snapshot: spec.selected_snapshot.map(str::to_string),
+        algorithm_version: spec.algorithm_version.to_string(),
+        computation_version: env!("CARGO_PKG_VERSION").to_string(),
+        binary_commit: option_env!("WIKI_ECON_BUILD_COMMIT").map(str::to_string),
+        inputs: inspected_inputs,
+        outputs: inspected_outputs,
+        fingerprint: String::new(),
+    };
+    receipt.fingerprint = receipt_fingerprint(&receipt)?;
+    atomic_write_receipt(receipt_path, &receipt)?;
+    Ok(receipt)
+}
+
+fn atomic_write_receipt(receipt_path: &Path, receipt: &StageReceipt) -> Result<()> {
+    let parent = receipt_path
+        .parent()
+        .context("stage receipt has no parent")?;
+    fs::create_dir_all(parent)?;
+    let temp = parent.join(format!(".stage-receipt-{}.tmp", std::process::id()));
+    let write_result = (|| -> Result<()> {
+        let mut file = File::create(&temp)?;
+        serde_json::to_writer_pretty(&mut file, receipt)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        fs::rename(&temp, receipt_path)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    write_result
 }
 
 fn site_selected_snapshots(output_dir: &Path) -> Result<String> {
@@ -940,6 +1005,92 @@ mod tests {
     }
 
     #[test]
+    fn verified_receipt_can_be_split_but_never_widened_or_reused_after_mutation() -> Result<()> {
+        let dir = TestDir::new()?;
+        let input = dir.path().join("input.txt");
+        let first_output = dir.path().join("first.txt");
+        let second_output = dir.path().join("second.txt");
+        fs::write(&input, "input")?;
+        fs::write(&first_output, "first")?;
+        fs::write(&second_output, "second")?;
+        let inputs = [TrackedPath::new("input", &input)];
+        let source_outputs = [
+            TrackedPath::new("output/first", &first_output),
+            TrackedPath::new("output/second", &second_output),
+        ];
+        let source_spec = StageSpec {
+            stage: "compute",
+            scope: "testwiki",
+            selected_snapshot: Some("2026-08"),
+            algorithm_version: "legacy-v1",
+        };
+        let source = record(
+            &dir.path().join("legacy.json"),
+            source_spec,
+            &inputs,
+            &source_outputs,
+        )
+        .expect("source receipt should record");
+        let family_spec = StageSpec {
+            stage: "compute_monthly",
+            scope: "testwiki",
+            selected_snapshot: Some("2026-08"),
+            algorithm_version: "monthly-v1",
+        };
+
+        let family_path = dir.path().join("monthly.json");
+        let family_outputs = [TrackedPath::new("output/first", &first_output)];
+        let family = record_from_verified_receipt(
+            &family_path,
+            family_spec,
+            &inputs,
+            &family_outputs,
+            &source,
+        )
+        .expect("verified source receipt should split");
+        assert_eq!(family.outputs.len(), 1);
+        assert_eq!(family.outputs[0], source.outputs[0]);
+        assert!(
+            reusable(&family_path, family_spec, &inputs, &family_outputs,)
+                .expect("split receipt should validate")
+        );
+
+        assert!(
+            record_from_verified_receipt(
+                &dir.path().join("empty.json"),
+                family_spec,
+                &inputs,
+                &[],
+                &source,
+            )
+            .is_err()
+        );
+        assert!(
+            record_from_verified_receipt(
+                &dir.path().join("unknown.json"),
+                family_spec,
+                &inputs,
+                &[TrackedPath::new("output/unknown", &first_output)],
+                &source,
+            )
+            .is_err()
+        );
+
+        fs::write(&first_output, "mutated")?;
+        assert!(
+            record_from_verified_receipt(
+                &dir.path().join("mutated.json"),
+                family_spec,
+                &inputs,
+                &family_outputs,
+                &source,
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
     fn parquet_receipt_records_schema_rows_and_date_range() -> Result<()> {
         let dir = TestDir::new()?;
         let path = dir.path().join("metric.parquet");
@@ -1058,6 +1209,66 @@ mod tests {
         ParquetWriter::new(File::create(&empty_path)?).finish(&mut empty)?;
         let (_, rows, minimum, maximum) = parquet_summary(&empty_path)?;
         assert_eq!((rows, minimum, maximum), (0, None, None));
+        Ok(())
+    }
+
+    #[test]
+    fn fresh_semantic_draft_replaces_an_obsolete_artifact_sidecar() -> Result<()> {
+        let dir = TestDir::new()?;
+        let path = dir.path().join("metric.parquet");
+        let mut initial = DataFrame::new_infer_height(vec![
+            Column::new("wiki".into(), ["testwiki"]),
+            Column::new("year_month".into(), ["2026-01"]),
+        ])
+        .expect("initial fixture should be valid");
+        ParquetWriter::new(File::create(&path)?).finish(&mut initial)?;
+        let tracked = TrackedPath::new("metric.parquet", &path);
+        let first = inspect_receipted_output(&tracked, "metric-v1", "input-v1")?;
+
+        let mut replacement = DataFrame::new_infer_height(vec![
+            Column::new("wiki".into(), ["testwiki", "testwiki"]),
+            Column::new("year_month".into(), ["2026-01", "2026-02"]),
+        ])
+        .expect("replacement fixture should be valid");
+        let mut semantics = crate::artifact_receipt::SemanticAccumulator::new(
+            crate::artifact_receipt::SemanticSpec::for_identity("metric.parquet"),
+        );
+        semantics.observe(&replacement)?;
+        ParquetWriter::new(File::create(&path)?).finish(&mut replacement)?;
+        crate::artifact_receipt::write_semantic_draft(&path, semantics)?;
+
+        let second = inspect_receipted_output(&tracked, "metric-v2", "input-v2")?;
+        assert_ne!(second.sha256, first.sha256);
+        assert_eq!(second.rows, Some(2));
+        let document = crate::artifact_receipt::read(&path)?;
+        assert_eq!(document.receipt.algorithm_version, "metric-v2");
+        assert_eq!(document.receipt.input_fingerprint, "input-v2");
+
+        let missing = dir.path().join("missing-after-draft.parquet");
+        let mut doomed =
+            DataFrame::new_infer_height(vec![Column::new("wiki".into(), ["testwiki"])])
+                .expect("doomed fixture should be valid");
+        let mut doomed_semantics = crate::artifact_receipt::SemanticAccumulator::new(
+            crate::artifact_receipt::SemanticSpec::for_identity("missing-after-draft.parquet"),
+        );
+        doomed_semantics
+            .observe(&doomed)
+            .expect("doomed semantics should be observable");
+        ParquetWriter::new(File::create(&missing).expect("doomed artifact should be creatable"))
+            .finish(&mut doomed)
+            .expect("doomed artifact should be writable");
+        crate::artifact_receipt::write_semantic_draft(&missing, doomed_semantics)
+            .expect("doomed semantic draft should be writable");
+        fs::remove_file(&missing).expect("doomed artifact should be removable");
+        assert!(
+            inspect_receipted_output(
+                &TrackedPath::new("missing-after-draft.parquet", &missing),
+                "metric-v2",
+                "input-v2",
+            )
+            .is_err(),
+            "a semantic draft without its artifact must fail closed"
+        );
         Ok(())
     }
 
