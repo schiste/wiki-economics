@@ -31,6 +31,8 @@ struct FakePatrolTransport {
     json_values: Mutex<VecDeque<Value>>,
     get_calls: Mutex<Vec<(String, Option<u64>)>>,
     json_calls: Mutex<Vec<String>>,
+    response_etag: Option<String>,
+    response_last_modified: Option<String>,
 }
 
 impl FakePatrolTransport {
@@ -40,7 +42,15 @@ impl FakePatrolTransport {
             json_values: Mutex::new(json_values.into()),
             get_calls: Mutex::new(Vec::new()),
             json_calls: Mutex::new(Vec::new()),
+            response_etag: None,
+            response_last_modified: None,
         }
+    }
+
+    fn with_response_identity(mut self, etag: &str, last_modified: &str) -> Self {
+        self.response_etag = Some(etag.to_string());
+        self.response_last_modified = Some(last_modified.to_string());
+        self
     }
 
     fn get_calls(&self) -> Vec<(String, Option<u64>)> {
@@ -70,7 +80,16 @@ impl PatrolTransport for FakePatrolTransport {
             .expect("transport bodies lock should not be poisoned")
             .pop_front()
             .expect("test transport should have a queued body");
-        Ok(PatrolTransportResponse::from_bytes(bytes))
+        let content_length = self
+            .response_etag
+            .as_ref()
+            .and_then(|_| u64::try_from(bytes.len()).ok());
+        Ok(PatrolTransportResponse::from_bytes_with_identity(
+            bytes,
+            content_length,
+            self.response_etag.as_deref(),
+            self.response_last_modified.as_deref(),
+        ))
     }
 
     fn get_json(&self, url: &str) -> Result<Value> {
@@ -723,6 +742,76 @@ autopatrolled</params>
     )
     .expect_err("malformed XML should fail");
     assert!(!err.to_string().is_empty());
+    Ok(())
+}
+
+#[test]
+fn generation_fetch_is_snapshot_aware_monthly_and_provenanced() -> Result<()> {
+    let data_dir = TestDir::new()?;
+    let xml = r#"<mediawiki xmlns="http://www.mediawiki.org/xml/export-0.11/">
+  <logitem><id>1</id><timestamp>2026-01-05T12:00:00Z</timestamp><contributor><username>Patroller</username><id>10</id></contributor><type>patrol</type><logtitle>Page</logtitle><params>101
+100
+0</params></logitem>
+  <logitem><id>2</id><timestamp>2026-01-06T12:00:00Z</timestamp><type>rights</type><logtitle>User:Editor</logtitle><params>editor
+autopatrolled</params></logitem>
+  <logitem><id>3</id><timestamp>2026-02-05T12:00:00Z</timestamp><contributor><username>Patroller</username><id>10</id></contributor><type>patrol</type><logtitle>Page</logtitle><params>102
+101
+0</params></logitem>
+  <logitem><id>4</id><timestamp>2026-02-06T12:00:00Z</timestamp><type>rights</type><logtitle>User:Editor</logtitle><params>autopatrolled
+editor</params></logitem>
+</mediawiki>"#;
+    let source = gzip_bytes(xml)?;
+    let transport = FakePatrolTransport::new(
+        vec![source.clone()],
+        vec![json!({
+            "query": { "usergroups": [
+                { "name": "autopatrolled", "rights": ["autopatrol"] }
+            ] }
+        })],
+    )
+    .with_response_identity("\"logging-v1\"", "Wed, 26 Aug 2026 00:00:00 GMT");
+
+    let generation = generation::fetch(&transport, "testwiki", "2026-08", data_dir.path())?;
+    assert_eq!(generation.stats.total_log_items, 4);
+    assert_eq!(generation.stats.patrol_events, 2);
+    assert_eq!(generation.stats.rights_events, 2);
+    assert_eq!(generation.patrol_months.len(), 2);
+    assert_eq!(generation.rights_months.len(), 2);
+    assert_eq!(
+        generation.source.content_length,
+        u64::try_from(source.len())?
+    );
+    assert_eq!(generation.source.etag.as_deref(), Some("\"logging-v1\""));
+    assert_eq!(
+        generation.source.last_modified.as_deref(),
+        Some("Wed, 26 Aug 2026 00:00:00 GMT")
+    );
+    assert_eq!(generation.parser_version, PATROL_PARSER_VERSION);
+    let root = generation::generation_dir(data_dir.path(), "testwiki", "2026-08")?;
+    assert!(root.join("generation.json").is_file());
+    assert!(!root.join("source.xml.gz").exists());
+    assert!(
+        root.join("patrol/year=2026/month=2026-01/part-00000.parquet")
+            .is_file()
+    );
+    assert!(
+        root.join("rights/year=2026/month=2026-02/part-00000.parquet")
+            .is_file()
+    );
+    assert!(
+        !data_dir
+            .path()
+            .join("patrol/testwiki/patrol.parquet")
+            .exists()
+    );
+
+    let reused = generation::fetch(&transport, "testwiki", "2026-08", data_dir.path())?;
+    assert_eq!(reused, generation);
+    assert_eq!(transport.get_calls().len(), 1);
+
+    let first_patrol = root.join(&generation.patrol_months[0].relative_path);
+    fs::write(&first_patrol, b"corrupt")?;
+    assert!(generation::load(data_dir.path(), "testwiki", "2026-08").is_err());
     Ok(())
 }
 

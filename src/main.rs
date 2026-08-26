@@ -484,6 +484,14 @@ trait Ops {
     }
     fn fetch_wiki(&self, wiki: &str, version: &str, data_dir: &std::path::Path) -> Result<()>;
     fn fetch_patrol(&self, wiki: &str, data_dir: &std::path::Path) -> Result<()>;
+    fn fetch_patrol_for_snapshot(
+        &self,
+        wiki: &str,
+        _version: &str,
+        data_dir: &std::path::Path,
+    ) -> Result<()> {
+        self.fetch_patrol(wiki, data_dir)
+    }
     fn ingest_wiki(
         &self,
         wiki: &str,
@@ -578,6 +586,14 @@ trait Ops {
     }
     fn cached_patrol_sources_available(&self, _wiki: &str, _data_dir: &Path) -> bool {
         false
+    }
+    fn cached_patrol_generation_available(
+        &self,
+        wiki: &str,
+        _version: &str,
+        data_dir: &Path,
+    ) -> bool {
+        self.cached_patrol_sources_available(wiki, data_dir)
     }
     fn compute_candidate(
         &self,
@@ -686,6 +702,15 @@ impl Ops for RealOps {
 
     fn fetch_patrol(&self, wiki: &str, data_dir: &std::path::Path) -> Result<()> {
         patrol::fetch_patrol(wiki, data_dir)
+    }
+
+    fn fetch_patrol_for_snapshot(
+        &self,
+        wiki: &str,
+        version: &str,
+        data_dir: &std::path::Path,
+    ) -> Result<()> {
+        patrol::fetch_patrol_for_snapshot(wiki, version, data_dir)
     }
 
     fn ingest_wiki(
@@ -845,6 +870,15 @@ impl Ops for RealOps {
 
     fn cached_patrol_sources_available(&self, wiki: &str, data_dir: &Path) -> bool {
         patrol::cached_sources_available(data_dir, wiki)
+    }
+
+    fn cached_patrol_generation_available(
+        &self,
+        wiki: &str,
+        version: &str,
+        data_dir: &Path,
+    ) -> bool {
+        patrol::cached_sources_available_for_snapshot(data_dir, wiki, version)
     }
 
     fn compute_candidate(
@@ -1020,7 +1054,7 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
                     ops.fetch_wiki(wiki, &version, &data_dir)
                 })?;
                 run_timed_stage("patrol_fetch", Some(wiki), || {
-                    ops.fetch_patrol(wiki, &data_dir)
+                    ops.fetch_patrol_for_snapshot(wiki, &version, &data_dir)
                 })?;
             }
         }
@@ -1100,12 +1134,12 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
                         )
                     })?;
                     if same_snapshot_candidate
-                        && ops.cached_patrol_sources_available(&wiki, &data_dir)
+                        && ops.cached_patrol_generation_available(&wiki, &version, &data_dir)
                     {
                         record_skipped_stage("patrol_fetch", Some(&wiki));
                     } else {
                         run_timed_stage("patrol_fetch", Some(&wiki), || {
-                            ops.fetch_patrol(&wiki, &data_dir)
+                            ops.fetch_patrol_for_snapshot(&wiki, &version, &data_dir)
                         })?;
                     }
                     if compute_reused {
@@ -1167,7 +1201,7 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
                 )
             })?;
             run_timed_stage("patrol_fetch", Some(&wiki), || {
-                ops.fetch_patrol(&wiki, &data_dir)
+                ops.fetch_patrol_for_snapshot(&wiki, &version, &data_dir)
             })?;
             run_timed_stage("compute", Some(&wiki), || {
                 ops.compute_candidate(&wiki, &version, &data_dir, &qualification_dir)
@@ -1468,7 +1502,7 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
                         )
                     })?;
                     run_timed_stage("patrol_fetch", Some(wiki), || {
-                        ops.fetch_patrol(wiki, &data_dir)
+                        ops.fetch_patrol_for_snapshot(wiki, &version, &data_dir)
                     })?;
                 }
                 if stage.runs_compute() {

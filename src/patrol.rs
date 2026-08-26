@@ -7,8 +7,10 @@ use quick_xml::events::Event;
 use regex::Regex;
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
-use reqwest::header::{CONTENT_RANGE, HeaderMap, RANGE};
+use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, ETAG, HeaderMap, LAST_MODIFIED, RANGE};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Write};
@@ -26,6 +28,7 @@ const PARQUET_BATCH_ROWS: usize = 50_000;
 const SUBSTANTIAL_LOGGING_DUMP_BYTES: u64 = 1024 * 1024;
 const SUBSTANTIAL_LOG_ITEMS: usize = 10_000;
 const PATROL_COMPUTE_ALGORITHM_VERSION: &str = "patrol-metrics-v2-fingerprinted";
+const PATROL_PARSER_VERSION: &str = "patrol-logging-multigzip-monthly-v1";
 const REVISION_COLUMNS: &[&str] = &[
     "revision_id",
     "event_timestamp",
@@ -157,12 +160,23 @@ struct LogItem {
     params: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 struct LoggingParseStats {
     total_log_items: usize,
     patrol_events: usize,
     rights_events: usize,
     skipped_events: usize,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct LoggingSourceIdentity {
+    remote_url: String,
+    content_length: u64,
+    etag: Option<String>,
+    last_modified: Option<String>,
+    downloaded_sha256: String,
 }
 
 struct PatrolWriter {
@@ -177,6 +191,14 @@ struct RightsWriter {
     batch_rows: usize,
 }
 
+trait PatrolSink {
+    fn add_patrol(&mut self, row: PatrolRow) -> Result<()>;
+}
+
+trait RightsSink {
+    fn add_rights(&mut self, row: RightsRow) -> Result<()>;
+}
+
 #[cfg_attr(coverage, allow(dead_code))]
 struct ReqwestPatrolTransport {
     dump_client: Client,
@@ -185,6 +207,9 @@ struct ReqwestPatrolTransport {
 
 pub(crate) struct PatrolTransportResponse {
     body: Box<dyn Read + Send>,
+    content_length: Option<u64>,
+    etag: Option<String>,
+    last_modified: Option<String>,
 }
 
 impl PatrolTransportResponse {
@@ -192,6 +217,24 @@ impl PatrolTransportResponse {
     pub(crate) fn from_bytes(bytes: impl Into<Vec<u8>>) -> Self {
         Self {
             body: Box::new(std::io::Cursor::new(bytes.into())),
+            content_length: None,
+            etag: None,
+            last_modified: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_bytes_with_identity(
+        bytes: impl Into<Vec<u8>>,
+        content_length: Option<u64>,
+        etag: Option<&str>,
+        last_modified: Option<&str>,
+    ) -> Self {
+        Self {
+            body: Box::new(std::io::Cursor::new(bytes.into())),
+            content_length,
+            etag: etag.map(str::to_string),
+            last_modified: last_modified.map(str::to_string),
         }
     }
 }
@@ -229,11 +272,21 @@ impl PatrolTransport for ReqwestPatrolTransport {
         {
             return Ok(PatrolTransportResponse {
                 body: Box::new(std::io::empty()),
+                content_length: range_start,
+                etag: header_string(response.headers(), ETAG),
+                last_modified: header_string(response.headers(), LAST_MODIFIED),
             });
         }
         let response = response.error_for_status()?;
+        let headers = response.headers();
+        let content_length = response_total_length(headers, range_start);
+        let etag = header_string(headers, ETAG);
+        let last_modified = header_string(headers, LAST_MODIFIED);
         Ok(PatrolTransportResponse {
             body: Box::new(response),
+            content_length,
+            etag,
+            last_modified,
         })
     }
 
@@ -241,6 +294,23 @@ impl PatrolTransport for ReqwestPatrolTransport {
         let response = self.api_client.get(url).send()?.error_for_status()?;
         response.json().map_err(Into::into)
     }
+}
+
+fn header_string(headers: &HeaderMap, name: reqwest::header::HeaderName) -> Option<String> {
+    headers.get(name)?.to_str().ok().map(str::to_string)
+}
+
+fn response_total_length(headers: &HeaderMap, range_start: Option<u64>) -> Option<u64> {
+    if let Some(total) = headers
+        .get(CONTENT_RANGE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.rsplit_once('/'))
+        .and_then(|(_, total)| total.parse().ok())
+    {
+        return Some(total);
+    }
+    let length = headers.get(CONTENT_LENGTH)?.to_str().ok()?.parse().ok()?;
+    range_start.unwrap_or_default().checked_add(length)
 }
 
 fn unsatisfied_range_total(headers: &HeaderMap) -> Option<u64> {
@@ -299,6 +369,9 @@ fn configured_test_transport() -> Option<std::sync::Arc<dyn PatrolTransport>> {
 }
 
 pub fn fetch_patrol(wiki: &str, data_dir: &Path) -> Result<()> {
+    if let Some(snapshot) = storage::current_snapshot_version(data_dir, wiki)? {
+        return fetch_patrol_for_snapshot(wiki, &snapshot, data_dir);
+    }
     #[cfg(coverage)]
     {
         let transport = configured_test_transport()
@@ -315,6 +388,29 @@ pub fn fetch_patrol(wiki: &str, data_dir: &Path) -> Result<()> {
     let transport = build_transport()?;
     #[cfg(not(coverage))]
     return fetch_patrol_with_transport(wiki, data_dir, &transport);
+}
+
+pub(crate) fn fetch_patrol_for_snapshot(wiki: &str, snapshot: &str, data_dir: &Path) -> Result<()> {
+    storage::validate_snapshot_version(snapshot)?;
+    #[cfg(coverage)]
+    {
+        let transport = configured_test_transport()
+            .expect("install_test_transport must be used before patrol generation fetch");
+        generation::fetch(transport.as_ref(), wiki, snapshot, data_dir)?;
+        return Ok(());
+    }
+
+    #[cfg(all(test, not(coverage)))]
+    if let Some(transport) = configured_test_transport() {
+        generation::fetch(transport.as_ref(), wiki, snapshot, data_dir)?;
+        return Ok(());
+    }
+
+    #[cfg(not(coverage))]
+    let transport = build_transport()?;
+    #[cfg(not(coverage))]
+    generation::fetch(&transport, wiki, snapshot, data_dir)?;
+    Ok(())
 }
 
 fn fetch_patrol_with_transport<T: PatrolTransport + ?Sized>(
@@ -704,6 +800,15 @@ pub(crate) fn cached_sources_available(data_dir: &Path, wiki: &str) -> bool {
             })
 }
 
+pub(crate) fn cached_sources_available_for_snapshot(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot: &str,
+) -> bool {
+    generation::exists(data_dir, wiki, snapshot)
+        && generation::load(data_dir, wiki, snapshot).is_ok()
+}
+
 #[cfg(test)]
 pub(crate) fn record_candidate_fingerprint_for_test(
     wiki: &str,
@@ -774,11 +879,14 @@ fn download_logging_dump<T: PatrolTransport + ?Sized>(
     transport: &T,
     wiki: &str,
     dest_path: &Path,
-) -> Result<()> {
+) -> Result<LoggingSourceIdentity> {
     let url = format!("{PATROL_DUMP_BASE}/{wiki}/latest/{wiki}-latest-pages-logging.xml.gz");
     let existing_size = dest_path.metadata().map(|meta| meta.len()).unwrap_or(0);
     info!(wiki = wiki, url = %url, resume_from = existing_size, "downloading patrol log dump");
     let mut response = transport.get(&url, (existing_size > 0).then_some(existing_size))?;
+    let expected_length = response.content_length;
+    let etag = response.etag.take();
+    let last_modified = response.last_modified.take();
     let mut file = if existing_size > 0 {
         fs::OpenOptions::new()
             .create(true)
@@ -814,8 +922,21 @@ fn download_logging_dump<T: PatrolTransport + ?Sized>(
         return Err(integrity_error);
     }
 
+    let (content_length, downloaded_sha256) = storage::sha256_file(dest_path)?;
+    anyhow::ensure!(
+        expected_length.is_none_or(|expected| expected == content_length),
+        "patrol logging source length changed during download (expected {}, received {content_length})",
+        expected_length.unwrap_or_default()
+    );
+
     info!(wiki = wiki, path = %dest_path.display(), "downloaded patrol log dump");
-    Ok(())
+    Ok(LoggingSourceIdentity {
+        remote_url: url,
+        content_length,
+        etag,
+        last_modified,
+        downloaded_sha256,
+    })
 }
 
 /// Magic-byte check for gzipped patrol log dumps. See `fetch::verify_bz2_magic`
@@ -882,10 +1003,10 @@ fn wiki_to_api_domain(wiki: &str) -> Option<String> {
     None
 }
 
-fn parse_logging_events(
+fn parse_logging_events<P: PatrolSink + ?Sized, R: RightsSink + ?Sized>(
     xml_path: &Path,
-    patrol_writer: &mut PatrolWriter,
-    rights_writer: &mut RightsWriter,
+    patrol_writer: &mut P,
+    rights_writer: &mut R,
 ) -> Result<LoggingParseStats> {
     let file = File::open(xml_path)?;
     let compressed_bytes = file.metadata()?.len();
@@ -923,11 +1044,11 @@ fn parse_logging_events(
                             stats.total_log_items += 1;
                             match item {
                                 item if matches!(item.log_type.as_deref(), Some("patrol")) => {
-                                    patrol_writer.add(item.into_patrol_row())?;
+                                    patrol_writer.add_patrol(item.into_patrol_row())?;
                                     stats.patrol_events += 1;
                                 }
                                 item if matches!(item.log_type.as_deref(), Some("rights")) => {
-                                    rights_writer.add(item.into_rights_row())?;
+                                    rights_writer.add_rights(item.into_rights_row())?;
                                     stats.rights_events += 1;
                                 }
                                 _ => stats.skipped_events += 1,
@@ -1126,6 +1247,12 @@ impl PatrolWriter {
     }
 }
 
+impl PatrolSink for PatrolWriter {
+    fn add_patrol(&mut self, row: PatrolRow) -> Result<()> {
+        self.add(row)
+    }
+}
+
 impl RightsWriter {
     fn new(path: &Path) -> Result<Self> {
         Self::new_with_batch_rows(path, PARQUET_BATCH_ROWS)
@@ -1168,6 +1295,12 @@ impl RightsWriter {
         self.flush()?;
         self.writer.finish()?;
         Ok(())
+    }
+}
+
+impl RightsSink for RightsWriter {
+    fn add_rights(&mut self, row: RightsRow) -> Result<()> {
+        self.add(row)
     }
 }
 
@@ -2215,6 +2348,8 @@ fn classify_user_type(
 fn round1(value: f64) -> f64 {
     (value * 10.0).round() / 10.0
 }
+
+mod generation;
 
 #[cfg(test)]
 mod tests;
