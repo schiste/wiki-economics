@@ -45,12 +45,14 @@ generations to `retired` before deleting their directories. The compact state
 receipt remains after data retirement as an audit trail.
 
 Before creating a new candidate, preparation compares the resolved snapshot
-with every valid ready candidate for that wiki and verifies the current core
-and patrol stage fingerprints. When both fingerprints still match, the job
-finishes successfully as an explicit no-op and points its log at the existing
-`ready.json`. When only one fingerprint matches, its receipt-covered files are
-copied atomically into the new candidate and only the invalidated stage runs.
-The original ready candidate remains immutable.
+with indexed ready candidates for that wiki and verifies four core-family
+fingerprints plus the independent patrol fingerprint. A complete match finishes
+as an explicit no-op and points its log at the existing `ready.json`. On a
+partial match, each receipt-covered family is copied atomically into the new
+candidate and `ComputePlan` runs only invalid families. Reusable families may
+come from different immutable candidates; readiness is issued only after the
+new candidate contains and authenticates the complete family set. The original
+ready candidates remain immutable.
 
 Preparation holds `output/_prepare-locks/<wiki>.lock`. Different wikis may run
 concurrently; a second preparation for the same wiki exits with status 75.

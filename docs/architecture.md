@@ -147,6 +147,29 @@ Important decisions:
   - labor cohorts
   - labor churn
 
+Core history outputs are invalidated as four independent families:
+
+- monthly stateless: GDP, GDP user-type share, inequality, and labor monthly
+- activity tiers: monthly, quarterly, and yearly tier labels derived from
+  editor-month aggregates
+- lifecycle: business funnel, labor cohorts, and labor churn
+- page-week: bounded weekly reduction, boundary reconciliation, and previous
+  week values
+
+Patrol remains a fifth, separate input and receipt path. `ComputePlan` decides
+which history families are reusable before reading a partition. During a full
+or multi-family rebuild, each analytical partition is opened once and its
+frame is offered only to the invalid monthly/activity/lifecycle accumulators.
+Page-week retains its separate two-level disk-bucket scan because it projects
+different page identity and timestamp columns. This preserves scan fusion
+without coupling unrelated invalidation domains.
+
+The family algorithm constants live beside their contracts under
+`src/compute/{monthly,activity,lifecycle,weekly}/`. CI maps semantic source
+paths to those constants. Shared compute-orchestration changes conservatively
+map to every family unless an exact reviewed no-semantic-change declaration is
+present.
+
 This split is intentional:
 
 - month-scoped metrics should never require a whole-wiki in-memory load

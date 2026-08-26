@@ -29,6 +29,8 @@ for f in site/data-build/*.cjs; do node --check "$f"; done
 node --test site/admin-auth.test.cjs
 node --test site/admin-server.test.cjs
 node scripts/generate-stack-reference.cjs --check
+node --test scripts/check-compute-versions.test.cjs
+node scripts/check-compute-versions.cjs
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 cargo test --locked --all-targets --all-features
@@ -191,9 +193,22 @@ The following are live architecture contracts, not incidental implementation det
 - patrol fetch and compute are Rust subcommands; patrol compute participates in
   the same merge/default materialization path as the history metrics
 - deterministic stage receipts live under `data/stages/` and `output/_stages/`; algorithm changes must increment the owning `*_ALGORITHM_VERSION` constant
+- core history compute has independent `monthly`, `activity_tiers`,
+  `lifecycle`, and `page_week` receipts; patrol is not a core-history input
 - unpinned fetch/run commands resolve one completed snapshot for the entire run and fail when no dump exists within `WIKI_ECON_MAX_SNAPSHOT_LAG_MONTHS`
 
 If any of these change, update `docs/architecture.md`, tests, and storage helpers together.
+
+### Compute semantic-version enforcement
+
+`scripts/check-compute-versions.cjs` compares changed compute paths with the
+family constants in `src/compute/*/mod.rs`. A source change must either bump
+every mapped family version or be listed exactly in
+`config/compute-no-semantic-change.json` with the unchanged versions and a
+meaningful rationale. The declaration is deliberately per path and per base
+commit; it is an auditable assertion for a mechanical refactor, not a durable
+allowlist. Patrol changes map to no history family and therefore never force a
+history algorithm bump.
 
 Dependency versions and lifecycle state are deliberately absent from this
 narrative guide. Update their manifests, run

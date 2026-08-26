@@ -13,7 +13,10 @@ data/stages/<wiki>/<snapshot>/ingest.json
 data/snapshots/<wiki>/<snapshot>/remote-inventory.json
 data/snapshots/<wiki>/<snapshot>/workload-profile.json
 output/_ready-index/<wiki>.json
-output/_stages/compute/<wiki>.json
+output/_stages/compute/monthly/<wiki>.json
+output/_stages/compute/activity_tiers/<wiki>.json
+output/_stages/compute/lifecycle/<wiki>.json
+output/_stages/compute/page_week/<wiki>.json
 output/_stages/patrol_compute/<wiki>.json
 output/_stages/merge.json
 output/_stages/site.json
@@ -53,12 +56,18 @@ fast validation index and is deliberately excluded from the fingerprint.
   `(data root, wiki, snapshot, manifest hash)` cache. It does not reconstruct
   the manifest, hash fragments, or reopen Parquet footers. Strict physical
   validation remains the compatibility, recovery, and scrub path.
-- **compute** reuses only the exact selected generation, explicit Rust
-  algorithm version, persisted adaptive workload profile, and complete recorded
-  metric inventory. The profile records total compressed bytes, source count,
-  prior measured rows, preferred source concurrency, and the two-level bucket
-  layout. When possible compute's other input is the validated ingest receipt,
-  avoiding a second multi-gigabyte hash pass.
+- **compute** has four independently invalidated receipts: monthly stateless
+  aggregates, activity tiers, stateful editor lifecycle, and page-week. All
+  four bind the exact selected generation and their own Rust algorithm version;
+  only page-week additionally binds the persisted adaptive workload profile
+  and two-level bucket topology. When multiple nonweekly families are invalid,
+  one `ComputePlan` scan feeds their accumulators together. Changing an
+  activity threshold therefore cannot touch page-week, and changing page-week
+  topology cannot touch GDP. A valid legacy `core-metrics-v8` receipt is split
+  once by authenticating compatible outputs against their artifact receipts;
+  rollout does not decode or re-hash activity, lifecycle, or page-week
+  Parquets. Monthly outputs rebuild once because the family split also added a
+  deterministic `user_type` tie-break order to GDP and labor monthly.
 - **patrol compute** includes the selected ingest generation and all three
   locally validated patrol inputs (`patrol.parquet`, `rights.parquet`, and the
   autopatrol-group metadata). A changed algorithm or input invalidates patrol
@@ -82,7 +91,12 @@ fast validation index and is deliberately excluded from the fingerprint.
   publisher records `no_op` before merge, Parquet validation, or site build.
 
 Changing Rust logic without changing source data must increment the relevant
-`*_ALGORITHM_VERSION` constant. CI embeds `github.sha` as
+family `ALGORITHM_VERSION` constant. `scripts/check-compute-versions.cjs`
+maps compute source paths to those constants and fails CI when semantic code
+changes without a version bump. A refactor proven not to affect semantics may
+instead add an exact, reviewed entry to
+`config/compute-no-semantic-change.json`; wildcard exceptions are not accepted.
+CI embeds `github.sha` as
 `WIKI_ECON_BUILD_COMMIT`; manual builds remain deterministic because the
 explicit algorithm version is always present.
 
