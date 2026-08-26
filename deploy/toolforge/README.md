@@ -147,9 +147,12 @@ and higher resource envelope are being qualified.
   indexes and a receipt-backed publication digest; unchanged publication
   preparation returns before merge and site build.
   A separate `wiki-econ-artifact-scrub` job runs monthly under the publication
-  lock and independently rehashes every published Parquet against its canonical
-  semantic receipt. Reports are retained under `output/_scrubs/`; this does not
-  deploy or republish data.
+  lock and independently rereads every published Parquet, recomputes its
+  semantic summary, and rehashes it against the canonical receipt. Reports and
+  durable success/failure status are retained under `output/_scrubs/`; a failed
+  or malformed status raises a public freshness alert and blocks later
+  publication until a successful scrub. This job does not deploy or republish
+  data.
   The one-CPU Toolforge job also defaults `RAYON_NUM_THREADS` and
   `POLARS_MAX_THREADS` to `1`, because the container currently sees eight host
   CPUs despite its one-CPU quota. Sequential raw/hash/ingest I/O uses Linux

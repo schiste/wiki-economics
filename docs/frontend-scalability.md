@@ -7,7 +7,7 @@ The public site has two deliberately separate data paths:
 
 ## Publication layout
 
-`wiki-econ merge` writes `browser-data-index.json` from the immutable per-wiki metric outputs. Each entry records the metric, wiki, minimum and maximum date, public file path, rows, bytes, and SHA-256. The site build copies only indexed sources into its staged release and publishes the index with the rest of that atomic release.
+`wiki-econ merge` writes `browser-data-index.json` from the immutable per-wiki metric outputs. Each entry records the metric, wiki, minimum and maximum date, public file path, rows, bytes, SHA-256, and authoritative artifact-receipt identity. Index schema 2 reuses an existing entry exactly when that receipt identity is unchanged and rebuilds only changed entries. The site build copies only indexed sources into its staged release and publishes the index with the rest of that atomic release.
 
 The current custom-query metrics are bounded monthly or yearly aggregates, so one file per metric/wiki is comfortably within the browser budgets. `page_weekly_edits` is intentionally excluded: it supplies a Rust-generated default page and is never decoded in the browser. If a per-wiki aggregate later exceeds the budgets, introduce a new index schema with year or bounded-range shards and retain the same selected-wiki loading contract.
 

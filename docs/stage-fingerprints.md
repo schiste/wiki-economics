@@ -76,9 +76,11 @@ fast validation index and is deliberately excluded from the fingerprint.
   current compute and patrol receipts. A complete hit is a recorded no-op. On
   a partial hit, only receipt-covered stage files are copied atomically into
   the new immutable candidate; invalidated stages alone execute.
-- **merge** includes published per-wiki Parquets, lifecycle configuration,
-  Rust dashboard code, and the manifest validator. On a hit it preserves the merged files but issues
-  a new publication candidate for the current run ID.
+- **merge** gives every root metric its own sorted per-wiki input fingerprint
+  and stage receipt. Only a metric whose wiki-run identities changed is
+  rewritten; other root Parquets remain untouched. The small dashboard and
+  manifest outputs retain a separate global orchestration receipt. A hit still
+  issues a publication candidate for the current run ID.
 - **site** includes the publication candidate's artifacts plus the Observable
   sources/configuration. Reuse runs only inside the fail-closed publication
   flow, after the current run receipt is verified.
@@ -89,6 +91,9 @@ fast validation index and is deliberately excluded from the fingerprint.
   index. If the sorted active ready hashes, lifecycle hash, merge/publication
   versions, and site-source fingerprint match `publication-gate.json`, the
   publisher records `no_op` before merge, Parquet validation, or site build.
+  Otherwise gate schema 8 compares per-wiki family receipt identities and
+  algorithm versions with the previous publication and authenticates unchanged
+  evidence without reopening its Parquet rows.
 
 Changing Rust logic without changing source data must increment the relevant
 family `ALGORITHM_VERSION` constant. `scripts/check-compute-versions.cjs`

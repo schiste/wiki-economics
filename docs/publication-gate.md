@@ -19,7 +19,8 @@ output directory:
 - `publication-gate.json` is the public operator receipt. It is written only
   after semantic validation passes and includes snapshot versions, per-wiki
   cutoffs, metric row and conservation totals, patrol source counts, and the
-  candidate artifact inventory. Receipt schema 6 also records the MIT SPDX
+  candidate artifact inventory. Receipt schema 8 also records per-wiki metric
+  family proofs and the exact changed/reused publication plan. It records the MIT SPDX
   identifier on every artifact plus the generating commit, run ID, source
   datasets, attribution, trademark status, privacy notice, and Toolforge open
   source/open data declaration.
@@ -53,10 +54,23 @@ The Rust gate validates:
   artifact/receipt pairing from candidate readiness through site publication.
 
 The gate consumes semantic receipts and does not reopen unchanged Parquets to
-rediscover schemas, rows, dates, wiki ranges, or conservation totals. Page-week
+rediscover schemas, rows, dates, wiki ranges, or conservation totals. For each
+publication it compares the current per-wiki family proofs with the preceding
+gate, writes the deterministic change plan to
+`publication-change-plan.json`, and reuses the preceding gate report for an
+unchanged `wiki × metric family`. Changed artifacts receive a content-hash
+verification; unchanged artifacts receive receipt and metadata verification.
+Page-week
 receipts validate edit conservation, stable ordering, and
 `previous_week_edits` while bounded reconciliation batches pass through the
 writer. A first migration of a legacy artifact performs one sequential scan.
+
+The monthly `artifact-scrub` remains independent of this fast path. It
+sequentially rereads every published Parquet, recomputes all semantic evidence
+and SHA-256 identities, and requires exact equality with the authoritative
+receipt. A failure is persisted in `_scrubs/status.json`, appears as a critical
+alert at `/health/freshness.json`, and blocks later publication until a
+successful scrub replaces the failed status.
 
 ## Operator checks
 

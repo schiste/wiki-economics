@@ -76,9 +76,20 @@ output/_publication_transactions/<run-id>/selection.json
 
 For each changed wiki it moves the old `output/<wiki>` to the transaction's
 backup directory, installs a relative symlink to the immutable candidate, and
-switches the snapshot pointer. It then regenerates combined metrics and
-browser partitions and runs the fail-closed publication gate. Any failure in
+switches the snapshot pointer. It derives a `changed wiki × changed metric
+family` plan from authenticated candidate receipts. Root aggregates are
+rewritten only for changed families; page-week remains per-wiki and never has
+a combined root artifact. Browser index entries whose artifact-receipt identity
+did not change are reused byte-for-byte. The fail-closed gate composes unchanged
+semantic reports from the preceding receipt and deeply verifies changed
+artifacts. Any failure in
 that sequence restores both the old wiki paths and snapshot pointers.
+
+The production SLO for the receipt-backed `publication_prepare` stage is three
+minutes for the current six-wiki set. The run record retains the exact change
+plan and the public freshness endpoint raises
+`incremental_publication_slow` when a successful incremental publication
+exceeds that bound.
 
 The site is built in its existing isolated staging directory and its symlink
 is switched atomically. `publication-commit-ready` verifies the publication
