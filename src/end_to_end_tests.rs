@@ -17,7 +17,7 @@ use std::io::Write;
 use std::path::Path;
 
 use crate::test_support::{TestDir, init_test_tracing};
-use crate::{compute, ingest, merge, schema, storage};
+use crate::{compute, cross_snapshot, ingest, merge, schema, storage};
 
 fn fixture_row(timestamp: &str, user_id: &str, revision_id: &str) -> String {
     let mut row = vec![String::new(); schema::COLUMNS.len()];
@@ -274,7 +274,8 @@ fn snapshot_rollover_computes_only_the_new_generation() -> Result<()> {
         &july_source,
         &[
             fixture_row("2024-01-01 12:00:00.0", "1", "100"),
-            fixture_row("2024-01-08 12:00:00.0", "1", "101"),
+            fixture_row("2024-01-31 12:00:00.0", "1", "101"),
+            fixture_row("2024-02-01 12:00:00.0", "2", "102"),
         ],
     )?;
     ingest::ingest_wiki_snapshot("tinywiki", "2026-07", &data_dir)?;
@@ -298,9 +299,10 @@ fn snapshot_rollover_computes_only_the_new_generation() -> Result<()> {
     write_bz2(
         &august_source,
         &[
-            fixture_row("2024-01-01 12:00:00.0", "1", "200"),
-            fixture_row("2024-01-08 12:00:00.0", "1", "201"),
-            fixture_row("2024-01-15 12:00:00.0", "1", "202"),
+            fixture_row("2024-01-01 12:00:00.0", "1", "100"),
+            fixture_row("2024-01-31 12:00:00.0", "1", "101"),
+            fixture_row("2024-02-01 12:00:00.0", "2", "102"),
+            fixture_row("2024-02-08 12:00:00.0", "2", "103"),
         ],
     )?;
     ingest::ingest_wiki_snapshot("tinywiki", "2026-08", &data_dir)?;
@@ -317,11 +319,34 @@ fn snapshot_rollover_computes_only_the_new_generation() -> Result<()> {
 
     let weekly = read_parquet(&output_dir.join("tinywiki/page_weekly_edits.parquet"))?;
     let total_edits: u32 = weekly.column("edits")?.u32()?.into_no_null_iter().sum();
-    assert_eq!(weekly.height(), 3);
     assert_eq!(
-        total_edits, 3,
+        weekly.height(),
+        3,
+        "the week crossing January and February must be reconciled once"
+    );
+    assert_eq!(
+        total_edits, 4,
         "July and August histories must not be added together"
     );
+
+    let qualification_root = temp.path().join("cross-snapshot-qualification");
+    let qualification_report = temp.path().join("cross-snapshot-report.json");
+    let qualification = cross_snapshot::qualify(
+        &data_dir,
+        "tinywiki",
+        "2026-07",
+        "2026-08",
+        &qualification_root,
+        &qualification_report,
+    )?;
+    assert!(!qualification.publication_eligible);
+    assert_eq!(qualification.artifact_count, 9);
+    assert!(qualification.baseline_cache.rebuilt_artifacts > 0);
+    assert!(
+        qualification.candidate_cache.reused_artifacts >= 6,
+        "the unchanged January stateless, editor-month, and weekly contributions should be reused"
+    );
+    assert!(qualification_report.is_file());
 
     assert_eq!(
         storage::retire_inactive_snapshots(&data_dir, "tinywiki")?,

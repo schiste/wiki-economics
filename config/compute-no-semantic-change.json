@@ -4,26 +4,26 @@
     {
       "family": "monthly",
       "paths": ["src/compute/mod.rs"],
-      "reason": "Add publication-invisible cross-snapshot cache reuse without changing monthly metric semantics or final bytes.",
-      "base_commit": "34d9129b16f377e6e5378b5a3f8ac3099ca22536"
+      "reason": "Add the publication-invisible weekly equivalence builder without changing monthly metric semantics or final bytes.",
+      "base_commit": "f5880db6bf95a28d70d60894fb22efc2254c3825"
     },
     {
       "family": "activity_tiers",
       "paths": ["src/compute/mod.rs"],
-      "reason": "Add publication-invisible editor-month reuse without changing activity-tier semantics or final bytes.",
-      "base_commit": "34d9129b16f377e6e5378b5a3f8ac3099ca22536"
+      "reason": "Add the publication-invisible weekly equivalence builder without changing activity-tier semantics or final bytes.",
+      "base_commit": "f5880db6bf95a28d70d60894fb22efc2254c3825"
     },
     {
       "family": "lifecycle",
       "paths": ["src/compute/mod.rs"],
-      "reason": "Add publication-invisible yearly state checkpoints without changing lifecycle metric semantics or final bytes.",
-      "base_commit": "34d9129b16f377e6e5378b5a3f8ac3099ca22536"
+      "reason": "Add the publication-invisible weekly equivalence builder without changing lifecycle metric semantics or final bytes.",
+      "base_commit": "f5880db6bf95a28d70d60894fb22efc2254c3825"
     },
     {
       "family": "page_week",
       "paths": ["src/compute/mod.rs", "src/compute/weekly/mod.rs"],
-      "reason": "Add publication-invisible monthly contribution reuse without changing page-week semantics or final bytes.",
-      "base_commit": "34d9129b16f377e6e5378b5a3f8ac3099ca22536"
+      "reason": "Externally merge publication-invisible monthly contribution runs without changing production page-week semantics.",
+      "base_commit": "f5880db6bf95a28d70d60894fb22efc2254c3825"
     }
   ]
 }

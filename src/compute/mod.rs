@@ -7,7 +7,7 @@ pub mod monthly;
 pub mod weekly;
 
 use anyhow::{Context, Result};
-use chrono::{Duration, NaiveDate};
+use chrono::{Datelike, Duration, NaiveDate};
 use polars::io::parquet::write::BatchedWriter;
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -1716,6 +1716,375 @@ fn weekly_group_keys() -> [Expr; 4] {
     ]
 }
 
+const WEEKLY_EXTERNAL_BATCH_ROWS: usize = 100_000;
+const WEEKLY_EXTERNAL_READ_ROWS: usize = 4_096;
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct WeeklyContributionRow {
+    page_id: Option<i64>,
+    page_namespace: Option<i32>,
+    page_title: Option<String>,
+    week_start: i32,
+    edits: u32,
+}
+
+impl WeeklyContributionRow {
+    fn same_key(&self, other: &Self) -> bool {
+        self.page_id == other.page_id
+            && self.page_namespace == other.page_namespace
+            && self.page_title == other.page_title
+            && self.week_start == other.week_start
+    }
+}
+
+struct WeeklyContributionCursor {
+    reader: storage::SequentialParquetReader,
+    batch: Option<DataFrame>,
+    row: usize,
+    previous: Option<WeeklyContributionRow>,
+}
+
+impl WeeklyContributionCursor {
+    fn new(path: &Path) -> Result<Self> {
+        Ok(Self {
+            reader: storage::SequentialParquetReader::new(
+                path,
+                Some(
+                    [
+                        "page_id",
+                        "page_namespace",
+                        "page_title",
+                        "week_start",
+                        "edits",
+                    ]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+                ),
+                WEEKLY_EXTERNAL_READ_ROWS,
+            )?,
+            batch: None,
+            row: 0,
+            previous: None,
+        })
+    }
+
+    fn next_row(&mut self) -> Result<Option<WeeklyContributionRow>> {
+        loop {
+            if let Some(batch) = &self.batch
+                && self.row < batch.height()
+            {
+                let row = WeeklyContributionRow {
+                    page_id: batch.column("page_id")?.i64()?.get(self.row),
+                    page_namespace: batch.column("page_namespace")?.i32()?.get(self.row),
+                    page_title: batch
+                        .column("page_title")?
+                        .str()?
+                        .get(self.row)
+                        .map(str::to_owned),
+                    week_start: batch
+                        .column("week_start")?
+                        .date()?
+                        .physical()
+                        .get(self.row)
+                        .context("weekly contribution has no week")?,
+                    edits: batch
+                        .column("edits")?
+                        .u32()?
+                        .get(self.row)
+                        .context("weekly contribution has no edit count")?,
+                };
+                self.row += 1;
+                if let Some(previous) = &self.previous {
+                    anyhow::ensure!(
+                        previous <= &row,
+                        "weekly contribution run violates its logical order"
+                    );
+                }
+                self.previous = Some(row.clone());
+                return Ok(Some(row));
+            }
+            self.batch = self.reader.next_batch()?;
+            self.row = 0;
+            if self.batch.is_none() {
+                return Ok(None);
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct WeeklyFinalBatch {
+    week_start: Vec<String>,
+    iso_year: Vec<i32>,
+    iso_week: Vec<i32>,
+    page_id: Vec<Option<i64>>,
+    page_title: Vec<Option<String>>,
+    page_namespace: Vec<Option<i32>>,
+    edits: Vec<u32>,
+    previous_week_edits: Vec<u32>,
+    wow_change: Vec<i64>,
+    wow_rate: Vec<Option<f64>>,
+    previous: Option<WeeklyContributionRow>,
+}
+
+impl WeeklyFinalBatch {
+    fn len(&self) -> usize {
+        self.edits.len()
+    }
+
+    fn push(&mut self, row: WeeklyContributionRow) -> Result<()> {
+        let date = format_epoch_day(row.week_start).context("weekly contribution date overflow")?;
+        let parsed = NaiveDate::parse_from_str(&date, "%Y-%m-%d")?;
+        let previous = self.previous.as_ref().map_or(0, |previous| {
+            if previous.page_id == row.page_id
+                && previous.page_namespace == row.page_namespace
+                && previous.page_title == row.page_title
+                && row.week_start.checked_sub(previous.week_start) == Some(7)
+            {
+                previous.edits
+            } else {
+                0
+            }
+        });
+        self.week_start.push(date);
+        self.iso_year.push(parsed.iso_week().year());
+        self.iso_week.push(i32::try_from(parsed.iso_week().week())?);
+        self.page_id.push(row.page_id);
+        self.page_title.push(row.page_title.clone());
+        self.page_namespace.push(row.page_namespace);
+        self.edits.push(row.edits);
+        self.previous_week_edits.push(previous);
+        let change = i64::from(row.edits) - i64::from(previous);
+        self.wow_change.push(change);
+        self.wow_rate
+            .push((previous != 0).then_some(change as f64 / f64::from(previous)));
+        self.previous = Some(row);
+        Ok(())
+    }
+
+    fn take_frame(&mut self, wiki: &str) -> Result<DataFrame> {
+        let rows = self.len();
+        let previous = self.previous.clone();
+        let taken = std::mem::take(self);
+        self.previous = previous;
+        DataFrame::new_infer_height(vec![
+            Column::new("week_start".into(), taken.week_start),
+            Column::new("iso_year".into(), taken.iso_year),
+            Column::new("iso_week".into(), taken.iso_week),
+            Column::new("page_id".into(), taken.page_id),
+            Column::new("page_title".into(), taken.page_title),
+            Column::new("page_namespace".into(), taken.page_namespace),
+            Column::new("edits".into(), taken.edits),
+            Column::new("previous_week_edits".into(), taken.previous_week_edits),
+            Column::new("wow_change".into(), taken.wow_change),
+            Column::new("wow_rate".into(), taken.wow_rate),
+            Column::new("wiki".into(), vec![wiki; rows]),
+        ])
+        .map_err(Into::into)
+    }
+}
+
+fn write_weekly_contribution_run(path: &Path, frame: &mut DataFrame) -> Result<()> {
+    let mut file = File::create(path)?;
+    ParquetWriter::new(&mut file)
+        .with_compression(ParquetCompression::Zstd(None))
+        .with_row_group_size(Some(WEEKLY_EXTERNAL_READ_ROWS))
+        .set_parallel(false)
+        .finish(frame)?;
+    file.sync_all()?;
+    Ok(())
+}
+
+fn compute_page_weekly_external_qualification(
+    wiki: &str,
+    data_dir: &Path,
+    output_dir: &Path,
+    config: &WeeklyAggregationConfig,
+    snapshot: Option<&str>,
+    cross_snapshot: Option<&crate::cross_snapshot::CrossSnapshotCache>,
+) -> Result<Option<WeeklyAggregationReport>> {
+    let started = Instant::now();
+    let snapshot = snapshot.context("external weekly qualification requires a snapshot")?;
+    let layer = storage::snapshot_compute_layer(
+        data_dir,
+        wiki,
+        snapshot,
+        storage::GenerationLayer::Warehouse,
+    )?;
+    let partitions = storage::snapshot_partition_specs(data_dir, wiki, snapshot, layer)?;
+    if partitions.is_empty() {
+        return Ok(None);
+    }
+    let runs = WeeklyRunDir::new(output_dir, wiki, config.scratch_root.as_deref())?;
+    let event_date_options = StrptimeOptions {
+        format: Some("%Y-%m-%d".into()),
+        strict: true,
+        exact: true,
+        cache: true,
+    };
+    let reduction_started = Instant::now();
+    let mut contribution_paths = Vec::with_capacity(partitions.len());
+    let mut staged_rows = 0usize;
+    let mut total_edits_before = 0i64;
+    for (index, partition) in partitions.iter().enumerate() {
+        let input_digest = cross_snapshot
+            .map(|cache| cache.month_digest(&partition.year_month))
+            .transpose()?;
+        let mut contribution = cached_or_compute(
+            cross_snapshot,
+            "page_week_contribution",
+            weekly::CONTRIBUTION_ALGORITHM_VERSION,
+            input_digest,
+            "weekly_contribution",
+            || {
+                let reduced = warehouse_lazyframe(&partition.files)?
+                    .with_column(
+                        col("event_timestamp")
+                            .str()
+                            .slice(lit(0), lit(10))
+                            .str()
+                            .to_date(event_date_options.clone())
+                            .dt()
+                            .truncate(lit("1w"))
+                            .alias("week_start"),
+                    )
+                    .group_by(weekly_group_keys())
+                    .agg([len().alias("edits")])
+                    .collect()?;
+                sort_frame(reduced, weekly_sort_keys())
+            },
+        )?;
+        let edits = sum_edits_column(std::slice::from_ref(&contribution))?;
+        let source_rows = parquet_paths_row_count(&partition.files)?;
+        anyhow::ensure!(
+            u64::try_from(edits)? == source_rows,
+            "external weekly month {} lost edits",
+            partition.year_month
+        );
+        total_edits_before = total_edits_before
+            .checked_add(edits)
+            .context("external weekly input edit overflow")?;
+        staged_rows = staged_rows
+            .checked_add(contribution.height())
+            .context("external weekly contribution row overflow")?;
+        let path = runs.partition_path(index);
+        write_weekly_contribution_run(&path, &mut contribution)?;
+        contribution_paths.push(path);
+    }
+    let reduction_elapsed_ms = reduction_started.elapsed().as_millis() as u64;
+    let scratch_peak_bytes = runs.size_bytes()?;
+    let mut cursors = contribution_paths
+        .iter()
+        .map(|path| WeeklyContributionCursor::new(path))
+        .collect::<Result<Vec<_>>>()?;
+    let mut heap = std::collections::BinaryHeap::new();
+    for (run, cursor) in cursors.iter_mut().enumerate() {
+        if let Some(row) = cursor.next_row()? {
+            heap.push(std::cmp::Reverse((row, run)));
+        }
+    }
+    let reconciliation_started = Instant::now();
+    let final_path = output_dir.join(wiki).join("page_weekly_edits.parquet");
+    let mut writer: Option<AtomicBatchedParquetWriter> = None;
+    let mut batch = WeeklyFinalBatch::default();
+    let mut current: Option<WeeklyContributionRow> = None;
+    let mut output_rows = 0usize;
+    let mut total_edits_after = 0i64;
+    let mut minimum_week = None;
+    let mut maximum_week = None;
+
+    let flush = |batch: &mut WeeklyFinalBatch,
+                 writer: &mut Option<AtomicBatchedParquetWriter>|
+     -> Result<()> {
+        if batch.len() == 0 {
+            return Ok(());
+        }
+        let mut frame = batch.take_frame(wiki)?;
+        if writer.is_none() {
+            *writer = Some(AtomicBatchedParquetWriter::new(
+                final_path.clone(),
+                frame.schema(),
+            )?);
+        }
+        writer
+            .as_mut()
+            .context("external weekly writer was not initialized")?
+            .write_batch(&mut frame)
+    };
+
+    while let Some(std::cmp::Reverse((row, run))) = heap.pop() {
+        if let Some(next) = cursors[run].next_row()? {
+            heap.push(std::cmp::Reverse((next, run)));
+        }
+        if let Some(active) = current.as_mut()
+            && active.same_key(&row)
+        {
+            active.edits = active
+                .edits
+                .checked_add(row.edits)
+                .context("external weekly boundary edit overflow")?;
+            continue;
+        }
+        if let Some(completed) = current.replace(row) {
+            minimum_week = minimum_week.into_iter().chain([completed.week_start]).min();
+            maximum_week = maximum_week.into_iter().chain([completed.week_start]).max();
+            total_edits_after = total_edits_after
+                .checked_add(i64::from(completed.edits))
+                .context("external weekly output edit overflow")?;
+            output_rows += 1;
+            batch.push(completed)?;
+            if batch.len() >= WEEKLY_EXTERNAL_BATCH_ROWS {
+                flush(&mut batch, &mut writer)?;
+            }
+        }
+    }
+    if let Some(completed) = current {
+        minimum_week = minimum_week.into_iter().chain([completed.week_start]).min();
+        maximum_week = maximum_week.into_iter().chain([completed.week_start]).max();
+        total_edits_after = total_edits_after
+            .checked_add(i64::from(completed.edits))
+            .context("external weekly output edit overflow")?;
+        output_rows += 1;
+        batch.push(completed)?;
+    }
+    flush(&mut batch, &mut writer)?;
+    anyhow::ensure!(
+        total_edits_before == total_edits_after,
+        "external weekly merge lost or duplicated edits"
+    );
+    let writer = writer.context("external weekly merge produced no output")?;
+    let output_bytes = writer.finish()?;
+    let reconciliation_elapsed_ms = reconciliation_started.elapsed().as_millis() as u64;
+    let memory = MemorySnapshot::capture();
+    let minimum_week_start = minimum_week.and_then(format_epoch_day);
+    let maximum_week_start = maximum_week.and_then(format_epoch_day);
+    Ok(Some(WeeklyAggregationReport {
+        wiki: wiki.to_string(),
+        bucket_count: config.logical_bucket_count(),
+        primary_bucket_count: config.primary_bucket_count,
+        secondary_bucket_count: config.secondary_bucket_count,
+        partitions: partitions.len(),
+        staged_rows,
+        output_rows,
+        total_edits: total_edits_after,
+        minimum_week_start,
+        maximum_week_start,
+        bucket_staged_rows: Vec::new(),
+        primary_bucket_staged_rows: Vec::new(),
+        largest_bucket_staged_rows: 0,
+        output_bytes,
+        scratch_peak_bytes,
+        working_storage_peak_bytes: scratch_peak_bytes.saturating_add(output_bytes),
+        reduction_peak: ResourcePeak::default(),
+        reconciliation_peak: ResourcePeak::default(),
+        final_memory: memory,
+        reduction_elapsed_ms,
+        reconciliation_elapsed_ms,
+        elapsed_ms: started.elapsed().as_millis() as u64,
+    }))
+}
+
 fn weekly_sort_keys() -> [&'static str; 4] {
     ["page_id", "page_namespace", "page_title", "week_start"]
 }
@@ -3196,7 +3565,7 @@ pub(crate) fn compute_cross_snapshot_qualification_build(
         ComputePlan::all_recompute(),
         cache.as_ref(),
     )?;
-    compute_page_weekly_edits_for_snapshot_cached(
+    compute_page_weekly_external_qualification(
         wiki,
         data_dir,
         output_dir,
