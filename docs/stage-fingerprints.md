@@ -10,7 +10,9 @@ Receipts are stored outside published artifacts:
 ```text
 data/stages/<wiki>/<snapshot>/fetch.json
 data/stages/<wiki>/<snapshot>/ingest.json
+data/snapshots/<wiki>/<snapshot>/remote-inventory.json
 data/snapshots/<wiki>/<snapshot>/workload-profile.json
+output/_ready-index/<wiki>.json
 output/_stages/compute/<wiki>.json
 output/_stages/patrol_compute/<wiki>.json
 output/_stages/merge.json
@@ -45,8 +47,12 @@ fast validation index and is deliberately excluded from the fingerprint.
 - **fetch** derives the complete source list first. A source already represented
   by a valid generation-scoped ingest marker is never probed for disk headroom
   or downloaded. Missing/invalid sources alone are fetched.
-- **ingest** reuses only a receipt whose complete output generation still
-  validates. It then atomically selects that generation again.
+- **ingest** authenticates the immutable generation manifest through its stage
+  receipt. Same-snapshot reuse validates only the small source plan and
+  manifest identities, then consumes the manifest allowlist from a process-local
+  `(data root, wiki, snapshot, manifest hash)` cache. It does not reconstruct
+  the manifest, hash fragments, or reopen Parquet footers. Strict physical
+  validation remains the compatibility, recovery, and scrub path.
 - **compute** reuses only the exact selected generation, explicit Rust
   algorithm version, persisted adaptive workload profile, and complete recorded
   metric inventory. The profile records total compressed bytes, source count,
@@ -67,6 +73,13 @@ fast validation index and is deliberately excluded from the fingerprint.
 - **site** includes the publication candidate's artifacts plus the Observable
   sources/configuration. Reuse runs only inside the fail-closed publication
   flow, after the current run receipt is verified.
+- **publication** reads one atomic `_ready-index/<wiki>.json` per managed wiki.
+  The index binds the newest ready and active published candidates to their
+  ready-receipt hashes, core/patrol artifact-receipt identities, and workload
+  profile. Directory discovery is used only to rebuild a missing or invalid
+  index. If the sorted active ready hashes, lifecycle hash, merge/publication
+  versions, and site-source fingerprint match `publication-gate.json`, the
+  publisher records `no_op` before merge, Parquet validation, or site build.
 
 Changing Rust logic without changing source data must increment the relevant
 `*_ALGORITHM_VERSION` constant. CI embeds `github.sha` as
@@ -75,9 +88,14 @@ explicit algorithm version is always present.
 
 ## Snapshot Resolution
 
-When `fetch` or `run` has no explicit `--version`, the binary probes Wikimedia
+When `fetch` or `run` has no explicit `--version`, the binary resolves Wikimedia
 once at run start and pins the newest complete snapshot common to every
-requested wiki. It starts with the preceding UTC month and falls back only
+requested wiki. A successful completeness pass atomically records a separate
+`remote-inventory.json` containing the plan hash, remote sizes, range support,
+ETag/Last-Modified values when supplied, and check time. Later triggers reuse
+that immutable inventory; an incomplete newest month is tested from the newest
+source backward, so enwiki does not repeat hundreds of historical HEAD probes.
+Resolution starts with the preceding UTC month and falls back only
 within `WIKI_ECON_MAX_SNAPSHOT_LAG_MONTHS` (default: `2`). A fallback emits a
 warning; finding nothing within the bound fails the run.
 

@@ -21,6 +21,13 @@ schemas, row-count contracts, wiki labels, dates, snapshot cutoff, and
 patrol/rights sources pass validation. A directory without a valid
 `ready.json` is never eligible for publication.
 
+The same commit atomically updates `output/_ready-index/<wiki>.json`. The index
+contains the newest valid ready candidate, the active published candidate,
+snapshot, workload profile, core and patrol receipt identities, and the
+ready-receipt SHA-256. Publishers read these compact indexes in the normal path;
+candidate-directory discovery is retained as a self-healing fallback that
+rebuilds a missing, truncated, or stale index.
+
 Every attempt also has a durable record below
 `output/_generation-state/<wiki>/<snapshot>/<run-id>.json`. Its guarded state
 machine is:
@@ -53,8 +60,12 @@ unselected input generation.
 ## Publication transaction
 
 `wiki-econ publication-prepare-ready` runs under the sole global
-`output/.publication.lock`. It revalidates every ready receipt and artifact,
-selects the newest non-downgrading candidate for each managed wiki, and writes
+`output/.publication.lock`. Before selection it compares the current
+publication no-op digest: sorted active ready-receipt identities, lifecycle
+hash, merge algorithm version, publication contract version, and site-source
+fingerprint. A match records an immediate `no_op` after compact receipt and
+artifact metadata checks. Otherwise it validates changed candidates, selects
+the newest non-downgrading candidate for each managed wiki, and writes
 a recovery journal under:
 
 ```text
@@ -107,8 +118,9 @@ the pipeline deliberately does not infer cross-snapshot deltas.
 
 The publisher runs every two hours. It may publish one wiki while another is
 still computing; an incomplete or failed candidate is invisible to it. A
-publication with no new ready candidate is a validated near-no-op and may
-reuse both merge and site fingerprints.
+publication with no new ready candidate and an identical publication digest
+is an immediate no-op; it does not walk candidate trees, decode Parquet, merge,
+or invoke the site build.
 
 The former `wiki-econ-refresh` and split stage jobs remain on-demand recovery
 tools but are no longer scheduled. They use the legacy whole-refresh lock and

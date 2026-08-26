@@ -140,6 +140,12 @@ and higher resource envelope are being qualified.
   fallback is controlled by `WIKI_ECON_MAX_SNAPSHOT_LAG_MONTHS` (default `2`);
   exceeding it fails closed. Receipt layout and invalidation rules are
   documented in [stage fingerprints](../../docs/stage-fingerprints.md).
+  Completed source inventories are retained beside each snapshot plan, so a
+  same-snapshot enwiki trigger probes only a possibly incomplete newest source
+  and reuses the prior completed inventory instead of issuing hundreds of
+  historical HEAD requests. The publisher consumes atomic per-wiki ready
+  indexes and a receipt-backed publication digest; unchanged publication
+  preparation returns before merge and site build.
   A separate `wiki-econ-artifact-scrub` job runs monthly under the publication
   lock and independently rehashes every published Parquet against its canonical
   semantic receipt. Reports are retained under `output/_scrubs/`; this does not

@@ -64,6 +64,11 @@ Important decisions:
   Monthly planning plus bounded ingestion does not by itself qualify giant
   projects for production; bounded compute remains required before enabling
   enwiki.
+- Remote completeness metadata is deliberately separate from the canonical
+  plan. A successful full check writes immutable `remote-inventory.json` with
+  the plan hash, source count, sizes and available HTTP identity headers.
+  Snapshot resolution and workload sizing reuse it; an invalid receipt is
+  ignored and rebuilt only after a new complete probe.
 
 ## Ingest
 
@@ -91,6 +96,10 @@ Important decisions:
   only manifest-listed fragments; filesystem discovery is retained solely for
   imported legacy datasets that have no snapshot pointer. Unlisted or abandoned
   Parquets therefore cannot enter a computation.
+- Once the ingest stage receipt authenticates that manifest and its source
+  plan, ordinary readers memoize the parsed allowlist and skip fragment hashes
+  and footer reads. Independent artifact scrubs and recovery retain the strict
+  physical validation path.
 - Fragment compaction is not currently performed. If introduced, it must be a
   separately fingerprinted transaction that publishes a replacement generation
   manifest rather than appending to or rewriting selected fragments in place.
