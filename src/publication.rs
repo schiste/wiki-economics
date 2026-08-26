@@ -514,6 +514,71 @@ struct MetricReport {
 struct PatrolSourceReport {
     patrol_events: u64,
     rights_events: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    generation: Option<PatrolGenerationReport>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct PatrolGenerationReport {
+    remote_url: String,
+    content_length: u64,
+    etag: Option<String>,
+    last_modified: Option<String>,
+    downloaded_sha256: String,
+    parser_version: String,
+    total_log_items: u64,
+    skipped_events: u64,
+    manifest_sha256: String,
+}
+
+fn patrol_source_report(data_dir: &Path, wiki: &str, snapshot: &str) -> Result<PatrolSourceReport> {
+    let generation = crate::patrol::source_generation_summary(data_dir, wiki, snapshot)?;
+    patrol_source_report_with_generation(data_dir, wiki, generation)
+}
+
+fn patrol_source_report_with_generation(
+    data_dir: &Path,
+    wiki: &str,
+    generation: Option<crate::patrol::PatrolSourceSummary>,
+) -> Result<PatrolSourceReport> {
+    if let Some(source) = generation {
+        ensure!(
+            source.patrol_events > 0 && source.rights_events > 0,
+            "scheduled wiki {wiki} has empty patrol or rights source data"
+        );
+        return Ok(PatrolSourceReport {
+            patrol_events: source.patrol_events,
+            rights_events: source.rights_events,
+            generation: Some(PatrolGenerationReport {
+                remote_url: source.remote_url,
+                content_length: source.content_length,
+                etag: source.etag,
+                last_modified: source.last_modified,
+                downloaded_sha256: source.downloaded_sha256,
+                parser_version: source.parser_version,
+                total_log_items: source.total_log_items,
+                skipped_events: source.skipped_events,
+                manifest_sha256: source.manifest_sha256,
+            }),
+        });
+    }
+
+    let patrol_dir = data_dir.join("patrol").join(wiki);
+    let patrol_path = patrol_dir.join("patrol.parquet");
+    let rights_path = patrol_dir.join("rights.parquet");
+    let patrol_identity = format!("patrol-source/{wiki}/patrol.parquet");
+    let rights_identity = format!("patrol-source/{wiki}/rights.parquet");
+    let patrol_rows = receipted_rows(&patrol_path, &patrol_identity, "patrol-source-v1")?;
+    let rights_rows = receipted_rows(&rights_path, &rights_identity, "patrol-source-v1")?;
+    ensure!(
+        patrol_rows > 0 && rights_rows > 0,
+        "scheduled wiki {wiki} has empty patrol or rights source data"
+    );
+    Ok(PatrolSourceReport {
+        patrol_events: patrol_rows,
+        rights_events: rights_rows,
+        generation: None,
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1073,13 +1138,7 @@ pub(crate) fn mark_wiki_candidate_ready(
         }
         artifacts.push(prepared_artifact(&candidate_dir, &path)?);
     }
-    let patrol_dir = data_dir.join("patrol").join(wiki);
-    for name in ["patrol.parquet", "rights.parquet"] {
-        let path = patrol_dir.join(name);
-        let identity = format!("patrol-source/{wiki}/{name}");
-        let rows = receipted_rows(&path, &identity, "patrol-source-v1")?;
-        ensure!(rows > 0, "candidate patrol source {name} is empty");
-    }
+    patrol_source_report(data_dir, wiki, snapshot)?;
     artifacts.sort_by(|left, right| left.path.cmp(&right.path));
     let workload_profile = crate::workload_profile::load(data_dir, wiki, snapshot)?;
     ensure!(
@@ -1193,13 +1252,7 @@ pub(crate) fn mark_wiki_qualification_ready(
         }
         artifacts.push(prepared_artifact(&qualification_dir, &path)?);
     }
-    let patrol_dir = data_dir.join("patrol").join(wiki);
-    for name in ["patrol.parquet", "rights.parquet"] {
-        let path = patrol_dir.join(name);
-        let identity = format!("patrol-source/{wiki}/{name}");
-        let rows = receipted_rows(&path, &identity, "patrol-source-v1")?;
-        ensure!(rows > 0, "qualification patrol source {name} is empty");
-    }
+    patrol_source_report(data_dir, wiki, snapshot)?;
     artifacts.sort_by(|left, right| left.path.cmp(&right.path));
     let workload_profile = crate::workload_profile::load(data_dir, wiki, snapshot)?
         .context("qualification has no persisted workload profile")?;
@@ -4094,22 +4147,12 @@ pub fn validate(
                 .get(wiki)
                 .is_some_and(|lifecycle| lifecycle.refresh == "scheduled")
     }) {
-        let patrol_path = data_dir.join("patrol").join(&wiki).join("patrol.parquet");
-        let rights_path = data_dir.join("patrol").join(&wiki).join("rights.parquet");
-        let patrol_identity = format!("patrol-source/{wiki}/patrol.parquet");
-        let rights_identity = format!("patrol-source/{wiki}/rights.parquet");
-        let patrol_rows = receipted_rows(&patrol_path, &patrol_identity, "patrol-source-v1")?;
-        let rights_rows = receipted_rows(&rights_path, &rights_identity, "patrol-source-v1")?;
-        ensure!(
-            patrol_rows > 0 && rights_rows > 0,
-            "scheduled wiki {wiki} has empty patrol or rights source data"
-        );
+        let snapshot = selected_snapshots
+            .get(&wiki)
+            .with_context(|| format!("scheduled wiki {wiki} has no selected snapshot"))?;
         patrol_sources.insert(
-            wiki,
-            PatrolSourceReport {
-                patrol_events: patrol_rows,
-                rights_events: rights_rows,
-            },
+            wiki.clone(),
+            patrol_source_report(data_dir, &wiki, snapshot)?,
         );
     }
     let policy = licensing::publication_policy()?;
@@ -4245,6 +4288,36 @@ mod tests {
             std::io::ErrorKind::Unsupported,
             "fixture",
         ))
+    }
+
+    #[test]
+    fn generation_patrol_source_report_preserves_authenticated_provenance() -> Result<()> {
+        let data = TestDir::new()?;
+        let source = crate::patrol::PatrolSourceSummary {
+            remote_url: "https://dumps.wikimedia.org/test.xml.gz".to_string(),
+            content_length: 123,
+            etag: Some("fixture".to_string()),
+            last_modified: Some("Wed, 26 Aug 2026 00:00:00 GMT".to_string()),
+            downloaded_sha256: "a".repeat(64),
+            parser_version: "parser-v1".to_string(),
+            total_log_items: 15,
+            patrol_events: 10,
+            rights_events: 2,
+            skipped_events: 3,
+            manifest_sha256: "b".repeat(64),
+        };
+        let report =
+            patrol_source_report_with_generation(data.path(), "nlwiki", Some(source.clone()))?;
+        assert_eq!(report.patrol_events, 10);
+        assert_eq!(report.rights_events, 2);
+        let generation = report.generation.context("generation report is missing")?;
+        assert_eq!(generation.downloaded_sha256, "a".repeat(64));
+        assert_eq!(generation.manifest_sha256, "b".repeat(64));
+
+        let mut empty = source;
+        empty.rights_events = 0;
+        assert!(patrol_source_report_with_generation(data.path(), "nlwiki", Some(empty)).is_err());
+        Ok(())
     }
 
     struct Fixture {

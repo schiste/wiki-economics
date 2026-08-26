@@ -349,8 +349,68 @@ function parquetRowCounter(countsFile = process.env.WIKI_ECON_PARQUET_ROW_COUNTS
   };
 }
 
-async function patrolSummary(dataDir, outputDir, wiki, required, rowCounter) {
+function selectedPatrolGeneration(dataDir, wiki, snapshot) {
+  if (!snapshot) return null;
   const sourceDir = path.join(dataDir, "patrol", wiki);
+  const pointerFile = path.join(sourceDir, "current-generation.json");
+  const pointer = readJson(pointerFile);
+  if (pointer?.schema_version !== 1
+      || pointer?.wiki !== wiki
+      || pointer?.snapshot !== snapshot
+      || typeof pointer?.parser_version !== "string" || pointer.parser_version.length === 0
+      || !/^generations\/[0-9]{4}-[0-9]{2}\/[0-9a-f]{64}\/generation\.json$/.test(pointer?.manifest_relative_path || "")
+      || !/^[0-9a-f]{64}$/.test(pointer?.manifest_sha256 || "")
+      || !/^[0-9a-f]{64}$/.test(pointer?.manifest_file_sha256 || "")) return null;
+  const root = path.resolve(sourceDir);
+  const manifestFile = path.resolve(sourceDir, pointer.manifest_relative_path);
+  if (!manifestFile.startsWith(`${root}${path.sep}`)) return null;
+  let bytes;
+  try { bytes = fs.readFileSync(manifestFile); } catch { return null; }
+  if (crypto.createHash("sha256").update(bytes).digest("hex") !== pointer.manifest_file_sha256) return null;
+  const generation = readJson(manifestFile);
+  const stats = generation?.stats;
+  if (generation?.schema_version !== 2
+      || generation?.wiki !== wiki
+      || generation?.snapshot !== snapshot
+      || generation?.parser_version !== pointer.parser_version
+      || generation?.manifest_sha256 !== pointer.manifest_sha256
+      || !Number.isSafeInteger(stats?.total_log_items) || stats.total_log_items < 0
+      || !Number.isSafeInteger(stats?.patrol_events) || stats.patrol_events < 0
+      || !Number.isSafeInteger(stats?.rights_events) || stats.rights_events < 0
+      || !Number.isSafeInteger(stats?.skipped_events) || stats.skipped_events < 0
+      || stats.total_log_items !== stats.patrol_events + stats.rights_events + stats.skipped_events
+      || !Array.isArray(generation?.autopatrol_groups)
+      || !Array.isArray(generation?.patrol_months)
+      || !Array.isArray(generation?.rights_months)) return null;
+  const validateArtifacts = (artifacts) => {
+    let rows = 0;
+    let previous = null;
+    for (const artifact of artifacts) {
+      if (!/^\d{4}-\d{2}$/.test(artifact?.event_month || "")
+          || (previous !== null && previous >= artifact.event_month)
+          || !/^[0-9a-f]{64}$/.test(artifact?.artifact_sha256 || "")
+          || !Number.isSafeInteger(artifact?.bytes) || artifact.bytes <= 0
+          || !Number.isSafeInteger(artifact?.rows) || artifact.rows <= 0
+          || typeof artifact?.relative_path !== "string") return null;
+      const file = path.resolve(path.dirname(manifestFile), artifact.relative_path);
+      if (!file.startsWith(`${path.dirname(manifestFile)}${path.sep}`)) return null;
+      const stat = statFile(file);
+      if (!stat || stat.size !== artifact.bytes) return null;
+      rows += artifact.rows;
+      previous = artifact.event_month;
+    }
+    return rows;
+  };
+  const patrolRows = validateArtifacts(generation.patrol_months);
+  const rightsRows = validateArtifacts(generation.rights_months);
+  if (patrolRows === null || rightsRows === null
+      || patrolRows !== stats.patrol_events || rightsRows !== stats.rights_events) return null;
+  return {generation, patrolRows, rightsRows};
+}
+
+async function patrolSummary(dataDir, outputDir, wiki, snapshot, required, rowCounter) {
+  const sourceDir = path.join(dataDir, "patrol", wiki);
+  const selected = selectedPatrolGeneration(dataDir, wiki, snapshot);
   const xml = statFile(path.join(sourceDir, `${wiki}-latest-pages-logging.xml.gz`));
   const groups = readJson(path.join(sourceDir, "autopatrol_groups.json"));
   const patrolFile = path.join(sourceDir, "patrol.parquet");
@@ -363,10 +423,17 @@ async function patrolSummary(dataDir, outputDir, wiki, required, rowCounter) {
     if (!stat) return 0;
     try { return await rowCounter.count(file); } catch { return 0; }
   };
-  const [patrolRows, rightsRows, metricRows] = await Promise.all([
+  const [legacyPatrolRows, legacyRightsRows, metricRows] = await Promise.all([
     count(patrolFile, sourcePatrol), count(rightsFile, sourceRights), count(metricFile, metric),
   ]);
-  const groupsReady = Array.isArray(groups?.autopatrol_groups) && groups.autopatrol_groups.length > 0;
+  const patrolRows = selected?.patrolRows ?? legacyPatrolRows;
+  const rightsRows = selected?.rightsRows ?? legacyRightsRows;
+  const groupsReady = selected
+    ? selected.generation.autopatrol_groups.length > 0
+    : Array.isArray(groups?.autopatrol_groups) && groups.autopatrol_groups.length > 0;
+  const sourceReady = selected
+    ? groupsReady && patrolRows > 0 && rightsRows > 0
+    : Boolean(xml?.size && groupsReady && patrolRows > 0 && rightsRows > 0);
   return {
     required: Number(required),
     xml: Number(Boolean(xml?.size)),
@@ -375,7 +442,15 @@ async function patrolSummary(dataDir, outputDir, wiki, required, rowCounter) {
     rights: Number(rightsRows > 0),
     rights_rows: rightsRows,
     groups: Number(groupsReady),
-    source_ready: Number(Boolean(xml?.size && groupsReady && patrolRows > 0 && rightsRows > 0)),
+    source_generation: selected ? {
+      snapshot,
+      parser_version: selected.generation.parser_version,
+      source: selected.generation.source,
+      total_log_items: selected.generation.stats.total_log_items,
+      skipped_events: selected.generation.stats.skipped_events,
+      manifest_sha256: selected.generation.manifest_sha256,
+    } : null,
+    source_ready: Number(sourceReady),
     metric_ready: Number(metricRows > 0),
     metric_rows: metricRows,
   };
@@ -434,7 +509,7 @@ async function buildManifest(options = {}) {
       const generation = generationSummary(dataDir, wiki);
       const metrics = fileList(path.join(outputDir, wiki));
       const metricNames = new Set(metrics.map((entry) => entry.name));
-      const patrol = await patrolSummary(dataDir, outputDir, wiki, patrolRequired, rowCounter);
+      const patrol = await patrolSummary(dataDir, outputDir, wiki, generation.version, patrolRequired, rowCounter);
       const selectedProfile = workloadProfile(dataDir, wiki, generation.version);
       const missingCore = requiredCore.filter((metric) => !metricNames.has(metric));
       const missingMerged = expected.filter((metric) =>

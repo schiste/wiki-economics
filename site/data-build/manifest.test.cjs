@@ -125,6 +125,54 @@ function rows(values) {
   };
 }
 
+function installPatrolGeneration(dataDir, wiki, snapshot) {
+  const crypto = require("node:crypto");
+  const parserVersion = "patrol-logging-multigzip-monthly-v1";
+  const parserIdentity = crypto.createHash("sha256").update(parserVersion).digest("hex");
+  const generationRoot = path.join(dataDir, "patrol", wiki, "generations", snapshot, parserIdentity);
+  const patrolFile = path.join(generationRoot, "patrol/year=2026/month=2026-07/part-00000.parquet");
+  const rightsFile = path.join(generationRoot, "rights/year=2026/month=2026-07/part-00000.parquet");
+  fs.mkdirSync(path.dirname(patrolFile), {recursive: true});
+  fs.mkdirSync(path.dirname(rightsFile), {recursive: true});
+  fs.writeFileSync(patrolFile, "monthly-patrol");
+  fs.writeFileSync(rightsFile, "monthly-rights");
+  const artifact = (file, relativePath, rows) => ({
+    event_month: "2026-07",
+    relative_path: relativePath,
+    artifact_sha256: crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex"),
+    bytes: fs.statSync(file).size,
+    rows,
+    observed_modified_unix_nanos: 1,
+    ordering_contract: "timestamp-logical-fields-v1",
+  });
+  const generation = {
+    schema_version: 2,
+    wiki,
+    snapshot,
+    parser_version: parserVersion,
+    source: {remote_url: "https://dumps.wikimedia.org/test.xml.gz", content_length: 123,
+      etag: "fixture", last_modified: "Wed, 26 Aug 2026 00:00:00 GMT", downloaded_sha256: "a".repeat(64)},
+    stats: {total_log_items: 15, patrol_events: 10, rights_events: 2, skipped_events: 3},
+    autopatrol_groups: ["sysop"],
+    patrol_months: [artifact(patrolFile, "patrol/year=2026/month=2026-07/part-00000.parquet", 10)],
+    rights_months: [artifact(rightsFile, "rights/year=2026/month=2026-07/part-00000.parquet", 2)],
+    rights_timeline_digest: "b".repeat(64),
+    manifest_sha256: "c".repeat(64),
+  };
+  const manifestFile = path.join(generationRoot, "generation.json");
+  fs.writeFileSync(manifestFile, `${JSON.stringify(generation, null, 2)}\n`);
+  fs.writeFileSync(path.join(dataDir, "patrol", wiki, "current-generation.json"), JSON.stringify({
+    schema_version: 1,
+    wiki,
+    snapshot,
+    parser_version: parserVersion,
+    manifest_relative_path: `generations/${snapshot}/${parserIdentity}/generation.json`,
+    manifest_sha256: generation.manifest_sha256,
+    manifest_file_sha256: crypto.createHash("sha256").update(fs.readFileSync(manifestFile)).digest("hex"),
+  }));
+  return {manifestFile, patrolFile};
+}
+
 test("generation readiness follows the pointer and strict ingest receipt without raw dumps", async () => {
   const current = fixture("complete");
   const manifest = await buildManifest({
@@ -172,6 +220,37 @@ test("generation readiness follows the pointer and strict ingest receipt without
   assert.equal(manifest.wikis._stages, undefined);
   assert.equal(manifest.wikis[".refresh-lock"], undefined);
   assert.equal(manifest.wikis.logs, undefined);
+});
+
+test("patrol readiness follows the selected immutable generation after raw cleanup", async () => {
+  const current = fixture("patrol-generation");
+  const patrolDir = path.join(current.dataDir, "patrol", "nlwiki");
+  for (const name of ["nlwiki-latest-pages-logging.xml.gz", "autopatrol_groups.json", "patrol.parquet", "rights.parquet"]) {
+    fs.rmSync(path.join(patrolDir, name));
+  }
+  const source = installPatrolGeneration(current.dataDir, "nlwiki", "2026-07");
+  const manifest = await buildManifest({
+    root,
+    dataDir: current.dataDir,
+    outputDir: current.outputDir,
+    lifecycle: lifecycle(),
+    rowCounter: rows({events: 0, rights: 0, metric: 5}),
+  });
+  assert.equal(manifest.wikis.nlwiki.status, "complete");
+  assert.equal(manifest.wikis.nlwiki.patrol.xml, 0);
+  assert.equal(manifest.wikis.nlwiki.patrol.event_rows, 10);
+  assert.equal(manifest.wikis.nlwiki.patrol.rights_rows, 2);
+  assert.equal(manifest.wikis.nlwiki.patrol.source_generation.snapshot, "2026-07");
+
+  fs.appendFileSync(source.manifestFile, "tampered");
+  const damaged = await buildManifest({
+    root,
+    dataDir: current.dataDir,
+    outputDir: current.outputDir,
+    lifecycle: lifecycle(),
+    rowCounter: rows({events: 0, rights: 0, metric: 5}),
+  });
+  assert.equal(damaged.wikis.nlwiki.status, "needs_patrol_fetch");
 });
 
 test("generation readiness rejects divergent analytical and warehouse row totals", () => {
