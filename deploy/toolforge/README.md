@@ -158,6 +158,10 @@ and higher resource envelope are being qualified.
   CPUs despite its one-CPU quota. Sequential raw/hash/ingest I/O uses Linux
   cache-discard hints after durable writes or completed reads so reproducible
   dump files do not consume the 6 GiB memory limit as retained page cache.
+  `WIKI_ECON_WEEKLY_WORKERS` likewise defaults to `1`. The separate
+  publication-invisible CPU matrix in `cpu-qualification-jobs.yaml` measures
+  1/2/4-CPU profiles for nlwiki, ptwiki, and frwiki before any production
+  default changes; see [benchmarking](../../docs/benchmarking.md#cpu-and-bounded-worker-qualification).
 - `run-record.cjs` — the single atomic writer for live refresh status and the
   bounded terminal history. It folds Rust/site stage events together with
   cgroup, disk, deployment provenance, and publication-gate data.

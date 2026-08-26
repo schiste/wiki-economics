@@ -126,3 +126,66 @@ counts only if they materially improve the measured maximum bucket or memory.
 The scratch root is explicit for capacity jobs. Normal compute may set
 `WIKI_ECON_SCRATCH_DIR`; the Toolforge refresh wrapper passes that root to
 safe stale-artifact cleanup after acquiring the single-flight lock.
+
+## CPU and bounded-worker qualification
+
+Do not raise production concurrency from the one-worker default based on host
+CPU visibility. Toolforge containers can see CPUs that are not included in
+their cgroup quota. Phase 8 uses twelve isolated, publication-invisible jobs:
+
+| CPU quota | Polars/Rayon threads | Weekly workers |
+| ---: | ---: | ---: |
+| 1 | 1 | 1 |
+| 2 | 2 | 1 |
+| 4 | 3 | 1 |
+| 4 | 3 | 2 |
+
+Run every profile for nlwiki, ptwiki, and frwiki, one job at a time. The
+on-demand definitions live in
+`deploy/toolforge/cpu-qualification-jobs.yaml`. Loading a definition starts
+it, so wait for a terminal state before loading the next one; overlapping runs
+would contaminate both CPU and shared-NFS throughput evidence:
+
+As checked with `toolforge jobs quota` on 2026-08-26, wiki-economics currently
+has 16 aggregate CPUs but a 3-CPU per-job ceiling. The required 4-CPU cells
+must not be launched until that per-job limit is raised to at least 4. A
+3-CPU substitution is useful exploratory evidence but does not satisfy this
+matrix or permit a production concurrency change.
+
+```sh
+toolforge jobs load --job wiki-econ-cpu-nl-c1-t1-w1 \
+  deploy/toolforge/cpu-qualification-jobs.yaml
+toolforge jobs show wiki-econ-cpu-nl-c1-t1-w1
+```
+
+Repeat for the twelve names in the manifest. The wrapper reuses each wiki's
+active immutable warehouse generation, produces no publication candidate, and
+removes isolated output and scratch on exit. Source downloads therefore remain
+serialized in production and are outside this compute-only matrix. Prefer the
+local dump mount for a later fetch/ingest-specific experiment.
+
+Pass the twelve retained receipt paths to the Rust evaluator:
+
+```sh
+wiki-econ cpu-qualify \
+  --capacity-report /path/to/nl-c1-t1-w1.json \
+  --capacity-report /path/to/nl-c2-t2-w1.json \
+  --capacity-report /path/to/nl-c4-t3-w1.json \
+  --capacity-report /path/to/nl-c4-t3-w2.json \
+  --capacity-report /path/to/pt-c1-t1-w1.json \
+  --capacity-report /path/to/pt-c2-t2-w1.json \
+  --capacity-report /path/to/pt-c4-t3-w1.json \
+  --capacity-report /path/to/pt-c4-t3-w2.json \
+  --capacity-report /path/to/fr-c1-t1-w1.json \
+  --capacity-report /path/to/fr-c2-t2-w1.json \
+  --capacity-report /path/to/fr-c4-t3-w1.json \
+  --capacity-report /path/to/fr-c4-t3-w2.json \
+  --report /data/project/wiki-economics/capacity/cpu-qualification.json
+```
+
+The evaluator rejects missing or duplicate cells, wrong cgroup CPU quotas,
+incomplete CPU/page-cache/I/O telemetry, inconsistent snapshots, any capacity
+gate failure, less than 25% memory headroom, or different output SHA-256 values
+across worker counts. A higher-CPU profile is recommended only if its aggregate
+wall-time speedup across all three wikis is at least 15%. A failed evaluation
+still writes the complete atomic report as qualification evidence.

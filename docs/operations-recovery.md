@@ -8,6 +8,13 @@ policy.
 
 ## Capacity qualification
 
+The bucket-topology gate below qualifies storage and memory shape. CPU quota
+or weekly-worker changes additionally require the twelve-cell nlwiki/ptwiki/
+frwiki matrix and Rust `cpu-qualify` evaluator documented in
+[CPU and bounded-worker qualification](benchmarking.md#cpu-and-bounded-worker-qualification).
+That matrix is publication-invisible and must run sequentially so shared NFS
+and CPU measurements remain attributable.
+
 Run nlwiki and ptwiki with 256 buckets and frwiki independently with 256, 512,
 and 1024 buckets. Each run must use a fresh 6 GiB / one-CPU Toolforge
 container so `memory.peak` belongs to one variant:

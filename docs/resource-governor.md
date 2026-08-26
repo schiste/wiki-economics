@@ -34,11 +34,12 @@ The production `256 x 1` layout writes stable primary-bucket row groups through
 one staging writer and reads one primary bucket at a time. Larger workloads can
 use two levels: monthly staging is compacted into 64 or 128 primary files in
 writer-bounded batches, then one primary is streamed by Parquet row group into
-16 or 32 secondary files. Only one secondary reconciliation unit is loaded,
-sorted, and grouped at a time. Primary scratch is deleted after its validated
-secondary fragments are durable. Final-level scratch is retained until the
-complete output has a footer, has been synced, and has been atomically renamed;
-the run directory is then reclaimed as one state transition.
+16 or 32 secondary files. One or two independently admitted reconciliation
+units may be loaded, sorted, and grouped at a time. Each worker writes an
+immutable result artifact; the main thread appends those artifacts in explicit
+logical-bucket order and immediately reclaims completed scratch. Primary
+scratch is deleted after its validated secondary fragments are durable. The
+run directory is reclaimed as one state transition.
 
 Both levels use non-overlapping bits from the same stable page hash. Traversal
 is primary-major then secondary-major, so repeated runs of one configuration
@@ -62,6 +63,7 @@ All byte values are integer bytes.
 | `WIKI_ECON_THREAD_LIMIT` | Upper bound for Rayon and Polars pools | configured pool size, otherwise 1 |
 | `WIKI_ECON_MAX_LOGICAL_PARTITION_BYTES` | Largest month accepted by compute | 8 GiB |
 | `WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS` | Parquet writers allowed at once | 16 |
+| `WIKI_ECON_WEEKLY_WORKERS` | Independently admitted weekly reconciliation workers; must not exceed the thread limit | 1 |
 | `WIKI_ECON_WORKLOAD_PROFILE` | Manual `small`/`large` override for isolated qualification only | unset |
 | `WIKI_ECON_REQUIRE_QUALIFIED_PROFILE` | Reject manual or unqualified profiles | false outside production; true in Toolforge wrappers |
 | `WIKI_ECON_WEEKLY_BUCKET_COUNT` | Legacy flat primary count; cannot be combined with the next two settings | 256 |
@@ -108,6 +110,14 @@ adaptive `small` profile prefers two workers, but the checked-in production
 capacity policy currently admits only the one-worker cap. These are operational
 defaults, not enwiki qualification results.
 
+Before a weekly worker starts, it reserves a conservative in-memory expansion
+estimate plus result scratch. Admission proves that current cgroup memory,
+existing worker reservations, the new estimate, and the mandatory reserve fit
+below the ceiling. Scratch and file descriptors are checked the same way. A
+closed gate rejects new work before Polars materializes the bucket; already
+admitted workers finish and release their reservations through RAII even on an
+error path.
+
 Worker counts are physical admission limits, not computation versions.
 `config/determinism-contract.json` pins the partition hash and every ordering
 rule, while the compute algorithm version includes that contract plus the
@@ -142,7 +152,7 @@ only if the capacity report retains at least 25% sustained memory headroom and
 the measured storage peak stays inside quota plus reserve. `capacity-bench`
 accepts `--weekly-buckets <primary>` and
 `--weekly-secondary-buckets <secondary>` and records all three counts
-(primary, secondary, and logical) in report schema 4.
+(primary, secondary, and logical) in report schema 5.
 
 ## Telemetry
 
@@ -150,10 +160,13 @@ Every admission, source completion, reduced partition, and reconciled bucket
 records a structured JSON sample in the Rust log. Samples include:
 
 - RSS plus cgroup current, peak, and limit memory;
-- cgroup CPU usage, throttled time, and throttle count;
+- cgroup CPU user/system/total time, scheduling periods, throttled periods, and
+  throttled time;
+- RSS, cgroup current/recorded peak, and cgroup page-cache peak;
+- process read/write bytes and derived throughput;
 - scratch bytes and persistent-filesystem used/free bytes;
-- open file descriptors and active source workers;
-- reserved source bytes; and
+- open file descriptors plus active source and weekly-bucket workers;
+- reserved source bytes plus bucket memory and scratch; and
 - cumulative download bytes, ingested rows, durations, and throughput.
 
 Linux production fails closed if memory or persistent-space telemetry needed
