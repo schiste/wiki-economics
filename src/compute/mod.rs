@@ -651,6 +651,59 @@ fn load_latest_lifecycle_checkpoint(
     Ok(None)
 }
 
+fn lifecycle_full_digest(
+    cache: &crate::cross_snapshot::CrossSnapshotCache,
+    partitions: &[storage::PartitionSpec],
+) -> Result<String> {
+    let digests = partitions
+        .iter()
+        .map(|partition| cache.month_digest(&partition.year_month))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(cache.derived_digest("lifecycle_full", lifecycle::ALGORITHM_VERSION, &digests))
+}
+
+fn load_cached_lifecycle_outputs(
+    cache: &crate::cross_snapshot::CrossSnapshotCache,
+    input_digest: &str,
+) -> Result<Option<Vec<(&'static str, DataFrame)>>> {
+    let mut outputs = Vec::new();
+    for metric in lifecycle::METRICS {
+        let Some(frame) = cache.load(
+            "lifecycle_final",
+            lifecycle::ALGORITHM_VERSION,
+            input_digest,
+            metric,
+        )?
+        else {
+            return Ok(None);
+        };
+        outputs.push((metric, frame));
+    }
+    Ok(Some(outputs))
+}
+
+fn store_lifecycle_outputs(
+    cache: &crate::cross_snapshot::CrossSnapshotCache,
+    input_digest: &str,
+    wiki: &str,
+    output_dir: &Path,
+) -> Result<()> {
+    for metric in lifecycle::METRICS {
+        let path = output_dir.join(wiki).join(format!("{metric}.parquet"));
+        let mut frame = ParquetReader::new(File::open(path)?)
+            .set_low_memory(true)
+            .finish()?;
+        cache.store(
+            "lifecycle_final",
+            lifecycle::ALGORITHM_VERSION,
+            input_digest,
+            metric,
+            &mut frame,
+        )?;
+    }
+    Ok(())
+}
+
 fn analytical_select_exprs() -> Vec<Expr> {
     schema::ANALYTICAL_COLUMNS
         .iter()
@@ -2826,22 +2879,38 @@ fn compute_all_incremental_cached(
     let mut gdp_activity_month_digests = Vec::new();
     let mut gdp_activity_year = None;
     let mut labor_monthly_frames = Vec::new();
-    let lifecycle_checkpoint = if plan.lifecycle.must_compute() {
+    let lifecycle_input_digest = if plan.lifecycle.must_compute() {
         cross_snapshot
-            .map(|cache| load_latest_lifecycle_checkpoint(cache, &partitions))
+            .map(|cache| lifecycle_full_digest(cache, &partitions))
             .transpose()?
-            .flatten()
     } else {
         None
     };
+    let mut cached_lifecycle_outputs = if let (Some(cache), Some(input_digest)) =
+        (cross_snapshot, lifecycle_input_digest.as_deref())
+    {
+        load_cached_lifecycle_outputs(cache, input_digest)?
+    } else {
+        None
+    };
+    let lifecycle_checkpoint =
+        if plan.lifecycle.must_compute() && cached_lifecycle_outputs.is_none() {
+            cross_snapshot
+                .map(|cache| load_latest_lifecycle_checkpoint(cache, &partitions))
+                .transpose()?
+                .flatten()
+        } else {
+            None
+        };
     let lifecycle_resume_through = lifecycle_checkpoint
         .as_ref()
         .map(|checkpoint| checkpoint.through_month.clone());
-    let mut registered_state = plan.lifecycle.must_compute().then(|| {
-        lifecycle_checkpoint
-            .map(LifecycleCheckpoint::into_state)
-            .unwrap_or_else(RegisteredState::new)
-    });
+    let mut registered_state =
+        (plan.lifecycle.must_compute() && cached_lifecycle_outputs.is_none()).then(|| {
+            lifecycle_checkpoint
+                .map(LifecycleCheckpoint::into_state)
+                .unwrap_or_else(RegisteredState::new)
+        });
     let mut lifecycle_month_digests = Vec::new();
 
     let partition_count = partitions.len();
@@ -2981,8 +3050,17 @@ fn compute_all_incremental_cached(
         )?;
         write_activity_outputs(wiki, output_dir, gdp_tier_frames)?;
     }
-    if let Some(state) = registered_state {
+    if let Some(outputs) = cached_lifecycle_outputs.as_mut() {
+        for (metric, frame) in outputs {
+            write_output(frame, wiki, metric, output_dir)?;
+        }
+    } else if let Some(state) = registered_state {
         write_lifecycle_outputs(wiki, output_dir, state)?;
+        if let (Some(cache), Some(input_digest)) =
+            (cross_snapshot, lifecycle_input_digest.as_deref())
+        {
+            store_lifecycle_outputs(cache, input_digest, wiki, output_dir)?;
+        }
     }
 
     Ok(partition_count)

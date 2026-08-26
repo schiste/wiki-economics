@@ -44,9 +44,24 @@ pub(crate) struct QualificationReport {
     pub(crate) candidate_snapshot: String,
     pub(crate) baseline_cache: CacheStats,
     pub(crate) candidate_cache: CacheStats,
+    pub(crate) unchanged_months: Vec<String>,
+    pub(crate) changed_months: Vec<String>,
+    pub(crate) removed_months: Vec<String>,
     pub(crate) artifact_count: usize,
     pub(crate) aggregate_sha256: String,
     pub(crate) artifacts: Vec<crate::determinism::ArtifactDigest>,
+    pub(crate) semantic_summaries: Vec<QualificationSemanticSummary>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct QualificationSemanticSummary {
+    pub(crate) identity: String,
+    pub(crate) rows: u64,
+    pub(crate) minimum_date: Option<String>,
+    pub(crate) maximum_date: Option<String>,
+    pub(crate) conservation_totals: BTreeMap<String, i128>,
+    pub(crate) artifact_sha256: String,
 }
 
 pub(crate) struct CrossSnapshotCache {
@@ -357,6 +372,36 @@ pub(crate) fn qualify(
         "cross-snapshot qualification root already exists: {}",
         work_root.display()
     );
+    let current_snapshot_before = storage::current_snapshot_version(data_dir, wiki)?;
+    let baseline_inventory =
+        canonical_month::ensure_snapshot_inventory(data_dir, wiki, baseline_snapshot)?;
+    let candidate_inventory =
+        canonical_month::ensure_snapshot_inventory(data_dir, wiki, candidate_snapshot)?;
+    let baseline_months = baseline_inventory
+        .identities
+        .iter()
+        .map(|identity| (identity.event_month.as_str(), identity.digest.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let candidate_months = candidate_inventory
+        .identities
+        .iter()
+        .map(|identity| (identity.event_month.as_str(), identity.digest.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let unchanged_months = candidate_months
+        .iter()
+        .filter(|(month, digest)| baseline_months.get(**month) == Some(digest))
+        .map(|(month, _)| (*month).to_string())
+        .collect::<Vec<_>>();
+    let changed_months = candidate_months
+        .iter()
+        .filter(|(month, digest)| baseline_months.get(**month) != Some(digest))
+        .map(|(month, _)| (*month).to_string())
+        .collect::<Vec<_>>();
+    let removed_months = baseline_months
+        .keys()
+        .filter(|month| !candidate_months.contains_key(**month))
+        .map(|month| (*month).to_string())
+        .collect::<Vec<_>>();
     fs::create_dir_all(work_root)?;
     let baseline_root = work_root.join("baseline-cache-seed");
     let incremental_root = work_root.join("candidate-incremental");
@@ -393,6 +438,37 @@ pub(crate) fn qualify(
             incremental == clean,
             "incremental and clean metric artifacts are not byte-identical"
         );
+        let mut semantic_summaries = Vec::with_capacity(clean.len());
+        for artifact in &clean {
+            let incremental_path = incremental_root.join(&artifact.identity);
+            let clean_path = clean_root.join(&artifact.identity);
+            let incremental_receipt = crate::artifact_receipt::scan_and_write(
+                &incremental_path,
+                &artifact.identity,
+                "cross-snapshot-equivalence-v1",
+                candidate_snapshot,
+            )?;
+            let clean_receipt = crate::artifact_receipt::scan_and_write(
+                &clean_path,
+                &artifact.identity,
+                "cross-snapshot-equivalence-v1",
+                candidate_snapshot,
+            )?;
+            ensure!(
+                incremental_receipt.receipt == clean_receipt.receipt,
+                "incremental and clean semantic receipts disagree for {}",
+                artifact.identity
+            );
+            let receipt = clean_receipt.receipt;
+            semantic_summaries.push(QualificationSemanticSummary {
+                identity: artifact.identity.clone(),
+                rows: receipt.rows,
+                minimum_date: receipt.minimum_date,
+                maximum_date: receipt.maximum_date,
+                conservation_totals: receipt.conservation_totals,
+                artifact_sha256: receipt.artifact_sha256,
+            });
+        }
         let report = QualificationReport {
             schema_version: 1,
             publication_eligible: false,
@@ -401,9 +477,13 @@ pub(crate) fn qualify(
             candidate_snapshot: candidate_snapshot.to_string(),
             baseline_cache,
             candidate_cache,
+            unchanged_months: unchanged_months.clone(),
+            changed_months: changed_months.clone(),
+            removed_months: removed_months.clone(),
             artifact_count: clean.len(),
             aggregate_sha256: crate::determinism::aggregate_digest(&clean),
             artifacts: clean,
+            semantic_summaries,
         };
         atomic_json(report_path, &report)?;
         Ok(report)
@@ -414,6 +494,10 @@ pub(crate) fn qualify(
         file.write_all(b"cross-snapshot qualification failed; artifacts retained for diagnosis\n")?;
         file.sync_all()?;
     }
+    ensure!(
+        storage::current_snapshot_version(data_dir, wiki)? == current_snapshot_before,
+        "cross-snapshot qualification changed the live generation"
+    );
     result
 }
 

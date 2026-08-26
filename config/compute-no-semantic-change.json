@@ -4,26 +4,26 @@
     {
       "family": "monthly",
       "paths": ["src/compute/mod.rs"],
-      "reason": "Add the publication-invisible weekly equivalence builder without changing monthly metric semantics or final bytes.",
-      "base_commit": "f5880db6bf95a28d70d60894fb22efc2254c3825"
+      "reason": "Add publication-invisible semantic equivalence reporting without changing monthly metric semantics or final bytes.",
+      "base_commit": "c8c9ce2513293573f209840fa80bd0564b5dcfbc"
     },
     {
       "family": "activity_tiers",
       "paths": ["src/compute/mod.rs"],
-      "reason": "Add the publication-invisible weekly equivalence builder without changing activity-tier semantics or final bytes.",
-      "base_commit": "f5880db6bf95a28d70d60894fb22efc2254c3825"
+      "reason": "Add publication-invisible semantic equivalence reporting without changing activity-tier semantics or final bytes.",
+      "base_commit": "c8c9ce2513293573f209840fa80bd0564b5dcfbc"
     },
     {
       "family": "lifecycle",
       "paths": ["src/compute/mod.rs"],
-      "reason": "Add the publication-invisible weekly equivalence builder without changing lifecycle metric semantics or final bytes.",
-      "base_commit": "f5880db6bf95a28d70d60894fb22efc2254c3825"
+      "reason": "Reuse fully identical lifecycle outputs in qualification without changing lifecycle semantics or final bytes.",
+      "base_commit": "c8c9ce2513293573f209840fa80bd0564b5dcfbc"
     },
     {
       "family": "page_week",
       "paths": ["src/compute/mod.rs", "src/compute/weekly/mod.rs"],
-      "reason": "Externally merge publication-invisible monthly contribution runs without changing production page-week semantics.",
-      "base_commit": "f5880db6bf95a28d70d60894fb22efc2254c3825"
+      "reason": "Add publication-invisible semantic equivalence reporting without changing production page-week semantics.",
+      "base_commit": "c8c9ce2513293573f209840fa80bd0564b5dcfbc"
     }
   ]
 }

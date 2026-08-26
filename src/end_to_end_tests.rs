@@ -341,18 +341,59 @@ fn snapshot_rollover_computes_only_the_new_generation() -> Result<()> {
     )?;
     assert!(!qualification.publication_eligible);
     assert_eq!(qualification.artifact_count, 9);
+    assert_eq!(qualification.unchanged_months, ["2024-01"]);
+    assert_eq!(qualification.changed_months, ["2024-02"]);
+    assert!(qualification.removed_months.is_empty());
+    assert_eq!(qualification.semantic_summaries.len(), 9);
     assert!(qualification.baseline_cache.rebuilt_artifacts > 0);
     assert!(
         qualification.candidate_cache.reused_artifacts >= 6,
         "the unchanged January stateless, editor-month, and weekly contributions should be reused"
     );
     assert!(qualification_report.is_file());
+    assert_eq!(
+        storage::current_snapshot_version(&data_dir, "tinywiki")?.as_deref(),
+        Some("2026-08"),
+        "qualification must not switch the selected generation"
+    );
+
+    let september_source = raw_dir.join("2026-09.tinywiki.all-time.tsv.bz2");
+    write_bz2(
+        &september_source,
+        &[
+            fixture_row("2024-01-01 12:00:00.0", "1", "100"),
+            fixture_row("2024-01-31 12:00:00.0", "1", "101"),
+            fixture_row("2024-02-01 12:00:00.0", "2", "102"),
+            fixture_row("2024-02-08 12:00:00.0", "2", "103"),
+        ],
+    )?;
+    ingest::ingest_wiki_snapshot("tinywiki", "2026-09", &data_dir)?;
+    let identical = cross_snapshot::qualify(
+        &data_dir,
+        "tinywiki",
+        "2026-08",
+        "2026-09",
+        &temp.path().join("identical-cross-snapshot-qualification"),
+        &temp.path().join("identical-cross-snapshot-report.json"),
+    )?;
+    assert_eq!(identical.unchanged_months, ["2024-01", "2024-02"]);
+    assert!(identical.changed_months.is_empty());
+    assert_eq!(
+        identical.candidate_cache.rebuilt_artifacts, 0,
+        "an identical logical snapshot should reuse every cached metric partition"
+    );
+    assert!(identical.candidate_cache.reused_artifacts >= 16);
+    assert_eq!(
+        storage::current_snapshot_version(&data_dir, "tinywiki")?.as_deref(),
+        Some("2026-09")
+    );
 
     assert_eq!(
         storage::retire_inactive_snapshots(&data_dir, "tinywiki")?,
-        3
+        6
     );
     assert!(!storage::snapshot_metric_input_wiki_dir(&data_dir, "tinywiki", "2026-07")?.exists());
-    assert!(storage::snapshot_metric_input_wiki_dir(&data_dir, "tinywiki", "2026-08")?.exists());
+    assert!(!storage::snapshot_metric_input_wiki_dir(&data_dir, "tinywiki", "2026-08")?.exists());
+    assert!(storage::snapshot_metric_input_wiki_dir(&data_dir, "tinywiki", "2026-09")?.exists());
     Ok(())
 }
