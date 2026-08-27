@@ -9,6 +9,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::publication::READY_INDEX_SCHEMA_VERSION;
 use crate::snapshot_plan::{SnapshotPlan, SourceLayout};
 use crate::workload_profile::{self, WorkloadProfileName};
 
@@ -473,7 +474,8 @@ pub(crate) fn complete(queue_root: &Path, claim_path: &Path, output_dir: &Path) 
         .with_context(|| format!("fleet completion is missing {}", ready_index.display()))?;
     let ready: Value = serde_json::from_slice(&ready_bytes)?;
     ensure!(
-        ready.get("schema_version").and_then(Value::as_u64) == Some(1)
+        ready.get("schema_version").and_then(Value::as_u64)
+            == Some(u64::from(READY_INDEX_SCHEMA_VERSION))
             && ready.get("wiki").and_then(Value::as_str) == Some(claim.task.wiki.as_str())
             && ready
                 .pointer("/newest_valid_ready/snapshot")
@@ -869,14 +871,13 @@ fn completed_evidence_valid(root: &Path, task: &FleetTask) -> Result<bool> {
         return Ok(false);
     }
     let ready: Value = serde_json::from_slice(&fs::read(ready_path)?)?;
-    Ok(
-        ready.get("schema_version").and_then(Value::as_u64) == Some(1)
-            && ready.get("wiki").and_then(Value::as_str) == Some(task.wiki.as_str())
-            && ready
-                .pointer("/newest_valid_ready/snapshot")
-                .and_then(Value::as_str)
-                == Some(task.snapshot.as_str()),
-    )
+    Ok(ready.get("schema_version").and_then(Value::as_u64)
+        == Some(u64::from(READY_INDEX_SCHEMA_VERSION))
+        && ready.get("wiki").and_then(Value::as_str) == Some(task.wiki.as_str())
+        && ready
+            .pointer("/newest_valid_ready/snapshot")
+            .and_then(Value::as_str)
+            == Some(task.snapshot.as_str()))
 }
 
 fn lease_dir(root: &Path, wiki: &str) -> PathBuf {
@@ -1058,12 +1059,16 @@ mod tests {
         atomic_write_json(&claim_path, &claim)?;
         fs::create_dir_all(output.path().join("_ready-index"))?;
         const STALE_READY: &[u8] =
-            br#"{"schema_version":1,"wiki":"nlwiki","newest_valid_ready":{"snapshot":"2026-07"}}"#;
+            br#"{"schema_version":2,"wiki":"nlwiki","newest_valid_ready":{"snapshot":"2026-07"}}"#;
         let ready_index = output.path().join("_ready-index/nlwiki.json");
         fs::write(&ready_index, STALE_READY)?;
         assert!(complete(queue.path(), &claim_path, output.path()).is_err());
-        const CURRENT_READY: &[u8] =
+        const OBSOLETE_READY: &[u8] =
             br#"{"schema_version":1,"wiki":"nlwiki","newest_valid_ready":{"snapshot":"2026-08"}}"#;
+        fs::write(&ready_index, OBSOLETE_READY)?;
+        assert!(complete(queue.path(), &claim_path, output.path()).is_err());
+        const CURRENT_READY: &[u8] =
+            br#"{"schema_version":2,"wiki":"nlwiki","newest_valid_ready":{"snapshot":"2026-08"}}"#;
         fs::write(&ready_index, CURRENT_READY)?;
         let notification = complete(queue.path(), &claim_path, output.path())?;
         assert!(notification.is_file());

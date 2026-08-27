@@ -129,7 +129,7 @@ fn fleet_cli_discovers_claims_heartbeats_completes_and_recovers() {
         .expect("ready index directory should be writable");
     fs::write(
         output_dir.path().join("_ready-index/testwiki.json"),
-        r#"{"schema_version":1,"wiki":"testwiki","newest_valid_ready":{"snapshot":"2026-08"}}"#,
+        r#"{"schema_version":2,"wiki":"testwiki","newest_valid_ready":{"snapshot":"2026-08"}}"#,
     )
     .expect("ready index should be writable");
     let complete = base()

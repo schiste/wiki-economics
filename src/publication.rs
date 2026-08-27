@@ -15,7 +15,7 @@ use crate::{artifact_receipt, licensing, storage};
 const RUN_CONTEXT_FILE: &str = ".publication-run.json";
 const CANDIDATE_FILE: &str = ".publication-candidate.json";
 const READY_INDEX_DIR: &str = "_ready-index";
-const READY_INDEX_SCHEMA_VERSION: u8 = 2;
+pub(crate) const READY_INDEX_SCHEMA_VERSION: u8 = 2;
 const PUBLICATION_CONTRACT_VERSION: &str =
     "ready-candidate-publication-v3-incremental-receipt-composition";
 pub const RECEIPT_FILE: &str = "publication-gate.json";
