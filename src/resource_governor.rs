@@ -582,17 +582,23 @@ impl ResourceGovernor {
             "resource governor bucket scratch gate closed: {admitted_scratch} bytes exceeds {} bytes",
             self.budget.scratch_limit_bytes
         );
-        if let Some(open) = sample.open_file_descriptors {
-            let required = BUCKET_FD_ALLOWANCE
-                .checked_mul(state.active_bucket_workers.saturating_add(1))
-                .and_then(|allowance| open.checked_add(allowance))
-                .context("bucket file-descriptor admission overflow")?;
-            anyhow::ensure!(
-                required <= self.budget.max_open_files,
-                "resource governor bucket file-descriptor gate closed at {required}; limit is {}",
-                self.budget.max_open_files
-            );
-        }
+        let required_open_files = sample
+            .open_file_descriptors
+            .map(|open| {
+                BUCKET_FD_ALLOWANCE
+                    .checked_mul(state.active_bucket_workers.saturating_add(1))
+                    .and_then(|allowance| open.checked_add(allowance))
+                    .context("bucket file-descriptor admission overflow")
+            })
+            .transpose()?;
+        let open_file_limit_exceeded =
+            required_open_files.is_some_and(|required| required > self.budget.max_open_files);
+        anyhow::ensure!(
+            !open_file_limit_exceeded,
+            "resource governor bucket file-descriptor gate closed at {}; limit is {}",
+            required_open_files.unwrap_or_default(),
+            self.budget.max_open_files
+        );
         let available = sample
             .persistent_available_bytes
             .context("resource governor bucket admission requires filesystem availability")?;
