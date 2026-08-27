@@ -952,16 +952,13 @@ fn patrol_generation_handles_empty_sources_and_cleans_failed_staging() -> Result
     assert!(generation.patrol_months.is_empty());
     assert!(generation.rights_months.is_empty());
 
-    let out_of_order = r#"<mediawiki>
-<logitem><id>1</id><timestamp>2024-02-02T00:00:00Z</timestamp><contributor><username>P</username></contributor><type>patrol</type><params>2
+    let invalid_month = r#"<mediawiki>
+<logitem><id>1</id><timestamp>invalid</timestamp><contributor><username>P</username></contributor><type>patrol</type><params>2
 1
-0</params></logitem>
-<logitem><id>2</id><timestamp>2024-01-02T00:00:00Z</timestamp><contributor><username>P</username></contributor><type>patrol</type><params>1
-0
 0</params></logitem>
 </mediawiki>"#;
     let failed = FakePatrolTransport::new(
-        vec![gzip_bytes(out_of_order)?],
+        vec![gzip_bytes(invalid_month)?],
         vec![json!({"query": {"usergroups": []}})],
     );
     assert!(generation::fetch(&failed, "orderwiki", "2026-08", data_dir.path()).is_err());
@@ -989,6 +986,140 @@ fn patrol_generation_handles_empty_sources_and_cleans_failed_staging() -> Result
             .to_string_lossy()
             .ends_with(".tmp")
     }));
+    Ok(())
+}
+
+#[test]
+fn patrol_generation_sorts_unordered_multi_member_events_deterministically() -> Result<()> {
+    let first_member = r#"<mediawiki>
+<logitem><id>20</id><timestamp>2024-02-20T00:00:00Z</timestamp><contributor><username>P</username></contributor><type>patrol</type><params>20
+3
+0</params></logitem>
+<logitem><id>19</id><timestamp>2024-02-10T00:00:00Z</timestamp><type>rights</type><logtitle>User:Editor</logtitle><params>editor
+autopatrolled</params></logitem>
+"#
+    .to_string();
+    let mut second_member = String::new();
+    for day in (1..=9).rev() {
+        second_member.push_str(&format!(
+            "<logitem><id>{day}</id><timestamp>2024-01-{day:02}T00:00:00Z</timestamp><contributor><username>P</username></contributor><type>patrol</type><params>{day}\n0\n0</params></logitem>\n"
+        ));
+    }
+    second_member.push_str(
+        r#"<logitem><id>10</id><timestamp>2024-01-05T00:00:00Z</timestamp><type>rights</type><logtitle>User:Editor</logtitle><params>editor
+autopatrolled</params></logitem>
+</mediawiki>"#,
+    );
+    let source = {
+        let mut bytes = gzip_bytes(&first_member)?;
+        bytes.extend(gzip_bytes(&second_member)?);
+        bytes
+    };
+    let build = |root: &Path| -> Result<generation::PatrolGeneration> {
+        let transport = FakePatrolTransport::new(
+            vec![source.clone()],
+            vec![json!({"query": {"usergroups": [
+                {"name": "autopatrolled", "rights": ["autopatrol"]}
+            ]}})],
+        );
+        generation::fetch(&transport, "orderwiki", "2026-08", root)
+    };
+
+    let first_root = TestDir::new()?;
+    let second_root = TestDir::new()?;
+    let first = build(first_root.path())?;
+    let second = build(second_root.path())?;
+    assert_eq!(first.patrol_months.len(), 2);
+    assert_eq!(first.rights_months.len(), 2);
+    assert_eq!(
+        first
+            .patrol_months
+            .iter()
+            .map(|artifact| (
+                &artifact.event_month,
+                &artifact.artifact_sha256,
+                artifact.rows
+            ))
+            .collect::<Vec<_>>(),
+        second
+            .patrol_months
+            .iter()
+            .map(|artifact| (
+                &artifact.event_month,
+                &artifact.artifact_sha256,
+                artifact.rows
+            ))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        first
+            .rights_months
+            .iter()
+            .map(|artifact| (
+                &artifact.event_month,
+                &artifact.artifact_sha256,
+                artifact.rows
+            ))
+            .collect::<Vec<_>>(),
+        second
+            .rights_months
+            .iter()
+            .map(|artifact| (
+                &artifact.event_month,
+                &artifact.artifact_sha256,
+                artifact.rows
+            ))
+            .collect::<Vec<_>>()
+    );
+
+    let generation_root = generation::generation_dir(first_root.path(), "orderwiki", "2026-08")?;
+    let january_patrol = first
+        .patrol_months
+        .iter()
+        .find(|artifact| artifact.event_month == "2024-01")
+        .context("January patrol artifact should exist")?;
+    let january_patrol = read_parquet_df(
+        &generation::artifact_path(&generation_root, january_patrol)?,
+        None,
+    )?;
+    assert_eq!(
+        january_patrol
+            .column("timestamp")?
+            .str()?
+            .iter()
+            .flatten()
+            .collect::<Vec<_>>(),
+        vec![
+            "2024-01-01 00:00:00",
+            "2024-01-02 00:00:00",
+            "2024-01-03 00:00:00",
+            "2024-01-04 00:00:00",
+            "2024-01-05 00:00:00",
+            "2024-01-06 00:00:00",
+            "2024-01-07 00:00:00",
+            "2024-01-08 00:00:00",
+            "2024-01-09 00:00:00",
+        ]
+    );
+    let january_rights = first
+        .rights_months
+        .iter()
+        .find(|artifact| artifact.event_month == "2024-01")
+        .context("January rights artifact should exist")?;
+    let january_rights = read_parquet_df(
+        &generation::artifact_path(&generation_root, january_rights)?,
+        None,
+    )?;
+    assert_eq!(
+        january_rights
+            .column("timestamp")?
+            .str()?
+            .iter()
+            .flatten()
+            .collect::<Vec<_>>(),
+        vec!["2024-01-05 00:00:00"]
+    );
+    assert!(!generation_root.join(".spool").exists());
     Ok(())
 }
 

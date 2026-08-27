@@ -1,7 +1,21 @@
 use super::*;
+use serde::de::DeserializeOwned;
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+use std::fs::OpenOptions;
+use std::io::{BufRead, BufWriter};
+use std::marker::PhantomData;
 
 const GENERATION_SCHEMA_VERSION: u32 = 2;
 const ARTIFACT_ORDERING: &str = "timestamp-logical-fields-v1";
+#[cfg(not(test))]
+const EXTERNAL_SORT_BATCH_ROWS: usize = PARQUET_BATCH_ROWS;
+#[cfg(test)]
+const EXTERNAL_SORT_BATCH_ROWS: usize = 2;
+#[cfg(not(test))]
+const EXTERNAL_SORT_FAN_IN: usize = 16;
+#[cfg(test)]
+const EXTERNAL_SORT_FAN_IN: usize = 2;
 
 #[derive(Debug, Serialize)]
 struct CurrentPatrolGeneration {
@@ -50,174 +64,310 @@ impl PatrolGeneration {
     }
 }
 
-struct ActivePatrolMonth {
+struct ActiveMonthSpool {
     month: String,
-    temporary: PathBuf,
-    final_path: PathBuf,
-    writer: PatrolWriter,
+    writer: BufWriter<File>,
 }
 
-struct ActiveRightsMonth {
-    month: String,
-    temporary: PathBuf,
-    final_path: PathBuf,
-    writer: RightsWriter,
+struct MonthlySpool<T> {
+    root: PathBuf,
+    kind: &'static str,
+    active: Option<ActiveMonthSpool>,
+    months: BTreeSet<String>,
+    row_type: PhantomData<T>,
 }
 
 pub(super) struct MonthlyPatrolWriter {
-    root: PathBuf,
-    active: Option<ActivePatrolMonth>,
-    completed: Vec<PathBuf>,
+    spool: MonthlySpool<PatrolRow>,
 }
 
 pub(super) struct MonthlyRightsWriter {
-    root: PathBuf,
-    active: Option<ActiveRightsMonth>,
-    completed: Vec<PathBuf>,
+    spool: MonthlySpool<RightsRow>,
 }
 
-impl MonthlyPatrolWriter {
-    fn new(root: &Path) -> Self {
+impl<T: Serialize> MonthlySpool<T> {
+    fn new(root: &Path, kind: &'static str) -> Self {
         Self {
             root: root.to_path_buf(),
+            kind,
             active: None,
-            completed: Vec::new(),
+            months: BTreeSet::new(),
+            row_type: PhantomData,
         }
     }
 
-    fn rotate(&mut self, month: &str) -> Result<()> {
+    fn add(&mut self, month: &str, row: &T) -> Result<()> {
         if self
             .active
             .as_ref()
             .is_some_and(|active| active.month == month)
         {
-            return Ok(());
-        }
-        if let Some(active) = self.active.as_ref() {
-            anyhow::ensure!(
-                active.month.as_str() < month,
-                "patrol logging source is not ordered by event month"
-            );
+            return self.write(row);
         }
         self.finish_active()?;
-        let final_path = month_path(&self.root, "patrol", month)?;
-        ensure_parent_dir(&final_path)?;
-        let temporary = final_path.with_extension("parquet.tmp");
-        let _ = fs::remove_file(&temporary);
-        let writer = PatrolWriter::new(&temporary)?;
-        self.active = Some(ActivePatrolMonth {
+        let path = spool_path(&self.root, self.kind, month)?;
+        ensure_parent_dir(&path)?;
+        let writer = BufWriter::new(OpenOptions::new().create(true).append(true).open(&path)?);
+        self.months.insert(month.to_string());
+        self.active = Some(ActiveMonthSpool {
             month: month.to_string(),
-            temporary,
-            final_path,
             writer,
         });
+        self.write(row)
+    }
+
+    fn write(&mut self, row: &T) -> Result<()> {
+        let writer = &mut self
+            .active
+            .as_mut()
+            .context("monthly spool was not initialized")?
+            .writer;
+        serde_json::to_writer(&mut *writer, row)?;
+        writer.write_all(b"\n")?;
         Ok(())
     }
 
     fn finish_active(&mut self) -> Result<()> {
-        let Some(active) = self.active.take() else {
+        let Some(mut active) = self.active.take() else {
             return Ok(());
         };
-        active.writer.finish()?;
-        File::open(&active.temporary)?.sync_all()?;
-        fs::rename(&active.temporary, &active.final_path)?;
-        let parent = active
-            .final_path
-            .parent()
-            .expect("constructed patrol month always has a parent");
-        File::open(parent)?.sync_all()?;
-        self.completed.push(active.final_path);
+        active.writer.flush()?;
+        active.writer.get_ref().sync_all()?;
         Ok(())
     }
 
-    fn finish(mut self) -> Result<Vec<PathBuf>> {
+    fn finish(mut self) -> Result<Vec<(String, PathBuf)>> {
         self.finish_active()?;
-        Ok(self.completed)
+        self.months
+            .into_iter()
+            .map(|month| {
+                let path = spool_path(&self.root, self.kind, &month)?;
+                Ok((month, path))
+            })
+            .collect()
+    }
+}
+
+impl MonthlyPatrolWriter {
+    fn new(root: &Path) -> Self {
+        Self {
+            spool: MonthlySpool::new(root, "patrol"),
+        }
+    }
+
+    fn finish(self) -> Result<Vec<PathBuf>> {
+        let root = self.spool.root.clone();
+        let months = self.spool.finish()?;
+        let mut completed = Vec::with_capacity(months.len());
+        for (month, spool) in months {
+            let final_path = month_path(&root, "patrol", &month)?;
+            ensure_parent_dir(&final_path)?;
+            let temporary = final_path.with_extension("parquet.tmp");
+            let _ = fs::remove_file(&temporary);
+            let mut writer = PatrolWriter::new(&temporary)?;
+            external_sort_spool::<PatrolRow, _>(&spool, |row| writer.add(row))?;
+            writer.finish()?;
+            commit_month_artifact(&temporary, &final_path)?;
+            completed.push(final_path);
+        }
+        remove_spool_tree(&root, "patrol")?;
+        Ok(completed)
     }
 }
 
 impl PatrolSink for MonthlyPatrolWriter {
     fn add_patrol(&mut self, row: PatrolRow) -> Result<()> {
         let month = event_month(&row.timestamp)?;
-        self.rotate(&month)?;
-        self.active
-            .as_mut()
-            .context("patrol month writer was not initialized")?
-            .writer
-            .add(row)
+        self.spool.add(&month, &row)
     }
 }
 
 impl MonthlyRightsWriter {
     fn new(root: &Path) -> Self {
         Self {
-            root: root.to_path_buf(),
-            active: None,
-            completed: Vec::new(),
+            spool: MonthlySpool::new(root, "rights"),
         }
     }
 
-    fn rotate(&mut self, month: &str) -> Result<()> {
-        if self
-            .active
-            .as_ref()
-            .is_some_and(|active| active.month == month)
-        {
-            return Ok(());
+    fn finish(self) -> Result<Vec<PathBuf>> {
+        let root = self.spool.root.clone();
+        let months = self.spool.finish()?;
+        let mut completed = Vec::with_capacity(months.len());
+        for (month, spool) in months {
+            let final_path = month_path(&root, "rights", &month)?;
+            ensure_parent_dir(&final_path)?;
+            let temporary = final_path.with_extension("parquet.tmp");
+            let _ = fs::remove_file(&temporary);
+            let mut writer = RightsWriter::new(&temporary)?;
+            external_sort_spool::<RightsRow, _>(&spool, |row| writer.add(row))?;
+            writer.finish()?;
+            commit_month_artifact(&temporary, &final_path)?;
+            completed.push(final_path);
         }
-        if let Some(active) = self.active.as_ref() {
-            anyhow::ensure!(
-                active.month.as_str() < month,
-                "rights logging source is not ordered by event month"
-            );
-        }
-        self.finish_active()?;
-        let final_path = month_path(&self.root, "rights", month)?;
-        ensure_parent_dir(&final_path)?;
-        let temporary = final_path.with_extension("parquet.tmp");
-        let _ = fs::remove_file(&temporary);
-        let writer = RightsWriter::new(&temporary)?;
-        self.active = Some(ActiveRightsMonth {
-            month: month.to_string(),
-            temporary,
-            final_path,
-            writer,
-        });
-        Ok(())
-    }
-
-    fn finish_active(&mut self) -> Result<()> {
-        let Some(active) = self.active.take() else {
-            return Ok(());
-        };
-        active.writer.finish()?;
-        File::open(&active.temporary)?.sync_all()?;
-        fs::rename(&active.temporary, &active.final_path)?;
-        let parent = active
-            .final_path
-            .parent()
-            .expect("constructed rights month always has a parent");
-        File::open(parent)?.sync_all()?;
-        self.completed.push(active.final_path);
-        Ok(())
-    }
-
-    fn finish(mut self) -> Result<Vec<PathBuf>> {
-        self.finish_active()?;
-        Ok(self.completed)
+        remove_spool_tree(&root, "rights")?;
+        Ok(completed)
     }
 }
 
 impl RightsSink for MonthlyRightsWriter {
     fn add_rights(&mut self, row: RightsRow) -> Result<()> {
         let month = event_month(&row.timestamp)?;
-        self.rotate(&month)?;
-        self.active
-            .as_mut()
-            .context("rights month writer was not initialized")?
-            .writer
-            .add(row)
+        self.spool.add(&month, &row)
     }
+}
+
+fn spool_path(root: &Path, kind: &str, month: &str) -> Result<PathBuf> {
+    month_path(&root.join(".spool"), kind, month).map(|path| path.with_extension("jsonl"))
+}
+
+fn remove_spool_tree(root: &Path, kind: &str) -> Result<()> {
+    let path = root.join(".spool").join(kind);
+    if path.exists() {
+        fs::remove_dir_all(&path)?;
+    }
+    let spool_root = root.join(".spool");
+    if spool_root.is_dir() && fs::read_dir(&spool_root)?.next().is_none() {
+        fs::remove_dir(&spool_root)?;
+    }
+    Ok(())
+}
+
+fn commit_month_artifact(temporary: &Path, final_path: &Path) -> Result<()> {
+    File::open(temporary)?.sync_all()?;
+    fs::rename(temporary, final_path)?;
+    let parent = final_path
+        .parent()
+        .expect("constructed patrol month always has a parent");
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+fn external_sort_spool<T, F>(spool: &Path, mut emit: F) -> Result<()>
+where
+    T: DeserializeOwned + Ord + Serialize,
+    F: FnMut(T) -> Result<()>,
+{
+    let work = spool.with_extension("sort");
+    let _ = fs::remove_dir_all(&work);
+    fs::create_dir(&work)?;
+    let result = (|| {
+        let mut runs = create_sorted_runs::<T>(spool, &work)?;
+        let mut round = 0_usize;
+        while runs.len() > EXTERNAL_SORT_FAN_IN {
+            let round_root = work.join(format!("round-{round:04}"));
+            fs::create_dir(&round_root)?;
+            let mut next = Vec::new();
+            for (index, group) in runs.chunks(EXTERNAL_SORT_FAN_IN).enumerate() {
+                let path = round_root.join(format!("run-{index:08}.jsonl"));
+                merge_runs_to_json::<T>(group, &path)?;
+                next.push(path);
+            }
+            for path in runs {
+                fs::remove_file(path)?;
+            }
+            runs = next;
+            round += 1;
+        }
+        merge_sorted_runs::<T, _>(&runs, &mut emit)?;
+        fs::remove_file(spool)?;
+        Ok::<_, anyhow::Error>(())
+    })();
+    let cleanup = fs::remove_dir_all(&work);
+    result?;
+    cleanup?;
+    Ok(())
+}
+
+fn create_sorted_runs<T>(spool: &Path, work: &Path) -> Result<Vec<PathBuf>>
+where
+    T: DeserializeOwned + Ord + Serialize,
+{
+    let mut reader = BufReader::new(File::open(spool)?);
+    let mut line = String::new();
+    let mut rows: Vec<T> = Vec::with_capacity(EXTERNAL_SORT_BATCH_ROWS);
+    let mut runs = Vec::new();
+    loop {
+        line.clear();
+        let read = reader.read_line(&mut line)?;
+        if read == 0 {
+            break;
+        }
+        rows.push(serde_json::from_str(line.trim_end())?);
+        if rows.len() == EXTERNAL_SORT_BATCH_ROWS {
+            write_sorted_run(&mut rows, work, runs.len(), &mut runs)?;
+        }
+    }
+    if !rows.is_empty() {
+        write_sorted_run(&mut rows, work, runs.len(), &mut runs)?;
+    }
+    anyhow::ensure!(!runs.is_empty(), "monthly patrol spool is empty");
+    Ok(runs)
+}
+
+fn write_sorted_run<T: Ord + Serialize>(
+    rows: &mut Vec<T>,
+    work: &Path,
+    index: usize,
+    runs: &mut Vec<PathBuf>,
+) -> Result<()> {
+    rows.sort();
+    let path = work.join(format!("run-{index:08}.jsonl"));
+    let mut writer = BufWriter::new(File::create(&path)?);
+    for row in rows.drain(..) {
+        serde_json::to_writer(&mut writer, &row)?;
+        writer.write_all(b"\n")?;
+    }
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    runs.push(path);
+    Ok(())
+}
+
+fn merge_runs_to_json<T>(runs: &[PathBuf], output: &Path) -> Result<()>
+where
+    T: DeserializeOwned + Ord + Serialize,
+{
+    let mut writer = BufWriter::new(File::create(output)?);
+    merge_sorted_runs::<T, _>(runs, |row| {
+        serde_json::to_writer(&mut writer, &row)?;
+        writer.write_all(b"\n")?;
+        Ok(())
+    })?;
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    Ok(())
+}
+
+fn merge_sorted_runs<T, F>(runs: &[PathBuf], mut emit: F) -> Result<()>
+where
+    T: DeserializeOwned + Ord,
+    F: FnMut(T) -> Result<()>,
+{
+    let mut readers = runs
+        .iter()
+        .map(|path| File::open(path).map(BufReader::new))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    let mut heap = BinaryHeap::new();
+    for (index, reader) in readers.iter_mut().enumerate() {
+        if let Some(row) = read_spooled_row(reader)? {
+            heap.push(Reverse((row, index)));
+        }
+    }
+    while let Some(Reverse((row, index))) = heap.pop() {
+        emit(row)?;
+        if let Some(next) = read_spooled_row(&mut readers[index])? {
+            heap.push(Reverse((next, index)));
+        }
+    }
+    Ok(())
+}
+
+fn read_spooled_row<T: DeserializeOwned>(reader: &mut BufReader<File>) -> Result<Option<T>> {
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_str(line.trim_end())?))
 }
 
 pub(super) fn generation_dir(data_dir: &Path, wiki: &str, snapshot: &str) -> Result<PathBuf> {

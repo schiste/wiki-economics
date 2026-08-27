@@ -28,7 +28,7 @@ const PARQUET_BATCH_ROWS: usize = 50_000;
 const SUBSTANTIAL_LOGGING_DUMP_BYTES: u64 = 1024 * 1024;
 const SUBSTANTIAL_LOG_ITEMS: usize = 10_000;
 const PATROL_COMPUTE_ALGORITHM_VERSION: &str = "patrol-metrics-v3-monthly-generations";
-const PATROL_PARSER_VERSION: &str = "patrol-logging-multigzip-monthly-v1";
+const PATROL_PARSER_VERSION: &str = "patrol-logging-multigzip-monthly-v2-external-sort";
 const REVISION_COLUMNS: &[&str] = &[
     "revision_id",
     "event_timestamp",
@@ -1232,10 +1232,10 @@ impl LogItem {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 struct PatrolRow {
-    log_id: i64,
     timestamp: String,
+    log_id: i64,
     user: Option<String>,
     user_id: Option<i64>,
     page_title: Option<String>,
@@ -1244,7 +1244,7 @@ struct PatrolRow {
     is_auto: bool,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 struct RightsRow {
     timestamp: String,
     target_user: String,
