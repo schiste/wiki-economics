@@ -210,12 +210,13 @@ fn build_index_with_previous(
                 .context("global browser shard has no UTF-8 name")?
                 .to_string();
             let identity = format!("{GLOBAL_ROOT}/{metric}/{shard}.parquet");
-            let document = artifact_receipt::verify(
+            let verification = artifact_receipt::verify(
                 &source,
                 &identity,
                 None,
                 artifact_receipt::VerificationMode::Fast,
-            )?;
+            );
+            let document = verification?;
             let receipt_sha256 = document.receipt_sha256;
             let receipt = document.receipt;
             ensure!(
@@ -330,98 +331,94 @@ fn materialize_global_partitions(
     }
     let destination = output_dir.join(GLOBAL_ROOT);
     let backup = output_dir.join(format!(".{GLOBAL_ROOT}.{}.backup", std::process::id()));
+    publish_global_directory(&staging, &destination, &backup, |from, to| {
+        fs::rename(from, to)
+    })?;
+    File::open(output_dir)?.sync_all()?;
+    Ok(())
+}
+
+fn publish_global_directory(
+    staging: &Path,
+    destination: &Path,
+    backup: &Path,
+    mut rename: impl FnMut(&Path, &Path) -> std::io::Result<()>,
+) -> Result<()> {
     if backup.exists() {
-        fs::remove_dir_all(&backup)?;
+        fs::remove_dir_all(backup)?;
     }
     if destination.exists() {
-        fs::rename(&destination, &backup)?;
+        rename(destination, backup)?;
     }
-    if let Err(error) = fs::rename(&staging, &destination) {
+    if let Err(error) = rename(staging, destination) {
         if backup.exists() {
-            let _ = fs::rename(&backup, &destination);
+            let _ = rename(backup, destination);
         }
         return Err(error).context("failed to publish global browser partitions");
     }
     if backup.exists() {
         fs::remove_dir_all(backup)?;
     }
-    File::open(output_dir)?.sync_all()?;
     Ok(())
 }
 
 fn aggregate_global_metric(metric: &str, frame: DataFrame) -> Result<DataFrame> {
+    const FUNNEL_SUMS: &[&str] = &["cohort_size", "reached_5", "reached_25", "reached_100"];
+    const GDP_KEYS: &[&str] = &["year_month", "page_namespace", "user_type"];
+    const GDP_SUMS: &[&str] = &[
+        "gross_bytes_added",
+        "net_bytes",
+        "total_edits",
+        "productive_edits",
+        "reverted_edits",
+        "unique_editors",
+        "minor_edits",
+    ];
+    const ACTIVITY_KEYS: &[&str] = &[
+        "year_month",
+        "period",
+        "period_start",
+        "period_end",
+        "period_type",
+        "period_months",
+        "user_type",
+        "activity_tier",
+        "tier_rank",
+    ];
+    const ACTIVITY_SUMS: &[&str] = &["editors", "total_edits", "net_bytes", "gross_bytes"];
+    const SHARE_KEYS: &[&str] = &["year_month", "user_type"];
+    const SHARE_SUMS: &[&str] = &["edits", "net_bytes", "editors"];
+    const CHURN_KEYS: &[&str] = &["period", "period_type"];
+    const CHURN_SUMS: &[&str] = &["active_editors", "arrivals", "departures"];
+    const COHORT_KEYS: &[&str] = &["cohort_year", "year"];
+    const COHORT_SUMS: &[&str] = &["survived_editors", "initial_editors"];
+    const LABOR_SUMS: &[&str] = &[
+        "unique_editors",
+        "total_edits",
+        "net_bytes",
+        "reverted_edits",
+    ];
     let result = match metric {
-        "business_funnel" => aggregate_sums(
-            frame,
-            &["cohort_year"],
-            &["cohort_size", "reached_5", "reached_25", "reached_100"],
-        )?,
-        "gdp" => aggregate_sums(
-            frame,
-            &["year_month", "page_namespace", "user_type"],
-            &[
-                "gross_bytes_added",
-                "net_bytes",
-                "total_edits",
-                "productive_edits",
-                "reverted_edits",
-                "unique_editors",
-                "minor_edits",
-            ],
-        )?
-        .lazy()
-        .with_columns([
-            safe_ratio("gross_bytes_added", "total_edits", "bytes_per_edit"),
-            safe_ratio("gross_bytes_added", "unique_editors", "bytes_per_editor"),
-            safe_ratio("reverted_edits", "total_edits", "revert_rate"),
-        ])
-        .collect()?,
-        "gdp_activity_tiers" => aggregate_sums(
-            frame,
-            &[
-                "year_month",
-                "period",
-                "period_start",
-                "period_end",
-                "period_type",
-                "period_months",
-                "user_type",
-                "activity_tier",
-                "tier_rank",
-            ],
-            &["editors", "total_edits", "net_bytes", "gross_bytes"],
-        )?,
-        "gdp_user_type_share" => aggregate_sums(
-            frame,
-            &["year_month", "user_type"],
-            &["edits", "net_bytes", "editors"],
-        )?,
-        "labor_churn" => aggregate_sums(
-            frame,
-            &["period", "period_type"],
-            &["active_editors", "arrivals", "departures"],
-        )?
-        .lazy()
-        .with_columns([
-            safe_ratio("arrivals", "active_editors", "arrival_rate"),
-            safe_ratio("departures", "active_editors", "departure_rate"),
-        ])
-        .collect()?,
-        "labor_cohorts" => aggregate_sums(
-            frame,
-            &["cohort_year", "year"],
-            &["survived_editors", "initial_editors"],
-        )?,
-        "labor_monthly" => aggregate_sums(
-            frame,
-            &["year_month", "page_namespace", "user_type"],
-            &[
-                "unique_editors",
-                "total_edits",
-                "net_bytes",
-                "reverted_edits",
-            ],
-        )?,
+        "business_funnel" => aggregate_sums(frame, &["cohort_year"], FUNNEL_SUMS)?,
+        "gdp" => aggregate_sums(frame, GDP_KEYS, GDP_SUMS)?
+            .lazy()
+            .with_columns([
+                safe_ratio("gross_bytes_added", "total_edits", "bytes_per_edit"),
+                safe_ratio("gross_bytes_added", "unique_editors", "bytes_per_editor"),
+                safe_ratio("reverted_edits", "total_edits", "revert_rate"),
+            ])
+            .collect()?,
+        "gdp_activity_tiers" => aggregate_sums(frame, ACTIVITY_KEYS, ACTIVITY_SUMS)?,
+        "gdp_user_type_share" => aggregate_sums(frame, SHARE_KEYS, SHARE_SUMS)?,
+        "labor_churn" => aggregate_sums(frame, CHURN_KEYS, CHURN_SUMS)?
+            .lazy()
+            .with_columns([
+                safe_ratio("arrivals", "active_editors", "arrival_rate"),
+                safe_ratio("departures", "active_editors", "departure_rate"),
+            ])
+            .collect()?,
+        "labor_cohorts" => aggregate_sums(frame, COHORT_KEYS, COHORT_SUMS)?,
+        "labor_monthly" => aggregate_sums(frame, GDP_KEYS, LABOR_SUMS)?,
         "inequality" => aggregate_global_inequality(frame)?,
         "patrol" => aggregate_global_patrol(frame)?,
         _ => anyhow::bail!("unsupported global browser metric {metric}"),
@@ -506,62 +503,62 @@ fn aggregate_global_inequality(frame: DataFrame) -> Result<DataFrame> {
 }
 
 fn aggregate_global_patrol(frame: DataFrame) -> Result<DataFrame> {
-    aggregate_sums(
-        frame,
-        &["year_month", "page_namespace", "user_type"],
-        &[
-            "total_patrols",
-            "unique_patrollers",
-            "patrol_new_pages",
-            "patrol_diffs",
-            "patrolled_revisions",
-            "autopatrolled_revisions",
-            "total_revisions",
-        ],
-    )?
-    .lazy()
-    .with_columns([
-        lit(NULL)
-            .cast(DataType::Float64)
-            .alias("median_latency_hours"),
-        lit(NULL).cast(DataType::Float64).alias("p90_latency_hours"),
-        safe_ratio("patrolled_revisions", "total_revisions", "_patrol_fraction"),
-        safe_ratio(
-            "autopatrolled_revisions",
-            "total_revisions",
-            "_autopatrol_fraction",
-        ),
-        lit(NULL).cast(DataType::Float64).alias("top1_pct"),
-        lit(NULL)
-            .cast(DataType::Int64)
-            .alias("min_patrollers_50pct"),
-    ])
-    .with_columns([
-        (col("_patrol_fraction") * lit(100.0_f64)).alias("patrol_coverage_pct"),
-        ((col("_patrol_fraction") + col("_autopatrol_fraction")) * lit(100.0_f64))
-            .alias("adjusted_coverage_pct"),
-    ])
-    .select([
-        col("year_month"),
-        col("wiki"),
-        col("page_namespace"),
-        col("user_type"),
-        col("total_patrols"),
-        col("unique_patrollers"),
-        col("patrol_new_pages"),
-        col("patrol_diffs"),
-        col("median_latency_hours"),
-        col("p90_latency_hours"),
-        col("patrolled_revisions"),
-        col("autopatrolled_revisions"),
-        col("total_revisions"),
-        col("patrol_coverage_pct"),
-        col("adjusted_coverage_pct"),
-        col("top1_pct"),
-        col("min_patrollers_50pct"),
-    ])
-    .collect()
-    .map_err(anyhow::Error::from)
+    const PATROL_KEYS: &[&str] = &["year_month", "page_namespace", "user_type"];
+    const PATROL_SUMS: &[&str] = &[
+        "total_patrols",
+        "unique_patrollers",
+        "patrol_new_pages",
+        "patrol_diffs",
+        "patrolled_revisions",
+        "autopatrolled_revisions",
+        "total_revisions",
+    ];
+    let aggregate_result = aggregate_sums(frame, PATROL_KEYS, PATROL_SUMS);
+    let aggregate = aggregate_result?;
+    aggregate
+        .lazy()
+        .with_columns([
+            lit(NULL)
+                .cast(DataType::Float64)
+                .alias("median_latency_hours"),
+            lit(NULL).cast(DataType::Float64).alias("p90_latency_hours"),
+            safe_ratio("patrolled_revisions", "total_revisions", "_patrol_fraction"),
+            safe_ratio(
+                "autopatrolled_revisions",
+                "total_revisions",
+                "_autopatrol_fraction",
+            ),
+            lit(NULL).cast(DataType::Float64).alias("top1_pct"),
+            lit(NULL)
+                .cast(DataType::Int64)
+                .alias("min_patrollers_50pct"),
+        ])
+        .with_columns([
+            (col("_patrol_fraction") * lit(100.0_f64)).alias("patrol_coverage_pct"),
+            ((col("_patrol_fraction") + col("_autopatrol_fraction")) * lit(100.0_f64))
+                .alias("adjusted_coverage_pct"),
+        ])
+        .select([
+            col("year_month"),
+            col("wiki"),
+            col("page_namespace"),
+            col("user_type"),
+            col("total_patrols"),
+            col("unique_patrollers"),
+            col("patrol_new_pages"),
+            col("patrol_diffs"),
+            col("median_latency_hours"),
+            col("p90_latency_hours"),
+            col("patrolled_revisions"),
+            col("autopatrolled_revisions"),
+            col("total_revisions"),
+            col("patrol_coverage_pct"),
+            col("adjusted_coverage_pct"),
+            col("top1_pct"),
+            col("min_patrollers_50pct"),
+        ])
+        .collect()
+        .map_err(anyhow::Error::from)
 }
 
 fn write_year_shards(
@@ -607,7 +604,7 @@ fn write_year_shards(
             .set_parallel(false)
             .finish(&mut shard)?;
         let identity = format!("{GLOBAL_ROOT}/{metric}/{year}.parquet");
-        artifact_receipt::scan_and_write_with_spec(
+        let receipt = artifact_receipt::scan_and_write_with_spec(
             &path,
             &identity,
             GLOBAL_AGGREGATION_VERSION,
@@ -618,7 +615,8 @@ fn write_year_shards(
                 ordering_contract: "global-time-shard/v1".to_string(),
                 page_week_consistency: false,
             },
-        )?;
+        );
+        receipt?;
         paths.push(path);
     }
     Ok(paths)
@@ -712,6 +710,118 @@ mod tests {
     fn write_complete_wiki(root: &Path, wiki: &str) -> Result<()> {
         for (metric, date_column) in BROWSER_METRICS {
             write_metric(root, wiki, metric, date_column)?;
+        }
+        Ok(())
+    }
+
+    fn global_source(metric: &str) -> Result<DataFrame> {
+        let wiki = &["nlwiki", "ptwiki"];
+        let frame = match metric {
+            "business_funnel" => df!(
+                "wiki" => wiki,
+                "cohort_year" => &["2025", "2026"],
+                "cohort_size" => &[10_i64, 20],
+                "reached_5" => &[8_i64, 16],
+                "reached_25" => &[4_i64, 8],
+                "reached_100" => &[2_i64, 4],
+            ),
+            "gdp" => df!(
+                "wiki" => wiki,
+                "year_month" => &["2025-12", "2026-01"],
+                "page_namespace" => &[0_i32, 0],
+                "user_type" => &["registered", "registered"],
+                "gross_bytes_added" => &[100_i64, 200],
+                "net_bytes" => &[50_i64, 100],
+                "total_edits" => &[10_i64, 0],
+                "productive_edits" => &[8_i64, 16],
+                "reverted_edits" => &[2_i64, 0],
+                "unique_editors" => &[5_i64, 0],
+                "minor_edits" => &[1_i64, 2],
+            ),
+            "gdp_activity_tiers" => df!(
+                "wiki" => wiki,
+                "year_month" => &["2025-12", "2026-01"],
+                "period" => &["2025", "2026"],
+                "period_start" => &["2025-01", "2026-01"],
+                "period_end" => &["2025-12", "2026-12"],
+                "period_type" => &["year", "year"],
+                "period_months" => &[12_i64, 12],
+                "user_type" => &["registered", "registered"],
+                "activity_tier" => &["1-1200 edits", "1201+ edits"],
+                "tier_rank" => &[1_i64, 2],
+                "editors" => &[5_i64, 6],
+                "total_edits" => &[20_i64, 30],
+                "net_bytes" => &[40_i64, 50],
+                "gross_bytes" => &[60_i64, 70],
+            ),
+            "gdp_user_type_share" => df!(
+                "wiki" => wiki,
+                "year_month" => &["2025-12", "2026-01"],
+                "user_type" => &["registered", "registered"],
+                "edits" => &[10_i64, 20],
+                "net_bytes" => &[30_i64, 40],
+                "editors" => &[5_i64, 6],
+            ),
+            "inequality" => df!(
+                "wiki" => wiki,
+                "year_month" => &["2025-12", "2026-01"],
+                "user_type" => &["registered", "registered"],
+                "gini" => &[0.3_f64, 0.4],
+                "theil" => &[0.2_f64, 0.25],
+                "palma" => &[1.1_f64, 1.2],
+                "min_editors_50pct" => &[2_i64, 3],
+                "total_editors" => &[10_i64, 20],
+                "total_edits" => &[100_i64, 200],
+            ),
+            "labor_churn" => df!(
+                "wiki" => wiki,
+                "period" => &["2025-12", "2026-01"],
+                "period_type" => &["month", "month"],
+                "active_editors" => &[10_i64, 0],
+                "arrivals" => &[2_i64, 0],
+                "departures" => &[1_i64, 0],
+            ),
+            "labor_cohorts" => df!(
+                "wiki" => wiki,
+                "cohort_year" => &["2025", "2026"],
+                "year" => &["2025", "2026"],
+                "survived_editors" => &[8_i64, 16],
+                "initial_editors" => &[10_i64, 20],
+            ),
+            "labor_monthly" => df!(
+                "wiki" => wiki,
+                "year_month" => &["2025-12", "2026-01"],
+                "page_namespace" => &[0_i32, 0],
+                "user_type" => &["registered", "registered"],
+                "unique_editors" => &[10_i64, 20],
+                "total_edits" => &[100_i64, 200],
+                "net_bytes" => &[50_i64, 100],
+                "reverted_edits" => &[2_i64, 4],
+            ),
+            "patrol" => df!(
+                "wiki" => wiki,
+                "year_month" => &["2025-12", "2026-01"],
+                "page_namespace" => &[0_i32, 0],
+                "user_type" => &["registered", "registered"],
+                "total_patrols" => &[10_i64, 20],
+                "unique_patrollers" => &[2_i64, 4],
+                "patrol_new_pages" => &[3_i64, 6],
+                "patrol_diffs" => &[7_i64, 14],
+                "patrolled_revisions" => &[8_i64, 0],
+                "autopatrolled_revisions" => &[1_i64, 0],
+                "total_revisions" => &[10_i64, 0],
+            ),
+            _ => return Err(anyhow::anyhow!("unsupported fixture metric {metric}")),
+        };
+        frame.map_err(anyhow::Error::from)
+    }
+
+    fn write_global_sources(root: &Path) -> Result<()> {
+        for (metric, _) in BROWSER_METRICS {
+            let mut frame = global_source(metric)?;
+            ParquetWriter::new(File::create(root.join(format!("{metric}.parquet")))?)
+                .set_parallel(false)
+                .finish(&mut frame)?;
         }
         Ok(())
     }
@@ -891,6 +1001,101 @@ mod tests {
                 .join(format!(".{INDEX_FILENAME}.{}.tmp", std::process::id()))
                 .exists()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn global_aggregates_are_sharded_reused_and_fail_closed() -> Result<()> {
+        let output = TestDir::new()?;
+        write_complete_wiki(output.path(), "nlwiki")?;
+        write_complete_wiki(output.path(), "ptwiki")?;
+        write_global_sources(output.path())?;
+
+        let stale_staging = output
+            .path()
+            .join(format!(".{GLOBAL_ROOT}.{}.tmp", std::process::id()));
+        let stale_backup = output
+            .path()
+            .join(format!(".{GLOBAL_ROOT}.{}.backup", std::process::id()));
+        fs::create_dir(&stale_staging)?;
+        fs::create_dir(&stale_backup)?;
+        materialize(output.path(), None)?;
+        assert!(!stale_staging.exists());
+        assert!(!stale_backup.exists());
+
+        let first = read_index(&output.path().join(INDEX_FILENAME))?;
+        let global = first
+            .entries
+            .iter()
+            .filter(|entry| entry.scope == "global")
+            .collect::<Vec<_>>();
+        assert_eq!(global.len(), BROWSER_METRICS.len() * 2);
+        assert!(global.iter().all(|entry| {
+            entry.wiki == GLOBAL_WIKI
+                && entry.shard.is_some()
+                && entry.aggregation_version.as_deref() == Some(GLOBAL_AGGREGATION_VERSION)
+        }));
+
+        materialize(output.path(), None)?;
+        assert_eq!(first, read_index(&output.path().join(INDEX_FILENAME))?);
+        assert!(aggregate_global_metric("unknown", DataFrame::empty()).is_err());
+        assert!(global_source("unknown").is_err());
+
+        let invalid = TestDir::new()?;
+        let mut broken = df!("wiki" => &["nlwiki"], "year_month" => &["2026-01"])?;
+        ParquetWriter::new(File::create(invalid.path().join("gdp.parquet"))?)
+            .finish(&mut broken)?;
+        assert!(materialize_global_partitions(invalid.path(), None).is_err());
+        assert!(
+            !invalid
+                .path()
+                .join(format!(".{GLOBAL_ROOT}.{}.tmp", std::process::id()))
+                .exists()
+        );
+
+        let transaction = TestDir::new()?;
+        let staging = transaction.path().join("staging");
+        let destination = transaction.path().join("destination");
+        let backup = transaction.path().join("backup");
+        fs::create_dir(&staging)?;
+        fs::create_dir(&destination)?;
+        fs::write(destination.join("live"), b"live")?;
+        let error = publish_global_directory(&staging, &destination, &backup, |from, to| {
+            if from == staging {
+                Err(std::io::Error::other("injected publish failure"))
+            } else {
+                fs::rename(from, to)
+            }
+        })
+        .expect_err("an interrupted global switch must fail");
+        assert!(error.to_string().contains("failed to publish"));
+        assert!(destination.join("live").is_file());
+        assert!(!backup.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn global_year_shards_reject_invalid_dates_and_skip_nulls() -> Result<()> {
+        let root = TestDir::new()?;
+        let with_null = df!(
+            "year_month" => &[Some("2026-01"), None],
+            "wiki" => &[GLOBAL_WIKI, GLOBAL_WIKI],
+            "value" => &[1_i64, 2],
+        )
+        .expect("nullable date fixture is valid");
+        let paths = write_year_shards(root.path(), "fixture", "year_month", &with_null)?;
+        assert_eq!(paths.len(), 1);
+
+        let wrong_type = df!("year_month" => &[2026_i64], "wiki" => &[GLOBAL_WIKI])?;
+        assert!(write_year_shards(root.path(), "bad-type", "year_month", &wrong_type).is_err());
+        let too_short = df!("year_month" => &["x"], "wiki" => &[GLOBAL_WIKI])?;
+        assert!(write_year_shards(root.path(), "short", "year_month", &too_short).is_err());
+        let undated = df!(
+            "year_month" => &[None::<&str>],
+            "wiki" => &[GLOBAL_WIKI],
+        )
+        .expect("undated fixture is valid");
+        assert!(write_year_shards(root.path(), "undated", "year_month", &undated).is_err());
         Ok(())
     }
 }

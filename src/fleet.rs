@@ -198,7 +198,7 @@ pub(crate) fn classify(
     let (historical_memory_peak_bytes, historical_scratch_peak_bytes, throughput) =
         historical_signals(output_dir, plan.wiki.as_str(), prior_rows)?;
     let fragment_count = generation_fragment_count(data_dir, plan.wiki.as_str())?;
-    workload_profile::record_observations(
+    let observation_write = workload_profile::record_observations(
         data_dir,
         plan.wiki.as_str(),
         workload_profile::WorkloadObservations {
@@ -208,7 +208,8 @@ pub(crate) fn classify(
             peak_scratch_bytes: historical_scratch_peak_bytes,
             throughput_rows_per_second: throughput,
         },
-    )?;
+    );
+    observation_write?;
     let signals = SchedulingSignals {
         source_layout: plan.layout,
         source_count: plan.sources.len(),
@@ -312,12 +313,13 @@ fn enqueue_at(
             report.unchanged = 1;
             return Ok(report);
         }
-        atomic_write_json(
+        let superseded_write = atomic_write_json(
             &queue_root
                 .join("superseded")
                 .join(format!("{}-{}.json", existing.wiki, existing.task_id)),
             &existing,
-        )?;
+        );
+        superseded_write?;
         report.replaced_obsolete = 1;
     }
     atomic_write_json(&pending, &task)?;
@@ -356,6 +358,34 @@ fn claim_at(
     lease_timeout_secs: u64,
     now: u64,
 ) -> Result<Option<FleetClaim>> {
+    claim_at_with(
+        queue_root,
+        resource_class,
+        worker_id,
+        lease_timeout_secs,
+        now,
+        acquire_lease,
+        publish_claim,
+    )
+}
+
+fn acquire_lease(path: &Path) -> std::io::Result<()> {
+    fs::create_dir(path)
+}
+
+fn publish_claim(path: &Path, claim: &FleetClaim) -> Result<()> {
+    atomic_write_json(path, claim)
+}
+
+fn claim_at_with(
+    queue_root: &Path,
+    resource_class: ResourceClass,
+    worker_id: &str,
+    lease_timeout_secs: u64,
+    now: u64,
+    mut acquire: impl FnMut(&Path) -> std::io::Result<()>,
+    mut publish: impl FnMut(&Path, &FleetClaim) -> Result<()>,
+) -> Result<Option<FleetClaim>> {
     validate_component(worker_id, "worker ID")?;
     ensure!(lease_timeout_secs > 0, "lease timeout must be positive");
     initialize(queue_root)?;
@@ -380,7 +410,7 @@ fn claim_at(
             continue;
         }
         let directory = lease_dir(queue_root, &task.wiki);
-        match fs::create_dir(&directory) {
+        match acquire(&directory) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error).context("failed to acquire fleet lease"),
@@ -403,7 +433,7 @@ fn claim_at(
             heartbeat_at_unix: now,
             lease_timeout_secs,
         };
-        let write = atomic_write_json(&directory.join("owner.json"), &claim);
+        let write = publish(&directory.join("owner.json"), &claim);
         if let Err(error) = write {
             let _ = fs::remove_dir_all(&directory);
             return Err(error).context("failed to publish fleet lease owner");
@@ -423,10 +453,11 @@ pub(crate) fn heartbeat(queue_root: &Path, claim_path: &Path) -> Result<FleetCla
         "fleet heartbeat does not own the live lease"
     );
     claim.heartbeat_at_unix = now_unix()?;
-    atomic_write_json(
+    let live_write = atomic_write_json(
         &lease_dir(queue_root, &claim.task.wiki).join("owner.json"),
         &claim,
-    )?;
+    );
+    live_write?;
     atomic_write_json(claim_path, &claim)?;
     Ok(claim)
 }
@@ -438,10 +469,9 @@ pub(crate) fn complete(queue_root: &Path, claim_path: &Path, output_dir: &Path) 
     let ready_index = output_dir
         .join("_ready-index")
         .join(format!("{}.json", claim.task.wiki));
-    let ready: Value = serde_json::from_slice(
-        &fs::read(&ready_index)
-            .with_context(|| format!("fleet completion is missing {}", ready_index.display()))?,
-    )?;
+    let ready_bytes = fs::read(&ready_index)
+        .with_context(|| format!("fleet completion is missing {}", ready_index.display()))?;
+    let ready: Value = serde_json::from_slice(&ready_bytes)?;
     ensure!(
         ready.get("schema_version").and_then(Value::as_u64) == Some(1)
             && ready.get("wiki").and_then(Value::as_str) == Some(claim.task.wiki.as_str())
@@ -465,12 +495,13 @@ pub(crate) fn complete(queue_root: &Path, claim_path: &Path, output_dir: &Path) 
         .join("ready")
         .join(format!("{}-{}.json", claim.task.wiki, claim.task.task_id));
     atomic_write_json(&notification_path, &notification)?;
-    atomic_write_json(
+    let completed_write = atomic_write_json(
         &queue_root
             .join("completed")
             .join(format!("{}-{}.json", claim.task.wiki, claim.task.task_id)),
         &claim.task,
-    )?;
+    );
+    completed_write?;
     fs::remove_file(pending_path(queue_root, &claim.task.wiki))?;
     fs::remove_dir_all(lease_dir(queue_root, &claim.task.wiki))?;
     sync_dir(queue_root)?;
@@ -506,7 +537,7 @@ fn fail_claim_at(
     let concise = concise_error(error);
     let quarantined = next_attempt >= max_attempts;
     if quarantined {
-        atomic_write_json(
+        let quarantine_write = atomic_write_json(
             &queue_root.join("quarantine").join(format!(
                 "{}-{}-attempt-{next_attempt}.json",
                 claim.task.wiki, claim.task.task_id
@@ -518,14 +549,15 @@ fn fail_claim_at(
                 "failed_at_unix": now,
                 "claim": claim,
             }),
-        )?;
+        );
+        quarantine_write?;
         fs::remove_file(pending_path(queue_root, &claim.task.wiki))?;
     } else {
         let mut task = claim.task.clone();
         task.attempt = next_attempt;
         task.not_before_unix = now.saturating_add(retry_delay_secs(next_attempt));
         atomic_write_json(&pending_path(queue_root, &task.wiki), &task)?;
-        atomic_write_json(
+        let failure_write = atomic_write_json(
             &queue_root.join("failures").join(format!(
                 "{}-{}-attempt-{next_attempt}.json",
                 task.wiki, task.task_id
@@ -537,7 +569,8 @@ fn fail_claim_at(
                 "worker_id": claim.worker_id,
                 "task": task,
             }),
-        )?;
+        );
+        failure_write?;
     }
     fs::remove_dir_all(lease_dir(queue_root, &claim.task.wiki))?;
     sync_dir(queue_root)?;
@@ -556,23 +589,25 @@ fn recover_stale_at(queue_root: &Path, now: u64, max_attempts: u32) -> Result<us
         let entry = entry?;
         let wiki = entry.file_name().to_string_lossy().into_owned();
         if !entry.path().is_dir() {
-            quarantine_unknown(
+            let quarantined = quarantine_unknown(
                 queue_root,
                 &entry.path(),
                 "lease entry is not a directory",
                 now,
-            )?;
+            );
+            quarantined?;
             continue;
         }
         let owner_path = entry.path().join("owner.json");
         let claim = read_json::<FleetClaim>(&owner_path);
         let Ok(claim) = claim else {
-            quarantine_unknown(
+            let quarantined = quarantine_unknown(
                 queue_root,
                 &entry.path(),
                 "lease owner is missing or invalid",
                 now,
-            )?;
+            );
+            quarantined?;
             continue;
         };
         if claim.validate().is_err() || claim.task.wiki != wiki {
@@ -582,13 +617,14 @@ fn recover_stale_at(queue_root: &Path, now: u64, max_attempts: u32) -> Result<us
         if now.saturating_sub(claim.heartbeat_at_unix) <= claim.lease_timeout_secs {
             continue;
         }
-        fail_claim_at(
+        let failed = fail_claim_at(
             queue_root,
             &claim,
             "worker lease heartbeat expired",
             max_attempts,
             now,
-        )?;
+        );
+        failed?;
         recovered += 1;
     }
     Ok(recovered)
@@ -604,14 +640,15 @@ impl FleetTask {
         validate_component(&self.wiki, "task wiki")?;
         crate::storage::validate_snapshot_version(&self.snapshot)?;
         validate_component(&self.controller_run_id, "controller run ID")?;
+        let identity = task_identity(
+            &self.wiki,
+            &self.snapshot,
+            self.resource_class,
+            &self.signals,
+        );
+        let expected_identity = identity?;
         ensure!(
-            self.task_id
-                == task_identity(
-                    &self.wiki,
-                    &self.snapshot,
-                    self.resource_class,
-                    &self.signals
-                )?,
+            self.task_id == expected_identity,
             "fleet task identity mismatch"
         );
         ensure!(self.signals.source_count > 0, "fleet task has no sources");
@@ -950,27 +987,29 @@ mod tests {
         }
     }
 
+    fn enqueue_fixture(
+        root: &Path,
+        wiki: &str,
+        snapshot: &str,
+        controller: &str,
+        now: u64,
+    ) -> Result<DiscoveryReport> {
+        enqueue_at(
+            root,
+            wiki,
+            snapshot,
+            ResourceClass::Small,
+            signals(SourceLayout::Yearly),
+            controller,
+            now,
+        )
+    }
+
     #[test]
     fn queue_claims_independent_wikis_and_retries_then_quarantines() -> Result<()> {
         let root = TestDir::new()?;
-        enqueue_at(
-            root.path(),
-            "nlwiki",
-            "2026-08",
-            ResourceClass::Small,
-            signals(SourceLayout::Yearly),
-            "controller-1",
-            1_000,
-        )?;
-        enqueue_at(
-            root.path(),
-            "ptwiki",
-            "2026-08",
-            ResourceClass::Small,
-            signals(SourceLayout::Yearly),
-            "controller-1",
-            1_000,
-        )?;
+        enqueue_fixture(root.path(), "nlwiki", "2026-08", "controller-1", 1_000)?;
+        enqueue_fixture(root.path(), "ptwiki", "2026-08", "controller-1", 1_000)?;
         let first = claim_at(root.path(), ResourceClass::Small, "worker-1", 60, 1_001)?
             .context("first task should be claimable")?;
         let second = claim_at(root.path(), ResourceClass::Small, "worker-2", 60, 1_001)?
@@ -978,13 +1017,8 @@ mod tests {
         assert_ne!(first.task.wiki, second.task.wiki);
         assert!(claim_at(root.path(), ResourceClass::Small, "worker-3", 60, 1_001)?.is_none());
 
-        assert!(!fail_claim_at(
-            root.path(),
-            &first,
-            "temporary\nfailure",
-            2,
-            1_010
-        )?);
+        let first_failure = fail_claim_at(root.path(), &first, "temporary\nfailure", 2, 1_010)?;
+        assert!(!first_failure);
         assert!(claim_at(root.path(), ResourceClass::Small, "worker-3", 60, 1_100)?.is_none());
         let retry = claim_at(root.path(), ResourceClass::Small, "worker-3", 60, 1_700)?
             .context("retry should become eligible after backoff")?;
@@ -1001,15 +1035,7 @@ mod tests {
     #[test]
     fn stale_lease_recovery_is_bounded_and_idempotent() -> Result<()> {
         let root = TestDir::new()?;
-        enqueue_at(
-            root.path(),
-            "nlwiki",
-            "2026-08",
-            ResourceClass::Small,
-            signals(SourceLayout::Yearly),
-            "controller-1",
-            100,
-        )?;
+        enqueue_fixture(root.path(), "nlwiki", "2026-08", "controller-1", 100)?;
         let claim = claim_at(root.path(), ResourceClass::Small, "worker-1", 10, 101)?
             .context("task should be claimable")?;
         assert_eq!(recover_stale_at(root.path(), 111, 3)?, 0);
@@ -1025,53 +1051,28 @@ mod tests {
     fn completion_requires_matching_ready_index_and_publishes_notification() -> Result<()> {
         let queue = TestDir::new()?;
         let output = TestDir::new()?;
-        enqueue_at(
-            queue.path(),
-            "nlwiki",
-            "2026-08",
-            ResourceClass::Small,
-            signals(SourceLayout::Yearly),
-            "controller-1",
-            100,
-        )?;
+        enqueue_fixture(queue.path(), "nlwiki", "2026-08", "controller-1", 100)?;
         let claim = claim_at(queue.path(), ResourceClass::Small, "worker-1", 60, 101)?
             .context("task should be claimable")?;
         let claim_path = queue.path().join("claim.json");
         atomic_write_json(&claim_path, &claim)?;
         fs::create_dir_all(output.path().join("_ready-index"))?;
-        fs::write(
-            output.path().join("_ready-index/nlwiki.json"),
-            br#"{"schema_version":1,"wiki":"nlwiki","newest_valid_ready":{"snapshot":"2026-07"}}"#,
-        )?;
+        const STALE_READY: &[u8] =
+            br#"{"schema_version":1,"wiki":"nlwiki","newest_valid_ready":{"snapshot":"2026-07"}}"#;
+        let ready_index = output.path().join("_ready-index/nlwiki.json");
+        fs::write(&ready_index, STALE_READY)?;
         assert!(complete(queue.path(), &claim_path, output.path()).is_err());
-        fs::write(
-            output.path().join("_ready-index/nlwiki.json"),
-            br#"{"schema_version":1,"wiki":"nlwiki","newest_valid_ready":{"snapshot":"2026-08"}}"#,
-        )?;
+        const CURRENT_READY: &[u8] =
+            br#"{"schema_version":1,"wiki":"nlwiki","newest_valid_ready":{"snapshot":"2026-08"}}"#;
+        fs::write(&ready_index, CURRENT_READY)?;
         let notification = complete(queue.path(), &claim_path, output.path())?;
         assert!(notification.is_file());
         assert!(!pending_path(queue.path(), "nlwiki").exists());
         assert!(!lease_dir(queue.path(), "nlwiki").exists());
-        let unchanged = enqueue_at(
-            queue.path(),
-            "nlwiki",
-            "2026-08",
-            ResourceClass::Small,
-            signals(SourceLayout::Yearly),
-            "controller-2",
-            200,
-        )?;
+        let unchanged = enqueue_fixture(queue.path(), "nlwiki", "2026-08", "controller-2", 200)?;
         assert_eq!(unchanged.unchanged, 1);
         fs::remove_file(output.path().join("_ready-index/nlwiki.json"))?;
-        let repaired = enqueue_at(
-            queue.path(),
-            "nlwiki",
-            "2026-08",
-            ResourceClass::Small,
-            signals(SourceLayout::Yearly),
-            "controller-3",
-            201,
-        )?;
+        let repaired = enqueue_fixture(queue.path(), "nlwiki", "2026-08", "controller-3", 201)?;
         assert_eq!(repaired.scheduled, 1);
         Ok(())
     }
@@ -1079,46 +1080,14 @@ mod tests {
     #[test]
     fn discovery_deduplicates_and_replaces_only_unleased_work() -> Result<()> {
         let root = TestDir::new()?;
-        let first = enqueue_at(
-            root.path(),
-            "nlwiki",
-            "2026-07",
-            ResourceClass::Small,
-            signals(SourceLayout::Yearly),
-            "controller-1",
-            100,
-        )?;
+        let first = enqueue_fixture(root.path(), "nlwiki", "2026-07", "controller-1", 100)?;
         assert_eq!(first.scheduled, 1);
-        let unchanged = enqueue_at(
-            root.path(),
-            "nlwiki",
-            "2026-07",
-            ResourceClass::Small,
-            signals(SourceLayout::Yearly),
-            "controller-2",
-            101,
-        )?;
+        let unchanged = enqueue_fixture(root.path(), "nlwiki", "2026-07", "controller-2", 101)?;
         assert_eq!(unchanged.unchanged, 1);
-        let replaced = enqueue_at(
-            root.path(),
-            "nlwiki",
-            "2026-08",
-            ResourceClass::Small,
-            signals(SourceLayout::Yearly),
-            "controller-3",
-            102,
-        )?;
+        let replaced = enqueue_fixture(root.path(), "nlwiki", "2026-08", "controller-3", 102)?;
         assert_eq!(replaced.replaced_obsolete, 1);
         let _claim = claim_at(root.path(), ResourceClass::Small, "worker-1", 60, 103)?;
-        let leased = enqueue_at(
-            root.path(),
-            "nlwiki",
-            "2026-09",
-            ResourceClass::Small,
-            signals(SourceLayout::Yearly),
-            "controller-4",
-            104,
-        )?;
+        let leased = enqueue_fixture(root.path(), "nlwiki", "2026-09", "controller-4", 104)?;
         assert_eq!(leased.leased, 1);
         Ok(())
     }
@@ -1127,10 +1096,8 @@ mod tests {
     fn lifecycle_and_signal_classification_have_no_wiki_name_branch() -> Result<()> {
         let root = TestDir::new()?;
         let lifecycle = root.path().join("lifecycle.json");
-        fs::write(
-            &lifecycle,
-            br#"{"schema_version":1,"wikis":{"smallwiki":{"publication":"published","refresh":"scheduled"},"manualwiki":{"publication":"published","refresh":"manual"},"monthlywiki":{"publication":"hidden","refresh":"qualification","fleet_resource_class":"isolated"}}}"#,
-        )?;
+        const LIFECYCLE: &[u8] = br#"{"schema_version":1,"wikis":{"smallwiki":{"publication":"published","refresh":"scheduled"},"manualwiki":{"publication":"published","refresh":"manual"},"monthlywiki":{"publication":"hidden","refresh":"qualification","fleet_resource_class":"isolated"}}}"#;
+        fs::write(&lifecycle, LIFECYCLE)?;
         assert_eq!(scheduled_wikis(&lifecycle)?, vec!["smallwiki"]);
         assert_eq!(
             lifecycle_resource_overrides(&lifecycle)?.get("monthlywiki"),
@@ -1160,15 +1127,7 @@ mod tests {
         let root = TestDir::new()?;
         for index in 0..300 {
             let wiki = format!("w{index:03}wiki");
-            enqueue_at(
-                root.path(),
-                &wiki,
-                "2026-08",
-                ResourceClass::Small,
-                signals(SourceLayout::Yearly),
-                "controller-1",
-                100,
-            )?;
+            enqueue_fixture(root.path(), &wiki, "2026-08", "controller-1", 100)?;
         }
         assert_eq!(fs::read_dir(root.path().join("pending"))?.count(), 300);
         let claim = claim_at(root.path(), ResourceClass::Small, "worker-1", 60, 101)?
@@ -1197,6 +1156,9 @@ mod tests {
 
     #[test]
     fn helpers_validate_identity_backoff_and_error_bounds() -> Result<()> {
+        assert_eq!(ResourceClass::Small.as_str(), "small");
+        assert_eq!(ResourceClass::MediumLarge.as_str(), "medium_large");
+        assert_eq!(ResourceClass::Isolated.as_str(), "isolated");
         assert!(validate_component("bad/wiki", "test").is_err());
         assert_eq!(retry_delay_secs(1), 600);
         assert_eq!(concise_error(&"x".repeat(600)).len(), MAX_ERROR_BYTES);
@@ -1205,6 +1167,233 @@ mod tests {
         assert_eq!(maximum(None, Some(2)), Some(2));
         assert_eq!(minimum_nonzero(Some(3), Some(2)), Some(2));
         assert_eq!(minimum_nonzero(Some(0), Some(2)), Some(2));
+        Ok(())
+    }
+
+    #[test]
+    fn public_queue_wrappers_heartbeat_and_validation_fail_closed() -> Result<()> {
+        let queue = TestDir::new()?;
+        let output = TestDir::new()?;
+        let report_result = enqueue(
+            queue.path(),
+            "nlwiki",
+            "2026-08",
+            ResourceClass::Small,
+            signals(SourceLayout::Yearly),
+            "controller-wrapper",
+        );
+        let report = report_result?;
+        assert_eq!(report.scheduled, 1);
+        assert!(
+            enqueue(
+                queue.path(),
+                "bad/wiki",
+                "2026-08",
+                ResourceClass::Small,
+                signals(SourceLayout::Yearly),
+                "controller-wrapper",
+            )
+            .is_err()
+        );
+        assert!(claim(queue.path(), ResourceClass::Small, "worker", 0).is_err());
+
+        let claim = claim(queue.path(), ResourceClass::Small, "worker", 60)?
+            .context("wrapper task should be claimable")?;
+        let receipt = queue.path().join("claim.json");
+        write_claim_receipt(&receipt, &claim)?;
+        let refreshed = heartbeat(queue.path(), &receipt)?;
+        assert_eq!(refreshed.lease_id, claim.lease_id);
+        assert!(complete(queue.path(), &receipt, output.path()).is_err());
+
+        let mut impostor = refreshed.clone();
+        impostor.lease_id = "0".repeat(64);
+        atomic_write_json(&receipt, &impostor)?;
+        assert!(heartbeat(queue.path(), &receipt).is_err());
+        assert!(fail(queue.path(), &receipt, "lost ownership", 3).is_err());
+        assert!(fail(queue.path(), &receipt, "invalid attempts", 0).is_err());
+        assert_eq!(recover_stale(queue.path(), 3)?, 0);
+
+        let mut invalid_task = claim.task.clone();
+        invalid_task.schema_version = 99;
+        assert!(invalid_task.validate().is_err());
+        invalid_task = claim.task.clone();
+        invalid_task.task_id = "0".repeat(64);
+        assert!(invalid_task.validate().is_err());
+        invalid_task = claim.task.clone();
+        invalid_task.signals.source_count = 0;
+        let invalid_identity = task_identity(
+            &invalid_task.wiki,
+            &invalid_task.snapshot,
+            invalid_task.resource_class,
+            &invalid_task.signals,
+        );
+        invalid_task.task_id = invalid_identity?;
+        assert!(invalid_task.validate().is_err());
+
+        for invalid in [
+            FleetClaim {
+                schema_version: 99,
+                ..claim.clone()
+            },
+            FleetClaim {
+                lease_id: "bad".to_string(),
+                ..claim.clone()
+            },
+            FleetClaim {
+                lease_timeout_secs: 0,
+                ..claim.clone()
+            },
+            FleetClaim {
+                claimed_at_unix: claim.heartbeat_at_unix.saturating_add(1),
+                ..claim.clone()
+            },
+        ] {
+            assert!(invalid.validate().is_err());
+            assert!(write_claim_receipt(&queue.path().join("invalid.json"), &invalid).is_err());
+        }
+
+        let acquire_failure = TestDir::new()?;
+        let acquire_root = acquire_failure.path();
+        enqueue_fixture(acquire_root, "nlwiki", "2026-08", "controller", 100)?;
+        let acquisition = claim_at_with(
+            acquire_failure.path(),
+            ResourceClass::Small,
+            "worker",
+            60,
+            101,
+            |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected",
+                ))
+            },
+            publish_claim,
+        );
+        assert!(acquisition.is_err());
+
+        let publish_failure = TestDir::new()?;
+        let publish_root = publish_failure.path();
+        enqueue_fixture(publish_root, "nlwiki", "2026-08", "controller", 100)?;
+        let publication = claim_at_with(
+            publish_failure.path(),
+            ResourceClass::Small,
+            "worker",
+            60,
+            101,
+            acquire_lease,
+            |_, _| Err(anyhow::anyhow!("injected owner publication failure")),
+        );
+        assert!(publication.is_err());
+        assert!(!lease_dir(publish_failure.path(), "nlwiki").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn measured_history_and_generation_fragments_drive_classification() -> Result<()> {
+        let data = TestDir::new()?;
+        let output = TestDir::new()?;
+        let pointer = crate::storage::write_current_snapshot_pointer_for_test(
+            data.path(),
+            "testwiki",
+            "2026-08",
+        );
+        pointer?;
+        let manifest =
+            crate::storage::generation_manifest_path(data.path(), "testwiki", "2026-08")?;
+        fs::create_dir_all(manifest.parent().context("manifest has a parent")?)?;
+        fs::write(&manifest, br#"{"fragments":[{}, {}, {}]}"#)?;
+
+        let status = output
+            .path()
+            .join("_candidate-status/testwiki.history.jsonl");
+        fs::create_dir_all(status.parent().context("history has a parent")?)?;
+        let history_json = concat!(
+            "\n",
+            "{\"memoryPeakBytes\":1610612736,\"scratchPeakBytes\":100,",
+            "\"throughputRowsPerSecond\":400}\n",
+            "{\"memoryPeakBytes\":2000000000,\"scratchPeakBytes\":200,",
+            "\"stageDurationsMs\":{\"compute\":1000}}\n"
+        );
+        fs::write(&status, history_json)?;
+        assert_eq!(generation_fragment_count(data.path(), "testwiki")?, Some(3));
+        let history = historical_signals(output.path(), "testwiki", Some(1_000))?;
+        assert_eq!(history, (Some(2_000_000_000), Some(200), Some(400)));
+
+        let plan = SnapshotPlan::resolve("testwiki", "2026-08")?;
+        let (class, classified) = classify(data.path(), output.path(), &plan, None)?;
+        assert_eq!(class, ResourceClass::MediumLarge);
+        assert_eq!(classified.fragment_count, Some(3));
+
+        fs::remove_file(&manifest)?;
+        assert_eq!(generation_fragment_count(data.path(), "testwiki")?, None);
+        assert_eq!(generation_fragment_count(data.path(), "missingwiki")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn lifecycle_reports_and_queue_evidence_cover_recovery_edges() -> Result<()> {
+        let root = TestDir::new()?;
+        let lifecycle = root.path().join("lifecycle.json");
+        for invalid in [
+            br#"{"schema_version":2,"wikis":{}}"#.as_slice(),
+            br#"{"schema_version":1,"wikis":{"xwiki":{"publication":"bad","refresh":"manual"}}}"#.as_slice(),
+            br#"{"schema_version":1,"wikis":{"xwiki":{"publication":"published","refresh":"bad"}}}"#.as_slice(),
+            br#"{"schema_version":1,"wikis":{"xwiki":{"publication":"hidden","refresh":"scheduled"}}}"#.as_slice(),
+        ] {
+            fs::write(&lifecycle, invalid)?;
+            assert!(scheduled_wikis(&lifecycle).is_err());
+        }
+
+        let mut combined = DiscoveryReport::default();
+        combined.merge(DiscoveryReport {
+            scheduled: 1,
+            unchanged: 2,
+            leased: 3,
+            replaced_obsolete: 4,
+            recovered_stale: 5,
+            quarantined: 6,
+            by_resource_class: BTreeMap::from([("small".to_string(), 7)]),
+        });
+        combined.merge(DiscoveryReport {
+            by_resource_class: BTreeMap::from([("small".to_string(), 1)]),
+            ..DiscoveryReport::default()
+        });
+        assert_eq!(combined.by_resource_class["small"], 8);
+        assert_eq!(combined.quarantined, 6);
+
+        let queue = root.path().join("queue");
+        initialize(&queue)?;
+        fs::create_dir(queue.join("pending/not-json"))?;
+        fs::write(queue.join("pending/ignored.txt"), b"ignored")?;
+        assert!(pending_tasks(&queue)?.is_empty());
+
+        let report = enqueue_fixture(&queue, "nlwiki", "2026-08", "controller", 100)?;
+        assert_eq!(report.scheduled, 1);
+        let pending = queue.join("pending/nlwiki.json");
+        let wrong_pending = queue.join("pending/wrongwiki.json");
+        fs::rename(&pending, &wrong_pending)?;
+        assert!(pending_tasks(&queue).is_err());
+        fs::rename(&wrong_pending, &pending)?;
+
+        fs::write(queue.join("leases/ambiguouswiki"), b"not a directory")?;
+        assert_eq!(recover_stale_at(&queue, 200, 3)?, 0);
+        assert!(!queue.join("leases/ambiguouswiki").exists());
+
+        let _lease = claim_at(&queue, ResourceClass::Small, "worker", 10, 201)?
+            .context("recovery fixture should be claimable")?;
+        let wrong_lease = lease_dir(&queue, "wrongwiki");
+        fs::rename(lease_dir(&queue, "nlwiki"), &wrong_lease)?;
+        assert_eq!(recover_stale_at(&queue, 300, 3)?, 0);
+        assert!(!wrong_lease.exists());
+
+        let atomic_target = root.path().join("atomic-target");
+        fs::create_dir(&atomic_target)?;
+        assert!(atomic_write_json(&atomic_target, &serde_json::json!({"ok": true})).is_err());
+        assert!(
+            fs::read_dir(root.path())?
+                .filter_map(std::result::Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp"))
+        );
         Ok(())
     }
 }

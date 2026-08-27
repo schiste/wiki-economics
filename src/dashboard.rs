@@ -1679,9 +1679,8 @@ mod tests {
             "MIT"
         );
 
-        let browser_index = crate::browser_data::read_index(
-            &first.path().join(crate::browser_data::INDEX_FILENAME),
-        )?;
+        let browser_index_path = first.path().join(crate::browser_data::INDEX_FILENAME);
+        let browser_index = crate::browser_data::read_index(&browser_index_path)?;
         let global_metrics = browser_index
             .entries
             .iter()
@@ -1692,10 +1691,9 @@ mod tests {
             global_metrics.len(),
             crate::browser_data::BROWSER_METRICS.len()
         );
-        let global_inequality = ParquetReader::new(File::open(
-            first.path().join("_browser-global/inequality/2026.parquet"),
-        )?)
-        .finish()?;
+        let global_inequality_file =
+            File::open(first.path().join("_browser-global/inequality/2026.parquet"))?;
+        let global_inequality = ParquetReader::new(global_inequality_file).finish()?;
         assert_eq!(global_inequality.column("wiki")?.str()?.get(0), Some("all"));
         assert_eq!(global_inequality.column("gini")?.f64()?.get(0), None);
         assert!(global_inequality.column("theil")?.f64()?.get(0).is_some());
@@ -1749,6 +1747,20 @@ mod tests {
         let (patrol, _) = patrol_artifacts(&frames)?;
         assert_eq!(patrol["patrol"][0]["patrol_coverage_pct"], 0);
         assert_eq!(patrol["patrol"][0]["adjusted_coverage_pct"], 0);
+
+        for column in ["total_editors", "total_edits"] {
+            let replacement = frames.inequality.replace(
+                column,
+                Column::new(column.into(), vec![0_i64; frames.inequality.height()]),
+            );
+            replacement?;
+        }
+        let (inequality, _) = inequality_artifacts(&frames)?;
+        assert!(
+            inequality["data"]
+                .as_array()
+                .is_some_and(|rows| rows.iter().all(|row| row["theil"].is_null()))
+        );
         Ok(())
     }
 

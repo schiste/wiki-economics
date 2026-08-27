@@ -268,11 +268,10 @@ fn select_automatic(signals: &WorkloadSignals) -> WorkloadProfileName {
 
 impl WorkloadProfile {
     pub(crate) fn validate(&self, wiki: &str, snapshot: &str) -> Result<()> {
+        let supported_schema = self.schema_version == PROFILE_SCHEMA_VERSION
+            || self.schema_version == LEGACY_PROFILE_SCHEMA_VERSION;
         ensure!(
-            matches!(
-                self.schema_version,
-                PROFILE_SCHEMA_VERSION | LEGACY_PROFILE_SCHEMA_VERSION
-            ),
+            supported_schema,
             "unsupported workload profile schema {}",
             self.schema_version
         );
@@ -578,28 +577,22 @@ mod tests {
     #[test]
     fn measured_observations_merge_monotonically_and_seed_new_profiles() -> Result<()> {
         let root = TestDir::new()?;
-        record_observations(
-            root.path(),
-            "testwiki",
-            WorkloadObservations {
-                schema_version: OBSERVATIONS_SCHEMA_VERSION,
-                fragment_count: Some(100),
-                peak_memory_bytes: Some(200),
-                peak_scratch_bytes: Some(300),
-                throughput_rows_per_second: Some(400),
-            },
-        )?;
-        record_observations(
-            root.path(),
-            "testwiki",
-            WorkloadObservations {
-                schema_version: OBSERVATIONS_SCHEMA_VERSION,
-                fragment_count: Some(50),
-                peak_memory_bytes: Some(250),
-                peak_scratch_bytes: None,
-                throughput_rows_per_second: Some(350),
-            },
-        )?;
+        let initial = WorkloadObservations {
+            schema_version: OBSERVATIONS_SCHEMA_VERSION,
+            fragment_count: Some(100),
+            peak_memory_bytes: Some(200),
+            peak_scratch_bytes: Some(300),
+            throughput_rows_per_second: Some(400),
+        };
+        record_observations(root.path(), "testwiki", initial)?;
+        let update = WorkloadObservations {
+            schema_version: OBSERVATIONS_SCHEMA_VERSION,
+            fragment_count: Some(50),
+            peak_memory_bytes: Some(250),
+            peak_scratch_bytes: None,
+            throughput_rows_per_second: Some(350),
+        };
+        record_observations(root.path(), "testwiki", update)?;
         let observed = load_observations(root.path(), "testwiki")?;
         assert_eq!(observed.fragment_count, Some(100));
         assert_eq!(observed.peak_memory_bytes, Some(250));

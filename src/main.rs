@@ -1293,14 +1293,15 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
                     snapshot_plan::SnapshotPlan::load_or_resolve(&data_dir, &wiki, &version)?;
                 let (resource_class, signals) =
                     fleet::classify(&data_dir, &output_dir, &plan, overrides.get(&wiki).copied())?;
-                report.merge(fleet::enqueue(
+                let discovery = fleet::enqueue(
                     &queue_dir,
                     &wiki,
                     &version,
                     resource_class,
                     signals,
                     controller_run_id,
-                )?);
+                );
+                report.merge(discovery?);
             }
             println!("{}", serde_json::to_string(&report)?);
         }
@@ -3024,6 +3025,37 @@ mod tests {
             ops.calls.into_inner(),
             vec!["bench:frwiki,dewiki:dataset:bench-out:2:4:true"]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn fleet_discovery_resolves_an_unpinned_snapshot_and_enqueues_once() -> Result<()> {
+        let data = TestDir::new()?;
+        let output = TestDir::new()?;
+        let queue = output.path().join("_fleet-shadow");
+        let lifecycle = output.path().join("lifecycle.json");
+        const LIFECYCLE: &[u8] = br#"{"schema_version":1,"wikis":{"testwiki":{"publication":"published","refresh":"scheduled"}}}"#;
+        fs::write(&lifecycle, LIFECYCLE)?;
+        let ops = RecordingOps::default();
+        let discovery = run_with_ops(
+            Cli {
+                data_dir: data.path().to_path_buf(),
+                output_dir: output.path().to_path_buf(),
+                run_id: Some("fleet-unpinned-test".to_string()),
+                command: Commands::FleetDiscover {
+                    lifecycle,
+                    queue_dir: queue.clone(),
+                    snapshot: None,
+                },
+            },
+            &ops,
+        );
+        discovery?;
+        assert_eq!(
+            ops.calls.into_inner(),
+            vec!["resolve_snapshot:testwiki".to_string()]
+        );
+        assert!(queue.join("pending/testwiki.json").is_file());
         Ok(())
     }
 
