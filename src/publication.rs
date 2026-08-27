@@ -930,6 +930,39 @@ fn prepared_artifact(candidate_dir: &Path, path: &Path) -> Result<PreparedArtifa
     })
 }
 
+fn authoritative_ready_candidate(
+    candidate_dir: &Path,
+    ready: &ReadyWikiCandidate,
+) -> Result<ReadyWikiCandidate> {
+    let mut authoritative = ready.clone();
+    let mut artifacts = Vec::with_capacity(ready.artifacts.len());
+    for artifact in &ready.artifacts {
+        if artifact.receipt_identity.is_empty() || artifact.receipt_sha256.len() != 64 {
+            let path = candidate_dir.join(&artifact.path);
+            let upgraded = prepared_artifact(candidate_dir, &path)?;
+            ensure!(
+                upgraded.path == artifact.path
+                    && upgraded.bytes == artifact.bytes
+                    && upgraded.rows == artifact.rows
+                    && upgraded.sha256 == artifact.sha256,
+                "legacy ready artifact changed while authenticating receipts"
+            );
+            artifacts.push(upgraded);
+        } else {
+            validate_prepared_artifact(candidate_dir, artifact)?;
+            artifacts.push(artifact.clone());
+        }
+    }
+    ensure!(
+        artifacts.iter().all(|artifact| {
+            !artifact.receipt_identity.is_empty() && artifact.receipt_sha256.len() == 64
+        }),
+        "ready artifact has no authoritative receipt identity"
+    );
+    authoritative.artifacts = artifacts;
+    Ok(authoritative)
+}
+
 fn validate_prepared_artifact(candidate_dir: &Path, artifact: &PreparedArtifact) -> Result<()> {
     let relative = Path::new(&artifact.path);
     ensure!(
@@ -1594,18 +1627,12 @@ fn ready_candidate_reference(
     candidate_dir: &Path,
     ready: &ReadyWikiCandidate,
 ) -> Result<ReadyCandidateReference> {
+    let ready = authoritative_ready_candidate(candidate_dir, ready)?;
     let candidate_relative = candidate_dir
         .strip_prefix(output_dir)
         .context("ready candidate is outside the output directory")?
         .to_string_lossy()
         .into_owned();
-    ensure!(
-        ready
-            .artifacts
-            .iter()
-            .all(|artifact| artifact.receipt_sha256.len() == 64),
-        "ready artifact has no authoritative receipt identity"
-    );
     let core_family_receipt_identities = crate::compute::family_receipt_identities(
         &ready.wiki,
         &ready.snapshot,
@@ -1628,11 +1655,11 @@ fn ready_candidate_reference(
     let (_, ready_receipt_sha256) = storage::sha256_file(&ready_path)?;
     Ok(ReadyCandidateReference {
         candidate_relative,
-        snapshot: ready.snapshot.clone(),
-        run_id: ready.run_id.clone(),
+        snapshot: ready.snapshot,
+        run_id: ready.run_id,
         core_family_receipt_identities,
         patrol_receipt_identity,
-        workload_profile: ready.workload_profile.clone(),
+        workload_profile: ready.workload_profile,
         ready_receipt_sha256,
     })
 }
@@ -1745,6 +1772,7 @@ fn current_wiki_publication_proof(
     };
     let candidate_dir = output_dir.join(&candidate_relative);
     let ready: ReadyWikiCandidate = read_json(&candidate_dir.join("ready.json"))?;
+    let ready = authoritative_ready_candidate(&candidate_dir, &ready)?;
     ensure!(ready.wiki == wiki, "active candidate ready wiki mismatch");
     validate_ready_candidate(data_dir, &candidate_dir, &ready)?;
     ensure!(
@@ -5123,6 +5151,60 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_active_ready_candidate_is_authenticated_without_rewriting_it() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let ready_path = fixture.ready_candidate("legacy-active")?;
+        let candidate_dir = ready_path
+            .parent()
+            .context("legacy ready receipt should have a candidate directory")?;
+        let mut legacy: ReadyWikiCandidate = read_json(&ready_path)?;
+        for artifact in &mut legacy.artifacts {
+            artifact.receipt_identity.clear();
+            artifact.receipt_sha256.clear();
+        }
+        atomic_json(&ready_path, &legacy)?;
+        let legacy_ready_bytes = fs::read(&ready_path)?;
+
+        fs::remove_dir_all(fixture.output.path().join("nlwiki"))?;
+        std::os::unix::fs::symlink(
+            candidate_dir
+                .join("nlwiki")
+                .strip_prefix(fixture.output.path())?,
+            fixture.output.path().join("nlwiki"),
+        )?;
+
+        let reference =
+            active_ready_reference(fixture.data.path(), fixture.output.path(), "nlwiki")?
+                .context("legacy active candidate should have an authenticated reference")?;
+        assert_eq!(reference.run_id, "legacy-active");
+        assert_eq!(fs::read(&ready_path)?, legacy_ready_bytes);
+
+        let proof = current_wiki_publication_proof(
+            fixture.data.path(),
+            fixture.output.path(),
+            &load_lifecycle(&fixture.lifecycle_path)?,
+            "nlwiki",
+        )?;
+        assert!(proof.artifacts.values().all(|artifact| {
+            !artifact.receipt_identity.is_empty() && artifact.receipt_sha256.len() == 64
+        }));
+
+        fixture.ready_candidate("new-ready")?;
+        let index: ReadyCandidateIndex =
+            read_json(&ready_index_path(fixture.output.path(), "nlwiki"))?;
+        assert_eq!(index.newest_valid_ready.run_id, "new-ready");
+        assert_eq!(
+            index
+                .active_published
+                .context("ready index should retain the authenticated active baseline")?
+                .run_id,
+            "legacy-active"
+        );
+        assert_eq!(fs::read(ready_path)?, legacy_ready_bytes);
         Ok(())
     }
 
