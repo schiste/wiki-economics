@@ -16,6 +16,10 @@ elif [ "$#" -eq 3 ]; then
 fi
 case "$resource_class" in small|medium_large) ;; *) echo "Unsupported fleet resource class: $resource_class" >&2; exit 2 ;; esac
 case "$worker_id" in *[!A-Za-z0-9_-]*|'') echo "Unsafe worker ID: $worker_id" >&2; exit 2 ;; esac
+cli_resource_class=$resource_class
+if [ "$cli_resource_class" = medium_large ]; then
+  cli_resource_class=medium-large
+fi
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 # shellcheck disable=SC1091
@@ -52,7 +56,7 @@ while true; do
     --output-dir "$WIKI_ECON_OUTPUT_DIR" \
     fleet-claim \
     --queue-dir "$queue_dir" \
-    --resource-class "$resource_class" \
+    --resource-class "$cli_resource_class" \
     --worker-id "$worker_id" \
     --lease-timeout-secs "$lease_timeout_secs" \
     --receipt "$claim_receipt"

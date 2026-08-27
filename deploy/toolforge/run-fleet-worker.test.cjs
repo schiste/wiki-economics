@@ -26,16 +26,20 @@ function fixture({failPrepare = false} = {}) {
 set -eu
 command=""
 receipt=""
+resource_class=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
     fleet-claim|fleet-heartbeat|fleet-complete|fleet-fail|fleet-recover) command="$1" ;;
     --receipt) shift; receipt="$1" ;;
+    --resource-class) shift; resource_class="$1" ;;
   esac
   shift
 done
-printf '%s\n' "$command" >> "${log}"
 if [ "$command" = fleet-claim ]; then
+  printf '%s %s\n' "$command" "$resource_class" >> "${log}"
   cp "${claim}" "$receipt"
+else
+  printf '%s\n' "$command" >> "${log}"
 fi
 `, {mode: 0o755});
   const prepare = path.join(root, "prepare");
@@ -47,9 +51,9 @@ exit ${failPrepare ? 1 : 0}
   return {root, log, binary, prepare};
 }
 
-function runWorker(options) {
+function runWorker({resourceClass = "small", ...options} = {}) {
   const state = fixture(options);
-  const result = spawnSync("bash", [script, "small", "small-test", "--once"], {
+  const result = spawnSync("bash", [script, resourceClass, `${resourceClass}-test`, "--once"], {
     encoding: "utf8",
     env: {
       ...process.env,
@@ -68,10 +72,17 @@ function runWorker(options) {
 test("one-shot worker pins the claimed snapshot and completes independently", () => {
   const {result, calls} = runWorker();
   assert.equal(result.status, 0, result.stderr || result.stdout);
-  assert.equal(calls[0], "fleet-claim");
+  assert.equal(calls[0], "fleet-claim small");
   assert.match(calls[1], /^prepare testwiki 2026-08 fleet-small-test-testwiki-/);
   assert.equal(calls.at(-1), "fleet-complete");
   assert.ok(!calls.includes("fleet-fail"));
+});
+
+test("medium worker translates the queue resource class to Clap's CLI spelling", () => {
+  const {result, calls} = runWorker({resourceClass: "medium_large"});
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(calls[0], "fleet-claim medium-large");
+  assert.equal(calls.at(-1), "fleet-complete");
 });
 
 test("failed preparation is returned to the bounded retry path", () => {
