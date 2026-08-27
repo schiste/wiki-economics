@@ -875,10 +875,12 @@ fn funnel_rows(frame: &DataFrame, wiki: &str) -> Result<Vec<Value>> {
 struct InequalityYear {
     total_editors: f64,
     total_edits: f64,
-    min_editors_50pct: f64,
-    gini: Average,
-    theil: Average,
-    palma: Average,
+    source_rows: usize,
+    within_theil: f64,
+    edit_mean_log: f64,
+    single_min_editors_50pct: Option<f64>,
+    single_gini: Option<f64>,
+    single_palma: Option<f64>,
 }
 
 fn inequality_artifacts(frames: &Frames) -> Result<(Value, Value)> {
@@ -894,31 +896,45 @@ fn inequality_artifacts(frames: &Frames) -> Result<(Value, Value)> {
             string(&frames.inequality, "year_month", row)?.context("inequality month is null")?;
         let entry = yearly.entry(year(&month)?).or_default();
         let editors = float(&frames.inequality, "total_editors", row)?.unwrap_or_default();
+        let edits = float(&frames.inequality, "total_edits", row)?.unwrap_or_default();
+        if entry.source_rows == 0 {
+            entry.single_min_editors_50pct = float(&frames.inequality, "min_editors_50pct", row)?;
+            entry.single_gini = float(&frames.inequality, "gini", row)?;
+            entry.single_palma = float(&frames.inequality, "palma", row)?;
+        }
+        entry.source_rows += 1;
         entry.total_editors += editors;
-        entry.total_edits += float(&frames.inequality, "total_edits", row)?.unwrap_or_default();
-        entry.min_editors_50pct +=
-            float(&frames.inequality, "min_editors_50pct", row)?.unwrap_or_default();
-        entry
-            .gini
-            .add_weighted(float(&frames.inequality, "gini", row)?, editors);
-        entry
-            .theil
-            .add_weighted(float(&frames.inequality, "theil", row)?, editors);
-        entry
-            .palma
-            .add_weighted(float(&frames.inequality, "palma", row)?, editors);
+        entry.total_edits += edits;
+        if editors > 0.0
+            && edits > 0.0
+            && let Some(theil) = float(&frames.inequality, "theil", row)?
+        {
+            entry.within_theil += edits * theil;
+            entry.edit_mean_log += edits * (edits / editors).ln();
+        }
     }
     let data = yearly
         .into_iter()
         .map(|(period, entry)| {
+            let theil = if entry.total_edits > 0.0 && entry.total_editors > 0.0 {
+                Some(
+                    ((entry.within_theil + entry.edit_mean_log
+                        - entry.total_edits * (entry.total_edits / entry.total_editors).ln())
+                        / entry.total_edits)
+                        .max(0.0),
+                )
+            } else {
+                None
+            };
+            let single = entry.source_rows == 1;
             json!({
                 "period": period,
                 "total_editors": number(entry.total_editors),
                 "total_edits": number(entry.total_edits),
-                "min_editors_50pct": number(entry.min_editors_50pct),
-                "gini": entry.gini.value(),
-                "theil": entry.theil.value(),
-                "palma": entry.palma.value(),
+                "min_editors_50pct": single.then_some(entry.single_min_editors_50pct).flatten(),
+                "gini": single.then_some(entry.single_gini).flatten(),
+                "theil": theil,
+                "palma": single.then_some(entry.single_palma).flatten(),
             })
         })
         .collect::<Vec<_>>();
@@ -1633,7 +1649,8 @@ mod tests {
 
         let inequality = read_json(&first.path().join("defaults_inequality.json"))?;
         assert_eq!(inequality["data"][0]["total_editors"], 16);
-        assert_eq!(inequality["data"][0]["gini"], json!(0.425));
+        assert_eq!(inequality["data"][0]["gini"], Value::Null);
+        assert!(inequality["data"][0]["theil"].is_number());
 
         let labor = read_json(&first.path().join("defaults_labor.json"))?;
         assert_eq!(labor["churn"][1]["active_editors"], 16);
@@ -1655,12 +1672,33 @@ mod tests {
         assert_eq!(manifest["generated_at"], "2026-01-31T00:00:00Z");
         assert_eq!(manifest["license"]["spdx_identifier"], "MIT");
         assert_eq!(manifest["provenance"]["run_id"], "site-fixture");
-        assert_eq!(manifest["browser_data"]["schema_version"], 2);
+        assert_eq!(manifest["browser_data"]["schema_version"], 3);
         assert_eq!(manifest["downloadable_artifacts"][0]["license_spdx"], "MIT");
         assert_eq!(
             manifest["toolforge_open_licensing"]["open_data_license_spdx"],
             "MIT"
         );
+
+        let browser_index = crate::browser_data::read_index(
+            &first.path().join(crate::browser_data::INDEX_FILENAME),
+        )?;
+        let global_metrics = browser_index
+            .entries
+            .iter()
+            .filter(|entry| entry.scope == "global" && entry.wiki == ALL_WIKIS_SCOPE)
+            .map(|entry| entry.metric.as_str())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            global_metrics.len(),
+            crate::browser_data::BROWSER_METRICS.len()
+        );
+        let global_inequality = ParquetReader::new(File::open(
+            first.path().join("_browser-global/inequality/2026.parquet"),
+        )?)
+        .finish()?;
+        assert_eq!(global_inequality.column("wiki")?.str()?.get(0), Some("all"));
+        assert_eq!(global_inequality.column("gini")?.f64()?.get(0), None);
+        assert!(global_inequality.column("theil")?.f64()?.get(0).is_some());
         Ok(())
     }
 

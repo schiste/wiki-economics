@@ -40,7 +40,7 @@ if (useDefaults) {
   const defaults = await loadDefaults()
   ineqData = defaults.data
 } else {
-  const {inequality} = await loadIneqRows(wiki)
+  const {inequality} = await loadIneqRows(wiki, {startPeriod, endPeriod})
   const selected = filterRows(inequality, {
     wiki, userTypes, namespaces: null, startPeriod, endPeriod, granularity
   })
@@ -51,6 +51,7 @@ if (useDefaults) {
 }
 const tickStep = Math.max(1, Math.floor(ineqData.length / 20))
 const latest = ineqData.length > 0 ? ineqData[ineqData.length - 1] : null
+const metricValue = (value, digits) => Number.isFinite(value) ? value.toFixed(digits) : "—"
 ```
 
 ```js
@@ -61,24 +62,24 @@ pageExportBar([{name: "edit_distribution", data: ineqData}])
 
 <div class="kpi-row">
 <div class="kpi-card">
-  <div class="kpi-value">${latest ? latest.gini.toFixed(3) : "—"}</div>
+  <div class="kpi-value">${metricValue(latest?.gini, 3)}</div>
   <div class="kpi-label">Current Gini</div>
   <div class="kpi-sub">${latest ? latest.period : ""}</div>
 </div>
 <div class="kpi-card">
-  <div class="kpi-value">${latest ? latest.theil.toFixed(3) : "—"}</div>
+  <div class="kpi-value">${metricValue(latest?.theil, 3)}</div>
   <div class="kpi-label">Current Theil</div>
   <div class="kpi-sub">${latest ? latest.period : ""}</div>
 </div>
 <div class="kpi-card">
-  <div class="kpi-value">${latest ? latest.palma.toFixed(2) : "—"}</div>
+  <div class="kpi-value">${metricValue(latest?.palma, 2)}</div>
   <div class="kpi-label">Current Palma</div>
-  <div class="kpi-sub">${latest ? (latest.palma > 1 ? "top 10% dominate" : "relatively equal") : ""}</div>
+  <div class="kpi-sub">${Number.isFinite(latest?.palma) ? (latest.palma > 1 ? "top 10% dominate" : "relatively equal") : "not derivable from grouped data"}</div>
 </div>
 <div class="kpi-card">
-  <div class="kpi-value">${latest && latest.total_editors > 0 ? (latest.min_editors_50pct / latest.total_editors * 100).toFixed(1) + "%" : "—"}</div>
+  <div class="kpi-value">${latest && latest.total_editors > 0 && Number.isFinite(latest.min_editors_50pct) ? (latest.min_editors_50pct / latest.total_editors * 100).toFixed(1) + "%" : "—"}</div>
   <div class="kpi-label">Fragility</div>
-  <div class="kpi-sub">${latest ? fmtNum(latest.min_editors_50pct) + " editors for 50% of output" : ""}</div>
+  <div class="kpi-sub">${Number.isFinite(latest?.min_editors_50pct) ? fmtNum(latest.min_editors_50pct) + " editors for 50% of output" : "not derivable from grouped data"}</div>
 </div>
 </div>
 
@@ -100,7 +101,7 @@ withExport(Plot.plot({
     Plot.areaY(ineqData, {x: "period", y: "gini", fill: "tomato", fillOpacity: 0.2}),
     Plot.lineY(ineqData, {x: "period", y: "gini", stroke: "tomato", strokeWidth: 1.5}),
     Plot.ruleY([0.5], {stroke: "grey", strokeDasharray: "4"}),
-    Plot.tip(ineqData, Plot.pointerX({x: "period", y: "gini", title: d => `${d.period}\nGini: ${d.gini.toFixed(3)}\nEditors: ${fmtNum(d.total_editors)}\nEdits: ${fmtNum(d.total_edits)}`}))
+    Plot.tip(ineqData, Plot.pointerX({x: "period", y: "gini", title: d => `${d.period}\nGini: ${metricValue(d.gini, 3)}\nEditors: ${fmtNum(d.total_editors)}\nEdits: ${fmtNum(d.total_edits)}`}))
   ]
 }), ineqData, "gini")
 ```
@@ -110,7 +111,7 @@ withExport(Plot.plot({
 `Gini = (2 × Σ rank × edits_i) / (n × Total Edits) − (n + 1) / n`
 where n = number of editors, sorted by ascending edit count, rank = 1…n
 
-The standard Gini coefficient is applied to the distribution of edits across all active editors in each wiki and month. A value of 0 means perfect equality (every editor made the same number of edits), while 1 means maximum inequality (one editor made all edits). Selected rows are weighted by active-editor count when combined. The All wikis view is therefore an editor-weighted portfolio statistic, not a pooled re-identification of people across projects.
+The standard Gini coefficient is applied to the distribution of edits across all active editors in each wiki and month. A value of 0 means perfect equality (every editor made the same number of edits), while 1 means maximum inequality (one editor made all edits). Gini cannot be reconstructed exactly from monthly or per-wiki summary statistics, so it is shown only when the selected period is represented by one source row. Combined periods and All wikis never report a weighted average as a global Gini.
 
 </details>
 </div>
@@ -132,7 +133,7 @@ withExport(Plot.plot({
   marks: [
     Plot.areaY(ineqData, {x: "period", y: "theil", fill: "var(--theme-foreground-focus)", fillOpacity: 0.15}),
     Plot.lineY(ineqData, {x: "period", y: "theil", stroke: "var(--theme-foreground-focus)", strokeWidth: 1.5}),
-    Plot.tip(ineqData, Plot.pointerX({x: "period", y: "theil", title: d => `${d.period}\nTheil: ${d.theil.toFixed(3)}\n${d.theil > 2 ? "Very high concentration" : d.theil > 1 ? "High concentration" : d.theil > 0.5 ? "Moderate concentration" : "Low concentration"}`}))
+    Plot.tip(ineqData, Plot.pointerX({x: "period", y: "theil", title: d => `${d.period}\nTheil: ${metricValue(d.theil, 3)}\n${d.theil > 2 ? "Very high concentration" : d.theil > 1 ? "High concentration" : d.theil > 0.5 ? "Moderate concentration" : "Low concentration"}`}))
   ]
 }), ineqData, "theil")
 ```
@@ -164,7 +165,7 @@ withExport(Plot.plot({
     Plot.areaY(ineqData, {x: "period", y: "palma", fill: "orange", fillOpacity: 0.2}),
     Plot.lineY(ineqData, {x: "period", y: "palma", stroke: "orange", strokeWidth: 1.5}),
     Plot.ruleY([1], {stroke: "grey", strokeDasharray: "4"}),
-    Plot.tip(ineqData, Plot.pointerX({x: "period", y: "palma", title: d => `${d.period}\nPalma: ${d.palma.toFixed(2)}\n${d.palma > 1 ? "Top 10% contribute more than bottom 40%" : "Bottom 40% contribute more than top 10%"}`}))
+    Plot.tip(ineqData, Plot.pointerX({x: "period", y: "palma", title: d => `${d.period}\nPalma: ${metricValue(d.palma, 2)}${Number.isFinite(d.palma) ? `\n${d.palma > 1 ? "Top 10% contribute more than bottom 40%" : "Bottom 40% contribute more than top 10%"}` : ""}`}))
   ]
 }), ineqData, "palma")
 ```

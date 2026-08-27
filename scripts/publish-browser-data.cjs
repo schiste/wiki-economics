@@ -8,12 +8,24 @@ const path = require("node:path");
 const INDEX_FILENAME = "browser-data-index.json";
 
 function safeSource(dataDir, entry) {
-  if (!/^[a-z0-9_]+$/.test(entry?.metric || "")
-      || !/^[a-z0-9_]+wiki$/.test(entry?.wiki || "")
-      || entry.file !== `browser-data/${entry.metric}/${entry.wiki}.parquet`) {
+  if (!/^[a-z0-9_]+$/.test(entry?.metric || "")) {
     throw new Error(`unsafe browser data entry: ${JSON.stringify(entry)}`);
   }
-  return path.join(dataDir, entry.wiki, `${entry.metric}.parquet`);
+  if (entry.scope === "wiki"
+      && /^[a-z0-9_]+wiki$/.test(entry.wiki || "")
+      && entry.shard == null
+      && entry.aggregation_version == null
+      && entry.file === `browser-data/${entry.metric}/${entry.wiki}.parquet`) {
+    return path.join(dataDir, entry.wiki, `${entry.metric}.parquet`);
+  }
+  if (entry.scope === "global"
+      && entry.wiki === "all"
+      && /^\d{4}$/.test(entry.shard || "")
+      && entry.aggregation_version === "global-browser-aggregate-v1"
+      && entry.file === `browser-data/${entry.metric}/all-${entry.shard}.parquet`) {
+    return path.join(dataDir, "_browser-global", entry.metric, `${entry.shard}.parquet`);
+  }
+  throw new Error(`unsafe browser data entry: ${JSON.stringify(entry)}`);
 }
 
 function sha256(file) {
@@ -23,8 +35,8 @@ function sha256(file) {
 function publishBrowserData({dataDir, distDir}) {
   const indexPath = path.join(dataDir, INDEX_FILENAME);
   const index = JSON.parse(fs.readFileSync(indexPath, "utf8"));
-  if (index?.schema_version !== 2
-      || index?.cache_schema_version !== 2
+  if (index?.schema_version !== 3
+      || index?.cache_schema_version !== 3
       || !/^[0-9a-f]{64}$/.test(index?.generation || "")
       || index?.license_spdx !== "MIT"
       || !Array.isArray(index?.entries)
@@ -37,7 +49,7 @@ function publishBrowserData({dataDir, distDir}) {
   const identities = new Set();
   for (const entry of index.entries) {
     const source = safeSource(dataDir, entry);
-    const identity = `${entry.metric}/${entry.wiki}`;
+    const identity = entry.file;
     if (!/^[0-9a-f]{64}$/.test(entry?.artifact_receipt_sha256 || "")) {
       throw new Error(`browser data entry has no artifact receipt: ${identity}`);
     }

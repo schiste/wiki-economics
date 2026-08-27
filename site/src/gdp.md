@@ -51,7 +51,7 @@ if (useDefaults) {
   output = defaults.output
   byType = defaults.byType
 } else {
-  const {gdp: gdpRaw} = await loadGdpRows(wiki)
+  const {gdp: gdpRaw} = await loadGdpRows(wiki, {startPeriod, endPeriod})
   output = queryGrouped(gdpRaw, {
     sumCols: ["gross_bytes_added", "net_bytes", "total_edits", "productive_edits", "reverted_edits", "unique_editors"],
     wiki, userTypes, namespaces, startPeriod, endPeriod, granularity
@@ -268,7 +268,7 @@ if (useDefaults) {
   const defaults = await loadDefaults()
   tiersAgg = defaults.tiers.map(d => ({...d, activity_tier: d.activity_tier, editors: d.editors, total_edits: d.total_edits, gross_bytes: d.gross_bytes, net_bytes: d.net_bytes}))
 } else {
-  const {tiers: tiersRaw} = await loadGdpRows(wiki)
+  const {tiers: tiersRaw} = await loadGdpRows(wiki, {startPeriod, endPeriod})
   const tiersFiltered = tiersRaw
     .filter(d => wikiMatches(d, wiki) && userTypes.includes(d.user_type)
       && d.period_type === granularity && d.period_end >= startPeriod && d.period_start <= endPeriod)
@@ -373,7 +373,7 @@ if (useDefaults) {
     })
     .sort((a, b) => d3.ascending(a.period, b.period))
 } else {
-  const {typeShare: shareRaw} = await loadGdpRows(wiki)
+  const {typeShare: shareRaw} = await loadGdpRows(wiki, {startPeriod, endPeriod})
   const shareData = shareRaw
     .filter(d => wikiMatches(d, wiki) && d.year_month >= startPeriod && d.year_month <= endPeriod)
     .map(d => ({...d, period: toPeriod(d.year_month, granularity)}))
@@ -434,7 +434,7 @@ if (useDefaults) {
     edits: d.edits, gross_bytes: d.gross_bytes, net_bytes: d.net_bytes
   }))
 } else {
-  const {gdp: gdpRaw} = await loadGdpRows(wiki)
+  const {gdp: gdpRaw} = await loadGdpRows(wiki, {startPeriod, endPeriod})
   const sectorRows = gdpRaw
     .filter(d => wikiMatches(d, wiki) && userTypes.includes(d.user_type) && namespaces.includes(d.page_namespace)
       && d.year_month >= startPeriod && d.year_month <= endPeriod)

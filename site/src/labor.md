@@ -49,7 +49,7 @@ if (useDefaults) {
   workforce = defaults.workforce
   churnData = defaults.churn
 } else {
-  const {labor: laborRaw, churn: churnRaw} = await loadLaborRows(wiki)
+  const {labor: laborRaw, churn: churnRaw} = await loadLaborRows(wiki, {startPeriod, endPeriod})
   workforce = queryGrouped(laborRaw, {
     sumCols: ["unique_editors", "total_edits", "net_bytes", "reverted_edits"],
     wiki, userTypes, namespaces, startPeriod, endPeriod, granularity
@@ -151,7 +151,7 @@ if (useDefaults) {
   const defaults = await loadDefaults()
   typeAgg = defaults.byType
 } else {
-  const {labor: laborRaw} = await loadLaborRows(wiki)
+  const {labor: laborRaw} = await loadLaborRows(wiki, {startPeriod, endPeriod})
   const byType = laborRaw
     .filter(d => wikiMatches(d, wiki) && d.year_month >= startPeriod && d.year_month <= endPeriod && namespaces.includes(d.page_namespace))
     .map(d => ({...d, period: toPeriod(d.year_month, granularity)}))
@@ -253,7 +253,7 @@ if (useDefaults) {
   const defaults = await loadDefaults()
   cohortData = defaults.cohorts
 } else {
-  const {cohorts} = await loadLaborRows(wiki)
+  const {cohorts} = await loadLaborRows(wiki, {startPeriod, endPeriod})
   cohortData = aggregateCohorts(cohorts.filter(d => wikiMatches(d, wiki)))
 }
 } finally {

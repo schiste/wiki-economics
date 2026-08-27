@@ -46,12 +46,19 @@ test("all-wiki count reducers sum primitives and recompute rates", () => {
   ]), [{cohort_year: "2020", cohort_size: 14, reached_5: 8, reached_25: 3, reached_100: 1}]);
 });
 
-test("non-additive portfolio statistics are weighted and coverage is recomputed", () => {
-  assert.deepEqual(aggregateInequalityByPeriod([
+test("non-additive portfolio statistics fail closed while Theil and coverage remain exact", () => {
+  const inequality = aggregateInequalityByPeriod([
     {period: "2026", total_editors: 10, total_edits: 30, min_editors_50pct: 2, gini: 0.4, theil: 0.2, palma: 1},
     {period: "2026", total_editors: 30, total_edits: 70, min_editors_50pct: 4, gini: 0.8, theil: 0.6, palma: 3},
-  ]), [{period: "2026", total_editors: 40, total_edits: 100, min_editors_50pct: 6,
-    gini: 0.7, theil: 0.5, palma: 2.5}]);
+  ])[0];
+  const exactTheil = (30 * 0.2 + 70 * 0.6 + 30 * Math.log(3) + 70 * Math.log(70 / 30)
+    - 100 * Math.log(2.5)) / 100;
+  assert.equal(inequality.total_editors, 40);
+  assert.equal(inequality.total_edits, 100);
+  assert.equal(inequality.gini, null);
+  assert.equal(inequality.palma, null);
+  assert.equal(inequality.min_editors_50pct, null);
+  assert.ok(Math.abs(inequality.theil - exactTheil) < 1e-12);
 
   const patrol = aggregatePatrolByPeriod([
     {period: "2026", total_patrols: 10, unique_patrollers: 2, patrol_new_pages: 4, patrol_diffs: 6,
@@ -62,25 +69,32 @@ test("non-additive portfolio statistics are weighted and coverage is recomputed"
       min_patrollers_50pct: 2, median_latency_hours: 3, p90_latency_hours: 5, top1_pct: 20},
   ])[0];
   assert.equal(patrol.total_patrols, 40);
-  assert.equal(patrol.median_latency_hours, 2.5);
+  assert.equal(patrol.median_latency_hours, null);
+  assert.equal(patrol.min_patrollers_50pct, null);
   assert.equal(patrol.patrol_coverage_pct, 40);
   assert.equal(patrol.adjusted_coverage_pct, 48);
 });
 
-test("all-wiki browser selection includes every requested partition deterministically", () => {
+test("all-wiki browser selection downloads only global time shards", () => {
   const index = {entries: [
-    {wiki: "ptwiki", metric: "gdp", minimum_date: "2020-01", file: "pt-gdp"},
-    {wiki: "nlwiki", metric: "labor", minimum_date: "2001-01", file: "nl-labor"},
-    {wiki: "nlwiki", metric: "gdp", minimum_date: "2001-01", file: "nl-gdp"},
-    {wiki: "ptwiki", metric: "labor", minimum_date: "2020-01", file: "pt-labor"},
+    {wiki: "ptwiki", scope: "wiki", metric: "gdp", minimum_date: "2020-01", file: "pt-gdp"},
+    {wiki: "all", scope: "global", metric: "labor", minimum_date: "2026-01", maximum_date: "2026-12", file: "all-labor-2026"},
+    {wiki: "all", scope: "global", metric: "gdp", minimum_date: "2025-01", maximum_date: "2025-12", file: "all-gdp-2025"},
+    {wiki: "all", scope: "global", metric: "gdp", minimum_date: "2026-01", maximum_date: "2026-12", file: "all-gdp-2026"},
+    {wiki: "nlwiki", scope: "wiki", metric: "labor", minimum_date: "2001-01", file: "nl-labor"},
   ]};
   assert.deepEqual(
     selectBrowserEntries(index, {gdp: "gdp", labor: "labor"}, ALL_WIKIS).map(entry => entry.file),
-    ["nl-gdp", "pt-gdp", "nl-labor", "pt-labor"],
+    ["all-gdp-2025", "all-gdp-2026", "all-labor-2026"],
+  );
+  assert.deepEqual(
+    selectBrowserEntries(index, {gdp: "gdp"}, ALL_WIKIS, {startPeriod: "2026-02", endPeriod: "2026-03"})
+      .map(entry => entry.file),
+    ["all-gdp-2026"],
   );
   assert.throws(() => selectBrowserEntries(
-    {entries: index.entries.filter(entry => entry.file !== "pt-labor")},
+    {entries: index.entries.filter(entry => entry.file !== "all-labor-2026")},
     {gdp: "gdp", labor: "labor"},
     ALL_WIKIS,
-  ), /no labor partition for ptwiki/);
+  ), /no labor partition for all/);
 });

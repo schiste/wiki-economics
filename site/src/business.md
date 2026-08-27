@@ -53,7 +53,7 @@ if (useDefaults) {
   const defaults = await loadDefaults()
   churnData = defaults.churn
 } else {
-  const {churn: churnRaw} = await loadBizRows(wiki)
+  const {churn: churnRaw} = await loadBizRows(wiki, {startPeriod, endPeriod})
   churnData = aggregateChurn(churnRaw.filter(d => wikiMatches(d, wiki) && d.period_type === granularity && d.period >= startP && d.period <= endP))
 }
 } finally {
@@ -70,7 +70,7 @@ if (useDefaults) {
   const defaults = await loadDefaults()
   tierAgg = defaults.tiers
 } else {
-  const {tiers: tiersRaw} = await loadBizRows(wiki)
+  const {tiers: tiersRaw} = await loadBizRows(wiki, {startPeriod, endPeriod})
   const tierFiltered = tiersRaw
     .filter(d => wikiMatches(d, wiki) && userTypes.includes(d.user_type)
       && d.period_type === granularity && d.period_end >= startPeriod && d.period_start <= endPeriod)
@@ -104,7 +104,7 @@ if (useDefaults) {
   }))
   gdpRaw = null
 } else {
-  const {gdp} = await loadBizRows(wiki)
+  const {gdp} = await loadBizRows(wiki, {startPeriod, endPeriod})
   gdpRaw = gdp.filter(d => wikiMatches(d, wiki))
   const gdpFiltered = gdpRaw
     .filter(d => userTypes.includes(d.user_type) && namespaces.includes(d.page_namespace) && d.year_month >= startPeriod && d.year_month <= endPeriod)
@@ -173,7 +173,7 @@ if (useDefaults) {
     bytesPerEditor: d.unique_editors > 0 ? d.net_bytes / d.unique_editors : 0
   }))
 } else {
-  const {cohorts} = await loadBizRows(wiki)
+  const {cohorts} = await loadBizRows(wiki, {startPeriod, endPeriod})
   cohortData = aggregateCohorts(cohorts.filter(d => wikiMatches(d, wiki)))
   yearlyBytesPerEditor = d3.rollups(
     gdpRaw.filter(d => userTypes.includes(d.user_type) && d.page_namespace === 0),
@@ -317,7 +317,7 @@ try {
     const defaults = await loadDefaults()
     funnelData = defaults.funnel
   } else {
-    const {funnel} = await loadBizRows(wiki)
+    const {funnel} = await loadBizRows(wiki, {startPeriod, endPeriod})
     funnelData = aggregateFunnel(funnel.filter(d => wikiMatches(d, wiki)))
   }
 } finally {

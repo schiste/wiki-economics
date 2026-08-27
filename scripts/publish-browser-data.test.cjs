@@ -23,10 +23,11 @@ function fixture() {
   fs.writeFileSync(source, "parquet-fixture");
   const bytes = fs.statSync(source).size;
   const sha256 = crypto.createHash("sha256").update(fs.readFileSync(source)).digest("hex");
-  const index = {schema_version: 2, cache_schema_version: 2, generation: "a".repeat(64), license_spdx: "MIT",
+  const index = {schema_version: 3, cache_schema_version: 3, generation: "a".repeat(64), license_spdx: "MIT",
     entries: [{metric: "gdp", wiki: "nlwiki", minimum_date: "2020-01", maximum_date: "2026-07",
       file: "browser-data/gdp/nlwiki.parquet", rows: 2, bytes, sha256,
-      artifact_receipt_sha256: "b".repeat(64)}]};
+      artifact_receipt_sha256: "b".repeat(64), scope: "wiki", shard: null,
+      aggregation_version: null}]};
   fs.writeFileSync(path.join(dataDir, "browser-data-index.json"), JSON.stringify(index));
   return {dataDir, distDir, index, source};
 }
@@ -39,6 +40,23 @@ test("publishes exactly the allowlisted indexed partitions", () => {
   assert.deepEqual(files, ["browser-data/gdp/nlwiki.parquet", "browser-data/index.json"]);
   assert.deepEqual(fs.readFileSync(path.join(distDir, "browser-data/gdp/nlwiki.parquet")), fs.readFileSync(source));
   assert.equal(fs.existsSync(path.join(distDir, "browser-data/gdp/ptwiki.parquet")), false);
+});
+
+test("publishes receipt-indexed global year shards from their isolated source", () => {
+  const fixtureData = fixture();
+  const source = path.join(fixtureData.dataDir, "_browser-global", "gdp", "2026.parquet");
+  fs.mkdirSync(path.dirname(source), {recursive: true});
+  fs.writeFileSync(source, "global-parquet-fixture");
+  const bytes = fs.statSync(source).size;
+  const sha256 = crypto.createHash("sha256").update(fs.readFileSync(source)).digest("hex");
+  fixtureData.index.entries = [{metric: "gdp", wiki: "all", minimum_date: "2026-01", maximum_date: "2026-07",
+    file: "browser-data/gdp/all-2026.parquet", rows: 2, bytes, sha256,
+    artifact_receipt_sha256: "c".repeat(64), scope: "global", shard: "2026",
+    aggregation_version: "global-browser-aggregate-v1"}];
+  fs.writeFileSync(path.join(fixtureData.dataDir, "browser-data-index.json"), JSON.stringify(fixtureData.index));
+  const files = publishBrowserData(fixtureData);
+  assert.deepEqual(files, ["browser-data/gdp/all-2026.parquet", "browser-data/index.json"]);
+  assert.deepEqual(fs.readFileSync(path.join(fixtureData.distDir, "browser-data/gdp/all-2026.parquet")), fs.readFileSync(source));
 });
 
 test("fails closed on traversal and changed content", () => {

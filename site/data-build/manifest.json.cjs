@@ -143,8 +143,8 @@ function fileList(directory, extension = ".parquet") {
 function browserDataSummary(outputDir) {
   const indexPath = path.join(outputDir, BROWSER_INDEX);
   const index = readJson(indexPath);
-  if (index?.schema_version !== 2
-      || index?.cache_schema_version !== 2
+  if (index?.schema_version !== 3
+      || index?.cache_schema_version !== 3
       || !/^[0-9a-f]{64}$/.test(index?.generation || "")
       || index?.license_spdx !== ARTIFACT_LICENSE_SPDX
       || !Array.isArray(index?.entries)
@@ -156,9 +156,18 @@ function browserDataSummary(outputDir) {
     if (!/^[0-9a-f]{64}$/.test(entry?.artifact_receipt_sha256 || "")) {
       throw new Error(`browser data entry has no artifact receipt: ${entry?.metric}/${entry?.wiki}`);
     }
+    const wikiSource = entry?.scope === "wiki"
+      && /^[a-z0-9_]+wiki$/.test(entry?.wiki || "")
+      && entry?.shard == null
+      && entry?.aggregation_version == null
+      && entry.file === `browser-data/${entry.metric}/${entry.wiki}.parquet`;
+    const globalSource = entry?.scope === "global"
+      && entry?.wiki === "all"
+      && /^\d{4}$/.test(entry?.shard || "")
+      && entry?.aggregation_version === "global-browser-aggregate-v1"
+      && entry.file === `browser-data/${entry.metric}/all-${entry.shard}.parquet`;
     if (!/^[a-z0-9_]+$/.test(entry?.metric || "")
-        || !/^[a-z0-9_]+wiki$/.test(entry?.wiki || "")
-        || entry.file !== `browser-data/${entry.metric}/${entry.wiki}.parquet`
+        || (!wikiSource && !globalSource)
         || typeof entry.minimum_date !== "string"
         || typeof entry.maximum_date !== "string"
         || !Number.isSafeInteger(entry.rows) || entry.rows <= 0
@@ -166,10 +175,12 @@ function browserDataSummary(outputDir) {
         || !/^[0-9a-f]{64}$/.test(entry.sha256 || "")) {
       throw new Error(`invalid browser data entry: ${JSON.stringify(entry)}`);
     }
-    const identity = `${entry.metric}/${entry.wiki}`;
+    const identity = entry.file;
     if (identities.has(identity)) throw new Error(`duplicate browser data entry: ${identity}`);
     identities.add(identity);
-    const source = path.join(outputDir, entry.wiki, `${entry.metric}.parquet`);
+    const source = wikiSource
+      ? path.join(outputDir, entry.wiki, `${entry.metric}.parquet`)
+      : path.join(outputDir, "_browser-global", entry.metric, `${entry.shard}.parquet`);
     const stat = statFile(source);
     if (!stat || stat.size !== entry.bytes) throw new Error(`browser source size mismatch: ${source}`);
     const sha256 = crypto.createHash("sha256").update(fs.readFileSync(source)).digest("hex");

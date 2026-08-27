@@ -84,7 +84,7 @@ function verifyBuild(distDir) {
   }
   const browserIndexPath = path.join(distDir, "browser-data", "index.json");
   const browserIndex = JSON.parse(fs.readFileSync(browserIndexPath, "utf8"));
-  if (browserIndex?.schema_version !== 2 || browserIndex?.cache_schema_version !== 2
+  if (browserIndex?.schema_version !== 3 || browserIndex?.cache_schema_version !== 3
       || !Array.isArray(browserIndex?.entries) || browserIndex.entries.length === 0) {
     throw new Error("Observable build has an invalid browser data index");
   }

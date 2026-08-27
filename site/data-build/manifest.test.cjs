@@ -105,10 +105,11 @@ function fixture(name) {
     const sha256 = require("node:crypto").createHash("sha256").update(fs.readFileSync(source)).digest("hex");
     return {metric, wiki: "nlwiki", minimum_date: "2026-01", maximum_date: "2026-07",
       file: `browser-data/${metric}/nlwiki.parquet`, rows: 5, bytes, sha256,
-      artifact_receipt_sha256: "b".repeat(64)};
+      artifact_receipt_sha256: "b".repeat(64), scope: "wiki", shard: null,
+      aggregation_version: null};
   });
   fs.writeFileSync(path.join(outputDir, "browser-data-index.json"), JSON.stringify({
-    schema_version: 2, cache_schema_version: 2, generation: "a".repeat(64), license_spdx: "MIT",
+    schema_version: 3, cache_schema_version: 3, generation: "a".repeat(64), license_spdx: "MIT",
     entries: browserEntries,
   }));
   return {analytical, dataDir, outputDir, warehouse};

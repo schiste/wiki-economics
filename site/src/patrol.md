@@ -44,7 +44,7 @@ if (useDefaults) {
   const defaults = await loadDefaults()
   data = defaults.patrol
 } else {
-  const {patrol} = await loadPatrolRows(wiki)
+  const {patrol} = await loadPatrolRows(wiki, {startPeriod, endPeriod})
   const selected = filterRows(patrol, {
     wiki, userTypes, namespaces, startPeriod, endPeriod, granularity
   })

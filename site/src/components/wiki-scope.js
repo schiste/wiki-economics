@@ -105,9 +105,9 @@ export function aggregateFunnel(rows) {
   return [...grouped.values()].sort((left, right) => left.cohort_year.localeCompare(right.cohort_year));
 }
 
-/**
- * Aggregate already-computed inequality rows. These are editor-weighted
- * cross-wiki statistics, not a pooled re-computation from editor-level rows.
+/** Aggregate counts and the exactly decomposable Theil statistic.
+ * Gini, Palma, and fragility cannot be recovered from grouped summaries, so
+ * they remain available only when a selected period contains one source row.
  */
 export function aggregateInequalityByPeriod(rows) {
   const grouped = new Map();
@@ -116,33 +116,38 @@ export function aggregateInequalityByPeriod(rows) {
       period: row.period,
       total_editors: 0,
       total_edits: 0,
-      min_editors_50pct: 0,
-      gini: 0,
-      theil: 0,
-      palma: 0,
+      source_rows: 0,
+      within_theil: 0,
+      edit_mean_log: 0,
+      single: row,
     };
     const weight = row.total_editors ?? 0;
     entry.total_editors += weight;
-    entry.total_edits += row.total_edits ?? 0;
-    entry.min_editors_50pct += row.min_editors_50pct ?? 0;
-    for (const column of ["gini", "theil", "palma"]) {
-      if (row[column] != null && weight > 0) {
-        entry[column] += row[column] * weight;
-        entry[`${column}_weight`] = (entry[`${column}_weight`] ?? 0) + weight;
-      }
+    const edits = row.total_edits ?? 0;
+    entry.total_edits += edits;
+    entry.source_rows += 1;
+    if (edits > 0 && weight > 0 && row.theil != null) {
+      entry.within_theil += edits * row.theil;
+      entry.edit_mean_log += edits * Math.log(edits / weight);
     }
     grouped.set(row.period, entry);
   }
   return [...grouped.values()]
     .sort((left, right) => left.period.localeCompare(right.period))
     .map(entry => {
-      const output = {...entry};
-      for (const column of ["gini", "theil", "palma"]) {
-        const weight = output[`${column}_weight`] ?? 0;
-        output[column] = weight > 0 ? output[column] / weight : null;
-        delete output[`${column}_weight`];
-      }
-      return output;
+      const exactTheil = entry.total_edits > 0 && entry.total_editors > 0
+        ? (entry.within_theil + entry.edit_mean_log
+          - entry.total_edits * Math.log(entry.total_edits / entry.total_editors)) / entry.total_edits
+        : null;
+      return {
+        period: entry.period,
+        total_editors: entry.total_editors,
+        total_edits: entry.total_edits,
+        min_editors_50pct: entry.source_rows === 1 ? entry.single.min_editors_50pct : null,
+        gini: entry.source_rows === 1 ? entry.single.gini : null,
+        theil: exactTheil,
+        palma: entry.source_rows === 1 ? entry.single.palma : null,
+      };
     });
 }
 
@@ -155,7 +160,6 @@ export function aggregatePatrolByPeriod(rows) {
   const sumColumns = [
     "total_patrols", "unique_patrollers", "patrol_new_pages", "patrol_diffs",
     "patrolled_revisions", "autopatrolled_revisions", "total_revisions",
-    "min_patrollers_50pct",
   ];
   for (const row of rows) {
     const entry = grouped.get(row.period) ?? {
@@ -163,8 +167,11 @@ export function aggregatePatrolByPeriod(rows) {
       median_latency_hours: 0,
       p90_latency_hours: 0,
       top1_pct: 0,
+      source_rows: 0,
+      single: row,
     };
     for (const column of sumColumns) entry[column] = (entry[column] ?? 0) + (row[column] ?? 0);
+    entry.source_rows += 1;
     const weight = row.total_patrols ?? 0;
     if (weight > 0) {
       for (const column of ["median_latency_hours", "p90_latency_hours", "top1_pct"]) {
@@ -189,6 +196,16 @@ export function aggregatePatrolByPeriod(rows) {
         ? output.patrolled_revisions / output.total_revisions * 100 : 0;
       output.adjusted_coverage_pct = output.total_revisions > 0
         ? (output.patrolled_revisions + output.autopatrolled_revisions) / output.total_revisions * 100 : 0;
+      if (output.source_rows > 1) {
+        output.median_latency_hours = null;
+        output.p90_latency_hours = null;
+        output.top1_pct = null;
+        output.min_patrollers_50pct = null;
+      } else {
+        output.min_patrollers_50pct = output.single.min_patrollers_50pct;
+      }
+      delete output.source_rows;
+      delete output.single;
       return output;
     });
 }

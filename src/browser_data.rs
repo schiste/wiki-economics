@@ -1,18 +1,20 @@
 use anyhow::{Context, Result, ensure};
-#[cfg(test)]
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::{artifact_receipt, licensing};
 
 pub const INDEX_FILENAME: &str = "browser-data-index.json";
-pub const INDEX_SCHEMA_VERSION: u32 = 2;
-pub const CACHE_SCHEMA_VERSION: u32 = 2;
+pub const INDEX_SCHEMA_VERSION: u32 = 3;
+pub const CACHE_SCHEMA_VERSION: u32 = 3;
+const GLOBAL_WIKI: &str = "all";
+const GLOBAL_ROOT: &str = "_browser-global";
+const GLOBAL_AGGREGATION_VERSION: &str = "global-browser-aggregate-v1";
 
 pub const BROWSER_METRICS: [(&str, &str); 9] = [
     ("business_funnel", "cohort_year"),
@@ -38,6 +40,9 @@ pub struct BrowserDataEntry {
     pub bytes: u64,
     pub sha256: String,
     pub artifact_receipt_sha256: String,
+    pub scope: String,
+    pub shard: Option<String>,
+    pub aggregation_version: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -93,6 +98,7 @@ fn build_index_with_previous(
     allowlist: Option<&BTreeSet<String>>,
     previous: Option<&BrowserDataIndex>,
 ) -> Result<(BrowserDataIndex, usize, usize)> {
+    materialize_global_partitions(output_dir, allowlist)?;
     let wikis = published_wikis(output_dir, allowlist)?;
     ensure!(
         !wikis.is_empty(),
@@ -101,7 +107,7 @@ fn build_index_with_previous(
     let previous = previous
         .into_iter()
         .flat_map(|index| &index.entries)
-        .map(|entry| ((entry.metric.as_str(), entry.wiki.as_str()), entry))
+        .map(|entry| (entry.file.as_str(), entry))
         .collect::<BTreeMap<_, _>>();
     let mut entries = Vec::new();
     let mut reused = 0_usize;
@@ -172,8 +178,75 @@ fn build_index_with_previous(
                 bytes: receipt.bytes,
                 sha256: receipt.artifact_sha256,
                 artifact_receipt_sha256: receipt_sha256,
+                scope: "wiki".to_string(),
+                shard: None,
+                aggregation_version: None,
             };
-            if let Some(existing) = previous.get(&(metric, wiki.as_str()))
+            if let Some(existing) = previous.get(expected.file.as_str())
+                && **existing == expected
+            {
+                entries.push((*existing).clone());
+                reused += 1;
+            } else {
+                entries.push(expected);
+                rebuilt += 1;
+            }
+        }
+    }
+    for (metric, date_column) in BROWSER_METRICS {
+        let metric_root = output_dir.join(GLOBAL_ROOT).join(metric);
+        if !metric_root.is_dir() {
+            continue;
+        }
+        let mut shards = fs::read_dir(&metric_root)?
+            .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+            .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("parquet"))
+            .collect::<Vec<_>>();
+        shards.sort();
+        for source in shards {
+            let shard = source
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .context("global browser shard has no UTF-8 name")?
+                .to_string();
+            let identity = format!("{GLOBAL_ROOT}/{metric}/{shard}.parquet");
+            let document = artifact_receipt::verify(
+                &source,
+                &identity,
+                None,
+                artifact_receipt::VerificationMode::Fast,
+            )?;
+            let receipt_sha256 = document.receipt_sha256;
+            let receipt = document.receipt;
+            ensure!(
+                receipt.rows > 0
+                    && receipt.minimum_wiki == GLOBAL_WIKI
+                    && receipt.maximum_wiki == GLOBAL_WIKI
+                    && receipt
+                        .parquet_schema
+                        .iter()
+                        .any(|field| field.name == date_column),
+                "global browser partition is empty or invalid"
+            );
+            let expected = BrowserDataEntry {
+                metric: metric.to_string(),
+                wiki: GLOBAL_WIKI.to_string(),
+                minimum_date: receipt
+                    .minimum_date
+                    .context("global browser partition date minimum is null")?,
+                maximum_date: receipt
+                    .maximum_date
+                    .context("global browser partition date maximum is null")?,
+                file: format!("browser-data/{metric}/all-{shard}.parquet"),
+                rows: receipt.rows,
+                bytes: receipt.bytes,
+                sha256: receipt.artifact_sha256,
+                artifact_receipt_sha256: receipt_sha256,
+                scope: "global".to_string(),
+                shard: Some(shard),
+                aggregation_version: Some(GLOBAL_AGGREGATION_VERSION.to_string()),
+            };
+            if let Some(existing) = previous.get(expected.file.as_str())
                 && **existing == expected
             {
                 entries.push((*existing).clone());
@@ -215,6 +288,340 @@ fn build_index_with_previous(
         reused,
         rebuilt,
     ))
+}
+
+fn materialize_global_partitions(
+    output_dir: &Path,
+    allowlist: Option<&BTreeSet<String>>,
+) -> Result<()> {
+    let staging = output_dir.join(format!(".{GLOBAL_ROOT}.{}.tmp", std::process::id()));
+    if staging.exists() {
+        fs::remove_dir_all(&staging)?;
+    }
+    fs::create_dir_all(&staging)?;
+    let result = (|| -> Result<()> {
+        for (metric, date_column) in BROWSER_METRICS {
+            let source = output_dir.join(format!("{metric}.parquet"));
+            if !source.is_file() {
+                continue;
+            }
+            let frame = ParquetReader::new(File::open(&source)?)
+                .set_low_memory(true)
+                .read_parallel(ParallelStrategy::None)
+                .finish()?;
+            let frame = if let Some(allowed) = allowlist {
+                let allowed = allowed.iter().cloned().collect::<Vec<_>>();
+                frame
+                    .lazy()
+                    .filter(col("wiki").is_in(lit(Series::new("allowed".into(), allowed)), false))
+                    .collect()?
+            } else {
+                frame
+            };
+            ensure!(frame.height() > 0, "global {metric} input is empty");
+            let aggregate = aggregate_global_metric(metric, frame)?;
+            write_year_shards(&staging, metric, date_column, &aggregate)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    let destination = output_dir.join(GLOBAL_ROOT);
+    let backup = output_dir.join(format!(".{GLOBAL_ROOT}.{}.backup", std::process::id()));
+    if backup.exists() {
+        fs::remove_dir_all(&backup)?;
+    }
+    if destination.exists() {
+        fs::rename(&destination, &backup)?;
+    }
+    if let Err(error) = fs::rename(&staging, &destination) {
+        if backup.exists() {
+            let _ = fs::rename(&backup, &destination);
+        }
+        return Err(error).context("failed to publish global browser partitions");
+    }
+    if backup.exists() {
+        fs::remove_dir_all(backup)?;
+    }
+    File::open(output_dir)?.sync_all()?;
+    Ok(())
+}
+
+fn aggregate_global_metric(metric: &str, frame: DataFrame) -> Result<DataFrame> {
+    let result = match metric {
+        "business_funnel" => aggregate_sums(
+            frame,
+            &["cohort_year"],
+            &["cohort_size", "reached_5", "reached_25", "reached_100"],
+        )?,
+        "gdp" => aggregate_sums(
+            frame,
+            &["year_month", "page_namespace", "user_type"],
+            &[
+                "gross_bytes_added",
+                "net_bytes",
+                "total_edits",
+                "productive_edits",
+                "reverted_edits",
+                "unique_editors",
+                "minor_edits",
+            ],
+        )?
+        .lazy()
+        .with_columns([
+            safe_ratio("gross_bytes_added", "total_edits", "bytes_per_edit"),
+            safe_ratio("gross_bytes_added", "unique_editors", "bytes_per_editor"),
+            safe_ratio("reverted_edits", "total_edits", "revert_rate"),
+        ])
+        .collect()?,
+        "gdp_activity_tiers" => aggregate_sums(
+            frame,
+            &[
+                "year_month",
+                "period",
+                "period_start",
+                "period_end",
+                "period_type",
+                "period_months",
+                "user_type",
+                "activity_tier",
+                "tier_rank",
+            ],
+            &["editors", "total_edits", "net_bytes", "gross_bytes"],
+        )?,
+        "gdp_user_type_share" => aggregate_sums(
+            frame,
+            &["year_month", "user_type"],
+            &["edits", "net_bytes", "editors"],
+        )?,
+        "labor_churn" => aggregate_sums(
+            frame,
+            &["period", "period_type"],
+            &["active_editors", "arrivals", "departures"],
+        )?
+        .lazy()
+        .with_columns([
+            safe_ratio("arrivals", "active_editors", "arrival_rate"),
+            safe_ratio("departures", "active_editors", "departure_rate"),
+        ])
+        .collect()?,
+        "labor_cohorts" => aggregate_sums(
+            frame,
+            &["cohort_year", "year"],
+            &["survived_editors", "initial_editors"],
+        )?,
+        "labor_monthly" => aggregate_sums(
+            frame,
+            &["year_month", "page_namespace", "user_type"],
+            &[
+                "unique_editors",
+                "total_edits",
+                "net_bytes",
+                "reverted_edits",
+            ],
+        )?,
+        "inequality" => aggregate_global_inequality(frame)?,
+        "patrol" => aggregate_global_patrol(frame)?,
+        _ => anyhow::bail!("unsupported global browser metric {metric}"),
+    };
+    let sort_columns = result
+        .get_column_names()
+        .iter()
+        .filter(|name| name.as_str() != "wiki")
+        .map(|name| col(name.as_str()))
+        .collect::<Vec<_>>();
+    result
+        .lazy()
+        .sort_by_exprs(sort_columns, SortMultipleOptions::default())
+        .collect()
+        .map_err(anyhow::Error::from)
+}
+
+fn aggregate_sums(frame: DataFrame, keys: &[&str], sums: &[&str]) -> Result<DataFrame> {
+    frame
+        .lazy()
+        .group_by(keys.iter().map(|name| col(*name)).collect::<Vec<_>>())
+        .agg(
+            sums.iter()
+                .map(|name| col(*name).cast(DataType::Int64).sum().alias(*name))
+                .collect::<Vec<_>>(),
+        )
+        .with_columns([lit(GLOBAL_WIKI).alias("wiki")])
+        .collect()
+        .map_err(anyhow::Error::from)
+}
+
+fn safe_ratio(numerator: &'static str, denominator: &'static str, output: &'static str) -> Expr {
+    when(col(denominator).neq(lit(0_i64)))
+        .then(col(numerator).cast(DataType::Float64) / col(denominator).cast(DataType::Float64))
+        .otherwise(lit(0.0_f64))
+        .alias(output)
+}
+
+fn aggregate_global_inequality(frame: DataFrame) -> Result<DataFrame> {
+    let edits = col("total_edits").cast(DataType::Float64);
+    let editors = col("total_editors").cast(DataType::Float64);
+    frame
+        .lazy()
+        .with_columns([
+            (edits.clone() * col("theil")).alias("_within_theil"),
+            (edits.clone() * (edits.clone() / editors.clone()).log(lit(std::f64::consts::E)))
+                .alias("_mean_log"),
+        ])
+        .group_by([col("year_month"), col("user_type")])
+        .agg([
+            col("total_editors").cast(DataType::Int64).sum(),
+            col("total_edits").cast(DataType::Int64).sum(),
+            col("_within_theil").sum(),
+            col("_mean_log").sum(),
+        ])
+        .with_columns([
+            lit(NULL).cast(DataType::Float64).alias("gini"),
+            ((col("_within_theil") + col("_mean_log")
+                - col("total_edits").cast(DataType::Float64)
+                    * (col("total_edits").cast(DataType::Float64)
+                        / col("total_editors").cast(DataType::Float64))
+                    .log(lit(std::f64::consts::E)))
+                / col("total_edits").cast(DataType::Float64))
+            .alias("theil"),
+            lit(NULL).cast(DataType::Float64).alias("palma"),
+            lit(NULL).cast(DataType::Int64).alias("min_editors_50pct"),
+            lit(GLOBAL_WIKI).alias("wiki"),
+        ])
+        .select([
+            col("year_month"),
+            col("user_type"),
+            col("gini"),
+            col("theil"),
+            col("palma"),
+            col("min_editors_50pct"),
+            col("total_editors"),
+            col("total_edits"),
+            col("wiki"),
+        ])
+        .collect()
+        .map_err(anyhow::Error::from)
+}
+
+fn aggregate_global_patrol(frame: DataFrame) -> Result<DataFrame> {
+    aggregate_sums(
+        frame,
+        &["year_month", "page_namespace", "user_type"],
+        &[
+            "total_patrols",
+            "unique_patrollers",
+            "patrol_new_pages",
+            "patrol_diffs",
+            "patrolled_revisions",
+            "autopatrolled_revisions",
+            "total_revisions",
+        ],
+    )?
+    .lazy()
+    .with_columns([
+        lit(NULL)
+            .cast(DataType::Float64)
+            .alias("median_latency_hours"),
+        lit(NULL).cast(DataType::Float64).alias("p90_latency_hours"),
+        safe_ratio("patrolled_revisions", "total_revisions", "_patrol_fraction"),
+        safe_ratio(
+            "autopatrolled_revisions",
+            "total_revisions",
+            "_autopatrol_fraction",
+        ),
+        lit(NULL).cast(DataType::Float64).alias("top1_pct"),
+        lit(NULL)
+            .cast(DataType::Int64)
+            .alias("min_patrollers_50pct"),
+    ])
+    .with_columns([
+        (col("_patrol_fraction") * lit(100.0_f64)).alias("patrol_coverage_pct"),
+        ((col("_patrol_fraction") + col("_autopatrol_fraction")) * lit(100.0_f64))
+            .alias("adjusted_coverage_pct"),
+    ])
+    .select([
+        col("year_month"),
+        col("wiki"),
+        col("page_namespace"),
+        col("user_type"),
+        col("total_patrols"),
+        col("unique_patrollers"),
+        col("patrol_new_pages"),
+        col("patrol_diffs"),
+        col("median_latency_hours"),
+        col("p90_latency_hours"),
+        col("patrolled_revisions"),
+        col("autopatrolled_revisions"),
+        col("total_revisions"),
+        col("patrol_coverage_pct"),
+        col("adjusted_coverage_pct"),
+        col("top1_pct"),
+        col("min_patrollers_50pct"),
+    ])
+    .collect()
+    .map_err(anyhow::Error::from)
+}
+
+fn write_year_shards(
+    staging: &Path,
+    metric: &str,
+    date_column: &str,
+    frame: &DataFrame,
+) -> Result<Vec<PathBuf>> {
+    let mut years = BTreeSet::new();
+    let dates = frame.column(date_column)?;
+    for row in 0..frame.height() {
+        let value = dates.get(row)?;
+        let value = match value {
+            AnyValue::String(value) => value,
+            AnyValue::StringOwned(ref value) => value.as_str(),
+            AnyValue::Null => continue,
+            value => anyhow::bail!("global {metric} date is not a string: {value:?}"),
+        };
+        ensure!(value.len() >= 4, "global {metric} date is too short");
+        years.insert(value[..4].to_string());
+    }
+    ensure!(!years.is_empty(), "global {metric} has no dated rows");
+    let directory = staging.join(metric);
+    fs::create_dir_all(&directory)?;
+    let mut paths = Vec::new();
+    for year in years {
+        let mask = BooleanChunked::from_iter((0..frame.height()).map(|row| {
+            frame
+                .column(date_column)
+                .ok()
+                .and_then(|column| column.get(row).ok())
+                .and_then(|value| match value {
+                    AnyValue::String(value) => Some(value.starts_with(&year)),
+                    AnyValue::StringOwned(value) => Some(value.as_str().starts_with(&year)),
+                    _ => None,
+                })
+                .unwrap_or(false)
+        }));
+        let mut shard = frame.filter(&mask)?;
+        ensure!(shard.height() > 0, "global {metric}/{year} shard is empty");
+        let path = directory.join(format!("{year}.parquet"));
+        ParquetWriter::new(File::create(&path)?)
+            .set_parallel(false)
+            .finish(&mut shard)?;
+        let identity = format!("{GLOBAL_ROOT}/{metric}/{year}.parquet");
+        artifact_receipt::scan_and_write_with_spec(
+            &path,
+            &identity,
+            GLOBAL_AGGREGATION_VERSION,
+            "publication-ready-receipts",
+            artifact_receipt::SemanticSpec {
+                date_column: Some(date_column.to_string()),
+                conservation_columns: Vec::new(),
+                ordering_contract: "global-time-shard/v1".to_string(),
+                page_week_consistency: false,
+            },
+        )?;
+        paths.push(path);
+    }
+    Ok(paths)
 }
 
 pub fn materialize(output_dir: &Path, allowlist: Option<&BTreeSet<String>>) -> Result<()> {

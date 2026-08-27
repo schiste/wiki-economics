@@ -34,7 +34,10 @@ function validateStaticBudgets(distDir, budgets) {
 function validateProfile(profile, budgets, index) {
   const metrics = new Set(["gdp", "gdp_activity_tiers", "gdp_user_type_share"]);
   const selectedEntries = index.entries.filter(entry => metrics.has(entry.metric)
-    && (profile.wiki === "all" || entry.wiki === profile.wiki));
+    && (profile.wiki === "all"
+      ? entry.scope === "global" && entry.wiki === "all"
+        && entry.maximum_date >= profile.start_period && entry.minimum_date <= profile.end_period
+      : entry.scope === "wiki" && entry.wiki === profile.wiki));
   if (profile.wiki === "all") {
     const requestedFiles = new Set(profile.parquet_requests.map(request => new URL(request).pathname.slice(1)));
     const indexedFiles = new Set(selectedEntries.map(entry => entry.file));
@@ -246,7 +249,8 @@ async function runBrowserPerformance({distDir, budgets}) {
       const heapUsed = metrics.metrics.find(metric => metric.name === "JSHeapUsedSize")?.value || 0;
       peakHeapUsed = Math.max(peakHeapUsed, heapUsed);
       const heapLimit = await evaluate(cdp, "performance.memory?.jsHeapSizeLimit || 0");
-      const profile = {wiki, duration_ms: load.durationMs, rows: load.rows, compressed_bytes: load.compressedBytes,
+      const profile = {wiki, start_period: "2025-12", end_period: "2026-01",
+        duration_ms: load.durationMs, rows: load.rows, compressed_bytes: load.compressedBytes,
         cache_hits: load.cacheHits, peak_heap_used_bytes: peakHeapUsed, heap_limit_bytes: heapLimit,
         memory_headroom_ratio: heapLimit > 0 ? (heapLimit - peakHeapUsed) / heapLimit : 0,
         parquet_requests: requests.slice(requestStart).filter(url => url.endsWith(".parquet"))};

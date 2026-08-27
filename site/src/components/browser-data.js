@@ -1,5 +1,5 @@
 import {createBrowserCache} from "./browser-cache.js";
-import {isAllWikis} from "./wiki-scope.js";
+import {ALL_WIKIS, isAllWikis} from "./wiki-scope.js";
 
 const DEFAULT_INDEX_URL = "/browser-data/index.json";
 let decoderPromise;
@@ -26,36 +26,32 @@ function arrowRowToObject(row) {
 }
 
 export function validateBrowserIndex(index) {
-  if (index?.schema_version !== 2
+  if (index?.schema_version !== 3
       || !Number.isSafeInteger(index?.cache_schema_version)
       || index.cache_schema_version <= 0
       || !/^[0-9a-f]{64}$/.test(index?.generation || "")
       || index?.license_spdx !== "MIT"
       || !Array.isArray(index?.entries)
       || index.entries.length === 0
-      || index.entries.some((entry) => !/^[0-9a-f]{64}$/.test(entry?.artifact_receipt_sha256 || ""))) {
+      || index.entries.some((entry) => !/^[0-9a-f]{64}$/.test(entry?.artifact_receipt_sha256 || "")
+        || !["wiki", "global"].includes(entry?.scope))) {
     throw new Error("Invalid browser data index");
   }
   return index;
 }
 
-export function selectBrowserEntries(index, metrics, wiki) {
+export function selectBrowserEntries(index, metrics, wiki, {startPeriod, endPeriod} = {}) {
   const requested = new Set(Object.values(metrics));
-  const selected = index.entries.filter(entry =>
-    (isAllWikis(wiki) || entry.wiki === wiki) && requested.has(entry.metric));
+  const all = isAllWikis(wiki);
+  const selected = index.entries.filter(entry => requested.has(entry.metric)
+    && (all
+      ? entry.scope === "global" && entry.wiki === ALL_WIKIS
+        && (!startPeriod || entry.maximum_date >= startPeriod)
+        && (!endPeriod || entry.minimum_date <= endPeriod)
+      : entry.scope === "wiki" && entry.wiki === wiki));
   for (const metric of requested) {
     if (!selected.some(entry => entry.metric === metric)) {
       throw new Error(`Browser data index has no ${metric} partition for ${wiki}`);
-    }
-  }
-  if (isAllWikis(wiki)) {
-    const selectedWikis = new Set(selected.map(entry => entry.wiki));
-    for (const selectedWiki of selectedWikis) {
-      for (const metric of requested) {
-        if (!selected.some(entry => entry.wiki === selectedWiki && entry.metric === metric)) {
-          throw new Error(`Browser data index has no ${metric} partition for ${selectedWiki}`);
-        }
-      }
     }
   }
   return selected.sort((left, right) => left.metric.localeCompare(right.metric)
@@ -100,9 +96,9 @@ export function makeRowsLoader(metrics, {
     return indexPromise;
   }
 
-  return async function loadRows(wiki) {
+  return async function loadRows(wiki, range = {}) {
     const {index, url} = await indexAndUrl();
-    const entries = selectBrowserEntries(index, metrics, wiki);
+    const entries = selectBrowserEntries(index, metrics, wiki, range);
     const key = `${wiki}:${entries.map(entry => entry.sha256).join(":")}`;
     if (activeKey === key && activePromise) return activePromise;
     activeKey = key;

@@ -23,7 +23,7 @@ test("static budgets reject oversized and DuckDB artifacts", () => {
 });
 
 test("profile budgets reject unrelated wiki downloads, latency, memory, and row drift", () => {
-  const index = {entries: ["gdp", "gdp_activity_tiers", "gdp_user_type_share"].map(metric => ({metric, wiki: "nlwiki", rows: 10}))};
+  const index = {entries: ["gdp", "gdp_activity_tiers", "gdp_user_type_share"].map(metric => ({metric, wiki: "nlwiki", scope: "wiki", rows: 10}))};
   const valid = {wiki: "nlwiki", duration_ms: 10, rows: 30, memory_headroom_ratio: 0.5,
     parquet_requests: ["https://example/browser-data/gdp/nlwiki.parquet"]};
   assert.doesNotThrow(() => validateProfile(valid, budgets, index));
@@ -33,14 +33,17 @@ test("profile budgets reject unrelated wiki downloads, latency, memory, and row 
   assert.throws(() => validateProfile({...valid, rows: 29}, budgets, index), /index declares/);
 });
 
-test("all-wiki profile accounts for every indexed partition from network or cache", () => {
-  const entries = ["nlwiki", "ptwiki"].flatMap(wiki =>
+test("all-wiki profile accounts only for overlapping global shards", () => {
+  const entries = ["2025", "2026", "2027"].flatMap(year =>
     ["gdp", "gdp_activity_tiers", "gdp_user_type_share"].map(metric => ({
-      metric, wiki, rows: 10, file: `browser-data/${metric}/${wiki}.parquet`,
+      metric, wiki: "all", scope: "global", rows: 10, minimum_date: `${year}-01`, maximum_date: `${year}-12`,
+      file: `browser-data/${metric}/all-${year}.parquet`,
     })));
   const index = {entries};
-  const valid = {wiki: "all", duration_ms: 20, rows: 60, memory_headroom_ratio: 0.5,
-    cache_hits: 3, parquet_requests: entries.slice(3).map(entry => `https://example/${entry.file}`)};
+  const selected = entries.filter(entry => entry.maximum_date >= "2025-12" && entry.minimum_date <= "2026-01");
+  const valid = {wiki: "all", start_period: "2025-12", end_period: "2026-01",
+    duration_ms: 20, rows: 60, memory_headroom_ratio: 0.5,
+    cache_hits: 3, parquet_requests: selected.slice(3).map(entry => `https://example/${entry.file}`)};
   assert.doesNotThrow(() => validateProfile(valid, budgets, index));
   assert.throws(() => validateProfile({...valid, cache_hits: 2}, budgets, index), /exactly the indexed/);
   assert.throws(() => validateProfile({...valid, parquet_requests: [...valid.parquet_requests, "https://example/other.parquet"]}, budgets, index), /exactly the indexed/);
