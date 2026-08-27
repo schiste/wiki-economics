@@ -555,9 +555,11 @@ impl ResourceGovernor {
             .cgroup_current_bytes
             .or(sample.memory.rss_bytes);
         #[cfg(target_os = "linux")]
-        let current_memory = current_memory.context(
+        let current_memory_result = current_memory.context(
             "resource governor requires current cgroup or RSS memory for bucket admission",
-        )?;
+        );
+        #[cfg(target_os = "linux")]
+        let current_memory = current_memory_result?;
         #[cfg(not(target_os = "linux"))]
         let current_memory = current_memory.unwrap_or(0);
         let admitted_memory = current_memory
@@ -828,14 +830,15 @@ fn parse_cpu_stat(value: &str) -> CpuSnapshot {
 }
 
 fn capture_page_cache() -> Option<u64> {
-    fs::read_to_string("/sys/fs/cgroup/memory.stat")
-        .ok()
-        .and_then(|value| parse_named_counter(&value, "file"))
-        .or_else(|| {
-            fs::read_to_string("/sys/fs/cgroup/memory/memory.stat")
-                .ok()
-                .and_then(|value| parse_named_counter(&value, "cache"))
-        })
+    let unified = fs::read_to_string("/sys/fs/cgroup/memory.stat").ok();
+    let legacy = fs::read_to_string("/sys/fs/cgroup/memory/memory.stat").ok();
+    page_cache_from_contents(unified.as_deref(), legacy.as_deref())
+}
+
+fn page_cache_from_contents(unified: Option<&str>, legacy: Option<&str>) -> Option<u64> {
+    unified
+        .and_then(|value| parse_named_counter(value, "file"))
+        .or_else(|| legacy.and_then(|value| parse_named_counter(value, "cache")))
 }
 
 #[cfg(not(coverage))]
@@ -1019,6 +1022,15 @@ mod tests {
             Some(2048)
         );
         assert_eq!(
+            page_cache_from_contents(Some("anon 2\nfile 4096\n"), None),
+            Some(4096)
+        );
+        assert_eq!(
+            page_cache_from_contents(None, Some("cache 2048\nrss 1024\n")),
+            Some(2048)
+        );
+        assert_eq!(page_cache_from_contents(None, None), None);
+        assert_eq!(
             parse_io_snapshot("read_bytes: 1024\nwrite_bytes: 2048\n"),
             IoSnapshot {
                 read_bytes: Some(1024),
@@ -1110,6 +1122,18 @@ mod tests {
                 .validate_bucket_admission(&GovernorState::default(), &sample, 1, 1)
                 .is_err()
         );
+        sample.open_file_descriptors = Some(1);
+        governor.validate_bucket_admission(&GovernorState::default(), &sample, 1, 1)?;
+        #[cfg(target_os = "linux")]
+        {
+            sample.memory.rss_bytes = None;
+            sample.memory.cgroup_current_bytes = None;
+            assert!(
+                governor
+                    .validate_bucket_admission(&GovernorState::default(), &sample, 1, 1)
+                    .is_err()
+            );
+        }
         Ok(())
     }
 

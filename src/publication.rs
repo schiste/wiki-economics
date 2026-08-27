@@ -1368,14 +1368,11 @@ enum CandidateReuseMethod {
 fn try_reflink(source: &Path, target: &Path) -> std::io::Result<()> {
     let source = File::open(source)?;
     let target_file = File::create(target)?;
-    match rustix::fs::ioctl_ficlone(&target_file, &source) {
-        Ok(()) => Ok(()),
-        Err(error) => {
-            drop(target_file);
-            let _ = fs::remove_file(target);
-            Err(error.into())
-        }
-    }
+    rustix::fs::ioctl_ficlone(&target_file, &source).map_err(|error| {
+        drop(target_file);
+        let _ = fs::remove_file(target);
+        std::io::Error::from(error)
+    })
 }
 
 #[cfg(target_vendor = "apple")]
