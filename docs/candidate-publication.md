@@ -120,16 +120,17 @@ The scheduled jobs are:
 
 | Job | Lock | Responsibility |
 | --- | --- | --- |
-| `wiki-econ-prepare-nlwiki` | `nlwiki.lock` | Prepare and validate nlwiki |
-| `wiki-econ-prepare-ptwiki` | `ptwiki.lock` | Prepare and validate ptwiki |
-| `wiki-econ-prepare-frwiki` | `frwiki.lock` | Prepare and validate frwiki |
+| `wiki-econ-fleet-controller` | atomic queue writes | Discover every scheduled lifecycle wiki |
+| `wiki-econ-fleet-small-a/b` | task lease + `<wiki>.lock` | Prepare small-class wiki candidates |
+| `wiki-econ-fleet-medium` | task lease + `<wiki>.lock` | Prepare medium/large-class wiki candidates |
 | `wiki-econ-publish-ready` | `.publication.lock` | Select, merge, build, validate, switch, retire |
 
-The weekly preparation schedules are discovery triggers rather than an
+The weekly controller schedule is a discovery trigger rather than an
 instruction to rebuild. Each trigger resolves and pins the latest completed
 snapshot. If that version and its stage fingerprints are already represented
-by a ready candidate, the run record reports `noOp: true`; no dump or patrol
-download and no compute stage starts.
+by matching completed-task, notification, and ready-index evidence, no task is
+queued. If a worker still reaches an unchanged candidate, its run record reports
+`noOp: true`; no dump or patrol download and no compute stage starts.
 
 Every Wikimedia monthly history dump is treated as a complete authoritative
 snapshot. Snapshot rollover performs the complete source-generation ingest;

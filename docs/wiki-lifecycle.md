@@ -34,6 +34,11 @@ Retired wikis must use `refresh=paused`. Imported historical datasets use
 `imported_cutoff` field so the dashboard and operators can distinguish a valid
 historical snapshot from a failed refresh.
 
+An optional `fleet_resource_class` may pin `small`, `medium_large`, or
+`isolated` for reviewed qualification evidence. Automatic classification is
+preferred and uses measured workload signals rather than wiki names. Monthly
+source layouts cannot be overridden out of `isolated`.
+
 ## Runtime behavior
 
 `scripts/wiki-lifecycle.cjs` validates the registry and provides the canonical

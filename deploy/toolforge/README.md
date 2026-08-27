@@ -60,9 +60,12 @@ and higher resource envelope are being qualified.
 - `rebuild-image.sh` rebuilds only the Toolforge image and restarts continuous
   processes. It uses detached JSON output and polls the exact build ID, so a
   disconnected log stream or concurrent build cannot produce a false result.
-- `jobs.yaml` — six independently scheduled per-wiki candidate jobs (elwiki,
-  frwiki, itwiki, nlwiki, ptwiki, and svwiki) and the short
-  `wiki-econ-publish-ready` job, plus legacy on-demand recovery jobs.
+- `jobs.yaml` — one Rust fleet controller, two fixed small-wiki workers, one
+  fixed medium/large worker, and the short `wiki-econ-publish-ready` job, plus
+  legacy on-demand recovery jobs. The controller represents elwiki, frwiki,
+  itwiki, nlwiki, ptwiki, and svwiki from the lifecycle registry; adding a wiki
+  does not add a Toolforge Job definition. Monthly layouts remain isolated
+  because no production isolated worker exists.
   The full state machine and recovery boundary are documented in
   [per-wiki candidate preparation and publication](../../docs/candidate-publication.md).
   `wiki-econ-admin` serves `/admin*` and the built static site as a separate
@@ -79,11 +82,14 @@ and higher resource envelope are being qualified.
   `--envvar`/`--envvars` flag; `toolforge envvars create` is tool-wide only),
   so `jobs.yaml` points each on-demand Job's `command:` at its wrapper
   instead of setting the stage through an `envvars:` field.
-- `run-prepare-wiki.sh`, `run-with-lock.sh`, `run-publish-ready.sh`, and
+- `run-fleet-controller.sh`, `run-fleet-worker.sh`, `run-prepare-wiki.sh`,
+  `run-with-lock.sh`, `run-publish-ready.sh`, and
   `publish-ready-transaction.sh` implement the production schedule. Long
   preparation holds a per-wiki NFS-safe heartbeat lock and never changes a
   live pointer. Publication alone holds the global lock while selecting ready
   candidates, merging, validating, building, and switching the site.
+  Fleet tasks use atomic NFS leases and heartbeats, bounded retries, and
+  quarantine; see the [fleet scheduler](../../docs/fleet-scheduler.md).
 - `run-refresh.sh` — wraps `scripts/refresh.sh` as an on-demand compatibility
   and recovery path; it is no longer the scheduled production path.
   Unlike Cloud VPS's `run-refresh.sh`, this does not keep a `releases/`

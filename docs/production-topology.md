@@ -32,7 +32,9 @@ coverage checker and its tests. There is no PyArrow dependency.
 ## Refresh and publication flow
 
 ```text
-per-wiki preparation Jobs
+Rust fleet discovery/controller Job
+  -> atomic NFS task queue
+  -> fixed small and medium/large worker Jobs
   -> per-wiki NFS lock + live run record
   -> resolve one completed snapshot for that wiki
   -> fetch -> ingest immutable generation -> select generation
@@ -63,12 +65,13 @@ publication receipt still matches immediately before publication. See
 There are independent Kubernetes workloads sharing the tool account's NFS
 mount:
 
-- `wiki-econ-prepare-elwiki`, `wiki-econ-prepare-frwiki`,
-  `wiki-econ-prepare-itwiki`, `wiki-econ-prepare-nlwiki`,
-  `wiki-econ-prepare-ptwiki`, and `wiki-econ-prepare-svwiki` are the scheduled
-  per-wiki preparation Jobs defined in `deploy/toolforge/jobs.yaml`. Each owns
-  only its wiki's candidate-generation paths and may run without blocking other
-  wikis or the public site.
+- `wiki-econ-fleet-controller` discovers elwiki, frwiki, itwiki, nlwiki,
+  ptwiki, and svwiki from the lifecycle registry and writes atomic tasks.
+  `wiki-econ-fleet-small-a`, `wiki-econ-fleet-small-b`, and
+  `wiki-econ-fleet-medium` are a fixed worker pool. Each claimed task owns only
+  its wiki's candidate-generation paths; leases, heartbeats, bounded retries,
+  and quarantine keep failures independent. There is deliberately no isolated
+  production worker.
 - `wiki-econ-publish-ready` is the short scheduled publisher. It alone acquires
   the global publication lock and mutates merged output and the live site.
 - `wiki-econ-refresh` is retained as an unscheduled, on-demand compatibility
@@ -112,6 +115,7 @@ output/
   .refresh-status.json              atomically updated live status
   .refresh-history.jsonl            bounded terminal history
   logs/refresh/<run-id>.log         per-run file log
+  _fleet/                           pending tasks, leases, retries, quarantine, ready notifications
 
 site-dist -> .site-dist.build.<run-id>.*
 capacity/                            isolated qualification reports/staging
