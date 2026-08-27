@@ -1856,6 +1856,37 @@ fn legacy_wiki_publication_proof(
     })
 }
 
+fn current_family_publication_proofs(
+    reference: ReadyCandidateReference,
+    algorithms: &BTreeMap<String, String>,
+) -> Result<(BTreeMap<String, FamilyPublicationProof>, String)> {
+    let mut families = reference
+        .core_family_receipt_identities
+        .into_iter()
+        .map(|(family, receipt_identity)| {
+            let algorithm_version = algorithms
+                .get(&family)
+                .cloned()
+                .with_context(|| format!("candidate family {family} has no algorithm version"))?;
+            Ok((
+                family,
+                FamilyPublicationProof {
+                    receipt_identity,
+                    algorithm_version,
+                },
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    families.insert(
+        "patrol".to_string(),
+        FamilyPublicationProof {
+            receipt_identity: reference.patrol_receipt_identity,
+            algorithm_version: crate::patrol::algorithm_version().to_string(),
+        },
+    );
+    Ok((families, reference.ready_receipt_sha256))
+}
+
 fn current_wiki_publication_proof(
     data_dir: &Path,
     output_dir: &Path,
@@ -1875,54 +1906,26 @@ fn current_wiki_publication_proof(
             == Some(ready.snapshot.as_str()),
         "active candidate and snapshot pointer disagree for {wiki}"
     );
-    let (families, ready_receipt_sha256) =
-        match ready_candidate_reference(data_dir, output_dir, &candidate_dir, &ready) {
-            Ok(reference) => {
-                let algorithms = crate::compute::family_receipt_algorithms(
-                    wiki,
-                    &ready.snapshot,
-                    data_dir,
-                    &candidate_dir,
-                )?;
-                let mut families = reference
-                    .core_family_receipt_identities
-                    .into_iter()
-                    .map(|(family, receipt_identity)| {
-                        let algorithm_version =
-                            algorithms.get(&family).cloned().with_context(|| {
-                                format!("candidate family {family} has no algorithm version")
-                            })?;
-                        Ok((
-                            family,
-                            FamilyPublicationProof {
-                                receipt_identity,
-                                algorithm_version,
-                            },
-                        ))
-                    })
-                    .collect::<Result<BTreeMap<_, _>>>()?;
-                families.insert(
-                    "patrol".to_string(),
-                    FamilyPublicationProof {
-                        receipt_identity: reference.patrol_receipt_identity,
-                        algorithm_version: crate::patrol::algorithm_version().to_string(),
-                    },
-                );
-                (families, reference.ready_receipt_sha256)
-            }
-            Err(error) => {
-                warn!(
-                    wiki,
-                    path = %candidate_dir.display(),
-                    error = %format!("{error:#}"),
-                    "composing active publication proof from artifact receipts"
-                );
-                let families = artifact_backed_family_proofs(&candidate_dir, &ready.artifacts)?;
-                let (_, ready_receipt_sha256) =
-                    storage::sha256_file(&candidate_dir.join("ready.json"))?;
-                (families, ready_receipt_sha256)
-            }
-        };
+    let reference = ready_candidate_reference(data_dir, output_dir, &candidate_dir, &ready);
+    let algorithms =
+        crate::compute::family_receipt_algorithms(wiki, &ready.snapshot, data_dir, &candidate_dir);
+    let (families, ready_receipt_sha256) = match (reference, algorithms) {
+        (Ok(reference), Ok(algorithms)) => {
+            current_family_publication_proofs(reference, &algorithms)?
+        }
+        (Err(error), _) | (_, Err(error)) => {
+            warn!(
+                wiki,
+                path = %candidate_dir.display(),
+                error = %format!("{error:#}"),
+                "composing active publication proof from artifact receipts"
+            );
+            let families = artifact_backed_family_proofs(&candidate_dir, &ready.artifacts)?;
+            let (_, ready_receipt_sha256) =
+                storage::sha256_file(&candidate_dir.join("ready.json"))?;
+            (families, ready_receipt_sha256)
+        }
+    };
     let mut artifacts = BTreeMap::new();
     for artifact in ready.artifacts {
         let metric = prepared_metric_name(&artifact)?;
@@ -5311,7 +5314,53 @@ mod tests {
         let candidate_dir = ready_path
             .parent()
             .context("legacy ready receipt should have a candidate directory")?;
+
+        fs::remove_dir_all(fixture.output.path().join("nlwiki"))?;
+        std::os::unix::fs::symlink(
+            candidate_dir
+                .join("nlwiki")
+                .strip_prefix(fixture.output.path())?,
+            fixture.output.path().join("nlwiki"),
+        )
+        .expect("current candidate symlink should be installed");
+
+        let registry = load_lifecycle(&fixture.lifecycle_path)?;
+        let current_proof = current_wiki_publication_proof(
+            fixture.data.path(),
+            fixture.output.path(),
+            &registry,
+            "nlwiki",
+        )
+        .expect("current family receipts should produce a publication proof");
+        assert_eq!(current_proof.families.len(), 5);
+
         let mut legacy: ReadyWikiCandidate = read_json(&ready_path)?;
+        let current_reference = ready_candidate_reference(
+            fixture.data.path(),
+            fixture.output.path(),
+            candidate_dir,
+            &legacy,
+        )
+        .expect("current family receipts should produce a ready reference");
+        let mut incomplete_algorithms = crate::compute::family_receipt_algorithms(
+            "nlwiki",
+            &legacy.snapshot,
+            fixture.data.path(),
+            candidate_dir,
+        )
+        .expect("current family receipts should expose algorithm versions");
+        incomplete_algorithms.remove(crate::compute::MetricFamily::Monthly.name());
+        assert!(
+            current_family_publication_proofs(current_reference, &incomplete_algorithms)
+                .unwrap_err()
+                .to_string()
+                .contains("has no algorithm version")
+        );
+
+        let mut invalid_artifacts = legacy.artifacts.clone();
+        invalid_artifacts[0].receipt_sha256 = "0".repeat(64);
+        assert!(artifact_backed_family_proofs(candidate_dir, &invalid_artifacts).is_err());
+
         for artifact in &mut legacy.artifacts {
             artifact.receipt_identity.clear();
             artifact.receipt_sha256.clear();
@@ -5328,15 +5377,6 @@ mod tests {
         }
         let legacy_ready_bytes = fs::read(&ready_path)?;
 
-        fs::remove_dir_all(fixture.output.path().join("nlwiki"))?;
-        std::os::unix::fs::symlink(
-            candidate_dir
-                .join("nlwiki")
-                .strip_prefix(fixture.output.path())?,
-            fixture.output.path().join("nlwiki"),
-        )
-        .expect("legacy active candidate symlink should be installed");
-
         let reference =
             active_ready_reference(fixture.data.path(), fixture.output.path(), "nlwiki")?
                 .context("legacy active candidate should have an authenticated reference")?;
@@ -5346,7 +5386,7 @@ mod tests {
         let proof = current_wiki_publication_proof(
             fixture.data.path(),
             fixture.output.path(),
-            &load_lifecycle(&fixture.lifecycle_path)?,
+            &registry,
             "nlwiki",
         )
         .expect("legacy active candidate should produce a publication proof");
