@@ -1958,6 +1958,8 @@ fn discover_latest_ready_candidate(
         return Ok(None);
     }
     let mut candidates = Vec::new();
+    let mut invalid_candidates = 0_u64;
+    let mut last_error = None;
     for snapshot_entry in fs::read_dir(&root)? {
         let snapshot_dir = snapshot_entry?.path();
         if !snapshot_dir.is_dir() {
@@ -1969,13 +1971,34 @@ fn discover_latest_ready_candidate(
             if !ready_path.is_file() {
                 continue;
             }
-            let ready: ReadyWikiCandidate = read_json(&ready_path)?;
-            ensure!(ready.wiki == wiki, "ready candidate wiki mismatch");
-            validate_ready_candidate_metadata(data_dir, &candidate_dir, &ready)?;
-            reconcile_ready_generation_state(output_dir, &ready)?;
-            candidates.push((ready, candidate_dir));
+            let candidate = (|| -> Result<(ReadyWikiCandidate, PathBuf)> {
+                let ready: ReadyWikiCandidate = read_json(&ready_path)?;
+                ensure!(ready.wiki == wiki, "ready candidate wiki mismatch");
+                validate_ready_candidate_metadata(data_dir, &candidate_dir, &ready)?;
+                reconcile_ready_generation_state(output_dir, &ready)?;
+                ready_candidate_reference(data_dir, output_dir, &candidate_dir, &ready)?;
+                Ok((ready, candidate_dir.clone()))
+            })();
+            match candidate {
+                Ok(candidate) => candidates.push(candidate),
+                Err(error) => {
+                    invalid_candidates += 1;
+                    last_error = Some(format!("{error:#}"));
+                    warn!(
+                        wiki,
+                        path = %candidate_dir.display(),
+                        error = %format!("{error:#}"),
+                        "ignoring unauthenticated ready candidate during index recovery"
+                    );
+                }
+            }
         }
     }
+    ensure!(
+        !candidates.is_empty() || invalid_candidates == 0,
+        "no authenticated ready candidate found for {wiki}; rejected {invalid_candidates}: {}",
+        last_error.as_deref().unwrap_or("unknown candidate error")
+    );
     candidates.sort_by_key(|(ready, _)| {
         (
             ready.snapshot.clone(),
@@ -5326,6 +5349,14 @@ mod tests {
             "candidate-reusable",
         )
         .expect("candidate lifecycle should restart");
+        let invalid_ready = fixture.ready_candidate("zz-invalid")?;
+        let invalid_dir = invalid_ready
+            .parent()
+            .context("invalid candidate should have a directory")?;
+        let invalid_compute = invalid_dir.join("_stages/compute/monthly/nlwiki.json");
+        let mut invalid_receipt: Value = read_json(&invalid_compute)?;
+        invalid_receipt["algorithm_version"] = Value::String("superseded-algorithm".to_string());
+        atomic_json(&invalid_compute, &invalid_receipt)?;
         let ready_index = ready_index_path(fixture.output.path(), "nlwiki");
         fs::remove_file(&ready_index).expect("ready index should be removable");
         assert_eq!(
