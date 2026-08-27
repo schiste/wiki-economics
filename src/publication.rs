@@ -5175,7 +5175,8 @@ mod tests {
                 .join("nlwiki")
                 .strip_prefix(fixture.output.path())?,
             fixture.output.path().join("nlwiki"),
-        )?;
+        )
+        .expect("legacy active candidate symlink should be installed");
 
         let reference =
             active_ready_reference(fixture.data.path(), fixture.output.path(), "nlwiki")?
@@ -5188,7 +5189,8 @@ mod tests {
             fixture.output.path(),
             &load_lifecycle(&fixture.lifecycle_path)?,
             "nlwiki",
-        )?;
+        )
+        .expect("legacy active candidate should produce a publication proof");
         assert!(proof.artifacts.values().all(|artifact| {
             !artifact.receipt_identity.is_empty() && artifact.receipt_sha256.len() == 64
         }));
