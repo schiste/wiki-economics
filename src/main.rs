@@ -16,6 +16,7 @@ mod determinism;
 mod end_to_end_tests;
 mod fetch;
 mod fingerprint;
+mod fleet;
 mod generation_lifecycle;
 mod ingest;
 mod licensing;
@@ -207,6 +208,82 @@ enum Commands {
         /// Wiki lifecycle and publication contract
         #[arg(long, default_value = "config/wiki-lifecycle.json")]
         lifecycle: PathBuf,
+    },
+
+    /// Discover scheduled wikis and atomically enqueue independent preparation work
+    FleetDiscover {
+        /// Wiki lifecycle registry that defines the scheduled fleet
+        #[arg(long, default_value = "config/wiki-lifecycle.json")]
+        lifecycle: PathBuf,
+
+        /// NFS-backed fleet control-plane root
+        #[arg(long)]
+        queue_dir: PathBuf,
+
+        /// Deterministic snapshot override used by qualification and fixtures
+        #[arg(long)]
+        snapshot: Option<String>,
+    },
+
+    /// Claim one fleet task for a fixed resource-class worker
+    FleetClaim {
+        #[arg(long)]
+        queue_dir: PathBuf,
+
+        #[arg(long, value_enum)]
+        resource_class: fleet::ResourceClass,
+
+        #[arg(long)]
+        worker_id: String,
+
+        #[arg(long, default_value_t = 900)]
+        lease_timeout_secs: u64,
+
+        /// Atomic claim receipt consumed by heartbeats and completion
+        #[arg(long)]
+        receipt: PathBuf,
+    },
+
+    /// Refresh the heartbeat for a fleet task still owned by this worker
+    FleetHeartbeat {
+        #[arg(long)]
+        queue_dir: PathBuf,
+
+        #[arg(long)]
+        receipt: PathBuf,
+    },
+
+    /// Mark a claimed wiki ready after authenticating its ready-candidate index
+    FleetComplete {
+        #[arg(long)]
+        queue_dir: PathBuf,
+
+        #[arg(long)]
+        receipt: PathBuf,
+    },
+
+    /// Retry or quarantine one failed fleet task
+    FleetFail {
+        #[arg(long)]
+        queue_dir: PathBuf,
+
+        #[arg(long)]
+        receipt: PathBuf,
+
+        #[arg(long)]
+        error: String,
+
+        #[arg(long, default_value_t = 3)]
+        max_attempts: u32,
+    },
+
+    /// Recover expired fleet leases without claiming new work
+    FleetRecover {
+        #[arg(long)]
+        queue_dir: PathBuf,
+
+        #[arg(long, default_value_t = 3)]
+        max_attempts: u32,
     },
 
     /// Prepare and validate an isolated, permanently publication-ineligible wiki
@@ -1191,6 +1268,83 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
                     println!("{}", ready.display());
                 }
             }
+        }
+
+        Commands::FleetDiscover {
+            lifecycle,
+            queue_dir,
+            snapshot,
+        } => {
+            let controller_run_id = run_id
+                .as_deref()
+                .context("fleet discovery requires --run-id")?;
+            let wikis = fleet::scheduled_wikis(&lifecycle)?;
+            let overrides = fleet::lifecycle_resource_overrides(&lifecycle)?;
+            let mut report = fleet::DiscoveryReport::default();
+            for wiki in wikis {
+                let version = match snapshot.as_deref() {
+                    Some(version) => version.to_string(),
+                    None => run_timed_stage("fleet_snapshot_resolve", Some(&wiki), || {
+                        ops.resolve_snapshot(std::slice::from_ref(&wiki), Utc::now(), &data_dir)
+                    })?,
+                };
+                ops.persist_snapshot_plans(std::slice::from_ref(&wiki), &version, &data_dir)?;
+                let (plan, _) =
+                    snapshot_plan::SnapshotPlan::load_or_resolve(&data_dir, &wiki, &version)?;
+                let (resource_class, signals) =
+                    fleet::classify(&data_dir, &output_dir, &plan, overrides.get(&wiki).copied())?;
+                report.merge(fleet::enqueue(
+                    &queue_dir,
+                    &wiki,
+                    &version,
+                    resource_class,
+                    signals,
+                    controller_run_id,
+                )?);
+            }
+            println!("{}", serde_json::to_string(&report)?);
+        }
+
+        Commands::FleetClaim {
+            queue_dir,
+            resource_class,
+            worker_id,
+            lease_timeout_secs,
+            receipt,
+        } => match fleet::claim(&queue_dir, resource_class, &worker_id, lease_timeout_secs)? {
+            Some(claim) => {
+                fleet::write_claim_receipt(&receipt, &claim)?;
+                println!("{}", serde_json::to_string(&claim)?);
+            }
+            None => println!("{{\"claimed\":false}}"),
+        },
+
+        Commands::FleetHeartbeat { queue_dir, receipt } => {
+            let claim = fleet::heartbeat(&queue_dir, &receipt)?;
+            println!("{}", serde_json::to_string(&claim)?);
+        }
+
+        Commands::FleetComplete { queue_dir, receipt } => {
+            let notification = fleet::complete(&queue_dir, &receipt, &output_dir)?;
+            println!("{}", notification.display());
+        }
+
+        Commands::FleetFail {
+            queue_dir,
+            receipt,
+            error,
+            max_attempts,
+        } => {
+            let quarantined = fleet::fail(&queue_dir, &receipt, &error, max_attempts)?;
+            println!("{{\"quarantined\":{quarantined}}}");
+        }
+
+        Commands::FleetRecover {
+            queue_dir,
+            max_attempts,
+        } => {
+            let recovered = fleet::recover_stale(&queue_dir, max_attempts)?;
+            println!("{{\"recovered\":{recovered}}}");
         }
 
         Commands::QualifyWiki {

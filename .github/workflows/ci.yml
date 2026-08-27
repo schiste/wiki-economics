@@ -131,6 +131,7 @@ jobs:
           node --test deploy/toolforge/run-qualify-wiki.test.cjs
           node --test deploy/toolforge/rebuild-image.test.cjs
           node --test deploy/toolforge/load-scheduled-jobs.test.cjs
+          node --test deploy/toolforge/run-fleet-worker.test.cjs
           node --test deploy/toolforge/imported-backup.test.cjs
           node --test deploy/toolforge/recovery-operations.test.cjs
           node --test scripts/check-npm-advisories.test.cjs
@@ -148,11 +149,13 @@ jobs:
           node --test scripts/publish-browser-data.test.cjs
           node --test scripts/browser-performance.test.cjs
           node --test scripts/check-compute-versions.test.cjs
+          node --test scripts/check-fleet-qualification.test.cjs
           node --test site/browser-cache.test.mjs
           node --test site/activity-tiers.test.mjs
           node --test site/wiki-scope.test.mjs
           node --test scripts/wiki-lifecycle.test.cjs
           node --test scripts/wiki-econ-runtime.test.cjs
+          node scripts/check-fleet-qualification.cjs
 
       - name: Check helper CLI entrypoints
         run: |

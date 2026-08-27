@@ -60,6 +60,157 @@ fn stage_events(path: &Path) -> Vec<serde_json::Value> {
 }
 
 #[test]
+fn fleet_cli_discovers_claims_heartbeats_completes_and_recovers() {
+    let data_dir = TestDir::new().expect("temp data dir");
+    let output_dir = TestDir::new().expect("temp output dir");
+    let queue_dir = output_dir.path().join("_fleet");
+    let lifecycle = data_dir.path().join("lifecycle.json");
+    let receipt = data_dir.path().join("claim.json");
+    fs::write(
+        &lifecycle,
+        r#"{"schema_version":1,"wikis":{"testwiki":{"publication":"published","refresh":"scheduled"}}}"#,
+    )
+    .expect("lifecycle should be writable");
+
+    let base = || {
+        let mut command = instrumented_binary();
+        command
+            .arg("--data-dir")
+            .arg(data_dir.path())
+            .arg("--output-dir")
+            .arg(output_dir.path());
+        command
+    };
+    let discovered = base()
+        .arg("--run-id")
+        .arg("fleet-cli-test")
+        .arg("fleet-discover")
+        .arg("--lifecycle")
+        .arg(&lifecycle)
+        .arg("--queue-dir")
+        .arg(&queue_dir)
+        .arg("--snapshot")
+        .arg("2026-08")
+        .output()
+        .expect("fleet discovery should run");
+    assert!(
+        discovered.status.success(),
+        "{}",
+        String::from_utf8_lossy(&discovered.stderr)
+    );
+    assert!(queue_dir.join("pending/testwiki.json").is_file());
+
+    let claim = base()
+        .arg("fleet-claim")
+        .arg("--queue-dir")
+        .arg(&queue_dir)
+        .arg("--resource-class")
+        .arg("small")
+        .arg("--worker-id")
+        .arg("cli-worker")
+        .arg("--receipt")
+        .arg(&receipt)
+        .output()
+        .expect("fleet claim should run");
+    assert!(claim.status.success());
+    assert!(receipt.is_file());
+
+    let heartbeat = base()
+        .arg("fleet-heartbeat")
+        .arg("--queue-dir")
+        .arg(&queue_dir)
+        .arg("--receipt")
+        .arg(&receipt)
+        .output()
+        .expect("fleet heartbeat should run");
+    assert!(heartbeat.status.success());
+
+    fs::create_dir_all(output_dir.path().join("_ready-index"))
+        .expect("ready index directory should be writable");
+    fs::write(
+        output_dir.path().join("_ready-index/testwiki.json"),
+        r#"{"schema_version":1,"wiki":"testwiki","newest_valid_ready":{"snapshot":"2026-08"}}"#,
+    )
+    .expect("ready index should be writable");
+    let complete = base()
+        .arg("fleet-complete")
+        .arg("--queue-dir")
+        .arg(&queue_dir)
+        .arg("--receipt")
+        .arg(&receipt)
+        .output()
+        .expect("fleet completion should run");
+    assert!(
+        complete.status.success(),
+        "{}",
+        String::from_utf8_lossy(&complete.stderr)
+    );
+
+    let rediscovered = base()
+        .arg("--run-id")
+        .arg("fleet-cli-test-2")
+        .arg("fleet-discover")
+        .arg("--lifecycle")
+        .arg(&lifecycle)
+        .arg("--queue-dir")
+        .arg(&queue_dir)
+        .arg("--snapshot")
+        .arg("2026-09")
+        .output()
+        .expect("changed snapshot discovery should run");
+    assert!(rediscovered.status.success());
+    let retry_claim = base()
+        .arg("fleet-claim")
+        .arg("--queue-dir")
+        .arg(&queue_dir)
+        .arg("--resource-class")
+        .arg("small")
+        .arg("--worker-id")
+        .arg("retry-worker")
+        .arg("--receipt")
+        .arg(&receipt)
+        .output()
+        .expect("changed snapshot claim should run");
+    assert!(retry_claim.status.success());
+    let failed = base()
+        .arg("fleet-fail")
+        .arg("--queue-dir")
+        .arg(&queue_dir)
+        .arg("--receipt")
+        .arg(&receipt)
+        .arg("--error")
+        .arg("fixture failure")
+        .output()
+        .expect("fleet failure should run");
+    assert!(failed.status.success());
+
+    let recover = base()
+        .arg("fleet-recover")
+        .arg("--queue-dir")
+        .arg(&queue_dir)
+        .output()
+        .expect("fleet recovery should run");
+    assert!(recover.status.success());
+
+    let no_claim_receipt = data_dir.path().join("no-claim.json");
+    let no_claim = base()
+        .arg("fleet-claim")
+        .arg("--queue-dir")
+        .arg(&queue_dir)
+        .arg("--resource-class")
+        .arg("small")
+        .arg("--worker-id")
+        .arg("idle-worker")
+        .arg("--receipt")
+        .arg(&no_claim_receipt)
+        .output()
+        .expect("empty fleet claim should run");
+    assert!(no_claim.status.success());
+    assert!(!no_claim_receipt.exists());
+    assert!(String::from_utf8_lossy(&no_claim.stdout).contains("\"claimed\":false"));
+}
+
+#[test]
 fn binary_entrypoint_records_successful_and_failed_stage_events() {
     let data_dir = TestDir::new().expect("temp dir");
     let events = data_dir.path().join("run-events.jsonl");

@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "policy_version": "fleet-qualification-v1",
+  "current_production_wikis": ["elwiki", "frwiki", "itwiki", "nlwiki", "ptwiki", "svwiki"],
+  "stages": [
+    {
+      "step": 1,
+      "id": "local_deterministic_fixtures",
+      "state": "pending",
+      "resource_class": "small",
+      "publication_eligible": false,
+      "required_evidence": ["queue invariants", "worker-count byte equality", "failure recovery"]
+    },
+    {
+      "step": 2,
+      "id": "six_wiki_shadow",
+      "state": "pending",
+      "resource_class": "small",
+      "publication_eligible": false,
+      "required_evidence": ["unchanged public generation", "candidate receipt equality", "resource report"]
+    },
+    {
+      "step": 3,
+      "id": "hidden_medium_yearly",
+      "state": "pending",
+      "resource_class": "medium_large",
+      "publication_eligible": false,
+      "required_evidence": ["hidden lifecycle candidate", "25 percent memory headroom", "scratch reserve"]
+    },
+    {
+      "step": 4,
+      "id": "hidden_large_yearly",
+      "state": "pending",
+      "resource_class": "medium_large",
+      "publication_eligible": false,
+      "required_evidence": ["hidden lifecycle candidate", "25 percent memory headroom", "bounded writers"]
+    },
+    {
+      "step": 5,
+      "id": "frwiki_concurrent_fleet",
+      "state": "pending",
+      "resource_class": "medium_large",
+      "publication_eligible": false,
+      "required_evidence": ["independent wiki progress", "NFS throughput", "deterministic output"]
+    },
+    {
+      "step": 6,
+      "id": "enwiki_isolated",
+      "state": "pending",
+      "resource_class": "isolated",
+      "publication_eligible": false,
+      "required_evidence": ["capacity report", "25 percent memory headroom", "full recovery drill"]
+    },
+    {
+      "step": 7,
+      "id": "gradual_fleet_batches",
+      "state": "pending",
+      "resource_class": "mixed",
+      "publication_eligible": true,
+      "required_evidence": ["freshness SLO", "browser budget", "bounded retry and quarantine"]
+    }
+  ]
+}

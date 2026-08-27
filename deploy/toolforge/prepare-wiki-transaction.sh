@@ -32,13 +32,17 @@ finish_candidate() {
 trap finish_candidate EXIT
 trap 'failure_error="command failed: $BASH_COMMAND"' ERR
 
-selected_snapshot="$(
-  RUST_LOG=error "$WIKI_ECON_BIN" \
-    --data-dir "$WIKI_ECON_DATA_DIR" \
-    --output-dir "$WIKI_ECON_OUTPUT_DIR" \
-    --run-id "$WIKI_ECON_RUN_ID" \
-    snapshot-resolve "$wiki"
-)"
+if [ -n "${WIKI_ECON_PREPARE_SNAPSHOT:-}" ]; then
+  selected_snapshot="$WIKI_ECON_PREPARE_SNAPSHOT"
+else
+  selected_snapshot="$(
+    RUST_LOG=error "$WIKI_ECON_BIN" \
+      --data-dir "$WIKI_ECON_DATA_DIR" \
+      --output-dir "$WIKI_ECON_OUTPUT_DIR" \
+      --run-id "$WIKI_ECON_RUN_ID" \
+      snapshot-resolve "$wiki"
+  )"
+fi
 if [[ ! "$selected_snapshot" =~ ^[0-9]{4}-[0-9]{2}$ ]]; then
   echo "Snapshot resolver returned an invalid version: $selected_snapshot" >&2
   exit 1

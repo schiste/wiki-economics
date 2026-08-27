@@ -39,62 +39,40 @@
   mem: 6Gi
   cpu: "1"
 
-# Scheduled preparation is isolated per wiki. The weekly trigger discovers a
-# completed snapshot and is a recorded no-op when current/ready fingerprints
-# already cover it. These jobs never switch the published data or site, and
-# each holds only its own per-wiki lock.
-- name: wiki-econ-prepare-nlwiki
+# Fleet discovery represents every scheduled lifecycle entry in one atomic NFS
+# queue. Fixed workers claim independent wikis with leases and heartbeats; the
+# existing per-wiki preparation lock remains the final concurrency boundary.
+- name: wiki-econ-fleet-controller
   image: tool-wiki-economics/tool-wiki-economics:latest
-  command: deploy/toolforge/run-prepare-nlwiki.sh
+  command: deploy/toolforge/run-fleet-controller.sh
   schedule: "0 1 * * 0"
   filelog: true
   mount: all
-  mem: 6Gi
+  mem: 1Gi
   cpu: "1"
 
-- name: wiki-econ-prepare-ptwiki
+- name: wiki-econ-fleet-small-a
   image: tool-wiki-economics/tool-wiki-economics:latest
-  command: deploy/toolforge/run-prepare-ptwiki.sh
-  schedule: "10 1 * * 0"
+  command: deploy/toolforge/run-fleet-worker.sh small small-a --once
+  schedule: "5,35 * * * *"
   filelog: true
   mount: all
-  mem: 6Gi
+  mem: 2Gi
   cpu: "1"
 
-- name: wiki-econ-prepare-frwiki
+- name: wiki-econ-fleet-small-b
   image: tool-wiki-economics/tool-wiki-economics:latest
-  command: deploy/toolforge/run-prepare-frwiki.sh
-  schedule: "20 1 * * 0"
+  command: deploy/toolforge/run-fleet-worker.sh small small-b --once
+  schedule: "15,45 * * * *"
   filelog: true
   mount: all
-  mem: 6Gi
+  mem: 2Gi
   cpu: "1"
 
-# Newly promoted datasets are deliberately spread across separate UTC days.
-# This bounds shared NFS and download pressure and makes per-wiki performance
-# records attributable instead of overlapping the Sunday preparation window.
-- name: wiki-econ-prepare-itwiki
+- name: wiki-econ-fleet-medium
   image: tool-wiki-economics/tool-wiki-economics:latest
-  command: deploy/toolforge/run-prepare-itwiki.sh
-  schedule: "0 1 * * 1"
-  filelog: true
-  mount: all
-  mem: 6Gi
-  cpu: "1"
-
-- name: wiki-econ-prepare-svwiki
-  image: tool-wiki-economics/tool-wiki-economics:latest
-  command: deploy/toolforge/run-prepare-svwiki.sh
-  schedule: "0 1 * * 2"
-  filelog: true
-  mount: all
-  mem: 6Gi
-  cpu: "1"
-
-- name: wiki-econ-prepare-elwiki
-  image: tool-wiki-economics/tool-wiki-economics:latest
-  command: deploy/toolforge/run-prepare-elwiki.sh
-  schedule: "0 1 * * 3"
+  command: deploy/toolforge/run-fleet-worker.sh medium_large medium-1 --once
+  schedule: "25,55 * * * *"
   filelog: true
   mount: all
   mem: 6Gi

@@ -9,6 +9,19 @@ const {test} = require("node:test");
 
 const script = path.join(__dirname, "load-scheduled-jobs.sh");
 
+test("fleet capacity uses a fixed controller and worker pool", () => {
+  const manifest = fs.readFileSync(path.join(__dirname, "jobs.yaml"), "utf8");
+  const fleetJobs = [...manifest.matchAll(/^- name: (wiki-econ-fleet-[a-z-]+)$/gm)]
+    .map((match) => match[1]);
+  assert.deepEqual(fleetJobs, [
+    "wiki-econ-fleet-controller",
+    "wiki-econ-fleet-small-a",
+    "wiki-econ-fleet-small-b",
+    "wiki-econ-fleet-medium",
+  ]);
+  assert.doesNotMatch(manifest, /^- name: wiki-econ-prepare-/m);
+});
+
 test("normal job loading allowlists schedules and removes one-off definitions", () => {
   const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-jobs-load-"));
   try {
@@ -32,16 +45,18 @@ esac
     const invocations = fs.readFileSync(calls, "utf8").trim().split("\n");
     const loaded = invocations.filter((call) => call.startsWith("jobs load --job "));
     assert.deepEqual(loaded, [
-      `jobs load --job wiki-econ-prepare-nlwiki ${manifest}`,
-      `jobs load --job wiki-econ-prepare-ptwiki ${manifest}`,
-      `jobs load --job wiki-econ-prepare-frwiki ${manifest}`,
-      `jobs load --job wiki-econ-prepare-itwiki ${manifest}`,
-      `jobs load --job wiki-econ-prepare-svwiki ${manifest}`,
-      `jobs load --job wiki-econ-prepare-elwiki ${manifest}`,
+      `jobs load --job wiki-econ-fleet-controller ${manifest}`,
+      `jobs load --job wiki-econ-fleet-small-a ${manifest}`,
+      `jobs load --job wiki-econ-fleet-small-b ${manifest}`,
+      `jobs load --job wiki-econ-fleet-medium ${manifest}`,
       `jobs load --job wiki-econ-publish-ready ${manifest}`,
       `jobs load --job wiki-econ-artifact-scrub ${manifest}`,
     ]);
-    for (const name of ["wiki-econ-refresh", "wiki-econ-ingest", "wiki-econ-compute", "wiki-econ-site"]) {
+    for (const name of [
+      "wiki-econ-prepare-nlwiki", "wiki-econ-prepare-ptwiki", "wiki-econ-prepare-frwiki",
+      "wiki-econ-prepare-itwiki", "wiki-econ-prepare-svwiki", "wiki-econ-prepare-elwiki",
+      "wiki-econ-refresh", "wiki-econ-ingest", "wiki-econ-compute", "wiki-econ-site",
+    ]) {
       assert.ok(invocations.includes(`jobs delete ${name}`));
       assert.ok(!loaded.some((call) => call.includes(name)));
     }

@@ -15,16 +15,20 @@ MANIFEST="${1:-$ROOT/deploy/toolforge/jobs.yaml}"
 }
 
 scheduled_jobs=(
+  wiki-econ-fleet-controller
+  wiki-econ-fleet-small-a
+  wiki-econ-fleet-small-b
+  wiki-econ-fleet-medium
+  wiki-econ-publish-ready
+  wiki-econ-artifact-scrub
+)
+on_demand_jobs=(
   wiki-econ-prepare-nlwiki
   wiki-econ-prepare-ptwiki
   wiki-econ-prepare-frwiki
   wiki-econ-prepare-itwiki
   wiki-econ-prepare-svwiki
   wiki-econ-prepare-elwiki
-  wiki-econ-publish-ready
-  wiki-econ-artifact-scrub
-)
-on_demand_jobs=(
   wiki-econ-refresh
   wiki-econ-ingest
   wiki-econ-compute

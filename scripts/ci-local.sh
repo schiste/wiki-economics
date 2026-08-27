@@ -78,6 +78,7 @@ node --test deploy/toolforge/run-capacity-benchmark.test.cjs
 node --test deploy/toolforge/run-qualify-wiki.test.cjs
 node --test deploy/toolforge/rebuild-image.test.cjs
 node --test deploy/toolforge/load-scheduled-jobs.test.cjs
+node --test deploy/toolforge/run-fleet-worker.test.cjs
 node --test deploy/toolforge/imported-backup.test.cjs
 node --test deploy/toolforge/recovery-operations.test.cjs
 
@@ -105,6 +106,7 @@ node --test scripts/verify-site-reproducibility.test.cjs
 node --test scripts/publish-browser-data.test.cjs
 node --test scripts/browser-performance.test.cjs
 node --test scripts/check-compute-versions.test.cjs
+node --test scripts/check-fleet-qualification.test.cjs
 node --test site/browser-cache.test.mjs
 node --test site/activity-tiers.test.mjs
 node --test site/wiki-scope.test.mjs
@@ -165,6 +167,9 @@ node scripts/check-npm-advisories.cjs
 
 echo "==> node scripts/check-npm-licenses.cjs"
 node scripts/check-npm-licenses.cjs
+
+echo "==> node scripts/check-fleet-qualification.cjs"
+node scripts/check-fleet-qualification.cjs
 
 echo "==> scripts/check_vendor_patches.sh"
 scripts/check_vendor_patches.sh

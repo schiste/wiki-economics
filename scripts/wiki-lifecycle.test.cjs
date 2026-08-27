@@ -147,6 +147,7 @@ test("registry validation rejects invalid lifecycle states and metadata", () => 
     [{ schema_version: 1, wikis: { nlwiki: { publication: "published", refresh: "paused", provenance: "x", imported_cutoff: "2026-13" } }, ...contract }, /YYYY-MM/],
     [{ schema_version: 1, wikis: { nlwiki: { publication: "published", refresh: "paused", provenance: "x", freshness_sla_days: 0 } }, ...contract }, /positive integer/],
     [{ schema_version: 1, wikis: { nlwiki: { publication: "published", refresh: "scheduled", provenance: "x" } }, ...contract }, /no freshness_sla_days/],
+    [{ schema_version: 1, wikis: { nlwiki: { publication: "published", refresh: "paused", provenance: "x", fleet_resource_class: "huge" } }, ...contract }, /fleet_resource_class/],
   ];
   for (const [registry, expected] of invalid) {
     assert.throws(() => validateWikiLifecycle(registry, "fixture"), expected);

@@ -8,6 +8,7 @@ const REFRESH_STATES = new Set(["scheduled", "manual", "paused", "qualification"
 const WIKI_NAME = /^[a-z0-9_]+wiki$/;
 const YEAR_MONTH = /^\d{4}-(0[1-9]|1[0-2])$/;
 const DATASET_NAME = /^[a-z][a-z0-9_]*$/;
+const FLEET_RESOURCE_CLASSES = new Set(["small", "medium_large", "isolated"]);
 
 function lifecyclePath(root = path.resolve(__dirname, ".."), env = process.env) {
   return path.resolve(env.WIKI_ECON_WIKI_LIFECYCLE_FILE || path.join(root, "config", "wiki-lifecycle.json"));
@@ -69,6 +70,10 @@ function validateWikiLifecycle(registry, label = "wiki lifecycle registry") {
     }
     if (entry.refresh === "scheduled" && entry.freshness_sla_days == null) {
       throw new Error(`${label}.wikis.${wiki} is scheduled but has no freshness_sla_days`);
+    }
+    if (entry.fleet_resource_class != null
+      && !FLEET_RESOURCE_CLASSES.has(entry.fleet_resource_class)) {
+      throw new Error(`${label}.wikis.${wiki}.fleet_resource_class is invalid`);
     }
   }
 
