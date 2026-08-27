@@ -5499,6 +5499,27 @@ mod tests {
     }
 
     #[test]
+    fn ready_index_recovery_fails_when_every_candidate_is_unauthenticated() {
+        let fixture = Fixture::new().expect("recovery fixture should initialize");
+        let ready_path = fixture
+            .ready_candidate("only-invalid")
+            .expect("invalid candidate fixture should write");
+        let candidate_dir = ready_path
+            .parent()
+            .expect("candidate ready receipt should have a parent");
+        let monthly_receipt = candidate_dir.join("_stages/compute/monthly/nlwiki.json");
+        let mut receipt: Value =
+            read_json(&monthly_receipt).expect("monthly receipt should be readable");
+        receipt["algorithm_version"] = Value::String("superseded-algorithm".to_string());
+        atomic_json(&monthly_receipt, &receipt).expect("monthly receipt should be corruptible");
+
+        let error =
+            discover_latest_ready_candidate(fixture.data.path(), fixture.output.path(), "nlwiki")
+                .expect_err("recovery must fail when every candidate is unauthenticated");
+        assert!(format!("{error:#}").contains("no authenticated ready candidate found"));
+    }
+
+    #[test]
     fn preparation_planner_adopts_fingerprinted_legacy_outputs() -> Result<()> {
         let fixture = Fixture::new()?;
         // Reuse the fixture helper to finish the selected input generation, then
