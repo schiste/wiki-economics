@@ -35,7 +35,14 @@ fi
 temporary_link="$app_root/.current.tmp.$$"
 trap 'rm -f "$temporary_link"' EXIT
 ln -s "releases/$release_sha" "$temporary_link"
-node -e 'require("node:fs").renameSync(process.argv[1], process.argv[2])' "$temporary_link" "$app_root/current"
+if command -v node >/dev/null 2>&1; then
+  node -e 'require("node:fs").renameSync(process.argv[1], process.argv[2])' "$temporary_link" "$app_root/current"
+elif command -v python3 >/dev/null 2>&1; then
+  python3 -c 'import os, sys; os.replace(sys.argv[1], sys.argv[2])' "$temporary_link" "$app_root/current"
+else
+  echo "Atomic rollback requires either node or python3" >&2
+  exit 1
+fi
 
 echo "Rolled back wiki-econ to $release_sha"
 echo "Restart the webservice so it picks up the selected release."

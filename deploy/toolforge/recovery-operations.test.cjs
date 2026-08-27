@@ -12,6 +12,7 @@ const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-recovery-op
 after(() => fs.rmSync(fixtureRoot, {recursive: true, force: true}));
 const recover = path.join(__dirname, "recover-stage.sh");
 const rollbackDrill = path.join(__dirname, "drill-binary-rollback.sh");
+const rollbackBinary = path.join(__dirname, "rollback-binary.sh");
 const rebuildDrill = path.join(__dirname, "run-rebuild-drill.sh");
 
 function executable(file, body) {
@@ -81,6 +82,34 @@ test("the rollback drill really switches binaries and restores the original rele
   assert.equal(report.succeeded, true);
   assert.equal(report.rollback_release, candidate);
   assert.equal(report.restored_release, original);
+});
+
+test("binary rollback remains atomic on a Node-free Toolforge bastion", () => {
+  const root = path.join(fixtureRoot, "rollback-without-node");
+  const app = path.join(root, "app");
+  const tools = path.join(root, "tools");
+  const original = "3".repeat(40);
+  const candidate = "4".repeat(40);
+  fs.mkdirSync(tools, {recursive: true});
+  for (const command of ["ln", "python3", "rm", "sha256sum"]) {
+    const resolved = spawnSync("/usr/bin/env", ["sh", "-c", `command -v ${command}`], {encoding: "utf8"});
+    assert.equal(resolved.status, 0, `missing test command ${command}`);
+    fs.symlinkSync(resolved.stdout.trim(), path.join(tools, command));
+  }
+  for (const sha of [original, candidate]) {
+    const directory = path.join(app, "releases", sha);
+    const binary = executable(path.join(directory, "wiki-econ"), '[ "$1" = "--help" ]');
+    const checksum = crypto.createHash("sha256").update(fs.readFileSync(binary)).digest("hex");
+    fs.writeFileSync(path.join(directory, "wiki-econ.sha256"), `${checksum}  wiki-econ\n`);
+  }
+  fs.symlinkSync(`releases/${original}`, path.join(app, "current"));
+
+  const result = spawnSync("/bin/bash", [rollbackBinary, candidate], {encoding: "utf8", env: {
+    WIKI_ECON_TOOLFORGE_APP_ROOT: app,
+    PATH: tools,
+  }});
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(fs.readlinkSync(path.join(app, "current")), `releases/${candidate}`);
 });
 
 test("the rebuild drill starts with only restored imports and keeps live paths untouched", () => {
