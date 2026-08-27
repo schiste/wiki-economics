@@ -1704,6 +1704,95 @@ fn prepared_metric_name(artifact: &PreparedArtifact) -> Result<String> {
         .context("prepared artifact has no UTF-8 metric name")
 }
 
+fn artifact_backed_family_proofs(
+    candidate_dir: &Path,
+    artifacts: &[PreparedArtifact],
+) -> Result<BTreeMap<String, FamilyPublicationProof>> {
+    let mut identities: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut algorithms: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for artifact in artifacts {
+        let metric = prepared_metric_name(artifact)?;
+        let family = publication_family_for_metric(&metric)?.to_string();
+        let path = candidate_dir.join(&artifact.path);
+        let document = artifact_receipt::verify(
+            &path,
+            &artifact.receipt_identity,
+            Some(&artifact.receipt_sha256),
+            artifact_receipt::VerificationMode::Fast,
+        )?;
+        identities
+            .entry(family.clone())
+            .or_default()
+            .push(artifact.receipt_sha256.clone());
+        algorithms
+            .entry(family)
+            .or_default()
+            .insert(document.receipt.algorithm_version);
+    }
+    identities
+        .into_iter()
+        .map(|(family, mut receipt_hashes)| {
+            receipt_hashes.sort();
+            let receipt_identity =
+                hex::encode(Sha256::digest(serde_json::to_vec(&receipt_hashes)?));
+            let algorithm_version = algorithms
+                .remove(&family)
+                .context("artifact-backed family algorithms are missing")?
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join("+");
+            Ok((
+                family,
+                FamilyPublicationProof {
+                    receipt_identity,
+                    algorithm_version,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn artifact_backed_ready_candidate_reference(
+    output_dir: &Path,
+    candidate_dir: &Path,
+    ready: &ReadyWikiCandidate,
+) -> Result<ReadyCandidateReference> {
+    let ready = authoritative_ready_candidate(candidate_dir, ready)?;
+    let proofs = artifact_backed_family_proofs(candidate_dir, &ready.artifacts)?;
+    let core_family_receipt_identities = crate::compute::MetricFamily::ALL
+        .into_iter()
+        .map(|family| {
+            let name = family.name().to_string();
+            let identity = proofs
+                .get(&name)
+                .with_context(|| format!("active candidate has no {name} artifact family"))?
+                .receipt_identity
+                .clone();
+            Ok((name, identity))
+        })
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    let patrol_receipt_identity = proofs
+        .get("patrol")
+        .context("active candidate has no patrol artifact family")?
+        .receipt_identity
+        .clone();
+    let candidate_relative = candidate_dir
+        .strip_prefix(output_dir)
+        .context("active candidate is outside the output directory")?
+        .to_string_lossy()
+        .into_owned();
+    let (_, ready_receipt_sha256) = storage::sha256_file(&candidate_dir.join("ready.json"))?;
+    Ok(ReadyCandidateReference {
+        candidate_relative,
+        snapshot: ready.snapshot,
+        run_id: ready.run_id,
+        core_family_receipt_identities,
+        patrol_receipt_identity,
+        workload_profile: ready.workload_profile,
+        ready_receipt_sha256,
+    })
+}
+
 fn legacy_wiki_publication_proof(
     data_dir: &Path,
     output_dir: &Path,
@@ -1786,33 +1875,54 @@ fn current_wiki_publication_proof(
             == Some(ready.snapshot.as_str()),
         "active candidate and snapshot pointer disagree for {wiki}"
     );
-    let reference = ready_candidate_reference(data_dir, output_dir, &candidate_dir, &ready)?;
-    let algorithms =
-        crate::compute::family_receipt_algorithms(wiki, &ready.snapshot, data_dir, &candidate_dir)?;
-    let mut families = reference
-        .core_family_receipt_identities
-        .into_iter()
-        .map(|(family, receipt_identity)| {
-            let algorithm_version = algorithms
-                .get(&family)
-                .cloned()
-                .with_context(|| format!("candidate family {family} has no algorithm version"))?;
-            Ok((
-                family,
-                FamilyPublicationProof {
-                    receipt_identity,
-                    algorithm_version,
-                },
-            ))
-        })
-        .collect::<Result<BTreeMap<_, _>>>()?;
-    families.insert(
-        "patrol".to_string(),
-        FamilyPublicationProof {
-            receipt_identity: reference.patrol_receipt_identity,
-            algorithm_version: crate::patrol::algorithm_version().to_string(),
-        },
-    );
+    let (families, ready_receipt_sha256) =
+        match ready_candidate_reference(data_dir, output_dir, &candidate_dir, &ready) {
+            Ok(reference) => {
+                let algorithms = crate::compute::family_receipt_algorithms(
+                    wiki,
+                    &ready.snapshot,
+                    data_dir,
+                    &candidate_dir,
+                )?;
+                let mut families = reference
+                    .core_family_receipt_identities
+                    .into_iter()
+                    .map(|(family, receipt_identity)| {
+                        let algorithm_version =
+                            algorithms.get(&family).cloned().with_context(|| {
+                                format!("candidate family {family} has no algorithm version")
+                            })?;
+                        Ok((
+                            family,
+                            FamilyPublicationProof {
+                                receipt_identity,
+                                algorithm_version,
+                            },
+                        ))
+                    })
+                    .collect::<Result<BTreeMap<_, _>>>()?;
+                families.insert(
+                    "patrol".to_string(),
+                    FamilyPublicationProof {
+                        receipt_identity: reference.patrol_receipt_identity,
+                        algorithm_version: crate::patrol::algorithm_version().to_string(),
+                    },
+                );
+                (families, reference.ready_receipt_sha256)
+            }
+            Err(error) => {
+                warn!(
+                    wiki,
+                    path = %candidate_dir.display(),
+                    error = %format!("{error:#}"),
+                    "composing active publication proof from artifact receipts"
+                );
+                let families = artifact_backed_family_proofs(&candidate_dir, &ready.artifacts)?;
+                let (_, ready_receipt_sha256) =
+                    storage::sha256_file(&candidate_dir.join("ready.json"))?;
+                (families, ready_receipt_sha256)
+            }
+        };
     let mut artifacts = BTreeMap::new();
     for artifact in ready.artifacts {
         let metric = prepared_metric_name(&artifact)?;
@@ -1830,7 +1940,7 @@ fn current_wiki_publication_proof(
         snapshot: ready.snapshot,
         candidate_run_id: ready.run_id,
         candidate_relative,
-        ready_receipt_sha256: reference.ready_receipt_sha256,
+        ready_receipt_sha256,
         families,
         artifacts,
     })
@@ -1929,7 +2039,18 @@ fn active_ready_reference(
     let candidate_dir = output_dir.join(relative);
     let ready: ReadyWikiCandidate = read_json(&candidate_dir.join("ready.json"))?;
     validate_ready_candidate_metadata(data_dir, &candidate_dir, &ready)?;
-    ready_candidate_reference(data_dir, output_dir, &candidate_dir, &ready).map(Some)
+    match ready_candidate_reference(data_dir, output_dir, &candidate_dir, &ready) {
+        Ok(reference) => Ok(Some(reference)),
+        Err(error) => {
+            warn!(
+                wiki,
+                path = %candidate_dir.display(),
+                error = %format!("{error:#}"),
+                "composing active ready reference from artifact receipts"
+            );
+            artifact_backed_ready_candidate_reference(output_dir, &candidate_dir, &ready).map(Some)
+        }
+    }
 }
 
 fn write_ready_index(
@@ -5196,6 +5317,15 @@ mod tests {
             artifact.receipt_sha256.clear();
         }
         atomic_json(&ready_path, &legacy)?;
+        for family in crate::compute::MetricFamily::ALL {
+            fs::remove_file(
+                candidate_dir
+                    .join("_stages/compute")
+                    .join(family.name())
+                    .join("nlwiki.json"),
+            )
+            .expect("legacy active candidate family receipt should be removable");
+        }
         let legacy_ready_bytes = fs::read(&ready_path)?;
 
         fs::remove_dir_all(fixture.output.path().join("nlwiki"))?;
