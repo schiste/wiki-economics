@@ -155,6 +155,7 @@ pub(super) fn compute(
 ) -> Result<()> {
     let generation = generation::load(data_dir, wiki, snapshot)?;
     let generation_root = generation::generation_dir(data_dir, wiki, snapshot)?;
+    let warehouse_generation = storage::read_generation_manifest(data_dir, wiki, snapshot)?;
     let recordable_run = limit_months.is_none();
     let fingerprinted_run = !rebuild && recordable_run;
     let inputs = patrol_stage_inputs(wiki, data_dir, Some(snapshot))?;
@@ -176,13 +177,37 @@ pub(super) fn compute(
     }
 
     clear_patrol_parts_dir(output_dir, wiki)?;
-    let revision_inventory =
-        crate::canonical_month::ensure_snapshot_inventory(data_dir, wiki, snapshot)?;
-    let revision_digests = revision_inventory
-        .identities
-        .iter()
-        .map(|identity| (identity.event_month.clone(), identity.digest.clone()))
-        .collect::<BTreeMap<_, _>>();
+    let all_revision_partitions = collect_partition_files_by_month(data_dir, wiki, Some(snapshot))?;
+    let (revision_digests, cache) = if warehouse_generation.schema_version == 3 {
+        let revision_inventory =
+            crate::canonical_month::ensure_snapshot_inventory(data_dir, wiki, snapshot)?;
+        let digests = revision_inventory
+            .identities
+            .iter()
+            .map(|identity| (identity.event_month.clone(), identity.digest.clone()))
+            .collect::<BTreeMap<_, _>>();
+        (
+            digests,
+            crate::cross_snapshot::CrossSnapshotCache::new(data_dir, wiki, snapshot)?,
+        )
+    } else {
+        warn!(
+            wiki,
+            snapshot,
+            generation_schema = warehouse_generation.schema_version,
+            "using snapshot-scoped patrol recovery for a pre-compaction generation"
+        );
+        (
+            patrol_try!(snapshot_scoped_revision_digests(
+                data_dir,
+                wiki,
+                snapshot,
+                &warehouse_generation,
+                &all_revision_partitions,
+            )),
+            crate::cross_snapshot::CrossSnapshotCache::snapshot_scoped(data_dir, wiki, snapshot)?,
+        )
+    };
     let patrol_artifacts = generation
         .patrol_months
         .iter()
@@ -220,8 +245,6 @@ pub(super) fn compute(
         )
         .cloned()
         .collect::<BTreeSet<_>>();
-    let cache = crate::cross_snapshot::CrossSnapshotCache::new(data_dir, wiki, snapshot)?;
-    let all_revision_partitions = collect_partition_files_by_month(data_dir, wiki, Some(snapshot))?;
     let all_revision_files = all_revision_partitions
         .values()
         .flatten()
@@ -390,6 +413,50 @@ pub(super) fn compute(
         "completed bounded generation-aware patrol computation"
     );
     Ok(())
+}
+
+fn snapshot_scoped_revision_digests(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot: &str,
+    manifest: &storage::GenerationManifest,
+    partitions: &BTreeMap<i32, Vec<PathBuf>>,
+) -> Result<BTreeMap<String, String>> {
+    let fragments = manifest
+        .fragments
+        .iter()
+        .map(|fragment| (data_dir.join(&fragment.path), fragment))
+        .collect::<BTreeMap<_, _>>();
+
+    partitions
+        .iter()
+        .map(|(month_key, files)| {
+            let month = format_year_month(*month_key);
+            let mut digest = Sha256::new();
+            digest.update(b"wiki-economics\0patrol-snapshot-scoped-revision-month\0v1\0");
+            for value in [wiki, snapshot, month.as_str()] {
+                digest.update((value.len() as u64).to_be_bytes());
+                digest.update(value.as_bytes());
+            }
+            digest.update(manifest.schema_version.to_be_bytes());
+            let mut files = files.clone();
+            files.sort();
+            for file in files {
+                let fragment = patrol_try!(fragments.get(&file).with_context(|| {
+                    format!(
+                        "revision partition is absent from the generation manifest: {}",
+                        file.display()
+                    )
+                }));
+                for value in [fragment.source_id.as_str(), fragment.sha256.as_str()] {
+                    digest.update((value.len() as u64).to_be_bytes());
+                    digest.update(value.as_bytes());
+                }
+                digest.update(fragment.rows.to_be_bytes());
+            }
+            Ok((month, hex::encode(digest.finalize())))
+        })
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -959,6 +1026,31 @@ mod tests {
 
     fn cache(root: &Path, wiki: &str) -> crate::cross_snapshot::CrossSnapshotCache {
         crate::cross_snapshot::CrossSnapshotCache::for_test(root, wiki, Vec::<MonthIdentity>::new())
+    }
+
+    #[test]
+    fn snapshot_scoped_revision_digests_reject_an_unlisted_partition() -> Result<()> {
+        let root = TestDir::new()?;
+        let manifest = storage::GenerationManifest {
+            schema_version: 2,
+            wiki: "legacywiki".to_string(),
+            snapshot_version: "2026-08".to_string(),
+            source_plan_sha256: "0".repeat(64),
+            compaction_manifest_path: None,
+            compaction_manifest_sha256: None,
+            fragments: Vec::new(),
+        };
+        let missing = root.path().join("unlisted.parquet");
+        let error = snapshot_scoped_revision_digests(
+            root.path(),
+            "legacywiki",
+            "2026-08",
+            &manifest,
+            &BTreeMap::from([(202_608, vec![missing.clone()])]),
+        )
+        .expect_err("an unlisted revision fragment must fail closed");
+        assert!(error.to_string().contains(&missing.display().to_string()));
+        Ok(())
     }
 
     fn write_rights(path: &Path, rows: &[(&str, &str, &str, &str)]) -> Result<()> {

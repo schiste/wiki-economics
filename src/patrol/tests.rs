@@ -1299,6 +1299,63 @@ editor</params></logitem>
 }
 
 #[test]
+fn schema2_history_generation_uses_snapshot_scoped_patrol_recovery() -> Result<()> {
+    init_test_tracing();
+    let root = TestDir::new()?;
+    let data_dir = root.path().join("data");
+    let wiki = "patrolschema2wiki";
+    let snapshot = "2026-08";
+    let template = write_revision_partition(
+        &data_dir,
+        wiki,
+        "2026-02",
+        &[(
+            Some(501),
+            Some("2026-02-01 00:00:00"),
+            Some("Editor"),
+            Some(0),
+            None,
+            false,
+            false,
+        )],
+    )?;
+    let plan = crate::snapshot_plan::SnapshotPlan::load_or_resolve(&data_dir, wiki, snapshot)?.0;
+    let source_id = &plan.sources.first().context("snapshot source")?.source_id;
+    let metric_root = storage::snapshot_metric_input_wiki_dir(&data_dir, wiki, snapshot)?;
+    let metric_file = storage::month_partition_dir(&metric_root, 2026, "2026-02")
+        .join(format!("{source_id}.part-00000.parquet"));
+    metric_file.parent().map(fs::create_dir_all).transpose()?;
+    fs::copy(template, metric_file)?;
+    storage::write_test_generation_manifest_from_files(&data_dir, wiki, snapshot)?;
+    assert_eq!(
+        storage::read_generation_manifest(&data_dir, wiki, snapshot)?.schema_version,
+        2
+    );
+
+    let logging_xml = r#"<mediawiki>
+<logitem><id>1</id><timestamp>2026-02-02T00:00:00Z</timestamp><contributor><username>Patroller</username><id>2</id></contributor><type>patrol</type><logtitle>Page</logtitle><params>501
+500
+0</params></logitem>
+</mediawiki>"#;
+    let transport = FakePatrolTransport::new(
+        vec![gzip_bytes(logging_xml)?],
+        vec![json!({"query": {"usergroups": []}})],
+    );
+    generation::fetch(&transport, wiki, snapshot, &data_dir)?;
+
+    let output = root.path().join("output");
+    compute_patrol_for_snapshot(wiki, snapshot, &data_dir, &output, false, None)?;
+    let patrol = read_parquet_df(&output.join(wiki).join("patrol.parquet"), None)?;
+    assert!(patrol.height() > 0);
+    assert_eq!(patrol.column("patrolled_revisions")?.i64()?.sum(), Some(1));
+    assert!(
+        !crate::canonical_month::inventory_path(&data_dir, wiki, snapshot)?.exists(),
+        "schema-v2 recovery must not claim canonical cross-snapshot identities"
+    );
+    Ok(())
+}
+
+#[test]
 fn incremental_patrol_restores_and_authenticates_rights_checkpoints() -> Result<()> {
     let root = TestDir::new()?;
     let data_dir = root.path().join("data");

@@ -99,6 +99,25 @@ impl CrossSnapshotCache {
         })
     }
 
+    /// Construct a cache namespace for a legacy generation whose month
+    /// identities are valid only inside one snapshot. Callers must include the
+    /// snapshot in every derived input digest; this deliberately permits
+    /// same-snapshot recovery without claiming cross-snapshot equivalence.
+    pub(crate) fn snapshot_scoped(data_dir: &Path, wiki: &str, snapshot: &str) -> Result<Self> {
+        storage::validate_snapshot_version(snapshot)?;
+        Ok(Self {
+            wiki: wiki.to_string(),
+            root: data_dir
+                .join("incremental")
+                .join("metric-cache")
+                .join(wiki)
+                .join("_snapshot-scoped")
+                .join(snapshot),
+            months: BTreeMap::new(),
+            stats: RefCell::new(CacheStats::default()),
+        })
+    }
+
     pub(crate) fn month_digest(&self, event_month: &str) -> Result<&str> {
         self.months
             .get(event_month)
