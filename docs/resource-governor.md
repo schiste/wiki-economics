@@ -80,20 +80,23 @@ consumes an adaptive profile instead.
 
 At snapshot start Rust resolves one immutable
 `data/snapshots/<wiki>/<snapshot>/workload-profile.json`. Selection uses the
-canonical source plan's source count, the exact total compressed bytes obtained
-from strict markers or remote metadata, and the last validated generation's
-warehouse rows. It never branches on a wiki name.
+canonical source plan's source count, exact total compressed bytes obtained
+from strict markers or remote metadata, the last validated generation's rows
+and fragment count, historical memory and scratch peaks, and conservative
+observed throughput. Prior rows divided by the worst non-zero throughput
+estimate the next runtime. It never branches on a wiki name.
 
 | Profile | Preferred source workers | Primary buckets | Secondary buckets | Logical buckets |
 | --- | ---: | ---: | ---: | ---: |
 | `small` | 2 | 32 | 8 | 256 |
 | `large` | 3 | 64 | 32 | 2,048 |
 
-`small` is selected only at or below 64 GiB compressed, 64 sources, and five
-billion prior measured rows. Exceeding any boundary selects `large`. Missing
-source sizes fail closed. A missing prior row measurement is allowed for a
-first generation because the source inventory and compressed bytes still bound
-the decision.
+`small` is selected only at or below 64 GiB compressed, 64 sources, five
+billion prior measured rows, 2,048 fragments, 4.5 GB historical memory, 8 GiB
+historical scratch, and a six-hour throughput-derived runtime. Exceeding any
+known boundary selects `large`. Missing source sizes fail closed. A missing
+historical measurement is allowed for a first generation because the source
+inventory and compressed bytes still bound the decision.
 
 Preferred source workers are capped by `WIKI_ECON_SOURCE_WORKERS` and the
 source window. Production checks the resulting concurrency and logical bucket

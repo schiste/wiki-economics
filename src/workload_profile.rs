@@ -9,14 +9,21 @@ use std::path::{Path, PathBuf};
 use crate::snapshot_plan::SnapshotPlan;
 use crate::storage::{self, GenerationLayer};
 
-const PROFILE_SCHEMA_VERSION: u32 = 1;
-const SELECTION_ALGORITHM_VERSION: &str = "adaptive-workload-profile-v1";
+const PROFILE_SCHEMA_VERSION: u32 = 2;
+const LEGACY_PROFILE_SCHEMA_VERSION: u32 = 1;
+const SELECTION_ALGORITHM_VERSION: &str = "adaptive-workload-profile-v2-measured";
+const LEGACY_SELECTION_ALGORITHM_VERSION: &str = "adaptive-workload-profile-v1";
 const PROFILE_OVERRIDE_ENV: &str = "WIKI_ECON_WORKLOAD_PROFILE";
 const REQUIRE_QUALIFIED_ENV: &str = "WIKI_ECON_REQUIRE_QUALIFIED_PROFILE";
 const SMALL_MAX_COMPRESSED_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const SMALL_MAX_SOURCE_COUNT: usize = 64;
 const SMALL_MAX_PRIOR_ROWS: u64 = 5_000_000_000;
+const SMALL_MAX_FRAGMENT_COUNT: u64 = 2_048;
+const SMALL_MAX_HISTORICAL_MEMORY_BYTES: u64 = 4_500_000_000;
+const SMALL_MAX_HISTORICAL_SCRATCH_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+const SMALL_MAX_ESTIMATED_RUNTIME_SECS: u64 = 6 * 60 * 60;
 const CAPACITY_POLICY: &str = include_str!("../config/capacity-qualification.json");
+const OBSERVATIONS_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -74,6 +81,24 @@ pub(crate) struct WorkloadSignals {
     pub(crate) total_compressed_bytes: u64,
     pub(crate) source_count: usize,
     pub(crate) prior_measured_rows: Option<u64>,
+    #[serde(default)]
+    pub(crate) prior_fragment_count: Option<u64>,
+    #[serde(default)]
+    pub(crate) historical_peak_memory_bytes: Option<u64>,
+    #[serde(default)]
+    pub(crate) historical_peak_scratch_bytes: Option<u64>,
+    #[serde(default)]
+    pub(crate) observed_throughput_rows_per_second: Option<u64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkloadObservations {
+    pub(crate) schema_version: u32,
+    pub(crate) fragment_count: Option<u64>,
+    pub(crate) peak_memory_bytes: Option<u64>,
+    pub(crate) peak_scratch_bytes: Option<u64>,
+    pub(crate) throughput_rows_per_second: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -167,10 +192,15 @@ pub(crate) fn load_or_select(
     let wiki = plan.wiki.as_str();
     let snapshot = plan.snapshot.as_str();
     let prior_measured_rows = prior_measured_rows(data_dir, wiki, snapshot)?;
+    let observations = load_observations(data_dir, wiki)?;
     let signals = WorkloadSignals {
         total_compressed_bytes,
         source_count: plan.sources.len(),
         prior_measured_rows,
+        prior_fragment_count: observations.fragment_count,
+        historical_peak_memory_bytes: observations.peak_memory_bytes,
+        historical_peak_scratch_bytes: observations.peak_scratch_bytes,
+        observed_throughput_rows_per_second: observations.throughput_rows_per_second,
     };
     let override_name = env::var(PROFILE_OVERRIDE_ENV).ok();
     let (profile, selection_mode) = select_with_override(&signals, override_name.as_deref())?;
@@ -207,9 +237,28 @@ fn select_automatic(signals: &WorkloadSignals) -> WorkloadProfileName {
     let prior_rows_fit = signals
         .prior_measured_rows
         .is_none_or(|rows| rows <= SMALL_MAX_PRIOR_ROWS);
+    let estimated_runtime_fits = match (
+        signals.prior_measured_rows,
+        signals.observed_throughput_rows_per_second,
+    ) {
+        (Some(rows), Some(throughput)) if throughput > 0 => {
+            rows.div_ceil(throughput) <= SMALL_MAX_ESTIMATED_RUNTIME_SECS
+        }
+        _ => true,
+    };
     if signals.total_compressed_bytes <= SMALL_MAX_COMPRESSED_BYTES
         && signals.source_count <= SMALL_MAX_SOURCE_COUNT
         && prior_rows_fit
+        && estimated_runtime_fits
+        && signals
+            .prior_fragment_count
+            .is_none_or(|count| count <= SMALL_MAX_FRAGMENT_COUNT)
+        && signals
+            .historical_peak_memory_bytes
+            .is_none_or(|bytes| bytes <= SMALL_MAX_HISTORICAL_MEMORY_BYTES)
+        && signals
+            .historical_peak_scratch_bytes
+            .is_none_or(|bytes| bytes <= SMALL_MAX_HISTORICAL_SCRATCH_BYTES)
     {
         WorkloadProfileName::Small
     } else {
@@ -220,12 +269,18 @@ fn select_automatic(signals: &WorkloadSignals) -> WorkloadProfileName {
 impl WorkloadProfile {
     pub(crate) fn validate(&self, wiki: &str, snapshot: &str) -> Result<()> {
         ensure!(
-            self.schema_version == PROFILE_SCHEMA_VERSION,
+            matches!(
+                self.schema_version,
+                PROFILE_SCHEMA_VERSION | LEGACY_PROFILE_SCHEMA_VERSION
+            ),
             "unsupported workload profile schema {}",
             self.schema_version
         );
         ensure!(
-            self.selection_algorithm_version == SELECTION_ALGORITHM_VERSION,
+            (self.schema_version == PROFILE_SCHEMA_VERSION
+                && self.selection_algorithm_version == SELECTION_ALGORITHM_VERSION)
+                || (self.schema_version == LEGACY_PROFILE_SCHEMA_VERSION
+                    && self.selection_algorithm_version == LEGACY_SELECTION_ALGORITHM_VERSION),
             "unsupported workload profile selection algorithm"
         );
         ensure!(
@@ -244,7 +299,9 @@ impl WorkloadProfile {
             self.parameters == self.profile.parameters(),
             "workload profile parameters do not match the named profile"
         );
-        if self.selection_mode == ProfileSelectionMode::Automatic {
+        if self.selection_mode == ProfileSelectionMode::Automatic
+            && self.schema_version == PROFILE_SCHEMA_VERSION
+        {
             ensure!(
                 self.profile == select_automatic(&self.signals),
                 "automatic workload profile does not match its recorded sizing signals"
@@ -316,9 +373,76 @@ impl WorkloadProfile {
 
     pub(crate) fn algorithm_version(&self) -> Result<String> {
         Ok(format!(
-            "{SELECTION_ALGORITHM_VERSION}-{}",
+            "{}-{}",
+            self.selection_algorithm_version,
             self.profile.as_str()
         ))
+    }
+}
+
+pub(crate) fn record_observations(
+    data_dir: &Path,
+    wiki: &str,
+    incoming: WorkloadObservations,
+) -> Result<()> {
+    ensure!(
+        incoming.schema_version == OBSERVATIONS_SCHEMA_VERSION,
+        "unsupported workload observation schema"
+    );
+    let mut current = load_observations(data_dir, wiki)?;
+    current.fragment_count = maximum(current.fragment_count, incoming.fragment_count);
+    current.peak_memory_bytes = maximum(current.peak_memory_bytes, incoming.peak_memory_bytes);
+    current.peak_scratch_bytes = maximum(current.peak_scratch_bytes, incoming.peak_scratch_bytes);
+    current.throughput_rows_per_second = minimum_nonzero(
+        current.throughput_rows_per_second,
+        incoming.throughput_rows_per_second,
+    );
+    write_atomic_value(&observations_path(data_dir, wiki)?, &current)
+}
+
+fn observations_path(data_dir: &Path, wiki: &str) -> Result<PathBuf> {
+    ensure!(
+        !wiki.is_empty()
+            && wiki
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')),
+        "unsafe workload observation wiki"
+    );
+    Ok(data_dir
+        .join("workload-observations")
+        .join(format!("{wiki}.json")))
+}
+
+fn load_observations(data_dir: &Path, wiki: &str) -> Result<WorkloadObservations> {
+    let path = observations_path(data_dir, wiki)?;
+    if !path.is_file() {
+        return Ok(WorkloadObservations {
+            schema_version: OBSERVATIONS_SCHEMA_VERSION,
+            ..WorkloadObservations::default()
+        });
+    }
+    let observations: WorkloadObservations = serde_json::from_slice(&fs::read(&path)?)?;
+    ensure!(
+        observations.schema_version == OBSERVATIONS_SCHEMA_VERSION,
+        "unsupported workload observation schema"
+    );
+    Ok(observations)
+}
+
+fn maximum(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.max(right)),
+        (left, right) => left.or(right),
+    }
+}
+
+fn minimum_nonzero(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (
+        left.filter(|value| *value > 0),
+        right.filter(|value| *value > 0),
+    ) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (left, right) => left.or(right),
     }
 }
 
@@ -358,12 +482,16 @@ fn prior_measured_rows(data_dir: &Path, wiki: &str, snapshot: &str) -> Result<Op
 }
 
 fn write_atomic(path: &Path, profile: &WorkloadProfile) -> Result<()> {
+    write_atomic_value(path, profile)
+}
+
+fn write_atomic_value(path: &Path, value: &impl Serialize) -> Result<()> {
     let parent = path.parent().context("workload profile has no parent")?;
     fs::create_dir_all(parent)?;
     let temporary = parent.join(format!(".workload-profile.{}.tmp", std::process::id()));
     let result = (|| -> Result<()> {
         let mut file = File::create(&temporary)?;
-        serde_json::to_writer_pretty(&mut file, profile)?;
+        serde_json::to_writer_pretty(&mut file, value)?;
         file.write_all(b"\n")?;
         file.sync_all()?;
         fs::rename(&temporary, path)?;
@@ -386,6 +514,10 @@ mod tests {
             total_compressed_bytes: bytes,
             source_count: sources,
             prior_measured_rows: rows,
+            prior_fragment_count: None,
+            historical_peak_memory_bytes: None,
+            historical_peak_scratch_bytes: None,
+            observed_throughput_rows_per_second: None,
         }
     }
 
@@ -428,6 +560,77 @@ mod tests {
             select_automatic(&signals(1, 1, Some(SMALL_MAX_PRIOR_ROWS + 1))),
             WorkloadProfileName::Large
         );
+        let mut measured = signals(1, 1, Some(1));
+        measured.prior_fragment_count = Some(SMALL_MAX_FRAGMENT_COUNT + 1);
+        assert_eq!(select_automatic(&measured), WorkloadProfileName::Large);
+        measured.prior_fragment_count = Some(1);
+        measured.historical_peak_memory_bytes = Some(SMALL_MAX_HISTORICAL_MEMORY_BYTES + 1);
+        assert_eq!(select_automatic(&measured), WorkloadProfileName::Large);
+        measured.historical_peak_memory_bytes = Some(1);
+        measured.historical_peak_scratch_bytes = Some(SMALL_MAX_HISTORICAL_SCRATCH_BYTES + 1);
+        assert_eq!(select_automatic(&measured), WorkloadProfileName::Large);
+        measured.historical_peak_scratch_bytes = Some(1);
+        measured.prior_measured_rows = Some(1_000_000_000);
+        measured.observed_throughput_rows_per_second = Some(1_000);
+        assert_eq!(select_automatic(&measured), WorkloadProfileName::Large);
+    }
+
+    #[test]
+    fn measured_observations_merge_monotonically_and_seed_new_profiles() -> Result<()> {
+        let root = TestDir::new()?;
+        record_observations(
+            root.path(),
+            "testwiki",
+            WorkloadObservations {
+                schema_version: OBSERVATIONS_SCHEMA_VERSION,
+                fragment_count: Some(100),
+                peak_memory_bytes: Some(200),
+                peak_scratch_bytes: Some(300),
+                throughput_rows_per_second: Some(400),
+            },
+        )?;
+        record_observations(
+            root.path(),
+            "testwiki",
+            WorkloadObservations {
+                schema_version: OBSERVATIONS_SCHEMA_VERSION,
+                fragment_count: Some(50),
+                peak_memory_bytes: Some(250),
+                peak_scratch_bytes: None,
+                throughput_rows_per_second: Some(350),
+            },
+        )?;
+        let observed = load_observations(root.path(), "testwiki")?;
+        assert_eq!(observed.fragment_count, Some(100));
+        assert_eq!(observed.peak_memory_bytes, Some(250));
+        assert_eq!(observed.peak_scratch_bytes, Some(300));
+        assert_eq!(observed.throughput_rows_per_second, Some(350));
+
+        let plan = SnapshotPlan::resolve("testwiki", "2026-08")?;
+        let profile = load_or_select(root.path(), &plan, &[Some(42)])?;
+        assert_eq!(profile.signals.prior_fragment_count, Some(100));
+        assert_eq!(profile.signals.historical_peak_memory_bytes, Some(250));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_profiles_remain_readable_during_schema_two_rollout() -> Result<()> {
+        let root = TestDir::new()?;
+        let mut legacy = profile(
+            "testwiki",
+            WorkloadProfileName::Small,
+            ProfileSelectionMode::Automatic,
+        );
+        legacy.schema_version = LEGACY_PROFILE_SCHEMA_VERSION;
+        legacy.selection_algorithm_version = LEGACY_SELECTION_ALGORITHM_VERSION.to_string();
+        legacy.signals.prior_fragment_count = None;
+        legacy.signals.historical_peak_memory_bytes = None;
+        legacy.signals.historical_peak_scratch_bytes = None;
+        legacy.signals.observed_throughput_rows_per_second = None;
+        let path = profile_path(root.path(), "testwiki", "2026-08")?;
+        write_atomic(&path, &legacy)?;
+        assert_eq!(load(root.path(), "testwiki", "2026-08")?, Some(legacy));
+        Ok(())
     }
 
     #[test]
@@ -513,7 +716,7 @@ mod tests {
         assert!(
             selected
                 .algorithm_version()?
-                .contains("adaptive-workload-profile-v1-small")
+                .contains("adaptive-workload-profile-v2-measured-small")
         );
         selected.ensure_compute_qualified_with(false)?;
         selected.ensure_compute_qualified_with(true)?;
