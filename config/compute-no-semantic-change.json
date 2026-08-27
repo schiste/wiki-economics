@@ -18,6 +18,24 @@
       "paths": ["src/compute/mod.rs"],
       "reason": "Add governed page-week bucket workers and capacity telemetry without changing lifecycle metric semantics or bytes.",
       "base_commit": "c232c4342a856f76a1aad1875683a125b5ac72c3"
+    },
+    {
+      "family": "monthly",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Canonicalize only activity-tier output columns; monthly metric semantics and bytes are unchanged.",
+      "base_commit": "e32d88931892fd900f3d739293e45ad3a83b25ca"
+    },
+    {
+      "family": "lifecycle",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Canonicalize only activity-tier output columns; lifecycle metric semantics and bytes are unchanged.",
+      "base_commit": "e32d88931892fd900f3d739293e45ad3a83b25ca"
+    },
+    {
+      "family": "page_week",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Canonicalize only activity-tier output columns; page-week metric semantics and bytes are unchanged.",
+      "base_commit": "e32d88931892fd900f3d739293e45ad3a83b25ca"
     }
   ]
 }

@@ -1116,6 +1116,28 @@ fn activity_tier_labels(months: u32) -> [String; 5] {
     ]
 }
 
+const ACTIVITY_TIER_OUTPUT_COLUMNS: [&str; 13] = [
+    "year_month",
+    "period",
+    "period_start",
+    "period_end",
+    "period_type",
+    "period_months",
+    "user_type",
+    "activity_tier",
+    "tier_rank",
+    "editors",
+    "total_edits",
+    "net_bytes",
+    "gross_bytes",
+];
+
+fn canonicalize_activity_tier_columns(frame: &DataFrame) -> Result<DataFrame> {
+    frame
+        .select(ACTIVITY_TIER_OUTPUT_COLUMNS.iter().copied())
+        .map_err(Into::into)
+}
+
 fn gdp_activity_tiers_for_period(
     editor_months: &DataFrame,
     period: ActivityPeriod,
@@ -1229,7 +1251,8 @@ fn gdp_activity_tiers_for_period(
         frame.with_column(column)?;
     }
     frame.drop_in_place("period_key")?;
-    sort_frame(frame, ["period", "user_type", "tier_rank"])
+    let frame = sort_frame(frame, ["period", "user_type", "tier_rank"])?;
+    canonicalize_activity_tier_columns(&frame)
 }
 
 fn activity_tiers_all_periods(base: DataFrame) -> Result<DataFrame> {
@@ -3397,6 +3420,7 @@ fn write_monthly_outputs(
 fn write_activity_outputs(wiki: &str, output_dir: &Path, frames: Vec<DataFrame>) -> Result<()> {
     let mut output = concat_frames(frames)?;
     output = sort_frame(output, ["period", "user_type", "tier_rank"])?;
+    output = canonicalize_activity_tier_columns(&output)?;
     add_wiki_column(&mut output, wiki)?;
     write_output(&mut output, wiki, "gdp_activity_tiers", output_dir)
 }
@@ -4100,6 +4124,14 @@ mod tests {
         let user_ids = [1, 1, 1, 2, 2, 2];
         let frame = editor_months(&edits, &month_keys, &user_ids)?;
         let quarterly = gdp_activity_tiers_for_period(&frame, ActivityPeriod::Quarter)?;
+        assert_eq!(
+            quarterly
+                .get_column_names()
+                .iter()
+                .map(|name| name.as_str())
+                .collect::<Vec<_>>(),
+            ACTIVITY_TIER_OUTPUT_COLUMNS
+        );
         assert_eq!(quarterly.column("total_edits")?.u32()?.sum(), Some(597));
         assert_eq!(quarterly.column("editors")?.u32()?.sum(), Some(2));
         assert_eq!(quarterly.column("period")?.str()?.get(0), Some("2024-Q1"));
@@ -4184,6 +4216,16 @@ mod tests {
             .join(wiki)
             .join("gdp_activity_tiers.parquet");
         let tiers = ParquetReader::new(File::open(tiers_path)?).finish()?;
+        let mut expected_columns = ACTIVITY_TIER_OUTPUT_COLUMNS.to_vec();
+        expected_columns.push("wiki");
+        assert_eq!(
+            tiers
+                .get_column_names()
+                .iter()
+                .map(|name| name.as_str())
+                .collect::<Vec<_>>(),
+            expected_columns
+        );
         assert!(
             tiers
                 .column("period")?
