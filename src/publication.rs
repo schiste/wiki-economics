@@ -1550,6 +1550,12 @@ pub(crate) fn plan_wiki_preparation(
         let patrol =
             crate::patrol::reusable_candidate_files(wiki, snapshot, data_dir, candidate_dir)?;
         if compute.len() == crate::compute::MetricFamily::ALL.len() && patrol.is_some() {
+            let indexed = indexed_latest_ready_candidate(data_dir, output_dir, wiki)?
+                .context("unchanged candidate has no recoverable ready index")?;
+            ensure!(
+                indexed.0.snapshot == snapshot && indexed.1 == *candidate_dir,
+                "unchanged candidate is not the newest indexed ready candidate"
+            );
             let ready_path = candidate_dir.join("ready.json");
             info!(wiki, snapshot, path = %ready_path.display(), "snapshot candidate fingerprints are unchanged");
             return Ok(WikiPreparationPlan::NoOp { ready_path });
@@ -5320,6 +5326,8 @@ mod tests {
             "candidate-reusable",
         )
         .expect("candidate lifecycle should restart");
+        let ready_index = ready_index_path(fixture.output.path(), "nlwiki");
+        fs::remove_file(&ready_index).expect("ready index should be removable");
         assert_eq!(
             plan_wiki_preparation(
                 fixture.data.path(),
@@ -5330,6 +5338,22 @@ mod tests {
             )
             .expect("unchanged snapshot should be reusable"),
             WikiPreparationPlan::NoOp { ready_path: ready }
+        );
+        let repaired: ReadyCandidateIndex =
+            read_json(&ready_index).expect("no-op discovery should repair the ready index");
+        assert_eq!(repaired.newest_valid_ready.run_id, "candidate-reusable");
+        assert!(
+            repaired
+                .newest_valid_ready
+                .core_family_receipt_identities
+                .values()
+                .all(|identity| !identity.is_empty())
+        );
+        assert!(
+            !repaired
+                .newest_valid_ready
+                .patrol_receipt_identity
+                .is_empty()
         );
 
         let source = wiki_candidate_dir(
