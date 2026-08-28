@@ -72,6 +72,7 @@ node --test deploy/toolforge/prune-releases.test.cjs
 
 echo "==> node --test deploy/toolforge/install-binary.test.cjs"
 node --test deploy/toolforge/install-binary.test.cjs
+node --test deploy/toolforge/download-release.test.cjs
 
 echo "==> node --test deploy/toolforge/run-capacity-benchmark.test.cjs"
 node --test deploy/toolforge/run-capacity-benchmark.test.cjs

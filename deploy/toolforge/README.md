@@ -382,17 +382,22 @@ commit from an operator workstation:
 
 ```sh
 release_sha=$(git rev-parse origin/main)
-run_id=$(gh run list --repo schiste/wiki-economics --commit "$release_sha" \
-  --workflow CI --limit 1 --json databaseId --jq '.[0].databaseId')
 release_dir=$(mktemp -d)
-gh run download "$run_id" --repo schiste/wiki-economics \
-  --name "wiki-econ-linux-x86_64-$release_sha" --dir "$release_dir"
+deploy/toolforge/download-release.sh "$release_sha" "$release_dir"
 TOOLFORGE_SSH_TARGET=login.toolforge.org \
   deploy/toolforge/deploy-binary.sh \
     "$release_dir/wiki-econ-release-$release_sha.tar.gz" \
     "$release_sha" \
     "$release_dir/wiki-econ-release-$release_sha.tar.gz.sha256"
 ```
+
+The downloader requires a successful completed CI run whose `headSha` is the
+requested commit. It discovers the archive through its strict `.sha256`
+manifest and normalizes it into `release_dir`, so deployment does not depend
+on the directory prefixes GitHub chooses while extracting a multi-root
+artifact. Duplicate manifests, a missing declared archive, or a hash mismatch
+fail before deployment begins. Pass a known workflow run ID as the optional
+third argument when reproducing a specific run.
 
 If online Sigstore root or attestation discovery is unavailable, download the
 GitHub attestation bundle while the operator has network access and pass it as
