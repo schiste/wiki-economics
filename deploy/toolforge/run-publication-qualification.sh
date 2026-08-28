@@ -161,7 +161,10 @@ if [ "${#overlay_metrics[@]}" -gt 0 ]; then
     artifact_path="$wiki/$metric"
     baseline_artifact="$isolated_output/$baseline_relative/$artifact_path"
     current_artifact="$isolated_output/$current_relative/$artifact_path"
-    [ -f "$baseline_artifact" ] && [ -f "$current_artifact" ] || {
+    baseline_receipt="$baseline_artifact.receipt.json"
+    current_receipt="$current_artifact.receipt.json"
+    [ -f "$baseline_artifact" ] && [ -f "$current_artifact" ] \
+      && [ -f "$baseline_receipt" ] && [ -f "$current_receipt" ] || {
       echo "Compatibility overlay artifact is missing: $artifact_path" >&2
       exit 1
     }
@@ -174,6 +177,8 @@ if [ "${#overlay_metrics[@]}" -gt 0 ]; then
     mv "$ready_overlay.next" "$ready_overlay"
     rm -- "$baseline_artifact"
     ln "$current_artifact" "$baseline_artifact"
+    rm -- "$baseline_receipt"
+    ln "$current_receipt" "$baseline_receipt"
   done
   mv "$ready_overlay" "$baseline_ready_isolated"
 fi

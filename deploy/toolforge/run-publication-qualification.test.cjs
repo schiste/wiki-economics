@@ -29,6 +29,7 @@ test("changed-one-wiki qualification is isolated, measured, and self-cleaning", 
       fs.mkdirSync(path.join(candidate, wiki), {recursive: true});
       const contents = runId === baseline ? "old-schema" : "current-schema";
       fs.writeFileSync(path.join(candidate, wiki, overlayMetric), contents);
+      fs.writeFileSync(path.join(candidate, wiki, `${overlayMetric}.receipt.json`), `${runId}-receipt\n`);
       fs.writeFileSync(path.join(candidate, "ready.json"), `${JSON.stringify({
         wiki,
         snapshot,
@@ -74,6 +75,7 @@ fi
 
     const before = fs.readFileSync(path.join(output, "publication-gate.json"));
     const baselineArtifact = path.join(output, "_candidates", wiki, snapshot, baseline, wiki, overlayMetric);
+    const baselineReceipt = `${baselineArtifact}.receipt.json`;
     const result = spawnSync("bash", [script, wiki, baseline, overlayMetric], {
       encoding: "utf8",
       env: {
@@ -100,6 +102,7 @@ fi
     assert.equal(report.publication_prepare.slo_passed, true);
     assert.deepEqual(report.baseline_compatibility_overlays, [overlayMetric]);
     assert.equal(fs.readFileSync(baselineArtifact, "utf8"), "old-schema");
+    assert.equal(fs.readFileSync(baselineReceipt, "utf8"), `${baseline}-receipt\n`);
     assert.deepEqual(fs.readdirSync(path.join(capacity, "work")), []);
   } finally {
     fs.rmSync(root, {recursive: true, force: true});
