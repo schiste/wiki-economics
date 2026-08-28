@@ -109,6 +109,14 @@ qualification. Only the compact JSON report is retained under
 `capacity/publication-qualifications/reports`; the hard-linked workspace is
 removed on exit.
 
+When a retained baseline crosses a known schema migration, the wrapper accepts
+an explicit comma-separated compatibility-overlay list as its third argument.
+Each named metric is hard-linked from the current candidate only inside the
+qualification workspace and its legacy ready-receipt entry is replaced with
+the current identity. Reports retain the exact overlay list, keeping the
+measurement reproducible and preventing a schema exception from entering the
+publisher itself.
+
 The site is built in its existing isolated staging directory and its symlink
 is switched atomically. `publication-commit-ready` verifies the publication
 receipt again, records `committing` in the recovery journal, advances

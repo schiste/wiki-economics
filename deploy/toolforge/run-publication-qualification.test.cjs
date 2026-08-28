@@ -21,12 +21,25 @@ test("changed-one-wiki qualification is isolated, measured, and self-cleaning", 
     const snapshot = "2026-07";
     const baseline = "baseline-run";
     const active = "active-run";
+    const overlayMetric = "gdp_activity_tiers.parquet";
     fs.mkdirSync(data);
     fs.mkdirSync(path.join(output, "_ready-index"), {recursive: true});
     for (const runId of [baseline, active]) {
       const candidate = path.join(output, "_candidates", wiki, snapshot, runId);
       fs.mkdirSync(path.join(candidate, wiki), {recursive: true});
-      fs.writeFileSync(path.join(candidate, "ready.json"), `${JSON.stringify({wiki, snapshot, run_id: runId})}\n`);
+      const contents = runId === baseline ? "old-schema" : "current-schema";
+      fs.writeFileSync(path.join(candidate, wiki, overlayMetric), contents);
+      fs.writeFileSync(path.join(candidate, "ready.json"), `${JSON.stringify({
+        wiki,
+        snapshot,
+        run_id: runId,
+        artifacts: [{
+          path: `${wiki}/${overlayMetric}`,
+          bytes: Buffer.byteLength(contents),
+          rows: 1,
+          sha256: runId === baseline ? "b".repeat(64) : "c".repeat(64),
+        }],
+      })}\n`);
     }
     fs.symlinkSync(`_candidates/${wiki}/${snapshot}/${active}/${wiki}`, path.join(output, wiki));
     fs.writeFileSync(path.join(output, "publication-gate.json"), "gate\n");
@@ -60,7 +73,8 @@ fi
 `, {mode: 0o755});
 
     const before = fs.readFileSync(path.join(output, "publication-gate.json"));
-    const result = spawnSync("bash", [script, wiki, baseline], {
+    const baselineArtifact = path.join(output, "_candidates", wiki, snapshot, baseline, wiki, overlayMetric);
+    const result = spawnSync("bash", [script, wiki, baseline, overlayMetric], {
       encoding: "utf8",
       env: {
         ...process.env,
@@ -84,6 +98,8 @@ fi
     assert.equal(report.production_mutated, false);
     assert.deepEqual(report.publication_prepare.changed_families, ["monthly"]);
     assert.equal(report.publication_prepare.slo_passed, true);
+    assert.deepEqual(report.baseline_compatibility_overlays, [overlayMetric]);
+    assert.equal(fs.readFileSync(baselineArtifact, "utf8"), "old-schema");
     assert.deepEqual(fs.readdirSync(path.join(capacity, "work")), []);
   } finally {
     fs.rmSync(root, {recursive: true, force: true});

@@ -371,6 +371,14 @@ site. The report is retained below
 `capacity/publication-qualifications/reports`; the large workspace is removed
 even when the qualification fails.
 
+If the retained baseline predates a schema migration in exactly one metric,
+name that metric explicitly as the third argument, for example
+`run-publication-qualification.sh itwiki prepare-itwiki-20260825T202727Z-7
+gdp_activity_tiers.parquet`. The isolated baseline then uses the current
+schema-compatible artifact for that family, records the overlay in its report,
+and still measures the genuinely changed remaining families. Never use an
+overlay to bypass a semantic or gate failure.
+
 ### First cutover
 
 1. Wait for the main-branch quality, coverage, security, and Toolforge release

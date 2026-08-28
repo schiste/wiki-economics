@@ -6,15 +6,24 @@ set -euo pipefail
 # lifecycle registry are read-only inputs.
 
 usage() {
-  echo "Usage: run-publication-qualification.sh <wiki> [retained-baseline-run-id]" >&2
+  echo "Usage: run-publication-qualification.sh <wiki> [retained-baseline-run-id] [current-schema-overlay-metrics]" >&2
   exit 2
 }
 
-[ "$#" -ge 1 ] && [ "$#" -le 2 ] || usage
+[ "$#" -ge 1 ] && [ "$#" -le 3 ] || usage
 wiki=$1
 baseline_run_id=${2:-}
+overlay_metrics_csv=${3:-}
 [[ "$wiki" =~ ^[a-z0-9]+wiki$ ]] || usage
 [ -z "$baseline_run_id" ] || [[ "$baseline_run_id" =~ ^[A-Za-z0-9._-]+$ ]] || usage
+IFS=',' read -r -a overlay_metrics <<< "$overlay_metrics_csv"
+if [ -n "$overlay_metrics_csv" ]; then
+  for metric in "${overlay_metrics[@]}"; do
+    [[ "$metric" =~ ^[a-z0-9_]+\.parquet$ ]] || usage
+  done
+else
+  overlay_metrics=()
+fi
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 tool_root=${WIKI_ECON_TOOL_ROOT:-/data/project/wiki-economics}
@@ -43,7 +52,7 @@ done
 [ -L "$source_output/$wiki" ] || { echo "$wiki is not an immutable published candidate" >&2; exit 1; }
 
 current_target=$(readlink "$source_output/$wiki")
-current_relative=${current_target%/$wiki}
+current_relative=${current_target%/"$wiki"}
 case "$current_relative" in
   _candidates/"$wiki"/*/*) ;;
   *) echo "Unexpected active candidate target for $wiki: $current_target" >&2; exit 1 ;;
@@ -138,6 +147,37 @@ isolated_data="$work_root/data"
 isolated_output="$work_root/output"
 isolated_lifecycle="$work_root/lifecycle.json"
 
+# A retained candidate may predate a schema migration in one family even when
+# the remaining families form a useful changed/reused qualification pair. In
+# that case, replace only the explicitly named incompatible artifact inside the
+# isolated baseline with the current artifact and its ready-receipt entry. The
+# overlay is recorded in the final report and never touches the live candidate.
+if [ "${#overlay_metrics[@]}" -gt 0 ]; then
+  baseline_ready_isolated="$isolated_output/$baseline_relative/ready.json"
+  current_ready_isolated="$isolated_output/$current_relative/ready.json"
+  ready_overlay="$work_root/baseline-ready.overlay.json"
+  cp -- "$baseline_ready_isolated" "$ready_overlay"
+  for metric in "${overlay_metrics[@]}"; do
+    artifact_path="$wiki/$metric"
+    baseline_artifact="$isolated_output/$baseline_relative/$artifact_path"
+    current_artifact="$isolated_output/$current_relative/$artifact_path"
+    [ -f "$baseline_artifact" ] && [ -f "$current_artifact" ] || {
+      echo "Compatibility overlay artifact is missing: $artifact_path" >&2
+      exit 1
+    }
+    replacement=$(jq -c --arg path "$artifact_path" \
+      '[.artifacts[] | select(.path == $path)] | if length == 1 then .[0] else error("expected one current artifact receipt") end' \
+      "$current_ready_isolated")
+    jq --arg path "$artifact_path" --argjson replacement "$replacement" \
+      '.artifacts |= map(if .path == $path then $replacement else . end)' \
+      "$ready_overlay" > "$ready_overlay.next"
+    mv "$ready_overlay.next" "$ready_overlay"
+    rm -- "$baseline_artifact"
+    ln "$current_artifact" "$baseline_artifact"
+  done
+  mv "$ready_overlay" "$baseline_ready_isolated"
+fi
+
 echo "==> Establishing retained $wiki candidate as the isolated baseline"
 rm -- "$isolated_output/$wiki"
 ln -s "$baseline_relative/$wiki" "$isolated_output/$wiki"
@@ -204,6 +244,8 @@ jq -e --arg wiki "$wiki" \
 changed_count=$(jq '.changed | length' "$change_plan")
 reused_count=$(jq '.reused | length' "$change_plan")
 changed_families=$(jq -c '[.changed[].family]' "$change_plan")
+overlay_metrics_json=$(printf '%s\n' "${overlay_metrics[@]}" | jq -Rsc \
+  'split("\n") | map(select(length > 0))')
 
 "$binary" --data-dir "$isolated_data" --output-dir "$isolated_output" \
   --run-id "$run_id" publication-rollback-ready --lifecycle "$isolated_lifecycle"
@@ -243,6 +285,7 @@ jq -n \
   --argjson changed_families "$changed_families" \
   --argjson changed_count "$changed_count" \
   --argjson reused_count "$reused_count" \
+  --argjson baseline_compatibility_overlays "$overlay_metrics_json" \
   --argjson memory_peak_bytes "$memory_peak" \
   --argjson cpu_usec "$cpu_usec" \
   --argjson throttled_usec "$throttled_usec" \
@@ -257,6 +300,7 @@ jq -n \
     generated_at: $generated_at,
     snapshot: $snapshot,
     baseline_candidate: $baseline_candidate,
+    baseline_compatibility_overlays: $baseline_compatibility_overlays,
     active_candidate: $active_candidate,
     production_identity_before_and_after: $production_identity,
     publication_prepare: {
