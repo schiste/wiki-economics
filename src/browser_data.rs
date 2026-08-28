@@ -314,7 +314,10 @@ fn materialize_global_partitions(
                 let allowed = allowed.iter().cloned().collect::<Vec<_>>();
                 frame
                     .lazy()
-                    .filter(col("wiki").is_in(lit(Series::new("allowed".into(), allowed)), false))
+                    .filter(col("wiki").is_in(
+                        lit(Series::new("allowed".into(), allowed)).implode(false),
+                        false,
+                    ))
                     .collect()?
             } else {
                 frame
@@ -1071,6 +1074,31 @@ mod tests {
         assert!(error.to_string().contains("failed to publish"));
         assert!(destination.join("live").is_file());
         assert!(!backup.exists());
+
+        let allowlisted = TestDir::new()?;
+        write_complete_wiki(allowlisted.path(), "nlwiki")?;
+        write_complete_wiki(allowlisted.path(), "ptwiki")?;
+        write_global_sources(allowlisted.path())?;
+        materialize(
+            allowlisted.path(),
+            Some(&BTreeSet::from(["ptwiki".to_string()])),
+        )
+        .expect("allowlisted global materialization should succeed");
+        let global_gdp = ParquetReader::new(
+            File::open(
+                allowlisted
+                    .path()
+                    .join(format!("{GLOBAL_ROOT}/gdp/2026.parquet")),
+            )
+            .expect("allowlisted global GDP shard should exist"),
+        )
+        .finish()?;
+        assert_eq!(global_gdp.height(), 1);
+        assert_eq!(
+            global_gdp.column("gross_bytes_added")?.i64()?.get(0),
+            Some(200)
+        );
+        assert_eq!(global_gdp.column("wiki")?.str()?.get(0), Some(GLOBAL_WIKI));
         Ok(())
     }
 
