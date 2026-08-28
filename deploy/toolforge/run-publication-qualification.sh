@@ -187,7 +187,9 @@ echo "==> Establishing retained $wiki candidate as the isolated baseline"
 rm -- "$isolated_output/$wiki"
 ln -s "$baseline_relative/$wiki" "$isolated_output/$wiki"
 rm -f -- "$isolated_output/_ready-index/$wiki.json"
-jq --arg wiki "$wiki" '.wikis[$wiki].refresh = "paused"' "$isolated_lifecycle" \
+jq --arg wiki "$wiki" --arg cutoff "$baseline_snapshot" \
+  '.wikis[$wiki].refresh = "paused" | .wikis[$wiki].imported_cutoff = $cutoff' \
+  "$isolated_lifecycle" \
   > "$work_root/lifecycle.paused.json"
 mv "$work_root/lifecycle.paused.json" "$isolated_lifecycle"
 

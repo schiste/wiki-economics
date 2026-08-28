@@ -51,14 +51,19 @@ test("changed-one-wiki qualification is isolated, measured, and self-cleaning", 
 set -euo pipefail
 output=''
 run=''
+lifecycle=''
 for ((i=1; i<=$#; i++)); do
   value="\${!i}"
   if [ "$value" = --output-dir ]; then j=$((i+1)); output="\${!j}"; fi
   if [ "$value" = --run-id ]; then j=$((i+1)); run="\${!j}"; fi
+  if [ "$value" = --lifecycle ]; then j=$((i+1)); lifecycle="\${!j}"; fi
 done
 if [[ "$*" == *" publication-prepare-ready "* ]]; then
   mkdir -p "$output/_publication_transactions/$run"
   if [[ "$run" == *-baseline ]]; then
+    jq -e --arg wiki '${wiki}' --arg cutoff '${snapshot}' \
+      '.wikis[$wiki].refresh == "paused" and .wikis[$wiki].imported_cutoff == $cutoff' \
+      "$lifecycle" >/dev/null
     printf '{"schema_version":1,"state":"selected","entries":[]}\\n' > "$output/_publication_transactions/$run/selection.json"
   else
     printf '{"schema_version":1,"state":"selected","entries":[{"wiki":"${wiki}"}]}\\n' > "$output/_publication_transactions/$run/selection.json"
