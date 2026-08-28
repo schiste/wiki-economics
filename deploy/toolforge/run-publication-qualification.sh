@@ -93,6 +93,11 @@ baseline_ready="$source_output/$baseline_relative/ready.json"
   echo "Retained baseline ready identity is invalid" >&2
   exit 1
 }
+baseline_cutoff=$(jq -r '.cutoff_date // empty' "$baseline_ready")
+[[ "$baseline_cutoff" =~ ^[0-9]{4}-[0-9]{2}$ ]] || {
+  echo "Retained baseline has an invalid semantic cutoff" >&2
+  exit 1
+}
 [ "$baseline_relative" != "$current_relative" ] || {
   echo "Retained baseline and active candidate are identical" >&2
   exit 1
@@ -187,7 +192,7 @@ echo "==> Establishing retained $wiki candidate as the isolated baseline"
 rm -- "$isolated_output/$wiki"
 ln -s "$baseline_relative/$wiki" "$isolated_output/$wiki"
 rm -f -- "$isolated_output/_ready-index/$wiki.json"
-jq --arg wiki "$wiki" --arg cutoff "$baseline_snapshot" \
+jq --arg wiki "$wiki" --arg cutoff "$baseline_cutoff" \
   '.wikis[$wiki].refresh = "paused" | .wikis[$wiki].imported_cutoff = $cutoff' \
   "$isolated_lifecycle" \
   > "$work_root/lifecycle.paused.json"

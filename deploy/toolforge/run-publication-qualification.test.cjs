@@ -19,6 +19,7 @@ test("changed-one-wiki qualification is isolated, measured, and self-cleaning", 
     const lifecycle = path.join(root, "lifecycle.json");
     const wiki = "nlwiki";
     const snapshot = "2026-07";
+    const cutoff = "2026-08";
     const baseline = "baseline-run";
     const active = "active-run";
     const overlayMetric = "gdp_activity_tiers.parquet";
@@ -33,6 +34,7 @@ test("changed-one-wiki qualification is isolated, measured, and self-cleaning", 
       fs.writeFileSync(path.join(candidate, "ready.json"), `${JSON.stringify({
         wiki,
         snapshot,
+        cutoff_date: cutoff,
         run_id: runId,
         artifacts: [{
           path: `${wiki}/${overlayMetric}`,
@@ -61,7 +63,7 @@ done
 if [[ "$*" == *" publication-prepare-ready "* ]]; then
   mkdir -p "$output/_publication_transactions/$run"
   if [[ "$run" == *-baseline ]]; then
-    jq -e --arg wiki '${wiki}' --arg cutoff '${snapshot}' \
+    jq -e --arg wiki '${wiki}' --arg cutoff '${cutoff}' \
       '.wikis[$wiki].refresh == "paused" and .wikis[$wiki].imported_cutoff == $cutoff' \
       "$lifecycle" >/dev/null
     printf '{"schema_version":1,"state":"selected","entries":[]}\\n' > "$output/_publication_transactions/$run/selection.json"
