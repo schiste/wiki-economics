@@ -5410,11 +5410,13 @@ mod tests {
                 .run_id,
             "legacy-active"
         );
-        assert!(!publication_is_immediate_noop(
+        let immediate_noop = publication_is_immediate_noop(
             fixture.data.path(),
             fixture.output.path(),
             &fixture.lifecycle_path,
-        )?);
+        );
+        let immediate_noop = immediate_noop.context("legacy replacement should be digestable")?;
+        assert!(!immediate_noop);
         assert_eq!(fs::read(ready_path)?, legacy_ready_bytes);
         Ok(())
     }
