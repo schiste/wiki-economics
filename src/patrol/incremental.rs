@@ -469,35 +469,74 @@ fn ensure_source_indexes(
     all_revision_files: &[PathBuf],
     cache: &crate::cross_snapshot::CrossSnapshotCache,
 ) -> Result<BTreeMap<String, SourceMonthIndex>> {
-    patrol_artifacts
-        .iter()
-        .map(|(month, artifact)| {
-            let index = patrol_try!(ensure_source_index(
-                wiki,
-                month,
-                artifact,
-                generation_root,
-                revision_digests,
-                all_revision_partitions,
-                all_revision_files,
-                cache,
-            ));
-            Ok((month.clone(), index))
-        })
-        .collect()
+    let mut indexes = BTreeMap::new();
+    let mut rebuild = Vec::new();
+    let mut shared_fallback_ids = HashSet::new();
+
+    for (month, artifact) in patrol_artifacts {
+        if let Some(index) = patrol_try!(load_reusable_source_index(
+            wiki,
+            month,
+            artifact,
+            revision_digests,
+            cache,
+        )) {
+            indexes.insert(month.clone(), index);
+            continue;
+        }
+
+        let (_, revision_ids, revision_lookup) = patrol_try!(load_source_month_context(
+            month,
+            artifact,
+            generation_root,
+            all_revision_partitions,
+        ));
+        shared_fallback_ids.extend(
+            revision_ids
+                .into_iter()
+                .filter(|revision_id| !revision_lookup.contains_key(revision_id)),
+        );
+        rebuild.push((month, *artifact));
+    }
+
+    let shared_fallback = patrol_try!(load_shared_revision_fallback(
+        wiki,
+        all_revision_files,
+        &shared_fallback_ids,
+        load_revision_subset_by_ids_once,
+    ));
+    info!(
+        wiki,
+        reusable_source_months = indexes.len(),
+        rebuilt_source_months = rebuild.len(),
+        shared_fallback_revision_ids = shared_fallback_ids.len(),
+        shared_fallback_matches = shared_fallback.len(),
+        "prepared bounded patrol source-index rebuild"
+    );
+
+    for (month, artifact) in rebuild {
+        let index = patrol_try!(build_source_index(
+            wiki,
+            month,
+            artifact,
+            generation_root,
+            revision_digests,
+            all_revision_partitions,
+            &shared_fallback,
+            cache,
+        ));
+        indexes.insert(month.clone(), index);
+    }
+    Ok(indexes)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn ensure_source_index(
+fn load_reusable_source_index(
     wiki: &str,
     action_month: &str,
     artifact: &generation::MonthArtifact,
-    generation_root: &Path,
     revision_digests: &BTreeMap<String, String>,
-    all_revision_partitions: &BTreeMap<i32, Vec<PathBuf>>,
-    all_revision_files: &[PathBuf],
     cache: &crate::cross_snapshot::CrossSnapshotCache,
-) -> Result<SourceMonthIndex> {
+) -> Result<Option<SourceMonthIndex>> {
     if let Some(index) = patrol_try!(cache.load_json::<SourceMonthIndex>(
         "patrol_source_pointer",
         SOURCE_INDEX_VERSION,
@@ -513,29 +552,76 @@ fn ensure_source_index(
                 "events",
             ))
         {
-            return Ok(index);
+            return Ok(Some(index));
         }
     }
+    Ok(None)
+}
 
+fn load_source_month_context(
+    action_month: &str,
+    artifact: &generation::MonthArtifact,
+    generation_root: &Path,
+    all_revision_partitions: &BTreeMap<i32, Vec<PathBuf>>,
+) -> Result<(DataFrame, HashSet<i64>, HashMap<i64, RevisionMeta>)> {
     let path = generation::artifact_path(generation_root, artifact)?;
     let patrol_df = read_parquet_df(&path, Some(patrol_projection()))?;
-    let pending = HashSet::from([
-        parse_year_month_key(action_month).context("invalid patrol source action month")?
-    ]);
+    let action_month_key =
+        parse_year_month_key(action_month).context("invalid patrol source action month")?;
+    let pending = HashSet::from([action_month_key]);
     let revision_ids = collect_patrolled_revision_ids(&patrol_df, &pending)?;
-    let pending_months = pending.iter().copied().collect::<Vec<_>>();
-    let mut revision_lookup = patrol_try!(load_revision_subset_by_ids_near_pending_months(
+    let revision_lookup = load_revision_subset_by_ids_near_pending_months(
         all_revision_partitions,
-        &pending_months,
+        &[action_month_key],
         &revision_ids,
+    )?;
+    Ok((patrol_df, revision_ids, revision_lookup))
+}
+
+fn load_shared_revision_fallback<F>(
+    wiki: &str,
+    all_revision_files: &[PathBuf],
+    revision_ids: &HashSet<i64>,
+    mut load: F,
+) -> Result<HashMap<i64, RevisionMeta>>
+where
+    F: FnMut(&[PathBuf], &HashSet<i64>) -> Result<HashMap<i64, RevisionMeta>>,
+{
+    if revision_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    info!(
+        wiki,
+        missing_revision_ids = revision_ids.len(),
+        "performing one shared full revision lookup for patrol source months"
+    );
+    load(all_revision_files, revision_ids)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_source_index(
+    wiki: &str,
+    action_month: &str,
+    artifact: &generation::MonthArtifact,
+    generation_root: &Path,
+    revision_digests: &BTreeMap<String, String>,
+    all_revision_partitions: &BTreeMap<i32, Vec<PathBuf>>,
+    shared_fallback: &HashMap<i64, RevisionMeta>,
+    cache: &crate::cross_snapshot::CrossSnapshotCache,
+) -> Result<SourceMonthIndex> {
+    let (patrol_df, revision_ids, mut revision_lookup) = patrol_try!(load_source_month_context(
+        action_month,
+        artifact,
+        generation_root,
+        all_revision_partitions,
     ));
-    let resolved = revision_lookup.keys().copied().collect::<HashSet<_>>();
-    let missing = revision_ids
-        .difference(&resolved)
-        .copied()
-        .collect::<HashSet<_>>();
-    if !missing.is_empty() {
-        extend_lookup_once(all_revision_files, &missing, &mut revision_lookup, wiki)?;
+
+    for revision_id in &revision_ids {
+        if !revision_lookup.contains_key(revision_id)
+            && let Some(meta) = shared_fallback.get(revision_id)
+        {
+            revision_lookup.insert(*revision_id, *meta);
+        }
     }
     let unresolved_revision_ids = patrol_try!(u64::try_from(
         revision_ids
@@ -1050,6 +1136,43 @@ mod tests {
         )
         .expect_err("an unlisted revision fragment must fail closed");
         assert!(error.to_string().contains(&missing.display().to_string()));
+        Ok(())
+    }
+
+    #[test]
+    fn shared_revision_fallback_scans_at_most_once() -> Result<()> {
+        let revision_files = vec![PathBuf::from("history.parquet")];
+        let revision_ids = HashSet::from([101_i64, 202_i64]);
+        let mut calls = 0;
+        let loaded = load_shared_revision_fallback(
+            "testwiki",
+            &revision_files,
+            &revision_ids,
+            |files, ids| {
+                calls += 1;
+                assert_eq!(files, revision_files);
+                assert_eq!(ids, &revision_ids);
+                Ok(HashMap::from([(
+                    101,
+                    RevisionMeta {
+                        timestamp_seconds: 1,
+                        year_month_key: 202_401,
+                        page_namespace: 0,
+                        user_type: UserType::Registered,
+                    },
+                )]))
+            },
+        )?;
+        assert_eq!(calls, 1);
+        assert_eq!(loaded.len(), 1);
+
+        let empty =
+            load_shared_revision_fallback("testwiki", &revision_files, &HashSet::new(), |_, _| {
+                calls += 1;
+                Ok(HashMap::new())
+            })?;
+        assert!(empty.is_empty());
+        assert_eq!(calls, 1, "an empty fallback must not scan history");
         Ok(())
     }
 
