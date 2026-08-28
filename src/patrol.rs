@@ -956,8 +956,11 @@ fn download_logging_dump<T: PatrolTransport + ?Sized>(
         }
         file.write_all(&buffer[..bytes_read])?;
     }
-    // Sync and drop before the magic check below opens a fresh handle.
+    // Make the downloaded bytes durable before hashing them.  The hash pass
+    // advises Linux to evict each completed range; without this sync those
+    // pages can remain dirty and charged to the preparation job's cgroup.
     file.flush()?;
+    file.sync_all()?;
     drop(file);
 
     // mediawiki_history dumps do not publish checksums, so we apply a cheap

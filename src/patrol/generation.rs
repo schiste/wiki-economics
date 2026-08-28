@@ -133,6 +133,8 @@ impl<T: Serialize> MonthlySpool<T> {
         };
         active.writer.flush()?;
         active.writer.get_ref().sync_all()?;
+        let bytes = active.writer.get_ref().metadata()?.len();
+        storage::discard_file_cache(active.writer.get_ref(), 0, bytes);
         Ok(())
     }
 
@@ -168,6 +170,7 @@ impl MonthlyPatrolWriter {
             external_sort_spool::<PatrolRow, _>(&spool, |row| writer.add(row))?;
             writer.finish()?;
             commit_month_artifact(&temporary, &final_path)?;
+            storage::discard_path_cache(&final_path);
             completed.push(final_path);
         }
         remove_spool_tree(&root, "patrol")?;
@@ -202,6 +205,7 @@ impl MonthlyRightsWriter {
             external_sort_spool::<RightsRow, _>(&spool, |row| writer.add(row))?;
             writer.finish()?;
             commit_month_artifact(&temporary, &final_path)?;
+            storage::discard_path_cache(&final_path);
             completed.push(final_path);
         }
         remove_spool_tree(&root, "rights")?;
@@ -252,6 +256,7 @@ where
     fs::create_dir(&work)?;
     let result = (|| {
         let mut runs = create_sorted_runs::<T>(spool, &work)?;
+        storage::discard_path_cache(spool);
         let mut round = 0_usize;
         while runs.len() > EXTERNAL_SORT_FAN_IN {
             let round_root = work.join(format!("round-{round:04}"));
@@ -263,12 +268,16 @@ where
                 next.push(path);
             }
             for path in runs {
+                storage::discard_path_cache(&path);
                 fs::remove_file(path)?;
             }
             runs = next;
             round += 1;
         }
         merge_sorted_runs::<T, _>(&runs, &mut emit)?;
+        for path in &runs {
+            storage::discard_path_cache(path);
+        }
         fs::remove_file(spool)?;
         Ok::<_, anyhow::Error>(())
     })();
@@ -319,6 +328,8 @@ fn write_sorted_run<T: Ord + Serialize>(
     }
     writer.flush()?;
     writer.get_ref().sync_all()?;
+    let bytes = writer.get_ref().metadata()?.len();
+    storage::discard_file_cache(writer.get_ref(), 0, bytes);
     runs.push(path);
     Ok(())
 }
@@ -335,6 +346,8 @@ where
     })?;
     writer.flush()?;
     writer.get_ref().sync_all()?;
+    let bytes = writer.get_ref().metadata()?.len();
+    storage::discard_file_cache(writer.get_ref(), 0, bytes);
     Ok(())
 }
 
