@@ -570,11 +570,11 @@ fn load_source_month_context(
         parse_year_month_key(action_month).context("invalid patrol source action month")?;
     let pending = HashSet::from([action_month_key]);
     let revision_ids = collect_patrolled_revision_ids(&patrol_df, &pending)?;
-    let revision_lookup = load_revision_subset_by_ids_near_pending_months(
+    let revision_lookup = patrol_try!(load_revision_subset_by_ids_near_pending_months(
         all_revision_partitions,
         &[action_month_key],
         &revision_ids,
-    )?;
+    ));
     Ok((patrol_df, revision_ids, revision_lookup))
 }
 
@@ -616,13 +616,7 @@ fn build_source_index(
         all_revision_partitions,
     ));
 
-    for revision_id in &revision_ids {
-        if !revision_lookup.contains_key(revision_id)
-            && let Some(meta) = shared_fallback.get(revision_id)
-        {
-            revision_lookup.insert(*revision_id, *meta);
-        }
-    }
+    extend_lookup_from_shared(&revision_ids, shared_fallback, &mut revision_lookup);
     let unresolved_revision_ids = patrol_try!(u64::try_from(
         revision_ids
             .iter()
@@ -688,6 +682,20 @@ fn build_source_index(
         &index,
     ));
     Ok(index)
+}
+
+fn extend_lookup_from_shared(
+    revision_ids: &HashSet<i64>,
+    shared_fallback: &HashMap<i64, RevisionMeta>,
+    revision_lookup: &mut HashMap<i64, RevisionMeta>,
+) {
+    for revision_id in revision_ids {
+        if !revision_lookup.contains_key(revision_id)
+            && let Some(meta) = shared_fallback.get(revision_id)
+        {
+            revision_lookup.insert(*revision_id, *meta);
+        }
+    }
 }
 
 fn enriched_source_events(
@@ -1144,35 +1152,48 @@ mod tests {
         let revision_files = vec![PathBuf::from("history.parquet")];
         let revision_ids = HashSet::from([101_i64, 202_i64]);
         let mut calls = 0;
-        let loaded = load_shared_revision_fallback(
-            "testwiki",
-            &revision_files,
-            &revision_ids,
-            |files, ids| {
-                calls += 1;
-                assert_eq!(files, revision_files);
-                assert_eq!(ids, &revision_ids);
-                Ok(HashMap::from([(
-                    101,
-                    RevisionMeta {
-                        timestamp_seconds: 1,
-                        year_month_key: 202_401,
-                        page_namespace: 0,
-                        user_type: UserType::Registered,
-                    },
-                )]))
-            },
-        )?;
-        assert_eq!(calls, 1);
+        let mut loader = |files: &[PathBuf], ids: &HashSet<i64>| {
+            calls += 1;
+            assert_eq!(files, revision_files);
+            assert_eq!(ids, &revision_ids);
+            Ok(HashMap::from([(
+                101,
+                RevisionMeta {
+                    timestamp_seconds: 1,
+                    year_month_key: 202_401,
+                    page_namespace: 0,
+                    user_type: UserType::Registered,
+                },
+            )]))
+        };
+        let loaded =
+            load_shared_revision_fallback("testwiki", &revision_files, &revision_ids, &mut loader)?;
         assert_eq!(loaded.len(), 1);
 
-        let empty =
-            load_shared_revision_fallback("testwiki", &revision_files, &HashSet::new(), |_, _| {
-                calls += 1;
-                Ok(HashMap::new())
-            })?;
+        let empty = load_shared_revision_fallback(
+            "testwiki",
+            &revision_files,
+            &HashSet::new(),
+            &mut loader,
+        )
+        .expect("an empty fallback should not invoke the loader");
         assert!(empty.is_empty());
         assert_eq!(calls, 1, "an empty fallback must not scan history");
+
+        let mut local = HashMap::from([(101, loaded[&101])]);
+        let fallback = HashMap::from([(
+            202,
+            RevisionMeta {
+                timestamp_seconds: 2,
+                year_month_key: 202_402,
+                page_namespace: 1,
+                user_type: UserType::Anonymous,
+            },
+        )]);
+        extend_lookup_from_shared(&revision_ids, &fallback, &mut local);
+        assert_eq!(local.len(), 2);
+        assert_eq!(local[&101].timestamp_seconds, 1);
+        assert_eq!(local[&202].timestamp_seconds, 2);
         Ok(())
     }
 
