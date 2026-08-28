@@ -161,7 +161,10 @@ test("incremental publication has a three-minute SLO", () => {
     stageDurationsMs: {publication_prepare: 180_001},
     publication: {
       ...success().publication,
-      changePlan: {changed: [{wiki: "nlwiki", family: "monthly"}], reused: []},
+      changePlan: {
+        changed: [{wiki: "nlwiki", family: "monthly"}],
+        reused: [{wiki: "nlwiki", family: "page_week"}],
+      },
     },
   });
   const result = evaluateFreshness({
@@ -172,6 +175,29 @@ test("incremental publication has a three-minute SLO", () => {
   });
   assert.equal(result.alerts[0].code, "incremental_publication_slow");
   assert.equal(result.alerts[0].changedFamilies, 1);
+});
+
+test("full baseline publication is not classified as incremental", () => {
+  const record = success({
+    stageDurationsMs: {publication_prepare: 1_109_480},
+    publication: {
+      ...success().publication,
+      changePlan: {
+        changed: [
+          {wiki: "nlwiki", family: "monthly"},
+          {wiki: "nlwiki", family: "page_week"},
+        ],
+        reused: [],
+      },
+    },
+  });
+  const result = evaluateFreshness({
+    last: record,
+    history: [record],
+    lifecycle,
+    now: Date.parse(record.finishedAt) + DAY_MS,
+  });
+  assert.ok(!result.alerts.some((alert) => alert.code === "incremental_publication_slow"));
 });
 
 test("browser publication size evidence is fail-closed and budgeted", () => {

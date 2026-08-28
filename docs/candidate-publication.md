@@ -92,7 +92,10 @@ The production SLO for the receipt-backed `publication_prepare` stage is three
 minutes for the current six-wiki set. The run record retains the exact change
 plan and the public freshness endpoint raises
 `incremental_publication_slow` when a successful incremental publication
-exceeds that bound.
+exceeds that bound. A baseline publication that changes every family and
+reuses none is classified as a full publication, not an incremental one; its
+one-time migration cost is retained in run history without making freshness
+permanently critical.
 
 The site is built in its existing isolated staging directory and its symlink
 is switched atomically. `publication-commit-ready` verifies the publication

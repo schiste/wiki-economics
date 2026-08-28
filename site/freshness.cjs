@@ -159,14 +159,21 @@ function evaluateFreshness({last = null, history = [], lifecycle, scrubStatus = 
 
   if (latestPublication) {
     const incrementalDuration = latestPublication.stageDurationsMs?.publication_prepare;
-    if (latestPublication.publication?.changePlan
+    const changePlan = latestPublication.publication?.changePlan;
+    const changedFamilies = changePlan?.changed;
+    const reusedFamilies = changePlan?.reused;
+    const isIncrementalPublication = Array.isArray(changedFamilies)
+      && changedFamilies.length > 0
+      && Array.isArray(reusedFamilies)
+      && reusedFamilies.length > 0;
+    if (isIncrementalPublication
         && Number.isFinite(incrementalDuration)
         && incrementalDuration > settings.incrementalPublicationMaximumMs) {
       alert("incremental_publication_slow", "critical", "Incremental publication exceeded its three-minute SLO.", {
         runId: latestPublication.runId,
         durationMs: incrementalDuration,
         thresholdMs: settings.incrementalPublicationMaximumMs,
-        changedFamilies: latestPublication.publication.changePlan.changed?.length ?? null,
+        changedFamilies: changedFamilies.length,
       });
     }
     const browser = latestPublication.publication?.browserData;
