@@ -393,7 +393,7 @@ jobs:
   toolforge-release:
     name: Build Toolforge release artifact
     if: |
-      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      always() && github.event_name == 'push' && github.ref == 'refs/heads/main' &&
       needs.quality-node.result == 'success' &&
       (needs.quality-rust.result == 'success' || needs.quality-rust.result == 'skipped') &&
       needs.site.result == 'success' &&
