@@ -16,7 +16,8 @@ use crate::workload_profile::{self, WorkloadProfileName};
 const TASK_SCHEMA_VERSION: u32 = 1;
 const LEASE_SCHEMA_VERSION: u32 = 1;
 const NOTIFICATION_SCHEMA_VERSION: u32 = 1;
-const QUEUE_ALGORITHM_VERSION: &str = "fleet-queue-v1";
+const QUEUE_ALGORITHM_VERSION: &str = "fleet-queue-v2";
+const LEGACY_QUEUE_ALGORITHM_VERSION: &str = "fleet-queue-v1";
 const DEFAULT_MAX_ATTEMPTS: u32 = 3;
 const MEDIUM_MEMORY_THRESHOLD_BYTES: u64 = 3 * 512 * 1024 * 1024;
 const MEDIUM_SCRATCH_THRESHOLD_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -291,7 +292,7 @@ fn enqueue_at(
     let task = FleetTask {
         schema_version: TASK_SCHEMA_VERSION,
         queue_algorithm_version: QUEUE_ALGORITHM_VERSION.to_string(),
-        task_id: task_identity(wiki, snapshot, resource_class, &signals)?,
+        task_id: task_identity(wiki, snapshot)?,
         wiki: wiki.to_string(),
         snapshot: snapshot.to_string(),
         resource_class,
@@ -311,6 +312,10 @@ fn enqueue_at(
         let existing: FleetTask = read_json(&pending)?;
         existing.validate()?;
         if existing.task_id == task.task_id {
+            // Resource classification and observations are scheduling metadata.
+            // Refresh them without turning the same immutable snapshot into new
+            // semantic work or changing its stable task identity.
+            atomic_write_json(&pending, &task)?;
             report.unchanged = 1;
             return Ok(report);
         }
@@ -636,18 +641,25 @@ impl FleetTask {
     fn validate(&self) -> Result<()> {
         ensure!(
             self.schema_version == TASK_SCHEMA_VERSION
-                && self.queue_algorithm_version == QUEUE_ALGORITHM_VERSION,
+                && matches!(
+                    self.queue_algorithm_version.as_str(),
+                    QUEUE_ALGORITHM_VERSION | LEGACY_QUEUE_ALGORITHM_VERSION
+                ),
             "unsupported fleet task schema"
         );
         validate_component(&self.wiki, "task wiki")?;
         crate::storage::validate_snapshot_version(&self.snapshot)?;
         validate_component(&self.controller_run_id, "controller run ID")?;
-        let identity = task_identity(
-            &self.wiki,
-            &self.snapshot,
-            self.resource_class,
-            &self.signals,
-        );
+        let identity = if self.queue_algorithm_version == LEGACY_QUEUE_ALGORITHM_VERSION {
+            legacy_task_identity(
+                &self.wiki,
+                &self.snapshot,
+                self.resource_class,
+                &self.signals,
+            )
+        } else {
+            task_identity(&self.wiki, &self.snapshot)
+        };
         let expected_identity = identity?;
         ensure!(
             self.task_id == expected_identity,
@@ -714,7 +726,21 @@ fn pending_tasks(root: &Path) -> Result<Vec<FleetTask>> {
     Ok(tasks)
 }
 
-fn task_identity(
+fn task_identity(wiki: &str, snapshot: &str) -> Result<String> {
+    #[derive(Serialize)]
+    struct Seed<'a> {
+        algorithm: &'static str,
+        wiki: &'a str,
+        snapshot: &'a str,
+    }
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&Seed {
+        algorithm: QUEUE_ALGORITHM_VERSION,
+        wiki,
+        snapshot,
+    })?)))
+}
+
+fn legacy_task_identity(
     wiki: &str,
     snapshot: &str,
     resource_class: ResourceClass,
@@ -729,7 +755,7 @@ fn task_identity(
         signals: &'a SchedulingSignals,
     }
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(&Seed {
-        algorithm: QUEUE_ALGORITHM_VERSION,
+        algorithm: LEGACY_QUEUE_ALGORITHM_VERSION,
         wiki,
         snapshot,
         resource_class,
@@ -852,9 +878,7 @@ fn completed_evidence_valid(root: &Path, task: &FleetTask) -> Result<bool> {
     ensure!(
         completed.task_id == task.task_id
             && completed.wiki == task.wiki
-            && completed.snapshot == task.snapshot
-            && completed.resource_class == task.resource_class
-            && completed.signals == task.signals,
+            && completed.snapshot == task.snapshot,
         "completed fleet task evidence drifted"
     );
     let notification: ReadyNotification = read_json(&notification_path)?;
@@ -1074,7 +1098,19 @@ mod tests {
         assert!(notification.is_file());
         assert!(!pending_path(queue.path(), "nlwiki").exists());
         assert!(!lease_dir(queue.path(), "nlwiki").exists());
-        let unchanged = enqueue_fixture(queue.path(), "nlwiki", "2026-08", "controller-2", 200)?;
+        let mut changed_signals = signals(SourceLayout::Yearly);
+        changed_signals.historical_memory_peak_bytes = Some(4_000_000_000);
+        changed_signals.observed_throughput_rows_per_second = Some(99_999);
+        let unchanged = enqueue_at(
+            queue.path(),
+            "nlwiki",
+            "2026-08",
+            ResourceClass::MediumLarge,
+            changed_signals,
+            "controller-2",
+            200,
+        );
+        let unchanged = unchanged.context("changed scheduling metadata should remain a no-op")?;
         assert_eq!(unchanged.unchanged, 1);
         fs::remove_file(output.path().join("_ready-index/nlwiki.json"))?;
         let repaired = enqueue_fixture(queue.path(), "nlwiki", "2026-08", "controller-3", 201)?;
@@ -1095,6 +1131,28 @@ mod tests {
         let leased = enqueue_fixture(root.path(), "nlwiki", "2026-09", "controller-4", 104)?;
         assert_eq!(leased.leased, 1);
         Ok(())
+    }
+
+    #[test]
+    fn legacy_tasks_remain_valid_during_queue_v2_rollout() -> Result<()> {
+        let task_signals = signals(SourceLayout::Yearly);
+        let task_id =
+            legacy_task_identity("nlwiki", "2026-08", ResourceClass::Small, &task_signals);
+        let task_id = task_id.context("legacy task identity should remain computable")?;
+        let task = FleetTask {
+            schema_version: TASK_SCHEMA_VERSION,
+            queue_algorithm_version: LEGACY_QUEUE_ALGORITHM_VERSION.to_string(),
+            task_id,
+            wiki: "nlwiki".to_string(),
+            snapshot: "2026-08".to_string(),
+            resource_class: ResourceClass::Small,
+            signals: task_signals,
+            attempt: 0,
+            not_before_unix: 100,
+            discovered_at_unix: 100,
+            controller_run_id: "controller-v1".to_string(),
+        };
+        task.validate()
     }
 
     #[test]
@@ -1226,12 +1284,7 @@ mod tests {
         assert!(invalid_task.validate().is_err());
         invalid_task = claim.task.clone();
         invalid_task.signals.source_count = 0;
-        let invalid_identity = task_identity(
-            &invalid_task.wiki,
-            &invalid_task.snapshot,
-            invalid_task.resource_class,
-            &invalid_task.signals,
-        );
+        let invalid_identity = task_identity(&invalid_task.wiki, &invalid_task.snapshot);
         invalid_task.task_id = invalid_identity?;
         assert!(invalid_task.validate().is_err());
 
