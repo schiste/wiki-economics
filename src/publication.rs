@@ -2260,7 +2260,6 @@ fn publication_noop_digest_for_site(
                 == Some(ready.snapshot.as_str()),
             "active ready candidate and snapshot pointer disagree for {wiki}"
         );
-        let reference = ready_candidate_reference(data_dir, output_dir, &active_dir, &ready)?;
         if require_newest_active {
             let (newest, newest_dir) = indexed_latest_ready_candidate(data_dir, output_dir, wiki)?
                 .context("active candidate has no indexed ready receipt")?;
@@ -2271,6 +2270,12 @@ fn publication_noop_digest_for_site(
                 return Ok(None);
             }
         }
+        let reference = active_ready_reference(data_dir, output_dir, wiki)?
+            .context("active candidate has no authenticated ready reference")?;
+        ensure!(
+            reference.candidate_relative == active_relative,
+            "active ready reference path changed while composing publication digest"
+        );
         identities.push(format!("{wiki}={}", reference.ready_receipt_sha256));
     }
     identities.sort();
@@ -5405,6 +5410,11 @@ mod tests {
                 .run_id,
             "legacy-active"
         );
+        assert!(!publication_is_immediate_noop(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+        )?);
         assert_eq!(fs::read(ready_path)?, legacy_ready_bytes);
         Ok(())
     }
