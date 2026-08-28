@@ -97,6 +97,18 @@ reuses none is classified as a full publication, not an incremental one; its
 one-time migration cost is retained in run history without making freshness
 permanently critical.
 
+Qualify that SLO independently from full migrations and no-ops with
+`deploy/toolforge/run-publication-qualification.sh <wiki>`. The Toolforge-only
+wrapper hard-links the current data and output trees into a run-scoped
+capacity workspace, establishes the retained superseded candidate as an
+isolated baseline, and then measures selection of the authentic current
+candidate. It requires a change plan containing only that wiki and both
+changed and reused families. The public symlink, publication receipt, browser
+index, and ready index are hashed before and after; any mutation fails the
+qualification. Only the compact JSON report is retained under
+`capacity/publication-qualifications/reports`; the hard-linked workspace is
+removed on exit.
+
 The site is built in its existing isolated staging directory and its symlink
 is switched atomically. `publication-commit-ready` verifies the publication
 receipt again, records `committing` in the recovery journal, advances

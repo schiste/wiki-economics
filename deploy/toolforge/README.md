@@ -356,6 +356,21 @@ production snapshot pointer, ready-candidate set, merged artifact, or site
 symlink. Inspect `qualification.json` and the isolated run status before
 starting capacity variants or considering lifecycle promotion.
 
+To measure the changed-one-wiki `publication_prepare` SLO independently from
+a full migration or no-op, use an on-demand 6 GiB/1-vCPU job:
+
+```sh
+toolforge jobs run --image tool-wiki-economics/tool-wiki-economics:latest \
+  --command 'deploy/toolforge/run-publication-qualification.sh elwiki' \
+  --filelog --mount all --mem 6Gi --cpu 1 wiki-econ-qualify-publication-elwiki
+```
+
+This qualification uses a hard-linked, run-scoped copy and an authentic
+retained rollback/current candidate pair. It never switches the public data or
+site. The report is retained below
+`capacity/publication-qualifications/reports`; the large workspace is removed
+even when the qualification fails.
+
 ### First cutover
 
 1. Wait for the main-branch quality, coverage, security, and Toolforge release
