@@ -3469,12 +3469,14 @@ mod tests {
     fn yearly_snapshot_completion_probes_only_reviewed_sparse_sources() -> Result<()> {
         let transport =
             FakeTransport::with_head_outcomes((0..25).map(|_| ok_head(Some(13), false)));
-        assert!(snapshot_is_complete(
+        let complete = snapshot_is_complete(
             &transport,
             "http://example.invalid",
             &["arwiki".to_string()],
             "2026-07",
-        )?);
+        )
+        .expect("the reviewed sparse Arabic inventory should be complete");
+        assert!(complete);
         assert_eq!(transport.head_requests(), 25);
         Ok(())
     }
