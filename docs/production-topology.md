@@ -65,8 +65,10 @@ publication receipt still matches immediately before publication. See
 There are independent Kubernetes workloads sharing the tool account's NFS
 mount:
 
-- `wiki-econ-fleet-controller` discovers elwiki, frwiki, itwiki, nlwiki,
-  ptwiki, and svwiki from the lifecycle registry and writes atomic tasks.
+- `wiki-econ-fleet-controller` discovers the sixteen scheduled lifecycle
+  entries (afwiki, arwiki, arzwiki, elwiki, eswiki, frwiki, hawiki, itwiki,
+  jawiki, nlwiki, ptwiki, svwiki, swwiki, viwiki, yowiki, and zhwiki) and
+  writes atomic tasks.
   `wiki-econ-fleet-small-a`, `wiki-econ-fleet-small-b`, and
   `wiki-econ-fleet-medium` are a fixed worker pool. Each claimed task owns only
   its wiki's candidate-generation paths; leases, heartbeats, bounded retries,

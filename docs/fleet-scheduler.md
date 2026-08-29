@@ -55,7 +55,7 @@ capacity report qualifies it.
 ordered, fail-closed promotion record:
 
 1. local deterministic queue and failure fixtures;
-2. current six-wiki publication-invisible shadow runs;
+2. publication-invisible shadow runs for the then-current scheduled set;
 3. one hidden medium yearly wiki;
 4. one hidden large yearly wiki;
 5. a concurrent frwiki fleet run;
@@ -75,6 +75,6 @@ The scheduled wrappers are `run-fleet-controller.sh` and
 trees. `wiki-econ fleet-recover` is an explicit, idempotent stale-lease pass.
 The old monolithic refresh and stage jobs remain on-demand recovery tools.
 
-Do not load the fleet schedules in production until the local and six-wiki
-shadow stages have passed. Loading them replaces the six legacy per-wiki job
+Do not load the fleet schedules in production until the local and scheduled-set
+shadow stages have passed. Loading them replaces legacy per-wiki job
 definitions; it does not enable hidden or isolated wikis.

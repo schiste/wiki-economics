@@ -65,23 +65,23 @@ build or browser dependency.
 ## Published wiki lifecycle
 
 The table below is rendered from `config/wiki-lifecycle.json`. Scheduled
-datasets are `elwiki`, `frwiki`, `itwiki`, `nlwiki`, `ptwiki`, `svwiki`; paused imported datasets are none.
+datasets are `afwiki`, `arwiki`, `arzwiki`, `elwiki`, `eswiki`, `frwiki`, `hawiki`, `itwiki`, `jawiki`, `nlwiki`, `ptwiki`, `svwiki`, `swwiki`, `viwiki`, `yowiki`, `zhwiki`; paused imported datasets are none.
 
 | Wiki | Publication | Refresh | Provenance | Freshness SLA / imported cutoff |
 | --- | --- | --- | --- | --- |
-| `afwiki` | hidden | qualification | toolforge-qualification | — |
-| `arwiki` | hidden | qualification | toolforge-qualification | — |
-| `arzwiki` | hidden | qualification | toolforge-qualification | — |
+| `afwiki` | published | scheduled | toolforge | 10 days |
+| `arwiki` | published | scheduled | toolforge | 10 days |
+| `arzwiki` | published | scheduled | toolforge | 10 days |
 | `elwiki` | published | scheduled | toolforge | 10 days |
-| `eswiki` | hidden | qualification | toolforge-qualification | — |
+| `eswiki` | published | scheduled | toolforge | 10 days |
 | `frwiki` | published | scheduled | toolforge | 10 days |
-| `hawiki` | hidden | qualification | toolforge-qualification | — |
+| `hawiki` | published | scheduled | toolforge | 10 days |
 | `itwiki` | published | scheduled | toolforge | 10 days |
-| `jawiki` | hidden | qualification | toolforge-qualification | — |
+| `jawiki` | published | scheduled | toolforge | 10 days |
 | `nlwiki` | published | scheduled | toolforge | 10 days |
 | `ptwiki` | published | scheduled | toolforge | 10 days |
 | `svwiki` | published | scheduled | toolforge | 10 days |
-| `swwiki` | hidden | qualification | toolforge-qualification | — |
-| `viwiki` | hidden | qualification | toolforge-qualification | — |
-| `yowiki` | hidden | qualification | toolforge-qualification | — |
-| `zhwiki` | hidden | qualification | toolforge-qualification | — |
+| `swwiki` | published | scheduled | toolforge | 10 days |
+| `viwiki` | published | scheduled | toolforge | 10 days |
+| `yowiki` | published | scheduled | toolforge | 10 days |
+| `zhwiki` | published | scheduled | toolforge | 10 days |

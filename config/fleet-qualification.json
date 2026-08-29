@@ -1,7 +1,11 @@
 {
   "schema_version": 1,
   "policy_version": "fleet-qualification-v1",
-  "current_production_wikis": ["elwiki", "frwiki", "itwiki", "nlwiki", "ptwiki", "svwiki"],
+  "current_production_wikis": [
+    "afwiki", "arwiki", "arzwiki", "elwiki", "eswiki", "frwiki",
+    "hawiki", "itwiki", "jawiki", "nlwiki", "ptwiki", "svwiki",
+    "swwiki", "viwiki", "yowiki", "zhwiki"
+  ],
   "stages": [
     {
       "step": 1,

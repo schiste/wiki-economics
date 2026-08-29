@@ -3,25 +3,47 @@
   "publication_contract": {
     "datasets": {
       "business_funnel": { "coverage": "all_published", "minimum_rows_per_wiki": 20 },
-      "gdp": { "coverage": "all_published", "minimum_rows_per_wiki": 5000 },
+      "gdp": {
+        "coverage": "all_published",
+        "minimum_rows_per_wiki": 5000,
+        "minimum_rows_by_wiki": { "hawiki": 2500, "yowiki": 3000 }
+      },
       "gdp_activity_tiers": { "coverage": "all_published", "minimum_rows_per_wiki": 1000 },
       "gdp_user_type_share": { "coverage": "all_published", "minimum_rows_per_wiki": 500 },
       "inequality": { "coverage": "all_published", "minimum_rows_per_wiki": 300 },
       "labor_churn": { "coverage": "all_published", "minimum_rows_per_wiki": 300 },
       "labor_cohorts": { "coverage": "all_published", "minimum_rows_per_wiki": 200 },
-      "labor_monthly": { "coverage": "all_published", "minimum_rows_per_wiki": 5000 },
+      "labor_monthly": {
+        "coverage": "all_published",
+        "minimum_rows_per_wiki": 5000,
+        "minimum_rows_by_wiki": { "hawiki": 2500, "yowiki": 3000 }
+      },
       "page_weekly_edits": {
-        "wikis": ["elwiki", "frwiki", "itwiki", "nlwiki", "ptwiki", "svwiki"],
+        "wikis": [
+          "afwiki", "arwiki", "arzwiki", "elwiki", "eswiki", "frwiki",
+          "hawiki", "itwiki", "jawiki", "nlwiki", "ptwiki", "svwiki",
+          "swwiki", "viwiki", "yowiki", "zhwiki"
+        ],
         "minimum_rows_per_wiki": 30000000,
         "minimum_rows_by_wiki": {
           "elwiki": 5000000,
           "itwiki": 75000000,
-          "svwiki": 40000000
+          "svwiki": 40000000,
+          "afwiki": 1000000,
+          "arzwiki": 7500000,
+          "hawiki": 250000,
+          "swwiki": 750000,
+          "yowiki": 300000
         }
       },
       "patrol": {
-        "wikis": ["elwiki", "frwiki", "itwiki", "nlwiki", "ptwiki", "svwiki"],
-        "minimum_rows_per_wiki": 5000
+        "wikis": [
+          "afwiki", "arwiki", "arzwiki", "elwiki", "eswiki", "frwiki",
+          "hawiki", "itwiki", "jawiki", "nlwiki", "ptwiki", "svwiki",
+          "swwiki", "viwiki", "yowiki", "zhwiki"
+        ],
+        "minimum_rows_per_wiki": 5000,
+        "minimum_rows_by_wiki": { "hawiki": 2000, "yowiki": 2500 }
       }
     }
   },
@@ -99,9 +121,10 @@
       }
     },
     "afwiki": {
-      "publication": "hidden",
-      "refresh": "qualification",
-      "provenance": "toolforge-qualification",
+      "publication": "published",
+      "refresh": "scheduled",
+      "provenance": "toolforge",
+      "freshness_sla_days": 10,
       "retention": {
         "source_recoverability": "redownloadable",
         "history_input": "purge_after_ready",
@@ -110,9 +133,10 @@
       }
     },
     "arwiki": {
-      "publication": "hidden",
-      "refresh": "qualification",
-      "provenance": "toolforge-qualification",
+      "publication": "published",
+      "refresh": "scheduled",
+      "provenance": "toolforge",
+      "freshness_sla_days": 10,
       "fleet_resource_class": "medium_large",
       "retention": {
         "source_recoverability": "redownloadable",
@@ -122,9 +146,10 @@
       }
     },
     "arzwiki": {
-      "publication": "hidden",
-      "refresh": "qualification",
-      "provenance": "toolforge-qualification",
+      "publication": "published",
+      "refresh": "scheduled",
+      "provenance": "toolforge",
+      "freshness_sla_days": 10,
       "retention": {
         "source_recoverability": "redownloadable",
         "history_input": "purge_after_ready",
@@ -133,9 +158,10 @@
       }
     },
     "eswiki": {
-      "publication": "hidden",
-      "refresh": "qualification",
-      "provenance": "toolforge-qualification",
+      "publication": "published",
+      "refresh": "scheduled",
+      "provenance": "toolforge",
+      "freshness_sla_days": 10,
       "fleet_resource_class": "medium_large",
       "retention": {
         "source_recoverability": "redownloadable",
@@ -145,9 +171,10 @@
       }
     },
     "hawiki": {
-      "publication": "hidden",
-      "refresh": "qualification",
-      "provenance": "toolforge-qualification",
+      "publication": "published",
+      "refresh": "scheduled",
+      "provenance": "toolforge",
+      "freshness_sla_days": 10,
       "retention": {
         "source_recoverability": "redownloadable",
         "history_input": "purge_after_ready",
@@ -156,9 +183,10 @@
       }
     },
     "jawiki": {
-      "publication": "hidden",
-      "refresh": "qualification",
-      "provenance": "toolforge-qualification",
+      "publication": "published",
+      "refresh": "scheduled",
+      "provenance": "toolforge",
+      "freshness_sla_days": 10,
       "fleet_resource_class": "medium_large",
       "retention": {
         "source_recoverability": "redownloadable",
@@ -168,9 +196,10 @@
       }
     },
     "swwiki": {
-      "publication": "hidden",
-      "refresh": "qualification",
-      "provenance": "toolforge-qualification",
+      "publication": "published",
+      "refresh": "scheduled",
+      "provenance": "toolforge",
+      "freshness_sla_days": 10,
       "retention": {
         "source_recoverability": "redownloadable",
         "history_input": "purge_after_ready",
@@ -179,9 +208,10 @@
       }
     },
     "viwiki": {
-      "publication": "hidden",
-      "refresh": "qualification",
-      "provenance": "toolforge-qualification",
+      "publication": "published",
+      "refresh": "scheduled",
+      "provenance": "toolforge",
+      "freshness_sla_days": 10,
       "fleet_resource_class": "medium_large",
       "retention": {
         "source_recoverability": "redownloadable",
@@ -191,9 +221,10 @@
       }
     },
     "yowiki": {
-      "publication": "hidden",
-      "refresh": "qualification",
-      "provenance": "toolforge-qualification",
+      "publication": "published",
+      "refresh": "scheduled",
+      "provenance": "toolforge",
+      "freshness_sla_days": 10,
       "retention": {
         "source_recoverability": "redownloadable",
         "history_input": "purge_after_ready",
@@ -202,9 +233,10 @@
       }
     },
     "zhwiki": {
-      "publication": "hidden",
-      "refresh": "qualification",
-      "provenance": "toolforge-qualification",
+      "publication": "published",
+      "refresh": "scheduled",
+      "provenance": "toolforge",
+      "freshness_sla_days": 10,
       "fleet_resource_class": "medium_large",
       "retention": {
         "source_recoverability": "redownloadable",

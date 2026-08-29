@@ -215,7 +215,7 @@ test("an active refresh owns metadata, rejects overlap, and releases cleanly", a
   assert.doesNotMatch(runLog, /\u001b\[/);
   assert.equal(
     fs.readFileSync(fixture.driverArgs, "utf8").trim(),
-    "--version 2026-07 elwiki frwiki itwiki nlwiki ptwiki svwiki",
+    "--version 2026-07 afwiki arwiki arzwiki elwiki eswiki frwiki hawiki itwiki jawiki nlwiki ptwiki svwiki swwiki viwiki yowiki zhwiki",
   );
   assert.equal(fs.readFileSync(fixture.driverEnv, "utf8"), "1\n1\n1\n1\nunset\n");
 });
@@ -247,7 +247,7 @@ test("an on-demand stage is passed through to the refresh driver", () => {
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
   assert.equal(
     fs.readFileSync(fixture.driverArgs, "utf8").trim(),
-    "--version 2026-07 elwiki frwiki itwiki nlwiki ptwiki svwiki --stage ingest",
+    "--version 2026-07 afwiki arwiki arzwiki elwiki eswiki frwiki hawiki itwiki jawiki nlwiki ptwiki svwiki swwiki viwiki yowiki zhwiki --stage ingest",
   );
 });
 

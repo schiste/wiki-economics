@@ -62,9 +62,11 @@ and higher resource envelope are being qualified.
   disconnected log stream or concurrent build cannot produce a false result.
 - `jobs.yaml` — one Rust fleet controller, two fixed small-wiki workers, one
   fixed medium/large worker, and the short `wiki-econ-publish-ready` job, plus
-  legacy on-demand recovery jobs. The controller represents elwiki, frwiki,
-  itwiki, nlwiki, ptwiki, and svwiki from the lifecycle registry; adding a wiki
-  does not add a Toolforge Job definition. Monthly layouts remain isolated
+  legacy on-demand recovery jobs. The controller represents the sixteen
+  scheduled wikis declared by the lifecycle registry: afwiki, arwiki, arzwiki,
+  elwiki, eswiki, frwiki, hawiki, itwiki, jawiki, nlwiki, ptwiki, svwiki,
+  swwiki, viwiki, yowiki, and zhwiki. Adding a wiki does not add a Toolforge
+  Job definition. Monthly layouts remain isolated
   because no production isolated worker exists.
   The full state machine and recovery boundary are documented in
   [per-wiki candidate preparation and publication](../../docs/candidate-publication.md).

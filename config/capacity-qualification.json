@@ -35,6 +35,56 @@
       "maximum_source_workers": 1,
       "minimum_identical_runs": 2,
       "required_bucket_counts": [256, 512, 1024]
+    },
+    "afwiki": {
+      "raw_transient_requirement_bytes": 1073741824,
+      "maximum_source_workers": 1,
+      "required_bucket_counts": [256]
+    },
+    "arwiki": {
+      "raw_transient_requirement_bytes": 6442450944,
+      "maximum_source_workers": 1,
+      "required_bucket_counts": [256]
+    },
+    "arzwiki": {
+      "raw_transient_requirement_bytes": 1073741824,
+      "maximum_source_workers": 1,
+      "required_bucket_counts": [256]
+    },
+    "eswiki": {
+      "raw_transient_requirement_bytes": 17179869184,
+      "maximum_source_workers": 1,
+      "required_bucket_counts": [256]
+    },
+    "hawiki": {
+      "raw_transient_requirement_bytes": 1073741824,
+      "maximum_source_workers": 1,
+      "required_bucket_counts": [256]
+    },
+    "jawiki": {
+      "raw_transient_requirement_bytes": 10737418240,
+      "maximum_source_workers": 1,
+      "required_bucket_counts": [256]
+    },
+    "swwiki": {
+      "raw_transient_requirement_bytes": 1073741824,
+      "maximum_source_workers": 1,
+      "required_bucket_counts": [256]
+    },
+    "viwiki": {
+      "raw_transient_requirement_bytes": 5368709120,
+      "maximum_source_workers": 1,
+      "required_bucket_counts": [256]
+    },
+    "yowiki": {
+      "raw_transient_requirement_bytes": 1073741824,
+      "maximum_source_workers": 1,
+      "required_bucket_counts": [256]
+    },
+    "zhwiki": {
+      "raw_transient_requirement_bytes": 8589934592,
+      "maximum_source_workers": 1,
+      "required_bucket_counts": [256]
     }
   }
 }

@@ -55,13 +55,18 @@ function validRegistry() {
 
 test("production lifecycle schedules qualified Toolforge wikis", () => {
   const registry = loadWikiLifecycle(path.join(__dirname, ".."), {});
+  const productionWikis = [
+    "afwiki", "arwiki", "arzwiki", "elwiki", "eswiki", "frwiki",
+    "hawiki", "itwiki", "jawiki", "nlwiki", "ptwiki", "svwiki",
+    "swwiki", "viwiki", "yowiki", "zhwiki",
+  ];
   assert.deepEqual(
     resolveRefreshWikis(registry, {}),
-    ["elwiki", "frwiki", "itwiki", "nlwiki", "ptwiki", "svwiki"],
+    productionWikis,
   );
   assert.deepEqual(
     wikisWithState(registry, "publication", "published"),
-    ["elwiki", "frwiki", "itwiki", "nlwiki", "ptwiki", "svwiki"],
+    productionWikis,
   );
   assert.equal(registry.wikis.frwiki.refresh, "scheduled");
   assert.equal(registry.wikis.frwiki.provenance, "toolforge");
@@ -70,7 +75,7 @@ test("production lifecycle schedules qualified Toolforge wikis", () => {
   assert.equal(registry.wikis.ptwiki.refresh, "scheduled");
   assert.equal(registry.wikis.ptwiki.provenance, "toolforge");
   assert.equal(registry.wikis.ptwiki.imported_cutoff, undefined);
-  for (const wiki of ["elwiki", "itwiki", "svwiki"]) {
+  for (const wiki of productionWikis) {
     assert.equal(registry.wikis[wiki].publication, "published");
     assert.equal(registry.wikis[wiki].refresh, "scheduled");
     assert.equal(registry.wikis[wiki].provenance, "toolforge");
@@ -192,15 +197,15 @@ test("CLI validates and lists lifecycle selections", () => {
   assert.equal(execFileSync(process.execPath, [SCRIPT, "validate"], { env, encoding: "utf8" }), "");
   assert.equal(
     execFileSync(process.execPath, [SCRIPT, "refresh-wikis"], { env, encoding: "utf8" }),
-    "elwiki\nfrwiki\nitwiki\nnlwiki\nptwiki\nsvwiki\n",
+    "afwiki\narwiki\narzwiki\nelwiki\neswiki\nfrwiki\nhawiki\nitwiki\njawiki\nnlwiki\nptwiki\nsvwiki\nswwiki\nviwiki\nyowiki\nzhwiki\n",
   );
   assert.equal(
     execFileSync(process.execPath, [SCRIPT, "published-wikis"], { env, encoding: "utf8" }),
-    "elwiki\nfrwiki\nitwiki\nnlwiki\nptwiki\nsvwiki\n",
+    "afwiki\narwiki\narzwiki\nelwiki\neswiki\nfrwiki\nhawiki\nitwiki\njawiki\nnlwiki\nptwiki\nsvwiki\nswwiki\nviwiki\nyowiki\nzhwiki\n",
   );
   assert.equal(
     execFileSync(process.execPath, [SCRIPT, "qualification-wikis"], { env, encoding: "utf8" }),
-    "afwiki\narwiki\narzwiki\neswiki\nhawiki\njawiki\nswwiki\nviwiki\nyowiki\nzhwiki\n",
+    "\n",
   );
   assert.equal(JSON.parse(execFileSync(process.execPath, [SCRIPT, "json"], { env, encoding: "utf8" })).schema_version, 1);
   assert.throws(() => execFileSync(process.execPath, [SCRIPT, "unknown"], { env, stdio: "pipe" }));

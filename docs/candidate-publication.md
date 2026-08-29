@@ -89,7 +89,7 @@ artifacts. Any failure in
 that sequence restores both the old wiki paths and snapshot pointers.
 
 The production SLO for the receipt-backed `publication_prepare` stage is three
-minutes for the current six-wiki set. The run record retains the exact change
+minutes for the complete scheduled lifecycle set. The run record retains the exact change
 plan and the public freshness endpoint raises
 `incremental_publication_slow` when a successful incremental publication
 exceeds that bound. A baseline publication that changes every family and
