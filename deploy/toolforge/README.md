@@ -301,6 +301,18 @@ that registry are used. The legacy `WIKI_ECON_ENABLED_WIKIS` name remains a
 backward-compatible alias. Paused imported wikis remain published and are not
 cleanup candidates; see [wiki lifecycle management](../../docs/wiki-lifecycle.md).
 
+Published redownloadable wikis use per-project retention from
+`config/wiki-lifecycle.json`. Audit before applying it manually:
+
+```bash
+wiki_econ_run_cli retention-audit --lifecycle "$WIKI_ECON_WIKI_LIFECYCLE_FILE" nlwiki
+wiki_econ_run_cli retention-apply --lifecycle "$WIKI_ECON_WIKI_LIFECYCLE_FILE" nlwiki
+```
+
+The scheduled publisher runs the same apply step only after a committed
+publication or verified no-op. Never delete generation directories manually;
+imported or otherwise irreplaceable projects must use retained inputs.
+
 ### ptwiki production qualification
 
 ptwiki joined the weekly schedule after the 2026-08-23 qualification against

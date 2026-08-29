@@ -39,6 +39,20 @@ rollback_on_failure() {
 trap rollback_on_failure EXIT
 trap 'failure_error="command failed: $BASH_COMMAND"' ERR
 
+apply_input_retention() {
+  local -a retention_wikis=()
+  while IFS= read -r wiki; do
+    [ -n "$wiki" ] && retention_wikis+=("$wiki")
+  done < <(node "$ROOT/scripts/wiki-lifecycle.cjs" published-wikis)
+  if [ "${#retention_wikis[@]}" -eq 0 ]; then
+    return 0
+  fi
+  echo "==> Applying receipt-authorized per-wiki input retention"
+  wiki_econ_run_cli retention-apply \
+    --lifecycle "$WIKI_ECON_WIKI_LIFECYCLE_FILE" \
+    "${retention_wikis[@]}"
+}
+
 echo "==> Auditing and recovering interrupted publication transactions"
 recovery_report="${WIKI_ECON_RUN_STATE_FILE%.state}.recovery.json"
 wiki_econ_run_cli publication-recover \
@@ -70,6 +84,7 @@ selection_state="$(node -e '
 case "$selection_state" in
   no_op)
     echo "==> No changed ready candidates; publication is a recorded no-op"
+    apply_input_retention
     exit 0
     ;;
   selected)
@@ -90,3 +105,4 @@ site_published=1
 wiki_econ_run_cli publication-commit-ready
 selection_active=0
 echo "==> Ready candidates published and committed"
+apply_input_retention

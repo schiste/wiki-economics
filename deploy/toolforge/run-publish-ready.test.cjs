@@ -46,3 +46,19 @@ test("publisher exits before the site build for an unchanged selection", () => {
   assert.match(transactionScript, /selection\.schema_version !== 1/);
   assert.match(transactionScript, /selection\.run_id !== process\.argv\[2\]/);
 });
+
+test("publisher applies authorized input retention only after a safe terminal state", () => {
+  const retentionFunction = transactionScript.indexOf("apply_input_retention() {");
+  const noOpState = transactionScript.indexOf("no_op)");
+  const noOpRetention = transactionScript.indexOf("apply_input_retention", noOpState);
+  const siteBuild = transactionScript.indexOf('"$ROOT/scripts/build-site.sh"', noOpRetention);
+  const commit = transactionScript.lastIndexOf("publication-commit-ready");
+  const committedRetention = transactionScript.indexOf("apply_input_retention", commit);
+
+  assert.ok(retentionFunction >= 0);
+  assert.ok(noOpRetention > noOpState);
+  assert.ok(noOpRetention < siteBuild);
+  assert.ok(committedRetention > commit);
+  assert.match(transactionScript, /wiki-lifecycle\.cjs" published-wikis/);
+  assert.match(transactionScript, /retention-apply/);
+});

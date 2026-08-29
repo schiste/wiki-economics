@@ -137,6 +137,15 @@ Expired, well-identified site/run staging is removed by run ID. Malformed or
 unknown objects found inside pipeline-owned candidate/staging namespaces are
 moved to `_quarantine` with a JSON receipt instead of being deleted.
 
+For lifecycle entries whose inputs are explicitly `redownloadable`, the
+publisher also invokes receipt-authorized retention after a successful commit
+or a publication no-op. The resulting `data/retention/<wiki>/<snapshot>.json`
+receipt lets publication authenticate intentionally absent input without
+misrepresenting it as a computable generation. Public metric artifacts remain
+covered by their own receipts, and one computed rollback candidate remains
+available. A future recomputation recreates the generation from the canonical
+source plan before any new candidate can become ready.
+
 ## Toolforge jobs
 
 The scheduled jobs are:
