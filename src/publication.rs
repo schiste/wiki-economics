@@ -583,6 +583,60 @@ fn patrol_source_report_with_generation(
     })
 }
 
+fn publication_patrol_source_report(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot: &str,
+    previous_gate: Option<&GateReceipt>,
+    current_proof: &WikiPublicationProof,
+) -> Result<PatrolSourceReport> {
+    if data_dir.join("patrol").join(wiki).is_dir() {
+        return patrol_source_report(data_dir, wiki, snapshot);
+    }
+
+    let retention = crate::retention::validate_purged_snapshot(data_dir, wiki, snapshot)
+        .with_context(|| format!("patrol source inputs are missing for {wiki}"))?;
+    ensure!(
+        retention.patrol_source == crate::retention::InputRetention::PurgeAfterReady,
+        "retention receipt does not authorize purged patrol inputs for {wiki}"
+    );
+    ensure!(
+        retention.authorized_ready_sha256 == current_proof.ready_receipt_sha256,
+        "retention receipt does not authorize the active ready candidate for {wiki}"
+    );
+    let previous_gate = previous_gate.with_context(|| {
+        format!("purged patrol source for {wiki} has no prior publication gate")
+    })?;
+    ensure!(
+        previous_gate
+            .selected_snapshot_versions
+            .get(wiki)
+            .map(String::as_str)
+            == Some(snapshot),
+        "prior patrol source report belongs to another snapshot for {wiki}"
+    );
+    let previous_proof = previous_gate
+        .wiki_proofs
+        .get(wiki)
+        .with_context(|| format!("prior publication gate has no wiki proof for {wiki}"))?;
+    ensure!(
+        previous_proof.ready_receipt_sha256 == current_proof.ready_receipt_sha256,
+        "prior patrol source report belongs to another ready candidate for {wiki}"
+    );
+    let report = previous_gate
+        .patrol_sources
+        .get(wiki)
+        .cloned()
+        .with_context(|| {
+            format!("prior publication gate has no patrol source report for {wiki}")
+        })?;
+    ensure!(
+        report.patrol_events > 0 && report.rights_events > 0,
+        "prior publication gate has empty patrol or rights source data for {wiki}"
+    );
+    Ok(report)
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct BrowserDataReport {
     generation: String,
@@ -622,7 +676,7 @@ struct PublicationChangePlan {
     reused: Vec<PublicationChange>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct GateReceipt {
     schema_version: u8,
     run_id: String,
@@ -649,7 +703,7 @@ struct GateReceipt {
     change_plan: Option<PublicationChangePlan>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct PublicationProvenance {
     run_id: String,
     generating_commit: Option<String>,
@@ -4474,9 +4528,18 @@ pub fn validate(
         let snapshot = selected_snapshots
             .get(&wiki)
             .with_context(|| format!("scheduled wiki {wiki} has no selected snapshot"))?;
+        let proof = wiki_proofs
+            .get(&wiki)
+            .with_context(|| format!("publication proof is missing for {wiki}"))?;
         patrol_sources.insert(
             wiki.clone(),
-            patrol_source_report(data_dir, &wiki, snapshot)?,
+            publication_patrol_source_report(
+                data_dir,
+                &wiki,
+                snapshot,
+                previous_gate.as_ref(),
+                proof,
+            )?,
         );
     }
     let policy = licensing::publication_policy()?;
@@ -6233,6 +6296,141 @@ mod tests {
         );
         assert!(!fixture.data.path().join("patrol/nlwiki").exists());
 
+        let registry = load_lifecycle(&fixture.lifecycle_path)?;
+        let proof =
+            current_publication_proofs(fixture.data.path(), fixture.output.path(), &registry)?
+                .remove("nlwiki")
+                .context("fixture publication proof should exist")?;
+        let gate: GateReceipt = read_json(&fixture.output.path().join(RECEIPT_FILE))?;
+        assert!(
+            publication_patrol_source_report(
+                fixture.data.path(),
+                "nlwiki",
+                "2026-03",
+                None,
+                &proof,
+            )
+            .is_err()
+        );
+
+        let retention_path =
+            crate::retention::receipt_path(fixture.data.path(), "nlwiki", "2026-03")?;
+        let retention: crate::retention::RetentionReceipt = read_json(&retention_path)?;
+        fs::rename(&retention_path, retention_path.with_extension("missing"))?;
+        assert!(
+            publication_patrol_source_report(
+                fixture.data.path(),
+                "nlwiki",
+                "2026-03",
+                Some(&gate),
+                &proof,
+            )
+            .is_err()
+        );
+        fs::rename(retention_path.with_extension("missing"), &retention_path)?;
+
+        let mut invalid_retention = retention.clone();
+        invalid_retention.patrol_source = crate::retention::InputRetention::Retain;
+        atomic_json(&retention_path, &invalid_retention)?;
+        assert!(
+            publication_patrol_source_report(
+                fixture.data.path(),
+                "nlwiki",
+                "2026-03",
+                Some(&gate),
+                &proof,
+            )
+            .is_err()
+        );
+        atomic_json(&retention_path, &retention)?;
+
+        let mut wrong_current_proof = proof.clone();
+        wrong_current_proof.ready_receipt_sha256 = "0".repeat(64);
+        assert!(
+            publication_patrol_source_report(
+                fixture.data.path(),
+                "nlwiki",
+                "2026-03",
+                Some(&gate),
+                &wrong_current_proof,
+            )
+            .is_err()
+        );
+
+        let mut wrong_snapshot_gate = gate.clone();
+        wrong_snapshot_gate
+            .selected_snapshot_versions
+            .insert("nlwiki".to_string(), "2026-02".to_string());
+        assert!(
+            publication_patrol_source_report(
+                fixture.data.path(),
+                "nlwiki",
+                "2026-03",
+                Some(&wrong_snapshot_gate),
+                &proof,
+            )
+            .is_err()
+        );
+
+        let mut missing_proof_gate = gate.clone();
+        missing_proof_gate.wiki_proofs.remove("nlwiki");
+        assert!(
+            publication_patrol_source_report(
+                fixture.data.path(),
+                "nlwiki",
+                "2026-03",
+                Some(&missing_proof_gate),
+                &proof,
+            )
+            .is_err()
+        );
+
+        let mut wrong_prior_proof_gate = gate.clone();
+        wrong_prior_proof_gate
+            .wiki_proofs
+            .get_mut("nlwiki")
+            .context("fixture prior proof should exist")?
+            .ready_receipt_sha256 = "0".repeat(64);
+        assert!(
+            publication_patrol_source_report(
+                fixture.data.path(),
+                "nlwiki",
+                "2026-03",
+                Some(&wrong_prior_proof_gate),
+                &proof,
+            )
+            .is_err()
+        );
+
+        let mut missing_patrol_gate = gate.clone();
+        missing_patrol_gate.patrol_sources.remove("nlwiki");
+        assert!(
+            publication_patrol_source_report(
+                fixture.data.path(),
+                "nlwiki",
+                "2026-03",
+                Some(&missing_patrol_gate),
+                &proof,
+            )
+            .is_err()
+        );
+        let mut empty_patrol_gate = gate.clone();
+        empty_patrol_gate
+            .patrol_sources
+            .get_mut("nlwiki")
+            .context("fixture patrol source report should exist")?
+            .patrol_events = 0;
+        assert!(
+            publication_patrol_source_report(
+                fixture.data.path(),
+                "nlwiki",
+                "2026-03",
+                Some(&empty_patrol_gate),
+                &proof,
+            )
+            .is_err()
+        );
+
         let plan = plan_wiki_preparation(
             fixture.data.path(),
             fixture.output.path(),
@@ -6252,6 +6450,78 @@ mod tests {
         let selection_file = selection_path(fixture.output.path(), "retention-noop-publish")?;
         let selection: PublicationSelection = read_json(&selection_file)?;
         assert_eq!(selection.state, "no_op");
+
+        atomic_json(
+            &fixture.output.path().join(RECEIPT_FILE),
+            &missing_patrol_gate,
+        )
+        .expect("missing patrol report fixture should publish");
+        begin_run(
+            fixture.output.path(),
+            Some("retention-missing-patrol-provenance"),
+            &[],
+            None,
+        )
+        .expect("missing-provenance validation run should initialize");
+        record_candidate(
+            fixture.output.path(),
+            Some("retention-missing-patrol-provenance"),
+            &fixture.names(),
+        )
+        .expect("missing-provenance publication candidate should record");
+        let missing_provenance_error = validate(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "retention-missing-patrol-provenance",
+        )
+        .expect_err("publication validation must reject missing retained patrol provenance");
+        assert!(
+            format!("{missing_provenance_error:#}")
+                .contains("prior publication gate has no patrol source report"),
+            "unexpected missing-provenance failure: {missing_provenance_error:#}"
+        );
+        atomic_json(&fixture.output.path().join(RECEIPT_FILE), &gate)?;
+
+        let mut lifecycle: Value = read_json(&fixture.lifecycle_path)?;
+        lifecycle["wikis"]["hiddenwiki"] = json!({
+            "publication": "hidden",
+            "refresh": "qualification",
+            "provenance": "toolforge-qualification"
+        });
+        atomic_json(&fixture.lifecycle_path, &lifecycle)?;
+        fs::rename(&retention_path, retention_path.with_extension("missing"))?;
+        prepare_ready_publication(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "retention-contract-change-rejected",
+        )
+        .expect_err("a publication rebuild without retained patrol provenance must fail");
+        fs::rename(retention_path.with_extension("missing"), &retention_path)?;
+        prepare_ready_publication(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "retention-contract-change",
+        )
+        .expect("a lifecycle-only publication rebuild should reuse purged patrol provenance");
+        let changed_selection_path =
+            selection_path(fixture.output.path(), "retention-contract-change")
+                .expect("changed publication selection path should be valid");
+        let changed_selection: PublicationSelection = read_json(&changed_selection_path)
+            .expect("changed publication selection should be readable");
+        assert_eq!(changed_selection.state, "selected");
+        assert!(changed_selection.entries.is_empty());
+        let changed_gate: GateReceipt = read_json(&fixture.output.path().join(RECEIPT_FILE))?;
+        assert_eq!(changed_gate.run_id, "retention-contract-change");
+        assert_eq!(changed_gate.patrol_sources["nlwiki"].patrol_events, 1);
+        commit_ready_publication(
+            fixture.data.path(),
+            fixture.output.path(),
+            "retention-contract-change",
+        )
+        .expect("changed publication should commit");
 
         let candidate = wiki_candidate_dir(
             fixture.output.path(),
