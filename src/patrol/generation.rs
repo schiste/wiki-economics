@@ -3,7 +3,7 @@ use serde::de::DeserializeOwned;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufWriter};
+use std::io::{self, BufRead, BufWriter};
 use std::marker::PhantomData;
 
 const GENERATION_SCHEMA_VERSION: u32 = 2;
@@ -16,6 +16,7 @@ const EXTERNAL_SORT_BATCH_ROWS: usize = 2;
 const EXTERNAL_SORT_FAN_IN: usize = 16;
 #[cfg(test)]
 const EXTERNAL_SORT_FAN_IN: usize = 2;
+const NFS_DIRECTORY_REMOVE_ATTEMPTS: usize = 6;
 
 #[derive(Debug, Serialize)]
 struct CurrentPatrolGeneration {
@@ -227,13 +228,45 @@ fn spool_path(root: &Path, kind: &str, month: &str) -> Result<PathBuf> {
 fn remove_spool_tree(root: &Path, kind: &str) -> Result<()> {
     let path = root.join(".spool").join(kind);
     if path.exists() {
-        fs::remove_dir_all(&path)?;
+        remove_directory_tree(&path)?;
     }
     let spool_root = root.join(".spool");
     if spool_root.is_dir() && fs::read_dir(&spool_root)?.next().is_none() {
-        fs::remove_dir(&spool_root)?;
+        remove_directory_tree(&spool_root)?;
     }
     Ok(())
+}
+
+fn remove_directory_tree(path: &Path) -> Result<()> {
+    let context = format!(
+        "failed to remove committed patrol scratch directory {}",
+        path.display()
+    );
+    retry_nfs_directory_remove(|| fs::remove_dir_all(path)).context(context)
+}
+
+fn retry_nfs_directory_remove<F>(mut remove: F) -> io::Result<()>
+where
+    F: FnMut() -> io::Result<()>,
+{
+    let mut attempt = 0_usize;
+    loop {
+        match remove() {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error)
+                if error.kind() == io::ErrorKind::DirectoryNotEmpty
+                    && attempt + 1 < NFS_DIRECTORY_REMOVE_ATTEMPTS =>
+            {
+                #[cfg(not(test))]
+                std::thread::sleep(std::time::Duration::from_millis(25_u64 << attempt.min(4)));
+                #[cfg(test)]
+                std::thread::yield_now();
+                attempt += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn commit_month_artifact(temporary: &Path, final_path: &Path) -> Result<()> {
@@ -281,7 +314,7 @@ where
         fs::remove_file(spool)?;
         Ok::<_, anyhow::Error>(())
     })();
-    let cleanup = fs::remove_dir_all(&work);
+    let cleanup = remove_directory_tree(&work);
     result?;
     cleanup?;
     Ok(())
@@ -466,11 +499,16 @@ pub(super) fn fetch<T: PatrolTransport + ?Sized>(
     let generation = match result {
         Ok(generation) => generation,
         Err(error) => {
-            let _ = fs::remove_dir_all(&staging);
+            let _ = remove_directory_tree(&staging);
             return Err(error);
         }
     };
-    fs::rename(&staging, &final_root)?;
+    let publish_context = format!(
+        "failed to publish patrol generation {} as {}",
+        staging.display(),
+        final_root.display()
+    );
+    fs::rename(&staging, &final_root).context(publish_context)?;
     File::open(generations)?.sync_all()?;
     validate(&final_root, wiki, snapshot, &generation)?;
     publish_current_pointer(data_dir, wiki, &generation)?;
@@ -742,4 +780,60 @@ pub(super) fn atomic_json<T: Serialize>(path: &Path, value: &T) -> Result<()> {
         let _ = fs::remove_file(temporary);
     }
     result
+}
+
+#[cfg(test)]
+mod directory_remove_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn nfs_directory_remove_retries_only_transient_nonempty_errors() {
+        let attempts = Cell::new(0_usize);
+        retry_nfs_directory_remove(|| {
+            let attempt = attempts.get();
+            attempts.set(attempt + 1);
+            if attempt < 2 {
+                Err(io::Error::from(io::ErrorKind::DirectoryNotEmpty))
+            } else {
+                Ok(())
+            }
+        })
+        .expect("a transient NFS directory state should be retried");
+        assert_eq!(attempts.get(), 3);
+
+        retry_nfs_directory_remove(|| Err(io::Error::from(io::ErrorKind::NotFound)))
+            .expect("an already removed scratch directory is successful");
+
+        let other = retry_nfs_directory_remove(|| {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "not retryable",
+            ))
+        })
+        .expect_err("unrelated filesystem failures must remain fail-closed");
+        assert_eq!(other.kind(), io::ErrorKind::PermissionDenied);
+
+        let persistent = Cell::new(0_usize);
+        let error = retry_nfs_directory_remove(|| {
+            persistent.set(persistent.get() + 1);
+            Err(io::Error::from(io::ErrorKind::DirectoryNotEmpty))
+        })
+        .expect_err("persistent non-empty scratch must not be hidden");
+        assert_eq!(error.kind(), io::ErrorKind::DirectoryNotEmpty);
+        assert_eq!(persistent.get(), NFS_DIRECTORY_REMOVE_ATTEMPTS);
+    }
+
+    #[test]
+    fn patrol_scratch_tree_removal_is_idempotent() -> Result<()> {
+        let root = crate::test_support::TestDir::new()?;
+        let scratch = root.path().join("nested/scratch");
+        fs::create_dir_all(scratch.join("child"))?;
+        fs::write(scratch.join("child/part"), b"scratch")?;
+
+        remove_directory_tree(&scratch)?;
+        assert!(!scratch.exists());
+        remove_directory_tree(&scratch)?;
+        Ok(())
+    }
 }
