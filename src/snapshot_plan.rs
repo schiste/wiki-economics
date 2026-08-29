@@ -13,6 +13,54 @@ pub(crate) const MEDIAWIKI_HISTORY_BASE_URL: &str =
 const PLAN_FILENAME: &str = "source-plan.json";
 const FIRST_HISTORY_MONTH: &str = "2001-01";
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct YearlySourcePolicy {
+    first_history_month: &'static str,
+    empty_years: &'static [u32],
+}
+
+const DEFAULT_YEARLY_SOURCE_POLICY: YearlySourcePolicy = YearlySourcePolicy {
+    first_history_month: FIRST_HISTORY_MONTH,
+    empty_years: &[],
+};
+
+/// Reviewed physical-layout facts from the MediaWiki History inventory.
+///
+/// These are intentionally source policies rather than workload branches:
+/// they describe which yearly objects Wikimedia publishes. A source named by
+/// the resulting canonical plan is still mandatory and fails closed when it
+/// is absent.
+const YEARLY_SOURCE_POLICIES: &[(&str, YearlySourcePolicy)] = &[
+    (
+        "arwiki",
+        YearlySourcePolicy {
+            first_history_month: "2001-01",
+            empty_years: &[2002],
+        },
+    ),
+    (
+        "jawiki",
+        YearlySourcePolicy {
+            first_history_month: "2002-01",
+            empty_years: &[],
+        },
+    ),
+    (
+        "viwiki",
+        YearlySourcePolicy {
+            first_history_month: "2002-01",
+            empty_years: &[],
+        },
+    ),
+    (
+        "zhwiki",
+        YearlySourcePolicy {
+            first_history_month: "2002-01",
+            empty_years: &[],
+        },
+    ),
+];
+
 /// Wikipedia language editions partitioned yearly in MediaWiki History.
 /// If a project is promoted from all-time to yearly upstream, update this
 /// source-layout registry and its plan fixture together.
@@ -182,7 +230,7 @@ impl SnapshotPlan {
         let layout = source_layout(wiki.as_str())?;
         let last_month = snapshot.following_month()?;
         let first_month = first_history_month(wiki.as_str(), layout);
-        let ranges = source_ranges(layout, &snapshot, first_month, &last_month)?;
+        let ranges = source_ranges(wiki.as_str(), layout, &snapshot, first_month, &last_month)?;
         let mut sources = Vec::with_capacity(ranges.len());
         for (partition, event_range) in ranges {
             let filename = match layout {
@@ -383,11 +431,22 @@ fn source_layout(wiki: &str) -> Result<SourceLayout> {
     }
 }
 
-fn first_history_month(_wiki: &str, _layout: SourceLayout) -> &'static str {
-    FIRST_HISTORY_MONTH
+fn yearly_source_policy(wiki: &str) -> YearlySourcePolicy {
+    YEARLY_SOURCE_POLICIES
+        .iter()
+        .find_map(|(candidate, policy)| (*candidate == wiki).then_some(*policy))
+        .unwrap_or(DEFAULT_YEARLY_SOURCE_POLICY)
+}
+
+fn first_history_month(wiki: &str, layout: SourceLayout) -> &'static str {
+    match layout {
+        SourceLayout::Yearly => yearly_source_policy(wiki).first_history_month,
+        SourceLayout::AllTime | SourceLayout::Monthly => FIRST_HISTORY_MONTH,
+    }
 }
 
 fn source_ranges(
+    wiki: &str,
     layout: SourceLayout,
     snapshot: &SnapshotVersion,
     first_month: &str,
@@ -399,8 +458,11 @@ fn source_ranges(
             DateRange::new(first_month, last_month)?,
         )]),
         SourceLayout::Yearly => {
+            let policy = yearly_source_policy(wiki);
+            let first_year: u32 = first_month[..4].parse()?;
             let end_year = snapshot.year()?;
-            (2001..=end_year)
+            (first_year..=end_year)
+                .filter(|year| !policy.empty_years.contains(year))
                 .map(|year| {
                     let end = if year == end_year {
                         last_month.to_string()
@@ -498,6 +560,59 @@ mod tests {
         assert_eq!(
             all_time.filenames()?,
             ["2026-02.simplewiki.all-time.tsv.bz2"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn yearly_plan_represents_reviewed_sparse_source_inventories() -> Result<()> {
+        let arabic = SnapshotPlan::resolve("arwiki", "2026-07")?;
+        assert_eq!(
+            arabic.expected_date_range,
+            DateRange::new("2001-01", "2026-08")?
+        );
+        assert_eq!(arabic.sources.len(), 25);
+        assert!(
+            arabic
+                .filenames()?
+                .iter()
+                .all(|filename| filename != "2026-07.arwiki.2002.tsv.bz2")
+        );
+        assert_eq!(
+            arabic.sources.first().unwrap().filename()?,
+            "2026-07.arwiki.2001.tsv.bz2"
+        );
+        assert_eq!(
+            arabic.sources.get(1).unwrap().filename()?,
+            "2026-07.arwiki.2003.tsv.bz2"
+        );
+
+        for wiki in ["jawiki", "viwiki", "zhwiki"] {
+            let plan = SnapshotPlan::resolve(wiki, "2026-07")?;
+            assert_eq!(
+                plan.expected_date_range,
+                DateRange::new("2002-01", "2026-08")?
+            );
+            assert_eq!(plan.sources.len(), 25);
+            assert_eq!(
+                plan.sources.first().unwrap().filename()?,
+                format!("2026-07.{wiki}.2002.tsv.bz2")
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn sparse_yearly_plan_still_rejects_an_unplanned_gap() -> Result<()> {
+        let mut plan = SnapshotPlan::resolve("arwiki", "2026-07")?;
+        plan.sources.remove(1);
+        let error = plan
+            .validate()
+            .expect_err("a planned non-empty Arabic year must remain mandatory");
+        assert!(
+            error
+                .to_string()
+                .contains("expected 25 sources but found 24")
         );
         Ok(())
     }
