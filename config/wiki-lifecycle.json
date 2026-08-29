@@ -30,37 +30,188 @@
       "publication": "published",
       "refresh": "scheduled",
       "provenance": "toolforge",
-      "freshness_sla_days": 10
+      "freshness_sla_days": 10,
+      "retention": {
+        "source_recoverability": "redownloadable",
+        "history_input": "purge_after_ready",
+        "patrol_source": "purge_after_ready",
+        "computed_rollback_generations": 1
+      }
     },
     "frwiki": {
       "publication": "published",
       "refresh": "scheduled",
       "provenance": "toolforge",
-      "freshness_sla_days": 10
+      "freshness_sla_days": 10,
+      "retention": {
+        "source_recoverability": "redownloadable",
+        "history_input": "purge_after_ready",
+        "patrol_source": "purge_after_ready",
+        "computed_rollback_generations": 1
+      }
     },
     "itwiki": {
       "publication": "published",
       "refresh": "scheduled",
       "provenance": "toolforge",
-      "freshness_sla_days": 10
+      "freshness_sla_days": 10,
+      "retention": {
+        "source_recoverability": "redownloadable",
+        "history_input": "purge_after_ready",
+        "patrol_source": "purge_after_ready",
+        "computed_rollback_generations": 1
+      }
     },
     "nlwiki": {
       "publication": "published",
       "refresh": "scheduled",
       "provenance": "toolforge",
-      "freshness_sla_days": 10
+      "freshness_sla_days": 10,
+      "retention": {
+        "source_recoverability": "redownloadable",
+        "history_input": "purge_after_ready",
+        "patrol_source": "purge_after_ready",
+        "computed_rollback_generations": 1
+      }
     },
     "ptwiki": {
       "publication": "published",
       "refresh": "scheduled",
       "provenance": "toolforge",
-      "freshness_sla_days": 10
+      "freshness_sla_days": 10,
+      "retention": {
+        "source_recoverability": "redownloadable",
+        "history_input": "purge_after_ready",
+        "patrol_source": "purge_after_ready",
+        "computed_rollback_generations": 1
+      }
     },
     "svwiki": {
       "publication": "published",
       "refresh": "scheduled",
       "provenance": "toolforge",
-      "freshness_sla_days": 10
+      "freshness_sla_days": 10,
+      "retention": {
+        "source_recoverability": "redownloadable",
+        "history_input": "purge_after_ready",
+        "patrol_source": "purge_after_ready",
+        "computed_rollback_generations": 1
+      }
+    },
+    "afwiki": {
+      "publication": "hidden",
+      "refresh": "qualification",
+      "provenance": "toolforge-qualification",
+      "retention": {
+        "source_recoverability": "redownloadable",
+        "history_input": "purge_after_ready",
+        "patrol_source": "purge_after_ready",
+        "computed_rollback_generations": 1
+      }
+    },
+    "arwiki": {
+      "publication": "hidden",
+      "refresh": "qualification",
+      "provenance": "toolforge-qualification",
+      "fleet_resource_class": "medium_large",
+      "retention": {
+        "source_recoverability": "redownloadable",
+        "history_input": "purge_after_ready",
+        "patrol_source": "purge_after_ready",
+        "computed_rollback_generations": 1
+      }
+    },
+    "arzwiki": {
+      "publication": "hidden",
+      "refresh": "qualification",
+      "provenance": "toolforge-qualification",
+      "retention": {
+        "source_recoverability": "redownloadable",
+        "history_input": "purge_after_ready",
+        "patrol_source": "purge_after_ready",
+        "computed_rollback_generations": 1
+      }
+    },
+    "eswiki": {
+      "publication": "hidden",
+      "refresh": "qualification",
+      "provenance": "toolforge-qualification",
+      "fleet_resource_class": "medium_large",
+      "retention": {
+        "source_recoverability": "redownloadable",
+        "history_input": "purge_after_ready",
+        "patrol_source": "purge_after_ready",
+        "computed_rollback_generations": 1
+      }
+    },
+    "hawiki": {
+      "publication": "hidden",
+      "refresh": "qualification",
+      "provenance": "toolforge-qualification",
+      "retention": {
+        "source_recoverability": "redownloadable",
+        "history_input": "purge_after_ready",
+        "patrol_source": "purge_after_ready",
+        "computed_rollback_generations": 1
+      }
+    },
+    "jawiki": {
+      "publication": "hidden",
+      "refresh": "qualification",
+      "provenance": "toolforge-qualification",
+      "fleet_resource_class": "medium_large",
+      "retention": {
+        "source_recoverability": "redownloadable",
+        "history_input": "purge_after_ready",
+        "patrol_source": "purge_after_ready",
+        "computed_rollback_generations": 1
+      }
+    },
+    "swwiki": {
+      "publication": "hidden",
+      "refresh": "qualification",
+      "provenance": "toolforge-qualification",
+      "retention": {
+        "source_recoverability": "redownloadable",
+        "history_input": "purge_after_ready",
+        "patrol_source": "purge_after_ready",
+        "computed_rollback_generations": 1
+      }
+    },
+    "viwiki": {
+      "publication": "hidden",
+      "refresh": "qualification",
+      "provenance": "toolforge-qualification",
+      "fleet_resource_class": "medium_large",
+      "retention": {
+        "source_recoverability": "redownloadable",
+        "history_input": "purge_after_ready",
+        "patrol_source": "purge_after_ready",
+        "computed_rollback_generations": 1
+      }
+    },
+    "yowiki": {
+      "publication": "hidden",
+      "refresh": "qualification",
+      "provenance": "toolforge-qualification",
+      "retention": {
+        "source_recoverability": "redownloadable",
+        "history_input": "purge_after_ready",
+        "patrol_source": "purge_after_ready",
+        "computed_rollback_generations": 1
+      }
+    },
+    "zhwiki": {
+      "publication": "hidden",
+      "refresh": "qualification",
+      "provenance": "toolforge-qualification",
+      "fleet_resource_class": "medium_large",
+      "retention": {
+        "source_recoverability": "redownloadable",
+        "history_input": "purge_after_ready",
+        "patrol_source": "purge_after_ready",
+        "computed_rollback_generations": 1
+      }
     }
   }
 }

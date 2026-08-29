@@ -200,7 +200,7 @@ test("CLI validates and lists lifecycle selections", () => {
   );
   assert.equal(
     execFileSync(process.execPath, [SCRIPT, "qualification-wikis"], { env, encoding: "utf8" }),
-    "\n",
+    "afwiki\narwiki\narzwiki\neswiki\nhawiki\njawiki\nswwiki\nviwiki\nyowiki\nzhwiki\n",
   );
   assert.equal(JSON.parse(execFileSync(process.execPath, [SCRIPT, "json"], { env, encoding: "utf8" })).schema_version, 1);
   assert.throws(() => execFileSync(process.execPath, [SCRIPT, "unknown"], { env, stdio: "pipe" }));

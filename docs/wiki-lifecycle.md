@@ -39,6 +39,28 @@ An optional `fleet_resource_class` may pin `small`, `medium_large`, or
 preferred and uses measured workload signals rather than wiki names. Monthly
 source layouts cannot be overridden out of `isolated`.
 
+Every production entry may define an explicit `retention` policy. The policy
+separates source recoverability from artifact lifetime:
+
+- `source_recoverability` is `redownloadable` or `irreplaceable`;
+- `history_input` and `patrol_source` are `retain` or `purge_after_ready`;
+- `computed_rollback_generations` must currently be one. The field makes the
+  retention contract explicit; accepting zero is deferred until publication
+  recovery can guarantee a safe no-rollback transition.
+
+An irreplaceable source is never eligible for input purging. For a
+redownloadable source, `purge_after_ready` removes only the exact snapshot
+generation and patrol-source paths after the published candidate, public
+snapshot pointer, publication gate, source plan, and every output artifact
+receipt agree. Compact plans, workload profiles, provenance, computed output,
+and the rollback candidate remain.
+
+`wiki-econ retention-audit WIKI...` is read-only. `retention-apply` first
+writes an atomic authorization receipt, then removes its allowlisted paths and
+marks the receipt applied. Interrupted cleanup is idempotent. A same-snapshot
+run authenticates current algorithms and output receipts as a no-op; a
+semantic algorithm change redownloads and rebuilds the input.
+
 ## Runtime behavior
 
 `scripts/wiki-lifecycle.cjs` validates the registry and provides the canonical

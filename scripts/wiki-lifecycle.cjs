@@ -9,6 +9,8 @@ const WIKI_NAME = /^[a-z0-9_]+wiki$/;
 const YEAR_MONTH = /^\d{4}-(0[1-9]|1[0-2])$/;
 const DATASET_NAME = /^[a-z][a-z0-9_]*$/;
 const FLEET_RESOURCE_CLASSES = new Set(["small", "medium_large", "isolated"]);
+const SOURCE_RECOVERABILITY = new Set(["redownloadable", "irreplaceable"]);
+const INPUT_RETENTION = new Set(["retain", "purge_after_ready"]);
 
 function lifecyclePath(root = path.resolve(__dirname, ".."), env = process.env) {
   return path.resolve(env.WIKI_ECON_WIKI_LIFECYCLE_FILE || path.join(root, "config", "wiki-lifecycle.json"));
@@ -74,6 +76,26 @@ function validateWikiLifecycle(registry, label = "wiki lifecycle registry") {
     if (entry.fleet_resource_class != null
       && !FLEET_RESOURCE_CLASSES.has(entry.fleet_resource_class)) {
       throw new Error(`${label}.wikis.${wiki}.fleet_resource_class is invalid`);
+    }
+    const retention = entry.retention;
+    if (retention == null) continue;
+    if (typeof retention !== "object" || Array.isArray(retention)) {
+      throw new Error(`${label}.wikis.${wiki}.retention must be an object when set`);
+    }
+    if (!SOURCE_RECOVERABILITY.has(retention.source_recoverability)) {
+      throw new Error(`${label}.wikis.${wiki}.retention.source_recoverability is invalid`);
+    }
+    for (const field of ["history_input", "patrol_source"]) {
+      if (!INPUT_RETENTION.has(retention[field])) {
+        throw new Error(`${label}.wikis.${wiki}.retention.${field} is invalid`);
+      }
+    }
+    if (retention.computed_rollback_generations !== 1) {
+      throw new Error(`${label}.wikis.${wiki}.retention.computed_rollback_generations must be one`);
+    }
+    if (retention.source_recoverability === "irreplaceable"
+      && (retention.history_input !== "retain" || retention.patrol_source !== "retain")) {
+      throw new Error(`${label}.wikis.${wiki} cannot purge irreplaceable inputs`);
     }
   }
 

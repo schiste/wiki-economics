@@ -69,9 +69,19 @@ datasets are `elwiki`, `frwiki`, `itwiki`, `nlwiki`, `ptwiki`, `svwiki`; paused 
 
 | Wiki | Publication | Refresh | Provenance | Freshness SLA / imported cutoff |
 | --- | --- | --- | --- | --- |
+| `afwiki` | hidden | qualification | toolforge-qualification | — |
+| `arwiki` | hidden | qualification | toolforge-qualification | — |
+| `arzwiki` | hidden | qualification | toolforge-qualification | — |
 | `elwiki` | published | scheduled | toolforge | 10 days |
+| `eswiki` | hidden | qualification | toolforge-qualification | — |
 | `frwiki` | published | scheduled | toolforge | 10 days |
+| `hawiki` | hidden | qualification | toolforge-qualification | — |
 | `itwiki` | published | scheduled | toolforge | 10 days |
+| `jawiki` | hidden | qualification | toolforge-qualification | — |
 | `nlwiki` | published | scheduled | toolforge | 10 days |
 | `ptwiki` | published | scheduled | toolforge | 10 days |
 | `svwiki` | published | scheduled | toolforge | 10 days |
+| `swwiki` | hidden | qualification | toolforge-qualification | — |
+| `viwiki` | hidden | qualification | toolforge-qualification | — |
+| `yowiki` | hidden | qualification | toolforge-qualification | — |
+| `zhwiki` | hidden | qualification | toolforge-qualification | — |
