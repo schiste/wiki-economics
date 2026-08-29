@@ -49,11 +49,13 @@ idle_secs="${WIKI_ECON_FLEET_IDLE_SECS:-60}"
 heartbeat_secs="${WIKI_ECON_FLEET_HEARTBEAT_SECS:-60}"
 lease_timeout_secs="${WIKI_ECON_FLEET_LEASE_TIMEOUT_SECS:-900}"
 max_attempts="${WIKI_ECON_FLEET_MAX_ATTEMPTS:-3}"
+prepare_lock_stale_secs="${WIKI_ECON_PREPARE_LOCK_STALE_SECS:-$lease_timeout_secs}"
 prepare_wrapper="${WIKI_ECON_FLEET_PREPARE_WRAPPER:-$ROOT/deploy/toolforge/run-prepare-wiki.sh}"
-for value in "$idle_secs" "$heartbeat_secs" "$lease_timeout_secs" "$max_attempts"; do
+for value in "$idle_secs" "$heartbeat_secs" "$lease_timeout_secs" "$max_attempts" "$prepare_lock_stale_secs"; do
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || { echo "Fleet timing and retry settings must be positive integers" >&2; exit 2; }
 done
 [ -x "$prepare_wrapper" ] || { echo "Fleet preparation wrapper is not executable: $prepare_wrapper" >&2; exit 2; }
+export WIKI_ECON_PREPARE_LOCK_STALE_SECS="$prepare_lock_stale_secs"
 
 while true; do
   # PIDs are namespaced per container and are therefore commonly identical

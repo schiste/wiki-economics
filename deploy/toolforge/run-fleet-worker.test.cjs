@@ -45,13 +45,19 @@ fi
   const prepare = path.join(root, "prepare");
   fs.writeFileSync(prepare, `#!/bin/sh
 set -eu
-printf 'prepare %s %s %s\n' "$1" "$WIKI_ECON_PREPARE_SNAPSHOT" "$WIKI_ECON_RUN_ID" >> "${log}"
+printf 'prepare %s %s %s stale=%s\n' "$1" "$WIKI_ECON_PREPARE_SNAPSHOT" "$WIKI_ECON_RUN_ID" "$WIKI_ECON_PREPARE_LOCK_STALE_SECS" >> "${log}"
 exit ${failPrepare ? 1 : 0}
 `, {mode: 0o755});
   return {root, log, binary, prepare};
 }
 
-function runWorker({resourceClass = "small", workerInstanceId = "test-pod", ...options} = {}) {
+function runWorker({
+  resourceClass = "small",
+  workerInstanceId = "test-pod",
+  leaseTimeoutSecs = "137",
+  prepareLockStaleSecs = "",
+  ...options
+} = {}) {
   const state = fixture(options);
   const result = spawnSync("bash", [script, resourceClass, `${resourceClass}-test`, "--once"], {
     encoding: "utf8",
@@ -64,6 +70,8 @@ function runWorker({resourceClass = "small", workerInstanceId = "test-pod", ...o
       WIKI_ECON_FLEET_PREPARE_WRAPPER: state.prepare,
       WIKI_ECON_FLEET_QUEUE_DIR: path.join(state.root, "queue"),
       WIKI_ECON_FLEET_HEARTBEAT_SECS: "1",
+      WIKI_ECON_FLEET_LEASE_TIMEOUT_SECS: leaseTimeoutSecs,
+      WIKI_ECON_PREPARE_LOCK_STALE_SECS: prepareLockStaleSecs,
       WIKI_ECON_WORKER_INSTANCE_ID: workerInstanceId,
     },
   });
@@ -74,7 +82,7 @@ test("one-shot worker pins the claimed snapshot and completes independently", ()
   const {result, calls} = runWorker();
   assert.equal(result.status, 0, result.stderr || result.stdout);
   assert.match(calls[0], /^fleet-claim small claim-test-pod-[0-9]+\.json$/);
-  assert.match(calls[1], /^prepare testwiki 2026-08 fleet-small-test-testwiki-/);
+  assert.match(calls[1], /^prepare testwiki 2026-08 fleet-small-test-testwiki-.* stale=137$/);
   assert.equal(calls.at(-1), "fleet-complete");
   assert.ok(!calls.includes("fleet-fail"));
 });
@@ -91,6 +99,12 @@ test("failed preparation is returned to the bounded retry path", () => {
   assert.notEqual(result.status, 0);
   assert.ok(calls.includes("fleet-fail"));
   assert.ok(!calls.includes("fleet-complete"));
+});
+
+test("an explicit preparation-lock timeout overrides the fleet lease timeout", () => {
+  const {result, calls} = runWorker({prepareLockStaleSecs: "211"});
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.match(calls[1], / stale=211$/);
 });
 
 test("worker rejects unsupported resource classes before touching the queue", () => {
