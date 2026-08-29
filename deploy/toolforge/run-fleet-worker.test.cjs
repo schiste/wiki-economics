@@ -36,7 +36,7 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 if [ "$command" = fleet-claim ]; then
-  printf '%s %s\n' "$command" "$resource_class" >> "${log}"
+  printf '%s %s %s\n' "$command" "$resource_class" "$(basename "$receipt")" >> "${log}"
   cp "${claim}" "$receipt"
 else
   printf '%s\n' "$command" >> "${log}"
@@ -51,7 +51,7 @@ exit ${failPrepare ? 1 : 0}
   return {root, log, binary, prepare};
 }
 
-function runWorker({resourceClass = "small", ...options} = {}) {
+function runWorker({resourceClass = "small", workerInstanceId = "test-pod", ...options} = {}) {
   const state = fixture(options);
   const result = spawnSync("bash", [script, resourceClass, `${resourceClass}-test`, "--once"], {
     encoding: "utf8",
@@ -64,6 +64,7 @@ function runWorker({resourceClass = "small", ...options} = {}) {
       WIKI_ECON_FLEET_PREPARE_WRAPPER: state.prepare,
       WIKI_ECON_FLEET_QUEUE_DIR: path.join(state.root, "queue"),
       WIKI_ECON_FLEET_HEARTBEAT_SECS: "1",
+      WIKI_ECON_WORKER_INSTANCE_ID: workerInstanceId,
     },
   });
   return {...state, result, calls: fs.readFileSync(state.log, "utf8").trim().split("\n")};
@@ -72,7 +73,7 @@ function runWorker({resourceClass = "small", ...options} = {}) {
 test("one-shot worker pins the claimed snapshot and completes independently", () => {
   const {result, calls} = runWorker();
   assert.equal(result.status, 0, result.stderr || result.stdout);
-  assert.equal(calls[0], "fleet-claim small");
+  assert.match(calls[0], /^fleet-claim small claim-test-pod-[0-9]+\.json$/);
   assert.match(calls[1], /^prepare testwiki 2026-08 fleet-small-test-testwiki-/);
   assert.equal(calls.at(-1), "fleet-complete");
   assert.ok(!calls.includes("fleet-fail"));
@@ -81,7 +82,7 @@ test("one-shot worker pins the claimed snapshot and completes independently", ()
 test("medium worker translates the queue resource class to Clap's CLI spelling", () => {
   const {result, calls} = runWorker({resourceClass: "medium_large"});
   assert.equal(result.status, 0, result.stderr || result.stdout);
-  assert.equal(calls[0], "fleet-claim medium-large");
+  assert.match(calls[0], /^fleet-claim medium-large claim-test-pod-[0-9]+\.json$/);
   assert.equal(calls.at(-1), "fleet-complete");
 });
 
@@ -96,4 +97,14 @@ test("worker rejects unsupported resource classes before touching the queue", ()
   const result = spawnSync("bash", [script, "isolated", "unsafe", "--once"], {encoding: "utf8"});
   assert.equal(result.status, 2);
   assert.match(result.stderr, /Unsupported fleet resource class/);
+});
+
+test("overlapping pods use distinct NFS claim receipts even when the worker ID is shared", () => {
+  const first = runWorker({workerInstanceId: "small-a-pod-one"});
+  const second = runWorker({workerInstanceId: "small-a-pod-two"});
+  assert.equal(first.result.status, 0, first.result.stderr || first.result.stdout);
+  assert.equal(second.result.status, 0, second.result.stderr || second.result.stdout);
+  assert.match(first.calls[0], /claim-small-a-pod-one-[0-9]+\.json$/);
+  assert.match(second.calls[0], /claim-small-a-pod-two-[0-9]+\.json$/);
+  assert.notEqual(first.calls[0], second.calls[0]);
 });

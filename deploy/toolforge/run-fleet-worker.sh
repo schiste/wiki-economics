@@ -38,6 +38,13 @@ fi
 queue_dir="${WIKI_ECON_FLEET_QUEUE_DIR:-$WIKI_ECON_OUTPUT_DIR/_fleet}"
 worker_root="$queue_dir/workers/$worker_id"
 mkdir -p "$worker_root"
+worker_instance_id="${WIKI_ECON_WORKER_INSTANCE_ID:-${HOSTNAME:-}}"
+case "$worker_instance_id" in
+  *[!A-Za-z0-9_.-]*|'')
+    echo "Fleet worker requires a safe, non-empty pod instance identity" >&2
+    exit 2
+    ;;
+esac
 idle_secs="${WIKI_ECON_FLEET_IDLE_SECS:-60}"
 heartbeat_secs="${WIKI_ECON_FLEET_HEARTBEAT_SECS:-60}"
 lease_timeout_secs="${WIKI_ECON_FLEET_LEASE_TIMEOUT_SECS:-900}"
@@ -49,7 +56,10 @@ done
 [ -x "$prepare_wrapper" ] || { echo "Fleet preparation wrapper is not executable: $prepare_wrapper" >&2; exit 2; }
 
 while true; do
-  claim_receipt="$worker_root/claim-$$.json"
+  # PIDs are namespaced per container and are therefore commonly identical
+  # across overlapping Toolforge pods. Include the Kubernetes pod hostname so
+  # independent runs of the same scheduled worker never share an NFS receipt.
+  claim_receipt="$worker_root/claim-$worker_instance_id-$$.json"
   rm -f -- "$claim_receipt"
   "$WIKI_ECON_BIN" \
     --data-dir "$WIKI_ECON_DATA_DIR" \
