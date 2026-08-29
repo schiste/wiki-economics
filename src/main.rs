@@ -25,6 +25,7 @@ mod observability;
 mod patrol;
 mod publication;
 mod resource_governor;
+mod retention;
 mod schema;
 mod schema_benchmark;
 mod snapshot_plan;
@@ -313,6 +314,26 @@ enum Commands {
 
     /// Commit a successfully built ready-candidate publication
     PublicationCommitReady,
+
+    /// Audit reclaimable per-wiki inputs authorized by lifecycle retention
+    RetentionAudit {
+        /// Wiki lifecycle and retention policy
+        #[arg(long, default_value = "config/wiki-lifecycle.json")]
+        lifecycle: PathBuf,
+
+        /// Published wiki database names to audit
+        wikis: Vec<String>,
+    },
+
+    /// Purge only receipt-covered redownloadable inputs after publication
+    RetentionApply {
+        /// Wiki lifecycle and retention policy
+        #[arg(long, default_value = "config/wiki-lifecycle.json")]
+        lifecycle: PathBuf,
+
+        /// Published wiki database names to clean
+        wikis: Vec<String>,
+    },
 
     /// Roll back a selected candidate set after publication failure
     PublicationRollbackReady {
@@ -1415,6 +1436,38 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             run_timed_stage("publication_commit", None, || {
                 ops.commit_ready_publication(&data_dir, &output_dir, run_id)
             })?;
+        }
+
+        Commands::RetentionAudit { lifecycle, wikis } => {
+            ensure!(!wikis.is_empty(), "retention requires at least one wiki");
+            let mut reports = Vec::with_capacity(wikis.len());
+            for wiki in wikis {
+                let authorization = publication::authorize_input_retention(
+                    &data_dir,
+                    &output_dir,
+                    &lifecycle,
+                    &wiki,
+                );
+                let authorization = authorization?;
+                reports.push(retention::audit_or_apply(&data_dir, authorization, false)?);
+            }
+            println!("{}", serde_json::to_string_pretty(&reports)?);
+        }
+
+        Commands::RetentionApply { lifecycle, wikis } => {
+            ensure!(!wikis.is_empty(), "retention requires at least one wiki");
+            let mut reports = Vec::with_capacity(wikis.len());
+            for wiki in wikis {
+                let authorization = publication::authorize_input_retention(
+                    &data_dir,
+                    &output_dir,
+                    &lifecycle,
+                    &wiki,
+                );
+                let authorization = authorization?;
+                reports.push(retention::audit_or_apply(&data_dir, authorization, true)?);
+            }
+            println!("{}", serde_json::to_string_pretty(&reports)?);
         }
 
         Commands::PublicationRollbackReady { lifecycle } => {
@@ -2741,6 +2794,31 @@ mod tests {
             ]
         );
         Ok(())
+    }
+
+    #[test]
+    fn retention_commands_require_an_explicit_wiki_set() {
+        for command in [
+            Commands::RetentionAudit {
+                lifecycle: PathBuf::from("lifecycle.json"),
+                wikis: Vec::new(),
+            },
+            Commands::RetentionApply {
+                lifecycle: PathBuf::from("lifecycle.json"),
+                wikis: Vec::new(),
+            },
+        ] {
+            let result = run_with_ops(
+                Cli {
+                    data_dir: PathBuf::from("data"),
+                    output_dir: PathBuf::from("output"),
+                    run_id: None,
+                    command,
+                },
+                &RecordingOps::default(),
+            );
+            assert!(result.is_err());
+        }
     }
 
     #[test]

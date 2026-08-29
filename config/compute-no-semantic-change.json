@@ -36,6 +36,30 @@
       "paths": ["src/compute/mod.rs"],
       "reason": "Canonicalize only activity-tier output columns; page-week metric semantics and bytes are unchanged.",
       "base_commit": "e32d88931892fd900f3d739293e45ad3a83b25ca"
+    },
+    {
+      "family": "monthly",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Validate current receipt-covered outputs after intentional input retention cleanup; monthly metric semantics and bytes are unchanged.",
+      "base_commit": "992cd6b029ac17fde7fbe8dd6717b44dfd733efc"
+    },
+    {
+      "family": "activity_tiers",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Validate current receipt-covered outputs after intentional input retention cleanup; activity-tier metric semantics and bytes are unchanged.",
+      "base_commit": "992cd6b029ac17fde7fbe8dd6717b44dfd733efc"
+    },
+    {
+      "family": "lifecycle",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Validate current receipt-covered outputs after intentional input retention cleanup; lifecycle metric semantics and bytes are unchanged.",
+      "base_commit": "992cd6b029ac17fde7fbe8dd6717b44dfd733efc"
+    },
+    {
+      "family": "page_week",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Validate current receipt-covered outputs after intentional input retention cleanup; page-week metric semantics and bytes are unchanged.",
+      "base_commit": "992cd6b029ac17fde7fbe8dd6717b44dfd733efc"
     }
   ]
 }

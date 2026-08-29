@@ -829,6 +829,24 @@ pub(crate) fn candidate_receipt_identity(
     Ok(fingerprint::read_receipt(&patrol_stage_receipt(candidate_dir, wiki))?.fingerprint)
 }
 
+pub(crate) fn candidate_receipt_current_without_inputs(
+    wiki: &str,
+    snapshot: &str,
+    candidate_dir: &Path,
+) -> Result<bool> {
+    storage::validate_snapshot_version(snapshot)?;
+    fingerprint::outputs_reusable(
+        &patrol_stage_receipt(candidate_dir, wiki),
+        fingerprint::StageSpec {
+            stage: "patrol_compute",
+            scope: wiki,
+            selected_snapshot: Some(snapshot),
+            algorithm_version: PATROL_COMPUTE_ALGORITHM_VERSION,
+        },
+        &patrol_stage_outputs(wiki, candidate_dir),
+    )
+}
+
 pub(crate) const fn algorithm_version() -> &'static str {
     PATROL_COMPUTE_ALGORITHM_VERSION
 }

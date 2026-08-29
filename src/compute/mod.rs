@@ -207,6 +207,18 @@ impl WeeklyAggregationConfig {
         Self::from_environment()
     }
 
+    fn from_workload_profile(profile: &workload_profile::WorkloadProfile) -> Result<Self> {
+        profile.ensure_compute_qualified()?;
+        let mut config = Self::new_two_level(
+            profile.parameters.primary_buckets,
+            profile.parameters.secondary_buckets,
+            None,
+        )
+        .expect("a validated workload profile always has a supported bucket topology");
+        config.workload_algorithm_version = Some(profile.algorithm_version()?);
+        Ok(config)
+    }
+
     fn from_environment() -> Result<Self> {
         Self::from_values(
             env::var_os(WEEKLY_BUCKET_COUNT_ENV),
@@ -3753,6 +3765,38 @@ pub(crate) fn reusable_candidate_families(
         reusable.push((family, files));
     }
     Ok(reusable)
+}
+
+/// Authenticate same-snapshot outputs after redownloadable metric input has
+/// been deliberately purged. The stage receipt still commits to the original
+/// input identities; this path verifies its envelope, current algorithm, and
+/// every concrete output without pretending the absent inputs remain reusable
+/// for a new computation.
+pub(crate) fn candidate_receipts_current_without_inputs(
+    wiki: &str,
+    snapshot: &str,
+    candidate_dir: &Path,
+    profile: Option<&workload_profile::WorkloadProfile>,
+) -> Result<bool> {
+    storage::validate_snapshot_version(snapshot)?;
+    let Some(profile) = profile else {
+        return Ok(false);
+    };
+    profile.validate(wiki, snapshot)?;
+    let weekly_config = WeeklyAggregationConfig::from_workload_profile(profile)?;
+    for family in MetricFamily::ALL {
+        let algorithm = family.algorithm_version(&weekly_config);
+        let outputs = family_outputs(family, wiki, candidate_dir);
+        let outputs_reusable = fingerprint::outputs_reusable(
+            &family_stage_receipt(candidate_dir, wiki, family),
+            family_stage_spec(family, wiki, Some(snapshot), &algorithm),
+            &outputs,
+        );
+        if !outputs_reusable? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn compute_plan(

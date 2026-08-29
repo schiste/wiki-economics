@@ -493,6 +493,8 @@ struct LifecycleWiki {
     refresh: String,
     imported_cutoff: Option<String>,
     freshness_sla_days: Option<u64>,
+    #[serde(default)]
+    retention: Option<crate::retention::RetentionPolicy>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -1345,7 +1347,15 @@ fn validate_ready_candidate_metadata(
         ),
         "ready candidate path does not match its identity"
     );
-    storage::ensure_generation_manifest(data_dir, &ready.wiki, &ready.snapshot)?;
+    if storage::generation_manifest_path(data_dir, &ready.wiki, &ready.snapshot)?.is_file() {
+        storage::ensure_generation_manifest(data_dir, &ready.wiki, &ready.snapshot)?;
+    } else {
+        let retained =
+            crate::retention::validate_purged_snapshot(data_dir, &ready.wiki, &ready.snapshot);
+        retained.context(
+            "ready candidate input generation is absent without valid retention authorization",
+        )?;
+    }
     if let Some(profile) = &ready.workload_profile {
         profile.validate(&ready.wiki, &ready.snapshot)?;
         profile.ensure_compute_qualified()?;
@@ -1542,9 +1552,37 @@ pub(crate) fn plan_wiki_preparation(
         (left.ready_at_unix, &left.run_id).cmp(&(right.ready_at_unix, &right.run_id))
     });
 
+    let purged_snapshot = crate::retention::receipt_path(data_dir, wiki, snapshot)?.is_file();
+    let purged_compute_current = match (purged_snapshot, candidates.last()) {
+        (true, Some((ready, candidate_dir))) => {
+            let current = crate::compute::candidate_receipts_current_without_inputs(
+                wiki,
+                snapshot,
+                candidate_dir,
+                ready.workload_profile.as_ref(),
+            );
+            current?
+        }
+        _ => false,
+    };
+    if purged_compute_current
+        && let Some((_, candidate_dir)) = candidates.last()
+        && crate::patrol::candidate_receipt_current_without_inputs(wiki, snapshot, candidate_dir)?
+    {
+        let indexed = indexed_latest_ready_candidate(data_dir, output_dir, wiki)?
+            .context("purged unchanged candidate has no recoverable ready index")?;
+        ensure!(
+            indexed.0.snapshot == snapshot && indexed.1 == *candidate_dir,
+            "purged unchanged candidate is not the newest indexed ready candidate"
+        );
+        let ready_path = candidate_dir.join("ready.json");
+        info!(wiki, snapshot, path = %ready_path.display(), "purged snapshot outputs and algorithms are unchanged");
+        return Ok(WikiPreparationPlan::NoOp { ready_path });
+    }
+
     let mut reusable_compute = BTreeMap::new();
     let mut reusable_patrol = None;
-    for (_, candidate_dir) in candidates.iter().rev() {
+    for (_, candidate_dir) in candidates.iter().rev().filter(|_| !purged_snapshot) {
         let compute =
             crate::compute::reusable_candidate_families(wiki, snapshot, data_dir, candidate_dir)?;
         let patrol =
@@ -1670,6 +1708,28 @@ fn ready_candidate_reference(
     })
 }
 
+fn resilient_ready_candidate_reference(
+    data_dir: &Path,
+    output_dir: &Path,
+    candidate_dir: &Path,
+    ready: &ReadyWikiCandidate,
+) -> Result<ReadyCandidateReference> {
+    match ready_candidate_reference(data_dir, output_dir, candidate_dir, ready) {
+        Ok(reference) => Ok(reference),
+        Err(error) => {
+            ensure_artifact_fallback_authorized(data_dir, candidate_dir, ready)?;
+            warn!(
+                wiki = ready.wiki,
+                snapshot = ready.snapshot,
+                path = %candidate_dir.display(),
+                error = %format!("{error:#}"),
+                "composing ready reference from output artifact receipts"
+            );
+            artifact_backed_ready_candidate_reference(output_dir, candidate_dir, ready)
+        }
+    }
+}
+
 fn publication_family_for_metric(metric: &str) -> Result<&'static str> {
     if metric == "patrol" {
         return Ok("patrol");
@@ -1750,6 +1810,25 @@ fn artifact_backed_family_proofs(
             ))
         })
         .collect()
+}
+
+fn ensure_artifact_fallback_authorized(
+    data_dir: &Path,
+    candidate_dir: &Path,
+    ready: &ReadyWikiCandidate,
+) -> Result<()> {
+    ensure!(
+        !storage::generation_manifest_path(data_dir, &ready.wiki, &ready.snapshot)?.is_file(),
+        "artifact-backed candidate authentication is allowed only after input retention"
+    );
+    let receipt =
+        crate::retention::validate_purged_snapshot(data_dir, &ready.wiki, &ready.snapshot)?;
+    let (_, ready_sha256) = storage::sha256_file(&candidate_dir.join("ready.json"))?;
+    ensure!(
+        receipt.authorized_ready_sha256 == ready_sha256,
+        "retention receipt does not authorize this ready candidate"
+    );
+    Ok(())
 }
 
 fn artifact_backed_ready_candidate_reference(
@@ -2025,7 +2104,8 @@ fn ready_from_reference(
     ensure!(ready.wiki == wiki, "ready index wiki mismatch");
     validate_ready_candidate_metadata(data_dir, &candidate_dir, &ready)?;
     ensure!(
-        ready_candidate_reference(data_dir, output_dir, &candidate_dir, &ready)? == *reference,
+        resilient_ready_candidate_reference(data_dir, output_dir, &candidate_dir, &ready)?
+            == *reference,
         "ready index fields do not match the candidate receipt"
     );
     Ok((ready, candidate_dir))
@@ -2062,10 +2142,12 @@ fn write_ready_index(
     wiki: &str,
     newest: &(ReadyWikiCandidate, PathBuf),
 ) -> Result<()> {
+    let newest_valid_ready =
+        resilient_ready_candidate_reference(data_dir, output_dir, &newest.1, &newest.0)?;
     let index = ReadyCandidateIndex {
         schema_version: READY_INDEX_SCHEMA_VERSION,
         wiki: wiki.to_string(),
-        newest_valid_ready: ready_candidate_reference(data_dir, output_dir, &newest.1, &newest.0)?,
+        newest_valid_ready,
         active_published: active_ready_reference(data_dir, output_dir, wiki)?,
         updated_at_unix: now_unix()?,
     };
@@ -2100,7 +2182,7 @@ fn discover_latest_ready_candidate(
                 ensure!(ready.wiki == wiki, "ready candidate wiki mismatch");
                 validate_ready_candidate_metadata(data_dir, &candidate_dir, &ready)?;
                 reconcile_ready_generation_state(output_dir, &ready)?;
-                ready_candidate_reference(data_dir, output_dir, &candidate_dir, &ready)?;
+                resilient_ready_candidate_reference(data_dir, output_dir, &candidate_dir, &ready)?;
                 Ok((ready, candidate_dir.clone()))
             })();
             match candidate {
@@ -3643,8 +3725,67 @@ fn load_lifecycle(path: &Path) -> Result<LifecycleRegistry> {
             lifecycle.publication != "retired" || lifecycle.refresh == "paused",
             "retired wiki lifecycle entry {wiki} must be paused"
         );
+        if let Some(retention) = &lifecycle.retention {
+            retention
+                .validate()
+                .with_context(|| format!("invalid retention policy for {wiki}"))?;
+        }
     }
     Ok(registry)
+}
+
+pub(crate) fn authorize_input_retention(
+    data_dir: &Path,
+    output_dir: &Path,
+    lifecycle_path: &Path,
+    wiki: &str,
+) -> Result<crate::retention::RetentionAuthorization> {
+    let registry = load_lifecycle(lifecycle_path)?;
+    let lifecycle = registry
+        .wikis
+        .get(wiki)
+        .with_context(|| format!("retention wiki {wiki} is not registered"))?;
+    ensure!(
+        lifecycle.publication == "published",
+        "retention purge requires a published wiki"
+    );
+    let policy = lifecycle
+        .retention
+        .clone()
+        .with_context(|| format!("retention wiki {wiki} has no explicit policy"))?;
+    policy.validate()?;
+    ensure!(
+        policy.purges_any_input(),
+        "retention policy for {wiki} does not authorize an input purge"
+    );
+    let candidate_relative = active_candidate_relative(output_dir, wiki)?
+        .with_context(|| format!("retention wiki {wiki} has no immutable active candidate"))?;
+    let candidate_dir = output_dir.join(&candidate_relative);
+    let ready_path = candidate_dir.join("ready.json");
+    let ready: ReadyWikiCandidate = read_json(&ready_path)?;
+    ensure!(ready.wiki == wiki, "active ready candidate wiki mismatch");
+    validate_ready_candidate(data_dir, &candidate_dir, &ready)?;
+    ensure!(
+        storage::current_snapshot_version(data_dir, wiki)?.as_deref()
+            == Some(ready.snapshot.as_str()),
+        "active candidate and selected snapshot disagree for {wiki}"
+    );
+    let gate: GateReceipt = read_json(&output_dir.join(RECEIPT_FILE))?;
+    ensure!(
+        gate.selected_snapshot_versions.get(wiki) == Some(&ready.snapshot),
+        "publication receipt does not select the active {wiki} snapshot"
+    );
+    let (_, ready_sha256) = storage::sha256_file(&ready_path)?;
+    let source_plan = crate::snapshot_plan::plan_path(data_dir, wiki, &ready.snapshot)?;
+    let (_, source_plan_sha256) = storage::sha256_file(&source_plan)
+        .context("retention purge requires the canonical source plan")?;
+    Ok(crate::retention::RetentionAuthorization {
+        wiki: wiki.to_string(),
+        snapshot: ready.snapshot,
+        ready_sha256,
+        source_plan_sha256,
+        policy,
+    })
 }
 
 fn expected_wikis(
@@ -4534,7 +4675,13 @@ mod tests {
                     "nlwiki": {
                         "publication": "published",
                         "refresh": "scheduled",
-                        "freshness_sla_days": 10
+                        "freshness_sla_days": 10,
+                        "retention": {
+                            "source_recoverability": "redownloadable",
+                            "history_input": "purge_after_ready",
+                            "patrol_source": "purge_after_ready",
+                            "computed_rollback_generations": 1
+                        }
                     }
                 }
             }))?;
@@ -6036,6 +6183,113 @@ mod tests {
             .state,
             crate::generation_lifecycle::GenerationState::Published
         );
+        Ok(())
+    }
+
+    #[test]
+    fn published_redownloadable_inputs_purge_without_breaking_noops() -> Result<()> {
+        let fixture = Fixture::new()?;
+        fixture.ready_candidate("retention-candidate")?;
+        prepare_ready_publication(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "retention-publish",
+        )
+        .expect("retention fixture publication should prepare");
+        commit_ready_publication(
+            fixture.data.path(),
+            fixture.output.path(),
+            "retention-publish",
+        )
+        .expect("retention fixture publication should commit");
+
+        for command in [
+            crate::Commands::RetentionAudit {
+                lifecycle: fixture.lifecycle_path.clone(),
+                wikis: vec!["nlwiki".to_string()],
+            },
+            crate::Commands::RetentionApply {
+                lifecycle: fixture.lifecycle_path.clone(),
+                wikis: vec!["nlwiki".to_string()],
+            },
+        ] {
+            crate::run_with_ops(
+                crate::Cli {
+                    data_dir: fixture.data.path().to_path_buf(),
+                    output_dir: fixture.output.path().to_path_buf(),
+                    run_id: None,
+                    command,
+                },
+                &crate::RealOps,
+            )
+            .expect("retention CLI should accept a published candidate");
+        }
+        let retention =
+            crate::retention::validate_purged_snapshot(fixture.data.path(), "nlwiki", "2026-03")?;
+        assert!(retention.removed_bytes > 0);
+        assert!(
+            !storage::generation_manifest_path(fixture.data.path(), "nlwiki", "2026-03")?.exists()
+        );
+        assert!(!fixture.data.path().join("patrol/nlwiki").exists());
+
+        let plan = plan_wiki_preparation(
+            fixture.data.path(),
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            "retention-noop",
+        )
+        .expect("retained outputs should make preparation a no-op");
+        assert!(matches!(plan, WikiPreparationPlan::NoOp { .. }));
+        prepare_ready_publication(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "retention-noop-publish",
+        )
+        .expect("unchanged retained outputs should publish as a no-op");
+        let selection_file = selection_path(fixture.output.path(), "retention-noop-publish")?;
+        let selection: PublicationSelection = read_json(&selection_file)?;
+        assert_eq!(selection.state, "no_op");
+
+        let candidate = wiki_candidate_dir(
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            "retention-candidate",
+        )
+        .expect("candidate path should remain valid");
+        let missing_profile = crate::compute::candidate_receipts_current_without_inputs(
+            "nlwiki", "2026-03", &candidate, None,
+        )
+        .expect("a missing profile should be a clean cache miss");
+        assert!(!missing_profile);
+        fs::write(candidate.join("_stages/compute/monthly/nlwiki.json"), b"{}")?;
+        let ready: ReadyWikiCandidate = read_json(&candidate.join("ready.json"))?;
+        let damaged_receipt = crate::compute::candidate_receipts_current_without_inputs(
+            "nlwiki",
+            "2026-03",
+            &candidate,
+            ready.workload_profile.as_ref(),
+        )
+        .expect("a damaged family receipt should be a clean cache miss");
+        assert!(!damaged_receipt);
+        Ok(())
+    }
+
+    #[test]
+    fn absent_generation_without_retention_is_not_a_ready_candidate() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let ready_path = fixture.ready_candidate("unretained")?;
+        let ready: ReadyWikiCandidate = read_json(&ready_path)?;
+        let manifest = storage::generation_manifest_path(fixture.data.path(), "nlwiki", "2026-03")?;
+        fs::remove_file(manifest)?;
+        let candidate =
+            wiki_candidate_dir(fixture.output.path(), "nlwiki", "2026-03", "unretained")?;
+        let error = validate_ready_candidate_metadata(fixture.data.path(), &candidate, &ready)
+            .expect_err("missing input needs explicit retention authorization");
+        assert!(error.to_string().contains("retention authorization"));
         Ok(())
     }
 
@@ -7691,6 +7945,7 @@ mod tests {
                 refresh: "paused".to_string(),
                 imported_cutoff: Some("2026-03".to_string()),
                 freshness_sla_days: None,
+                retention: None,
             },
         );
         let frwiki_metrics = expected_metrics_for_wiki(&registry, "frwiki")?;
@@ -7769,6 +8024,7 @@ mod tests {
                         refresh: "paused".to_string(),
                         imported_cutoff: Some("2026-03".to_string()),
                         freshness_sla_days: None,
+                        retention: None,
                     },
                 ),
                 (
@@ -7778,6 +8034,7 @@ mod tests {
                         refresh: "paused".to_string(),
                         imported_cutoff: None,
                         freshness_sla_days: None,
+                        retention: None,
                     },
                 ),
                 (
@@ -7787,6 +8044,7 @@ mod tests {
                         refresh: "manual".to_string(),
                         imported_cutoff: None,
                         freshness_sla_days: None,
+                        retention: None,
                     },
                 ),
             ]),
