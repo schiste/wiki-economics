@@ -57,7 +57,6 @@ function displayTitle(title) {
   <div class="portfolio-eyebrow">Wikipedia activity portfolio · ${wikis.length} language editions · ${coverageStart}—${gdp.maxMonth ?? "present"}</div>
   <div class="portfolio-hero-grid">
     <div>
-      <h1>Many Wikipedias.<br><em>One economic lens.</em></h1>
       <p class="portfolio-deck">A combined view of production, participation, concentration, and review across every Wikipedia edition currently managed by this project.</p>
       <div class="portfolio-actions">
         <a class="portfolio-action primary" href="#choose-wiki">Choose a Wikipedia</a>
