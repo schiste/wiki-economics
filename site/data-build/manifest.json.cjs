@@ -322,17 +322,33 @@ function workloadProfile(dataDir, wiki, snapshot) {
   if (!fs.existsSync(file)) return null;
   const profile = readJson(file);
   const parameters = profile?.parameters;
+  const supportedSchema = (profile?.schema_version === 1
+      && profile?.selection_algorithm_version === "adaptive-workload-profile-v1")
+    || (profile?.schema_version === 2
+      && profile?.selection_algorithm_version === "adaptive-workload-profile-v2-measured");
+  const optionalSignalNames = [
+    "prior_measured_rows",
+    "prior_fragment_count",
+    "historical_peak_memory_bytes",
+    "historical_peak_scratch_bytes",
+    "observed_throughput_rows_per_second",
+  ];
+  const optionalSignalsValid = optionalSignalNames.every((name) => {
+    const value = profile?.signals?.[name];
+    return value === null || value === undefined || (Number.isSafeInteger(value) && value >= 0);
+  });
   const expectedParameters = profile?.profile === "small"
     ? {source_workers: 2, primary_buckets: 32, secondary_buckets: 8}
     : profile?.profile === "large"
       ? {source_workers: 3, primary_buckets: 64, secondary_buckets: 32}
       : null;
-  if (profile?.schema_version !== 1 || profile.wiki !== wiki || profile.snapshot !== snapshot
+  if (!supportedSchema || profile.wiki !== wiki || profile.snapshot !== snapshot
       || !["small", "large"].includes(profile.profile)
       || !["automatic", "manual_qualification_override"].includes(profile.selection_mode)
       || !Number.isSafeInteger(profile?.signals?.total_compressed_bytes)
       || profile.signals.total_compressed_bytes <= 0
       || !Number.isSafeInteger(profile?.signals?.source_count) || profile.signals.source_count <= 0
+      || !optionalSignalsValid
       || !Number.isSafeInteger(parameters?.source_workers) || parameters.source_workers <= 0
       || !Number.isSafeInteger(parameters?.primary_buckets) || parameters.primary_buckets <= 0
       || !Number.isSafeInteger(parameters?.secondary_buckets) || parameters.secondary_buckets <= 0

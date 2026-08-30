@@ -53,13 +53,21 @@ function fixture(name) {
   }));
   fs.mkdirSync(path.join(dataDir, "snapshots", "nlwiki", snapshot), {recursive: true});
   fs.writeFileSync(path.join(dataDir, "snapshots", "nlwiki", snapshot, "workload-profile.json"), JSON.stringify({
-    schema_version: 1,
-    selection_algorithm_version: "adaptive-workload-profile-v1",
+    schema_version: 2,
+    selection_algorithm_version: "adaptive-workload-profile-v2-measured",
     wiki: "nlwiki",
     snapshot,
     profile: "small",
     selection_mode: "automatic",
-    signals: {total_compressed_bytes: 1024, source_count: 1, prior_measured_rows: 42},
+    signals: {
+      total_compressed_bytes: 1024,
+      source_count: 1,
+      prior_measured_rows: 42,
+      prior_fragment_count: null,
+      historical_peak_memory_bytes: null,
+      historical_peak_scratch_bytes: null,
+      observed_throughput_rows_per_second: null,
+    },
     parameters: {source_workers: 2, primary_buckets: 32, secondary_buckets: 8},
   }));
   fs.mkdirSync(path.join(dataDir, "stages", "nlwiki", snapshot), {recursive: true});
@@ -282,6 +290,44 @@ test("publication rejects a workload profile whose parameters do not match its n
     rowCounter: rows({events: 10, rights: 2, metric: 5}),
     generatedAt: "2026-08-23T12:00:00Z",
     environment: {WIKI_ECON_RUN_ID: "invalid-profile-run", WIKI_ECON_SOURCE_COMMIT: "a".repeat(40)},
+  }), /invalid workload profile/);
+});
+
+test("publication accepts retained workload profile schema v1", async () => {
+  const current = fixture("legacy-workload-profile");
+  const file = path.join(current.dataDir, "snapshots", "nlwiki", "2026-07", "workload-profile.json");
+  const profile = JSON.parse(fs.readFileSync(file, "utf8"));
+  profile.schema_version = 1;
+  profile.selection_algorithm_version = "adaptive-workload-profile-v1";
+  fs.writeFileSync(file, JSON.stringify(profile));
+
+  const manifest = await buildManifest({
+    root,
+    dataDir: current.dataDir,
+    outputDir: current.outputDir,
+    lifecycle: lifecycle(),
+    rowCounter: rows({events: 10, rights: 2, metric: 5}),
+    generatedAt: "2026-08-23T12:00:00Z",
+    environment: {WIKI_ECON_RUN_ID: "legacy-profile-run", WIKI_ECON_SOURCE_COMMIT: "a".repeat(40)},
+  });
+  assert.equal(manifest.wikis.nlwiki.workload_profile.schema_version, 1);
+});
+
+test("publication rejects a workload profile whose schema and algorithm disagree", async () => {
+  const current = fixture("mismatched-workload-profile-version");
+  const file = path.join(current.dataDir, "snapshots", "nlwiki", "2026-07", "workload-profile.json");
+  const profile = JSON.parse(fs.readFileSync(file, "utf8"));
+  profile.selection_algorithm_version = "adaptive-workload-profile-v1";
+  fs.writeFileSync(file, JSON.stringify(profile));
+
+  await assert.rejects(() => buildManifest({
+    root,
+    dataDir: current.dataDir,
+    outputDir: current.outputDir,
+    lifecycle: lifecycle(),
+    rowCounter: rows({events: 10, rights: 2, metric: 5}),
+    generatedAt: "2026-08-23T12:00:00Z",
+    environment: {WIKI_ECON_RUN_ID: "mismatched-profile-run", WIKI_ECON_SOURCE_COMMIT: "a".repeat(40)},
   }), /invalid workload profile/);
 });
 
