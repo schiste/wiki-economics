@@ -207,6 +207,71 @@ test("a later authenticated no-op resolves a transient publication duration aler
   assert.equal(result.summary.lastPublicationRunId, "publish-slow");
 });
 
+test("a later site-only success preserves publication no-op evidence", () => {
+  const publication = success({
+    runId: "publish-slow",
+    stageDurationsMs: {publication_prepare: 180_001},
+    publication: {
+      ...success().publication,
+      changePlan: {
+        changed: [{wiki: "nlwiki", family: "monthly"}],
+        reused: [{wiki: "nlwiki", family: "page_week"}],
+      },
+    },
+  });
+  const noOp = success({
+    runId: "publish-no-op",
+    startedAt: "2026-08-21T03:01:00Z",
+    finishedAt: "2026-08-21T03:01:05Z",
+    noOp: true,
+    publication: null,
+  });
+  const siteOnly = success({
+    runId: "site-only",
+    startedAt: "2026-08-21T04:00:00Z",
+    finishedAt: "2026-08-21T04:02:00Z",
+    publication: null,
+  });
+  const result = evaluateFreshness({
+    last: siteOnly,
+    history: [publication, noOp, siteOnly],
+    lifecycle,
+    now: Date.parse("2026-08-22T03:00:00Z"),
+  });
+  assert.equal(result.status, "healthy");
+  assert.ok(!result.alerts.some((alert) => alert.code === "incremental_publication_slow"));
+  assert.equal(result.summary.lastSuccessfulRunId, "site-only");
+  assert.equal(result.summary.lastPublicationRunId, "publish-slow");
+});
+
+test("a non-publisher no-op does not resolve a publication duration alert", () => {
+  const publication = success({
+    runId: "publish-slow",
+    stageDurationsMs: {publication_prepare: 180_001},
+    publication: {
+      ...success().publication,
+      changePlan: {
+        changed: [{wiki: "nlwiki", family: "monthly"}],
+        reused: [{wiki: "nlwiki", family: "page_week"}],
+      },
+    },
+  });
+  const preparationNoOp = success({
+    runId: "prepare-no-op",
+    startedAt: "2026-08-21T03:01:00Z",
+    finishedAt: "2026-08-21T03:01:05Z",
+    noOp: true,
+    publication: null,
+  });
+  const result = evaluateFreshness({
+    last: preparationNoOp,
+    history: [publication, preparationNoOp],
+    lifecycle,
+    now: Date.parse("2026-08-22T03:00:00Z"),
+  });
+  assert.ok(result.alerts.some((alert) => alert.code === "incremental_publication_slow"));
+});
+
 test("full baseline publication is not classified as incremental", () => {
   const record = success({
     stageDurationsMs: {publication_prepare: 1_109_480},

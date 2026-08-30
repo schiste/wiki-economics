@@ -29,6 +29,12 @@ function successfulRuns(last, history) {
   return [...byRun.values()].sort((left, right) => (timestamp(left.finishedAt) || 0) - (timestamp(right.finishedAt) || 0));
 }
 
+function isPublicationNoOp(record) {
+  return record?.noOp === true
+    && typeof record.runId === "string"
+    && record.runId.startsWith("publish-");
+}
+
 function stageStart(record) {
   const current = [...(record?.stages || [])].reverse().find((stage) =>
     stage.state === "running" && stage.stage === record.currentStage && stage.wiki === (record.currentWiki || null));
@@ -166,8 +172,10 @@ function evaluateFreshness({last = null, history = [], lifecycle, scrubStatus = 
       && changedFamilies.length > 0
       && Array.isArray(reusedFamilies)
       && reusedFamilies.length > 0;
-    const resolvedByLaterNoOp = latestSuccess?.noOp === true
-      && timestamp(latestSuccess.finishedAt) > timestamp(latestPublication.finishedAt);
+    const publicationFinishedAt = timestamp(latestPublication.finishedAt);
+    const resolvedByLaterNoOp = successes.some((record) =>
+      isPublicationNoOp(record)
+      && timestamp(record.finishedAt) > publicationFinishedAt);
     if (isIncrementalPublication
         && !resolvedByLaterNoOp
         && Number.isFinite(incrementalDuration)
