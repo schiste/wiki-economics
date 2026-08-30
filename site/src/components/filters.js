@@ -5,6 +5,7 @@ import {
   combinedNamespaces,
   combinedRange,
   formatWiki,
+  matchesDefaultSelection,
   wikiMatches,
   withAllWikis,
 } from "./wiki-scope.js";
@@ -449,23 +450,13 @@ export function isDefaultView(filters, defaults, {defaultUserTypes = ["registere
   const parsed = parseDefaultsMeta(defaults)
   const defaultWiki = parsed.defaultWiki
   if (!defaultWiki) return false
-  const range = parsed.rangeByWiki.get(defaultWiki)
-  if (!range) return false
-  const {wiki, userTypes, granularity, startPeriod, endPeriod, namespaces} = filters
-  return wiki === defaultWiki
-    && granularity === defaultGranularity
-    && startPeriod === range.mn
-    && endPeriod === range.mx
-    && (userTypes == null
-      ? defaultUserTypes == null || defaultUserTypes.length === 0
-      : defaultUserTypes != null
-        && userTypes.length === defaultUserTypes.length
-        && defaultUserTypes.every(t => userTypes.includes(t)))
-    && (namespaces == null
-      ? defaultNamespaces == null
-      : defaultNamespaces != null
-        && namespaces.length === defaultNamespaces.length
-        && defaultNamespaces.every(n => namespaces.includes(n)))
+  return matchesDefaultSelection(filters, {
+    wiki: defaultWiki,
+    range: parsed.defaultRange ?? parsed.rangeByWiki.get(defaultWiki),
+    userTypes: defaultUserTypes,
+    granularity: defaultGranularity,
+    namespaces: defaultNamespaces,
+  })
 }
 
 /**
@@ -487,11 +478,19 @@ export function parseDefaultsMeta(defaults) {
   )
   if (!rangeByWiki.has(ALL_WIKIS)) rangeByWiki.set(ALL_WIKIS, combinedRange(rangeByWiki))
   const resolvedDefaultWiki = resolveDefaultWiki(defaults.defaultWiki ?? ALL_WIKIS, wikis)
+  const sourceDefaultRange = defaults.defaultRange
+  const defaultRange = sourceDefaultRange
+    && isValidPeriod(sourceDefaultRange.mn)
+    && isValidPeriod(sourceDefaultRange.mx)
+    && sourceDefaultRange.mn <= sourceDefaultRange.mx
+    ? {mn: sourceDefaultRange.mn, mx: sourceDefaultRange.mx}
+    : null
   return {
     wikis,
     nsByWiki,
     rangeByWiki,
     defaultWiki: resolvedDefaultWiki,
+    defaultRange,
     maxMonth: deriveMaxMonth(rangeByWiki, defaults.maxMonth ?? null)
   }
 }
@@ -508,6 +507,7 @@ export function parseDefaultsMeta(defaults) {
  * @param {Map<string, {mn: string, mx: string}>} options.rangeByWiki - Date range per wiki
  * @param {string|null} [options.maxMonth=null]
  * @param {string|null} [options.defaultWiki=null]
+ * @param {{mn: string, mx: string}|null} [options.defaultRange=null]
  * @param {string[]} [options.defaultUserTypes=["registered"]]
  * @param {string} [options.defaultGranularity="year"]
  * @param {number[]} [options.defaultNamespaces=[0]]
@@ -520,6 +520,7 @@ export function createFilterBar({
   rangeByWiki,
   maxMonth = null,
   defaultWiki = null,
+  defaultRange = null,
   defaultUserTypes = ["registered"],
   defaultGranularity = "year",
   defaultNamespaces = [0],
@@ -532,8 +533,9 @@ export function createFilterBar({
   const resolvedDefaultWiki = resolveDefaultWiki(defaultWiki, wikis);
   const initWiki = wikis.includes(persisted?.wiki) ? persisted.wiki : resolvedDefaultWiki;
   const derivedMaxMonth = deriveMaxMonth(rangeByWiki, maxMonth);
-  const defaultRange = rangeByWiki.get(initWiki) ?? fallbackRange(rangeByWiki, derivedMaxMonth);
-  const initialRange = normalizeRangeSelection(persistedRangeForWiki(persisted, initWiki), defaultRange);
+  const sourceRange = rangeByWiki.get(initWiki) ?? fallbackRange(rangeByWiki, derivedMaxMonth);
+  const initialDefaultRange = initWiki === resolvedDefaultWiki && defaultRange ? defaultRange : sourceRange;
+  const initialRange = normalizeRangeSelection(persistedRangeForWiki(persisted, initWiki), initialDefaultRange);
   const initialUserTypes = showUserTypes
     ? normalizeAllowedSelection(persisted?.userTypes, USER_TYPE_OPTIONS, defaultUserTypes)
     : null;

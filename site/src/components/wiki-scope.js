@@ -42,6 +42,35 @@ export function combinedNamespaces(nsByWiki) {
 }
 
 /**
+ * Compare a live filter state with the exact selection represented by a
+ * precomputed dashboard artifact. The artifact range may intentionally be
+ * narrower than the complete queryable source range.
+ */
+export function matchesDefaultSelection(filters, {
+  wiki,
+  range,
+  userTypes = ["registered"],
+  granularity = "year",
+  namespaces = [0],
+}) {
+  if (!wiki || !range) return false;
+  return filters.wiki === wiki
+    && filters.granularity === granularity
+    && filters.startPeriod === range.mn
+    && filters.endPeriod === range.mx
+    && (filters.userTypes == null
+      ? userTypes == null || userTypes.length === 0
+      : userTypes != null
+        && filters.userTypes.length === userTypes.length
+        && userTypes.every(type => filters.userTypes.includes(type)))
+    && (filters.namespaces == null
+      ? namespaces == null
+      : namespaces != null
+        && filters.namespaces.length === namespaces.length
+        && namespaces.every(namespace => filters.namespaces.includes(namespace)));
+}
+
+/**
  * Combine churn rows as a portfolio of wiki communities. Editor counts are
  * editor-wiki participations; rates are recomputed from the additive counts.
  */

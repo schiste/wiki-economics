@@ -13,6 +13,7 @@ use crate::{licensing, storage};
 
 const LARGE_METRIC_BATCH_ROWS: usize = 250_000;
 const ALL_WIKIS_SCOPE: &str = "all";
+const INEQUALITY_DEFAULT_START_MONTH: &str = "2001-06";
 
 pub const ARTIFACTS: [&str; 11] = [
     "defaults_business.json",
@@ -885,6 +886,20 @@ struct InequalityYear {
 
 fn inequality_artifacts(frames: &Frames) -> Result<(Value, Value)> {
     let meta = common_meta(&frames.inequality, None)?;
+    let mut default_start = None;
+    for row in 0..frames.inequality.height() {
+        if let Some(month) = string(&frames.inequality, "year_month", row)?
+            && month <= meta.max_month
+            && month.as_str() >= INEQUALITY_DEFAULT_START_MONTH
+            && default_start
+                .as_ref()
+                .is_none_or(|current| month < *current)
+        {
+            default_start = Some(month);
+        }
+    }
+    let default_start =
+        default_start.context("inequality input contains no row in the default date range")?;
     let mut yearly: BTreeMap<String, InequalityYear> = BTreeMap::new();
     for row in 0..frames.inequality.height() {
         if !selected_month_row(&frames.inequality, row, &meta.default_wiki, &meta.max_month)?
@@ -894,6 +909,9 @@ fn inequality_artifacts(frames: &Frames) -> Result<(Value, Value)> {
         }
         let month =
             string(&frames.inequality, "year_month", row)?.context("inequality month is null")?;
+        if month < default_start {
+            continue;
+        }
         let entry = yearly.entry(year(&month)?).or_default();
         let editors = float(&frames.inequality, "total_editors", row)?.unwrap_or_default();
         let edits = float(&frames.inequality, "total_edits", row)?.unwrap_or_default();
@@ -940,12 +958,15 @@ fn inequality_artifacts(frames: &Frames) -> Result<(Value, Value)> {
         .collect::<Vec<_>>();
     let defaults = json!({
         "defaultWiki": meta.default_wiki,
+        "defaultRange": {"mn": default_start, "mx": meta.max_month},
         "maxMonth": meta.max_month,
         "wikis": meta.wikis,
         "rangeByWiki": meta.ranges,
         "data": data,
     });
-    Ok((defaults, meta_json(&meta, false)))
+    let mut metadata = meta_json(&meta, false);
+    metadata["defaultRange"] = defaults["defaultRange"].clone();
+    Ok((defaults, metadata))
 }
 
 #[derive(Default)]
@@ -1648,6 +1669,12 @@ mod tests {
         );
 
         let inequality = read_json(&first.path().join("defaults_inequality.json"))?;
+        let inequality_meta = read_json(&first.path().join("meta_inequality.json"))?;
+        assert_eq!(
+            inequality["defaultRange"],
+            json!({"mn": "2026-01", "mx": "2026-01"})
+        );
+        assert_eq!(inequality_meta["defaultRange"], inequality["defaultRange"]);
         assert_eq!(inequality["data"][0]["total_editors"], 16);
         assert_eq!(inequality["data"][0]["gini"], Value::Null);
         assert!(inequality["data"][0]["theil"].is_number());
@@ -1761,6 +1788,36 @@ mod tests {
                 .as_array()
                 .is_some_and(|rows| rows.iter().all(|row| row["theil"].is_null()))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn inequality_defaults_exclude_rows_before_the_canonical_start() -> Result<()> {
+        let output = TestDir::new()?;
+        write_site_fixture(output.path())?;
+        let mut frames = Frames::read(output.path())?;
+        frames.inequality = df!(
+            "wiki" => &["nlwiki", "nlwiki"],
+            "year_month" => &["2001-05", "2001-06"],
+            "user_type" => &["registered", "registered"],
+            "total_editors" => &[10_i64, 20_i64],
+            "total_edits" => &[100_i64, 200_i64],
+            "min_editors_50pct" => &[2_i64, 3_i64],
+            "gini" => &[0.5_f64, 0.6_f64],
+            "theil" => &[0.2_f64, 0.3_f64],
+            "palma" => &[1.0_f64, 1.5_f64],
+        )
+        .expect("inequality boundary fixture columns have equal lengths");
+
+        let (defaults, metadata) = inequality_artifacts(&frames)?;
+        assert_eq!(
+            defaults["defaultRange"],
+            json!({"mn": "2001-06", "mx": "2001-06"})
+        );
+        assert_eq!(metadata["defaultRange"], defaults["defaultRange"]);
+        assert_eq!(defaults["data"].as_array().map(Vec::len), Some(1));
+        assert_eq!(defaults["data"][0]["total_editors"], 20);
+        assert_eq!(defaults["data"][0]["total_edits"], 200);
         Ok(())
     }
 

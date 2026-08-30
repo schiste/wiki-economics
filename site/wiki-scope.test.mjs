@@ -10,6 +10,7 @@ import {
   combinedNamespaces,
   combinedRange,
   formatWiki,
+  matchesDefaultSelection,
   wikiMatches,
   withAllWikis,
 } from "./src/components/wiki-scope.js";
@@ -28,6 +29,27 @@ test("all-wiki scope has a stable value, label, range, and namespace union", () 
     ["nlwiki", [1, 0, null]],
     ["ptwiki", [2, 0]],
   ])), [0, 1, 2, null]);
+});
+
+test("precomputed defaults use their explicit selection instead of the wider source range", () => {
+  const selection = {
+    wiki: ALL_WIKIS,
+    range: {mn: "2001-06", mx: "2026-08"},
+    userTypes: ["registered"],
+    granularity: "year",
+    namespaces: null,
+  };
+  const canonical = {
+    wiki: ALL_WIKIS,
+    userTypes: ["registered"],
+    granularity: "year",
+    startPeriod: "2001-06",
+    endPeriod: "2026-08",
+    namespaces: null,
+  };
+  assert.equal(matchesDefaultSelection(canonical, selection), true);
+  assert.equal(matchesDefaultSelection({...canonical, startPeriod: "2001-05"}, selection), false);
+  assert.equal(matchesDefaultSelection({...canonical, wiki: "nlwiki"}, selection), false);
 });
 
 test("all-wiki count reducers sum primitives and recompute rates", () => {

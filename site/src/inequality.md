@@ -13,14 +13,14 @@ import {filterRows, aggregateInequalityByPeriod, makeRowsLoader, makeJsonLoader,
 import {withExport, pageExportBar} from "./components/exports.js"
 
 const meta = await FileAttachment("data/meta_inequality.json").json()
-const {wikis, rangeByWiki, defaultWiki, maxMonth} = parseDefaultsMeta(meta)
+const {wikis, rangeByWiki, defaultWiki, defaultRange, maxMonth} = parseDefaultsMeta(meta)
 const loadDefaults = makeJsonLoader(FileAttachment("data/defaults_inequality.json"))
 ```
 
 <!-- ── Sticky filter bar ─────────────────────────────────── -->
 
 ```js
-const filters = view(createFilterBar({wikis, rangeByWiki, defaultWiki, maxMonth, showNamespaces: false}))
+const filters = view(createFilterBar({wikis, rangeByWiki, defaultWiki, defaultRange, maxMonth, showNamespaces: false}))
 ```
 
 ```js
