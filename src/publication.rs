@@ -4797,7 +4797,8 @@ mod tests {
             fs::write(
                 output.path().join("_stages/dashboard-defaults.json"),
                 b"{\"fingerprint\":\"defaults\"}\n",
-            )?;
+            )
+            .expect("dashboard defaults receipt fixture should write");
             Ok(Self {
                 data,
                 output,

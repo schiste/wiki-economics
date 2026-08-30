@@ -759,12 +759,11 @@ fn dashboard_defaults_inputs(output_dir: &Path, workspace_dir: &Path) -> Result<
         TrackedPath::new("workspace/Cargo.toml", workspace_dir.join("Cargo.toml")),
         TrackedPath::new("workspace/Cargo.lock", workspace_dir.join("Cargo.lock")),
     ];
-    inputs.extend(collect_tracked_files(
-        &workspace_dir.join("src"),
-        "workspace/src",
-    )?);
-    inputs.sort_by(|left, right| left.identity.cmp(&right.identity));
-    Ok(inputs)
+    collect_tracked_files(&workspace_dir.join("src"), "workspace/src").map(|sources| {
+        inputs.extend(sources);
+        inputs.sort_by(|left, right| left.identity.cmp(&right.identity));
+        inputs
+    })
 }
 
 fn dashboard_defaults_receipt_path(output_dir: &Path) -> PathBuf {
@@ -1363,11 +1362,13 @@ mod tests {
         fs::write(
             output.join(".publication-candidate.json"),
             r#"{"artifacts":[{"name":"metric.json"}]}"#,
-        )?;
+        )
+        .expect("candidate fixture should be written");
         fs::write(
             output.join(crate::publication::RECEIPT_FILE),
             r#"{"selected_snapshot_versions":{"nlwiki":"2026-07"}}"#,
-        )?;
+        )
+        .expect("gate fixture should be written");
         fs::write(output.join("manifest.json"), r#"{"status":"ready"}"#)?;
         fs::write(workspace.join("src/dashboard.rs"), "fn generate() {}")?;
         fs::write(workspace.join("Cargo.toml"), "[package]\nname='fixture'")?;
@@ -1378,9 +1379,10 @@ mod tests {
 
         let receipt = record_dashboard_defaults(&output, &workspace, &defaults)?;
         assert_eq!(receipt.stage, "dashboard-defaults");
-        assert!(dashboard_defaults_are_reusable(
-            &output, &workspace, &defaults
-        )?);
+        assert!(
+            dashboard_defaults_are_reusable(&output, &workspace, &defaults)
+                .expect("unchanged defaults should be reusable")
+        );
 
         fs::write(workspace.join("site/src/index.md"), "# Static change")?;
         assert!(
@@ -1389,14 +1391,16 @@ mod tests {
         );
 
         fs::write(workspace.join("src/dashboard.rs"), "fn generate_v2() {}")?;
-        assert!(!dashboard_defaults_are_reusable(
-            &output, &workspace, &defaults
-        )?);
+        assert!(
+            !dashboard_defaults_are_reusable(&output, &workspace, &defaults)
+                .expect("generator changes should be evaluated")
+        );
         fs::write(workspace.join("src/dashboard.rs"), "fn generate() {}")?;
         fs::write(defaults.join("gdp.json"), r#"{"rows":2}"#)?;
-        assert!(!dashboard_defaults_are_reusable(
-            &output, &workspace, &defaults
-        )?);
+        assert!(
+            !dashboard_defaults_are_reusable(&output, &workspace, &defaults)
+                .expect("defaults corruption should be evaluated")
+        );
         Ok(())
     }
 
@@ -1427,7 +1431,8 @@ mod tests {
         fs::write(
             output.join("_stages/dashboard-defaults.json"),
             r#"{"fingerprint":"defaults"}"#,
-        )?;
+        )
+        .expect("dashboard defaults receipt fixture should be written");
         fs::write(site.join("src/nested/index.md"), "# Site")?;
         let generated_cache = site.join("src/.observablehq/cache/generated.js");
         fs::write(generated_cache, "transient")?;

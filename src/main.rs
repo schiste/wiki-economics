@@ -3990,7 +3990,8 @@ mod tests {
         fs::write(
             output_dir.path().join("_stages/dashboard-defaults.json"),
             r#"{"fingerprint":"defaults"}"#,
-        )?;
+        )
+        .expect("dashboard defaults receipt fixture should be written");
         fs::write(site_dir.join("src/index.md"), "# Site")?;
         fs::write(site_dir.join("data-build/manifest.sh"), "true")?;
         fs::write(site_dir.join("observablehq.config.js"), "export default {}")
@@ -4047,16 +4048,19 @@ mod tests {
         fs::write(
             output_dir.path().join(".publication-candidate.json"),
             r#"{"artifacts":[]}"#,
-        )?;
+        )
+        .expect("candidate fixture should be written");
         fs::write(
             output_dir.path().join(publication::RECEIPT_FILE),
             r#"{"selected_snapshot_versions":{"nlwiki":"2026-07"}}"#,
-        )?;
+        )
+        .expect("gate fixture should be written");
         fs::write(output_dir.path().join("manifest.json"), "{}")?;
         fs::write(
             workspace_dir.path().join("src/dashboard.rs"),
             "fn generate() {}",
-        )?;
+        )
+        .expect("dashboard generator fixture should be written");
         fs::write(workspace_dir.path().join("Cargo.toml"), "[package]")?;
         fs::write(workspace_dir.path().join("Cargo.lock"), "version = 4")?;
         fs::write(defaults_dir.path().join("defaults.json"), "{}")?;
@@ -4073,14 +4077,16 @@ mod tests {
                 defaults_dir: defaults_dir.path().to_path_buf(),
             }),
             &RecordingOps::default(),
-        )?;
+        )
+        .expect("dashboard defaults receipt should record");
         run_with_ops(
             command(Commands::DashboardDefaultsFingerprintCheck {
                 workspace_dir: workspace_dir.path().to_path_buf(),
                 defaults_dir: defaults_dir.path().to_path_buf(),
             }),
             &RecordingOps::default(),
-        )?;
+        )
+        .expect("dashboard defaults receipt should be reusable");
 
         fs::write(defaults_dir.path().join("defaults.json"), "changed")?;
         assert!(
@@ -4092,6 +4098,19 @@ mod tests {
                 &RecordingOps::default(),
             )
             .is_err()
+        );
+        fs::remove_dir_all(workspace_dir.path().join("src"))?;
+        fs::write(workspace_dir.path().join("src"), "not-a-directory")?;
+        assert!(
+            run_with_ops(
+                command(Commands::DashboardDefaultsFingerprintCheck {
+                    workspace_dir: workspace_dir.path().to_path_buf(),
+                    defaults_dir: defaults_dir.path().to_path_buf(),
+                }),
+                &RecordingOps::default(),
+            )
+            .is_err(),
+            "source inventory errors must propagate through the CLI"
         );
         Ok(())
     }

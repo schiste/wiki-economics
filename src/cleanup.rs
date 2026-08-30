@@ -469,6 +469,7 @@ fn clean_site_builds(
         .file_name()
         .and_then(|name| name.to_str())
         .context("site dist directory has no valid filename")?;
+    let defaults_name = format!("{dist_name}-defaults");
     clean_site_build_family(
         parent,
         dist_dir,
@@ -477,17 +478,18 @@ fn clean_site_builds(
         minimum_age,
         now,
         report,
-    )?;
-    let defaults_name = format!("{dist_name}-defaults");
-    clean_site_build_family(
-        parent,
-        &parent.join(&defaults_name),
-        &defaults_name,
-        current_run_id,
-        minimum_age,
-        now,
-        report,
     )
+    .and_then(|()| {
+        clean_site_build_family(
+            parent,
+            &parent.join(&defaults_name),
+            &defaults_name,
+            current_run_id,
+            minimum_age,
+            now,
+            report,
+        )
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -771,7 +773,8 @@ mod tests {
         std::os::unix::fs::symlink(
             live_defaults.file_name().context("live defaults name")?,
             site_parent.join("dist-defaults"),
-        )?;
+        )
+        .expect("live dashboard defaults symlink should be created");
         let run_stage = output.join(".refresh-staging.dead-run");
         let malformed_run_stage = output.join(".refresh-staging.bad$id");
         fs::create_dir(&run_stage)?;
