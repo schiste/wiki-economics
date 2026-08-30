@@ -1,0 +1,117 @@
+{
+  "schema_version": 1,
+  "measured_at": "2026-08-30",
+  "deployment_commit_binding": "git_commit_containing_this_file",
+  "snapshot": "2026-07",
+  "cutoff": "2026-08",
+  "published_wikis": [
+    "afwiki",
+    "arwiki",
+    "arzwiki",
+    "elwiki",
+    "eswiki",
+    "frwiki",
+    "hawiki",
+    "itwiki",
+    "jawiki",
+    "nlwiki",
+    "ptwiki",
+    "svwiki",
+    "swwiki",
+    "viwiki",
+    "yowiki",
+    "zhwiki"
+  ],
+  "production_preparation": {
+    "afwiki": {"wall_seconds": 490, "cpu_usage_usec": 340157150, "memory_peak_bytes": 429928448},
+    "arwiki": {"wall_seconds": 4372, "cpu_usage_usec": 2920743299, "memory_peak_bytes": 2340966400},
+    "arzwiki": {"wall_seconds": 935, "cpu_usage_usec": 776632894, "memory_peak_bytes": 881471488},
+    "eswiki": {"wall_seconds": 9649, "cpu_usage_usec": 6307832967, "memory_peak_bytes": 2467278848},
+    "hawiki": {"wall_seconds": 249, "cpu_usage_usec": 158640050, "memory_peak_bytes": 409153536},
+    "jawiki": {"wall_seconds": 6569, "cpu_usage_usec": 4319690111, "memory_peak_bytes": 2332098560},
+    "swwiki": {"wall_seconds": 439, "cpu_usage_usec": 315348318, "memory_peak_bytes": 542277632},
+    "viwiki": {"wall_seconds": 4102, "cpu_usage_usec": 3009539588, "memory_peak_bytes": 2316734464},
+    "yowiki": {"wall_seconds": 233, "cpu_usage_usec": 162904994, "memory_peak_bytes": 356614144},
+    "zhwiki": {"wall_seconds": 5587, "cpu_usage_usec": 3795790857, "memory_peak_bytes": 2436825088}
+  },
+  "publication": {
+    "run_id": "publish-20260830T090431Z-7",
+    "state": "committed",
+    "wall_seconds": 1942,
+    "stage_durations_ms": {
+      "publication_prepare": 1837253,
+      "site": 69000,
+      "publication_verify": 75,
+      "publication_commit": 4272
+    },
+    "memory_peak_bytes": 1163792384,
+    "memory_limit_bytes": 6442450944,
+    "cpu_usage_usec": 1865851216,
+    "cpu_throttled_usec": 25556626,
+    "site_generation": ".site-dist.build.publish-20260830T090431Z-7.INNBFC",
+    "changed_metric_families": 50,
+    "reused_metric_families": 30,
+    "metrics": {
+      "history_edits": 1152880965,
+      "page_week_rows": 644072684,
+      "page_week_edits": 1152880965,
+      "page_week_minimum_date": "2001-01-15",
+      "page_week_maximum_date": "2026-07-27"
+    }
+  },
+  "publication_noop": {
+    "run_id": "publish-20260830T093744Z-6",
+    "state": "succeeded",
+    "noop": true,
+    "wall_seconds": 5,
+    "publication_prepare_ms": 2313,
+    "memory_peak_bytes": 25931776,
+    "cpu_usage_usec": 2358821,
+    "site_generation_unchanged": true
+  },
+  "storage": {
+    "data_bytes": 451788402,
+    "output_bytes": 7000106800,
+    "site_bytes": 46514585,
+    "free_bytes": 2037068595200,
+    "generation_states": {
+      "building": 8,
+      "published": 16,
+      "retired": 5,
+      "superseded": 6
+    }
+  },
+  "browser": {
+    "index_schema_version": 3,
+    "cache_schema_version": 3,
+    "generation": "8455df75b2258252c9a23843d1f6da569516fd42ddfb7aaafc3d634e254abf40",
+    "partitions": 378,
+    "global_partitions": 234,
+    "rows": 703790,
+    "bytes": 36543476,
+    "largest_partition_bytes": 1903839,
+    "canonical_default": {
+      "browser_index_requests": 0,
+      "parquet_requests": 0,
+      "arrow_requests": 0,
+      "wasm_requests": 0
+    }
+  },
+  "jobs": [
+    "wiki-econ-artifact-scrub",
+    "wiki-econ-fleet-controller",
+    "wiki-econ-fleet-medium",
+    "wiki-econ-fleet-small-a",
+    "wiki-econ-fleet-small-b",
+    "wiki-econ-publish-ready"
+  ],
+  "health": {"status": "healthy", "alerts": []},
+  "local_validation": {
+    "rust_tests": 521,
+    "cli_tests": 4,
+    "line_coverage_covered": 40838,
+    "line_coverage_uncovered": 0,
+    "offline_site_builds_byte_identical": true,
+    "licenses_advisories_sboms": "pass"
+  }
+}
