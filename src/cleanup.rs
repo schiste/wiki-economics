@@ -469,8 +469,39 @@ fn clean_site_builds(
         .file_name()
         .and_then(|name| name.to_str())
         .context("site dist directory has no valid filename")?;
-    let prefix = format!(".{dist_name}.build.");
-    let live_target = fs::read_link(dist_dir).ok().map(|target| {
+    clean_site_build_family(
+        parent,
+        dist_dir,
+        dist_name,
+        current_run_id,
+        minimum_age,
+        now,
+        report,
+    )?;
+    let defaults_name = format!("{dist_name}-defaults");
+    clean_site_build_family(
+        parent,
+        &parent.join(&defaults_name),
+        &defaults_name,
+        current_run_id,
+        minimum_age,
+        now,
+        report,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn clean_site_build_family(
+    parent: &Path,
+    live_link: &Path,
+    family_name: &str,
+    current_run_id: Option<&str>,
+    minimum_age: Duration,
+    now: SystemTime,
+    report: &mut CleanupReport,
+) -> Result<()> {
+    let prefix = format!(".{family_name}.build.");
+    let live_target = fs::read_link(live_link).ok().map(|target| {
         if target.is_absolute() {
             target
         } else {
@@ -721,17 +752,26 @@ mod tests {
         let unrelated_site = site_parent.join("unrelated-site-directory");
         let live_site = site_parent.join(".dist.build.live-run.abc123");
         let current_site = site_parent.join(".dist.build.current-run.abc123");
+        let stale_defaults = site_parent.join(".dist-defaults.build.dead-run.abc123");
+        let live_defaults = site_parent.join(".dist-defaults.build.live-run.abc123");
         for directory in [
             &stale_site,
             &malformed_site,
             &unrelated_site,
             &live_site,
             &current_site,
+            &stale_defaults,
+            &live_defaults,
         ] {
             fs::create_dir(directory)?;
         }
         #[cfg(unix)]
         std::os::unix::fs::symlink(live_site.file_name().context("live name")?, &dist)?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(
+            live_defaults.file_name().context("live defaults name")?,
+            site_parent.join("dist-defaults"),
+        )?;
         let run_stage = output.join(".refresh-staging.dead-run");
         let malformed_run_stage = output.join(".refresh-staging.bad$id");
         fs::create_dir(&run_stage)?;
@@ -749,18 +789,20 @@ mod tests {
         .expect("abandoned staging cleanup should succeed");
 
         assert_eq!(report.merge_temporaries, 1);
-        assert_eq!(report.site_builds, 1);
+        assert_eq!(report.site_builds, 2);
         assert_eq!(report.run_staging_directories, 1);
         assert_eq!(report.quarantined_artifacts, 3);
         assert!(!stale_merge.exists());
         assert!(!malformed_merge.exists());
         assert!(!stale_site.exists());
+        assert!(!stale_defaults.exists());
         assert!(!malformed_site.exists());
         assert!(!run_stage.exists());
         assert!(!malformed_run_stage.exists());
         assert!(unrelated.exists());
         assert!(unrelated_site.exists());
         assert!(live_site.exists());
+        assert!(live_defaults.exists());
         assert!(current_site.exists());
         Ok(())
     }

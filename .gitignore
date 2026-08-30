@@ -5,6 +5,8 @@
 /output/
 /node_modules/
 /site/dist/
+/site/dist-defaults
+/site/.dist-defaults.*
 /site/node_modules/
 /site/src/.observablehq/
 /site/src/data/.observablehq/

@@ -140,6 +140,85 @@ test("a reusable site skips Node dependency installation", () => {
   assert.equal(events.at(-1).event, "completed");
 });
 
+test("a frontend-only rebuild reuses the validated Rust dashboard defaults", () => {
+  const closureBin = path.join(fixtureRoot, "closure-bin");
+  const commandLog = path.join(fixtureRoot, "defaults-command.log");
+  const receiptMarker = path.join(fixtureRoot, "defaults-receipt.valid");
+  const defaultsDir = path.join(path.dirname(distDir), "site-dist-defaults");
+  const closureWikiEcon = path.join(closureBin, "wiki-econ");
+  fs.mkdirSync(closureBin, {recursive: true});
+  fs.mkdirSync(path.join(fakeSite, "src"), {recursive: true});
+  fs.mkdirSync(path.join(fakeSite, "vendor", "observable-cache"), {recursive: true});
+  fs.writeFileSync(path.join(fakeSite, "src", "index.md"), "# Frontend\n");
+  fs.writeFileSync(path.join(outputDir, "manifest.json"), "{}\n");
+  fs.copyFileSync(fakeNpm, path.join(closureBin, "npm"));
+  fs.chmodSync(path.join(closureBin, "npm"), 0o755);
+  fs.writeFileSync(
+    closureWikiEcon,
+    `#!/bin/sh
+set -eu
+command_name=""
+destination=""
+for argument in "$@"; do
+  case "$argument" in
+    publication-verify|site-fingerprint-check|site-fingerprint-record|dashboard-materialize|dashboard-defaults-fingerprint-check|dashboard-defaults-fingerprint-record)
+      command_name="$argument"
+      ;;
+  esac
+  if [ "$command_name" = dashboard-materialize ] && [ "$argument" != --destination-dir ]; then
+    case "$argument" in /*) destination="$argument" ;; esac
+  fi
+done
+printf '%s\n' "$command_name" >> "$FAKE_DEFAULTS_COMMAND_LOG"
+case "$command_name" in
+  site-fingerprint-check) exit 1 ;;
+  dashboard-defaults-fingerprint-check) test -f "$FAKE_DEFAULTS_RECEIPT_MARKER" ;;
+  dashboard-materialize)
+    mkdir -p "$destination"
+    printf '{"rows":1}\n' > "$destination/defaults_inequality.json"
+    ;;
+  dashboard-defaults-fingerprint-record) : > "$FAKE_DEFAULTS_RECEIPT_MARKER" ;;
+esac
+`,
+    {mode: 0o755},
+  );
+  fs.writeFileSync(
+    path.join(closureBin, "node"),
+    `#!/bin/sh
+set -eu
+case "$1" in
+  -e) exec ${JSON.stringify(process.execPath)} "$@" ;;
+  */run-record.cjs|*/publish-browser-data.cjs|*/verify-site-dependencies.cjs) exit 0 ;;
+  */prepare-site-source.cjs) mkdir -p "$3" ;;
+  *) exec ${JSON.stringify(process.execPath)} "$@" ;;
+esac
+`,
+    {mode: 0o755},
+  );
+
+  const env = {
+    PATH: `${closureBin}${path.delimiter}${process.env.PATH}`,
+    WIKI_ECON_BIN: closureWikiEcon,
+    WIKI_ECON_REQUIRE_PUBLICATION_GATE: "1",
+    WIKI_ECON_VERIFY_SITE_CLOSURE: "1",
+    WIKI_ECON_SITE_DEFAULTS_DIR: defaultsDir,
+    WIKI_ECON_RUN_RECORD_HELPER: path.join(fakeRoot, "deploy", "toolforge", "run-record.cjs"),
+    FAKE_DEFAULTS_COMMAND_LOG: commandLog,
+    FAKE_DEFAULTS_RECEIPT_MARKER: receiptMarker,
+  };
+  const first = runBuild({...env, WIKI_ECON_RUN_ID: "defaults-first"});
+  assertBuildSucceeded(first);
+  assert.equal(fs.lstatSync(defaultsDir).isSymbolicLink(), true);
+  fs.writeFileSync(path.join(fakeSite, "src", "index.md"), "# Frontend changed\n");
+
+  const second = runBuild({...env, WIKI_ECON_RUN_ID: "defaults-second"});
+  assertBuildSucceeded(second);
+  assert.match(second.stdout, /Dashboard defaults unchanged; reusing validated bundle/);
+  const commands = fs.readFileSync(commandLog, "utf8").trim().split("\n");
+  assert.equal(commands.filter((command) => command === "dashboard-materialize").length, 1);
+  assert.equal(commands.filter((command) => command === "dashboard-defaults-fingerprint-check").length, 1);
+});
+
 test("production refuses a network dependency install when the image is incomplete", () => {
   const incompleteRoot = path.join(fixtureRoot, "incomplete-image");
   const npmLog = path.join(fixtureRoot, "incomplete-image-npm.log");

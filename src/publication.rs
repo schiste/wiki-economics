@@ -4793,6 +4793,11 @@ mod tests {
                 };
                 fs::write(output.path().join(name), value)?;
             }
+            fs::create_dir_all(output.path().join("_stages"))?;
+            fs::write(
+                output.path().join("_stages/dashboard-defaults.json"),
+                b"{\"fingerprint\":\"defaults\"}\n",
+            )?;
             Ok(Self {
                 data,
                 output,

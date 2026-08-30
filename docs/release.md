@@ -11,6 +11,7 @@ Keep these locally. Do not commit them:
 - generated `output/` artifacts such as `*.parquet`, `manifest.json`, and `defaults_*.json`
 - `node_modules/`
 - `site/dist/`
+- immutable local dashboard-default generations such as `site-dist-defaults`
 - local cache directories such as `site/src/.observablehq/`
 
 The checked-in manifest entrypoint and validator live under `site/data-build/`.

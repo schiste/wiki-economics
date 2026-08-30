@@ -46,6 +46,7 @@ wiki_econ_init_runtime
 wiki_econ_ensure_local_dirs
 SITE_STAGE_STARTED_EPOCH="$(date +%s)"
 SITE_STAGE_FINISHED=0
+DASHBOARD_DEFAULTS_STAGE_ACTIVE=0
 wiki_econ_record_stage_event started site
 
 verify_publication_receipt() {
@@ -98,17 +99,33 @@ source_dir="$(mktemp -d "$dist_parent/.${dist_name}.source.${site_build_run_id}.
 # prepare-site-source requires a destination that does not yet exist.
 rmdir "$source_dir"
 dashboard_dir=""
+dashboard_staging_dir=""
+defaults_dir="${WIKI_ECON_SITE_DEFAULTS_DIR:-$dist_parent/${dist_name}-defaults}"
+defaults_parent="$(dirname "$defaults_dir")"
+defaults_name="$(basename "$defaults_dir")"
 next_link="$(mktemp "$dist_parent/.${dist_name}.next.XXXXXX")"
 rm -f -- "$next_link"
 legacy_dir="$dist_parent/.${dist_name}.previous.$$"
+defaults_next_link=""
+defaults_legacy_dir="$defaults_parent/.${defaults_name}.previous.$$"
+
+case "$defaults_name" in
+  ''|.|..|/)
+    echo "Refusing unsafe dashboard defaults path: $defaults_dir" >&2
+    exit 1
+    ;;
+esac
 
 cleanup_site_build() {
   local exit_code=$? current_target=""
 
   rm -f -- "$next_link"
+  if [ -n "$defaults_next_link" ]; then
+    rm -f -- "$defaults_next_link"
+  fi
   rm -rf -- "$source_dir"
-  if [ -n "$dashboard_dir" ]; then
-    rm -rf -- "$dashboard_dir"
+  if [ -n "$dashboard_staging_dir" ]; then
+    rm -rf -- "$dashboard_staging_dir"
   fi
   if [ -L "$dist_dir" ]; then
     current_target="$(readlink "$dist_dir")"
@@ -120,6 +137,11 @@ cleanup_site_build() {
     mv -- "$legacy_dir" "$dist_dir"
   fi
   if [ "$exit_code" -ne 0 ] && [ "$SITE_STAGE_FINISHED" -eq 0 ]; then
+    if [ "$DASHBOARD_DEFAULTS_STAGE_ACTIVE" -eq 1 ]; then
+      wiki_econ_record_stage_event failed dashboard_defaults "" \
+        "$(( ($(date +%s) - DASHBOARD_DEFAULTS_STAGE_STARTED_EPOCH) * 1000 ))" \
+        "dashboard defaults exited with status $exit_code"
+    fi
     wiki_econ_record_stage_event failed site "" \
       "$(( ($(date +%s) - SITE_STAGE_STARTED_EPOCH) * 1000 ))" \
       "site build exited with status $exit_code"
@@ -135,9 +157,73 @@ echo "    dist dir:   $WIKI_ECON_SITE_DIST_DIR"
 echo "    staging:    $build_dir"
 
 if [ "${WIKI_ECON_VERIFY_SITE_CLOSURE:-1}" = "1" ]; then
-  dashboard_dir="$(mktemp -d "$dist_parent/.${dist_name}.dashboard.${site_build_run_id}.XXXXXX")"
-  wiki_econ_run_cli dashboard-materialize --destination-dir "$dashboard_dir"
-  cp "$WIKI_ECON_OUTPUT_DIR/manifest.json" "$dashboard_dir/manifest.json"
+  if [ "${WIKI_ECON_REQUIRE_PUBLICATION_GATE:-0}" = "1" ]; then
+    DASHBOARD_DEFAULTS_STAGE_STARTED_EPOCH="$(date +%s)"
+    DASHBOARD_DEFAULTS_STAGE_ACTIVE=1
+    wiki_econ_record_stage_event started dashboard_defaults
+    if [ -d "$defaults_dir" ] && wiki_econ_run_cli dashboard-defaults-fingerprint-check \
+      --workspace-dir "$ROOT" \
+      --defaults-dir "$defaults_dir"; then
+      dashboard_dir="$defaults_dir"
+      wiki_econ_record_stage_event reused dashboard_defaults
+      echo "==> Dashboard defaults unchanged; reusing validated bundle"
+    else
+      mkdir -p "$defaults_parent"
+      dashboard_staging_dir="$(mktemp -d "$defaults_parent/.${defaults_name}.build.${site_build_run_id}.XXXXXX")"
+      wiki_econ_run_cli dashboard-materialize --destination-dir "$dashboard_staging_dir"
+      cp "$WIKI_ECON_OUTPUT_DIR/manifest.json" "$dashboard_staging_dir/manifest.json"
+      wiki_econ_run_cli dashboard-defaults-fingerprint-record \
+        --workspace-dir "$ROOT" \
+        --defaults-dir "$dashboard_staging_dir"
+
+      old_defaults_release=""
+      defaults_next_link="$(mktemp "$defaults_parent/.${defaults_name}.next.XXXXXX")"
+      rm -f -- "$defaults_next_link"
+      if [ -L "$defaults_dir" ]; then
+        old_defaults_release="$(readlink "$defaults_dir")"
+        ln -s "$(basename "$dashboard_staging_dir")" "$defaults_next_link"
+        node -e 'require("node:fs").renameSync(process.argv[1], process.argv[2])' \
+          "$defaults_next_link" "$defaults_dir"
+      elif [ -e "$defaults_dir" ]; then
+        if [ -e "$defaults_legacy_dir" ] || [ -L "$defaults_legacy_dir" ]; then
+          echo "Refusing to overwrite dashboard-defaults recovery path: $defaults_legacy_dir" >&2
+          exit 1
+        fi
+        mv -- "$defaults_dir" "$defaults_legacy_dir"
+        ln -s "$(basename "$dashboard_staging_dir")" "$defaults_next_link"
+        if ! node -e 'require("node:fs").renameSync(process.argv[1], process.argv[2])' \
+          "$defaults_next_link" "$defaults_dir"; then
+          mv -- "$defaults_legacy_dir" "$defaults_dir"
+          exit 1
+        fi
+      else
+        ln -s "$(basename "$dashboard_staging_dir")" "$defaults_next_link"
+        node -e 'require("node:fs").renameSync(process.argv[1], process.argv[2])' \
+          "$defaults_next_link" "$defaults_dir"
+      fi
+      defaults_next_link=""
+      dashboard_staging_dir=""
+      dashboard_dir="$defaults_dir"
+
+      if [ -d "$defaults_legacy_dir" ]; then
+        rm -rf -- "$defaults_legacy_dir"
+      fi
+      case "$old_defaults_release" in
+        ".${defaults_name}.build."*)
+          rm -rf -- "${defaults_parent:?}/${old_defaults_release:?}"
+          ;;
+      esac
+      echo "==> Dashboard defaults generated and published: $defaults_dir -> $(readlink "$defaults_dir")"
+    fi
+    wiki_econ_record_stage_event completed dashboard_defaults "" \
+      "$(( ($(date +%s) - DASHBOARD_DEFAULTS_STAGE_STARTED_EPOCH) * 1000 ))"
+    DASHBOARD_DEFAULTS_STAGE_ACTIVE=0
+  else
+    dashboard_staging_dir="$(mktemp -d "$dist_parent/.${dist_name}.dashboard.${site_build_run_id}.XXXXXX")"
+    wiki_econ_run_cli dashboard-materialize --destination-dir "$dashboard_staging_dir"
+    cp "$WIKI_ECON_OUTPUT_DIR/manifest.json" "$dashboard_staging_dir/manifest.json"
+    dashboard_dir="$dashboard_staging_dir"
+  fi
 
   node "$ROOT/scripts/prepare-site-source.cjs" \
     "$WIKI_ECON_SITE_DIR/src" \

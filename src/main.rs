@@ -81,6 +81,30 @@ enum Commands {
         destination_dir: Option<PathBuf>,
     },
 
+    /// Exit successfully only when Rust-generated dashboard defaults are reusable
+    #[command(hide = true)]
+    DashboardDefaultsFingerprintCheck {
+        /// Repository root containing the Rust dashboard generator source
+        #[arg(long, default_value = ".")]
+        workspace_dir: PathBuf,
+
+        /// Published immutable dashboard-defaults directory
+        #[arg(long)]
+        defaults_dir: PathBuf,
+    },
+
+    /// Record a newly generated immutable dashboard-defaults bundle
+    #[command(hide = true)]
+    DashboardDefaultsFingerprintRecord {
+        /// Repository root containing the Rust dashboard generator source
+        #[arg(long, default_value = ".")]
+        workspace_dir: PathBuf,
+
+        /// Newly materialized dashboard-defaults directory
+        #[arg(long)]
+        defaults_dir: PathBuf,
+    },
+
     /// Write the deterministic minimal data fixture used by real site CI
     #[command(hide = true)]
     SiteFixture,
@@ -1098,6 +1122,27 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             } else {
                 dashboard::materialize(&output_dir)?;
             }
+        }
+        Commands::DashboardDefaultsFingerprintCheck {
+            workspace_dir,
+            defaults_dir,
+        } => {
+            anyhow::ensure!(
+                fingerprint::dashboard_defaults_are_reusable(
+                    &output_dir,
+                    &workspace_dir,
+                    &defaults_dir,
+                )?,
+                "dashboard defaults fingerprint changed"
+            );
+            observability::record_stage_reused("dashboard_defaults", None);
+            info!(path = %defaults_dir.display(), "reusing deterministic dashboard defaults");
+        }
+        Commands::DashboardDefaultsFingerprintRecord {
+            workspace_dir,
+            defaults_dir,
+        } => {
+            fingerprint::record_dashboard_defaults(&output_dir, &workspace_dir, &defaults_dir)?;
         }
         Commands::SiteFixture => dashboard::write_site_fixture(&output_dir)?,
         Commands::BrowserPerformanceFixture => {
@@ -3941,6 +3986,11 @@ mod tests {
             r#"{"selected_snapshot_versions":{"nlwiki":"2026-07"}}"#,
         )
         .expect("gate fixture should be written");
+        fs::create_dir_all(output_dir.path().join("_stages"))?;
+        fs::write(
+            output_dir.path().join("_stages/dashboard-defaults.json"),
+            r#"{"fingerprint":"defaults"}"#,
+        )?;
         fs::write(site_dir.join("src/index.md"), "# Site")?;
         fs::write(site_dir.join("data-build/manifest.sh"), "true")?;
         fs::write(site_dir.join("observablehq.config.js"), "export default {}")
@@ -3979,6 +4029,65 @@ mod tests {
                 command(Commands::SiteFingerprintCheck {
                     site_dir,
                     dist_dir: dist_dir.path().to_path_buf(),
+                }),
+                &RecordingOps::default(),
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn run_with_ops_records_and_checks_dashboard_defaults_fingerprint() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let output_dir = TestDir::new()?;
+        let workspace_dir = TestDir::new()?;
+        let defaults_dir = TestDir::new()?;
+        fs::create_dir_all(workspace_dir.path().join("src"))?;
+        fs::write(
+            output_dir.path().join(".publication-candidate.json"),
+            r#"{"artifacts":[]}"#,
+        )?;
+        fs::write(
+            output_dir.path().join(publication::RECEIPT_FILE),
+            r#"{"selected_snapshot_versions":{"nlwiki":"2026-07"}}"#,
+        )?;
+        fs::write(output_dir.path().join("manifest.json"), "{}")?;
+        fs::write(
+            workspace_dir.path().join("src/dashboard.rs"),
+            "fn generate() {}",
+        )?;
+        fs::write(workspace_dir.path().join("Cargo.toml"), "[package]")?;
+        fs::write(workspace_dir.path().join("Cargo.lock"), "version = 4")?;
+        fs::write(defaults_dir.path().join("defaults.json"), "{}")?;
+        let command = |command| Cli {
+            data_dir: data_dir.path().to_path_buf(),
+            output_dir: output_dir.path().to_path_buf(),
+            run_id: None,
+            command,
+        };
+
+        run_with_ops(
+            command(Commands::DashboardDefaultsFingerprintRecord {
+                workspace_dir: workspace_dir.path().to_path_buf(),
+                defaults_dir: defaults_dir.path().to_path_buf(),
+            }),
+            &RecordingOps::default(),
+        )?;
+        run_with_ops(
+            command(Commands::DashboardDefaultsFingerprintCheck {
+                workspace_dir: workspace_dir.path().to_path_buf(),
+                defaults_dir: defaults_dir.path().to_path_buf(),
+            }),
+            &RecordingOps::default(),
+        )?;
+
+        fs::write(defaults_dir.path().join("defaults.json"), "changed")?;
+        assert!(
+            run_with_ops(
+                command(Commands::DashboardDefaultsFingerprintCheck {
+                    workspace_dir: workspace_dir.path().to_path_buf(),
+                    defaults_dir: defaults_dir.path().to_path_buf(),
                 }),
                 &RecordingOps::default(),
             )

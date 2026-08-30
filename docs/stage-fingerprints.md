@@ -21,6 +21,7 @@ output/_stages/compute/lifecycle/<wiki>.json
 output/_stages/compute/page_week/<wiki>.json
 output/_stages/patrol_compute/<wiki>.json
 output/_stages/merge.json
+output/_stages/dashboard-defaults.json
 output/_stages/site.json
 ```
 
@@ -83,9 +84,16 @@ fast validation index and is deliberately excluded from the fingerprint.
   rewritten; other root Parquets remain untouched. The small dashboard and
   manifest outputs retain a separate global orchestration receipt. A hit still
   issues a publication candidate for the current run ID.
-- **site** includes the publication candidate's artifacts plus the Observable
-  sources/configuration. Reuse runs only inside the fail-closed publication
-  flow, after the current run receipt is verified.
+- **dashboard defaults** bind the publication candidate and gate, public
+  manifest, Rust dashboard generator source, and generated JSON bytes. The
+  validated bundle is published as an immutable symlinked generation and is
+  reused by frontend-only builds. A data, generator, manifest, or cached-byte
+  change fails closed and regenerates it.
+- **site** includes the dashboard-defaults receipt plus the publication
+  candidate, gate, and Observable sources/configuration. Reuse runs only inside
+  the fail-closed publication flow, after the current run receipt is verified.
+  A Markdown/CSS/JavaScript change rebuilds Observable without recomputing
+  unchanged Rust defaults.
 - **publication** reads one atomic `_ready-index/<wiki>.json` per managed wiki.
   The index binds the newest ready and active published candidates to their
   ready-receipt hashes, core/patrol artifact-receipt identities, and workload
