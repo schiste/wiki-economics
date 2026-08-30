@@ -9,7 +9,7 @@ use std::time::UNIX_EPOCH;
 use tracing::{info, warn};
 
 const RECEIPT_SCHEMA_VERSION: u32 = 1;
-const SITE_ALGORITHM_VERSION: &str = "observable-static-site-v7-reusable-dashboard-defaults";
+const SITE_ALGORITHM_VERSION: &str = "observable-static-site-v8-plain-distribution-artifacts";
 const DASHBOARD_DEFAULTS_ALGORITHM_VERSION: &str =
     "rust-dashboard-defaults-v1-publication-receipt-generator-source";
 const PARQUET_SUMMARY_BATCH_ROWS: usize = 250_000;
@@ -603,6 +603,36 @@ pub fn record(
     let deterministic_inputs = deterministic_artifacts(&inspected_inputs);
     let serialized_inputs = serde_json::to_vec(&deterministic_inputs)?;
     let input_fingerprint = hex::encode(Sha256::digest(serialized_inputs));
+    let inspected_outputs =
+        inspect_receipted_outputs(outputs, spec.algorithm_version, &input_fingerprint)?;
+    persist_receipt(receipt_path, spec, inspected_inputs, inspected_outputs)
+}
+
+fn record_plain_outputs(
+    receipt_path: &Path,
+    spec: StageSpec<'_>,
+    inputs: &[TrackedPath],
+    outputs: &[TrackedPath],
+) -> Result<StageReceipt> {
+    ensure!(
+        !outputs.is_empty(),
+        "stage {} produced no outputs",
+        spec.stage
+    );
+    persist_receipt(
+        receipt_path,
+        spec,
+        inspect_all(inputs)?,
+        inspect_all(outputs)?,
+    )
+}
+
+fn persist_receipt(
+    receipt_path: &Path,
+    spec: StageSpec<'_>,
+    inspected_inputs: Vec<ArtifactIdentity>,
+    inspected_outputs: Vec<ArtifactIdentity>,
+) -> Result<StageReceipt> {
     let mut receipt = StageReceipt {
         schema_version: RECEIPT_SCHEMA_VERSION,
         stage: spec.stage.to_string(),
@@ -612,7 +642,7 @@ pub fn record(
         computation_version: env!("CARGO_PKG_VERSION").to_string(),
         binary_commit: option_env!("WIKI_ECON_BUILD_COMMIT").map(str::to_string),
         inputs: inspected_inputs,
-        outputs: inspect_receipted_outputs(outputs, spec.algorithm_version, &input_fingerprint)?,
+        outputs: inspected_outputs,
         fingerprint: String::new(),
     };
     receipt.fingerprint = receipt_fingerprint(&receipt)?;
@@ -960,7 +990,12 @@ pub fn record_site(output_dir: &Path, site_dir: &Path, dist_dir: &Path) -> Resul
     };
     let inputs = site_stage_inputs(output_dir, site_dir)?;
     let outputs = collect_tracked_files(dist_dir, "site-dist")?;
-    record(&site_receipt_path(output_dir), spec, &inputs, &outputs)
+    // The site distribution contains copied browser Parquets whose semantic
+    // receipts already belong to the publication. Recording them as fresh
+    // metric outputs would create public `*.receipt.json` sidecars after the
+    // output inventory was captured, making every subsequent no-op appear
+    // dirty. Hash the served bytes without mutating the completed release.
+    record_plain_outputs(&site_receipt_path(output_dir), spec, &inputs, &outputs)
 }
 
 #[cfg(test)]
@@ -1446,6 +1481,14 @@ mod tests {
         .expect("workspace package fixture should be written");
         fs::write(dir.path().join("package-lock.json"), "{}")?;
         fs::write(dist.join("index.html"), "published")?;
+        let browser_metric = dist.join("browser-data/gdp/nlwiki.parquet");
+        fs::create_dir_all(browser_metric.parent().expect("browser metric parent"))?;
+        let mut browser_frame = df!(
+            "wiki" => ["nlwiki"],
+            "year_month" => ["2026-07"],
+            "value" => [1_i64],
+        )?;
+        ParquetWriter::new(File::create(&browser_metric)?).finish(&mut browser_frame)?;
 
         assert!(
             !current_site_matches_publication(&output, &site.join("missing"))
@@ -1458,6 +1501,16 @@ mod tests {
 
         let receipt = record_site(&output, &site, &dist)?;
         assert_eq!(receipt.selected_snapshot.as_deref(), Some("nlwiki=2026-07"));
+        assert_eq!(receipt.outputs.len(), 2);
+        assert!(
+            !crate::artifact_receipt::sidecar_path(&browser_metric)?.exists(),
+            "recording a site must not mutate it with metric receipt sidecars"
+        );
+        assert_eq!(
+            collect_tracked_files(&dist, "site-dist")?.len(),
+            receipt.outputs.len(),
+            "the recorded and subsequently observed inventories must match"
+        );
         assert!(
             receipt
                 .inputs
