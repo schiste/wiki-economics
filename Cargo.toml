@@ -22,14 +22,14 @@ polars = { version = "0.55.2", default-features = false, features = [
     "is_in",
     "log",
 ] }
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "default-tls", "json"] }
-bzip2 = "0.5"
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "default-tls", "json"] }
+bzip2 = "0.6"
 indicatif = "0.18"
 rayon = "1.10"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-quick-xml = "0.41"
+quick-xml = "0.42"
 flate2 = "1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 serde_json = "1"
