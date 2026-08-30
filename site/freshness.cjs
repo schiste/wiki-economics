@@ -166,7 +166,10 @@ function evaluateFreshness({last = null, history = [], lifecycle, scrubStatus = 
       && changedFamilies.length > 0
       && Array.isArray(reusedFamilies)
       && reusedFamilies.length > 0;
+    const resolvedByLaterNoOp = latestSuccess?.noOp === true
+      && timestamp(latestSuccess.finishedAt) > timestamp(latestPublication.finishedAt);
     if (isIncrementalPublication
+        && !resolvedByLaterNoOp
         && Number.isFinite(incrementalDuration)
         && incrementalDuration > settings.incrementalPublicationMaximumMs) {
       alert("incremental_publication_slow", "critical", "Incremental publication exceeded its three-minute SLO.", {

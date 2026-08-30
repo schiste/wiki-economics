@@ -177,6 +177,36 @@ test("incremental publication has a three-minute SLO", () => {
   assert.equal(result.alerts[0].changedFamilies, 1);
 });
 
+test("a later authenticated no-op resolves a transient publication duration alert", () => {
+  const publication = success({
+    runId: "publish-slow",
+    stageDurationsMs: {publication_prepare: 180_001},
+    publication: {
+      ...success().publication,
+      changePlan: {
+        changed: [{wiki: "nlwiki", family: "monthly"}],
+        reused: [{wiki: "nlwiki", family: "page_week"}],
+      },
+    },
+  });
+  const noOp = success({
+    runId: "publish-no-op",
+    startedAt: "2026-08-21T03:01:00Z",
+    finishedAt: "2026-08-21T03:01:05Z",
+    noOp: true,
+    publication: null,
+  });
+  const result = evaluateFreshness({
+    last: noOp,
+    history: [publication, noOp],
+    lifecycle,
+    now: Date.parse("2026-08-22T03:00:00Z"),
+  });
+  assert.equal(result.status, "healthy");
+  assert.ok(!result.alerts.some((alert) => alert.code === "incremental_publication_slow"));
+  assert.equal(result.summary.lastPublicationRunId, "publish-slow");
+});
+
 test("full baseline publication is not classified as incremental", () => {
   const record = success({
     stageDurationsMs: {publication_prepare: 1_109_480},
