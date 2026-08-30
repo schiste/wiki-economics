@@ -253,6 +253,11 @@ unmodified:
 - `wiki-econ-site` — the Observable production build only, against whatever
   a prior compute last published. `build-site.sh` re-verifies the
   publication gate itself, so this needs no wikis and no `run` invocation.
+  Before Observable runs, the deployed Rust binary regenerates dashboard JSON
+  into a site-private temporary overlay from the authenticated merged
+  Parquets. This lets a dashboard-generator fix ship without mutating the
+  receipt-covered publication tree or recomputing history metrics; the
+  overlay is removed after the atomic site switch.
 
 Trigger one manually the same way an operator manually fires the scheduled
 refresh, with `toolforge jobs restart <name>`:

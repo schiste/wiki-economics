@@ -97,6 +97,7 @@ build_dir="$(mktemp -d "$dist_parent/.${dist_name}.build.${site_build_run_id}.XX
 source_dir="$(mktemp -d "$dist_parent/.${dist_name}.source.${site_build_run_id}.XXXXXX")"
 # prepare-site-source requires a destination that does not yet exist.
 rmdir "$source_dir"
+dashboard_dir=""
 next_link="$(mktemp "$dist_parent/.${dist_name}.next.XXXXXX")"
 rm -f -- "$next_link"
 legacy_dir="$dist_parent/.${dist_name}.previous.$$"
@@ -106,6 +107,9 @@ cleanup_site_build() {
 
   rm -f -- "$next_link"
   rm -rf -- "$source_dir"
+  if [ -n "$dashboard_dir" ]; then
+    rm -rf -- "$dashboard_dir"
+  fi
   if [ -L "$dist_dir" ]; then
     current_target="$(readlink "$dist_dir")"
   fi
@@ -131,10 +135,14 @@ echo "    dist dir:   $WIKI_ECON_SITE_DIST_DIR"
 echo "    staging:    $build_dir"
 
 if [ "${WIKI_ECON_VERIFY_SITE_CLOSURE:-1}" = "1" ]; then
+  dashboard_dir="$(mktemp -d "$dist_parent/.${dist_name}.dashboard.${site_build_run_id}.XXXXXX")"
+  wiki_econ_run_cli dashboard-materialize --destination-dir "$dashboard_dir"
+  cp "$WIKI_ECON_OUTPUT_DIR/manifest.json" "$dashboard_dir/manifest.json"
+
   node "$ROOT/scripts/prepare-site-source.cjs" \
     "$WIKI_ECON_SITE_DIR/src" \
     "$source_dir" \
-    "$WIKI_ECON_OUTPUT_DIR" \
+    "$dashboard_dir" \
     "$WIKI_ECON_SITE_DIR/vendor/observable-cache"
 
   offline_guard="$ROOT/scripts/deny-network.cjs"

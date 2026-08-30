@@ -9,7 +9,8 @@ use std::time::UNIX_EPOCH;
 use tracing::{info, warn};
 
 const RECEIPT_SCHEMA_VERSION: u32 = 1;
-const SITE_ALGORITHM_VERSION: &str = "observable-static-site-v5-publication-receipt-identity";
+const SITE_ALGORITHM_VERSION: &str =
+    "observable-static-site-v6-dashboard-overlay-publication-receipt-identity";
 const PARQUET_SUMMARY_BATCH_ROWS: usize = 250_000;
 const DATE_COLUMNS: [&str; 6] = [
     "week_start",

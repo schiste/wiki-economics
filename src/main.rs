@@ -75,7 +75,11 @@ struct Cli {
 enum Commands {
     /// Regenerate dashboard JSON from already-merged Parquet inputs
     #[command(hide = true)]
-    DashboardMaterialize,
+    DashboardMaterialize {
+        /// Write generated JSON outside the receipt-covered metric input tree
+        #[arg(long)]
+        destination_dir: Option<PathBuf>,
+    },
 
     /// Write the deterministic minimal data fixture used by real site CI
     #[command(hide = true)]
@@ -1088,7 +1092,13 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
     let run_id = cli.run_id;
 
     match cli.command {
-        Commands::DashboardMaterialize => dashboard::materialize(&output_dir)?,
+        Commands::DashboardMaterialize { destination_dir } => {
+            if let Some(destination_dir) = destination_dir {
+                dashboard::materialize_into(&output_dir, &destination_dir)?;
+            } else {
+                dashboard::materialize(&output_dir)?;
+            }
+        }
         Commands::SiteFixture => dashboard::write_site_fixture(&output_dir)?,
         Commands::BrowserPerformanceFixture => {
             dashboard::write_browser_performance_fixture(&output_dir)?
@@ -4057,7 +4067,9 @@ mod tests {
         run_with_ops(command(Commands::SiteFixture), &RecordingOps::default())?;
         let first = fs::read(output_dir.path().join("defaults_gdp.json"))?;
         run_with_ops(
-            command(Commands::DashboardMaterialize),
+            command(Commands::DashboardMaterialize {
+                destination_dir: None,
+            }),
             &RecordingOps::default(),
         )
         .expect("dashboard fixture should rematerialize");
@@ -4065,6 +4077,16 @@ mod tests {
             fs::read(output_dir.path().join("defaults_gdp.json"))?,
             first
         );
+        let overlay = TestDir::new()?;
+        run_with_ops(
+            command(Commands::DashboardMaterialize {
+                destination_dir: Some(overlay.path().to_path_buf()),
+            }),
+            &RecordingOps::default(),
+        )
+        .expect("dashboard fixture should materialize into a site overlay");
+        assert_eq!(fs::read(overlay.path().join("defaults_gdp.json"))?, first);
+        assert!(overlay.path().join("meta_inequality.json").is_file());
         run_with_ops(
             command(Commands::BrowserPerformanceFixture),
             &RecordingOps::default(),

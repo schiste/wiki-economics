@@ -81,7 +81,14 @@ impl Average {
 }
 
 pub fn materialize(output_dir: &Path) -> Result<()> {
-    let frames = Frames::read(output_dir)?;
+    materialize_into(output_dir, output_dir)
+}
+
+/// Materialize the dashboard JSON from one immutable metric input set into a
+/// separate destination. Site-only deployments use this to refresh generated
+/// presentation data without mutating the receipt-covered publication tree.
+pub fn materialize_into(input_dir: &Path, destination_dir: &Path) -> Result<()> {
+    let frames = Frames::read(input_dir)?;
     let dashboard_wikis = wiki_set(&frames.gdp)?;
     ensure!(
         !dashboard_wikis.is_empty(),
@@ -97,7 +104,7 @@ pub fn materialize(output_dir: &Path) -> Result<()> {
     artifacts.insert("defaults_business.json", defaults_business);
     artifacts.insert(
         "defaults_edit_variation.json",
-        edit_variation_artifact(output_dir, ALL_WIKIS_SCOPE, &dashboard_wikis)?,
+        edit_variation_artifact(input_dir, ALL_WIKIS_SCOPE, &dashboard_wikis)?,
     );
     artifacts.insert("defaults_gdp.json", defaults_gdp);
     artifacts.insert("defaults_inequality.json", defaults_inequality);
@@ -114,11 +121,11 @@ pub fn materialize(output_dir: &Path) -> Result<()> {
             && ARTIFACTS.iter().all(|name| artifacts.contains_key(name)),
         "Rust dashboard generator did not produce the complete artifact set"
     );
-    publish_json_set(output_dir, &artifacts)?;
-    let retired = output_dir.join("defaults_overview.json");
+    publish_json_set(destination_dir, &artifacts)?;
+    let retired = destination_dir.join("defaults_overview.json");
     if retired.is_file() {
         fs::remove_file(&retired)?;
-        File::open(output_dir)?.sync_all()?;
+        File::open(destination_dir)?.sync_all()?;
     }
     Ok(())
 }
