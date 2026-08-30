@@ -15,6 +15,7 @@ const REQUIRED_PAGES = [
   "business.html",
   "edit-variation.html",
   "gdp.html",
+  "index.html",
   "inequality.html",
   "labor.html",
   "legal.html",

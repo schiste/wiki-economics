@@ -9,6 +9,7 @@ import {
   aggregatePatrolByPeriod,
   combinedNamespaces,
   combinedRange,
+  detailWikis,
   formatWiki,
   matchesDefaultSelection,
   wikiMatches,
@@ -29,6 +30,13 @@ test("all-wiki scope has a stable value, label, range, and namespace union", () 
     ["nlwiki", [1, 0, null]],
     ["ptwiki", [2, 0]],
   ])), [0, 1, 2, null]);
+});
+
+test("detail wiki pickers exclude the portfolio scope and preserve source order", () => {
+  assert.deepEqual(
+    detailWikis([ALL_WIKIS, "ptwiki", "nlwiki", "ptwiki", ""]),
+    ["ptwiki", "nlwiki"],
+  );
 });
 
 test("precomputed defaults use their explicit selection instead of the wider source range", () => {

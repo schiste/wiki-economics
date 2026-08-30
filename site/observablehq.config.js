@@ -103,6 +103,7 @@ document.addEventListener("DOMContentLoaded",function(){
 });
 </script>`,
   pages: [
+    { name: "Portfolio", path: "/" },
     {
       name: "Indicators",
       pages: [

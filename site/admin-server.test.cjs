@@ -269,22 +269,20 @@ test("hosted mode enforces same-origin checks on mutating admin API requests", a
   assert.equal(JSON.parse(accepted.text()).error, "No job is currently running");
 });
 
-test("retired homepage routes redirect to the canonical all-wiki inequality view", async (t) => {
+test("homepage routes serve the published portfolio without redirects", async (t) => {
   const { module, host, distDir } = await startServer(t, LOCAL_ENV);
-  fs.writeFileSync(path.join(distDir, "index.html"), "<!doctype html><h1>Retired home</h1>", "utf8");
-  const expected = "/inequality?wiki=all&types=registered&gran=year&start=2001-06&end=2026-08";
+  fs.writeFileSync(path.join(distDir, "index.html"), "<!doctype html><h1>Portfolio home</h1>", "utf8");
 
   for (const url of ["/", "/index", "/index.html"]) {
     const response = await invoke(module, { url, headers: { host } });
-    assert.equal(response.statusCode, 302);
-    assert.equal(response.getHeader("location"), expected);
-    assert.equal(response.getHeader("cache-control"), "no-store");
-    assert.equal(response.text(), "");
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.getHeader("location"), undefined);
+    assert.match(response.text(), /Portfolio home/);
   }
 
   const head = await invoke(module, { method: "HEAD", url: "/", headers: { host } });
-  assert.equal(head.statusCode, 302);
-  assert.equal(head.getHeader("location"), expected);
+  assert.equal(head.statusCode, 200);
+  assert.equal(head.text(), "");
 });
 
 test("static fallback serves site assets from SITE_DIST_DIR with per-path cache-control", async (t) => {

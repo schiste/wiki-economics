@@ -168,10 +168,12 @@ async function waitFor(cdp, expression, timeoutMs = 10000) {
   throw new Error(`browser condition timed out: ${expression}`);
 }
 
-async function navigate(cdp, url) {
+async function navigate(cdp, url, {waitForDataStage = true} = {}) {
   await cdp.send("Page.navigate", {url});
   await waitFor(cdp, "document.readyState === 'complete'");
-  await waitFor(cdp, "document.body && document.body.dataset.wkStage === 'done'");
+  if (waitForDataStage) {
+    await waitFor(cdp, "document.body && document.body.dataset.wkStage === 'done'");
+  }
 }
 
 async function terminateChild(child, graceMs = 2000) {
@@ -207,16 +209,15 @@ async function runBrowserPerformance({distDir, budgets}) {
     await cdp.send("Page.addScriptToEvaluateOnNewDocument", {source: `window.__wikiEconLoads=[];document.addEventListener("wiki-econ:data-load",event=>window.__wikiEconLoads.push(event.detail));`});
 
     let requestStart = requests.length;
-    await navigate(cdp, `${origin}/gdp.html`);
-    const defaultWikiPicker = await evaluate(cdp, `(() => {
-      const select = document.querySelector(".filters-bar select");
-      return select ? {
-        label: select.selectedOptions[0]?.textContent?.trim(),
-        query: new URLSearchParams(location.search).get("wiki"),
-      } : null;
-    })()`);
-    if (defaultWikiPicker?.query !== "all" || defaultWikiPicker?.label !== "All wikis") {
-      throw new Error(`default wiki picker is invalid: ${JSON.stringify(defaultWikiPicker)}`);
+    await navigate(cdp, `${origin}/`, {waitForDataStage: false});
+    await waitFor(cdp, "document.querySelectorAll('.portfolio-wiki-grid a').length > 0");
+    const portfolio = await evaluate(cdp, `({
+      hero: Boolean(document.querySelector(".portfolio-hero")),
+      wikiCount: document.querySelectorAll(".portfolio-wiki-grid a").length,
+      pickerCount: document.querySelectorAll(".filters-bar select").length,
+    })`);
+    if (!portfolio.hero || portfolio.wikiCount === 0 || portfolio.pickerCount !== 0) {
+      throw new Error(`portfolio homepage contract is invalid: ${JSON.stringify(portfolio)}`);
     }
     const defaultRequests = requests.slice(requestStart);
     if (defaultRequests.some(url => url.endsWith(".parquet") || url.endsWith(".wasm")
@@ -226,7 +227,7 @@ async function runBrowserPerformance({distDir, budgets}) {
     }
 
     const profiles = [];
-    for (const wiki of [...Object.keys(budgets.fixtures).sort(), "all"]) {
+    for (const wiki of Object.keys(budgets.fixtures).sort()) {
       requestStart = requests.length;
       let peakHeapUsed = 0;
       const sampler = setInterval(() => {
@@ -245,6 +246,9 @@ async function runBrowserPerformance({distDir, budgets}) {
         clearInterval(sampler);
       }
       const load = await evaluate(cdp, "window.__wikiEconLoads.at(-1)");
+      const pickerHasPortfolioScope = await evaluate(cdp,
+        `Array.from(document.querySelectorAll(".filters-bar select option")).some(option => option.value === "all")`);
+      if (pickerHasPortfolioScope) throw new Error("detail wiki picker still exposes the all-wiki portfolio scope");
       const metrics = await cdp.send("Performance.getMetrics");
       const heapUsed = metrics.metrics.find(metric => metric.name === "JSHeapUsedSize")?.value || 0;
       peakHeapUsed = Math.max(peakHeapUsed, heapUsed);
@@ -256,6 +260,18 @@ async function runBrowserPerformance({distDir, budgets}) {
         parquet_requests: requests.slice(requestStart).filter(url => url.endsWith(".parquet"))};
       validateProfile(profile, budgets, browserIndex);
       profiles.push(profile);
+    }
+    const legacyAllQuery = new URLSearchParams({wiki: "all", types: "registered", gran: "month",
+      start: "2025-12", end: "2026-01", ns: "0", breakdown: "false"});
+    await cdp.send("Page.navigate", {url: `${origin}/gdp.html?${legacyAllQuery}`});
+    await waitFor(cdp, "document.readyState === 'complete'");
+    await waitFor(cdp, "document.body.dataset.wkStage === 'done'", 15000);
+    const recoveredScope = await evaluate(cdp, `({
+      selected: document.querySelector(".filters-bar select")?.value,
+      query: new URLSearchParams(location.search).get("wiki"),
+    })`);
+    if (!recoveredScope.selected || recoveredScope.selected === "all" || recoveredScope.query === "all") {
+      throw new Error(`legacy all-wiki detail link did not recover to a concrete wiki: ${JSON.stringify(recoveredScope)}`);
     }
     requestStart = requests.length;
     const warmQuery = new URLSearchParams({wiki: "nlwiki", types: "registered", gran: "month",

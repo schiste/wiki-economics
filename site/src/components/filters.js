@@ -2,12 +2,10 @@ import * as Inputs from "npm:@observablehq/inputs";
 import {html} from "npm:htl@1.0.0";
 import {
   ALL_WIKIS,
-  combinedNamespaces,
-  combinedRange,
+  detailWikis,
   formatWiki,
   matchesDefaultSelection,
   wikiMatches,
-  withAllWikis,
 } from "./wiki-scope.js";
 export {activityTierLabels, activityTierMonths} from "./activity-tiers.js";
 export {makeRowsLoader} from "./browser-data.js";
@@ -449,7 +447,10 @@ export function queryGrouped(rows, {
 export function isDefaultView(filters, defaults, {defaultUserTypes = ["registered"], defaultGranularity = "year", defaultNamespaces = [0]} = {}) {
   const parsed = parseDefaultsMeta(defaults)
   const defaultWiki = parsed.defaultWiki
-  if (!defaultWiki) return false
+  // The Rust defaults intentionally describe the all-wiki portfolio. Detail
+  // pages expose concrete wikis only, so they must query the selected wiki
+  // instead of mistaking the portfolio payload for that wiki's fast path.
+  if (!defaultWiki || defaults.defaultWiki !== defaultWiki) return false
   return matchesDefaultSelection(filters, {
     wiki: defaultWiki,
     range: parsed.defaultRange ?? parsed.rangeByWiki.get(defaultWiki),
@@ -463,28 +464,32 @@ export function isDefaultView(filters, defaults, {defaultUserTypes = ["registere
  * Parse metadata from a defaults JSON object into the format expected by createFilterBar.
  */
 export function parseDefaultsMeta(defaults) {
-  const wikis = withAllWikis(defaults.wikis.map(d => d.wiki))
+  const wikis = detailWikis(defaults.wikis.map(d => d.wiki))
+  const wikiSet = new Set(wikis)
   let nsByWiki = null
   if (defaults.nsByWiki) {
     nsByWiki = new Map()
     for (const {wiki, page_namespace} of defaults.nsByWiki) {
+      if (!wikiSet.has(wiki)) continue
       if (!nsByWiki.has(wiki)) nsByWiki.set(wiki, [])
       nsByWiki.get(wiki).push(page_namespace)
     }
-    if (!nsByWiki.has(ALL_WIKIS)) nsByWiki.set(ALL_WIKIS, combinedNamespaces(nsByWiki))
   }
   const rangeByWiki = new Map(
-    defaults.rangeByWiki.map(d => [d.wiki, {mn: d.mn, mx: d.mx}])
+    defaults.rangeByWiki
+      .filter(d => wikiSet.has(d.wiki))
+      .map(d => [d.wiki, {mn: d.mn, mx: d.mx}])
   )
-  if (!rangeByWiki.has(ALL_WIKIS)) rangeByWiki.set(ALL_WIKIS, combinedRange(rangeByWiki))
-  const resolvedDefaultWiki = resolveDefaultWiki(defaults.defaultWiki ?? ALL_WIKIS, wikis)
+  const resolvedDefaultWiki = resolveDefaultWiki(defaults.defaultWiki, wikis)
   const sourceDefaultRange = defaults.defaultRange
-  const defaultRange = sourceDefaultRange
+  const sourceRangeIsApplicable = defaults.defaultWiki === resolvedDefaultWiki
+  const defaultRange = sourceRangeIsApplicable
+    && sourceDefaultRange
     && isValidPeriod(sourceDefaultRange.mn)
     && isValidPeriod(sourceDefaultRange.mx)
     && sourceDefaultRange.mn <= sourceDefaultRange.mx
     ? {mn: sourceDefaultRange.mn, mx: sourceDefaultRange.mx}
-    : null
+    : rangeByWiki.get(resolvedDefaultWiki) ?? null
   return {
     wikis,
     nsByWiki,

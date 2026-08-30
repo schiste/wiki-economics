@@ -12,19 +12,21 @@ This page surfaces the largest **week-over-week edit surges** on article pages a
 
 <div class="note">
 
-The default scope blends every managed wiki. Select an individual wiki to narrow the ranking. The ranking uses article namespace only (`page_namespace = 0`) and considers only weeks where the same page had at least one edit in the immediately preceding week.
+Select a Wikipedia edition to inspect its largest weekly movements. The combined portfolio ranking now lives on the homepage. The ranking uses article namespace only (`page_namespace = 0`) and considers only weeks where the same page had at least one edit in the immediately preceding week.
 
 </div>
 
 ```js
 import * as Inputs from "npm:@observablehq/inputs"
 import {html} from "npm:htl@1.0.0"
-import {ALL_WIKIS, formatWiki, fmtNum} from "./components/filters.js"
+import {formatWiki, fmtNum} from "./components/filters.js"
+import {detailWikis} from "./components/wiki-scope.js"
 
 const defaults = await FileAttachment("data/defaults_edit_variation.json").json()
-const wikis = [ALL_WIKIS, ...(defaults.wikis ?? []).map(d => d.wiki)]
-const wiki = view(Inputs.select(wikis, {label: "Wiki", value: defaults.defaultWiki ?? ALL_WIKIS, format: formatWiki}))
-const selected = (defaults.byWiki ?? []).find(d => d.wiki === wiki) ?? defaults
+const wikis = detailWikis((defaults.wikis ?? []).map(d => d.wiki))
+const defaultWiki = wikis.includes(defaults.defaultWiki) ? defaults.defaultWiki : wikis[0]
+const wiki = view(Inputs.select(wikis, {label: "Wiki", value: defaultWiki, format: formatWiki}))
+const selected = (defaults.byWiki ?? []).find(d => d.wiki === wiki) ?? {summary: [], topVariation: []}
 const summary = selected.summary?.[0] ?? {rows: 0, min_week: "—", max_week: "—"}
 const topVariation = selected.topVariation ?? []
 ```

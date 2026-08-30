@@ -17,6 +17,14 @@ export function withAllWikis(wikis) {
   return [ALL_WIKIS, ...wikis.filter(wiki => !isAllWikis(wiki))];
 }
 
+/**
+ * Return the concrete wiki scopes available to analytical detail pages.
+ * "all" is a publication scope used by the portfolio homepage, not a wiki.
+ */
+export function detailWikis(wikis) {
+  return [...new Set(wikis.filter(wiki => wiki && !isAllWikis(wiki)))];
+}
+
 export function combinedRange(rangeByWiki) {
   let mn = null;
   let mx = null;

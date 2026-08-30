@@ -72,11 +72,10 @@ and higher resource envelope are being qualified.
   [per-wiki candidate preparation and publication](../../docs/candidate-publication.md).
   `wiki-econ-admin` serves `/admin*` and the built static site as a separate
   buildservice webservice; it is not duplicated as a Toolforge Job.
-  The retired overview page is not built or published. Requests for `/`,
-  `/index`, and `/index.html` receive an HTTP redirect to the canonical
-  all-wiki registered-editor yearly inequality view; the query parameters are
-  explicit so a bookmarked root request remains reproducible as dashboard
-  defaults evolve.
+  The public root is a lightweight portfolio homepage built entirely from
+  Rust-generated all-wiki defaults. It makes no browser Parquet request and
+  routes readers into concrete-wiki detail dashboards; `all` is deliberately
+  absent from those dashboards' wiki pickers.
 - `run-refresh-ingest.sh`, `run-refresh-compute.sh`, `run-refresh-site.sh` —
   thin wrappers, one per on-demand Job, that export
   `WIKI_ECON_REFRESH_STAGE` and exec `run-refresh.sh` unmodified. Toolforge
