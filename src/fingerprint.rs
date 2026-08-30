@@ -1483,11 +1483,12 @@ mod tests {
         fs::write(dist.join("index.html"), "published")?;
         let browser_metric = dist.join("browser-data/gdp/nlwiki.parquet");
         fs::create_dir_all(browser_metric.parent().expect("browser metric parent"))?;
-        let mut browser_frame = df!(
-            "wiki" => ["nlwiki"],
-            "year_month" => ["2026-07"],
-            "value" => [1_i64],
-        )?;
+        let mut browser_frame = DataFrame::new_infer_height(vec![
+            Column::new("wiki".into(), ["nlwiki"]),
+            Column::new("year_month".into(), ["2026-07"]),
+            Column::new("value".into(), [1_i64]),
+        ])
+        .expect("valid browser Parquet fixture");
         ParquetWriter::new(File::create(&browser_metric)?).finish(&mut browser_frame)?;
 
         assert!(
