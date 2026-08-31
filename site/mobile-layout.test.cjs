@@ -42,15 +42,17 @@ test("mobile navigation locks scrolling and manages focus deterministically", as
   assert.match(head, /sidebarToggle\.tabIndex=mobileQuery\.matches\?-1:0/);
 });
 
-test("small-screen CSS presents a bounded light-gray publication tab", () => {
+test("small-screen CSS presents a discreet borderless rail with an accessible hit target", () => {
   assert.match(style, /\.mobile-masthead,\s*\.mobile-menu-button,\s*\.mobile-nav-toolbar \{\s*display: none;/);
   assert.match(style, /@media \(max-width: 1007px\)/);
   assert.match(style, /\.mobile-masthead \{[\s\S]*?display: grid;/);
   assert.match(style, /--wk-mobile-menu-surface: color-mix/);
-  assert.match(style, /\.mobile-menu-button \{[\s\S]*?position: fixed;[\s\S]*?width: 44px;[\s\S]*?min-height: 9\.5rem;/);
+  assert.match(style, /--wk-mobile-menu-visual-width: 30px;/);
+  assert.match(style, /\.mobile-menu-button \{[\s\S]*?position: fixed;[\s\S]*?width: 44px;[\s\S]*?min-height: 8rem;[\s\S]*?background: transparent;[\s\S]*?border: 0;[\s\S]*?box-shadow: none;/);
+  assert.match(style, /\.mobile-menu-button::before \{[\s\S]*?width: var\(--wk-mobile-menu-visual-width\);[\s\S]*?background: var\(--wk-mobile-menu-surface\);/);
   assert.match(style, /\.mobile-menu-word \{[\s\S]*?writing-mode: vertical-rl;[\s\S]*?text-orientation: upright;/);
   assert.match(style, /#observablehq-sidebar \{[\s\S]*?background: var\(--wk-mobile-menu-surface\);/);
-  assert.match(style, /#observablehq-center \{[\s\S]*?margin-left: 3\.75rem;/);
+  assert.match(style, /#observablehq-center \{[\s\S]*?margin-left: 3rem;/);
   assert.match(style, /#observablehq-sidebar-toggle \{[\s\S]*?clip-path: inset\(50%\);/);
   assert.match(style, /#observablehq-sidebar \{[\s\S]*?width: min\(20rem, 86vw\);/);
   assert.match(style, /#observablehq-sidebar-backdrop \{[\s\S]*?z-index: 900;/);
