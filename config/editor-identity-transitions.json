@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "metric_semantics": "canonical-editor-identity-v1",
+  "transitions": {
+    "frwiki": {
+      "effective_date": "2025-06-24",
+      "first_full_month": "2025-07",
+      "event": "Wikimedia temporary accounts enabled",
+      "source_url": "https://phabricator.wikimedia.org/T340001",
+      "interpretation": "Anonymous IP actors become browser-bound temporary accounts. Counts before and after this boundary describe different identity classes and must not be interpreted as a direct change in people."
+    }
+  }
+}

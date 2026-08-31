@@ -42,6 +42,10 @@ const WEEKLY_SECONDARY_BUCKET_COUNT_ENV: &str = "WIKI_ECON_WEEKLY_SECONDARY_BUCK
 const SCRATCH_DIR_ENV: &str = "WIKI_ECON_SCRATCH_DIR";
 const EDITOR_ACTOR_COLUMN: &str = "editor_actor";
 
+pub(crate) fn snapshot_contains_complete_month(snapshot: &str, event_month: &str) -> bool {
+    event_month <= snapshot
+}
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum MetricFamily {
     Monthly,
@@ -3141,7 +3145,7 @@ fn compute_all_incremental_cached(
     if !plan.any_nonweekly() {
         return Ok(0);
     }
-    let partitions = match snapshot {
+    let mut partitions = match snapshot {
         Some(snapshot) => {
             let layer_result = storage::snapshot_compute_layer(
                 data_dir,
@@ -3160,6 +3164,10 @@ fn compute_all_incremental_cached(
             storage::active_partition_specs(data_dir, wiki, layer)?
         }
     };
+    if let Some(snapshot) = snapshot {
+        partitions
+            .retain(|partition| snapshot_contains_complete_month(snapshot, &partition.year_month));
+    }
     if partitions.is_empty() {
         anyhow::ensure!(
             snapshot.is_none(),
@@ -4096,6 +4104,13 @@ mod tests {
     use super::*;
     use crate::resource_governor::ResourceBudget;
     use crate::test_support::{TestDir, init_test_tracing};
+
+    #[test]
+    fn snapshot_excludes_partial_following_month() {
+        assert!(snapshot_contains_complete_month("2026-07", "2026-07"));
+        assert!(snapshot_contains_complete_month("2026-07", "2001-01"));
+        assert!(!snapshot_contains_complete_month("2026-07", "2026-08"));
+    }
 
     fn editor_months(edits: &[u32], month_keys: &[i32], user_ids: &[i64]) -> Result<DataFrame> {
         anyhow::ensure!(edits.len() == month_keys.len() && edits.len() == user_ids.len());

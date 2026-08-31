@@ -16,10 +16,12 @@ whose size and composition shift over time. This page tracks active editors, the
 ```js
 import {makeRowsLoader, makeJsonLoader, toPeriod, fmtNum, createFilterBar, isDefaultView, parseDefaultsMeta, startLoading, doneLoading, aggregateChurn, aggregateCohorts, wikiMatches} from "./components/filters.js"
 import {withExport, pageExportBar} from "./components/exports.js"
+import {identityTransition} from "./components/editor-identities.js"
 
 const meta = await FileAttachment("data/meta_labor.json").json()
 const {wikis, nsByWiki, rangeByWiki, defaultWiki, maxMonth} = parseDefaultsMeta(meta)
 const loadDefaults = makeJsonLoader(FileAttachment("data/defaults_labor.json"))
+const identityTransitions = await FileAttachment("data/editor_identity_transitions.json").json()
 ```
 
 ```js
@@ -66,6 +68,7 @@ if (useDefaults) {
   doneLoading()
 }
 const tickStep = Math.max(1, Math.floor(workforce.length / 20))
+const editorIdentityTransition = identityTransition(identityTransitions, wiki, granularity)
 ```
 
 ```js
@@ -111,6 +114,8 @@ pageExportBar([
 
 **Active editor identities** per period. This is an exact wiki-wide distinct count for the selected month, quarter, or year; it is not a sum of namespace or monthly counts. The namespace filter therefore does not apply to this chart.
 
+${editorIdentityTransition ? html`<strong>Measurement boundary:</strong> temporary accounts were enabled on ${editorIdentityTransition.effective_date}. The dashed line marks the first full affected period; compare identity classes across it with care.` : ""}
+
 </div>
 
 ```js
@@ -122,6 +127,7 @@ withExport(Plot.plot({
   marks: [
     Plot.areaY(workforce, {x: "period", y: "unique_editors", fill: "steelblue", fillOpacity: 0.2}),
     Plot.lineY(workforce, {x: "period", y: "unique_editors", stroke: "steelblue", strokeWidth: 1.5}),
+    ...(editorIdentityTransition ? [Plot.ruleX([editorIdentityTransition.period], {stroke: "#b45309", strokeWidth: 2, strokeDasharray: "5,4"})] : []),
     Plot.tip(workforce, Plot.pointerX({x: "period", y: "unique_editors",
       title: d => `${d.period}\nEditors: ${fmtNum(d.unique_editors)}\nEdits: ${fmtNum(d.total_edits)}`
     })),
@@ -145,7 +151,7 @@ An identity is counted once per wiki and selected period even if it edits in mul
 
 <div class="note">
 
-Same metric broken down by editor classification. Watch for the **temporary accounts** category appearing after July 2025: this reflects Wikimedia's migration of IP editors to temporary accounts, not a real change in editing behavior.
+Same metric broken down by editor classification. The **temporary accounts** category reflects Wikimedia's migration of logged-out editors from public IP actors to temporary accounts, not by itself a real change in editing behavior.
 
 </div>
 
@@ -178,6 +184,7 @@ withExport(Plot.plot({
   y: {grid: true, label: "Editors"},
   marks: [
     Plot.lineY(typeAgg, {x: "period", y: "editors", stroke: "user_type", strokeWidth: 1.5}),
+    ...(editorIdentityTransition ? [Plot.ruleX([editorIdentityTransition.period], {stroke: "#b45309", strokeWidth: 2, strokeDasharray: "5,4"})] : []),
     Plot.tip(typeAgg, Plot.pointerX({x: "period", y: "editors", stroke: "user_type",
       title: d => `${d.period}\n${d.user_type}: ${fmtNum(d.editors)} editors`
     })),

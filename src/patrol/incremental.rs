@@ -224,6 +224,7 @@ pub(super) fn compute(
         .cloned()
         .collect::<BTreeSet<_>>()
         .into_iter()
+        .filter(|month| crate::compute::snapshot_contains_complete_month(snapshot, month))
         .collect::<Vec<_>>();
     if let Some(limit) = limit_months {
         output_months.truncate(limit);

@@ -233,6 +233,8 @@ const METRICS: [MetricSpec; 10] = [
     },
 ];
 
+const SUBSTANTIAL_ANONYMOUS_EDITS: u64 = 100;
+
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
 struct ArtifactRecord {
     name: String,
@@ -1199,6 +1201,9 @@ pub(crate) fn mark_wiki_candidate_ready(
             .join(format!("{}.parquet", spec.name));
         let identity = format!("{wiki}/{}.parquet", spec.name);
         let (rows, summary) = receipted_summary(&path, &identity, spec)?;
+        if spec.name == "gdp_user_type_share" {
+            validate_editor_identity_semantics(&path)?;
+        }
         let minimum_rows = contract.minimum_rows(wiki);
         ensure!(
             rows >= minimum_rows,
@@ -1314,6 +1319,9 @@ pub(crate) fn mark_wiki_qualification_ready(
             .join(format!("{}.parquet", spec.name));
         let identity = format!("{wiki}/{}.parquet", spec.name);
         let (rows, summary) = receipted_summary(&path, &identity, spec)?;
+        if spec.name == "gdp_user_type_share" {
+            validate_editor_identity_semantics(&path)?;
+        }
         ensure!(
             rows > 0,
             "{} qualification output is empty for {wiki}",
@@ -4155,6 +4163,42 @@ fn validate_snapshot_cutoff(wiki: &str, snapshot: &str, cutoff: &str) -> Result<
     Ok(())
 }
 
+fn validate_editor_identity_semantics(path: &Path) -> Result<()> {
+    let columns = vec![
+        "year_month".to_string(),
+        "user_type".to_string(),
+        "edits".to_string(),
+        "editors".to_string(),
+    ];
+    let mut reader = storage::SequentialParquetReader::new(path, Some(columns), 100_000)?;
+    while let Some(batch) = reader.next_batch()? {
+        let months = batch.column("year_month")?.str()?;
+        let user_types = batch.column("user_type")?.str()?;
+        let edits = batch.column("edits")?.u32()?;
+        let editors = batch.column("editors")?.u32()?;
+        for row in 0..batch.height() {
+            let month = months.get(row).context("editor identity month is null")?;
+            let user_type = user_types
+                .get(row)
+                .context("editor identity user type is null")?;
+            let edit_count = u64::from(edits.get(row).context("editor identity edits is null")?);
+            let editor_count =
+                u64::from(editors.get(row).context("editor identity count is null")?);
+            ensure!(
+                edit_count == 0 || editor_count > 0,
+                "{month} {user_type} has {edit_count} edits but no editor identities"
+            );
+            ensure!(
+                user_type != "anonymous"
+                    || edit_count < SUBSTANTIAL_ANONYMOUS_EDITS
+                    || editor_count > 1,
+                "{month} has {edit_count} anonymous edits collapsed into one identity; rebuild the qualified metric-input generation"
+            );
+        }
+    }
+    Ok(())
+}
+
 fn validate_snapshots(
     data_dir: &Path,
     registry: &LifecycleRegistry,
@@ -4963,6 +5007,29 @@ mod tests {
         ));
         assert_eq!(fs::read(target)?, fs::read(source)?);
         Ok(())
+    }
+
+    #[test]
+    fn publication_rejects_collapsed_anonymous_editor_identities() -> Result<()> {
+        let root = TestDir::new()?;
+        let path = root.path().join("gdp_user_type_share.parquet");
+        let mut collapsed = df!(
+            "year_month" => ["2025-06"],
+            "user_type" => ["anonymous"],
+            "edits" => [SUBSTANTIAL_ANONYMOUS_EDITS as u32],
+            "editors" => [1_u32],
+        )?;
+        ParquetWriter::new(File::create(&path)?).finish(&mut collapsed)?;
+        assert!(validate_editor_identity_semantics(&path).is_err());
+
+        let mut valid = df!(
+            "year_month" => ["2025-06", "2025-07"],
+            "user_type" => ["anonymous", "registered"],
+            "edits" => [SUBSTANTIAL_ANONYMOUS_EDITS as u32, 5_u32],
+            "editors" => [2_u32, 1_u32],
+        )?;
+        ParquetWriter::new(File::create(&path)?).finish(&mut valid)?;
+        validate_editor_identity_semantics(&path)
     }
 
     fn string_value(name: &str) -> &str {

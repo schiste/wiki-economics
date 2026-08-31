@@ -27,8 +27,7 @@ const PATROL_DUMP_BASE: &str = "https://dumps.wikimedia.org";
 const PARQUET_BATCH_ROWS: usize = 50_000;
 const SUBSTANTIAL_LOGGING_DUMP_BYTES: u64 = 1024 * 1024;
 const SUBSTANTIAL_LOG_ITEMS: usize = 10_000;
-const PATROL_COMPUTE_ALGORITHM_VERSION: &str =
-    "patrol-metrics-v4-monthly-generations-schema2-recovery";
+const PATROL_COMPUTE_ALGORITHM_VERSION: &str = "patrol-metrics-v5-complete-snapshot-months";
 const PATROL_PARSER_VERSION: &str = "patrol-logging-multigzip-monthly-v2-external-sort";
 const REVISION_COLUMNS: &[&str] = &[
     "revision_id",

@@ -15,13 +15,14 @@ const LARGE_METRIC_BATCH_ROWS: usize = 250_000;
 const ALL_WIKIS_SCOPE: &str = "all";
 const INEQUALITY_DEFAULT_START_MONTH: &str = "2001-06";
 
-pub const ARTIFACTS: [&str; 11] = [
+pub const ARTIFACTS: [&str; 12] = [
     "defaults_business.json",
     "defaults_edit_variation.json",
     "defaults_gdp.json",
     "defaults_inequality.json",
     "defaults_labor.json",
     "defaults_patrol.json",
+    "editor_identity_transitions.json",
     "meta_business.json",
     "meta_gdp.json",
     "meta_inequality.json",
@@ -110,6 +111,10 @@ pub fn materialize_into(input_dir: &Path, destination_dir: &Path) -> Result<()> 
     artifacts.insert("defaults_inequality.json", defaults_inequality);
     artifacts.insert("defaults_labor.json", defaults_labor);
     artifacts.insert("defaults_patrol.json", defaults_patrol);
+    artifacts.insert(
+        "editor_identity_transitions.json",
+        serde_json::from_str(include_str!("../config/editor-identity-transitions.json"))?,
+    );
     artifacts.insert("meta_business.json", meta_business);
     artifacts.insert("meta_gdp.json", meta_gdp);
     artifacts.insert("meta_inequality.json", meta_inequality);
