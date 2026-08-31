@@ -8,7 +8,7 @@ title: Community
 
 Wikipedia's **[labor market](https://en.wikipedia.org/wiki/Labour_economics)** is the pool of editors who contribute their time and expertise.
 Like a real economy, the wiki has hiring (new arrivals), attrition (departures), and a workforce
-whose size and composition shift over time. This page tracks active editors, their user types,
+whose size and composition shift over time. This page tracks active editor identities, their user types,
 [churn](https://en.wikipedia.org/wiki/Churn_rate) dynamics, and long-term [cohort](https://en.wikipedia.org/wiki/Cohort_analysis) retention: the vital signs of the community's labor supply.
 
 </div>
@@ -86,7 +86,7 @@ pageExportBar([
 <div class="kpi-row">
   <div class="kpi-card">
     <div class="kpi-value">${fmtNum(latestWf?.unique_editors)}</div>
-    <div class="kpi-label">Active Editors</div>
+    <div class="kpi-label">Active Editor Identities</div>
     <div class="kpi-sub">${latestWf ? latestWf.period : "—"}</div>
   </div>
   <div class="kpi-card">
@@ -123,13 +123,13 @@ withExport(Plot.plot({
   width,
   height: 400,
   x: {type: "band", tickRotate: -45, tickFilter: (d, i) => i % tickStep === 0},
-  y: {grid: true, label: "Unique editors"},
+  y: {grid: true, label: "Active editor identities"},
   marks: [
     Plot.areaY(workforce, {x: "period", y: "unique_editors", fill: "steelblue", fillOpacity: 0.2}),
     Plot.lineY(workforce, {x: "period", y: "unique_editors", stroke: "steelblue", strokeWidth: 1.5}),
     ...(editorIdentityTransition ? [Plot.ruleX([editorIdentityTransition.period], {stroke: "#b45309", strokeWidth: 2, strokeDasharray: "5,4"})] : []),
     Plot.tip(workforce, Plot.pointerX({x: "period", y: "unique_editors",
-      title: d => `${d.period}\nEditors: ${fmtNum(d.unique_editors)}\nEdits: ${fmtNum(d.total_edits)}`
+      title: d => `${d.period}\nEditor identities: ${fmtNum(d.unique_editors)}\nEdits: ${fmtNum(d.total_edits)}`
     })),
   ]
 }), workforce, "workforce")
@@ -181,7 +181,7 @@ withExport(Plot.plot({
   height: 400,
   color: {legend: true, domain: ["registered", "temporary", "anonymous", "bot"], range: ["steelblue", "orange", "gold", "tomato"]},
   x: {type: "band", tickRotate: -45, tickFilter: (d, i) => i % tickStep === 0},
-  y: {grid: true, label: "Editors"},
+  y: {grid: true, label: "Editor identities"},
   marks: [
     Plot.lineY(typeAgg, {x: "period", y: "editors", stroke: "user_type", strokeWidth: 1.5}),
     ...(editorIdentityTransition ? [Plot.ruleX([editorIdentityTransition.period], {stroke: "#b45309", strokeWidth: 2, strokeDasharray: "5,4"})] : []),
@@ -195,7 +195,7 @@ withExport(Plot.plot({
 <details class="methodology">
 <summary>How is this calculated?</summary>
 
-`Editors(type) = COUNT(DISTINCT editor_id) WHERE user_type = type`
+`Editor Identities(type) = COUNT(DISTINCT canonical_editor_identity) WHERE user_type = type`
 
 Same exact wiki-wide identity count broken down by classification: **registered** (permanent account), **temporary** (browser-bound temporary account), **anonymous** (historical IP actor), and **bot** (flagged bot account). All types are shown regardless of the user-type filter. These identity classes are not interchangeable estimates of people.
 
