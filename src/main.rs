@@ -3997,10 +3997,7 @@ mod tests {
         fs::write(site_dir.join("observablehq.config.js"), "export default {}")
             .expect("site config fixture should be written");
         fs::write(site_dir.join("package.json"), "{}")?;
-        fs::write(
-            site_dir.join("site-footer.js"),
-            "export const siteFooter = ''",
-        )?;
+        fs::write(site_dir.join("site-footer.js"), "")?;
         fs::write(workspace_dir.path().join("package.json"), "{}")?;
         fs::write(workspace_dir.path().join("package-lock.json"), "{}")?;
         fs::write(dist_dir.path().join("index.html"), "published")?;
