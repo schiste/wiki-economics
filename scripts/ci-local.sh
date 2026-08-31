@@ -41,6 +41,7 @@ node --check scripts/verify-site-dependencies.cjs
 node --check scripts/verify-site-reproducibility.cjs
 node --check scripts/publish-browser-data.cjs
 node --check scripts/browser-performance.cjs
+node --check scripts/site-source-bundle.cjs
 
 echo "==> node --check site/observablehq.config.js"
 node --check site/observablehq.config.js
@@ -76,6 +77,8 @@ node --test deploy/toolforge/prune-releases.test.cjs
 echo "==> node --test deploy/toolforge/install-binary.test.cjs"
 node --test deploy/toolforge/install-binary.test.cjs
 node --test deploy/toolforge/download-release.test.cjs
+node --test deploy/toolforge/download-site-source.test.cjs
+node --test deploy/toolforge/install-site-source.test.cjs
 node --test deploy/toolforge/run-publication-qualification.test.cjs
 
 echo "==> node --test deploy/toolforge/run-capacity-benchmark.test.cjs"
@@ -112,6 +115,7 @@ node --test scripts/publish-browser-data.test.cjs
 node --test scripts/browser-performance.test.cjs
 node --test scripts/check-compute-versions.test.cjs
 node --test scripts/check-fleet-qualification.test.cjs
+node --test scripts/site-source-bundle.test.cjs
 node --test site/browser-cache.test.mjs
 node --test site/activity-tiers.test.mjs
 node --test site/wiki-scope.test.mjs

@@ -25,7 +25,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
-      backend: ${{ steps.filter.outputs.backend }}
+      rust: ${{ steps.filter.outputs.rust }}
+      site: ${{ steps.filter.outputs.site }}
+      image: ${{ steps.filter.outputs.image }}
     steps:
       - name: Check out repository
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
@@ -37,16 +39,38 @@ jobs:
         uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d  # v4.0.3
         with:
           filters: |
-            backend:
+            rust:
               - 'src/**'
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain.toml'
-              - 'deploy/**'
-              - 'scripts/**'
+              - '.cargo/**'
+              - 'vendor/**'
+              - 'deny.toml'
+            site:
+              - 'site/src/**'
               - 'site/data-build/**'
+              - 'site/observablehq.config.js'
+              - 'site/package.json'
+              - 'site/site-footer.js'
+              - 'package.json'
+              - 'package-lock.json'
+              - 'scripts/site-source-bundle.cjs'
+            image:
+              - 'scripts/**'
+              - 'deploy/toolforge/**'
               - 'config/**'
-              - '.github/workflows/**'
+              - 'package.json'
+              - 'package-lock.json'
+              - 'site/package.json'
+              - 'site/vendor/**'
+              - 'site/admin-auth.cjs'
+              - 'site/admin-server.cjs'
+              - 'site/freshness.cjs'
+              - 'Procfile'
+              - 'RustConfig'
+              - '.node-version'
+              - '.npmrc'
 
   quality-node:
     name: Quality (Node/shell/Python)
@@ -115,6 +139,7 @@ jobs:
           node --check scripts/publish-browser-data.cjs
           node --check scripts/browser-performance.cjs
           node --check scripts/check-compute-versions.cjs
+          node --check scripts/site-source-bundle.cjs
 
       - name: Run Node unit tests
         run: |
@@ -128,6 +153,8 @@ jobs:
           node --test deploy/toolforge/run-refresh.test.cjs
           node --test deploy/toolforge/install-binary.test.cjs
           node --test deploy/toolforge/download-release.test.cjs
+          node --test deploy/toolforge/download-site-source.test.cjs
+          node --test deploy/toolforge/install-site-source.test.cjs
           node --test deploy/toolforge/run-publication-qualification.test.cjs
           node --test deploy/toolforge/prune-releases.test.cjs
           node --test deploy/toolforge/run-capacity-benchmark.test.cjs
@@ -153,6 +180,7 @@ jobs:
           node --test scripts/browser-performance.test.cjs
           node --test scripts/check-compute-versions.test.cjs
           node --test scripts/check-fleet-qualification.test.cjs
+          node --test scripts/site-source-bundle.test.cjs
           node --test site/browser-cache.test.mjs
           node --test site/activity-tiers.test.mjs
           node --test site/wiki-scope.test.mjs
@@ -175,7 +203,7 @@ jobs:
   quality-rust:
     name: Quality (Rust)
     needs: changes
-    if: needs.changes.outputs.backend == 'true'
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
 
@@ -276,7 +304,7 @@ jobs:
 
   coverage:
     needs: changes
-    if: needs.changes.outputs.backend == 'true'
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
@@ -363,7 +391,7 @@ jobs:
   security-rust:
     name: Security (Rust)
     needs: changes
-    if: needs.changes.outputs.backend == 'true'
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
 
@@ -397,6 +425,7 @@ jobs:
     name: Build Toolforge release artifact
     if: |
       always() && github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      needs.changes.outputs.rust == 'true' &&
       needs.quality-node.result == 'success' &&
       (needs.quality-rust.result == 'success' || needs.quality-rust.result == 'skipped') &&
       needs.site.result == 'success' &&
@@ -404,6 +433,7 @@ jobs:
       needs.security-node.result == 'success' &&
       (needs.security-rust.result == 'success' || needs.security-rust.result == 'skipped')
     needs:
+      - changes
       - quality-node
       - quality-rust
       - site
@@ -516,6 +546,66 @@ jobs:
           path: |
             target/release/wiki-econ-release-${{ github.sha }}.tar.gz
             target/release/wiki-econ-release-${{ github.sha }}.tar.gz.sha256
+            ${{ steps.attest.outputs.bundle-path }}
+          if-no-files-found: error
+          retention-days: 30
+
+  site-source-release:
+    name: Build Toolforge site-source artifact
+    if: |
+      always() && github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      needs.changes.outputs.site == 'true' &&
+      needs.quality-node.result == 'success' &&
+      needs.site.result == 'success' &&
+      needs.security-node.result == 'success'
+    needs:
+      - changes
+      - quality-node
+      - site
+      - security-node
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    concurrency:
+      group: toolforge-site-source-build
+      cancel-in-progress: false
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+
+      - name: Install Node.js
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
+        with:
+          node-version-file: .node-version
+          package-manager-cache: false
+
+      - name: Prepare deterministic site-source envelope
+        run: |
+          export SOURCE_DATE_EPOCH="$(git show -s --format=%ct "$GITHUB_SHA")"
+          bundle="$RUNNER_TEMP/wiki-econ-site-source"
+          archive="wiki-econ-site-source-$GITHUB_SHA.tar.gz"
+          node scripts/site-source-bundle.cjs --prepare "$GITHUB_WORKSPACE" "$bundle" "$GITHUB_SHA"
+          tar --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner \
+            -czf "$archive" -C "$bundle" .
+          sha256sum "$archive" > "$archive.sha256"
+
+      - name: Attest site-source envelope
+        id: attest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8  # v4.2.2
+        with:
+          subject-path: wiki-econ-site-source-${{ github.sha }}.tar.gz
+
+      - name: Upload site-source artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        with:
+          name: wiki-econ-site-source-${{ github.sha }}
+          path: |
+            wiki-econ-site-source-${{ github.sha }}.tar.gz
+            wiki-econ-site-source-${{ github.sha }}.tar.gz.sha256
             ${{ steps.attest.outputs.bundle-path }}
           if-no-files-found: error
           retention-days: 30

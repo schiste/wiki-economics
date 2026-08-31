@@ -42,6 +42,14 @@ and higher resource envelope are being qualified.
   SBOMs, notices, checksums, provenance and a GitHub artifact attestation,
   uploads the sealed 30-day artifact, and leaves deployment to an operator
   using the Toolforge SSH bastion.
+- The same workflow emits a much smaller, independently attested
+  `wiki-econ-site-source-<git-sha>` artifact whenever public site sources
+  change. It contains only the root npm manifests and the allowlisted
+  `site/src`, `site/data-build`, configuration, and footer inputs. Every file
+  has a deterministic receipt and SHA-256. Frontend-only changes install this
+  artifact under `/data/project/wiki-economics/site-sources/releases/<git-sha>`
+  and switch `site-sources/current`; they do not rebuild the Rust binary or
+  Build Service image.
 - `deploy-binary.sh` verifies the GitHub attestation and sealed release locally,
   uploads its single archive to a staging path, and calls
   `install-binary.sh` as the tool account. Releases live at
@@ -60,6 +68,13 @@ and higher resource envelope are being qualified.
 - `rebuild-image.sh` rebuilds only the Toolforge image and restarts continuous
   processes. It uses detached JSON output and polls the exact build ID, so a
   disconnected log stream or concurrent build cannot produce a false result.
+- `download-site-source.sh` and `deploy-site-source.sh` verify the successful
+  workflow SHA, archive checksum, GitHub attestation, exact file inventory,
+  per-file hashes, and content identity before the remote installer switches
+  the immutable site-source symlink. The installer retains three compact
+  source releases. The active Rust binary, Node image, and site source may
+  therefore come from different commits; each is verified independently and
+  all three identities are recorded in refresh run provenance.
 - `jobs.yaml` — one Rust fleet controller, two fixed small-wiki workers, one
   fixed medium/large worker, and the short `wiki-econ-publish-ready` job, plus
   legacy on-demand recovery jobs. The controller represents the sixteen
@@ -298,6 +313,8 @@ become wiki-economics toolforge envvars create WIKI_ECON_BIN /data/project/wiki-
 become wiki-economics toolforge envvars create WIKI_ECON_DATA_DIR /data/project/wiki-economics/data
 become wiki-economics toolforge envvars create WIKI_ECON_OUTPUT_DIR /data/project/wiki-economics/output
 become wiki-economics toolforge envvars create WIKI_ECON_SITE_DIST_DIR /data/project/wiki-economics/site-dist
+become wiki-economics toolforge envvars create WIKI_ECON_SITE_DIR /data/project/wiki-economics/site-sources/current/site
+become wiki-economics toolforge envvars create WIKI_ECON_SITE_SOURCE_REQUIRED 1
 become wiki-economics toolforge envvars create WIKI_ECON_REFRESH_SCHEDULE '0 3 * * 0'
 ```
 
@@ -460,8 +477,11 @@ TOOLFORGE_SSH_TARGET=login.toolforge.org \
     "$attestation_bundle"
 ```
 
-When site, Node, shared script, or Toolforge deployment files changed, rebuild
-the lightweight image from the exact release commit (Cargo remains skipped).
+When Node dependencies or pins, the runtime server, vendored cache, Procfile,
+RustConfig, or image/deployment plumbing changed, rebuild the lightweight image
+from the exact release commit (Cargo remains skipped). Ordinary `site/src`,
+site configuration, footer, and data-build generator changes use the separate
+site-source release below.
 Toolforge Build Service resolves named Git refs rather than detached commit
 IDs, so publish a deterministic lightweight deployment tag. The helper
 resolves that tag to the release SHA both before and after the build, then
@@ -489,6 +509,33 @@ attestation- and envelope-verified, smoke-tested releases by default: the live t
 rollback candidates. Cleanup fails closed if the live symlink is malformed or
 incomplete and ignores every directory that is not an exact 40-character
 commit SHA.
+
+### Frontend-only releases
+
+When CI classifies a commit as site-source-only, do not deploy a Rust release
+and do not rebuild the image. Download and install the exact attested site
+source, then run the existing on-demand site publisher:
+
+```sh
+site_sha=$(git rev-parse origin/main)
+site_release_dir=$(mktemp -d)
+deploy/toolforge/download-site-source.sh "$site_sha" "$site_release_dir"
+TOOLFORGE_SSH_TARGET=login.toolforge.org \
+  deploy/toolforge/deploy-site-source.sh \
+    "$site_release_dir/wiki-econ-site-source-$site_sha.tar.gz" \
+    "$site_sha" \
+    "$site_release_dir/wiki-econ-site-source-$site_sha.tar.gz.sha256"
+ssh login.toolforge.org \
+  'become wiki-economics toolforge jobs restart wiki-econ-site'
+```
+
+The publisher verifies the independently installed site-source receipt, uses
+the image's pinned Node dependencies and vendored Observable cache, rebuilds
+into a staging directory, validates it, and switches the site atomically. A
+package-lock, Node pin, runtime server, vendored dependency, `Procfile`, or
+`RustConfig` change still requires an image rebuild. A Rust/Cargo input change
+still requires the attested binary release. These invalidation boundaries are
+reported by the CI `Detect changed areas` job.
 
 ### Rollback
 

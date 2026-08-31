@@ -149,6 +149,13 @@ artifact and runs `deploy/toolforge/deploy-binary.sh`; both the workstation and
 Toolforge installer verify its commit, attestation, checksum, member allowlist,
 binary identity, provenance, and SBOM identities before switching `app/current`.
 
+Public site sources have a separate attested envelope and immutable NFS release
+pointer under `site-sources/current`. A frontend-only commit installs that
+envelope and runs the short site publisher without rebuilding either Rust or
+the Build Service image. Site execution verifies the source commit and content
+hash before use. Run records compose three independent identities: Rust binary
+commit/checksum, image source ref/digest, and site-source commit/content hash.
+
 Toolforge Build Service separately builds the lightweight source/Node image.
 `RustConfig` skips Cargo there during normal builds, so weekly refreshes use the
 verified NFS binary instead of rebuilding Rust. `deploy/toolforge/rebuild-image.sh`
@@ -171,11 +178,13 @@ node scripts/generate-stack-reference.cjs --check
 
 For a fresh Toolforge tool account:
 
-1. Build the main-branch source image with Toolforge Build Service and record
+1. Build the main-branch runtime image with Toolforge Build Service and record
    its exact source commit using `deploy/toolforge/rebuild-image.sh`.
 2. Download the successful GitHub `toolforge-release` artifact for that same
    commit and install it through `deploy/toolforge/deploy-binary.sh` over SSH.
-3. Create the tool-wide `WIKI_ECON_BIN`, `WIKI_ECON_DATA_DIR`,
+3. Download and install the matching attested site-source artifact with
+   `download-site-source.sh` and `deploy-site-source.sh`. Create the tool-wide
+   `WIKI_ECON_BIN`, `WIKI_ECON_DATA_DIR`,
    `WIKI_ECON_OUTPUT_DIR`, and `WIKI_ECON_SITE_DIST_DIR` values shown in the
    [Toolforge runbook](../deploy/toolforge/README.md#operator-prerequisites).
 4. Start the Build Service webservice from `Procfile`, run the allowlisted
