@@ -575,37 +575,26 @@ fn labor_artifacts(frames: &Frames) -> Result<(Value, Value)> {
 }
 
 fn labor_artifacts_with_meta(frames: &Frames, meta: CommonMeta) -> Result<(Value, Value)> {
-    let mut workforce: BTreeMap<String, [f64; 4]> = BTreeMap::new();
+    let mut workforce: BTreeMap<String, [f64; 2]> = BTreeMap::new();
     let mut by_type: BTreeMap<(String, String), f64> = BTreeMap::new();
 
-    for row in 0..frames.labor.height() {
-        if !selected_month_row(&frames.labor, row, &meta.default_wiki, &meta.max_month)? {
+    for row in 0..frames.tiers.height() {
+        if !selected_wiki_row(&frames.tiers, row, &meta.default_wiki)?
+            || string(&frames.tiers, "period_type", row)?.as_deref() != Some("year")
+        {
             continue;
         }
-        let month = string(&frames.labor, "year_month", row)?.context("labor month is null")?;
-        let Some(namespace) = integer(&frames.labor, "page_namespace", row)? else {
-            continue;
-        };
+        let period = string(&frames.tiers, "period", row)?.context("labor period is null")?;
         let user_type =
-            string(&frames.labor, "user_type", row)?.context("labor user type is null")?;
-        if namespace == 0 {
-            *by_type
-                .entry((month.clone(), user_type.clone()))
-                .or_default() += float(&frames.labor, "unique_editors", row)?.unwrap_or_default();
-        }
-        if namespace == 0 && user_type == "registered" {
-            let entry = workforce.entry(year(&month)?).or_default();
-            for (index, column) in [
-                "unique_editors",
-                "total_edits",
-                "net_bytes",
-                "reverted_edits",
-            ]
-            .iter()
-            .enumerate()
-            {
-                entry[index] += float(&frames.labor, column, row)?.unwrap_or_default();
-            }
+            string(&frames.tiers, "user_type", row)?.context("labor user type is null")?;
+        let editors = float(&frames.tiers, "editors", row)?.unwrap_or_default();
+        *by_type
+            .entry((period.clone(), user_type.clone()))
+            .or_default() += editors;
+        if user_type == "registered" {
+            let entry = workforce.entry(period).or_default();
+            entry[0] += editors;
+            entry[1] += float(&frames.tiers, "total_edits", row)?.unwrap_or_default();
         }
     }
 
@@ -622,8 +611,6 @@ fn labor_artifacts_with_meta(frames: &Frames, meta: CommonMeta) -> Result<(Value
             "period": period,
             "unique_editors": number(values[0]),
             "total_edits": number(values[1]),
-            "net_bytes": number(values[2]),
-            "reverted_edits": number(values[3]),
         })).collect::<Vec<_>>(),
         "byType": by_type.into_iter().map(|((period, user_type), editors)| json!({
             "period": period,

@@ -14,7 +14,7 @@ whose size and composition shift over time. This page tracks active editors, the
 </div>
 
 ```js
-import {queryGrouped, filterRows, makeRowsLoader, makeJsonLoader, toPeriod, fmtNum, fmtBytes, createFilterBar, isDefaultView, parseDefaultsMeta, startLoading, doneLoading, aggregateChurn, aggregateCohorts, wikiMatches} from "./components/filters.js"
+import {makeRowsLoader, makeJsonLoader, toPeriod, fmtNum, createFilterBar, isDefaultView, parseDefaultsMeta, startLoading, doneLoading, aggregateChurn, aggregateCohorts, wikiMatches} from "./components/filters.js"
 import {withExport, pageExportBar} from "./components/exports.js"
 
 const meta = await FileAttachment("data/meta_labor.json").json()
@@ -33,6 +33,7 @@ const {wiki, userTypes, granularity, startPeriod, endPeriod, namespaces} = filte
 ```js
 const loadLaborRows = makeRowsLoader({
   labor: "labor_monthly",
+  tiers: "gdp_activity_tiers",
   cohorts: "labor_cohorts",
   churn: "labor_churn",
 })
@@ -49,11 +50,16 @@ if (useDefaults) {
   workforce = defaults.workforce
   churnData = defaults.churn
 } else {
-  const {labor: laborRaw, churn: churnRaw} = await loadLaborRows(wiki, {startPeriod, endPeriod})
-  workforce = queryGrouped(laborRaw, {
-    sumCols: ["unique_editors", "total_edits", "net_bytes", "reverted_edits"],
-    wiki, userTypes, namespaces, startPeriod, endPeriod, granularity
-  })
+  const {tiers: tierRaw, churn: churnRaw} = await loadLaborRows(wiki, {startPeriod, endPeriod})
+  workforce = d3.rollups(
+    tierRaw.filter(d => wikiMatches(d, wiki) && userTypes.includes(d.user_type)
+      && d.period_type === granularity && d.period >= startP && d.period <= endP),
+    rows => ({
+      unique_editors: d3.sum(rows, d => d.editors),
+      total_edits: d3.sum(rows, d => d.total_edits),
+    }),
+    d => d.period,
+  ).map(([period, values]) => ({period, ...values})).sort((a, b) => d3.ascending(a.period, b.period))
   churnData = aggregateChurn(churnRaw.filter(d => wikiMatches(d, wiki) && d.period_type === granularity && d.period >= startP && d.period <= endP))
 }
 } finally {
@@ -103,7 +109,7 @@ pageExportBar([
 
 <div class="note">
 
-**Active editors** per period. A rising trend signals a growing community; a plateau or decline suggests saturation or attrition. Peaks in early Wikipedia history reflect the initial growth surge.
+**Active editor identities** per period. This is an exact wiki-wide distinct count for the selected month, quarter, or year; it is not a sum of namespace or monthly counts. The namespace filter therefore does not apply to this chart.
 
 </div>
 
@@ -126,9 +132,9 @@ withExport(Plot.plot({
 <details class="methodology">
 <summary>How is this calculated?</summary>
 
-`Active Editors = COUNT(DISTINCT editor_id) per period`
+`Active Editor Identities = COUNT(DISTINCT canonical_editor_identity) per period`
 
-Count of unique editor IDs active in each period. An editor is counted once per wiki and month even if they edit multiple namespaces. When wikis, months, quarters, or years are combined, this is an editor-participation count: the same person may contribute more than once across projects or months because local actor IDs are not a safe global identity.
+An identity is counted once per wiki and selected period even if it edits in multiple namespaces or months. Permanent and temporary accounts use their user ID; historical IP actors use their actor text internally. The grouping identity is never published. An account or IP actor is not necessarily one person, and cross-wiki totals remain editor–wiki observations because local actor IDs are not a safe global identity.
 
 </details>
 </div>
@@ -151,11 +157,10 @@ if (useDefaults) {
   const defaults = await loadDefaults()
   typeAgg = defaults.byType
 } else {
-  const {labor: laborRaw} = await loadLaborRows(wiki, {startPeriod, endPeriod})
-  const byType = laborRaw
-    .filter(d => wikiMatches(d, wiki) && d.year_month >= startPeriod && d.year_month <= endPeriod && namespaces.includes(d.page_namespace))
-    .map(d => ({...d, period: toPeriod(d.year_month, granularity)}))
-  typeAgg = d3.rollups(byType, v => d3.sum(v, d => d.unique_editors), d => d.period, d => d.user_type)
+  const {tiers: tierRaw} = await loadLaborRows(wiki, {startPeriod, endPeriod})
+  const byType = tierRaw.filter(d => wikiMatches(d, wiki) && d.period_type === granularity
+    && d.period >= startP && d.period <= endP)
+  typeAgg = d3.rollups(byType, v => d3.sum(v, d => d.editors), d => d.period, d => d.user_type)
     .flatMap(([period, types]) => types.map(([user_type, editors]) => ({period, user_type, editors})))
     .sort((a, b) => d3.ascending(a.period, b.period))
 }
@@ -185,7 +190,7 @@ withExport(Plot.plot({
 
 `Editors(type) = COUNT(DISTINCT editor_id) WHERE user_type = type`
 
-Same unique-editor metric broken down by classification: **registered** (has account), **temporary** (2025+ temp accounts), **anonymous** (IP edits), **bot** (flagged bot accounts). All types shown regardless of user type filter, so you can compare the full composition.
+Same exact wiki-wide identity count broken down by classification: **registered** (permanent account), **temporary** (browser-bound temporary account), **anonymous** (historical IP actor), and **bot** (flagged bot account). All types are shown regardless of the user-type filter. These identity classes are not interchangeable estimates of people.
 
 </details>
 </div>

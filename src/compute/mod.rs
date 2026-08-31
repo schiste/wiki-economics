@@ -4269,6 +4269,34 @@ mod tests {
     }
 
     #[test]
+    fn period_workforce_deduplicates_namespaces_and_months() -> Result<()> {
+        let base = DataFrame::new_infer_height(vec![
+            Column::new(
+                "year_month".into(),
+                vec!["2024-01", "2024-01", "2024-02", "2024-02"],
+            ),
+            Column::new(
+                "year_month_key".into(),
+                vec![202401_i32, 202401, 202402, 202402],
+            ),
+            Column::new("user_type".into(), vec!["registered"; 4]),
+            Column::new("event_user_id".into(), vec![1_i64, 1, 1, 2]),
+            Column::new("page_namespace".into(), vec![0_i32, 1, 0, 0]),
+            Column::new("revision_id".into(), vec![1_i64, 2, 3, 4]),
+            Column::new("revision_text_bytes_diff".into(), vec![1_i64; 4]),
+        ])?;
+        let editor_months = gdp_editor_month_frame(&base)?;
+
+        let monthly = gdp_activity_tiers_for_period(&editor_months, ActivityPeriod::Month)?;
+        let yearly = gdp_activity_tiers_for_period(&editor_months, ActivityPeriod::Year)?;
+
+        assert_eq!(monthly.column("editors")?.u32()?.sum(), Some(3));
+        assert_eq!(yearly.column("editors")?.u32()?.sum(), Some(2));
+        assert_eq!(yearly.column("total_edits")?.u32()?.sum(), Some(4));
+        Ok(())
+    }
+
+    #[test]
     fn activity_tier_incremental_compute_flushes_each_calendar_year() -> Result<()> {
         let data_dir = TestDir::new()?;
         let output_dir = TestDir::new()?;
