@@ -411,6 +411,8 @@ pub(super) fn compute(
         snapshot,
         reused_artifacts = stats.reused_artifacts,
         rebuilt_artifacts = stats.rebuilt_artifacts,
+        missing_artifacts = stats.missing_artifacts,
+        missing_receipts = stats.missing_receipts,
         "completed bounded generation-aware patrol computation"
     );
     Ok(())

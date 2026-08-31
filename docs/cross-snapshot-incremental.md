@@ -94,7 +94,8 @@ The command:
    bounds, wiki bounds, ordering contracts, and conservation totals;
 6. records unchanged, changed, and removed logical months plus cache reuse;
 7. rechecks that the live snapshot pointer is unchanged;
-8. writes a report marked `publication_eligible: false`.
+8. writes a report marked `publication_eligible: true` and an integrity-protected
+   production qualification marker.
 
 Failure leaves the diagnostic workspace and a `qualification-failed` marker.
 Cache artifacts and receipts are atomic, so a rerun in a fresh work directory
@@ -107,9 +108,15 @@ with `determinism-verify`. Vary the persisted workload profiles to cover 256,
 512, and 1024 weekly topologies; canonical month and contribution identities
 remain topology-independent.
 
-## Promotion gate
+## Production gate
 
-Do not connect this path to production candidate readiness until all are true:
+Production compute consumes the content-addressed cache only when the canonical
+qualification marker exists. The marker is written after incremental and clean
+outputs are byte-identical and their semantic receipts agree. A later failed
+qualification withdraws the marker, while schema-v1/v2 generations continue on
+the snapshot-scoped path.
+
+Before qualifying a new workload class, require:
 
 - multiple real rollovers pass for nlwiki, ptwiki, and frwiki;
 - identical logical snapshots under different source names rebuild zero cache

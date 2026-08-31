@@ -13,11 +13,16 @@ use crate::{canonical_month, storage};
 const CACHE_RECEIPT_SCHEMA_VERSION: u32 = 3;
 const CACHE_WRITER_VERSION: &str = "polars-parquet-zstd-row-group-100000-v1";
 const ROW_GROUP_ROWS: usize = 100_000;
+const PRODUCTION_QUALIFICATION_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct CacheStats {
     pub(crate) reused_artifacts: u64,
     pub(crate) rebuilt_artifacts: u64,
+    #[serde(default)]
+    pub(crate) missing_artifacts: u64,
+    #[serde(default)]
+    pub(crate) missing_receipts: u64,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -74,6 +79,39 @@ pub(crate) struct QualificationSemanticSummary {
     pub(crate) maximum_date: Option<String>,
     pub(crate) conservation_totals: BTreeMap<String, i128>,
     pub(crate) artifact_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ProductionQualification {
+    schema_version: u32,
+    wiki: String,
+    baseline_snapshot: String,
+    qualified_through_snapshot: String,
+    aggregate_sha256: String,
+    report_sha256: String,
+    qualification_sha256: String,
+}
+
+impl ProductionQualification {
+    fn canonical_hash(&self) -> Result<String> {
+        let mut canonical = self.clone();
+        canonical.qualification_sha256.clear();
+        Ok(hex::encode(Sha256::digest(serde_json::to_vec(&canonical)?)))
+    }
+
+    fn validate(&self, wiki: &str, snapshot: &str) -> Result<()> {
+        ensure!(
+            self.schema_version == PRODUCTION_QUALIFICATION_SCHEMA_VERSION
+                && self.wiki == wiki
+                && self.qualified_through_snapshot.as_str() <= snapshot
+                && self.aggregate_sha256.len() == 64
+                && self.report_sha256.len() == 64
+                && self.qualification_sha256 == self.canonical_hash()?,
+            "cross-snapshot production qualification identity changed"
+        );
+        Ok(())
+    }
 }
 
 pub(crate) struct CrossSnapshotCache {
@@ -150,7 +188,12 @@ impl CrossSnapshotCache {
     ) -> Result<Option<DataFrame>> {
         let path = self.artifact_path(kind, algorithm_version, input_digest, artifact)?;
         let receipt_path = receipt_path(&path);
-        if !path.is_file() || !receipt_path.is_file() {
+        if !path.is_file() {
+            self.stats.borrow_mut().missing_artifacts += 1;
+            return Ok(None);
+        }
+        if !receipt_path.is_file() {
+            self.stats.borrow_mut().missing_receipts += 1;
             return Ok(None);
         }
         let receipt = self.validate_artifact(&path, kind, algorithm_version, input_digest)?;
@@ -173,7 +216,12 @@ impl CrossSnapshotCache {
         artifact: &str,
     ) -> Result<bool> {
         let path = self.artifact_path(kind, algorithm_version, input_digest, artifact)?;
-        if !path.is_file() || !receipt_path(&path).is_file() {
+        if !path.is_file() {
+            self.stats.borrow_mut().missing_artifacts += 1;
+            return Ok(false);
+        }
+        if !receipt_path(&path).is_file() {
+            self.stats.borrow_mut().missing_receipts += 1;
             return Ok(false);
         }
         self.validate_artifact(&path, kind, algorithm_version, input_digest)?;
@@ -250,6 +298,7 @@ impl CrossSnapshotCache {
             "json",
         )?;
         if !path.is_file() {
+            self.stats.borrow_mut().missing_artifacts += 1;
             return Ok(None);
         }
         let value = serde_json::from_slice(&fs::read(&path)?)
@@ -390,6 +439,32 @@ impl CrossSnapshotCache {
             .join(input_digest)
             .join(format!("{artifact}.{extension}")))
     }
+}
+
+pub(crate) fn production_cache(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot: &str,
+) -> Result<Option<CrossSnapshotCache>> {
+    let manifest = storage::read_generation_manifest(data_dir, wiki, snapshot)?;
+    if manifest.schema_version != 3 {
+        return Ok(None);
+    }
+    let path = production_qualification_path(data_dir, wiki);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let qualification: ProductionQualification = serde_json::from_slice(&fs::read(&path)?)
+        .with_context(|| format!("invalid production qualification {}", path.display()))?;
+    qualification.validate(wiki, snapshot)?;
+    CrossSnapshotCache::new(data_dir, wiki, snapshot).map(Some)
+}
+
+fn production_qualification_path(data_dir: &Path, wiki: &str) -> PathBuf {
+    data_dir
+        .join("incremental")
+        .join("cross-snapshot-qualified")
+        .join(format!("{wiki}.json"))
 }
 
 fn update_string(digest: &mut Sha256, value: &str) {
@@ -554,7 +629,7 @@ pub(crate) fn qualify(
         }
         let report = QualificationReport {
             schema_version: 1,
-            publication_eligible: false,
+            publication_eligible: true,
             wiki: wiki.to_string(),
             baseline_snapshot: baseline_snapshot.to_string(),
             candidate_snapshot: candidate_snapshot.to_string(),
@@ -569,9 +644,25 @@ pub(crate) fn qualify(
             semantic_summaries,
         };
         atomic_json(report_path, &report)?;
+        let (_, report_sha256) = storage::sha256_file(report_path)?;
+        let mut qualification = ProductionQualification {
+            schema_version: PRODUCTION_QUALIFICATION_SCHEMA_VERSION,
+            wiki: wiki.to_string(),
+            baseline_snapshot: baseline_snapshot.to_string(),
+            qualified_through_snapshot: candidate_snapshot.to_string(),
+            aggregate_sha256: report.aggregate_sha256.clone(),
+            report_sha256,
+            qualification_sha256: String::new(),
+        };
+        qualification.qualification_sha256 = qualification.canonical_hash()?;
+        atomic_json(
+            &production_qualification_path(data_dir, wiki),
+            &qualification,
+        )?;
         Ok(report)
     })();
     if result.is_err() {
+        let _ = fs::remove_file(production_qualification_path(data_dir, wiki));
         let failure = work_root.join("qualification-failed");
         let mut file = File::create(&failure)?;
         file.write_all(b"cross-snapshot qualification failed; artifacts retained for diagnosis\n")?;
@@ -620,6 +711,8 @@ mod tests {
             CacheStats {
                 reused_artifacts: 1,
                 rebuilt_artifacts: 1,
+                missing_artifacts: 1,
+                missing_receipts: 0,
             }
         );
 
@@ -629,6 +722,10 @@ mod tests {
         fs::write(&artifact, &artifact_bytes)?;
         assert!(cache.reusable("monthly", "v1", digest, "gdp")?);
         let receipt_bytes = fs::read(&receipt)?;
+        fs::remove_file(&receipt)?;
+        assert!(cache.load("monthly", "v1", digest, "gdp")?.is_none());
+        assert_eq!(cache.stats().missing_receipts, 1);
+        fs::write(&receipt, &receipt_bytes)?;
         fs::write(&receipt, b"not json")?;
         assert!(cache.load("monthly", "v1", digest, "gdp").is_err());
         fs::write(&receipt, &receipt_bytes)?;

@@ -358,7 +358,7 @@ fn snapshot_rollover_computes_only_the_new_generation() -> Result<()> {
         &qualification_root,
         &qualification_report,
     )?;
-    assert!(!qualification.publication_eligible);
+    assert!(qualification.publication_eligible);
     assert_eq!(qualification.artifact_count, 9);
     assert_eq!(qualification.unchanged_months, ["2023-12", "2024-01"]);
     assert_eq!(qualification.changed_months, ["2024-02"]);
@@ -370,6 +370,7 @@ fn snapshot_rollover_computes_only_the_new_generation() -> Result<()> {
         "the unchanged January stateless, editor-month, and weekly contributions should be reused"
     );
     assert!(qualification_report.is_file());
+    assert!(cross_snapshot::production_cache(&data_dir, "tinywiki", "2026-08")?.is_some());
     assert_eq!(
         storage::current_snapshot_version(&data_dir, "tinywiki")?.as_deref(),
         Some("2026-08"),
@@ -437,6 +438,10 @@ fn snapshot_rollover_computes_only_the_new_generation() -> Result<()> {
         .is_err()
     );
     assert!(failed_work.join("qualification-failed").is_file());
+    assert!(
+        cross_snapshot::production_cache(&data_dir, "tinywiki", "2026-09")?.is_none(),
+        "a failed later qualification must withdraw production cache authorization"
+    );
     assert_eq!(
         storage::current_snapshot_version(&data_dir, "tinywiki")?.as_deref(),
         Some("2026-09"),

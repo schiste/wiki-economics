@@ -165,8 +165,10 @@ queued. If a worker still reaches an unchanged candidate, its run record reports
 `noOp: true`; no dump or patrol download and no compute stage starts.
 
 Every Wikimedia monthly history dump is treated as a complete authoritative
-snapshot. Snapshot rollover performs the complete source-generation ingest;
-the pipeline deliberately does not infer cross-snapshot deltas.
+snapshot. Snapshot rollover performs the complete source-generation ingest.
+After byte-for-byte qualification, metric computation may reuse content-addressed
+logical months whose canonical digests are unchanged; it never invents source
+deltas or skips ingest validation.
 
 The publisher runs every two hours. It may publish one wiki while another is
 still computing; an incomplete or failed candidate is invisible to it. A

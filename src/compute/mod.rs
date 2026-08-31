@@ -3124,6 +3124,7 @@ pub fn write_output(df: &mut DataFrame, wiki: &str, metric: &str, output_dir: &P
     Ok(())
 }
 
+#[cfg(test)]
 fn compute_all_incremental(
     wiki: &str,
     data_dir: &Path,
@@ -4034,16 +4035,33 @@ fn compute_all_selected(
 
     info!(wiki = wiki, ?plan, "computing invalidated metric families");
     let started = Instant::now();
+    let cross_snapshot = snapshot
+        .map(|snapshot| crate::cross_snapshot::production_cache(data_dir, wiki, snapshot))
+        .transpose()?
+        .flatten();
+    info!(
+        wiki,
+        snapshot = snapshot.unwrap_or("legacy"),
+        enabled = cross_snapshot.is_some(),
+        "selected production cross-snapshot cache policy"
+    );
 
-    let analytical_partitions_scanned =
-        compute_all_incremental(wiki, data_dir, output_dir, snapshot, plan)?;
+    let analytical_partitions_scanned = compute_all_incremental_cached(
+        wiki,
+        data_dir,
+        output_dir,
+        snapshot,
+        plan,
+        cross_snapshot.as_ref(),
+    )?;
     if plan.page_week.must_compute() {
-        compute_page_weekly_edits_for_snapshot(
+        compute_page_weekly_edits_for_snapshot_cached(
             wiki,
             data_dir,
             output_dir,
             &weekly_config,
             snapshot,
+            cross_snapshot.as_ref(),
         )?;
     }
     for family in MetricFamily::ALL {
@@ -4082,6 +4100,7 @@ fn compute_all_selected(
     info!(
         wiki = wiki,
         analytical_partitions_scanned,
+        cache = ?cross_snapshot.as_ref().map(crate::cross_snapshot::CrossSnapshotCache::stats),
         elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
         "finished metric computation"
     );
