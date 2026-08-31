@@ -4912,6 +4912,7 @@ mod tests {
             fs::write(site.join("data-build/manifest.sh"), "true")?;
             fs::write(site.join("observablehq.config.js"), "export default {}")?;
             fs::write(site.join("package.json"), "{}")?;
+            fs::write(site.join("site-footer.js"), "export const siteFooter = ''")?;
             fs::write(
                 site_root.path().join("package.json"),
                 "{\"workspaces\":[\"site\"]}",
@@ -7319,6 +7320,7 @@ mod tests {
             fs::write(site.join("data-build/manifest.sh"), "true")?;
             fs::write(site.join("observablehq.config.js"), "export default {}")?;
             fs::write(site.join("package.json"), "{}")?;
+            fs::write(site.join("site-footer.js"), "export const siteFooter = ''")?;
             fs::write(
                 site_root.path().join("package.json"),
                 "{\"workspaces\":[\"site\"]}",
@@ -7541,6 +7543,7 @@ mod tests {
         fs::write(site.join("data-build/manifest.sh"), "true")?;
         fs::write(site.join("observablehq.config.js"), "export default {}")?;
         fs::write(site.join("package.json"), "{}")?;
+        fs::write(site.join("site-footer.js"), "export const siteFooter = ''")?;
         fs::write(
             site_root.path().join("package.json"),
             "{\"workspaces\":[\"site\"]}",

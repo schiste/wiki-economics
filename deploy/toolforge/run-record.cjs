@@ -285,10 +285,14 @@ function buildRecord(environment, finalExitCode = null) {
     error,
     provenance: {
       sourceCommit: environment.WIKI_ECON_SOURCE_COMMIT || null,
+      binarySourceCommit: environment.WIKI_ECON_BINARY_SOURCE_COMMIT || environment.WIKI_ECON_SOURCE_COMMIT || null,
       binarySha256: environment.WIKI_ECON_BINARY_SHA256 || null,
       imageSourceRef: environment.WIKI_ECON_IMAGE_SOURCE_REF || null,
       imageSourceCommit: environment.WIKI_ECON_IMAGE_SOURCE_COMMIT || null,
       imageDigest: environment.WIKI_ECON_IMAGE_DIGEST || null,
+      siteSourceCommit: environment.WIKI_ECON_SITE_SOURCE_COMMIT || null,
+      siteSourceSha256: environment.WIKI_ECON_SITE_SOURCE_SHA256 || null,
+      siteSourceArchiveSha256: environment.WIKI_ECON_SITE_SOURCE_ARCHIVE_SHA256 || null,
     },
     publication,
     memoryCurrentBytes: finiteCounter(path.join(cgroupRoot, "memory.current")),
@@ -324,6 +328,7 @@ function compactHistoryEntry(record) {
     diskFreeBytes: record.disk.freeBytes,
     publishedSiteGeneration: record.publishedSiteGeneration,
     logFile: record.logFile,
+    provenance: record.provenance,
     publication: record.publication,
   };
 }
@@ -391,6 +396,7 @@ function structuredSummaries(record) {
     cpu: record.cpu,
     diskFreeBytes: record.disk.freeBytes,
     publishedSiteGeneration: record.publishedSiteGeneration,
+    provenance: record.provenance,
   }));
   return stages;
 }

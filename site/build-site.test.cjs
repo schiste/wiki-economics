@@ -18,7 +18,15 @@ const stageEvents = path.join(fixtureRoot, "site-stage-events.jsonl");
 fs.mkdirSync(path.join(fakeRoot, "node_modules", ".bin"), {recursive: true});
 fs.writeFileSync(
   path.join(fakeRoot, "node_modules", ".bin", "observable"),
-  "#!/bin/sh\nexit 0\n",
+  `#!/bin/sh
+set -eu
+if [ -n "\${FAKE_NPM_LOG:-}" ]; then
+  printf '%s\\n' "$*" >> "$FAKE_NPM_LOG"
+fi
+mkdir -p "$WIKI_ECON_SITE_DIST_DIR"
+printf 'new release\\n' > "$WIKI_ECON_SITE_DIST_DIR/inequality.html"
+if [ "\${FAKE_BUILD_FAIL:-0}" = 1 ]; then exit 1; fi
+`,
   {mode: 0o755},
 );
 fs.mkdirSync(path.join(fakeRoot, "deploy", "toolforge"), {recursive: true});

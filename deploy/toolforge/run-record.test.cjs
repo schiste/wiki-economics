@@ -49,6 +49,7 @@ function fixture(name) {
   ].join("\n"));
   const environment = {
     WIKI_ECON_BINARY_SHA256: "a".repeat(64),
+    WIKI_ECON_BINARY_SOURCE_COMMIT: "c".repeat(40),
     WIKI_ECON_CGROUP_ROOT: cgroup,
     WIKI_ECON_IMAGE_SOURCE_COMMIT: "b".repeat(40),
     WIKI_ECON_IMAGE_SOURCE_REF: "main",
@@ -67,6 +68,9 @@ function fixture(name) {
     WIKI_ECON_RUN_STATUS_FILE: path.join(output, ".refresh-status.json"),
     WIKI_ECON_RUN_WIKIS_JSON: '["nlwiki"]',
     WIKI_ECON_SITE_DIST_DIR: dist,
+    WIKI_ECON_SITE_SOURCE_COMMIT: "e".repeat(40),
+    WIKI_ECON_SITE_SOURCE_SHA256: "f".repeat(64),
+    WIKI_ECON_SITE_SOURCE_ARCHIVE_SHA256: "9".repeat(64),
     WIKI_ECON_SOURCE_COMMIT: "c".repeat(40),
   };
   return {environment, lock, output};
@@ -114,6 +118,9 @@ test("live and final records combine provenance, resources, publication, and sit
   assert.equal(live.noOp, false);
   assert.equal(live.provenance.imageSourceRef, "main");
   assert.equal(live.provenance.imageDigest, environment.WIKI_ECON_IMAGE_DIGEST);
+  assert.equal(live.provenance.binarySourceCommit, environment.WIKI_ECON_BINARY_SOURCE_COMMIT);
+  assert.equal(live.provenance.siteSourceCommit, environment.WIKI_ECON_SITE_SOURCE_COMMIT);
+  assert.equal(live.provenance.siteSourceSha256, environment.WIKI_ECON_SITE_SOURCE_SHA256);
   assert.equal(live.disk.path, environment.WIKI_ECON_OUTPUT_DIR);
   assert.equal(live.memoryPeakBytes, 654321);
   assert.deepEqual(live.cpu, {
@@ -161,6 +168,7 @@ test("live and final records combine provenance, resources, publication, and sit
   });
   assert.equal(final.publication.browserData.bytes, 900);
   assert.equal(final.publication.browserData.largestPartitionBytes, 200);
+  assert.equal(final.provenance.siteSourceArchiveSha256, environment.WIKI_ECON_SITE_SOURCE_ARCHIVE_SHA256);
 });
 
 test("failed records prefer the Rust stage error and reject another run's publication", () => {

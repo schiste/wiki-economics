@@ -23,9 +23,9 @@ wiki_econ_init_runtime() {
   WIKI_ECON_ENV="${WIKI_ECON_ENV:-local}"
   WIKI_ECON_DATA_DIR="$(wiki_econ_abs_path "$WIKI_ECON_ROOT" "${WIKI_ECON_DATA_DIR:-data}")"
   WIKI_ECON_OUTPUT_DIR="$(wiki_econ_abs_path "$WIKI_ECON_ROOT" "${WIKI_ECON_OUTPUT_DIR:-output}")"
-  WIKI_ECON_GENERATOR_DIR="$(wiki_econ_abs_path "$WIKI_ECON_ROOT" "${WIKI_ECON_GENERATOR_DIR:-site/data-build}")"
-  WIKI_ECON_WIKI_LIFECYCLE_FILE="$(wiki_econ_abs_path "$WIKI_ECON_ROOT" "${WIKI_ECON_WIKI_LIFECYCLE_FILE:-config/wiki-lifecycle.json}")"
   WIKI_ECON_SITE_DIR="$(wiki_econ_abs_path "$WIKI_ECON_ROOT" "${WIKI_ECON_SITE_DIR:-site}")"
+  WIKI_ECON_GENERATOR_DIR="$(wiki_econ_abs_path "$WIKI_ECON_ROOT" "${WIKI_ECON_GENERATOR_DIR:-$WIKI_ECON_SITE_DIR/data-build}")"
+  WIKI_ECON_WIKI_LIFECYCLE_FILE="$(wiki_econ_abs_path "$WIKI_ECON_ROOT" "${WIKI_ECON_WIKI_LIFECYCLE_FILE:-config/wiki-lifecycle.json}")"
   WIKI_ECON_SITE_DIST_DIR="$(wiki_econ_abs_path "$WIKI_ECON_ROOT" "${WIKI_ECON_SITE_DIST_DIR:-site/dist}")"
   WIKI_ECON_SITE_PORT="${WIKI_ECON_SITE_PORT:-3000}"
   WIKI_ECON_ADMIN_PORT="${WIKI_ECON_ADMIN_PORT:-3001}"
@@ -42,6 +42,8 @@ wiki_econ_init_runtime() {
   export WIKI_ECON_ADMIN_PORT
 
   wiki_econ_init_binary_provenance
+  wiki_econ_init_image_provenance
+  wiki_econ_init_site_source_provenance
 }
 
 wiki_econ_init_binary_provenance() {
@@ -97,14 +99,62 @@ wiki_econ_init_binary_provenance() {
     echo "Configured binary checksum does not match the deployed binary" >&2
     return 1
   }
-  [ -z "${WIKI_ECON_IMAGE_SOURCE_COMMIT:-}" ] || [ "$WIKI_ECON_IMAGE_SOURCE_COMMIT" = "$source_commit" ] || {
-    echo "Binary and image source commits disagree" >&2
+  WIKI_ECON_SOURCE_COMMIT="$source_commit"
+  WIKI_ECON_BINARY_SOURCE_COMMIT="$source_commit"
+  WIKI_ECON_BINARY_SHA256="$actual_binary_sha"
+  export WIKI_ECON_SOURCE_COMMIT WIKI_ECON_BINARY_SOURCE_COMMIT WIKI_ECON_BINARY_SHA256
+}
+
+wiki_econ_init_image_provenance() {
+  local commit="${WIKI_ECON_IMAGE_SOURCE_COMMIT:-}"
+  local ref="${WIKI_ECON_IMAGE_SOURCE_REF:-}"
+  local digest="${WIKI_ECON_IMAGE_DIGEST:-}"
+
+  if [ -z "$commit$ref$digest" ]; then
+    return 0
+  fi
+  if [[ ! "$commit" =~ ^[0-9a-f]{40}$ ]] || \
+     [ "$ref" != "toolforge-image-$commit" ] || \
+     [[ ! "$digest" =~ @sha256:[0-9a-f]{64}$ ]]; then
+    echo "Toolforge image provenance is incomplete or malformed" >&2
+    return 1
+  fi
+}
+
+wiki_econ_init_site_source_provenance() {
+  local required="${WIKI_ECON_SITE_SOURCE_REQUIRED:-0}"
+  local configured_commit="${WIKI_ECON_SITE_SOURCE_COMMIT:-}"
+  local configured_sha="${WIKI_ECON_SITE_SOURCE_SHA256:-}"
+  local physical_site release_root provenance_file observed
+
+  if [ "$required" != "1" ] && [ -z "$configured_commit$configured_sha" ]; then
+    return 0
+  fi
+  if [ ! -d "$WIKI_ECON_SITE_DIR" ]; then
+    echo "Configured site-source directory is missing: $WIKI_ECON_SITE_DIR" >&2
+    return 1
+  fi
+  [[ "$configured_commit" =~ ^[0-9a-f]{40}$ ]] && [[ "$configured_sha" =~ ^[0-9a-f]{64}$ ]] || {
+    echo "Configured site-source identity is incomplete or malformed" >&2
     return 1
   }
 
-  WIKI_ECON_SOURCE_COMMIT="$source_commit"
-  WIKI_ECON_BINARY_SHA256="$actual_binary_sha"
-  export WIKI_ECON_SOURCE_COMMIT WIKI_ECON_BINARY_SHA256
+  physical_site="$(cd "$WIKI_ECON_SITE_DIR" && pwd -P)"
+  release_root="$(dirname "$physical_site")"
+  provenance_file="$release_root/site-source-provenance.json"
+  [ -f "$provenance_file" ] || {
+    echo "Site-source provenance is missing: $provenance_file" >&2
+    return 1
+  }
+  observed="$(node "$WIKI_ECON_ROOT/scripts/site-source-bundle.cjs" --verify "$release_root" "$configured_commit")" || {
+    echo "Site-source release failed identity verification" >&2
+    return 1
+  }
+  # shellcheck disable=SC2016
+  [ "$(node -e 'const v=JSON.parse(process.argv[1]);process.stdout.write(v.content_sha256||"")' "$observed")" = "$configured_sha" ] || {
+    echo "Configured site-source checksum does not match its provenance" >&2
+    return 1
+  }
 }
 
 wiki_econ_print_runtime() {
@@ -117,6 +167,9 @@ Generators:   $WIKI_ECON_GENERATOR_DIR
 Wiki registry: $WIKI_ECON_WIKI_LIFECYCLE_FILE
 Site dir:     $WIKI_ECON_SITE_DIR
 Site dist:    $WIKI_ECON_SITE_DIST_DIR
+Binary commit: ${WIKI_ECON_BINARY_SOURCE_COMMIT:-unverified}
+Image commit:  ${WIKI_ECON_IMAGE_SOURCE_COMMIT:-unverified}
+Site commit:   ${WIKI_ECON_SITE_SOURCE_COMMIT:-unverified}
 EOF
 }
 

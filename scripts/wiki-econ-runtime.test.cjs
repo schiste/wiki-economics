@@ -7,6 +7,7 @@ const os = require("node:os");
 const path = require("node:path");
 const {spawnSync} = require("node:child_process");
 const {after, test} = require("node:test");
+const {prepareBundle} = require("./site-source-bundle.cjs");
 
 const ROOT = path.resolve(__dirname, "..");
 const LIBRARY = path.join(ROOT, "scripts", "lib", "wiki_econ.sh");
@@ -42,6 +43,8 @@ function initialize(fixture, extra = {}) {
       WIKI_ECON_BIN: fixture.binary,
       WIKI_ECON_ENV: "production",
       WIKI_ECON_IMAGE_SOURCE_COMMIT: fixture.commit,
+      WIKI_ECON_IMAGE_SOURCE_REF: `toolforge-image-${fixture.commit}`,
+      WIKI_ECON_IMAGE_DIGEST: `registry/toolforge-image@sha256:${"1".repeat(64)}`,
       ...extra,
     },
   });
@@ -54,11 +57,21 @@ test("production runtime derives commit and checksum from the deployed release",
   assert.deepEqual(result.stdout.trim().split("\n"), [fixture.commit, fixture.checksum]);
 });
 
-test("production runtime rejects image, checksum, and sidecar disagreement", () => {
+test("production runtime treats binary and image as independently verified identities", () => {
   const imageMismatch = releaseFixture("image-mismatch");
-  let result = initialize(imageMismatch, {WIKI_ECON_IMAGE_SOURCE_COMMIT: "b".repeat(40)});
+  const imageCommit = "b".repeat(40);
+  const result = initialize(imageMismatch, {
+    WIKI_ECON_IMAGE_SOURCE_COMMIT: imageCommit,
+    WIKI_ECON_IMAGE_SOURCE_REF: `toolforge-image-${imageCommit}`,
+  });
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test("production runtime rejects malformed image, checksum, and sidecar identity", () => {
+  const malformedImage = releaseFixture("image-malformed");
+  let result = initialize(malformedImage, {WIKI_ECON_IMAGE_SOURCE_REF: "wrong-ref"});
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /Binary and image source commits disagree/);
+  assert.match(result.stderr, /image provenance is incomplete or malformed/);
 
   const checksumMismatch = releaseFixture("checksum-mismatch");
   fs.appendFileSync(path.join(checksumMismatch.release, "wiki-econ"), "# changed\n");
@@ -71,4 +84,28 @@ test("production runtime rejects image, checksum, and sidecar disagreement", () 
   result = initialize(missingSidecar);
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /has no release provenance/);
+});
+
+test("production runtime verifies an immutable site-source release independently", () => {
+  const fixture = releaseFixture("site-source");
+  const siteCommit = "e".repeat(40);
+  const siteRelease = path.join(fixtureRoot, "site-source-release", siteCommit);
+  const provenance = prepareBundle(ROOT, siteRelease, siteCommit, "1788100000");
+  let result = initialize(fixture, {
+    WIKI_ECON_SITE_DIR: path.join(siteRelease, "site"),
+    WIKI_ECON_SITE_SOURCE_REQUIRED: "1",
+    WIKI_ECON_SITE_SOURCE_COMMIT: siteCommit,
+    WIKI_ECON_SITE_SOURCE_SHA256: provenance.content_sha256,
+  });
+  assert.equal(result.status, 0, result.stderr);
+
+  fs.appendFileSync(path.join(siteRelease, "site/src/style.css"), "tampered\n");
+  result = initialize(fixture, {
+    WIKI_ECON_SITE_DIR: path.join(siteRelease, "site"),
+    WIKI_ECON_SITE_SOURCE_REQUIRED: "1",
+    WIKI_ECON_SITE_SOURCE_COMMIT: siteCommit,
+    WIKI_ECON_SITE_SOURCE_SHA256: provenance.content_sha256,
+  });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /failed identity verification/);
 });

@@ -756,7 +756,7 @@ fn site_source_inputs(site_dir: &Path) -> Result<Vec<TrackedPath>> {
     inputs.extend(site_sources);
     let data_build = collect_tracked_files(&site_dir.join("data-build"), "site/data-build")?;
     inputs.extend(data_build);
-    for name in ["observablehq.config.js", "package.json"] {
+    for name in ["observablehq.config.js", "package.json", "site-footer.js"] {
         inputs.push(TrackedPath::new(
             format!("site/{name}"),
             site_dir.join(name),
@@ -1474,6 +1474,7 @@ mod tests {
         fs::write(site.join("data-build/manifest.sh"), "true")?;
         fs::write(site.join("observablehq.config.js"), "export default {}")?;
         fs::write(site.join("package.json"), "{}")?;
+        fs::write(site.join("site-footer.js"), "export const siteFooter = ''")?;
         fs::write(
             dir.path().join("package.json"),
             "{\"workspaces\":[\"site\"]}",

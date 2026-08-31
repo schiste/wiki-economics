@@ -74,6 +74,7 @@ if [ "${WIKI_ECON_REQUIRE_PUBLICATION_GATE:-0}" = "1" ]; then
 fi
 
 wiki_econ_ensure_site_deps
+site_vendor_cache="${WIKI_ECON_SITE_VENDOR_CACHE_DIR:-$WIKI_ECON_ROOT/site/vendor/observable-cache}"
 
 dist_dir="$WIKI_ECON_SITE_DIST_DIR"
 dist_parent="$(dirname "$dist_dir")"
@@ -229,18 +230,19 @@ if [ "${WIKI_ECON_VERIFY_SITE_CLOSURE:-1}" = "1" ]; then
     "$WIKI_ECON_SITE_DIR/src" \
     "$source_dir" \
     "$dashboard_dir" \
-    "$WIKI_ECON_SITE_DIR/vendor/observable-cache"
+    "$site_vendor_cache"
 
   offline_guard="$ROOT/scripts/deny-network.cjs"
   (cd "$WIKI_ECON_ROOT" && \
     NODE_OPTIONS="--require=$offline_guard${NODE_OPTIONS:+ $NODE_OPTIONS}" \
     WIKI_ECON_SITE_SOURCE_DIR="$source_dir" \
     WIKI_ECON_SITE_DIST_DIR="$build_dir" \
-    npm --workspace site run build)
+    "$WIKI_ECON_ROOT/node_modules/.bin/observable" build --config "$WIKI_ECON_SITE_DIR/observablehq.config.js")
   node "$ROOT/scripts/publish-browser-data.cjs" "$WIKI_ECON_OUTPUT_DIR" "$build_dir"
   node "$ROOT/scripts/verify-site-dependencies.cjs" "$build_dir"
 else
-  (cd "$WIKI_ECON_ROOT" && WIKI_ECON_SITE_DIST_DIR="$build_dir" npm --workspace site run build)
+  (cd "$WIKI_ECON_ROOT" && WIKI_ECON_SITE_DIST_DIR="$build_dir" \
+    "$WIKI_ECON_ROOT/node_modules/.bin/observable" build --config "$WIKI_ECON_SITE_DIR/observablehq.config.js")
   node "$ROOT/scripts/publish-browser-data.cjs" "$WIKI_ECON_OUTPUT_DIR" "$build_dir"
 fi
 
