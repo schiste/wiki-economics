@@ -41,6 +41,144 @@ ${adminApiScript}
 document.addEventListener("DOMContentLoaded",function(){
   var sidebar=document.getElementById("observablehq-sidebar");
   if(!sidebar)return;
+  var sidebarToggle=document.getElementById("observablehq-sidebar-toggle");
+  var center=document.getElementById("observablehq-center");
+  var mobileQuery=window.matchMedia("(max-width: 1007px)");
+  var masthead=document.createElement("header");
+  masthead.className="mobile-masthead";
+  var mastheadContext=document.createElement("div");
+  mastheadContext.className="mobile-masthead-context";
+  var mastheadBrand=document.createElement("a");
+  mastheadBrand.className="mobile-masthead-brand";
+  mastheadBrand.href="/";
+  mastheadBrand.textContent="Wiki Economics";
+  var activeLinks=sidebar.querySelectorAll(".observablehq-link-active a");
+  var mastheadPage=document.createElement("span");
+  mastheadPage.className="mobile-masthead-page";
+  mastheadPage.textContent=activeLinks.length?activeLinks[activeLinks.length-1].textContent:"Portfolio";
+  mastheadContext.appendChild(mastheadBrand);
+  mastheadContext.appendChild(mastheadPage);
+  var menuButton=document.createElement("button");
+  menuButton.type="button";
+  menuButton.className="mobile-menu-button";
+  menuButton.setAttribute("aria-controls","observablehq-sidebar");
+  menuButton.setAttribute("aria-expanded","false");
+  menuButton.setAttribute("aria-label","Open navigation");
+  var menuWordTop=document.createElement("span");
+  menuWordTop.className="mobile-menu-word";
+  menuWordTop.setAttribute("aria-hidden","true");
+  menuWordTop.textContent="MENU";
+  var menuIcon=document.createElement("span");
+  menuIcon.className="mobile-menu-icon";
+  menuIcon.setAttribute("aria-hidden","true");
+  menuIcon.textContent="\u203A";
+  var menuWordBottom=document.createElement("span");
+  menuWordBottom.className="mobile-menu-word";
+  menuWordBottom.setAttribute("aria-hidden","true");
+  menuWordBottom.textContent="MENU";
+  var menuLabel=document.createElement("span");
+  menuLabel.className="mobile-menu-label";
+  menuLabel.textContent="Menu";
+  menuButton.appendChild(menuWordTop);
+  menuButton.appendChild(menuIcon);
+  menuButton.appendChild(menuWordBottom);
+  menuButton.appendChild(menuLabel);
+  masthead.appendChild(mastheadContext);
+  document.body.insertBefore(masthead,center);
+  document.body.insertBefore(menuButton,center);
+  var navToolbar=document.createElement("div");
+  navToolbar.className="mobile-nav-toolbar";
+  var navTitle=document.createElement("strong");
+  navTitle.textContent="Navigation";
+  var closeButton=document.createElement("button");
+  closeButton.type="button";
+  closeButton.className="mobile-nav-close";
+  closeButton.setAttribute("aria-label","Close navigation");
+  var closeIcon=document.createElement("span");
+  closeIcon.setAttribute("aria-hidden","true");
+  closeIcon.textContent="\u00D7";
+  closeButton.appendChild(closeIcon);
+  closeButton.appendChild(document.createTextNode("Close"));
+  navToolbar.appendChild(navTitle);
+  navToolbar.appendChild(closeButton);
+  sidebar.insertBefore(navToolbar,sidebar.firstElementChild.nextSibling);
+  sidebar.setAttribute("aria-label","Primary navigation");
+  var scrollLockY=0;
+  var pageLocked=false;
+  var navigationPending=false;
+  var previousOpen=false;
+  function isMobileNavOpen(){
+    return mobileQuery.matches&&sidebarToggle.checked&&!sidebarToggle.indeterminate;
+  }
+  function setPageLocked(locked){
+    if(locked===pageLocked)return;
+    pageLocked=locked;
+    if(locked){
+      scrollLockY=window.scrollY;
+      document.documentElement.classList.add("mobile-nav-open");
+      document.body.style.position="fixed";
+      document.body.style.top="-"+scrollLockY+"px";
+      document.body.style.left="0";
+      document.body.style.right="0";
+      document.body.style.width="100%";
+    }else{
+      document.documentElement.classList.remove("mobile-nav-open");
+      document.body.style.removeProperty("position");
+      document.body.style.removeProperty("top");
+      document.body.style.removeProperty("left");
+      document.body.style.removeProperty("right");
+      document.body.style.removeProperty("width");
+      window.scrollTo(0,scrollLockY);
+    }
+  }
+  function syncMobileNavigation(){
+    var open=isMobileNavOpen();
+    menuButton.setAttribute("aria-expanded",open?"true":"false");
+    menuButton.setAttribute("aria-label",open?"Close navigation":"Open navigation");
+    menuLabel.textContent=open?"Close":"Menu";
+    sidebar.setAttribute("aria-hidden",mobileQuery.matches&&!open?"true":"false");
+    sidebarToggle.tabIndex=mobileQuery.matches?-1:0;
+    setPageLocked(open);
+    if(open&&!previousOpen){
+      window.requestAnimationFrame(function(){closeButton.focus({preventScroll:true});});
+    }else if(!open&&previousOpen&&!navigationPending){
+      window.requestAnimationFrame(function(){menuButton.focus({preventScroll:true});});
+    }
+    previousOpen=open;
+    navigationPending=false;
+  }
+  function scheduleMobileNavigationSync(){
+    window.requestAnimationFrame(syncMobileNavigation);
+  }
+  function toggleMobileNavigation(){
+    if(sidebarToggle)sidebarToggle.click();
+    scheduleMobileNavigationSync();
+  }
+  menuButton.addEventListener("click",toggleMobileNavigation);
+  closeButton.addEventListener("click",toggleMobileNavigation);
+  sidebarToggle.addEventListener("click",scheduleMobileNavigationSync);
+  sidebarToggle.addEventListener("change",scheduleMobileNavigationSync);
+  mobileQuery.addEventListener("change",scheduleMobileNavigationSync);
+  sidebar.addEventListener("click",function(event){
+    if(!mobileQuery.matches||!isMobileNavOpen()||!event.target.closest("a"))return;
+    navigationPending=true;
+    toggleMobileNavigation();
+  });
+  sidebar.addEventListener("keydown",function(event){
+    if(event.key!=="Tab"||!isMobileNavOpen())return;
+    var focusable=Array.from(sidebar.querySelectorAll("a[href],button:not([disabled]),summary,[tabindex]:not([tabindex='-1'])"));
+    if(focusable.length===0)return;
+    var first=focusable[0];
+    var last=focusable[focusable.length-1];
+    if(event.shiftKey&&document.activeElement===first){
+      event.preventDefault();
+      last.focus();
+    }else if(!event.shiftKey&&document.activeElement===last){
+      event.preventDefault();
+      first.focus();
+    }
+  });
+  syncMobileNavigation();
   var bottom=document.createElement("div");
   bottom.className="sidebar-bottom";
   var themeDiv=document.createElement("div");

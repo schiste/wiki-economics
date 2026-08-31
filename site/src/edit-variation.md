@@ -88,7 +88,7 @@ Rows are ordered by <strong>absolute WoW edit gain</strong>, not by percentage g
 </div>
 
 ```js
-html`<table>
+html`<div class="wide-table"><table>
   <thead>
     <tr>
       <th style="text-align:center">#</th>
@@ -113,7 +113,7 @@ html`<table>
       <td style="text-align:center">${row.wow}</td>
     </tr>`)}
   </tbody>
-</table>`
+</table></div>`
 ```
 
 </div>

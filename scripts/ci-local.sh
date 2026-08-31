@@ -57,6 +57,9 @@ node --test site/admin-server.test.cjs
 echo "==> node --test site/build-site.test.cjs"
 node --test site/build-site.test.cjs
 
+echo "==> node --test site/mobile-layout.test.cjs"
+node --test site/mobile-layout.test.cjs
+
 echo "==> node --test site/data-build/manifest.test.cjs site/freshness.test.cjs"
 node --test site/data-build/manifest.test.cjs
 node --test site/freshness.test.cjs
