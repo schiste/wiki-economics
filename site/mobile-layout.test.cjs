@@ -22,8 +22,10 @@ test("mobile navigation exposes one semantic controller and close action", async
   assert.match(head, /menuButton\.setAttribute\("aria-controls","observablehq-sidebar"\)/);
   assert.match(head, /menuButton\.setAttribute\("aria-expanded","false"\)/);
   assert.match(head, /menuButton\.setAttribute\("aria-label","Open navigation"\)/);
-  assert.equal((head.match(/menuWord(?:Top|Bottom)\.className="mobile-menu-word"/g) || []).length, 2);
-  assert.match(head, /menuIcon\.textContent="›"/);
+  assert.match(head, /for\(var menuLineIndex=0;menuLineIndex<3;menuLineIndex\+\+\)/);
+  assert.match(head, /menuLine\.className="mobile-menu-line"/);
+  assert.match(head, /masthead\.appendChild\(menuButton\)/);
+  assert.doesNotMatch(head, /document\.body\.insertBefore\(menuButton,center\)/);
   assert.match(head, /closeButton\.setAttribute\("aria-label","Close navigation"\)/);
   assert.match(head, /sidebar\.setAttribute\("aria-label","Primary navigation"\)/);
   assert.match(head, /sidebar\.insertBefore\(navToolbar,sidebar\.firstElementChild\.nextSibling\)/);
@@ -42,17 +44,19 @@ test("mobile navigation locks scrolling and manages focus deterministically", as
   assert.match(head, /sidebarToggle\.tabIndex=mobileQuery\.matches\?-1:0/);
 });
 
-test("small-screen CSS presents a discreet borderless rail with an accessible hit target", () => {
+test("small-screen CSS presents a conventional masthead hamburger with an accessible hit target", () => {
   assert.match(style, /\.mobile-masthead,\s*\.mobile-menu-button,\s*\.mobile-nav-toolbar \{\s*display: none;/);
   assert.match(style, /@media \(max-width: 1007px\)/);
   assert.match(style, /\.mobile-masthead \{[\s\S]*?display: grid;/);
   assert.match(style, /--wk-mobile-menu-surface: color-mix/);
-  assert.match(style, /--wk-mobile-menu-visual-width: 30px;/);
-  assert.match(style, /\.mobile-menu-button \{[\s\S]*?position: fixed;[\s\S]*?width: 44px;[\s\S]*?min-height: 8rem;[\s\S]*?background: transparent;[\s\S]*?border: 0;[\s\S]*?box-shadow: none;/);
-  assert.match(style, /\.mobile-menu-button::before \{[\s\S]*?width: var\(--wk-mobile-menu-visual-width\);[\s\S]*?background: var\(--wk-mobile-menu-surface\);/);
-  assert.match(style, /\.mobile-menu-word \{[\s\S]*?writing-mode: vertical-rl;[\s\S]*?text-orientation: upright;/);
+  assert.match(style, /\.mobile-masthead \{[\s\S]*?left: 0;[\s\S]*?width: 100vw;[\s\S]*?max-width: 100vw;[\s\S]*?grid-template-columns: minmax\(0, 1fr\) auto;/);
+  assert.match(style, /\.mobile-menu-button \{[\s\S]*?width: 44px;[\s\S]*?height: 44px;[\s\S]*?min-height: 44px;[\s\S]*?display: inline-grid;[\s\S]*?background: transparent;[\s\S]*?border: 0;[\s\S]*?box-shadow: none;/);
+  assert.match(style, /\.mobile-menu-icon \{[\s\S]*?width: 1\.25rem;[\s\S]*?height: 0\.875rem;[\s\S]*?flex-direction: column;/);
+  assert.match(style, /\.mobile-menu-line \{[\s\S]*?height: 2px;[\s\S]*?background: currentColor;/);
+  assert.doesNotMatch(style, /--wk-mobile-menu-visual-width/);
+  assert.doesNotMatch(style, /\.mobile-menu-word/);
   assert.match(style, /#observablehq-sidebar \{[\s\S]*?background: var\(--wk-mobile-menu-surface\);/);
-  assert.match(style, /#observablehq-center \{[\s\S]*?margin-left: 3rem;/);
+  assert.doesNotMatch(style, /margin-left: 3rem/);
   assert.match(style, /#observablehq-sidebar-toggle \{[\s\S]*?clip-path: inset\(50%\);/);
   assert.match(style, /#observablehq-sidebar \{[\s\S]*?width: min\(20rem, 86vw\);/);
   assert.match(style, /#observablehq-sidebar-backdrop \{[\s\S]*?z-index: 900;/);

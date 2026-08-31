@@ -64,28 +64,22 @@ document.addEventListener("DOMContentLoaded",function(){
   menuButton.setAttribute("aria-controls","observablehq-sidebar");
   menuButton.setAttribute("aria-expanded","false");
   menuButton.setAttribute("aria-label","Open navigation");
-  var menuWordTop=document.createElement("span");
-  menuWordTop.className="mobile-menu-word";
-  menuWordTop.setAttribute("aria-hidden","true");
-  menuWordTop.textContent="MENU";
   var menuIcon=document.createElement("span");
   menuIcon.className="mobile-menu-icon";
   menuIcon.setAttribute("aria-hidden","true");
-  menuIcon.textContent="\u203A";
-  var menuWordBottom=document.createElement("span");
-  menuWordBottom.className="mobile-menu-word";
-  menuWordBottom.setAttribute("aria-hidden","true");
-  menuWordBottom.textContent="MENU";
+  for(var menuLineIndex=0;menuLineIndex<3;menuLineIndex++){
+    var menuLine=document.createElement("span");
+    menuLine.className="mobile-menu-line";
+    menuIcon.appendChild(menuLine);
+  }
   var menuLabel=document.createElement("span");
   menuLabel.className="mobile-menu-label";
   menuLabel.textContent="Menu";
-  menuButton.appendChild(menuWordTop);
   menuButton.appendChild(menuIcon);
-  menuButton.appendChild(menuWordBottom);
   menuButton.appendChild(menuLabel);
   masthead.appendChild(mastheadContext);
+  masthead.appendChild(menuButton);
   document.body.insertBefore(masthead,center);
-  document.body.insertBefore(menuButton,center);
   var navToolbar=document.createElement("div");
   navToolbar.className="mobile-nav-toolbar";
   var navTitle=document.createElement("strong");
