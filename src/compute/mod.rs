@@ -22,7 +22,7 @@ use crate::{
     determinism, fingerprint,
     observability::MemorySnapshot,
     resource_governor::{GovernorPaths, ResourceGovernor, ResourceObservation},
-    schema, storage, workload_profile,
+    storage, workload_profile,
 };
 
 const LEGACY_COMPUTE_ALGORITHM_VERSION: &str = "core-metrics-v8-period-aware-activity-tiers";
@@ -40,6 +40,7 @@ const WEEKLY_BUCKET_COUNT_ENV: &str = "WIKI_ECON_WEEKLY_BUCKET_COUNT";
 const WEEKLY_PRIMARY_BUCKET_COUNT_ENV: &str = "WIKI_ECON_WEEKLY_PRIMARY_BUCKET_COUNT";
 const WEEKLY_SECONDARY_BUCKET_COUNT_ENV: &str = "WIKI_ECON_WEEKLY_SECONDARY_BUCKET_COUNT";
 const SCRATCH_DIR_ENV: &str = "WIKI_ECON_SCRATCH_DIR";
+const EDITOR_ACTOR_COLUMN: &str = "editor_actor";
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) enum MetricFamily {
@@ -722,13 +723,6 @@ fn store_lifecycle_outputs(
     Ok(())
 }
 
-fn analytical_select_exprs() -> Vec<Expr> {
-    schema::ANALYTICAL_COLUMNS
-        .iter()
-        .map(|column| col(*column))
-        .collect()
-}
-
 fn analytical_lazyframe(wiki: &str, data_dir: &Path) -> Result<LazyFrame> {
     let layer =
         storage::active_compute_layer(data_dir, wiki, storage::GenerationLayer::Analytical)?;
@@ -758,17 +752,6 @@ fn analytical_lazyframe(wiki: &str, data_dir: &Path) -> Result<LazyFrame> {
 }
 
 fn analytical_projection(df: LazyFrame, schema: &Schema) -> Result<DataFrame> {
-    let has_analytical_projection = schema::ANALYTICAL_COLUMNS
-        .iter()
-        .all(|column| schema.get(column).is_some());
-
-    if has_analytical_projection {
-        return df
-            .select(analytical_select_exprs())
-            .collect()
-            .map_err(Into::into);
-    }
-
     let has_year_month = schema.get("year_month").is_some();
     let has_year = schema.get("year").is_some();
     let has_year_month_key = schema.get("year_month_key").is_some();
@@ -797,48 +780,114 @@ fn analytical_projection(df: LazyFrame, schema: &Schema) -> Result<DataFrame> {
         schema.get("event_user_is_temporary"),
     );
 
-    df.select([
-        if has_year_month {
-            col("year_month")
-        } else {
-            year_month_col()
-        },
-        if has_year { col("year") } else { year_col() },
-        if has_year_month_key {
-            col("year_month_key")
-        } else {
-            year_month_key_col()
-        },
-        if has_user_type {
-            col("user_type")
-        } else {
-            user_type_col(
-                event_user_is_anonymous.clone(),
-                event_user_is_temporary.clone(),
-            )
-        },
-        col("event_user_id"),
-        col("page_namespace"),
-        col("revision_id"),
-        col("revision_text_bytes_diff"),
-        if has_is_reverted {
-            col("is_reverted")
-        } else {
-            bool_flag_expr(
-                "revision_is_identity_reverted",
-                schema.get("revision_is_identity_reverted"),
-            )
-            .alias("is_reverted")
-        },
-        if has_is_minor {
-            col("is_minor")
-        } else {
-            bool_flag_expr("revision_minor_edit", schema.get("revision_minor_edit"))
-                .alias("is_minor")
-        },
-    ])
-    .collect()
-    .map_err(Into::into)
+    let user_type = if has_user_type {
+        col("user_type")
+    } else {
+        user_type_col(
+            event_user_is_anonymous.clone(),
+            event_user_is_temporary.clone(),
+        )
+    };
+    let editor_actor = if schema.get("event_user_text").is_some() {
+        when(col("event_user_id").is_null())
+            .then(col("event_user_text"))
+            .otherwise(lit(NULL).cast(DataType::String))
+    } else {
+        lit(NULL).cast(DataType::String)
+    }
+    .alias(EDITOR_ACTOR_COLUMN);
+
+    let projected = df
+        .select([
+            if has_year_month {
+                col("year_month")
+            } else {
+                year_month_col()
+            },
+            if has_year { col("year") } else { year_col() },
+            if has_year_month_key {
+                col("year_month_key")
+            } else {
+                year_month_key_col()
+            },
+            user_type,
+            col("event_user_id"),
+            editor_actor,
+            col("page_namespace"),
+            col("revision_id"),
+            col("revision_text_bytes_diff"),
+            if has_is_reverted {
+                col("is_reverted")
+            } else {
+                bool_flag_expr(
+                    "revision_is_identity_reverted",
+                    schema.get("revision_is_identity_reverted"),
+                )
+                .alias("is_reverted")
+            },
+            if has_is_minor {
+                col("is_minor")
+            } else {
+                bool_flag_expr("revision_minor_edit", schema.get("revision_minor_edit"))
+                    .alias("is_minor")
+            },
+        ])
+        .collect()?;
+    validate_editor_identity_inputs(&projected)?;
+    Ok(projected)
+}
+
+/// A MediaWiki editor identity is either a user-table ID (permanent,
+/// temporary, and most bots) or the historical actor text when no user-table
+/// row exists (legacy IP actors). The actor text remains an internal grouping
+/// key and is never written to a metric output.
+pub(super) fn editor_identity_expr() -> Expr {
+    as_struct(vec![col("event_user_id"), col(EDITOR_ACTOR_COLUMN)])
+}
+
+pub(super) fn ensure_editor_identity_inputs(frame: &DataFrame) -> Result<DataFrame> {
+    if frame.column(EDITOR_ACTOR_COLUMN).is_ok() {
+        validate_editor_identity_inputs(frame)?;
+        return Ok(frame.clone());
+    }
+    let projected = frame
+        .clone()
+        .lazy()
+        .with_column(lit(NULL).cast(DataType::String).alias(EDITOR_ACTOR_COLUMN))
+        .collect()?;
+    validate_editor_identity_inputs(&projected)?;
+    Ok(projected)
+}
+
+fn ensure_editor_identity_key(frame: &DataFrame) -> Result<DataFrame> {
+    if frame.column("editor_identity").is_ok() {
+        return Ok(frame.clone());
+    }
+    ensure_editor_identity_inputs(frame)?
+        .lazy()
+        .with_column(editor_identity_expr().alias("editor_identity"))
+        .collect()
+        .map_err(Into::into)
+}
+
+fn validate_editor_identity_inputs(frame: &DataFrame) -> Result<()> {
+    let invalid = frame
+        .clone()
+        .lazy()
+        .filter(
+            col("event_user_id").is_null().and(
+                col(EDITOR_ACTOR_COLUMN)
+                    .is_null()
+                    .or(col(EDITOR_ACTOR_COLUMN).eq(lit(""))),
+            ),
+        )
+        .limit(1)
+        .collect()?;
+    anyhow::ensure!(
+        invalid.height() == 0,
+        "editor identity is unavailable: rows without event_user_id require event_user_text; rebuild the snapshot with the qualified metric-input schema"
+    );
+    Ok(())
 }
 
 /// Load the minimal base dataset for metric computation into memory once.
@@ -969,7 +1018,7 @@ fn sort_frame<const N: usize>(df: DataFrame, columns: [&str; N]) -> Result<DataF
 }
 
 fn gdp_monthly_frame(base: &DataFrame) -> Result<DataFrame> {
-    base.clone()
+    ensure_editor_identity_inputs(base)?
         .lazy()
         .group_by([col("year_month"), col("page_namespace"), col("user_type")])
         .agg([
@@ -988,7 +1037,7 @@ fn gdp_monthly_frame(base: &DataFrame) -> Result<DataFrame> {
                 .cast(DataType::UInt32)
                 .sum()
                 .alias("reverted_edits"),
-            col("event_user_id").n_unique().alias("unique_editors"),
+            editor_identity_expr().n_unique().alias("unique_editors"),
             col("is_minor")
                 .cast(DataType::UInt32)
                 .sum()
@@ -1009,26 +1058,26 @@ fn gdp_monthly_frame(base: &DataFrame) -> Result<DataFrame> {
 }
 
 fn gdp_type_share_frame(base: &DataFrame) -> Result<DataFrame> {
-    base.clone()
+    ensure_editor_identity_inputs(base)?
         .lazy()
         .group_by([col("year_month"), col("user_type")])
         .agg([
             col("revision_id").count().alias("edits"),
             col("revision_text_bytes_diff").sum().alias("net_bytes"),
-            col("event_user_id").n_unique().alias("editors"),
+            editor_identity_expr().n_unique().alias("editors"),
         ])
         .collect()
         .map_err(Into::into)
 }
 
 fn gdp_editor_month_frame(base: &DataFrame) -> Result<DataFrame> {
-    base.clone()
+    ensure_editor_identity_inputs(base)?
         .lazy()
         .group_by([
             col("year_month"),
             col("year_month_key"),
             col("user_type"),
-            col("event_user_id"),
+            editor_identity_expr().alias("editor_identity"),
         ])
         .agg([
             col("revision_id").count().alias("edits"),
@@ -1154,6 +1203,7 @@ fn gdp_activity_tiers_for_period(
     editor_months: &DataFrame,
     period: ActivityPeriod,
 ) -> Result<DataFrame> {
+    let editor_months = ensure_editor_identity_key(editor_months)?;
     let months = period.months();
     let labels = activity_tier_labels(months);
     let input_edits = editor_months
@@ -1163,10 +1213,9 @@ fn gdp_activity_tiers_for_period(
         .sum()
         .unwrap_or(0);
     let mut frame = editor_months
-        .clone()
         .lazy()
         .with_column(period.key_expr().alias("period_key"))
-        .group_by([col("period_key"), col("user_type"), col("event_user_id")])
+        .group_by([col("period_key"), col("user_type"), col("editor_identity")])
         .agg([
             col("edits").sum().alias("edits"),
             col("net_bytes").sum().alias("net_bytes"),
@@ -1202,7 +1251,7 @@ fn gdp_activity_tiers_for_period(
             col("activity_tier"),
         ])
         .agg([
-            col("event_user_id").n_unique().alias("editors"),
+            col("editor_identity").n_unique().alias("editors"),
             col("edits").sum().alias("total_edits"),
             col("net_bytes").sum().alias("net_bytes"),
             col("gross_bytes").sum().alias("gross_bytes"),
@@ -1292,11 +1341,11 @@ fn finish_activity_year(
 }
 
 fn labor_monthly_frame(base: &DataFrame) -> Result<DataFrame> {
-    base.clone()
+    ensure_editor_identity_inputs(base)?
         .lazy()
         .group_by([col("year_month"), col("page_namespace"), col("user_type")])
         .agg([
-            col("event_user_id").n_unique().alias("unique_editors"),
+            editor_identity_expr().n_unique().alias("unique_editors"),
             col("revision_id").count().alias("total_edits"),
             col("revision_text_bytes_diff").sum().alias("net_bytes"),
             col("is_reverted")
@@ -4689,6 +4738,38 @@ mod tests {
         .map_err(Into::into)
     }
 
+    fn anonymous_identity_input(include_actor_text: bool) -> Result<DataFrame> {
+        let mut columns = vec![
+            Column::new(
+                "event_timestamp".into(),
+                vec![
+                    "2025-05-01 00:00:00.0",
+                    "2025-05-02 00:00:00.0",
+                    "2025-05-03 00:00:00.0",
+                ],
+            ),
+            Column::new("event_user_id".into(), vec![None::<i64>, None, None]),
+            Column::new(
+                "event_user_is_bot_by".into(),
+                vec![None::<&str>, None, None],
+            ),
+            Column::new("event_user_is_anonymous".into(), vec![true, true, true]),
+            Column::new("event_user_is_temporary".into(), vec![false, false, false]),
+            Column::new("page_namespace".into(), vec![0_i32, 0, 0]),
+            Column::new("revision_id".into(), vec![1_i64, 2, 3]),
+            Column::new("revision_text_bytes_diff".into(), vec![1_i64, 1, 1]),
+            Column::new("is_reverted".into(), vec![false, false, false]),
+            Column::new("is_minor".into(), vec![false, false, false]),
+        ];
+        if include_actor_text {
+            columns.push(Column::new(
+                "event_user_text".into(),
+                vec!["192.0.2.1", "192.0.2.1", "198.51.100.4"],
+            ));
+        }
+        DataFrame::new_infer_height(columns).map_err(Into::into)
+    }
+
     #[test]
     fn compute_all_writes_expected_outputs() -> Result<()> {
         init_test_tracing();
@@ -4734,6 +4815,32 @@ mod tests {
             .collect();
         assert!(user_types.iter().any(|user_type| user_type == "temporary"));
 
+        Ok(())
+    }
+
+    #[test]
+    fn anonymous_actor_text_provides_distinct_editor_identity() -> Result<()> {
+        let input = anonymous_identity_input(true)?;
+        let schema = input.schema().clone();
+        let projected = analytical_projection(input.lazy(), schema.as_ref())?;
+
+        let type_share = gdp_type_share_frame(&projected)?;
+        assert_eq!(type_share.column("edits")?.u32()?.get(0), Some(3));
+        assert_eq!(type_share.column("editors")?.u32()?.get(0), Some(2));
+
+        let inequality = inequality::compute_frame(&projected)?;
+        assert_eq!(inequality.column("total_editors")?.u32()?.get(0), Some(2));
+        assert_eq!(inequality.column("total_edits")?.u32()?.get(0), Some(3));
+        Ok(())
+    }
+
+    #[test]
+    fn anonymous_rows_without_actor_text_fail_closed() -> Result<()> {
+        let input = anonymous_identity_input(false)?;
+        let schema = input.schema().clone();
+        let error = analytical_projection(input.lazy(), schema.as_ref())
+            .expect_err("anonymous rows without an actor identity must fail");
+        assert!(error.to_string().contains("event_user_text"));
         Ok(())
     }
 
@@ -6226,7 +6333,7 @@ mod tests {
         let loaded = load_partition(&storage::collect_parquet_files(&jan_dir)?)?;
 
         assert_eq!(loaded.height(), 2);
-        assert_eq!(loaded.width(), schema::ANALYTICAL_COLUMNS.len());
+        assert_eq!(loaded.width(), crate::schema::ANALYTICAL_COLUMNS.len() + 1);
         assert_eq!(loaded.column("year_month")?.str()?.get(0), Some("2024-01"));
         Ok(())
     }
@@ -6300,7 +6407,7 @@ mod tests {
         let loaded = load_wiki(wiki, data_dir.path())?;
 
         assert_eq!(loaded.height(), 6);
-        assert_eq!(loaded.width(), 10);
+        assert_eq!(loaded.width(), 11);
 
         let user_types: Vec<String> = loaded
             .column("user_type")?

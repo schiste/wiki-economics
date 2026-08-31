@@ -3,13 +3,13 @@ use polars::prelude::*;
 use std::path::Path;
 use tracing::debug;
 
-use super::write_output;
+use super::{editor_identity_expr, ensure_editor_identity_inputs, write_output};
 
 /// Compute GDP-style metrics: output, productivity, sectoral breakdown.
 pub fn compute(wiki: &str, base: &DataFrame, output_dir: &Path) -> Result<()> {
     debug!(wiki = wiki, "computing gdp metrics");
 
-    let base = base.clone().lazy();
+    let base = ensure_editor_identity_inputs(base)?.lazy();
 
     // --- 1. Monthly GDP by namespace (sector) ---
     let monthly_gdp = base
@@ -37,7 +37,7 @@ pub fn compute(wiki: &str, base: &DataFrame, output_dir: &Path) -> Result<()> {
                 .sum()
                 .alias("reverted_edits"),
             // Unique editors
-            col("event_user_id").n_unique().alias("unique_editors"),
+            editor_identity_expr().n_unique().alias("unique_editors"),
             // Minor edits
             col("is_minor")
                 .cast(DataType::UInt32)
@@ -75,7 +75,7 @@ pub fn compute(wiki: &str, base: &DataFrame, output_dir: &Path) -> Result<()> {
         .agg([
             col("revision_id").count().alias("edits"),
             col("revision_text_bytes_diff").sum().alias("net_bytes"),
-            col("event_user_id").n_unique().alias("editors"),
+            editor_identity_expr().n_unique().alias("editors"),
         ])
         .sort(["year_month", "user_type"], SortMultipleOptions::default())
         .collect()?;

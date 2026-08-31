@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 use tracing::debug;
 
-use super::{ChurnAccumulator, write_output};
+use super::{ChurnAccumulator, editor_identity_expr, ensure_editor_identity_inputs, write_output};
 
 pub(crate) fn normalize_period_key(year_month_key: i32, period_type: &str) -> Result<i32> {
     let year = year_month_key / 100;
@@ -112,6 +112,7 @@ fn churn_via_accumulator(
 /// Compute labor market metrics: participation, churn, cohort survival.
 pub fn compute(wiki: &str, base: &DataFrame, output_dir: &Path) -> Result<()> {
     debug!(wiki = wiki, "computing labor metrics");
+    let base = ensure_editor_identity_inputs(base)?;
 
     // --- 1. Monthly workforce stats ---
     let monthly = base
@@ -119,7 +120,7 @@ pub fn compute(wiki: &str, base: &DataFrame, output_dir: &Path) -> Result<()> {
         .lazy()
         .group_by([col("year_month"), col("page_namespace"), col("user_type")])
         .agg([
-            col("event_user_id").n_unique().alias("unique_editors"),
+            editor_identity_expr().n_unique().alias("unique_editors"),
             col("revision_id").count().alias("total_edits"),
             col("revision_text_bytes_diff").sum().alias("net_bytes"),
             col("is_reverted")
