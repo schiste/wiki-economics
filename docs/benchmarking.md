@@ -131,7 +131,9 @@ safe stale-artifact cleanup after acquiring the single-flight lock.
 
 Do not raise production concurrency from the one-worker default based on host
 CPU visibility. Toolforge containers can see CPUs that are not included in
-their cgroup quota. Phase 8 uses twelve isolated, publication-invisible jobs:
+their cgroup quota. A controlled two-thread qualification uses the first six
+publication-invisible jobs (the 1/1/1 and 2/2/1 rows for all three wikis). The
+complete optimization matrix uses all twelve jobs:
 
 | CPU quota | Polars/Rayon threads | Weekly workers |
 | ---: | ---: | ---: |
@@ -140,7 +142,7 @@ their cgroup quota. Phase 8 uses twelve isolated, publication-invisible jobs:
 | 4 | 3 | 1 |
 | 4 | 3 | 2 |
 
-Run every profile for nlwiki, ptwiki, and frwiki, one job at a time. The
+Run the selected scope for nlwiki, ptwiki, and frwiki, one job at a time. The
 on-demand definitions live in
 `deploy/toolforge/cpu-qualification-jobs.yaml`. Loading a definition starts
 it, so wait for a terminal state before loading the next one; overlapping runs
@@ -148,9 +150,10 @@ would contaminate both CPU and shared-NFS throughput evidence:
 
 As checked with `toolforge jobs quota` on 2026-08-26, wiki-economics currently
 has 16 aggregate CPUs but a 3-CPU per-job ceiling. The required 4-CPU cells
-must not be launched until that per-job limit is raised to at least 4. A
-3-CPU substitution is useful exploratory evidence but does not satisfy this
-matrix or permit a production concurrency change.
+must not be launched until that per-job limit is raised to at least 4. Until
+then, the six-cell scope can authorize at most the 2-CPU/2-thread profile. A
+3-CPU substitution is useful exploratory evidence but does not satisfy the
+complete matrix.
 
 ```sh
 toolforge jobs load --job wiki-econ-cpu-nl-c1-t1-w1 \
@@ -158,13 +161,15 @@ toolforge jobs load --job wiki-econ-cpu-nl-c1-t1-w1 \
 toolforge jobs show wiki-econ-cpu-nl-c1-t1-w1
 ```
 
-Repeat for the twelve names in the manifest. The wrapper reuses each wiki's
+Repeat for six names in the controlled two-thread scope or all twelve names in
+the complete matrix. The wrapper reuses each wiki's
 active immutable warehouse generation, produces no publication candidate, and
 removes isolated output and scratch on exit. Source downloads therefore remain
 serialized in production and are outside this compute-only matrix. Prefer the
 local dump mount for a later fetch/ingest-specific experiment.
 
-Pass the twelve retained receipt paths to the Rust evaluator:
+Pass either the six controlled two-thread receipts or all twelve retained
+receipt paths to the Rust evaluator:
 
 ```sh
 wiki-econ cpu-qualify \

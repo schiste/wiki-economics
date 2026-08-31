@@ -41,6 +41,7 @@ const REQUIRED_PROFILES: [CpuProfile; 4] = [
         weekly_workers: 2,
     },
 ];
+const TWO_THREAD_PROFILES: [CpuProfile; 2] = [REQUIRED_PROFILES[0], REQUIRED_PROFILES[1]];
 
 #[derive(Debug, Deserialize)]
 struct CapacityReceipt {
@@ -94,6 +95,7 @@ pub(crate) struct CpuQualificationReport {
     schema_version: u32,
     generated_at_unix: u64,
     complete: bool,
+    qualification_scope: String,
     deterministic: bool,
     telemetry_complete: bool,
     minimum_memory_headroom_percent: f64,
@@ -168,11 +170,13 @@ pub(crate) fn run(paths: &[PathBuf], report_path: &Path) -> Result<CpuQualificat
         );
     }
 
+    let required_profiles = qualification_profiles(&receipts);
     let required_keys = REQUIRED_WIKIS
         .into_iter()
         .flat_map(|wiki| {
-            REQUIRED_PROFILES
-                .into_iter()
+            required_profiles
+                .iter()
+                .copied()
                 .map(move |profile| (wiki.to_string(), profile))
         })
         .collect::<BTreeSet<_>>();
@@ -195,8 +199,9 @@ pub(crate) fn run(paths: &[PathBuf], report_path: &Path) -> Result<CpuQualificat
     let mut telemetry_complete = true;
     let mut minimum_headroom = 100.0_f64;
     for wiki in REQUIRED_WIKIS {
-        let wiki_receipts = REQUIRED_PROFILES
-            .into_iter()
+        let wiki_receipts = required_profiles
+            .iter()
+            .copied()
             .filter_map(|profile| receipts.get(&(wiki.to_string(), profile)))
             .collect::<Vec<_>>();
         let snapshots = wiki_receipts
@@ -325,8 +330,8 @@ pub(crate) fn run(paths: &[PathBuf], report_path: &Path) -> Result<CpuQualificat
     }
     let complete = actual_keys == required_keys;
     let mut profiles = Vec::new();
-    let baseline_total = total_wall(&cells, REQUIRED_PROFILES[0]);
-    for profile in REQUIRED_PROFILES {
+    let baseline_total = total_wall(&cells, required_profiles[0]);
+    for &profile in required_profiles {
         if let (Some(total_wall_ms), Some(baseline)) = (total_wall(&cells, profile), baseline_total)
         {
             let profile_cells = cells
@@ -377,6 +382,11 @@ pub(crate) fn run(paths: &[PathBuf], report_path: &Path) -> Result<CpuQualificat
         schema_version: REPORT_SCHEMA_VERSION,
         generated_at_unix: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
         complete,
+        qualification_scope: if required_profiles == TWO_THREAD_PROFILES.as_slice() {
+            "two_thread".to_string()
+        } else {
+            "full_matrix".to_string()
+        },
         deterministic,
         telemetry_complete,
         minimum_memory_headroom_percent: minimum_headroom,
@@ -394,6 +404,21 @@ pub(crate) fn run(paths: &[PathBuf], report_path: &Path) -> Result<CpuQualificat
         report_path.display()
     );
     Ok(report)
+}
+
+fn qualification_profiles(
+    receipts: &BTreeMap<(String, CpuProfile), CapacityReceipt>,
+) -> &'static [CpuProfile] {
+    let observed = receipts
+        .keys()
+        .map(|(_, profile)| *profile)
+        .collect::<BTreeSet<_>>();
+    let two_thread = TWO_THREAD_PROFILES.into_iter().collect::<BTreeSet<_>>();
+    if observed.is_subset(&two_thread) {
+        &TWO_THREAD_PROFILES
+    } else {
+        &REQUIRED_PROFILES
+    }
 }
 
 fn total_wall(cells: &[CellSummary], profile: CpuProfile) -> Option<u64> {
@@ -530,6 +555,27 @@ mod tests {
         assert!(report.promotion_eligible);
         assert_eq!(report.selected_profile, Some(REQUIRED_PROFILES[3]));
         assert!(report_path.is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn controlled_two_thread_matrix_can_qualify_without_four_cpu_quota() -> Result<()> {
+        let root = TestDir::new()?;
+        let paths = write_matrix(root.path(), false)?
+            .into_iter()
+            .filter(|path| {
+                let receipt: serde_json::Value =
+                    serde_json::from_slice(&fs::read(path).expect("capacity receipt"))
+                        .expect("JSON");
+                receipt["requested_cpu"]
+                    .as_u64()
+                    .is_some_and(|cpu| cpu <= 2)
+            })
+            .collect::<Vec<_>>();
+        let report = run(&paths, &root.path().join("two-thread.json"))?;
+        assert!(report.promotion_eligible);
+        assert_eq!(report.qualification_scope, "two_thread");
+        assert_eq!(report.selected_profile, Some(TWO_THREAD_PROFILES[1]));
         Ok(())
     }
 
