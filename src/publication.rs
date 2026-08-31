@@ -19,7 +19,7 @@ pub(crate) const READY_INDEX_SCHEMA_VERSION: u8 = 2;
 const PUBLICATION_CONTRACT_VERSION: &str =
     "ready-candidate-publication-v3-incremental-receipt-composition";
 pub const RECEIPT_FILE: &str = "publication-gate.json";
-const JSON_ARTIFACTS: [&str; 13] = [
+const JSON_ARTIFACTS: [&str; 14] = [
     crate::browser_data::INDEX_FILENAME,
     "defaults_business.json",
     "defaults_edit_variation.json",
@@ -27,6 +27,7 @@ const JSON_ARTIFACTS: [&str; 13] = [
     "defaults_inequality.json",
     "defaults_labor.json",
     "defaults_patrol.json",
+    "editor_identity_transitions.json",
     "meta_business.json",
     "meta_gdp.json",
     "meta_inequality.json",
