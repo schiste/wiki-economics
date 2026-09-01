@@ -624,6 +624,14 @@ trait Ops {
     ) -> Result<()> {
         Ok(())
     }
+    fn validate_completed_snapshot(
+        &self,
+        _wiki: &str,
+        _version: &str,
+        _data_dir: &Path,
+    ) -> Result<()> {
+        Ok(())
+    }
     fn fetch_wiki(&self, wiki: &str, version: &str, data_dir: &std::path::Path) -> Result<()>;
     fn fetch_patrol(&self, wiki: &str, data_dir: &std::path::Path) -> Result<()>;
     fn fetch_patrol_for_snapshot(
@@ -840,6 +848,15 @@ impl Ops for RealOps {
             snapshot_plan::SnapshotPlan::load_or_resolve(data_dir, wiki, version)?;
         }
         Ok(())
+    }
+
+    fn validate_completed_snapshot(
+        &self,
+        wiki: &str,
+        version: &str,
+        data_dir: &Path,
+    ) -> Result<()> {
+        fetch::validate_completed_snapshot(data_dir, wiki, version)
     }
 
     fn fetch_wiki(&self, wiki: &str, version: &str, data_dir: &std::path::Path) -> Result<()> {
@@ -1218,7 +1235,14 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
 
         Commands::Fetch { wikis, version } => {
             let version = match version {
-                Some(version) => version,
+                Some(version) => {
+                    for wiki in &wikis {
+                        run_timed_stage("snapshot_validate", Some(wiki), || {
+                            ops.validate_completed_snapshot(wiki, &version, &data_dir)
+                        })?;
+                    }
+                    version
+                }
                 None => run_timed_stage("snapshot_resolve", None, || {
                     ops.resolve_snapshot(&wikis, Utc::now(), &data_dir)
                 })?,
@@ -1266,7 +1290,12 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
                 .as_deref()
                 .context("candidate preparation requires --run-id")?;
             let version = match version {
-                Some(version) => version,
+                Some(version) => {
+                    run_timed_stage("snapshot_validate", Some(&wiki), || {
+                        ops.validate_completed_snapshot(&wiki, &version, &data_dir)
+                    })?;
+                    version
+                }
                 None => run_timed_stage("snapshot_resolve", Some(&wiki), || {
                     ops.resolve_snapshot(std::slice::from_ref(&wiki), Utc::now(), &data_dir)
                 })?,
@@ -1435,7 +1464,12 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
                 .context("wiki qualification requires --run-id")?;
             ops.ensure_qualification_wiki(&lifecycle, &wiki)?;
             let version = match version {
-                Some(version) => version,
+                Some(version) => {
+                    run_timed_stage("snapshot_validate", Some(&wiki), || {
+                        ops.validate_completed_snapshot(&wiki, &version, &data_dir)
+                    })?;
+                    version
+                }
                 None => run_timed_stage("snapshot_resolve", Some(&wiki), || {
                     ops.resolve_snapshot(std::slice::from_ref(&wiki), Utc::now(), &data_dir)
                 })?,

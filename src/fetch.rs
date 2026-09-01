@@ -838,6 +838,29 @@ pub fn resolve_latest_completed_snapshot(
     )
 }
 
+fn validate_completed_snapshot_with_transport<T: HttpTransport>(
+    transport: &T,
+    base_url: &str,
+    data_dir: &Path,
+    wiki: &str,
+    version: &str,
+) -> Result<()> {
+    anyhow::ensure!(
+        snapshot_wiki_is_complete_cached(transport, base_url, data_dir, wiki, version)?,
+        "requested snapshot {version} is not complete for {wiki}; omit --version to use the latest completed snapshot"
+    );
+    Ok(())
+}
+
+/// Validate and persist the immutable remote inventory for an exact snapshot.
+///
+/// Explicit snapshot pins are reproducibility boundaries, so they must fail
+/// closed instead of reaching the download stage with an incomplete plan.
+pub fn validate_completed_snapshot(data_dir: &Path, wiki: &str, version: &str) -> Result<()> {
+    let transport = build_transport()?;
+    validate_completed_snapshot_with_transport(&transport, BASE_URL, data_dir, wiki, version)
+}
+
 #[derive(Clone)]
 struct ReqwestTransport {
     client: reqwest::blocking::Client,
@@ -3145,6 +3168,26 @@ mod tests {
         assert_eq!(snapshot_max_lag_months(None)?, 2);
         assert_eq!(snapshot_max_lag_months(Some(OsStr::new("4")))?, 4);
         Ok(())
+    }
+
+    #[test]
+    fn exact_snapshot_validation_fails_before_download_with_actionable_guidance() {
+        let data_dir = TestDir::new().expect("validation fixture");
+        let transport = FakeTransport::with_head_outcomes([status_head(StatusCode::NOT_FOUND)]);
+
+        let error = validate_completed_snapshot_with_transport(
+            &transport,
+            "http://example.invalid",
+            data_dir.path(),
+            "simplewiki",
+            "2026-08",
+        )
+        .expect_err("an unavailable exact snapshot must fail closed");
+
+        assert!(error.to_string().contains("requested snapshot 2026-08"));
+        assert!(error.to_string().contains("omit --version"));
+        assert_eq!(transport.get_requests(), 0);
+        assert_eq!(transport.head_requests(), 1);
     }
 
     #[test]
