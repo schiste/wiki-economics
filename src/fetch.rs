@@ -3201,7 +3201,8 @@ mod tests {
             data_dir.path(),
             "simplewiki",
             "2026-08",
-        )?;
+        )
+        .expect("complete remote inventory should validate");
 
         let plan =
             SnapshotPlan::resolve_from_base("http://example.invalid", "simplewiki", "2026-08")?;
