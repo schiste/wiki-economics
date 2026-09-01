@@ -79,13 +79,14 @@
   cpu: "1"
 
 # Authenticated admin actions are written to an atomic NFS queue by the
-# 512 MiB webservice. This dedicated worker executes them with the same
-# production memory ceiling as scheduled preparation, so an operator can
-# never accidentally run a large ingest inside the web pod.
+# 512 MiB webservice. This dispatcher acquires the production 6 GiB ceiling
+# only while checking/executing one request, so an idle admin queue does not
+# permanently reserve the publisher's memory quota. Its staggered ten-minute
+# cadence avoids the fixed fleet and publisher start minutes.
 - name: wiki-econ-admin-dispatcher
   image: tool-wiki-economics/tool-wiki-economics:latest
-  command: deploy/toolforge/run-admin-dispatcher.sh
-  continuous: true
+  command: deploy/toolforge/run-admin-dispatcher.sh --once
+  schedule: "3,13,23,33,43,53 * * * *"
   filelog: true
   mount: all
   mem: 6Gi

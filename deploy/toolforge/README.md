@@ -76,7 +76,7 @@ and higher resource envelope are being qualified.
   therefore come from different commits; each is verified independently and
   all three identities are recorded in refresh run provenance.
 - `jobs.yaml` — one Rust fleet controller, two fixed small-wiki workers, one
-  fixed medium/large worker, a dedicated continuous 6 GiB admin dispatcher,
+  fixed medium/large worker, a staggered on-demand 6 GiB admin dispatcher,
   and the short `wiki-econ-publish-ready` job, plus
   legacy on-demand recovery jobs. The controller represents the sixteen
   scheduled wikis declared by the lifecycle registry: afwiki, arwiki, arzwiki,
@@ -89,7 +89,8 @@ and higher resource envelope are being qualified.
   `wiki-econ-admin` serves `/admin*` and the built static site as a separate
   buildservice webservice. Authenticated actions are persisted under
   `output/_admin/operations`; `wiki-econ-admin-dispatcher` claims and executes
-  them outside the 512 MiB web pod. The lifecycle registry is likewise stored
+  one outside the 512 MiB web pod every ten minutes. It exits immediately when
+  the queue is empty, leaving memory available to publication. The lifecycle registry is likewise stored
   on NFS, so the admin can register a supported wiki as hidden qualification,
   manual, or scheduled without rebuilding the image.
   The public root is a lightweight portfolio homepage built entirely from

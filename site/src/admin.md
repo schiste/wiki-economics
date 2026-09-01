@@ -519,7 +519,7 @@ display(html`<div class="admin-command-header">
   </div>
   <dl class="admin-command-facts">
     <div><dt>API</dt><dd class=${apiStatus ? "ok" : "bad"}>${apiStatus ? "Connected" : "Offline"}</dd></div>
-    <div><dt>Operator worker</dt><dd>${adminOperations.executionMode === "queue" ? "Dedicated 6 GiB" : "Local direct"} · ${adminOperations.counts?.queued || 0} queued</dd></div>
+    <div><dt>Operator worker</dt><dd>${adminOperations.executionMode === "queue" ? "Scheduled 6 GiB" : "Local direct"} · ${adminOperations.counts?.queued || 0} queued</dd></div>
     <div><dt>Coverage</dt><dd>${publishedWikis.length} published · ${refreshWikis.length} scheduled</dd></div>
     <div><dt>Inventory scan</dt><dd>${formatRefreshTimestamp(currentManifest.generated_at)}</dd></div>
   </dl>
@@ -930,7 +930,7 @@ function stageAction(stageKey) {
 
 function stateExplanation(name, wiki, state, lifecycle, direct, fleetWork) {
   if (!lifecycle) return `${name} is supported by the Rust source resolver, but has no lifecycle policy. Processing is intentionally blocked until an operator registers it.`
-  if (state === "queued") return `The request is durable and waiting for the ${direct?.resourceClass || lifecycle.fleet_resource_class || "assigned"} worker. It is safe to close this page.`
+  if (state === "queued") return `The request is durable and waiting for the next ${direct?.resourceClass || lifecycle.fleet_resource_class || "assigned"} worker dispatch (at most ten minutes). It is safe to close this page.`
   if (state === "running") return `A worker owns this operation. The heartbeat and current stage below distinguish healthy progress from a stalled process.`
   if (state === "stalled") return `The worker lease exists but its heartbeat is overdue. Recover the fleet lease before submitting duplicate work.`
   if (state === "quarantined") return `Automatic retries were exhausted. Review the final log excerpt, correct the cause, then explicitly retry.`

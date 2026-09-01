@@ -20,6 +20,14 @@ test("fleet capacity uses a fixed controller and worker pool", () => {
     "wiki-econ-fleet-medium",
   ]);
   assert.doesNotMatch(manifest, /^- name: wiki-econ-prepare-/m);
+  assert.match(
+    manifest,
+    /- name: wiki-econ-admin-dispatcher[\s\S]*?command: deploy\/toolforge\/run-admin-dispatcher\.sh --once[\s\S]*?schedule: "3,13,23,33,43,53 \* \* \* \*"/,
+  );
+  assert.doesNotMatch(
+    manifest,
+    /- name: wiki-econ-admin-dispatcher[\s\S]*?continuous: true/,
+  );
 });
 
 test("normal job loading allowlists schedules and removes one-off definitions", () => {
