@@ -441,6 +441,8 @@ impl CrossSnapshotCache {
     }
 }
 
+/// Open the cross-snapshot cache only when a validated production
+/// qualification authorizes this exact wiki and snapshot generation.
 pub(crate) fn production_cache(
     data_dir: &Path,
     wiki: &str,

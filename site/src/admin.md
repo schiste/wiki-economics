@@ -6,7 +6,7 @@ title: Admin
 
 <div class="page-intro">
 
-See what is running, what needs attention, and what is ready to publish. Every wiki follows the same six-stage path from source discovery to published site data.
+See what is running, what needs attention, and what is ready to publish. Durable operator, fleet, snapshot, and publication evidence is reconciled into the same six-stage path for every wiki.
 
 </div>
 

@@ -44,6 +44,8 @@ const FLEET_QUEUE_DIR = process.env.WIKI_ECON_FLEET_QUEUE_DIR
 const ADMIN_STATE_DIR = path.join(OUTPUT_DIR, "_admin");
 const ADMIN_CURRENT_JOB_PATH = path.join(ADMIN_STATE_DIR, "current-job.json");
 const ADMIN_JOB_HISTORY_PATH = path.join(ADMIN_STATE_DIR, "job-history.json");
+// These ledgers live on Toolforge NFS, so webservice pod replacement cannot
+// turn an interrupted operator action into an apparently idle pipeline.
 const DEFAULT_RUNNER = {
   program: "cargo",
   args: ["run", "--release", "--"],
