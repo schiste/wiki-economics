@@ -5,7 +5,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const {after, test} = require("node:test");
-const {buildManifest, determinismContract, generationSummary, parquetRowCounter, publicationLicensing, releaseProvenance, safeReceiptOutput} = require("./manifest.json.cjs");
+const {buildManifest, determinismContract, generationSummary, parquetRowCounter, publicationLicensing, releaseProvenance, repositoryRootFromEnvironment, safeReceiptOutput} = require("./manifest.json.cjs");
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-manifest-"));
 const repositoryRoot = path.resolve(__dirname, "../..");
@@ -21,6 +21,23 @@ const dashboardJson = [
   "meta_inequality", "meta_labor", "meta_patrol",
 ];
 const browserMetrics = metrics.filter((metric) => metric !== "page_weekly_edits");
+
+test("detached site-source generators use the explicit runtime repository root", () => {
+  const detached = path.join(root, "attested-site-source", "site", "data-build");
+  fs.mkdirSync(detached, {recursive: true});
+  assert.equal(
+    repositoryRootFromEnvironment({WIKI_ECON_ROOT: repositoryRoot}, detached),
+    repositoryRoot,
+  );
+  assert.throws(
+    () => repositoryRootFromEnvironment({WIKI_ECON_ROOT: path.join(root, "missing-root")}, detached),
+    /configured repository root is invalid/,
+  );
+  assert.throws(
+    () => repositoryRootFromEnvironment({}, detached),
+    /unable to locate repository root/,
+  );
+});
 
 function lifecycle() {
   return {

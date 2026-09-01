@@ -27,6 +27,16 @@ function findRoot(start = __dirname) {
   throw new Error("unable to locate repository root");
 }
 
+function repositoryRootFromEnvironment(environment = process.env, start = __dirname) {
+  const configured = environment.WIKI_ECON_ROOT;
+  if (!configured) return findRoot(start);
+  const root = path.resolve(configured);
+  if (!fs.statSync(path.join(root, "Cargo.toml"), {throwIfNoEntry: false})?.isFile()) {
+    throw new Error(`configured repository root is invalid: ${root}`);
+  }
+  return root;
+}
+
 function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return null; }
 }
@@ -501,14 +511,16 @@ function discoverWikis(dataDir, outputDir, lifecycle) {
 }
 
 async function buildManifest(options = {}) {
-  const root = options.root || findRoot();
-  const repositoryRoot = options.repositoryRoot || findRoot();
+  const environment = options.environment || process.env;
+  const repositoryRoot = options.repositoryRoot || repositoryRootFromEnvironment(environment);
+  const root = options.root || repositoryRoot;
   const dataDir = options.dataDir || process.env.WIKI_ECON_DATA_DIR || path.join(root, "data");
   const outputDir = options.outputDir || process.env.WIKI_ECON_OUTPUT_DIR || path.join(root, "output");
   const lifecycleFile = options.lifecycleFile || process.env.WIKI_ECON_WIKI_LIFECYCLE_FILE || path.join(root, "config", "wiki-lifecycle.json");
   const lifecycle = options.lifecycle || readJson(lifecycleFile);
-  const licensing = options.licensing || publicationLicensing(options.licensingFile);
-  const environment = options.environment || process.env;
+  const licensing = options.licensing || publicationLicensing(
+    options.licensingFile || path.join(repositoryRoot, "config", "publication-licensing.json"),
+  );
   const generatedAt = options.generatedAt || new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
   if (!lifecycle?.publication_contract?.datasets || !lifecycle?.wikis) throw new Error(`invalid wiki lifecycle registry: ${lifecycleFile}`);
   const rowCounter = options.rowCounter || parquetRowCounter();
@@ -625,4 +637,4 @@ if (require.main === module) {
 }
 
 module.exports = {BROWSER_INDEX, browserDataSummary, buildManifest, datasetApplies, determinismContract, discoverWikis, generationSummary, humanBytes, parquetRowCounter,
-  patrolSummary, publicationLicensing, releaseProvenance, repositoryRuntimeProvenance, safeReceiptOutput};
+  patrolSummary, publicationLicensing, releaseProvenance, repositoryRootFromEnvironment, repositoryRuntimeProvenance, safeReceiptOutput};
