@@ -7,6 +7,7 @@ const http = require("http");
 const {spawn} = require("child_process");
 const path = require("path");
 const fs = require("fs");
+const crypto = require("crypto");
 const {
   buildAuthorizeUrl,
   escapeHtml,
@@ -21,8 +22,8 @@ const {
 } = require("./admin-auth.cjs");
 const {
   lifecyclePath,
-  loadWikiLifecycle,
   resolveRefreshWikis,
+  validateWikiLifecycle,
   wikisWithState,
 } = require("../scripts/wiki-lifecycle.cjs");
 const {evaluateFreshness} = require("./freshness.cjs");
@@ -44,6 +45,13 @@ const FLEET_QUEUE_DIR = process.env.WIKI_ECON_FLEET_QUEUE_DIR
 const ADMIN_STATE_DIR = path.join(OUTPUT_DIR, "_admin");
 const ADMIN_CURRENT_JOB_PATH = path.join(ADMIN_STATE_DIR, "current-job.json");
 const ADMIN_JOB_HISTORY_PATH = path.join(ADMIN_STATE_DIR, "job-history.json");
+const ADMIN_LIFECYCLE_HISTORY_PATH = path.join(ADMIN_STATE_DIR, "lifecycle-history.json");
+const ADMIN_OPERATION_DIR = process.env.WIKI_ECON_ADMIN_OPERATION_DIR
+  ? resolveConfiguredPath("WIKI_ECON_ADMIN_OPERATION_DIR", path.join("output", "_admin", "operations"))
+  : path.join(ADMIN_STATE_DIR, "operations");
+const ADMIN_EXECUTION_MODE = process.env.WIKI_ECON_ADMIN_EXECUTION_MODE
+  || (RUNTIME_ENV === "production" ? "queue" : "direct");
+const ADMIN_OPERATION_STALE_MS = Number.parseInt(process.env.WIKI_ECON_ADMIN_OPERATION_STALE_SECS || "600", 10) * 1_000;
 // These ledgers live on Toolforge NFS, so webservice pod replacement cannot
 // turn an interrupted operator action into an apparently idle pipeline.
 const DEFAULT_RUNNER = {
@@ -77,9 +85,10 @@ const ALLOWED_ORIGINS = resolveAllowedOrigins();
 // schedule is sourced from tool-wide config, not confirmed against Toolforge.
 const REFRESH_SCHEDULE = process.env.WIKI_ECON_REFRESH_SCHEDULE || null;
 const WIKI_LIFECYCLE_PATH = lifecyclePath(ROOT);
-const WIKI_LIFECYCLE = loadWikiLifecycle(ROOT);
-const REFRESH_WIKIS = resolveRefreshWikis(WIKI_LIFECYCLE);
-const PUBLISHED_WIKIS = wikisWithState(WIKI_LIFECYCLE, "publication", "published");
+const BASE_WIKI_LIFECYCLE_PATH = path.join(ROOT, "config", "wiki-lifecycle.json");
+let WIKI_LIFECYCLE = loadOrInitializeWikiLifecycle();
+let REFRESH_WIKIS = resolveRefreshWikis(WIKI_LIFECYCLE);
+let PUBLISHED_WIKIS = wikisWithState(WIKI_LIFECYCLE, "publication", "published");
 
 let currentJob = null;
 let jobLog = [];
@@ -109,6 +118,11 @@ if (!ADMIN_ENABLED) {
 
 if (RUNTIME_ENV === "production" && !AUTH_ENABLED) {
   console.error("Refusing to run the admin server in production without authentication. Set WIKI_ECON_ADMIN_AUTH_MODE=mediawiki.");
+  process.exit(1);
+}
+
+if (!new Set(["direct", "queue"]).has(ADMIN_EXECUTION_MODE)) {
+  console.error(`Unsupported WIKI_ECON_ADMIN_EXECUTION_MODE: ${ADMIN_EXECUTION_MODE}. Expected "direct" or "queue".`);
   process.exit(1);
 }
 
@@ -144,6 +158,26 @@ function resolveConfiguredPath(envVar, fallback) {
   const value = process.env[envVar];
   if (!value) return path.resolve(ROOT, fallback);
   return path.isAbsolute(value) ? value : path.resolve(ROOT, value);
+}
+
+function loadOrInitializeWikiLifecycle() {
+  if (!fs.existsSync(WIKI_LIFECYCLE_PATH)) {
+    const base = JSON.parse(fs.readFileSync(BASE_WIKI_LIFECYCLE_PATH, "utf8"));
+    validateWikiLifecycle(base, BASE_WIKI_LIFECYCLE_PATH);
+    atomicWriteJson(WIKI_LIFECYCLE_PATH, base);
+  }
+  return readWikiLifecycleFile();
+}
+
+function readWikiLifecycleFile() {
+  let registry;
+  try {
+    registry = JSON.parse(fs.readFileSync(WIKI_LIFECYCLE_PATH, "utf8"));
+  } catch (error) {
+    throw new Error(`Unable to read wiki lifecycle registry ${WIKI_LIFECYCLE_PATH}: ${error.message}`);
+  }
+  validateWikiLifecycle(registry, WIKI_LIFECYCLE_PATH);
+  return registry;
 }
 
 function normalizeConfiguredOrigin(value) {
@@ -695,6 +729,267 @@ function atomicWriteJson(filePath, value) {
   }
 }
 
+function reloadWikiLifecycle() {
+  WIKI_LIFECYCLE = readWikiLifecycleFile();
+  REFRESH_WIKIS = resolveRefreshWikis(WIKI_LIFECYCLE);
+  PUBLISHED_WIKIS = wikisWithState(WIKI_LIFECYCLE, "publication", "published");
+  return WIKI_LIFECYCLE;
+}
+
+function defaultRetentionPolicy() {
+  return {
+    source_recoverability: "redownloadable",
+    history_input: "purge_after_ready",
+    patrol_source: "purge_after_ready",
+    computed_rollback_generations: 1,
+  };
+}
+
+function registrationLifecycle(mode, resourceClass, operator) {
+  const provenance = `toolforge-admin:${operator || "local-operator"}`;
+  const base = {
+    provenance,
+    retention: defaultRetentionPolicy(),
+  };
+  if (mode === "qualification") {
+    return {
+      ...base,
+      publication: "hidden",
+      refresh: "qualification",
+      fleet_resource_class: resourceClass || "medium_large",
+    };
+  }
+  if (mode === "manual") {
+    return {
+      ...base,
+      publication: "published",
+      refresh: "manual",
+      fleet_resource_class: resourceClass || "medium_large",
+    };
+  }
+  if (mode === "scheduled") {
+    return {
+      ...base,
+      publication: "published",
+      refresh: "scheduled",
+      freshness_sla_days: 10,
+      fleet_resource_class: resourceClass || "medium_large",
+    };
+  }
+  throw new Error(`Unsupported lifecycle mode ${mode}`);
+}
+
+function updateExplicitDatasetCoverage(registry, wiki, published) {
+  for (const contract of Object.values(registry.publication_contract?.datasets || {})) {
+    if (!Array.isArray(contract.wikis)) continue;
+    const covered = new Set(contract.wikis);
+    if (published) covered.add(wiki);
+    else covered.delete(wiki);
+    contract.wikis = [...covered].sort();
+  }
+}
+
+function recordLifecycleChange(change) {
+  const current = readJsonFile(ADMIN_LIFECYCLE_HISTORY_PATH);
+  const changes = current?.schemaVersion === 1 && Array.isArray(current.changes)
+    ? current.changes
+    : [];
+  atomicWriteJson(ADMIN_LIFECYCLE_HISTORY_PATH, {
+    schemaVersion: 1,
+    generatedAt: new Date().toISOString(),
+    changes: [change, ...changes].slice(0, ADMIN_JOB_HISTORY_LIMIT),
+  });
+}
+
+function registerWikiLifecycle({ wiki, mode, resourceClass, operator }) {
+  const supported = new Set(loadSupportedWikipedias());
+  if (!supported.has(wiki)) throw new Error(`${wiki} is not a supported Wikimedia history project`);
+  if (!new Set(["qualification", "manual", "scheduled"]).has(mode)) {
+    throw new Error("Lifecycle mode must be qualification, manual, or scheduled");
+  }
+  if (!new Set(["small", "medium_large", "isolated"]).has(resourceClass)) {
+    throw new Error("Resource class must be small, medium_large, or isolated");
+  }
+
+  const registry = structuredClone(reloadWikiLifecycle());
+  const previous = registry.wikis[wiki] ? structuredClone(registry.wikis[wiki]) : null;
+  registry.wikis[wiki] = registrationLifecycle(mode, resourceClass, operator);
+  updateExplicitDatasetCoverage(registry, wiki, mode !== "qualification");
+  validateWikiLifecycle(registry, WIKI_LIFECYCLE_PATH);
+  atomicWriteJson(WIKI_LIFECYCLE_PATH, registry);
+  reloadWikiLifecycle();
+  const updatedAt = new Date().toISOString();
+  recordLifecycleChange({
+    wiki,
+    mode,
+    resourceClass,
+    operator: operator || "local-operator",
+    updatedAt,
+    previous,
+    current: registry.wikis[wiki],
+  });
+  return { wiki, lifecycle: registry.wikis[wiki], previous, updatedAt };
+}
+
+function operationDirectories() {
+  const directories = {
+    queued: path.join(ADMIN_OPERATION_DIR, "queued"),
+    running: path.join(ADMIN_OPERATION_DIR, "running"),
+    history: path.join(ADMIN_OPERATION_DIR, "history"),
+    logs: path.join(ADMIN_OPERATION_DIR, "logs"),
+  };
+  for (const directory of Object.values(directories)) fs.mkdirSync(directory, { recursive: true });
+  return directories;
+}
+
+function operationLogTail(logPath, maxBytes = 64 * 1024) {
+  if (!logPath) return [];
+  try {
+    const fd = fs.openSync(logPath, "r");
+    try {
+      const size = fs.fstatSync(fd).size;
+      const start = Math.max(0, size - maxBytes);
+      const buffer = Buffer.alloc(size - start);
+      fs.readSync(fd, buffer, 0, buffer.length, start);
+      return [buffer.toString("utf8")];
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return [];
+  }
+}
+
+function operationEntries(directory, limit = ADMIN_JOB_HISTORY_LIMIT) {
+  return safeReadDir(directory)
+    .filter((name) => name.endsWith(".json"))
+    .map((name) => readJsonFile(path.join(directory, name)))
+    .filter((entry) => entry?.schemaVersion === 1)
+    .map((entry) => {
+      const heartbeatAge = Date.now() - Date.parse(entry.heartbeatAt || entry.updatedAt || entry.startedAt || 0);
+      return ["running", "cancelling"].includes(entry.state)
+        && Number.isFinite(heartbeatAge) && heartbeatAge > ADMIN_OPERATION_STALE_MS
+        ? {...entry, originalState: entry.state, state: "stalled", heartbeatAgeMs: heartbeatAge}
+        : entry;
+    })
+    .sort((left, right) => Date.parse(right.updatedAt || right.requestedAt || 0)
+      - Date.parse(left.updatedAt || left.requestedAt || 0))
+    .slice(0, limit)
+    .map((entry) => ({...entry, log: operationLogTail(entry.logPath)}));
+}
+
+function recoverStaleAdminOperations() {
+  const directories = operationDirectories();
+  const recovered = [];
+  const cancelled = [];
+  const exhausted = [];
+  for (const name of safeReadDir(directories.running).filter((entry) => entry.endsWith(".json")).sort()) {
+    const runningPath = path.join(directories.running, name);
+    const request = readJsonFile(runningPath);
+    const heartbeatAge = Date.now() - Date.parse(request?.heartbeatAt || request?.updatedAt || request?.startedAt || 0);
+    if (request?.schemaVersion !== 1 || !Number.isFinite(heartbeatAge) || heartbeatAge <= ADMIN_OPERATION_STALE_MS) continue;
+    const now = new Date().toISOString();
+    if (request.cancelRequested) {
+      atomicWriteJson(path.join(directories.history, `${Date.now()}-${request.requestId}.json`), {
+        ...request, state: "cancelled", exitCode: 130, finishedAt: now, updatedAt: now,
+        recoveryReason: `heartbeat stale for ${Math.round(heartbeatAge / 1_000)} seconds`,
+      });
+      fs.unlinkSync(runningPath);
+      cancelled.push(request.requestId);
+      continue;
+    }
+    if (Number(request.retryCount || 0) >= 2) {
+      atomicWriteJson(path.join(directories.history, `${Date.now()}-${request.requestId}.json`), {
+        ...request, state: "failed", exitCode: 1, finishedAt: now, updatedAt: now,
+        error: "Admin operation exceeded its stale-heartbeat recovery limit",
+        recoveryReason: `heartbeat stale for ${Math.round(heartbeatAge / 1_000)} seconds`,
+      });
+      fs.unlinkSync(runningPath);
+      exhausted.push(request.requestId);
+      continue;
+    }
+    const queuedPath = path.join(directories.queued, name);
+    if (fs.existsSync(queuedPath)) throw new Error(`Cannot recover ${request.requestId}: queued request already exists`);
+    fs.renameSync(runningPath, queuedPath);
+    atomicWriteJson(queuedPath, {
+      ...request,
+      state: "queued",
+      retryCount: Number(request.retryCount || 0) + 1,
+      recoveredAt: now,
+      updatedAt: now,
+      recoveryReason: `heartbeat stale for ${Math.round(heartbeatAge / 1_000)} seconds`,
+    });
+    recovered.push(request.requestId);
+  }
+  return {recovered, cancelled, exhausted};
+}
+
+function readAdminOperations() {
+  const directories = operationDirectories();
+  const queued = operationEntries(directories.queued);
+  const running = operationEntries(directories.running);
+  const recent = operationEntries(directories.history);
+  return {
+    executionMode: ADMIN_EXECUTION_MODE,
+    counts: {queued: queued.length, running: running.length},
+    queued,
+    running,
+    recent,
+  };
+}
+
+function queueAdminOperation({ action, wiki, version, requestedBy }) {
+  const directories = operationDirectories();
+  const requestId = adminRunId(action, wiki);
+  const requestedAt = new Date().toISOString();
+  const request = {
+    schemaVersion: 1,
+    requestId,
+    runId: requestId,
+    action,
+    wiki: wiki || null,
+    version: version || null,
+    lifecyclePath: WIKI_LIFECYCLE_PATH,
+    requestedBy: requestedBy || "local-operator",
+    requestedAt,
+    updatedAt: requestedAt,
+    state: "queued",
+    cancelRequested: false,
+    logPath: path.join(directories.logs, `${requestId}.log`),
+  };
+  atomicWriteJson(path.join(directories.queued, `${requestId}.json`), request);
+  return request;
+}
+
+function cancelAdminOperation({requestId, wiki}) {
+  const directories = operationDirectories();
+  const queued = operationEntries(directories.queued, Number.MAX_SAFE_INTEGER);
+  const running = operationEntries(directories.running, Number.MAX_SAFE_INTEGER);
+  const matches = (entry) => requestId ? entry.requestId === requestId : wiki && entry.wiki === wiki;
+  const queuedRequest = queued.find(matches);
+  if (queuedRequest) {
+    const source = path.join(directories.queued, `${queuedRequest.requestId}.json`);
+    const cancelled = {
+      ...queuedRequest,
+      state: "cancelled",
+      cancelRequested: true,
+      finishedAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    };
+    atomicWriteJson(path.join(directories.history, `${Date.now()}-${queuedRequest.requestId}.json`), cancelled);
+    fs.unlinkSync(source);
+    return cancelled;
+  }
+  const runningRequest = running.find(matches);
+  if (runningRequest) {
+    const file = path.join(directories.running, `${runningRequest.requestId}.json`);
+    const cancelling = {...runningRequest, cancelRequested: true, state: "cancelling", updatedAt: new Date().toISOString()};
+    atomicWriteJson(file, cancelling);
+    return cancelling;
+  }
+  return null;
+}
+
 function persistedLog(log) {
   const text = (log || []).join("");
   return text.length <= PERSISTED_LOG_LIMIT_BYTES
@@ -1031,7 +1326,7 @@ function suggestedSnapshotVersion(now = new Date()) {
 function adminRunId(action, wiki, now = new Date()) {
   const timestamp = now.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
   const subject = wiki || "global";
-  return `admin-${timestamp}-${subject}-${action.replace(/[^a-z0-9_-]/gi, "-")}`;
+  return `admin-${timestamp}-${subject}-${action.replace(/[^a-z0-9_-]/gi, "-")}-${crypto.randomUUID().slice(0, 8)}`;
 }
 
 function normalizeVersion(value) {
@@ -1343,8 +1638,10 @@ function wikiLifecycleStatus(now = Date.now()) {
 }
 
 function buildStatusPayload(req, session) {
+  reloadWikiLifecycle();
   const progress = getProgress();
   const scheduledRefresh = readRefreshStatus();
+  const adminOperations = readAdminOperations();
   const effectiveJob = currentJob
     ? {
         runId: currentJob.runId,
@@ -1381,6 +1678,7 @@ function buildStatusPayload(req, session) {
     adminEnabled: ADMIN_ENABLED,
     adminPort: PORT,
     environment: RUNTIME_ENV,
+    executionMode: ADMIN_EXECUTION_MODE,
     enabledWikis: REFRESH_WIKIS,
     refreshWikis: REFRESH_WIKIS,
     publishedWikis: PUBLISHED_WIKIS,
@@ -1395,9 +1693,13 @@ function buildStatusPayload(req, session) {
     }),
     fleet: readFleetStatus(),
     snapshotPlans: readSnapshotPlans(),
+    adminOperations,
     adminRuns: {
-      active: currentJob ? serializableRunningJob() : null,
-      recent: persistedHistoryJobs(),
+      active: currentJob ? serializableRunningJob() : (adminOperations.running[0] || null),
+      recent: [...adminOperations.recent, ...persistedHistoryJobs()]
+        .sort((left, right) => Date.parse(right.finishedAt || right.updatedAt || 0)
+          - Date.parse(left.finishedAt || left.updatedAt || 0))
+        .slice(0, ADMIN_JOB_HISTORY_LIMIT),
     },
     auth: authStatus(session, req),
   };
@@ -1419,6 +1721,7 @@ async function handleRequest(req, res) {
   const session = AUTH_ENABLED ? readSession(req) : null;
 
   if (req.method === "GET" && url.pathname === FRESHNESS_STATUS_PATH) {
+    reloadWikiLifecycle();
     writeJson(res, 200, evaluateFreshness({
       ...readRefreshStatus(),
       lifecycle: WIKI_LIFECYCLE,
@@ -1507,6 +1810,57 @@ async function handleRequest(req, res) {
       }
       const action = apiPath;
 
+      const wiki = (params.wiki || "").replace(/[^a-z0-9_]/gi, "");
+      const version = normalizeVersion(params.version);
+      if (version && !isValidVersion(version)) {
+        writeJson(res, 400, { error: "Invalid version. Use YYYY-MM." });
+        return;
+      }
+      const operator = session?.username || "local-operator";
+
+      if (action === "register-wiki") {
+        const operations = readAdminOperations();
+        if (currentJob || operations.running.length > 0) {
+          writeJson(res, 409, {error: "Lifecycle changes are blocked while an operator job is running"});
+          return;
+        }
+        if (!wiki) {
+          writeJson(res, 400, {error: "register-wiki requires a wiki parameter"});
+          return;
+        }
+        try {
+          const registration = registerWikiLifecycle({
+            wiki,
+            mode: String(params.mode || "qualification"),
+            resourceClass: String(params.resourceClass || "medium_large"),
+            operator,
+          });
+          writeJson(res, 201, {registered: true, ...registration});
+        } catch (error) {
+          writeJson(res, 400, {error: error.message});
+        }
+        return;
+      }
+
+      if (action === "cancel" && ADMIN_EXECUTION_MODE === "queue") {
+        const cancelled = cancelAdminOperation({requestId: params.requestId || null, wiki: wiki || null});
+        if (!cancelled) {
+          writeJson(res, 409, {error: "No job is currently running"});
+          return;
+        }
+        writeJson(res, 200, {started: false, cancelled: cancelled.state === "cancelled", operation: cancelled});
+        return;
+      }
+
+      if (action === "recover-admin" && ADMIN_EXECUTION_MODE === "queue") {
+        try {
+          writeJson(res, 200, {started: false, recovered: true, ...recoverStaleAdminOperations()});
+        } catch (error) {
+          writeJson(res, 409, {error: error.message});
+        }
+        return;
+      }
+
       if (currentJob) {
         if (action === "cancel") {
           currentJob.cancelRequested = true;
@@ -1520,20 +1874,49 @@ async function handleRequest(req, res) {
         return;
       }
 
-      const wiki = (params.wiki || "").replace(/[^a-z0-9_]/gi, "");
-      const version = normalizeVersion(params.version);
-      if (version && !isValidVersion(version)) {
-        writeJson(res, 400, { error: "Invalid version. Use YYYY-MM." });
-        return;
-      }
       const runId = adminRunId(action, wiki);
 
-      const wikiActions = new Set(["fetch", "ingest", "compute", "run", "patrol-fetch", "patrol-compute"]);
+      reloadWikiLifecycle();
+      const wikiActions = new Set([
+        "fetch", "ingest", "compute", "run", "qualify",
+        "patrol-fetch", "patrol-compute", "patrol-rebuild",
+      ]);
       if (wikiActions.has(action) && wiki && !WIKI_LIFECYCLE.wikis[wiki]) {
         writeJson(res, 409, {
           error: `${wiki} is not registered in the wiki lifecycle; add it as a qualification or managed project before processing`,
           wiki,
           lifecycleRequired: true,
+        });
+        return;
+      }
+
+      const globalActions = new Set(["merge", "publish", "site", "fleet-recover"]);
+      if (wikiActions.has(action) && !wiki) {
+        writeJson(res, 400, {error: `${action} requires a wiki parameter`});
+        return;
+      }
+      if (action === "qualify") {
+        const lifecycle = WIKI_LIFECYCLE.wikis[wiki];
+        if (lifecycle?.publication !== "hidden" || lifecycle?.refresh !== "qualification") {
+          writeJson(res, 409, {error: `${wiki} must be registered as hidden/qualification before qualification`});
+          return;
+        }
+      }
+      if (action === "run") {
+        const lifecycle = WIKI_LIFECYCLE.wikis[wiki];
+        if (lifecycle?.publication !== "published" || !new Set(["manual", "scheduled"]).has(lifecycle?.refresh)) {
+          writeJson(res, 409, {error: `${wiki} must be registered as a manual or scheduled published project before preparation`});
+          return;
+        }
+      }
+
+      if (ADMIN_EXECUTION_MODE === "queue" && (wikiActions.has(action) || globalActions.has(action))) {
+        const request = queueAdminOperation({action, wiki, version, requestedBy: operator});
+        writeJson(res, 202, {
+          started: false,
+          queued: true,
+          requestId: request.requestId,
+          operation: request,
         });
         return;
       }
@@ -1602,11 +1985,49 @@ async function handleRequest(req, res) {
               }
             : null;
           break;
+        case "qualify":
+          commandSpec = wiki
+            ? {
+                program: resolveRunner().program,
+                args: [
+                  ...resolveRunner().args,
+                  "--data-dir", DATA_DIR,
+                  "--output-dir", OUTPUT_DIR,
+                  "--run-id", runId,
+                  "qualify-wiki", wiki,
+                  ...(version ? ["--version", version] : []),
+                  "--lifecycle", WIKI_LIFECYCLE_PATH,
+                ],
+                label: `${resolveRunner().label} --data-dir ${DATA_DIR} --output-dir ${OUTPUT_DIR} --run-id ${runId} qualify-wiki ${wiki}${version ? ` --version ${version}` : ""} --lifecycle ${WIKI_LIFECYCLE_PATH}`,
+              }
+            : null;
+          break;
         case "merge":
           commandSpec = {
             program: resolveRunner().program,
             args: [...resolveRunner().args, "--data-dir", DATA_DIR, "--output-dir", OUTPUT_DIR, "--run-id", runId, "merge"],
             label: `${resolveRunner().label} --data-dir ${DATA_DIR} --output-dir ${OUTPUT_DIR} --run-id ${runId} merge`,
+          };
+          break;
+        case "publish":
+          commandSpec = {
+            program: "bash",
+            args: [path.join(ROOT, "deploy", "toolforge", "run-publish-ready.sh")],
+            label: "deploy/toolforge/run-publish-ready.sh",
+          };
+          break;
+        case "site":
+          commandSpec = {
+            program: "bash",
+            args: [path.join(ROOT, "deploy", "toolforge", "run-refresh-site.sh")],
+            label: "deploy/toolforge/run-refresh-site.sh",
+          };
+          break;
+        case "fleet-recover":
+          commandSpec = {
+            program: resolveRunner().program,
+            args: [...resolveRunner().args, "fleet-recover", "--queue-dir", FLEET_QUEUE_DIR],
+            label: `${resolveRunner().label} fleet-recover --queue-dir ${FLEET_QUEUE_DIR}`,
           };
           break;
         case "patrol-fetch":
@@ -1619,11 +2040,19 @@ async function handleRequest(req, res) {
             : null;
           break;
         case "patrol-compute":
+        case "patrol-rebuild":
           commandSpec = wiki
             ? {
                 program: resolveRunner().program,
-                args: [...resolveRunner().args, "--data-dir", DATA_DIR, "--output-dir", OUTPUT_DIR, "--run-id", runId, "patrol-compute", wiki],
-                label: `${resolveRunner().label} --data-dir ${DATA_DIR} --output-dir ${OUTPUT_DIR} --run-id ${runId} patrol-compute ${wiki}`,
+                args: [
+                  ...resolveRunner().args,
+                  "--data-dir", DATA_DIR,
+                  "--output-dir", OUTPUT_DIR,
+                  "--run-id", runId,
+                  "patrol-compute", wiki,
+                  ...(action === "patrol-rebuild" ? ["--rebuild"] : []),
+                ],
+                label: `${resolveRunner().label} --data-dir ${DATA_DIR} --output-dir ${OUTPUT_DIR} --run-id ${runId} patrol-compute ${wiki}${action === "patrol-rebuild" ? " --rebuild" : ""}`,
               }
             : null;
           break;
@@ -1664,7 +2093,11 @@ async function handleRequest(req, res) {
         proc,
         action,
         wiki: wiki || null,
-        stage: action === "run" ? "fetch" : action.replace("-", "_"),
+        stage: ["run", "qualify"].includes(action)
+          ? "fetch"
+          : action === "patrol-rebuild"
+            ? "patrol_compute"
+            : action.replace("-", "_"),
         expectedTotal: null,
         cancelRequested: false,
         startedAt,

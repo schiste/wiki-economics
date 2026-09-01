@@ -76,7 +76,8 @@ and higher resource envelope are being qualified.
   therefore come from different commits; each is verified independently and
   all three identities are recorded in refresh run provenance.
 - `jobs.yaml` — one Rust fleet controller, two fixed small-wiki workers, one
-  fixed medium/large worker, and the short `wiki-econ-publish-ready` job, plus
+  fixed medium/large worker, a dedicated continuous 6 GiB admin dispatcher,
+  and the short `wiki-econ-publish-ready` job, plus
   legacy on-demand recovery jobs. The controller represents the sixteen
   scheduled wikis declared by the lifecycle registry: afwiki, arwiki, arzwiki,
   elwiki, eswiki, frwiki, hawiki, itwiki, jawiki, nlwiki, ptwiki, svwiki,
@@ -86,7 +87,11 @@ and higher resource envelope are being qualified.
   The full state machine and recovery boundary are documented in
   [per-wiki candidate preparation and publication](../../docs/candidate-publication.md).
   `wiki-econ-admin` serves `/admin*` and the built static site as a separate
-  buildservice webservice; it is not duplicated as a Toolforge Job.
+  buildservice webservice. Authenticated actions are persisted under
+  `output/_admin/operations`; `wiki-econ-admin-dispatcher` claims and executes
+  them outside the 512 MiB web pod. The lifecycle registry is likewise stored
+  on NFS, so the admin can register a supported wiki as hidden qualification,
+  manual, or scheduled without rebuilding the image.
   The public root is a lightweight portfolio homepage built entirely from
   Rust-generated all-wiki defaults. It makes no browser Parquet request and
   routes readers into concrete-wiki detail dashboards; `all` is deliberately
@@ -99,6 +104,7 @@ and higher resource envelope are being qualified.
   so `jobs.yaml` points each on-demand Job's `command:` at its wrapper
   instead of setting the stage through an `envvars:` field.
 - `run-fleet-controller.sh`, `run-fleet-worker.sh`, `run-prepare-wiki.sh`,
+  `run-admin-dispatcher.sh`,
   `run-with-lock.sh`, `run-publish-ready.sh`, and
   `publish-ready-transaction.sh` implement the production schedule. Long
   preparation holds a per-wiki NFS-safe heartbeat lock and never changes a

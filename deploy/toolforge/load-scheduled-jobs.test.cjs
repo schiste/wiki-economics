@@ -49,6 +49,7 @@ esac
       `jobs load --job wiki-econ-fleet-small-a ${manifest}`,
       `jobs load --job wiki-econ-fleet-small-b ${manifest}`,
       `jobs load --job wiki-econ-fleet-medium ${manifest}`,
+      `jobs load --job wiki-econ-admin-dispatcher ${manifest}`,
       `jobs load --job wiki-econ-publish-ready ${manifest}`,
       `jobs load --job wiki-econ-artifact-scrub ${manifest}`,
     ]);

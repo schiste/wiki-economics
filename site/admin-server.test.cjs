@@ -84,6 +84,7 @@ async function startServer(t, envOverrides, wikiLifecycle, setup) {
   return {
     module,
     host: "127.0.0.1:3443",
+    tempRoot,
     distDir: path.join(tempRoot, "dist"),
     outputDir: path.join(tempRoot, "output"),
   };
@@ -553,6 +554,189 @@ test("admin rejects processing a wiki missing from the lifecycle before spawning
   const body = JSON.parse(response.text());
   assert.equal(body.lifecycleRequired, true);
   assert.match(body.error, /dewiki is not registered/);
+});
+
+test("admin can durably register dewiki for private qualification and start it", async (t) => {
+  const lifecycle = {
+    schema_version: 1,
+    publication_contract: {
+      datasets: {
+        page_weekly_edits: {wikis: ["nlwiki"], minimum_rows_per_wiki: 1},
+      },
+    },
+    wikis: {
+      nlwiki: {
+        refresh: "scheduled",
+        publication: "published",
+        provenance: "toolforge",
+        freshness_sla_days: 40,
+        retention: {
+          source_recoverability: "redownloadable",
+          history_input: "purge_after_ready",
+          patrol_source: "purge_after_ready",
+          computed_rollback_generations: 1,
+        },
+      },
+    },
+  };
+  const {module, host, tempRoot} = await startServer(t, {
+    ...LOCAL_ENV,
+    WIKI_ECON_BIN: "/usr/bin/true",
+  }, lifecycle);
+  const registered = await invoke(module, {
+    method: "POST",
+    url: "/api/register-wiki",
+    headers: {host, "content-type": "application/json"},
+    body: JSON.stringify({wiki: "dewiki", mode: "qualification", resourceClass: "medium_large"}),
+  });
+  assert.equal(registered.statusCode, 201);
+  const registration = JSON.parse(registered.text());
+  assert.equal(registration.lifecycle.publication, "hidden");
+  assert.equal(registration.lifecycle.refresh, "qualification");
+  const persisted = JSON.parse(fs.readFileSync(path.join(tempRoot, "wiki-lifecycle.json"), "utf8"));
+  assert.equal(persisted.wikis.dewiki.refresh, "qualification");
+  assert.deepEqual(persisted.publication_contract.datasets.page_weekly_edits.wikis, ["nlwiki"]);
+
+  const started = await invoke(module, {
+    method: "POST",
+    url: "/api/qualify",
+    headers: {host, "content-type": "application/json"},
+    body: JSON.stringify({wiki: "dewiki", version: "2026-08"}),
+  });
+  assert.equal(started.statusCode, 200);
+  assert.match(JSON.parse(started.text()).command, /qualify-wiki dewiki/);
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const status = JSON.parse((await invoke(module, {url: "/api/status", headers: {host}})).text());
+  assert.equal(status.wikiStates.dewiki.refresh, "qualification");
+  assert.equal(status.wikiJobs.dewiki.state, "succeeded");
+});
+
+test("production execution mode queues heavy work and supports cancellation", async (t) => {
+  const lifecycle = {
+    schema_version: 1,
+    publication_contract: {datasets: {}},
+    wikis: {
+      nlwiki: {
+        refresh: "manual",
+        publication: "published",
+        provenance: "toolforge",
+      },
+    },
+  };
+  const {module, host, outputDir} = await startServer(t, {
+    ...LOCAL_ENV,
+    WIKI_ECON_ADMIN_EXECUTION_MODE: "queue",
+  }, lifecycle);
+  const queued = await invoke(module, {
+    method: "POST",
+    url: "/api/run",
+    headers: {host, "content-type": "application/json"},
+    body: JSON.stringify({wiki: "nlwiki", version: "2026-08"}),
+  });
+  assert.equal(queued.statusCode, 202);
+  const queuedBody = JSON.parse(queued.text());
+  assert.equal(queuedBody.queued, true);
+  const queuedPath = path.join(
+    outputDir,
+    "_admin",
+    "operations",
+    "queued",
+    `${queuedBody.requestId}.json`,
+  );
+  assert.equal(fs.existsSync(queuedPath), true);
+
+  const status = JSON.parse((await invoke(module, {url: "/api/status", headers: {host}})).text());
+  assert.equal(status.executionMode, "queue");
+  assert.equal(status.adminOperations.counts.queued, 1);
+  assert.equal(status.adminOperations.queued[0].wiki, "nlwiki");
+
+  const cancelled = await invoke(module, {
+    method: "POST",
+    url: "/api/cancel",
+    headers: {host, "content-type": "application/json"},
+    body: JSON.stringify({requestId: queuedBody.requestId}),
+  });
+  assert.equal(cancelled.statusCode, 200);
+  assert.equal(JSON.parse(cancelled.text()).cancelled, true);
+  assert.equal(fs.existsSync(queuedPath), false);
+});
+
+test("stale operator work is explained as stalled and can be safely requeued", async (t) => {
+  const lifecycle = {
+    schema_version: 1,
+    publication_contract: {datasets: {}},
+    wikis: {nlwiki: {refresh: "manual", publication: "published", provenance: "toolforge"}},
+  };
+  const requestId = "admin-stale-nlwiki-compute";
+  const {module, host, outputDir} = await startServer(t, {
+    ...LOCAL_ENV,
+    WIKI_ECON_ADMIN_EXECUTION_MODE: "queue",
+    WIKI_ECON_ADMIN_OPERATION_STALE_SECS: "1",
+  }, lifecycle, ({outputDir: fixtureOutput}) => {
+    const running = path.join(fixtureOutput, "_admin", "operations", "running");
+    fs.mkdirSync(running, {recursive: true});
+    fs.writeFileSync(path.join(running, `${requestId}.json`), JSON.stringify({
+      schemaVersion: 1,
+      requestId,
+      runId: requestId,
+      action: "compute",
+      wiki: "nlwiki",
+      state: "running",
+      retryCount: 0,
+      startedAt: "2026-08-01T00:00:00Z",
+      heartbeatAt: "2026-08-01T00:00:00Z",
+      updatedAt: "2026-08-01T00:00:00Z",
+    }));
+  });
+
+  const before = JSON.parse((await invoke(module, {url: "/api/status", headers: {host}})).text());
+  assert.equal(before.adminOperations.running[0].state, "stalled");
+
+  const recovered = await invoke(module, {
+    method: "POST",
+    url: "/api/recover-admin",
+    headers: {host, "content-type": "application/json"},
+    body: "{}",
+  });
+  assert.equal(recovered.statusCode, 200);
+  assert.deepEqual(JSON.parse(recovered.text()).recovered, [requestId]);
+  assert.equal(fs.existsSync(path.join(outputDir, "_admin", "operations", "queued", `${requestId}.json`)), true);
+});
+
+test("admin dispatcher claims and completes one queued operation", async (t) => {
+  const operationRoot = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-admin-dispatcher-test-"));
+  t.after(() => fs.rmSync(operationRoot, {recursive: true, force: true}));
+  const queuedDir = path.join(operationRoot, "queued");
+  fs.mkdirSync(queuedDir, {recursive: true});
+  const request = {
+    schemaVersion: 1,
+    requestId: "admin-test-nlwiki-fetch",
+    runId: "admin-test-nlwiki-fetch",
+    action: "fetch",
+    wiki: "nlwiki",
+    version: "2026-08",
+    requestedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    state: "queued",
+  };
+  fs.writeFileSync(path.join(queuedDir, `${request.requestId}.json`), JSON.stringify(request));
+  const dispatcherPath = require.resolve("../deploy/toolforge/admin-dispatcher.cjs");
+  delete require.cache[dispatcherPath];
+  const previousRoot = process.env.WIKI_ECON_ADMIN_OPERATION_DIR;
+  const previousBin = process.env.WIKI_ECON_BIN;
+  process.env.WIKI_ECON_ADMIN_OPERATION_DIR = operationRoot;
+  process.env.WIKI_ECON_BIN = "/usr/bin/true";
+  const dispatcher = require(dispatcherPath);
+  const completed = await dispatcher.run();
+  if (previousRoot == null) delete process.env.WIKI_ECON_ADMIN_OPERATION_DIR;
+  else process.env.WIKI_ECON_ADMIN_OPERATION_DIR = previousRoot;
+  if (previousBin == null) delete process.env.WIKI_ECON_BIN;
+  else process.env.WIKI_ECON_BIN = previousBin;
+  delete require.cache[dispatcherPath];
+  assert.equal(completed.state, "succeeded");
+  assert.equal(fs.readdirSync(path.join(operationRoot, "queued")).length, 0);
+  assert.equal(fs.readdirSync(path.join(operationRoot, "running")).length, 0);
+  assert.equal(fs.readdirSync(path.join(operationRoot, "history")).length, 1);
 });
 
 test("admin prepare action is durable and never invokes the legacy publishing run command", async (t) => {

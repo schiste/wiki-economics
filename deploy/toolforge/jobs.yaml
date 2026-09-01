@@ -78,6 +78,19 @@
   mem: 6Gi
   cpu: "1"
 
+# Authenticated admin actions are written to an atomic NFS queue by the
+# 512 MiB webservice. This dedicated worker executes them with the same
+# production memory ceiling as scheduled preparation, so an operator can
+# never accidentally run a large ingest inside the web pod.
+- name: wiki-econ-admin-dispatcher
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: deploy/toolforge/run-admin-dispatcher.sh
+  continuous: true
+  filelog: true
+  mount: all
+  mem: 6Gi
+  cpu: "1"
+
 # Publication is intentionally short and independent. It selects only fully
 # validated ready candidates, merges, builds, validates, and switches the
 # release while holding the sole global publication lock.

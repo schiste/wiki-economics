@@ -19,6 +19,7 @@ scheduled_jobs=(
   wiki-econ-fleet-small-a
   wiki-econ-fleet-small-b
   wiki-econ-fleet-medium
+  wiki-econ-admin-dispatcher
   wiki-econ-publish-ready
   wiki-econ-artifact-scrub
 )
