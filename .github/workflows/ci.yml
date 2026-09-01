@@ -425,7 +425,6 @@ jobs:
     name: Build Toolforge release artifact
     if: |
       always() && github.event_name == 'push' && github.ref == 'refs/heads/main' &&
-      needs.changes.outputs.rust == 'true' &&
       needs.quality-node.result == 'success' &&
       (needs.quality-rust.result == 'success' || needs.quality-rust.result == 'skipped') &&
       needs.site.result == 'success' &&
@@ -554,7 +553,6 @@ jobs:
     name: Build Toolforge site-source artifact
     if: |
       always() && github.event_name == 'push' && github.ref == 'refs/heads/main' &&
-      needs.changes.outputs.site == 'true' &&
       needs.quality-node.result == 'success' &&
       needs.site.result == 'success' &&
       needs.security-node.result == 'success'
