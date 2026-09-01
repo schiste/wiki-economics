@@ -55,6 +55,32 @@ test("installer validates and atomically selects an immutable site-source releas
   }
 });
 
+test("retention never deletes current when NFS exposes the source root through an alias", () => {
+  const value = fixture();
+  try {
+    const alias = path.join(value.root, "site-sources-alias");
+    fs.symlinkSync(value.sourceRoot, alias, "dir");
+    for (const prefix of ["e", "f", "g"]) {
+      fs.mkdirSync(path.join(value.sourceRoot, "releases", prefix.repeat(40)), {recursive: true});
+    }
+    const aliasedArchive = path.join(alias, "incoming", path.basename(value.archive));
+    const result = spawnSync("bash", [script, commit, value.checksum, aliasedArchive], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        WIKI_ECON_TOOLFORGE_SITE_SOURCE_ROOT: alias,
+        WIKI_ECON_PUBLICATION_LOCK_DIR: value.lock,
+      },
+    });
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(fs.readlinkSync(path.join(alias, "current")), `releases/${commit}`);
+    assert.equal(fs.existsSync(path.join(value.sourceRoot, "releases", commit, "site-source-provenance.json")), true);
+    assert.equal(fs.readdirSync(path.join(value.sourceRoot, "releases")).length, 3);
+  } finally {
+    fs.rmSync(value.root, {recursive: true, force: true});
+  }
+});
+
 test("installer fails closed before switching current when the archive changes", () => {
   const value = fixture();
   try {

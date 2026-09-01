@@ -107,16 +107,19 @@ ln -s "releases/$release_sha" "$temporary_link"
 python3 -c 'import os,sys; os.replace(sys.argv[1], sys.argv[2])' "$temporary_link" "$source_root/current"
 rm -f -- "$staged_archive"
 
-current_target="$(readlink -f "$source_root/current")"
 while IFS= read -r old_release; do
-  [ "$old_release" = "$current_target" ] && continue
   old_name="$(basename "$old_release")"
   [[ "$old_name" =~ ^[0-9a-f]{40}$ ]] || continue
+  [ "$old_name" = "$release_sha" ] && continue
   release_count="$(find "$source_root/releases" -mindepth 1 -maxdepth 1 -type d -name '????????????????????????????????????????' | wc -l | tr -d ' ')"
   [ "$release_count" -le "${WIKI_ECON_SITE_SOURCE_RETENTION:-3}" ] && break
   rm -rf -- "$old_release"
 done < <(find "$source_root/releases" -mindepth 1 -maxdepth 1 -type d -name '????????????????????????????????????????' -print | LC_ALL=C sort)
 
+[ -f "$release_dir/site-source-provenance.json" ] || {
+  echo "Installed site-source release disappeared during retention: $release_sha" >&2
+  exit 1
+}
 echo "Installed verified site-source release $release_sha"
 echo "Stable site source: $source_root/current/site"
 echo "Content SHA-256: $(jq -r '.content_sha256' "$release_dir/site-source-provenance.json")"
