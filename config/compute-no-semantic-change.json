@@ -60,6 +60,12 @@
       "paths": ["src/compute/mod.rs"],
       "reason": "Validate current receipt-covered outputs after intentional input retention cleanup; page-week metric semantics and bytes are unchanged.",
       "base_commit": "992cd6b029ac17fde7fbe8dd6717b44dfd733efc"
+    },
+    {
+      "family": "page_week",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Editor-identity, complete-month invalidation, and coverage-only refactors do not change page-week aggregation semantics or bytes.",
+      "base_commit": "828fa51ae56e4ab1fb29dfc1855bc50e9281023c"
     }
   ]
 }
