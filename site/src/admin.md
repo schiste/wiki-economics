@@ -44,7 +44,10 @@ const adminUiState = globalThis.__wikiEconAdminState ??= {
   onboardingWiki: null,
   snapshotVersion: "",
   snapshotVersionDirty: false,
-  lastKnownRunner: null
+  lastKnownRunner: null,
+  onboardingMode: "qualification",
+  onboardingResourceClass: "medium_large",
+  notice: null
 }
 adminUiState.selectedWikiUser ??= false
 let pollTimer = null
@@ -243,7 +246,10 @@ async function runCommand(action, wikiOrOptions = null) {
     }
     const body = JSON.stringify({
       ...(options.wiki ? {wiki: options.wiki} : {}),
-      ...(requestedVersion ? {version: requestedVersion} : {})
+      ...(requestedVersion ? {version: requestedVersion} : {}),
+      ...(options.requestId ? {requestId: options.requestId} : {}),
+      ...(options.mode ? {mode: options.mode} : {}),
+      ...(options.resourceClass ? {resourceClass: options.resourceClass} : {})
     })
     const r = await fetch(`${API}/${action}`, {
       method: "POST",
@@ -255,9 +261,12 @@ async function runCommand(action, wikiOrOptions = null) {
     if (r.status === 401) {
       authState.value = data?.auth || {enabled: true, authenticated: false, loginUrl: "/admin/login", logoutUrl: null, user: null}
       alert("Admin authentication required. Sign in again to continue.")
-      return
+      return null
     }
-    if (data.error) { alert(data.error); return }
+    if (data.error) { alert(data.error); return null }
+    adminUiState.notice = data.queued
+      ? `${actionLabel(action)} queued as ${data.requestId}`
+      : `${actionLabel(action)} accepted`
     adminUiState.showRunningLog = false
     adminUiState.showJobLog = false
     await checkApi()
@@ -265,14 +274,24 @@ async function runCommand(action, wikiOrOptions = null) {
     if (pollTimer) clearInterval(pollTimer)
     pollTimer = setInterval(async () => {
       await checkApi()
-      if (jobStatus.value && !jobStatus.value.running) {
+      const operations = jobStatus.value?.adminOperations
+      if (jobStatus.value && !jobStatus.value.running && !operations?.counts?.running && !operations?.counts?.queued) {
         clearInterval(pollTimer)
         pollTimer = null
       }
     }, 500)
+    return data
   } catch (e) {
     alert("Admin server not reachable. Run scripts/dev.sh or WIKI_ECON_ADMIN_ENABLED=1 node site/admin-server.cjs")
+    return null
   }
+}
+
+async function registerWiki(wiki, mode, resourceClass, {start = false, version = null} = {}) {
+  const result = await runCommand("register-wiki", {wiki, mode, resourceClass})
+  if (!result?.registered) return
+  setSelectedWiki(wiki)
+  if (start) await runCommand(mode === "qualification" ? "qualify" : "run", {wiki, version})
 }
 
 function actionLabel(action) {
@@ -282,7 +301,14 @@ function actionLabel(action) {
     case "ingest": return "ingest"
     case "compute": return "compute"
     case "patrol-compute": return "patrol compute"
-    case "merge": return "publish"
+    case "patrol-rebuild": return "rebuild patrol"
+    case "merge": return "merge data"
+    case "publish": return "publish candidates"
+    case "site": return "rebuild site"
+    case "fleet-recover": return "recover fleet"
+    case "recover-admin": return "recover operator queue"
+    case "qualify": return "qualify project"
+    case "register-wiki": return "add project"
     case "cleanup": return "cleanup"
     case "cancel": return "cancel"
     case "run": return "prepare update"
@@ -302,8 +328,22 @@ function actionTooltip(action) {
       return "Compute the core economic metrics from the ingested parquet data for this wiki."
     case "patrol-compute":
       return "Compute the patrol-specific metrics incrementally, resuming from existing month shards; full rebuilds stay CLI-only."
+    case "patrol-rebuild":
+      return "Discard and rebuild only this wiki's patrol metrics from its validated patrol sources."
     case "merge":
-      return "Refresh the merged site data files served by the frontend."
+      return "Regenerate merged publication data without rebuilding the website."
+    case "publish":
+      return "Select valid ready candidates, validate the publication, and atomically switch the live generation."
+    case "site":
+      return "Rebuild and validate only the website against the currently published data."
+    case "fleet-recover":
+      return "Reclaim stale fleet leases and requeue recoverable work without touching healthy tasks."
+    case "recover-admin":
+      return "Requeue an operator operation only after its dedicated worker heartbeat has been stale for ten minutes."
+    case "qualify":
+      return "Run fetch, ingest, compute, patrol, and validation as a publication-invisible qualification."
+    case "register-wiki":
+      return "Persist this project in the lifecycle registry before any data is downloaded."
     case "cleanup":
       return "Remove temporary files and invalid ingest markers for this wiki."
     case "cancel":
@@ -344,6 +384,16 @@ const wikiJobHistory = job?.wikiJobHistory || {}
 const globalJob = job?.globalJob || null
 const fleet = job?.fleet || {counts: {}, work: [], quarantine: [], recentFailures: []}
 const fleetByWiki = new Map((fleet.work || []).map((entry) => [entry.wiki, entry]))
+const adminOperations = job?.adminOperations || {executionMode: "direct", counts: {}, queued: [], running: [], recent: []}
+const operatorOperations = [
+  ...(adminOperations.running || []),
+  ...(adminOperations.queued || []),
+  ...(adminOperations.recent || [])
+]
+const operatorOperationByWiki = new Map()
+for (const operation of operatorOperations) {
+  if (operation.wiki && !operatorOperationByWiki.has(operation.wiki)) operatorOperationByWiki.set(operation.wiki, operation)
+}
 const adminRuns = job?.adminRuns || {active: null, recent: []}
 const freshness = job?.freshness || {status: "unknown", alerts: [], summary: {}}
 const snapshotPlans = job?.snapshotPlans || []
@@ -370,6 +420,7 @@ const allWikiNames = Array.from(new Set([
   ...Object.keys(wikiJobMap),
   ...Object.keys(wikiJobHistory),
   ...(fleet.work || []).map((entry) => entry.wiki),
+  ...operatorOperations.map((entry) => entry.wiki),
   ...snapshotPlans.map((entry) => entry.wiki),
   ...(runningWiki ? [runningWiki] : [])
 ])).filter(Boolean)
@@ -395,13 +446,14 @@ for (const name of allWikiNames) {
 
 function latestWikiJob(name) {
   if (name === runningWiki && inlineRunningJob) return inlineRunningJob
-  return wikiJobMap[name] || wikiJobHistory[name]?.[0] || null
+  return operatorOperationByWiki.get(name) || wikiJobMap[name] || wikiJobHistory[name]?.[0] || null
 }
 
 function operationalState(name, wiki) {
   const direct = latestWikiJob(name)
   const fleetWork = fleetByWiki.get(name)
-  if (direct?.running) return "running"
+  if (direct?.running || direct?.state === "running" || direct?.state === "cancelling") return direct.state || "running"
+  if (direct?.state === "queued") return "queued"
   if (fleetWork?.state) return fleetWork.state
   if (direct?.interrupted) return "interrupted"
   if (direct?.cancelled) return "cancelled"
@@ -452,7 +504,10 @@ const attentionStates = new Set(["stalled", "quarantined", "interrupted", "faile
 const attentionCount = wikiEntries.filter(([name, wiki]) => attentionStates.has(operationalState(name, wiki))).length
 const freshnessNeedsAttention = ["critical", "warning"].includes(freshness.status)
 const operatorIssueCount = attentionCount + Number(freshnessNeedsAttention)
-const activeCount = Number(Boolean(inlineRunningJob)) + Number(fleet.counts?.running || 0)
+const activeCount = Number(Boolean(inlineRunningJob))
+  + Number(fleet.counts?.running || 0)
+  + Number(adminOperations.counts?.running || 0)
+  + Number(adminOperations.counts?.queued || 0)
 display(html`<div class="admin-command-header">
   <div class="admin-command-health ${operatorIssueCount > 0 ? "attention" : "clear"}">
     <span class="admin-command-kicker">Operator status</span>
@@ -461,7 +516,7 @@ display(html`<div class="admin-command-header">
   </div>
   <dl class="admin-command-facts">
     <div><dt>API</dt><dd class=${apiStatus ? "ok" : "bad"}>${apiStatus ? "Connected" : "Offline"}</dd></div>
-    <div><dt>Fleet</dt><dd>${fleet.counts?.queued || 0} queued · ${fleet.counts?.running || 0} running</dd></div>
+    <div><dt>Operator worker</dt><dd>${adminOperations.executionMode === "queue" ? "Dedicated 6 GiB" : "Local direct"} · ${adminOperations.counts?.queued || 0} queued</dd></div>
     <div><dt>Coverage</dt><dd>${publishedWikis.length} published · ${refreshWikis.length} scheduled</dd></div>
     <div><dt>Inventory scan</dt><dd>${formatRefreshTimestamp(currentManifest.generated_at)}</dd></div>
   </dl>
@@ -859,6 +914,87 @@ function stageCaption(wiki, stageKey) {
   }
 }
 
+function stageAction(stageKey) {
+  return ({
+    fetch: "fetch",
+    patrol_fetch: "patrol-fetch",
+    ingest: "ingest",
+    compute: "compute",
+    patrol_compute: "patrol-compute",
+    merge: "merge"
+  })[stageKey]
+}
+
+function stateExplanation(name, wiki, state, lifecycle, direct, fleetWork) {
+  if (!lifecycle) return `${name} is supported by the Rust source resolver, but has no lifecycle policy. Processing is intentionally blocked until an operator registers it.`
+  if (state === "queued") return `The request is durable and waiting for the ${direct?.resourceClass || lifecycle.fleet_resource_class || "assigned"} worker. It is safe to close this page.`
+  if (state === "running") return `A worker owns this operation. The heartbeat and current stage below distinguish healthy progress from a stalled process.`
+  if (state === "stalled") return `The worker lease exists but its heartbeat is overdue. Recover the fleet lease before submitting duplicate work.`
+  if (state === "quarantined") return `Automatic retries were exhausted. Review the final log excerpt, correct the cause, then explicitly retry.`
+  if (["failed", "interrupted"].includes(state)) return `The last operation did not finish. Completed source transactions remain reusable; retrying resumes from validated receipts rather than starting blindly from zero.`
+  if (state === "needs_fetch") return `No validated history source or selected snapshot is available yet. Fetch is the first unblocked stage.`
+  if (state === "needs_patrol_fetch") return `Core history is present, but the independent patrol source generation is incomplete.`
+  if (state === "needs_ingest") return `History sources exist but have not all been converted into validated metric-input fragments.`
+  if (state === "needs_compute") return `The warehouse generation is ready, but one or more core metric families are missing or invalid.`
+  if (state === "needs_patrol_compute") return `Patrol sources are ready, but the derived patrol metric has not been validated.`
+  if (state === "needs_merge") return `Per-wiki metrics are ready. They have not yet been incorporated into the public publication generation.`
+  if (state === "complete") return `${name} has a complete published artifact set. Recalculation controls remain available for algorithm changes or validation work.`
+  if (fleetWork) return `Fleet state ${fleetWork.state} was inferred from the durable work item and lease evidence.`
+  return `The state was inferred from lifecycle policy, snapshot receipts, source markers, metric artifacts, and publication files.`
+}
+
+function evidenceItems(name, wiki, lifecycle, direct, fleetWork, plan) {
+  return [
+    ["Lifecycle", lifecycle ? `${lifecycle.publication} / ${lifecycle.refresh}` : "not registered"],
+    ["Snapshot", plan?.snapshot || wiki.snapshot?.version || wiki.raw?.version || "not selected"],
+    ["History", wiki.snapshot?.ready ? `${wiki.ingest?.rows || 0} validated rows` : `${wiki.raw?.files || 0} raw files · ${wiki.parquet?.done || 0}/${wiki.parquet?.total || 0} ingested`],
+    ["Metrics", `${(wiki.metrics || []).length} core/patrol artifacts · ${wiki.dashboard?.length || 0} published files`],
+    ["Last activity", direct ? `${operationLabel(direct.state || (direct.exitCode === 0 ? "succeeded" : "failed"))} · ${relativeTime(operationTimestamp(direct))}` : "no operator run recorded"],
+    ["Worker", fleetWork ? `${fleetWork.workerId || fleetWork.resourceClass || "unclaimed"} · ${fleetWork.heartbeatAt ? `heartbeat ${relativeTime(fleetWork.heartbeatAt)}` : "no heartbeat"}` : "no fleet lease"]
+  ]
+}
+
+function pipelineDossier(name, wiki, state, lifecycle, direct, fleetWork, plan, isRunning) {
+  const canRun = Boolean(apiStatus && lifecycle)
+  const isQualification = lifecycle?.publication === "hidden" && lifecycle?.refresh === "qualification"
+  const operationActive = ["queued", "running", "cancelling"].includes(direct?.state) || direct?.running
+  const log = (direct?.log || []).join("")
+  return html`<section class="admin-pipeline-dossier" aria-label=${`${name} pipeline details`}>
+    <div class="admin-dossier-summary">
+      <div><span class="admin-command-kicker">What this means</span><p>${stateExplanation(name, wiki, state, lifecycle, direct, fleetWork)}</p></div>
+      <dl>${evidenceItems(name, wiki, lifecycle, direct, fleetWork, plan).map(([label, value]) => html`<div><dt>${label}</dt><dd>${value}</dd></div>`)}</dl>
+    </div>
+    <div class="admin-dossier-stages">
+      ${pipelineSteps.map((step) => {
+        const stepState = stageStateForWiki(wiki, step.key, isRunning, direct?.progress)
+        const action = stageAction(step.key)
+        return html`<div class="admin-dossier-stage ${stepState}">
+          <span>${step.label}</span><strong>${stageCaption(wiki, step.key)}</strong>
+          <button class="admin-stage-button" ?disabled=${!canRun || stepState === "blocked" || operationActive}
+            title=${actionTooltipWithApi(action, apiStatus)}
+            onclick=${() => runCommand(action, action === "merge" ? null : {wiki: name, version: action === "fetch" ? preferredSnapshotVersion(wiki) : null})}>
+            ${stepState === "done" ? "Run again" : "Run stage"}
+          </button>
+        </div>`
+      })}
+    </div>
+    <div class="admin-dossier-actions">
+      ${!lifecycle ? html`<button class="admin-btn primary" ?disabled=${!apiStatus} onclick=${() => {
+        if (confirm(`Add ${name} as a publication-invisible qualification project?`)) registerWiki(name, "qualification", "medium_large")
+      }}>Add as qualification</button>` : html`
+        <button class="admin-btn primary" ?disabled=${!apiStatus || operationActive}
+          onclick=${() => runCommand(isQualification ? "qualify" : "run", {wiki: name, version: preferredSnapshotVersion(wiki)})}>
+          ${isQualification ? "Run full qualification" : "Prepare full update"}
+        </button>
+        <button class="admin-btn" ?disabled=${!apiStatus || operationActive} onclick=${() => runCommand("patrol-rebuild", name)}>Rebuild patrol</button>
+        <button class="admin-btn" ?disabled=${!apiStatus} onclick=${() => runCommand("cleanup", name)}>Clean stale staging</button>`}
+      ${["stalled", "quarantined"].includes(state) ? html`<button class="admin-btn" ?disabled=${!apiStatus} onclick=${() => runCommand(direct?.requestId ? "recover-admin" : "fleet-recover")}>${direct?.requestId ? "Recover operator queue" : "Recover fleet lease"}</button>` : ""}
+      ${operationActive ? html`<button class="admin-btn danger" ?disabled=${!apiStatus} onclick=${() => runCommand("cancel", {requestId: direct?.requestId, wiki: name})}>Cancel operation</button>` : ""}
+    </div>
+    ${log ? html`<details class="admin-dossier-log"><summary>Latest output (${(direct.log || []).length} chunks)</summary><pre class="admin-job-log">${log}</pre></details>` : ""}
+  </section>`
+}
+
 ```
 
 ```js
@@ -906,11 +1042,12 @@ display(html`<div class="admin-pipeline-board">
             : plan && !wiki.tracked
             ? `${plan.snapshot} plan · no worker`
             : lifecycle?.freshness || lifecycle?.refresh || "inventory"
-          return html`<button
-            class="admin-pipeline-row ${selectedWiki === name ? "selected" : ""} state-${state}"
-            role="listitem"
-            onclick=${() => { setSelectedWiki(name) }}
-          >
+          const expanded = selectedWiki === name
+          return html`<div class="admin-pipeline-entry" role="listitem">
+          <button
+            class="admin-pipeline-row ${expanded ? "selected" : ""} state-${state}"
+            aria-expanded=${String(expanded)}
+            onclick=${() => { setSelectedWiki(name) }}>
             <span class="admin-pipeline-identity">
               <strong>${name}</strong>
               <small>${wikipediaProjectLabel(name).replace(` (${name})`, "")}</small>
@@ -926,8 +1063,10 @@ display(html`<div class="admin-pipeline-board">
               })}
             </span>
             <span class="admin-pipeline-lifecycle">${lifecycle?.refresh || (plan ? "unmanaged" : "unknown")}</span>
-            <span class="admin-row-chevron" aria-hidden="true">›</span>
-          </button>`
+            <span class="admin-row-chevron" aria-hidden="true">${expanded ? "⌄" : "›"}</span>
+          </button>
+          ${expanded ? pipelineDossier(name, wiki, state, lifecycle, direct, fleetWork, plan, isRunning) : ""}
+          </div>`
         })}
       </div>`}
 </div>`)
@@ -1069,6 +1208,24 @@ const onboardingCanRun = Boolean(onboardingLifecycle && ["scheduled", "manual", 
 ```
 
 ```js
+const onboardingModeInput = Inputs.select(new Map([
+  ["Qualification — hidden until explicitly promoted", "qualification"],
+  ["Managed manually — published, operator-triggered", "manual"],
+  ["Managed automatically — published and scheduled", "scheduled"]
+]), {label: "Lifecycle", value: adminUiState.onboardingMode})
+onboardingModeInput.addEventListener("input", () => { adminUiState.onboardingMode = onboardingModeInput.value })
+const onboardingMode = view(onboardingModeInput)
+
+const onboardingResourceInput = Inputs.select(new Map([
+  ["Small worker", "small"],
+  ["Medium / large worker", "medium_large"],
+  ["Isolated qualification only", "isolated"]
+]), {label: "Workload class", value: adminUiState.onboardingResourceClass})
+onboardingResourceInput.addEventListener("input", () => { adminUiState.onboardingResourceClass = onboardingResourceInput.value })
+const onboardingResourceClass = view(onboardingResourceInput)
+```
+
+```js
 const snapshotVersionDefault = adminUiState.snapshotVersionDirty
   ? adminUiState.snapshotVersion
   : (adminUiState.snapshotVersion || suggestedVersion || "")
@@ -1086,25 +1243,38 @@ const snapshotVersion = view(snapshotVersionInput)
 ```
 
 ```js
-html`<div class="admin-fetch-actions">
+html`<div class="admin-onboarding-console">
   ${!apiStatus ? adminConnectionWarning() : ""}
   ${onboardingWikiOptions.length === 0 ? html`<div class="warning">No supported onboarding projects were reported by the admin API yet.</div>` : ""}
   ${onboardingWikiUnknown ? html`<div class="warning">No project matches <code>${onboardingWikiTrimmed}</code>. Click the field to reopen the full project list, or keep typing to narrow it down.</div>` : ""}
-  ${onboardingWiki && !onboardingLifecycle ? html`<div class="warning"><strong>${onboardingWiki} is not registered.</strong> Its snapshot may be inspected, but processing is blocked until it is added to the lifecycle registry as a qualification or managed project.</div>` : ""}
-  <button class="admin-btn primary" ?disabled=${!apiStatus || !onboardingCanRun} onclick=${() => {
+  ${onboardingWiki && !onboardingLifecycle ? html`<div class="admin-registration-callout"><strong>${onboardingWiki} is ready to be registered.</strong><span>No data is downloaded until you choose a lifecycle and start it. Qualification is the safest default: it remains invisible to publication.</span></div>` : ""}
+  ${onboardingWiki && onboardingLifecycle ? html`<div class="admin-registration-callout registered"><strong>${onboardingWiki} is already registered.</strong><span>${onboardingLifecycle.publication} / ${onboardingLifecycle.refresh} · ${onboardingLifecycle.fleet_resource_class || "default"} worker</span></div>` : ""}
+  ${!onboardingLifecycle ? html`<div class="admin-registration-policy">${onboardingModeInput}${onboardingResourceInput}</div>` : ""}
+  <div class="admin-fetch-actions">
+  ${onboardingWiki && !onboardingLifecycle ? html`
+    <button class="admin-btn" ?disabled=${!apiStatus} onclick=${() => registerWiki(onboardingWiki, onboardingMode, onboardingResourceClass)}>Add project</button>
+    <button class="admin-btn primary" ?disabled=${!apiStatus} onclick=${() => {
+      const version = normalizeSnapshotVersion(snapshotVersion)
+      if (confirm(`Add ${onboardingWiki} and start its ${onboardingMode} pipeline${version ? ` for ${version}` : ""}?`)) {
+        registerWiki(onboardingWiki, onboardingMode, onboardingResourceClass, {start: true, version})
+      }
+    }}>Add & start ${onboardingMode === "qualification" ? "qualification" : "preparation"}</button>
+  ` : html`<button class="admin-btn primary" ?disabled=${!apiStatus || !onboardingCanRun} onclick=${() => {
         const w = onboardingWiki
         const version = normalizeSnapshotVersion(snapshotVersion)
         if (!w) { alert("Pick a supported Wikipedia project."); return }
-        if (confirm("Prepare a publication candidate for " + w + (version ? " at snapshot " + version : "") + "? This downloads, ingests, computes, and validates without publishing directly.")) {
-          runCommand("run", {wiki: w, version})
+        const action = onboardingLifecycle?.refresh === "qualification" ? "qualify" : "run"
+        if (confirm(`${action === "qualify" ? "Qualify" : "Prepare"} ${w}${version ? ` at snapshot ${version}` : ""}?`)) {
+          runCommand(action, {wiki: w, version})
         }
-      }} title=${onboardingCanRun ? actionTooltipWithApi("run", apiStatus) : "Register this project in the lifecycle before processing"}>Prepare project data</button>
-  <button class="admin-btn" ?disabled=${!apiStatus || !onboardingCanRun} title=${onboardingCanRun ? actionTooltipWithApi("fetch", apiStatus) : "Register this project in the lifecycle before downloading data"} onclick=${() => {
+      }}>${onboardingLifecycle?.refresh === "qualification" ? "Run full qualification" : "Prepare project data"}</button>`}
+  <button class="admin-btn" ?disabled=${!apiStatus || !onboardingCanRun} title=${actionTooltipWithApi("fetch", apiStatus)} onclick=${() => {
         const w = onboardingWiki
         const version = normalizeSnapshotVersion(snapshotVersion)
         if (!w) { alert("Pick a supported Wikipedia project."); return }
         runCommand("fetch", {wiki: w, version})
       }}>Fetch missing</button>
+  </div>
   ${!apiStatus ? html`
       <pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && WIKI_ECON_ADMIN_ENABLED=1 node site/admin-server.cjs</pre>
       <pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && ${runnerCommand()} ${cliFlags(currentManifest)} run ${onboardingWiki || "frwiki"}${normalizeSnapshotVersion(snapshotVersion) ? ` --version ${normalizeSnapshotVersion(snapshotVersion)}` : ""}</pre>`
@@ -1118,13 +1288,16 @@ html`<div class="admin-fetch-actions">
 
 <div class="chart-section">
 
-## Wiki Details
+## Evidence and manual controls
 
 <div class="note">Select a project in Pipeline Status to inspect its evidence and use stage-level recovery controls.</div>
 
 ```js
 const w = hasSelectedWiki ? wikiMap.get(selectedWiki) || emptyWikiStatus(selectedWiki) : emptyWikiStatus("—")
-const selectedWikiRunning = Boolean(job?.running && job?.progress?.wiki === selectedWiki)
+const selectedWikiRunning = Boolean(
+  (job?.running && job?.progress?.wiki === selectedWiki)
+  || ["queued", "running", "cancelling"].includes(operatorOperationByWiki.get(selectedWiki)?.state)
+)
 const selectedLifecycle = lifecycleStates[selectedWiki] || null
 const selectedJob = latestWikiJob(selectedWiki)
 const selectedFleetWork = fleetByWiki.get(selectedWiki) || null
@@ -1165,15 +1338,20 @@ const selectedPlan = latestPlanByWiki.get(selectedWiki) || null
   : html`${!apiStatus ? adminConnectionWarning() : ""}
     ${!selectedLifecycle ? html`<p class="filter-desc">Stage actions are unavailable until this project has a lifecycle policy.</p>` : ""}
     <div class="admin-maintenance-actions">
-      <button class="admin-btn primary" ?disabled=${!apiStatus || !selectedLifecycle} title=${actionTooltipWithApi("run", apiStatus)} onclick=${() => runCommand("run", {wiki: selectedWiki, version: preferredSnapshotVersion(w)})}>prepare update</button>
+      <button class="admin-btn primary" ?disabled=${!apiStatus || !selectedLifecycle || selectedWikiRunning} title=${actionTooltipWithApi(selectedLifecycle?.refresh === "qualification" ? "qualify" : "run", apiStatus)} onclick=${() => runCommand(selectedLifecycle?.refresh === "qualification" ? "qualify" : "run", {wiki: selectedWiki, version: preferredSnapshotVersion(w)})}>${selectedLifecycle?.refresh === "qualification" ? "run full qualification" : "prepare update"}</button>
       <button class="admin-btn" ?disabled=${!apiStatus || !selectedLifecycle} title=${actionTooltipWithApi("fetch", apiStatus)} onclick=${() => runCommand("fetch", {wiki: selectedWiki, version: preferredSnapshotVersion(w)})}>fetch missing</button>
       <button class="admin-btn" ?disabled=${!apiStatus || !selectedLifecycle} title=${actionTooltipWithApi("patrol-fetch", apiStatus)} onclick=${() => runCommand("patrol-fetch", selectedWiki)}>fetch patrol</button>
       <button class="admin-btn" ?disabled=${!apiStatus || !selectedLifecycle} title=${actionTooltipWithApi("ingest", apiStatus)} onclick=${() => runCommand("ingest", selectedWiki)}>ingest</button>
       <button class="admin-btn" ?disabled=${!apiStatus || !selectedLifecycle} title=${actionTooltipWithApi("compute", apiStatus)} onclick=${() => runCommand("compute", selectedWiki)}>compute core</button>
       <button class="admin-btn" ?disabled=${!apiStatus || !selectedLifecycle} title=${actionTooltipWithApi("patrol-compute", apiStatus)} onclick=${() => runCommand("patrol-compute", selectedWiki)}>compute patrol only</button>
-      <button class="admin-btn" ?disabled=${!apiStatus} title=${actionTooltipWithApi("merge", apiStatus)} onclick=${() => runCommand("merge")}>publish site data</button>
+      <button class="admin-btn" ?disabled=${!apiStatus || !selectedLifecycle} title=${actionTooltipWithApi("patrol-rebuild", apiStatus)} onclick=${() => runCommand("patrol-rebuild", selectedWiki)}>rebuild patrol</button>
+      <button class="admin-btn" ?disabled=${!apiStatus} title=${actionTooltipWithApi("merge", apiStatus)} onclick=${() => runCommand("merge")}>merge site data</button>
+      <button class="admin-btn" ?disabled=${!apiStatus} title=${actionTooltipWithApi("publish", apiStatus)} onclick=${() => runCommand("publish")}>publish ready candidates</button>
+      <button class="admin-btn" ?disabled=${!apiStatus} title=${actionTooltipWithApi("site", apiStatus)} onclick=${() => runCommand("site")}>rebuild website only</button>
+      <button class="admin-btn" ?disabled=${!apiStatus} title=${actionTooltipWithApi("fleet-recover", apiStatus)} onclick=${() => runCommand("fleet-recover")}>recover stale fleet work</button>
+      ${adminOperations.executionMode === "queue" ? html`<button class="admin-btn" ?disabled=${!apiStatus} title=${actionTooltipWithApi("recover-admin", apiStatus)} onclick=${() => runCommand("recover-admin")}>recover stale operator work</button>` : ""}
       <button class="admin-btn" ?disabled=${!apiStatus} title=${actionTooltipWithApi("cleanup", apiStatus)} onclick=${() => runCommand("cleanup", selectedWiki)}>cleanup</button>
-      ${selectedWikiRunning ? html`<button class="admin-btn danger" ?disabled=${!apiStatus} title=${actionTooltipWithApi("cancel", apiStatus)} onclick=${() => runCommand("cancel")}>cancel running job</button>` : ""}
+      ${selectedWikiRunning ? html`<button class="admin-btn danger" ?disabled=${!apiStatus} title=${actionTooltipWithApi("cancel", apiStatus)} onclick=${() => runCommand("cancel", {requestId: selectedJob?.requestId, wiki: selectedWiki})}>cancel queued/running job</button>` : ""}
     </div>`
 ```
 
@@ -2049,6 +2227,7 @@ currentManifest.merged.length > 0
 .admin-pipeline-toolbar form { margin: 0; }
 .admin-pipeline-toolbar > span { color: var(--theme-foreground-muted); font-size: 0.72rem; }
 .admin-pipeline-list { border-top: 1px solid var(--theme-foreground-faintest); }
+.admin-pipeline-entry { border-bottom: 1px solid var(--theme-foreground-faintest); }
 .admin-pipeline-row {
   appearance: none;
   width: 100%;
@@ -2059,7 +2238,7 @@ currentManifest.merged.length > 0
   min-height: 4.2rem;
   padding: 0.55rem 0.75rem;
   border: 0;
-  border-bottom: 1px solid var(--theme-foreground-faintest);
+  border-bottom: 0;
   background: transparent;
   color: inherit;
   text-align: left;
@@ -2087,6 +2266,41 @@ currentManifest.merged.length > 0
 @keyframes admin-pulse { 50% { opacity: 0.45; } }
 .admin-pipeline-lifecycle { color: var(--theme-foreground-muted); font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.05em; }
 .admin-row-chevron { color: var(--theme-foreground-muted); font-size: 1.25rem; }
+.admin-pipeline-dossier {
+  margin: 0 0.75rem 1rem;
+  border: 1px solid color-mix(in srgb, #315b8a 30%, var(--theme-foreground-faintest));
+  border-left: 3px solid #315b8a;
+  background: color-mix(in srgb, var(--theme-background) 96%, #dfe9f3 4%);
+}
+.admin-dossier-summary { display: grid; grid-template-columns: minmax(16rem, 0.8fr) minmax(28rem, 1.4fr); }
+.admin-dossier-summary > div { padding: 1rem; }
+.admin-dossier-summary p { max-width: 62ch; margin: 0.35rem 0 0; font-size: 0.82rem; line-height: 1.55; }
+.admin-dossier-summary dl { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); margin: 0; border-left: 1px solid var(--theme-foreground-faintest); }
+.admin-dossier-summary dl div { min-width: 0; padding: 0.75rem; border-left: 1px solid var(--theme-foreground-faintest); border-bottom: 1px solid var(--theme-foreground-faintest); }
+.admin-dossier-summary dl div:nth-child(3n + 1) { border-left: 0; }
+.admin-dossier-summary dt { color: var(--theme-foreground-muted); font-size: 0.62rem; font-weight: 750; letter-spacing: 0.08em; text-transform: uppercase; }
+.admin-dossier-summary dd { margin: 0.22rem 0 0; overflow-wrap: anywhere; font-size: 0.72rem; font-weight: 650; }
+.admin-dossier-stages { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); border-top: 1px solid var(--theme-foreground-faintest); }
+.admin-dossier-stage { display: grid; align-content: start; gap: 0.18rem; min-height: 6.3rem; padding: 0.72rem; border-left: 1px solid var(--theme-foreground-faintest); box-shadow: inset 0 3px var(--stage-color, #8793a1); }
+.admin-dossier-stage:first-child { border-left: 0; }
+.admin-dossier-stage.done { --stage-color: #3d8a53; }
+.admin-dossier-stage.active { --stage-color: #315b8a; }
+.admin-dossier-stage.todo { --stage-color: #d98c2f; }
+.admin-dossier-stage.blocked { --stage-color: #9aa0a7; opacity: 0.72; }
+.admin-dossier-stage > span { color: var(--theme-foreground-muted); font-size: 0.62rem; font-weight: 750; letter-spacing: 0.06em; text-transform: uppercase; }
+.admin-dossier-stage > strong { min-height: 2em; font-size: 0.74rem; }
+.admin-stage-button { justify-self: start; margin-top: auto; padding: 0; border: 0; background: transparent; color: #315b8a; font-size: 0.68rem; font-weight: 750; cursor: pointer; }
+.admin-stage-button:hover { text-decoration: underline; }
+.admin-stage-button:disabled { color: var(--theme-foreground-muted); cursor: not-allowed; text-decoration: none; }
+.admin-dossier-actions { display: flex; flex-wrap: wrap; gap: 0.4rem; padding: 0.75rem 1rem; border-top: 1px solid var(--theme-foreground-faintest); }
+.admin-dossier-log { border-top: 1px solid var(--theme-foreground-faintest); }
+.admin-dossier-log summary { padding: 0.6rem 1rem; color: var(--theme-foreground-muted); font-size: 0.72rem; font-weight: 700; cursor: pointer; }
+.admin-onboarding-console { display: grid; gap: 0.75rem; }
+.admin-registration-callout { display: grid; gap: 0.2rem; padding: 0.75rem 0.9rem; border-left: 3px solid #d98c2f; background: color-mix(in srgb, #d98c2f 7%, transparent); }
+.admin-registration-callout.registered { border-left-color: #3d8a53; background: color-mix(in srgb, #3d8a53 7%, transparent); }
+.admin-registration-callout span { color: var(--theme-foreground-muted); font-size: 0.76rem; }
+.admin-registration-policy { display: grid; grid-template-columns: minmax(16rem, 1.5fr) minmax(13rem, 1fr); gap: 0.8rem; max-width: 48rem; }
+.admin-registration-policy form { margin: 0; }
 .admin-empty-state { display: grid; gap: 0.2rem; border-block: 1px solid var(--theme-foreground-faintest); }
 .admin-wiki-focus { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-bottom: 0.75rem; border-block: 1px solid var(--theme-foreground-faintest); }
 .admin-wiki-focus > div { display: grid; gap: 0.25rem; padding: 0.75rem 0.85rem; border-left: 1px solid var(--theme-foreground-faintest); }
@@ -2117,6 +2331,10 @@ currentManifest.merged.length > 0
   .admin-command-facts { border: 0; border-block: 1px solid var(--admin-line); }
   .admin-command-session { grid-auto-flow: column; justify-content: start; }
   .admin-pipeline-row { grid-template-columns: minmax(9rem, 1fr) minmax(9rem, 1fr) minmax(14rem, 1.5fr) 5rem 1rem; }
+  .admin-dossier-summary { grid-template-columns: 1fr; }
+  .admin-dossier-summary dl { border-left: 0; border-top: 1px solid var(--theme-foreground-faintest); }
+  .admin-dossier-stages { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .admin-dossier-stage:nth-child(4) { border-left: 0; }
   .pipeline-stage-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
@@ -2134,6 +2352,14 @@ currentManifest.merged.length > 0
   .admin-stage-rail { grid-column: 1 / -1; grid-row: 2; }
   .admin-pipeline-lifecycle { display: none; }
   .admin-row-chevron { grid-column: 3; grid-row: 1; }
+  .admin-pipeline-dossier { margin-inline: 0; }
+  .admin-dossier-summary dl { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .admin-dossier-summary dl div:nth-child(3n + 1) { border-left: 1px solid var(--theme-foreground-faintest); }
+  .admin-dossier-summary dl div:nth-child(odd) { border-left: 0; }
+  .admin-dossier-stages { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .admin-dossier-stage:nth-child(4) { border-left: 1px solid var(--theme-foreground-faintest); }
+  .admin-dossier-stage:nth-child(odd) { border-left: 0; }
+  .admin-registration-policy { grid-template-columns: 1fr; }
   .admin-wiki-focus { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .admin-wiki-focus > div:nth-child(3) { border-left: 0; }
   .admin-wiki-focus > div:nth-child(n+3) { border-top: 1px solid var(--theme-foreground-faintest); }
