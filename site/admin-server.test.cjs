@@ -32,7 +32,7 @@ function loadAdminServer(envOverrides, wikiLifecycle = {
   schema_version: 1,
   publication_contract: { datasets: {} },
   wikis: {},
-}) {
+}, setup = null) {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-admin-test-"));
   const dataDir = path.join(tempRoot, "data");
   const outputDir = path.join(tempRoot, "output");
@@ -47,6 +47,7 @@ function loadAdminServer(envOverrides, wikiLifecycle = {
     "<!doctype html><html><body><h1>Admin Test Page</h1></body></html>",
     "utf8",
   );
+  if (setup) setup({ tempRoot, dataDir, outputDir, distDir });
 
   const env = {
     WIKI_ECON_DATA_DIR: dataDir,
@@ -74,8 +75,8 @@ function loadAdminServer(envOverrides, wikiLifecycle = {
   return { module, tempRoot };
 }
 
-async function startServer(t, envOverrides, wikiLifecycle) {
-  const { module, tempRoot } = loadAdminServer(envOverrides, wikiLifecycle);
+async function startServer(t, envOverrides, wikiLifecycle, setup) {
+  const { module, tempRoot } = loadAdminServer(envOverrides, wikiLifecycle, setup);
   t.after(() => {
     delete require.cache[SERVER_MODULE_PATH];
     fs.rmSync(tempRoot, { recursive: true, force: true });
@@ -327,6 +328,7 @@ test("status distinguishes scheduled refresh wikis from paused published wikis",
   const { module, host, outputDir } = await startServer(t, {
     ...LOCAL_ENV,
     WIKI_ECON_ENABLED_WIKIS: "nlwiki",
+    WIKI_ECON_BIN: "/usr/local/bin/wiki-econ",
   }, {
     schema_version: 1,
     publication_contract: { datasets: {} },
@@ -347,17 +349,6 @@ test("status distinguishes scheduled refresh wikis from paused published wikis",
   });
   fs.mkdirSync(path.join(outputDir, "nlwiki"), { recursive: true });
   fs.writeFileSync(path.join(outputDir, "nlwiki", "gdp.parquet"), "published", "utf8");
-  // resolveRunner() reads WIKI_ECON_BIN from process.env at request time
-  // (not module-load time, unlike DATA_DIR/OUTPUT_DIR/ENABLED_WIKIS), so it
-  // must be set around the request rather than via startServer()'s
-  // load-then-restore env handling.
-  const previousBin = process.env.WIKI_ECON_BIN;
-  process.env.WIKI_ECON_BIN = "/usr/local/bin/wiki-econ";
-  t.after(() => {
-    if (previousBin == null) delete process.env.WIKI_ECON_BIN;
-    else process.env.WIKI_ECON_BIN = previousBin;
-  });
-
   const response = await invoke(module, { url: "/api/status", headers: { host } });
   assert.equal(response.statusCode, 200);
   const body = JSON.parse(response.text());
@@ -452,6 +443,191 @@ test("scheduledRefresh surfaces an in-progress schema-v2 heartbeat", async (t) =
   const body = JSON.parse(response.text());
   assert.deepEqual(body.scheduledRefresh.last, live);
   assert.deepEqual(body.scheduledRefresh.history, []);
+});
+
+test("status keeps an untracked snapshot plan visible after its process has stopped", async (t) => {
+  const { module, host } = await startServer(t, LOCAL_ENV, undefined, ({ dataDir }) => {
+    const planDir = path.join(dataDir, "snapshots", "dewiki", "2026-08");
+    fs.mkdirSync(planDir, { recursive: true });
+    fs.writeFileSync(path.join(planDir, "source-plan.json"), JSON.stringify({
+      schema_version: 1,
+      wiki: "dewiki",
+      snapshot: "2026-08",
+      layout: "yearly",
+      sources: [{ source_id: "dewiki-2001" }],
+    }));
+  });
+  const response = await invoke(module, { url: "/api/status", headers: { host } });
+  const body = JSON.parse(response.text());
+  assert.deepEqual(body.snapshotPlans.map(({ wiki, snapshot, sourceCount }) => ({ wiki, snapshot, sourceCount })), [
+    { wiki: "dewiki", snapshot: "2026-08", sourceCount: 1 },
+  ]);
+});
+
+test("status restores an interrupted admin run from the durable ledger", async (t) => {
+  const { module, host } = await startServer(t, LOCAL_ENV, undefined, ({ outputDir }) => {
+    const adminDir = path.join(outputDir, "_admin");
+    fs.mkdirSync(adminDir, { recursive: true });
+    fs.writeFileSync(path.join(adminDir, "current-job.json"), JSON.stringify({
+      schemaVersion: 1,
+      runId: "admin-dewiki-test",
+      command: "wiki-econ run dewiki",
+      action: "run",
+      wiki: "dewiki",
+      stage: "ingest",
+      state: "running",
+      running: true,
+      pid: 99,
+      startedAt: "2026-09-01T10:00:00.000Z",
+      updatedAt: "2026-09-01T10:01:00.000Z",
+      log: ["started\n"],
+    }));
+  });
+  const response = await invoke(module, { url: "/api/status", headers: { host } });
+  const body = JSON.parse(response.text());
+  assert.equal(body.wikiJobs.dewiki.state, "interrupted");
+  assert.equal(body.wikiJobs.dewiki.interrupted, true);
+  assert.equal(body.adminRuns.recent[0].runId, "admin-dewiki-test");
+  assert.equal(body.adminRuns.active, null);
+});
+
+test("status classifies fleet leases from their heartbeat", async (t) => {
+  const nowUnix = Math.floor(Date.now() / 1000);
+  const { module, host } = await startServer(t, LOCAL_ENV, undefined, ({ outputDir }) => {
+    const leaseDir = path.join(outputDir, "_fleet", "leases", "nlwiki");
+    fs.mkdirSync(leaseDir, { recursive: true });
+    fs.writeFileSync(path.join(leaseDir, "owner.json"), JSON.stringify({
+      schema_version: 1,
+      worker_id: "medium-1",
+      lease_id: "a".repeat(64),
+      claimed_at_unix: nowUnix - 20,
+      heartbeat_at_unix: nowUnix - 5,
+      lease_timeout_secs: 60,
+      task: {
+        schema_version: 1,
+        queue_algorithm_version: "fleet-queue-v2",
+        task_id: "task-nlwiki",
+        wiki: "nlwiki",
+        snapshot: "2026-08",
+        resource_class: "medium_large",
+        attempt: 0,
+      },
+    }));
+  });
+  const response = await invoke(module, { url: "/api/status", headers: { host } });
+  const body = JSON.parse(response.text());
+  assert.equal(body.fleet.counts.running, 1);
+  assert.equal(body.fleet.counts.stalled, 0);
+  assert.equal(body.fleet.work[0].wiki, "nlwiki");
+  assert.equal(body.fleet.work[0].state, "running");
+  assert.equal(body.fleet.work[0].workerId, "medium-1");
+});
+
+test("admin rejects processing a wiki missing from the lifecycle before spawning", async (t) => {
+  const lifecycle = {
+    schema_version: 1,
+    publication_contract: { datasets: {} },
+    wikis: {
+      nlwiki: {
+        refresh: "scheduled",
+        publication: "published",
+        provenance: "toolforge",
+        freshness_sla_days: 40,
+        retention: {
+          source_recoverability: "redownloadable",
+          history_input: "purge_after_ready",
+          patrol_source: "purge_after_ready",
+          computed_rollback_generations: 1,
+        },
+      },
+    },
+  };
+  const { module, host } = await startServer(t, LOCAL_ENV, lifecycle);
+  const response = await invoke(module, {
+    method: "POST",
+    url: "/api/run",
+    headers: { host, "content-type": "application/json" },
+    body: JSON.stringify({ wiki: "dewiki", version: "2026-08" }),
+  });
+  assert.equal(response.statusCode, 409);
+  const body = JSON.parse(response.text());
+  assert.equal(body.lifecycleRequired, true);
+  assert.match(body.error, /dewiki is not registered/);
+});
+
+test("admin prepare action is durable and never invokes the legacy publishing run command", async (t) => {
+  const lifecycle = {
+    schema_version: 1,
+    publication_contract: { datasets: {} },
+    wikis: {
+      nlwiki: {
+        refresh: "scheduled",
+        publication: "published",
+        provenance: "toolforge",
+        freshness_sla_days: 40,
+        retention: {
+          source_recoverability: "redownloadable",
+          history_input: "purge_after_ready",
+          patrol_source: "purge_after_ready",
+          computed_rollback_generations: 1,
+        },
+      },
+    },
+  };
+  const { module, host, outputDir } = await startServer(t, {
+    ...LOCAL_ENV,
+    WIKI_ECON_BIN: "/usr/bin/true",
+  }, lifecycle);
+  const started = await invoke(module, {
+    method: "POST",
+    url: "/api/run",
+    headers: { host, "content-type": "application/json" },
+    body: JSON.stringify({ wiki: "nlwiki", version: "2026-08" }),
+  });
+  assert.equal(started.statusCode, 200);
+  assert.match(JSON.parse(started.text()).command, /prepare-wiki nlwiki/);
+  assert.doesNotMatch(JSON.parse(started.text()).command, /\srun nlwiki/);
+
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const status = JSON.parse((await invoke(module, { url: "/api/status", headers: { host } })).text());
+  assert.equal(status.wikiJobs.nlwiki.state, "succeeded");
+  assert.match(status.wikiJobs.nlwiki.runId, /^admin-/);
+  const ledger = JSON.parse(fs.readFileSync(path.join(outputDir, "_admin", "job-history.json"), "utf8"));
+  assert.equal(ledger.jobs[0].wiki, "nlwiki");
+  assert.equal(ledger.jobs[0].state, "succeeded");
+});
+
+test("a failed spawn produces one durable terminal record", async (t) => {
+  const lifecycle = {
+    schema_version: 1,
+    publication_contract: { datasets: {} },
+    wikis: {
+      nlwiki: {
+        refresh: "scheduled",
+        publication: "published",
+        provenance: "toolforge",
+        freshness_sla_days: 40,
+      },
+    },
+  };
+  const { module, host, outputDir } = await startServer(t, {
+    ...LOCAL_ENV,
+    WIKI_ECON_BIN: "/definitely/missing/wiki-econ-test-bin",
+  }, lifecycle);
+  const started = await invoke(module, {
+    method: "POST",
+    url: "/api/run",
+    headers: { host, "content-type": "application/json" },
+    body: JSON.stringify({ wiki: "nlwiki", version: "2026-08" }),
+  });
+  assert.equal(started.statusCode, 200);
+
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const status = JSON.parse((await invoke(module, { url: "/api/status", headers: { host } })).text());
+  assert.equal(status.wikiJobs.nlwiki.state, "failed");
+  assert.match(status.wikiJobs.nlwiki.log.join(""), /failed to start/);
+  const ledger = JSON.parse(fs.readFileSync(path.join(outputDir, "_admin", "job-history.json"), "utf8"));
+  assert.equal(ledger.jobs.filter((entry) => entry.runId === status.wikiJobs.nlwiki.runId).length, 1);
 });
 
 test("public freshness status is machine-readable without an admin session", async (t) => {

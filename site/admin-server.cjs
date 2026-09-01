@@ -37,6 +37,13 @@ const DATA_DIR = resolveConfiguredPath("WIKI_ECON_DATA_DIR", "data");
 const OUTPUT_DIR = resolveConfiguredPath("WIKI_ECON_OUTPUT_DIR", "output");
 const GENERATOR_DIR = resolveConfiguredPath("WIKI_ECON_GENERATOR_DIR", path.join("site", "data-build"));
 const SITE_DIST_DIR = resolveConfiguredPath("WIKI_ECON_SITE_DIST_DIR", path.join("site", "dist"));
+const CONFIGURED_BIN = process.env.WIKI_ECON_BIN || "";
+const FLEET_QUEUE_DIR = process.env.WIKI_ECON_FLEET_QUEUE_DIR
+  ? resolveConfiguredPath("WIKI_ECON_FLEET_QUEUE_DIR", path.join("output", "_fleet"))
+  : path.join(OUTPUT_DIR, "_fleet");
+const ADMIN_STATE_DIR = path.join(OUTPUT_DIR, "_admin");
+const ADMIN_CURRENT_JOB_PATH = path.join(ADMIN_STATE_DIR, "current-job.json");
+const ADMIN_JOB_HISTORY_PATH = path.join(ADMIN_STATE_DIR, "job-history.json");
 const DEFAULT_RUNNER = {
   program: "cargo",
   args: ["run", "--release", "--"],
@@ -82,8 +89,11 @@ let lastGlobalJob = null;
 // can show more than just the most recent run per wiki without needing any
 // persistence beyond process lifetime.
 const JOB_HISTORY_LIMIT = 5;
+const ADMIN_JOB_HISTORY_LIMIT = 104;
+const PERSISTED_LOG_LIMIT_BYTES = 128 * 1024;
 let lastWikiJobHistory = new Map();
 let lastGlobalJobHistory = [];
+let jobPersistenceTimer = null;
 let manifestCache = null;
 let manifestCacheAt = 0;
 const MANIFEST_CACHE_TTL_MS = 1500;
@@ -619,7 +629,7 @@ async function finishMediawikiLogin(req, res, url) {
 }
 
 function resolveRunner() {
-  const customBin = process.env.WIKI_ECON_BIN;
+  const customBin = CONFIGURED_BIN;
   if (customBin) {
     return {
       program: customBin,
@@ -633,7 +643,7 @@ function resolveRunner() {
 function runnerInfo() {
   const runner = resolveRunner();
   return {
-    mode: process.env.WIKI_ECON_BIN ? "bin" : "cargo",
+    mode: CONFIGURED_BIN ? "bin" : "cargo",
     label: runner.label,
   };
 }
@@ -644,6 +654,161 @@ function recordJobHistory(completedJob) {
     lastWikiJobHistory.set(completedJob.wiki, history);
   } else {
     lastGlobalJobHistory = [completedJob, ...lastGlobalJobHistory].slice(0, JOB_HISTORY_LIMIT);
+  }
+  persistJobHistory();
+}
+
+function readJsonFile(filePath) {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function atomicWriteJson(filePath, value) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  const temporary = path.join(
+    path.dirname(filePath),
+    `.${path.basename(filePath)}.${process.pid}.${Date.now()}.tmp`,
+  );
+  const fd = fs.openSync(temporary, "wx", 0o600);
+  try {
+    try {
+      fs.writeFileSync(fd, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+      fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(temporary, filePath);
+  } catch (error) {
+    try {
+      fs.unlinkSync(temporary);
+    } catch (cleanupError) {
+      if (cleanupError.code !== "ENOENT") {
+        console.error(`[admin] failed to clean temporary ledger ${temporary}: ${cleanupError.message}`);
+      }
+    }
+    throw error;
+  }
+}
+
+function persistedLog(log) {
+  const text = (log || []).join("");
+  return text.length <= PERSISTED_LOG_LIMIT_BYTES
+    ? text
+    : `[earlier output omitted from the persisted admin ledger]\n${text.slice(-PERSISTED_LOG_LIMIT_BYTES)}`;
+}
+
+function serializableRunningJob() {
+  if (!currentJob) return null;
+  return {
+    schemaVersion: 1,
+    runId: currentJob.runId,
+    command: currentJob.command,
+    action: currentJob.action,
+    wiki: currentJob.wiki,
+    stage: currentJob.stage,
+    state: currentJob.cancelRequested ? "cancelling" : "running",
+    running: true,
+    pid: currentJob.pid,
+    startedAt: currentJob.startedAt,
+    updatedAt: new Date().toISOString(),
+    log: [persistedLog(jobLog)],
+    diskHeadroom: currentJob.diskHeadroom ?? null,
+    rawCleanup: currentJob.rawCleanup ?? null,
+  };
+}
+
+function persistRunningJobNow() {
+  if (jobPersistenceTimer) {
+    clearTimeout(jobPersistenceTimer);
+    jobPersistenceTimer = null;
+  }
+  const running = serializableRunningJob();
+  if (running) atomicWriteJson(ADMIN_CURRENT_JOB_PATH, running);
+}
+
+function scheduleRunningJobPersistence() {
+  if (!currentJob || jobPersistenceTimer) return;
+  jobPersistenceTimer = setTimeout(() => {
+    jobPersistenceTimer = null;
+    try {
+      persistRunningJobNow();
+    } catch (error) {
+      console.error(`[admin] failed to persist running job: ${error.message}`);
+    }
+  }, 500);
+}
+
+function clearPersistedRunningJob() {
+  if (jobPersistenceTimer) {
+    clearTimeout(jobPersistenceTimer);
+    jobPersistenceTimer = null;
+  }
+  try {
+    fs.unlinkSync(ADMIN_CURRENT_JOB_PATH);
+  } catch (error) {
+    if (error.code !== "ENOENT") throw error;
+  }
+}
+
+function persistedHistoryJobs() {
+  return [
+    ...Array.from(lastWikiJobHistory.values()).flat(),
+    ...lastGlobalJobHistory,
+  ]
+    .sort((left, right) => Date.parse(right.finishedAt || 0) - Date.parse(left.finishedAt || 0))
+    .slice(0, ADMIN_JOB_HISTORY_LIMIT);
+}
+
+function persistJobHistory() {
+  try {
+    atomicWriteJson(ADMIN_JOB_HISTORY_PATH, {
+      schemaVersion: 1,
+      generatedAt: new Date().toISOString(),
+      jobs: persistedHistoryJobs(),
+    });
+  } catch (error) {
+    console.error(`[admin] failed to persist job history: ${error.message}`);
+  }
+}
+
+function restorePersistedJobHistory() {
+  const history = readJsonFile(ADMIN_JOB_HISTORY_PATH);
+  const jobs = history?.schemaVersion === 1 && Array.isArray(history.jobs) ? history.jobs : [];
+  for (const completedJob of [...jobs].reverse()) {
+    if (!completedJob || completedJob.running || !completedJob.finishedAt) continue;
+    lastJob = completedJob;
+    if (completedJob.wiki) {
+      lastWikiJobs.set(completedJob.wiki, completedJob);
+      const wikiHistory = [completedJob, ...(lastWikiJobHistory.get(completedJob.wiki) || [])]
+        .slice(0, JOB_HISTORY_LIMIT);
+      lastWikiJobHistory.set(completedJob.wiki, wikiHistory);
+    } else {
+      lastGlobalJob = completedJob;
+      lastGlobalJobHistory = [completedJob, ...lastGlobalJobHistory].slice(0, JOB_HISTORY_LIMIT);
+    }
+  }
+
+  const abandoned = readJsonFile(ADMIN_CURRENT_JOB_PATH);
+  if (abandoned?.schemaVersion === 1 && abandoned.running) {
+    const finishedAt = new Date().toISOString();
+    const interrupted = {
+      ...abandoned,
+      state: "interrupted",
+      running: false,
+      exitCode: null,
+      interrupted: true,
+      finishedAt,
+      updatedAt: finishedAt,
+      log: [...(abandoned.log || []), "\n[admin server restarted before this run reported completion]\n"],
+    };
+    lastJob = interrupted;
+    if (interrupted.wiki) lastWikiJobs.set(interrupted.wiki, interrupted);
+    else lastGlobalJob = interrupted;
+    recordJobHistory(interrupted);
+    clearPersistedRunningJob();
   }
 }
 
@@ -689,6 +854,155 @@ function readArtifactScrubStatus() {
   }
 }
 
+function directoryJsonEntries(directory, { directories = false, limit = 100 } = {}) {
+  const entries = [];
+  for (const entry of safeReadDir(directory)) {
+    const entryPath = directories
+      ? path.join(directory, entry, "owner.json")
+      : path.join(directory, entry);
+    const value = readJsonFile(entryPath);
+    if (!value) continue;
+    let modifiedAt = null;
+    try {
+      modifiedAt = fs.statSync(entryPath).mtime.toISOString();
+    } catch {
+      modifiedAt = null;
+    }
+    entries.push({ file: entry, modifiedAt, value });
+  }
+  return entries
+    .sort((left, right) => Date.parse(right.modifiedAt || 0) - Date.parse(left.modifiedAt || 0))
+    .slice(0, limit);
+}
+
+function fleetTaskFrom(value) {
+  return value?.task || value || {};
+}
+
+function fleetWikiFrom(value, filename = "") {
+  return fleetTaskFrom(value).wiki || value?.wiki || filename.match(/^([a-z0-9_]+wiki)(?:-|\.|$)/i)?.[1] || null;
+}
+
+function readFleetStatus(now = Date.now()) {
+  const pendingEntries = directoryJsonEntries(path.join(FLEET_QUEUE_DIR, "pending"));
+  const leaseEntries = directoryJsonEntries(path.join(FLEET_QUEUE_DIR, "leases"), { directories: true });
+  const quarantineEntries = directoryJsonEntries(path.join(FLEET_QUEUE_DIR, "quarantine"), { limit: 25 });
+  const failureEntries = directoryJsonEntries(path.join(FLEET_QUEUE_DIR, "failures"), { limit: 25 });
+  // Completed tasks are append-only evidence. The dashboard needs their count,
+  // not every receipt body, so avoid decoding the full archive on each poll.
+  const completedCount = safeReadDir(path.join(FLEET_QUEUE_DIR, "completed")).length;
+
+  const byWiki = new Map();
+  for (const entry of pendingEntries) {
+    const task = fleetTaskFrom(entry.value);
+    const wiki = fleetWikiFrom(entry.value, entry.file);
+    if (!wiki) continue;
+    byWiki.set(wiki, {
+      wiki,
+      state: "queued",
+      snapshot: task.snapshot ?? null,
+      resourceClass: task.resource_class ?? null,
+      attempt: task.attempt ?? 0,
+      notBeforeUnix: task.not_before_unix ?? null,
+      updatedAt: entry.modifiedAt,
+      taskId: task.task_id ?? null,
+    });
+  }
+  for (const entry of leaseEntries) {
+    const claim = entry.value;
+    const task = fleetTaskFrom(claim);
+    const wiki = fleetWikiFrom(claim, entry.file);
+    if (!wiki) continue;
+    const heartbeatAt = Number(claim.heartbeat_at_unix || 0) * 1000;
+    const timeoutMs = Number(claim.lease_timeout_secs || 0) * 1000;
+    const heartbeatAgeMs = heartbeatAt > 0 ? Math.max(0, now - heartbeatAt) : null;
+    byWiki.set(wiki, {
+      wiki,
+      state: heartbeatAgeMs != null && timeoutMs > 0 && heartbeatAgeMs > timeoutMs ? "stalled" : "running",
+      snapshot: task.snapshot ?? null,
+      resourceClass: task.resource_class ?? null,
+      attempt: task.attempt ?? 0,
+      workerId: claim.worker_id ?? null,
+      heartbeatAt: heartbeatAt > 0 ? new Date(heartbeatAt).toISOString() : null,
+      heartbeatAgeMs,
+      leaseTimeoutSecs: claim.lease_timeout_secs ?? null,
+      updatedAt: entry.modifiedAt,
+      taskId: task.task_id ?? null,
+    });
+  }
+  for (const entry of quarantineEntries) {
+    const wiki = fleetWikiFrom(entry.value, entry.file);
+    if (!wiki || byWiki.has(wiki)) continue;
+    const task = fleetTaskFrom(entry.value);
+    byWiki.set(wiki, {
+      wiki,
+      state: "quarantined",
+      snapshot: task.snapshot ?? null,
+      resourceClass: task.resource_class ?? null,
+      attempt: task.attempt ?? null,
+      error: entry.value.error ?? entry.value.reason ?? "Fleet task requires operator review",
+      updatedAt: entry.modifiedAt,
+      taskId: task.task_id ?? null,
+    });
+  }
+
+  const work = Array.from(byWiki.values()).sort((left, right) => {
+    const priority = { stalled: 0, quarantined: 1, running: 2, queued: 3 };
+    return (priority[left.state] ?? 9) - (priority[right.state] ?? 9)
+      || String(left.wiki).localeCompare(String(right.wiki));
+  });
+  return {
+    queueDir: FLEET_QUEUE_DIR,
+    counts: {
+      queued: work.filter((entry) => entry.state === "queued").length,
+      running: work.filter((entry) => entry.state === "running").length,
+      stalled: work.filter((entry) => entry.state === "stalled").length,
+      quarantined: quarantineEntries.length,
+      recentFailures: failureEntries.length,
+      completed: completedCount,
+    },
+    work,
+    quarantine: quarantineEntries.map((entry) => ({
+      wiki: fleetWikiFrom(entry.value, entry.file),
+      updatedAt: entry.modifiedAt,
+      error: entry.value.error ?? entry.value.reason ?? null,
+      task: fleetTaskFrom(entry.value),
+    })),
+    recentFailures: failureEntries.map((entry) => ({
+      wiki: fleetWikiFrom(entry.value, entry.file),
+      updatedAt: entry.modifiedAt,
+      error: entry.value.error ?? entry.value.reason ?? null,
+      task: fleetTaskFrom(entry.value),
+    })),
+  };
+}
+
+function readSnapshotPlans() {
+  const root = path.join(DATA_DIR, "snapshots");
+  const plans = [];
+  for (const wiki of safeReadDir(root)) {
+    for (const snapshot of safeReadDir(path.join(root, wiki))) {
+      const planPath = path.join(root, wiki, snapshot, "source-plan.json");
+      const plan = readJsonFile(planPath);
+      if (!plan || plan.wiki !== wiki || plan.snapshot !== snapshot) continue;
+      let updatedAt = null;
+      try {
+        updatedAt = fs.statSync(planPath).mtime.toISOString();
+      } catch {
+        updatedAt = null;
+      }
+      plans.push({
+        wiki,
+        snapshot,
+        layout: plan.layout ?? null,
+        sourceCount: Array.isArray(plan.sources) ? plan.sources.length : null,
+        updatedAt,
+      });
+    }
+  }
+  return plans.sort((left, right) => Date.parse(right.updatedAt || 0) - Date.parse(left.updatedAt || 0));
+}
+
 function loadSupportedWikipedias() {
   if (supportedWikisCache) return supportedWikisCache;
   // Scrape the WIKIPEDIA_DATABASES constant from src/fetch.rs so the picker's
@@ -710,6 +1024,12 @@ function suggestedSnapshotVersion(now = new Date()) {
   const year = currentMonth === 0 ? now.getUTCFullYear() - 1 : now.getUTCFullYear();
   const month = currentMonth === 0 ? 12 : currentMonth;
   return `${year}-${String(month).padStart(2, "0")}`;
+}
+
+function adminRunId(action, wiki, now = new Date()) {
+  const timestamp = now.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+  const subject = wiki || "global";
+  return `admin-${timestamp}-${subject}-${action.replace(/[^a-z0-9_-]/gi, "-")}`;
 }
 
 function normalizeVersion(value) {
@@ -895,6 +1215,7 @@ function trackStageFromChunk(chunk) {
 function appendJobLog(chunk) {
   jobLog.push(chunk);
   trackStageFromChunk(chunk);
+  scheduleRunningJobPersistence();
 }
 
 function getProgress() {
@@ -906,7 +1227,12 @@ function getProgress() {
 
   const manifest = refreshManifestSafely() || { wikis: {}, merged: [] };
   const wikiStatus = wiki ? manifest.wikis?.[wiki] ?? null : null;
-  const stage = currentJob.stage || (action === "run" ? "fetch" : action);
+  const reportedStage = currentJob.stage || (action === "run" ? "fetch" : action);
+  const stage = reportedStage === "source_window"
+    ? "ingest"
+    : reportedStage === "candidate_validate"
+      ? "merge"
+      : reportedStage;
   let done = 0;
   let total = 1;
   let detail = "starting...";
@@ -1019,11 +1345,15 @@ function buildStatusPayload(req, session) {
   const scheduledRefresh = readRefreshStatus();
   const effectiveJob = currentJob
     ? {
+        runId: currentJob.runId,
         command: currentJob.command,
         action: currentJob.action,
         wiki: currentJob.wiki,
         stage: currentJob.stage,
         running: true,
+        state: currentJob.cancelRequested ? "cancelling" : "running",
+        startedAt: currentJob.startedAt,
+        updatedAt: new Date().toISOString(),
         exitCode: null,
         log: jobLog,
         progress,
@@ -1061,9 +1391,17 @@ function buildStatusPayload(req, session) {
       lifecycle: WIKI_LIFECYCLE,
       scrubStatus: readArtifactScrubStatus(),
     }),
+    fleet: readFleetStatus(),
+    snapshotPlans: readSnapshotPlans(),
+    adminRuns: {
+      active: currentJob ? serializableRunningJob() : null,
+      recent: persistedHistoryJobs(),
+    },
     auth: authStatus(session, req),
   };
 }
+
+restorePersistedJobHistory();
 
 async function handleRequest(req, res) {
   applyCors(req, res);
@@ -1172,6 +1510,7 @@ async function handleRequest(req, res) {
           currentJob.cancelRequested = true;
           currentJob.proc.kill("SIGTERM");
           appendJobLog(`\n[cancel requested for pid ${currentJob.pid}]`);
+          persistRunningJobNow();
           writeJson(res, 200, { started: false, cancelled: true, pid: currentJob.pid });
           return;
         }
@@ -1183,6 +1522,17 @@ async function handleRequest(req, res) {
       const version = normalizeVersion(params.version);
       if (version && !isValidVersion(version)) {
         writeJson(res, 400, { error: "Invalid version. Use YYYY-MM." });
+        return;
+      }
+      const runId = adminRunId(action, wiki);
+
+      const wikiActions = new Set(["fetch", "ingest", "compute", "run", "patrol-fetch", "patrol-compute"]);
+      if (wikiActions.has(action) && wiki && !WIKI_LIFECYCLE.wikis[wiki]) {
+        writeJson(res, 409, {
+          error: `${wiki} is not registered in the wiki lifecycle; add it as a qualification or managed project before processing`,
+          wiki,
+          lifecycleRequired: true,
+        });
         return;
       }
 
@@ -1217,6 +1567,22 @@ async function handleRequest(req, res) {
         case "fetch":
         case "ingest":
         case "compute":
+          commandSpec = wiki
+            ? {
+                program: resolveRunner().program,
+                args: [
+                  ...resolveRunner().args,
+                  "--data-dir", DATA_DIR,
+                  "--output-dir", OUTPUT_DIR,
+                  "--run-id", runId,
+                  action,
+                  wiki,
+                  ...(version && action === "fetch" ? ["--version", version] : []),
+                ],
+                label: `${resolveRunner().label} --data-dir ${DATA_DIR} --output-dir ${OUTPUT_DIR} --run-id ${runId} ${action} ${wiki}${version && action === "fetch" ? ` --version ${version}` : ""}`,
+              }
+            : null;
+          break;
         case "run":
           commandSpec = wiki
             ? {
@@ -1225,27 +1591,28 @@ async function handleRequest(req, res) {
                   ...resolveRunner().args,
                   "--data-dir", DATA_DIR,
                   "--output-dir", OUTPUT_DIR,
-                  action,
-                  wiki,
-                  ...(version && (action === "fetch" || action === "run") ? ["--version", version] : []),
+                  "--run-id", runId,
+                  "prepare-wiki", wiki,
+                  ...(version ? ["--version", version] : []),
+                  "--lifecycle", WIKI_LIFECYCLE_PATH,
                 ],
-                label: `${resolveRunner().label} --data-dir ${DATA_DIR} --output-dir ${OUTPUT_DIR} ${action} ${wiki}${version && (action === "fetch" || action === "run") ? ` --version ${version}` : ""}`,
+                label: `${resolveRunner().label} --data-dir ${DATA_DIR} --output-dir ${OUTPUT_DIR} --run-id ${runId} prepare-wiki ${wiki}${version ? ` --version ${version}` : ""} --lifecycle ${WIKI_LIFECYCLE_PATH}`,
               }
             : null;
           break;
         case "merge":
           commandSpec = {
             program: resolveRunner().program,
-            args: [...resolveRunner().args, "--data-dir", DATA_DIR, "--output-dir", OUTPUT_DIR, "merge"],
-            label: `${resolveRunner().label} --data-dir ${DATA_DIR} --output-dir ${OUTPUT_DIR} merge`,
+            args: [...resolveRunner().args, "--data-dir", DATA_DIR, "--output-dir", OUTPUT_DIR, "--run-id", runId, "merge"],
+            label: `${resolveRunner().label} --data-dir ${DATA_DIR} --output-dir ${OUTPUT_DIR} --run-id ${runId} merge`,
           };
           break;
         case "patrol-fetch":
           commandSpec = wiki
             ? {
                 program: resolveRunner().program,
-                args: [...resolveRunner().args, "--data-dir", DATA_DIR, "--output-dir", OUTPUT_DIR, "patrol-fetch", wiki],
-                label: `${resolveRunner().label} --data-dir ${DATA_DIR} --output-dir ${OUTPUT_DIR} patrol-fetch ${wiki}`,
+                args: [...resolveRunner().args, "--data-dir", DATA_DIR, "--output-dir", OUTPUT_DIR, "--run-id", runId, "patrol-fetch", wiki],
+                label: `${resolveRunner().label} --data-dir ${DATA_DIR} --output-dir ${OUTPUT_DIR} --run-id ${runId} patrol-fetch ${wiki}`,
               }
             : null;
           break;
@@ -1253,8 +1620,8 @@ async function handleRequest(req, res) {
           commandSpec = wiki
             ? {
                 program: resolveRunner().program,
-                args: [...resolveRunner().args, "--data-dir", DATA_DIR, "--output-dir", OUTPUT_DIR, "patrol-compute", wiki],
-                label: `${resolveRunner().label} --data-dir ${DATA_DIR} --output-dir ${OUTPUT_DIR} patrol-compute ${wiki}`,
+                args: [...resolveRunner().args, "--data-dir", DATA_DIR, "--output-dir", OUTPUT_DIR, "--run-id", runId, "patrol-compute", wiki],
+                label: `${resolveRunner().label} --data-dir ${DATA_DIR} --output-dir ${OUTPUT_DIR} --run-id ${runId} patrol-compute ${wiki}`,
               }
             : null;
           break;
@@ -1271,6 +1638,7 @@ async function handleRequest(req, res) {
       }
 
       const startTime = new Date().toISOString().replace("T", " ").replace(/\.\d+Z$/, " UTC");
+      const startedAt = new Date().toISOString();
       jobLog = [`$ ${commandSpec.label}\nStarted: ${startTime}\n`];
       jobExitCode = null;
 
@@ -1288,6 +1656,7 @@ async function handleRequest(req, res) {
         },
       });
       currentJob = {
+        runId,
         command: commandSpec.label,
         pid: proc.pid,
         proc,
@@ -1296,24 +1665,35 @@ async function handleRequest(req, res) {
         stage: action === "run" ? "fetch" : action.replace("-", "_"),
         expectedTotal: null,
         cancelRequested: false,
+        startedAt,
       };
+      persistRunningJobNow();
 
       proc.stdout.on("data", (data) => appendJobLog(data.toString()));
       proc.stderr.on("data", (data) => appendJobLog(data.toString()));
-      proc.on("close", (code, signal) => {
-        const cancelled = currentJob?.cancelRequested && signal === "SIGTERM";
-        const renderedExit = cancelled ? "cancelled" : code;
-        jobLog.push(`\n[exited with code ${renderedExit}]`);
-        jobExitCode = cancelled ? 130 : code;
+      let processFinalized = false;
+      const finalizeProcess = ({ code, signal = null, error = null }) => {
+        // A failed spawn emits both `error` and `close`. Persist one terminal
+        // record so the activity ledger cannot show duplicate failures.
+        if (processFinalized) return;
+        processFinalized = true;
+        const cancelled = !error && currentJob?.cancelRequested && signal === "SIGTERM";
+        const exitCode = cancelled ? 130 : error ? 1 : code;
+        if (error) jobLog.push(`\n[failed to start: ${error.message}]`);
+        else jobLog.push(`\n[exited with code ${cancelled ? "cancelled" : code}]`);
+        jobExitCode = exitCode;
         const completedJob = {
+          runId,
           command: commandSpec.label,
           action,
           wiki: wiki || null,
           stage: currentJob?.stage ?? action.replace("-", "_"),
-          exitCode: cancelled ? 130 : code,
+          exitCode,
           cancelled,
           running: false,
+          state: cancelled ? "cancelled" : exitCode === 0 ? "succeeded" : "failed",
           log: [...jobLog],
+          startedAt,
           finishedAt: new Date().toISOString(),
           diskHeadroom: currentJob?.diskHeadroom ?? null,
           rawCleanup: currentJob?.rawCleanup ?? null,
@@ -1326,33 +1706,11 @@ async function handleRequest(req, res) {
         }
         recordJobHistory(completedJob);
         currentJob = null;
+        clearPersistedRunningJob();
         refreshManifestSafely(true);
-      });
-      proc.on("error", (error) => {
-        jobLog.push(`\n[failed to start: ${error.message}]`);
-        jobExitCode = 1;
-        const failedJob = {
-          command: commandSpec.label,
-          action,
-          wiki: wiki || null,
-          stage: action.replace("-", "_"),
-          exitCode: 1,
-          running: false,
-          log: [...jobLog],
-          finishedAt: new Date().toISOString(),
-          diskHeadroom: currentJob?.diskHeadroom ?? null,
-          rawCleanup: currentJob?.rawCleanup ?? null,
-        };
-        lastJob = failedJob;
-        if (failedJob.wiki) {
-          lastWikiJobs.set(failedJob.wiki, failedJob);
-        } else {
-          lastGlobalJob = failedJob;
-        }
-        recordJobHistory(failedJob);
-        currentJob = null;
-        refreshManifestSafely(true);
-      });
+      };
+      proc.on("close", (code, signal) => finalizeProcess({ code, signal }));
+      proc.on("error", (error) => finalizeProcess({ code: 1, error }));
 
       writeJson(res, 200, { started: true, command: commandSpec.label, pid: proc.pid });
       console.log(`[admin] started: ${commandSpec.label} (pid ${proc.pid})`);
