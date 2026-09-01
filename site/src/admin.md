@@ -288,10 +288,12 @@ async function runCommand(action, wikiOrOptions = null) {
 }
 
 async function registerWiki(wiki, mode, resourceClass, {start = false, version = null} = {}) {
-  const result = await runCommand("register-wiki", {wiki, mode, resourceClass})
+  const result = await runCommand(start ? "onboard-wiki" : "register-wiki", {wiki, mode, resourceClass, version})
   if (!result?.registered) return
   setSelectedWiki(wiki)
-  if (start) await runCommand(mode === "qualification" ? "qualify" : "run", {wiki, version})
+  if (start && !result.queued && result.nextAction) {
+    await runCommand(result.nextAction, {wiki, version})
+  }
 }
 
 function actionLabel(action) {
@@ -309,6 +311,7 @@ function actionLabel(action) {
     case "recover-admin": return "recover operator queue"
     case "qualify": return "qualify project"
     case "register-wiki": return "add project"
+    case "onboard-wiki": return "add and start project"
     case "cleanup": return "cleanup"
     case "cancel": return "cancel"
     case "run": return "prepare update"

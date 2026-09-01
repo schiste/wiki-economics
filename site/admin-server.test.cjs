@@ -611,6 +611,47 @@ test("admin can durably register dewiki for private qualification and start it",
   assert.equal(status.wikiJobs.dewiki.state, "succeeded");
 });
 
+test("one generic onboarding transaction registers and queues any supported project", async (t) => {
+  const lifecycle = {
+    schema_version: 1,
+    publication_contract: {
+      datasets: {page_weekly_edits: {wikis: ["nlwiki"], minimum_rows_per_wiki: 1}},
+    },
+    wikis: {nlwiki: {refresh: "manual", publication: "published", provenance: "toolforge"}},
+  };
+  const {module, host, tempRoot, outputDir} = await startServer(t, {
+    ...LOCAL_ENV,
+    WIKI_ECON_ADMIN_EXECUTION_MODE: "queue",
+  }, lifecycle);
+
+  for (const [wiki, mode, expectedAction] of [
+    ["bgwiki", "qualification", "qualify"],
+    ["kowiki", "manual", "run"],
+    ["hiwiki", "scheduled", "run"],
+  ]) {
+    const response = await invoke(module, {
+      method: "POST",
+      url: "/api/onboard-wiki",
+      headers: {host, "content-type": "application/json"},
+      body: JSON.stringify({wiki, mode, resourceClass: "medium_large", version: "2026-08"}),
+    });
+    assert.equal(response.statusCode, 202);
+    const body = JSON.parse(response.text());
+    assert.equal(body.registered, true);
+    assert.equal(body.queued, true);
+    assert.equal(body.nextAction, expectedAction);
+    assert.equal(body.operation.action, expectedAction);
+    assert.equal(body.operation.wiki, wiki);
+  }
+
+  const persisted = JSON.parse(fs.readFileSync(path.join(tempRoot, "wiki-lifecycle.json"), "utf8"));
+  assert.equal(persisted.wikis.bgwiki.refresh, "qualification");
+  assert.equal(persisted.wikis.kowiki.refresh, "manual");
+  assert.equal(persisted.wikis.hiwiki.refresh, "scheduled");
+  assert.deepEqual(persisted.publication_contract.datasets.page_weekly_edits.wikis, ["hiwiki", "kowiki", "nlwiki"]);
+  assert.equal(fs.readdirSync(path.join(outputDir, "_admin", "operations", "queued")).length, 3);
+});
+
 test("production execution mode queues heavy work and supports cancellation", async (t) => {
   const lifecycle = {
     schema_version: 1,

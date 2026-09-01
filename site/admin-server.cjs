@@ -1842,6 +1842,47 @@ async function handleRequest(req, res) {
         return;
       }
 
+      if (action === "onboard-wiki") {
+        const operations = readAdminOperations();
+        if (currentJob || operations.running.length > 0) {
+          writeJson(res, 409, {error: "Project onboarding is blocked while an operator job is running"});
+          return;
+        }
+        if (!wiki) {
+          writeJson(res, 400, {error: "onboard-wiki requires a wiki parameter"});
+          return;
+        }
+        try {
+          const mode = String(params.mode || "qualification");
+          const registration = registerWikiLifecycle({
+            wiki,
+            mode,
+            resourceClass: String(params.resourceClass || "medium_large"),
+            operator,
+          });
+          const nextAction = mode === "qualification" ? "qualify" : "run";
+          if (ADMIN_EXECUTION_MODE === "queue") {
+            const request = queueAdminOperation({action: nextAction, wiki, version, requestedBy: operator});
+            writeJson(res, 202, {
+              registered: true,
+              queued: true,
+              nextAction,
+              requestId: request.requestId,
+              operation: request,
+              ...registration,
+            });
+          } else {
+            // Local development deliberately keeps the historical direct
+            // runner; the browser performs the returned follow-up only after
+            // this durable registry update has completed.
+            writeJson(res, 201, {registered: true, queued: false, nextAction, ...registration});
+          }
+        } catch (error) {
+          writeJson(res, 400, {error: error.message});
+        }
+        return;
+      }
+
       if (action === "cancel" && ADMIN_EXECUTION_MODE === "queue") {
         const cancelled = cancelAdminOperation({requestId: params.requestId || null, wiki: wiki || null});
         if (!cancelled) {
