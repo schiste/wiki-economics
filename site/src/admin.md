@@ -2,11 +2,11 @@
 title: Admin
 ---
 
-# Pipeline Admin
+# Operations
 
 <div class="page-intro">
 
-Monitor and manage the data pipeline. Each wiki now flows through six stages: **fetch** (history dumps) → **patrol fetch** (logging XML) → **ingest** (convert to parquet) → **compute** (core metrics) → **patrol compute** (patrol metrics) → **publish** (refresh site data). In local development, start the dev/operator admin server with `scripts/dev.sh` or `WIKI_ECON_ADMIN_ENABLED=1 node site/admin-server.cjs`. In VPS deployments, this page is intended to be served through the authenticated admin server.
+See what is running, what needs attention, and what is ready to publish. Every wiki follows the same six-stage path from source discovery to published site data.
 
 </div>
 
@@ -33,6 +33,11 @@ const apiAvailable = Mutable(false)
 const jobStatus = Mutable(null)
 const authState = Mutable({enabled: false, authenticated: true, loginUrl: null, logoutUrl: null, user: null})
 const liveManifest = Mutable(initialManifest)
+const selectedWikiState = Mutable(null)
+function setSelectedWiki(value, userInitiated = true) {
+  if (userInitiated) adminUiState.selectedWikiUser = true
+  selectedWikiState.value = value
+}
 const adminUiState = globalThis.__wikiEconAdminState ??= {
   showRunningLog: false,
   showJobLog: false,
@@ -41,6 +46,7 @@ const adminUiState = globalThis.__wikiEconAdminState ??= {
   snapshotVersionDirty: false,
   lastKnownRunner: null
 }
+adminUiState.selectedWikiUser ??= false
 let pollTimer = null
 const SNAPSHOT_VERSION_RE = /^\d{4}-\d{2}$/
 const languageNames = typeof Intl !== "undefined" && Intl.DisplayNames
@@ -269,19 +275,6 @@ async function runCommand(action, wikiOrOptions = null) {
   }
 }
 
-function primaryActionForStatus(status) {
-  switch (status) {
-    case "needs_fetch": return "fetch"
-    case "needs_patrol_fetch": return "patrol-fetch"
-    case "needs_ingest": return "ingest"
-    case "needs_compute": return "compute"
-    case "needs_patrol_compute": return "patrol-compute"
-    case "needs_merge": return "merge"
-    case "complete": return "run"
-    default: return null
-  }
-}
-
 function actionLabel(action) {
   switch (action) {
     case "fetch": return "fetch missing"
@@ -292,7 +285,7 @@ function actionLabel(action) {
     case "merge": return "publish"
     case "cleanup": return "cleanup"
     case "cancel": return "cancel"
-    case "run": return "rerun"
+    case "run": return "prepare update"
     default: return action
   }
 }
@@ -316,7 +309,7 @@ function actionTooltip(action) {
     case "cancel":
       return "Stop the currently running pipeline job."
     case "run":
-      return "Run the full pipeline in sequence for this wiki."
+      return "Prepare and validate a new immutable candidate for this wiki without publishing it directly."
     default:
       return ""
   }
@@ -347,7 +340,14 @@ const lifecycleStates = job?.wikiStates || currentManifest.lifecycle?.wikis || {
 const refreshWikis = job?.refreshWikis || Object.entries(lifecycleStates).filter(([, state]) => state.refresh === "scheduled").map(([wiki]) => wiki)
 const publishedWikis = job?.publishedWikis || Object.entries(lifecycleStates).filter(([, state]) => state.publication === "published").map(([wiki]) => wiki)
 const wikiJobMap = job?.wikiJobs || {}
+const wikiJobHistory = job?.wikiJobHistory || {}
 const globalJob = job?.globalJob || null
+const fleet = job?.fleet || {counts: {}, work: [], quarantine: [], recentFailures: []}
+const fleetByWiki = new Map((fleet.work || []).map((entry) => [entry.wiki, entry]))
+const adminRuns = job?.adminRuns || {active: null, recent: []}
+const freshness = job?.freshness || {status: "unknown", alerts: [], summary: {}}
+const snapshotPlans = job?.snapshotPlans || []
+const latestPlanByWiki = new Map(snapshotPlans.map((plan) => [plan.wiki, plan]))
 const supportedWikis = Array.from(new Set(job?.supportedWikis || [])).sort((a, b) => a.localeCompare(b))
 const suggestedVersion = normalizeSnapshotVersion(job?.suggestedVersion) || ""
 ```
@@ -357,68 +357,117 @@ const suggestedVersion = normalizeSnapshotVersion(job?.suggestedVersion) || ""
 <!-- ── Job output panel ───────────────────────────────────── -->
 
 ```js
-const trackedWikiEntries = Object.entries(currentWikis).sort((a, b) => a[0].localeCompare(b[0]))
+const trackedWikiEntries = Object.entries(currentWikis)
 const trackedWikiNames = trackedWikiEntries.map(([name]) => name)
 ```
 
 ```js
 const effectiveJob = job?.job || null
 const runningWiki = effectiveJob?.running ? effectiveJob.wiki ?? null : null
-const selectedWiki = (runningWiki || trackedWikiNames[0] || "—").trim().toLowerCase()
-const hasSelectedWiki = selectedWiki !== "—"
+const allWikiNames = Array.from(new Set([
+  ...trackedWikiNames,
+  ...Object.keys(lifecycleStates),
+  ...Object.keys(wikiJobMap),
+  ...Object.keys(wikiJobHistory),
+  ...(fleet.work || []).map((entry) => entry.wiki),
+  ...snapshotPlans.map((entry) => entry.wiki),
+  ...(runningWiki ? [runningWiki] : [])
+])).filter(Boolean)
 const inlineRunningJob = effectiveJob?.running && runningWiki ? effectiveJob : null
 const topLevelJob = effectiveJob && !effectiveJob.wiki ? effectiveJob : globalJob
-const wikiMap = new Map(trackedWikiEntries.map(([name, value]) => [name, {...value, tracked: true}]))
-if (runningWiki && !wikiMap.has(runningWiki)) {
-  wikiMap.set(runningWiki, emptyWikiStatus(runningWiki))
+function normalizeWikiStatus(name, value = {}) {
+  const fallback = emptyWikiStatus(name)
+  return {
+    ...fallback,
+    ...value,
+    tracked: true,
+    raw: {...fallback.raw, ...(value.raw || {})},
+    parquet: {...fallback.parquet, ...(value.parquet || {})},
+    patrol: {...fallback.patrol, ...(value.patrol || {})},
+    metrics: Array.isArray(value.metrics) ? value.metrics : [],
+    dashboard: Array.isArray(value.dashboard) ? value.dashboard : []
+  }
 }
-const wikiEntries = Array.from(wikiMap.entries()).sort(([leftName], [rightName]) => {
-  const leftPriority =
-    leftName === runningWiki ? 0 :
-    1
-  const rightPriority =
-    rightName === runningWiki ? 0 :
-    1
-  if (leftPriority !== rightPriority) return leftPriority - rightPriority
-  return leftName.localeCompare(rightName)
+const wikiMap = new Map(trackedWikiEntries.map(([name, value]) => [name, normalizeWikiStatus(name, value)]))
+for (const name of allWikiNames) {
+  if (!wikiMap.has(name)) wikiMap.set(name, emptyWikiStatus(name))
+}
+
+function latestWikiJob(name) {
+  if (name === runningWiki && inlineRunningJob) return inlineRunningJob
+  return wikiJobMap[name] || wikiJobHistory[name]?.[0] || null
+}
+
+function operationalState(name, wiki) {
+  const direct = latestWikiJob(name)
+  const fleetWork = fleetByWiki.get(name)
+  if (direct?.running) return "running"
+  if (fleetWork?.state) return fleetWork.state
+  if (direct?.interrupted) return "interrupted"
+  if (direct?.cancelled) return "cancelled"
+  if (direct && direct.exitCode !== 0 && direct.exitCode != null) return "failed"
+  if (!wiki.tracked && latestPlanByWiki.has(name)) return "planned"
+  return wiki.status || "needs_fetch"
+}
+
+const operationalPriority = {
+  stalled: 0,
+  quarantined: 1,
+  interrupted: 2,
+  failed: 3,
+  running: 4,
+  cancelling: 5,
+  queued: 6,
+  planned: 7,
+  needs_fetch: 10,
+  needs_patrol_fetch: 11,
+  needs_ingest: 12,
+  needs_compute: 13,
+  needs_patrol_compute: 14,
+  needs_merge: 15,
+  cancelled: 16,
+  complete: 30
+}
+
+const wikiEntries = Array.from(wikiMap.entries()).sort(([leftName, left], [rightName, right]) => {
+  const leftState = operationalState(leftName, left)
+  const rightState = operationalState(rightName, right)
+  return (operationalPriority[leftState] ?? 20) - (operationalPriority[rightState] ?? 20)
+    || leftName.localeCompare(rightName)
 })
 const wikiNames = wikiEntries.map(([name]) => name)
+const selectedWikiCandidate = (adminUiState.selectedWikiUser && wikiNames.includes(selectedWikiState) ? selectedWikiState : null)
+  || runningWiki
+  || wikiNames[0]
+  || "—"
+if (selectedWikiCandidate !== "—" && selectedWikiCandidate !== selectedWikiState) {
+  setSelectedWiki(selectedWikiCandidate, false)
+}
+const selectedWiki = selectedWikiCandidate.trim().toLowerCase()
+const hasSelectedWiki = selectedWiki !== "—"
 ```
 
 ```js
-display(html`<div class="admin-control-strip">
-  <div class="admin-control-chip ${apiStatus ? "online" : "offline"}">
-    <span class="admin-control-dot"></span>
-    <strong>${apiStatus ? "Admin API online" : "Admin API offline"}</strong>
+const attentionStates = new Set(["stalled", "quarantined", "interrupted", "failed"])
+const attentionCount = wikiEntries.filter(([name, wiki]) => attentionStates.has(operationalState(name, wiki))).length
+const freshnessNeedsAttention = ["critical", "warning"].includes(freshness.status)
+const operatorIssueCount = attentionCount + Number(freshnessNeedsAttention)
+const activeCount = Number(Boolean(inlineRunningJob)) + Number(fleet.counts?.running || 0)
+display(html`<div class="admin-command-header">
+  <div class="admin-command-health ${operatorIssueCount > 0 ? "attention" : "clear"}">
+    <span class="admin-command-kicker">Operator status</span>
+    <strong>${operatorIssueCount > 0 ? `${operatorIssueCount} ${operatorIssueCount === 1 ? "item needs" : "items need"} attention` : "No blocking issues"}</strong>
+    <span>${activeCount > 0 ? `${activeCount} active ${activeCount === 1 ? "run" : "runs"}` : "Pipeline idle"}</span>
   </div>
-  <div class="admin-control-chip ${runningWiki ? "running" : ""}">
-    <span class="admin-control-label">Live run</span>
-    <strong>${runningWiki || "Idle"}</strong>
-  </div>
-  <div class="admin-control-chip">
-    <span class="admin-control-label">Details wiki</span>
-    <strong>${hasSelectedWiki ? selectedWiki : "None"}</strong>
-  </div>
-  <div class="admin-control-chip">
-    <span class="admin-control-label">Last scan</span>
-    <strong>${currentManifest.generated_at}</strong>
-  </div>
-  <div class="admin-control-chip">
-    <span class="admin-control-label">Signed in</span>
-    <strong>${auth?.user?.email || (auth?.enabled ? "Required" : "Local mode")}</strong>
-    ${auth?.logoutUrl ? html`<a href=${auth.logoutUrl}>sign out</a>` : ""}
-  </div>
-  <div class="admin-control-chip">
-    <span class="admin-control-label">Environment</span>
-    <strong>${job?.environment || "unknown"}</strong>
-  </div>
-  <div class="admin-control-chip">
-    <span class="admin-control-label">Runner</span>
-    <strong>${job?.runner?.mode === "bin" ? "Compiled binary" : "cargo run"}</strong>
-  </div>
-  <div class="admin-control-chip" title="Publication and refresh scheduling are independent lifecycle states">
-    <span class="admin-control-label">Scheduled / published</span>
-    <strong>${refreshWikis.length} / ${publishedWikis.length}</strong>
+  <dl class="admin-command-facts">
+    <div><dt>API</dt><dd class=${apiStatus ? "ok" : "bad"}>${apiStatus ? "Connected" : "Offline"}</dd></div>
+    <div><dt>Fleet</dt><dd>${fleet.counts?.queued || 0} queued · ${fleet.counts?.running || 0} running</dd></div>
+    <div><dt>Coverage</dt><dd>${publishedWikis.length} published · ${refreshWikis.length} scheduled</dd></div>
+    <div><dt>Inventory scan</dt><dd>${formatRefreshTimestamp(currentManifest.generated_at)}</dd></div>
+  </dl>
+  <div class="admin-command-session">
+    <span>${auth?.user?.email || (auth?.enabled ? "Sign-in required" : "Local operator")}</span>
+    ${auth?.logoutUrl ? html`<a href=${auth.logoutUrl}>Sign out</a>` : ""}
   </div>
 </div>`)
 ```
@@ -479,13 +528,110 @@ topLevelJob
   : html`<span></span>`
 ```
 
+<div class="chart-section admin-activity-section">
+
+## Activity
+
+```js
+function operationTimestamp(operation) {
+  return operation.updatedAt || operation.finishedAt || operation.startedAt || null
+}
+
+function operationLabel(state) {
+  return ({
+    running: "Running",
+    cancelling: "Cancelling",
+    queued: "Queued",
+    stalled: "Stalled",
+    quarantined: "Quarantined",
+    succeeded: "Succeeded",
+    failed: "Failed",
+    interrupted: "Interrupted",
+    cancelled: "Cancelled"
+  })[state] || state || "Unknown"
+}
+
+function operationTone(state) {
+  if (["failed", "interrupted", "quarantined", "stalled"].includes(state)) return "danger"
+  if (["running", "cancelling"].includes(state)) return "active"
+  if (state === "queued") return "waiting"
+  if (state === "succeeded") return "success"
+  return "neutral"
+}
+
+function relativeTime(value) {
+  if (!value) return "time unknown"
+  const delta = Date.now() - Date.parse(value)
+  if (!Number.isFinite(delta)) return formatRefreshTimestamp(value)
+  const absolute = Math.abs(delta)
+  if (absolute < 60_000) return "just now"
+  if (absolute < 3_600_000) return `${Math.floor(absolute / 60_000)}m ago`
+  if (absolute < 86_400_000) return `${Math.floor(absolute / 3_600_000)}h ago`
+  return `${Math.floor(absolute / 86_400_000)}d ago`
+}
+
+const activityRows = [
+  ...(adminRuns.active ? [{...adminRuns.active, source: "operator"}] : []),
+  ...(fleet.work || []).map((entry) => ({
+    ...entry,
+    action: "prepare",
+    source: "fleet",
+    stage: entry.state === "queued" ? "waiting for worker" : "candidate preparation"
+  })),
+  ...(adminRuns.recent || []).map((entry) => ({...entry, source: "operator"}))
+]
+  .filter((entry, index, rows) => {
+    const identity = entry.runId
+      ? `run:${entry.runId}`
+      : entry.taskId
+        ? `task:${entry.taskId}`
+        : `fallback:${entry.source}:${entry.wiki || "global"}:${operationTimestamp(entry) || "unknown"}:${entry.state || "unknown"}`
+    return rows.findIndex((candidate) => {
+      const candidateIdentity = candidate.runId
+        ? `run:${candidate.runId}`
+        : candidate.taskId
+          ? `task:${candidate.taskId}`
+          : `fallback:${candidate.source}:${candidate.wiki || "global"}:${operationTimestamp(candidate) || "unknown"}:${candidate.state || "unknown"}`
+      return candidateIdentity === identity
+    }) === index
+  })
+  .sort((left, right) => {
+    const priority = {stalled: 0, quarantined: 1, interrupted: 2, failed: 3, running: 4, cancelling: 5, queued: 6}
+    return (priority[left.state] ?? 20) - (priority[right.state] ?? 20)
+      || Date.parse(operationTimestamp(right) || 0) - Date.parse(operationTimestamp(left) || 0)
+  })
+  .slice(0, 12)
+```
+
+```js
+display(activityRows.length
+  ? html`<div class="admin-activity-ledger">
+      ${activityRows.map((operation) => html`<button
+        class="admin-activity-row ${operationTone(operation.state)}"
+        onclick=${() => { if (operation.wiki) setSelectedWiki(operation.wiki) }}
+        ?disabled=${!operation.wiki}
+      >
+        <span class="admin-activity-state">${operationLabel(operation.state)}</span>
+        <span class="admin-activity-main">
+          <strong>${operation.wiki || "Global publication"}</strong>
+          <span>${operation.stage || operation.action || "pipeline"}${operation.snapshot ? ` · ${operation.snapshot}` : ""}</span>
+        </span>
+        <span class="admin-activity-source">${operation.source}</span>
+        <time datetime=${operationTimestamp(operation) || ""}>${relativeTime(operationTimestamp(operation))}</time>
+      </button>`)}
+    </div>`
+  : html`<div class="admin-empty-state"><strong>No recent operator activity.</strong><span>Scheduled and manual runs will appear here as soon as they are queued.</span></div>`)
+```
+
+</div>
+
 <!-- ── Scheduled refresh panel ─────────────────────────────── -->
 
 <div class="chart-section">
 
-## Scheduled Refresh
+## Publication health
 
-<div class="note">The <code>wiki-econ-refresh</code> Toolforge Job runs the pipeline unattended on a schedule, in a separate pod with no shared memory — this panel only knows what it has written to <code>.refresh-status.json</code>/<code>.refresh-history.jsonl</code> on the shared NFS mount, polled the same way as everything else on this page.</div>
+<div class="note">Fail-closed freshness evaluation from the durable publisher run record, artifact scrub, lifecycle SLAs, memory, disk, and browser-size evidence.</div>
 
 ```js
 // `last` is the live run record. Starting/running records carry a heartbeat
@@ -555,27 +701,31 @@ const refreshHistoryNewestFirst = [...(scheduledRefresh.history || [])].reverse(
 display(html`<div class="admin-refresh-panel">
   <div class="admin-control-strip">
     <div class="admin-control-chip">
-      <span class="admin-control-label">Schedule</span>
-      <strong>${scheduledRefresh.schedule || "Not configured"}</strong>
+      <span class="admin-control-label">Health</span>
+      <strong style=${"color:" + (freshness.status === "healthy" ? "#2e7d32" : freshness.status === "warning" ? "#b26a00" : "#c62828")}>${freshness.status}</strong>
     </div>
     <div class="admin-control-chip">
-      <span class="admin-control-label">Status</span>
+      <span class="admin-control-label">Publisher</span>
       <strong style=${"color:" + refreshHealthColors[refreshHealth.status]}>${refreshHealth.message}</strong>
     </div>
     <div class="admin-control-chip">
-      <span class="admin-control-label">Heartbeat</span>
-      <strong>${formatRefreshTimestamp(scheduledRefresh.last?.heartbeatAt || scheduledRefresh.last?.finishedAt)}</strong>
+      <span class="admin-control-label">Last publication</span>
+      <strong>${formatRefreshTimestamp(freshness.summary?.lastPublicationAt)}</strong>
     </div>
     <div class="admin-control-chip">
-      <span class="admin-control-label">Duration</span>
-      <strong>${formatRefreshDuration(scheduledRefresh.last?.durationSecs)}</strong>
+      <span class="admin-control-label">Snapshot</span>
+      <strong>${freshness.summary?.selectedSnapshot || "—"}</strong>
     </div>
     <div class="admin-control-chip">
       <span class="admin-control-label">Peak memory</span>
       <strong>${formatRefreshBytes(scheduledRefresh.last?.memoryPeakBytes)} / ${formatRefreshBytes(scheduledRefresh.last?.memoryLimitBytes)}</strong>
     </div>
   </div>
-  ${refreshHistoryNewestFirst.length ? html`<table class="admin-refresh-history">
+  ${(freshness.alerts || []).length ? html`<div class="admin-health-alerts">
+    ${(freshness.alerts || []).slice(0, 8).map((alert) => html`<div class=${alert.severity || "warning"}><strong>${alert.code.replaceAll("_", " ")}</strong><span>${alert.message}</span></div>`)}
+    ${(freshness.alerts || []).length > 8 ? html`<span>${freshness.alerts.length - 8} more alerts in the public freshness record.</span>` : ""}
+  </div>` : html`<div class="admin-health-clear">All publication checks pass.</div>`}
+  ${refreshHistoryNewestFirst.length ? html`<details class="admin-history-details"><summary>Publication history (${refreshHistoryNewestFirst.length})</summary><table class="admin-refresh-history">
     <thead><tr><th>Started</th><th>Finished</th><th>Result</th><th>Duration</th><th>Peak memory</th><th>Wikis</th></tr></thead>
     <tbody>
       ${refreshHistoryNewestFirst.map(run => html`<tr>
@@ -587,7 +737,7 @@ display(html`<div class="admin-refresh-panel">
         <td>${(run.wikis || []).join(", ") || "—"}</td>
       </tr>`)}
     </tbody>
-  </table>` : html`<p class="filter-desc">No scheduled runs recorded yet.</p>`}
+  </table></details>` : html`<p class="filter-desc">No publisher runs recorded yet.</p>`}
 </div>`)
 ```
 
@@ -599,7 +749,7 @@ display(html`<div class="admin-refresh-panel">
 
 ## Pipeline Status
 
-<div class="note">Each wiki must pass through the full history + patrol pipeline before its site data is ready. Green = done, orange = in progress or partial, red = missing.</div>
+<div class="note">Ordered by operator urgency: stalled and failed work first, then active and incomplete projects, with healthy published wikis last. Select a row for evidence and controls.</div>
 
 ```js
 const statusColors = {
@@ -610,7 +760,14 @@ const statusColors = {
   needs_compute: "#f57f17",
   needs_patrol_compute: "#8e24aa",
   needs_merge: "#1565c0",
-  running: "#1565c0"
+  running: "#1565c0",
+  queued: "#5c6bc0",
+  planned: "#607d8b",
+  stalled: "#c62828",
+  quarantined: "#c62828",
+  interrupted: "#c62828",
+  failed: "#c62828",
+  cancelled: "#795548"
 }
 const statusLabels = {
   complete: "Complete",
@@ -620,7 +777,14 @@ const statusLabels = {
   needs_compute: "Needs compute",
   needs_patrol_compute: "Needs patrol compute",
   needs_merge: "Needs merge",
-  running: "Running"
+  running: "Running",
+  queued: "Queued",
+  planned: "Plan only",
+  stalled: "Stalled",
+  quarantined: "Quarantined",
+  interrupted: "Interrupted",
+  failed: "Failed",
+  cancelled: "Cancelled"
 }
 
 const pipelineSteps = [
@@ -644,6 +808,7 @@ function stageStateForWiki(wiki, stageKey, isRunning, runningProgress) {
   const runningStage = runningProgress?.stage || null
   const active = isRunning && runningStage === stageKey
   if (active) return "active"
+  if (!isRunning && wiki.status === "complete") return "done"
 
   switch (stageKey) {
     case "fetch":
@@ -694,149 +859,75 @@ function stageCaption(wiki, stageKey) {
   }
 }
 
-function stageAction(stageKey, state) {
-  if (state === "blocked" || state === "active") return null
-  switch (stageKey) {
-    case "fetch":
-      return {action: "fetch", label: "fetch missing", needsWiki: true}
-    case "patrol_fetch":
-      return {action: "patrol-fetch", label: "fetch patrol", needsWiki: true}
-    case "ingest":
-      return {action: "ingest", label: "ingest", needsWiki: true}
-    case "compute":
-      return {action: "compute", label: "compute", needsWiki: true}
-    case "patrol_compute":
-      return {action: "patrol-compute", label: "compute patrol", needsWiki: true}
-    case "merge":
-      return {action: "merge", label: "publish", needsWiki: false}
-    default:
-      return null
-  }
-}
-
 ```
 
 ```js
 const statusSummary = summarizeStatuses(wikiEntries)
+const pipelineFilterInput = Inputs.radio(
+  ["All", "Attention", "Active", "Incomplete"],
+  {label: "Show", value: "All"}
+)
+const pipelineFilter = view(pipelineFilterInput)
+```
+
+```js
+const visibleWikiEntries = wikiEntries.filter(([name, wiki]) => {
+  const state = operationalState(name, wiki)
+  if (pipelineFilter === "Attention") return attentionStates.has(state)
+  if (pipelineFilter === "Active") return ["running", "queued", "stalled"].includes(state)
+  if (pipelineFilter === "Incomplete") return state !== "complete"
+  return true
+})
+
 display(html`<div class="admin-pipeline-board">
-  <div class="admin-pipeline-summary">
-    <div class="admin-summary-card admin-summary-primary compact">
-      <span class="admin-summary-label">Wikis</span>
-      <strong>${wikiEntries.length}</strong>
-      <span class="admin-summary-meta">Updated ${currentManifest.generated_at}</span>
-    </div>
-    ${Object.entries(statusLabels)
-      .filter(([key]) => key !== "running")
-      .map(([key, label]) => html`<div class="admin-summary-card compact">
-        <span class="admin-summary-dot" style=${`background:${statusColors[key]}`}></span>
-        <span class="admin-summary-label">${label}</span>
-        <strong>${statusSummary[key] || 0}</strong>
-      </div>`)}
+  <div class="admin-pipeline-summary concise">
+    <div><strong>${wikiEntries.length}</strong><span>known wikis</span></div>
+    <div><strong>${activeCount}</strong><span>running</span></div>
+    <div class=${attentionCount ? "danger" : ""}><strong>${attentionCount}</strong><span>need attention</span></div>
+    <div><strong>${statusSummary.complete || 0}</strong><span>complete</span></div>
   </div>
-
-  ${wikiEntries.length === 0
-    ? html`<div class="admin-empty-state">No wikis are currently present in the manifest. Run a pipeline or refresh merged outputs to populate this view.</div>`
-    : html`<div class="admin-pipeline-cards">
-        ${wikiEntries.map(([name, w]) => {
+  <div class="admin-pipeline-toolbar">${pipelineFilterInput}<span>${visibleWikiEntries.length} shown</span></div>
+  ${visibleWikiEntries.length === 0
+    ? html`<div class="admin-empty-state"><strong>Nothing matches this view.</strong><span>Choose another filter to inspect the full inventory.</span></div>`
+    : html`<div class="admin-pipeline-list" role="list">
+        ${visibleWikiEntries.map(([name, wiki]) => {
           const isRunning = inlineRunningJob && name === runningWiki
-          const statusKey = isRunning ? "running" : w.status
-          const runningProgress = isRunning ? inlineRunningJob.progress : null
-          const rowJob = isRunning ? inlineRunningJob : wikiJobMap[name] || null
+          const state = operationalState(name, wiki)
           const lifecycle = lifecycleStates[name] || null
-          const lifecycleColor = lifecycle?.refresh === "scheduled" ? "#2e7d32" : lifecycle?.refresh === "paused" ? "#795548" : "#546e7a"
-          return html`<article class="pipeline-card status-${statusKey} ${isRunning ? "running" : ""}">
-            <div class="pipeline-card-top">
-              <div class="pipeline-card-title">
-                <div class="pipeline-card-heading">
-                  <strong>${name}</strong>
-                  ${!w.tracked ? html`<span class="pipeline-ghost-badge">Not tracked yet</span>` : ""}
-                  <span class="admin-badge" style="background:${statusColors[statusKey]}">${statusLabels[statusKey]}</span>
-                  ${lifecycle ? html`<span class="admin-badge" style=${`background:${lifecycleColor}`}>${lifecycle.refresh}</span>` : ""}
-                  ${lifecycle?.imported_cutoff ? html`<span class="pipeline-inline-meta">historical cutoff <code>${lifecycle.imported_cutoff}</code></span>` : ""}
-                  ${lifecycle?.freshness && lifecycle.refresh === "scheduled" ? html`<span class="pipeline-inline-meta">freshness ${lifecycle.freshness}</span>` : ""}
-                  ${w.raw.version ? html`<span class="pipeline-inline-meta">dump <code>${w.raw.version}</code></span>` : ""}
-                  ${w.raw.size && w.raw.size !== "0" ? html`<span class="pipeline-inline-meta">raw ${w.raw.size}</span>` : ""}
-                  ${w.parquet.size && w.parquet.size !== "0 B" ? html`<span class="pipeline-inline-meta">parquet ${w.parquet.size}</span>` : ""}
-                </div>
-              </div>
-              ${isRunning
-                ? html`<div class="pipeline-card-actions">
-                    <button class="admin-btn danger" title=${actionTooltip("cancel")} onclick=${() => runCommand("cancel")}>cancel</button>
-                  </div>`
-                : ""}
-            </div>
-
-            <div class="pipeline-stage-grid">
+          const direct = latestWikiJob(name)
+          const fleetWork = fleetByWiki.get(name)
+          const plan = latestPlanByWiki.get(name)
+          const stageDetail = isRunning
+            ? `${inlineRunningJob.progress?.stage || inlineRunningJob.stage || "starting"} · ${inlineRunningJob.progress?.pct || 0}%`
+            : fleetWork
+            ? `${fleetWork.workerId || fleetWork.resourceClass || "fleet"}${fleetWork.snapshot ? ` · ${fleetWork.snapshot}` : ""}`
+            : direct
+            ? `${direct.stage || direct.action || "run"} · ${relativeTime(operationTimestamp(direct))}`
+            : plan && !wiki.tracked
+            ? `${plan.snapshot} plan · no worker`
+            : lifecycle?.freshness || lifecycle?.refresh || "inventory"
+          return html`<button
+            class="admin-pipeline-row ${selectedWiki === name ? "selected" : ""} state-${state}"
+            role="listitem"
+            onclick=${() => { setSelectedWiki(name) }}
+          >
+            <span class="admin-pipeline-identity">
+              <strong>${name}</strong>
+              <small>${wikipediaProjectLabel(name).replace(` (${name})`, "")}</small>
+            </span>
+            <span class="admin-pipeline-state">
+              <i style=${`--state-color:${statusColors[state] || "#607d8b"}`}></i>
+              <span><strong>${statusLabels[state] || operationLabel(state)}</strong><small>${stageDetail}</small></span>
+            </span>
+            <span class="admin-stage-rail" aria-label="Pipeline stages">
               ${pipelineSteps.map((step) => {
-                const state = stageStateForWiki(w, step.key, isRunning, runningProgress)
-                const stageCmd = stageAction(step.key, state)
-                return html`<div class="pipeline-stage ${state}">
-                  <span class="pipeline-stage-label">${step.label}</span>
-                  <strong>${stageCaption(w, step.key)}</strong>
-                  ${stageCmd
-                    ? html`<button
-                        class="pipeline-stage-action"
-                        title=${actionTooltipWithApi(stageCmd.action, apiStatus)}
-                        ?disabled=${!apiStatus}
-                        onclick=${() => runCommand(stageCmd.action, stageCmd.needsWiki ? {wiki: name, version: preferredSnapshotVersion(w)} : null)}
-                      >${stageCmd.label}</button>`
-                    : ""}
-                </div>`
+                const stageState = stageStateForWiki(wiki, step.key, isRunning, inlineRunningJob?.progress)
+                return html`<i class=${stageState} title=${`${step.label}: ${stageCaption(wiki, step.key)}`}><span>${step.label}</span></i>`
               })}
-            </div>
-
-            ${isRunning
-              ? html`<div class="pipeline-live-panel">
-                  <div class="admin-progress">
-                    <div class="admin-progress-info">
-                      <span class="admin-progress-stage">${runningProgress.stage || "starting"}</span>
-                      <span class="admin-progress-detail">${runningProgress.detail}</span>
-                      <span class="admin-progress-pct">${runningProgress.pct}%</span>
-                    </div>
-                    <div class="admin-progress-track">
-                      <div class="admin-progress-fill" style=${"width:" + runningProgress.pct + "%"}></div>
-                    </div>
-                  </div>
-                  <div class="admin-log-section">
-                    <div class="admin-log-bar">
-                      <button
-                        class="admin-log-toggle admin-log-button"
-                        data-expand-label="Show live output"
-                        data-collapse-label="Hide live output"
-                        data-lines=${String((rowJob?.log || []).length)}
-                        onclick=${(event) => toggleLogSection(event, `row-log-${name}`)}
-                      >
-                        ${adminUiState[`row-log-${name}`] ? "Hide live output" : "Show live output"} (${(rowJob?.log || []).length} lines)
-                      </button>
-                      ${copyIconButton(() => (rowJob?.log || []).join(""), `Copy ${name} live log`)}
-                    </div>
-                    <pre class="admin-job-log" ?hidden=${!adminUiState[`row-log-${name}`]}>${(rowJob?.log || []).join("")}</pre>
-                  </div>
-                </div>`
-              : rowJob
-              ? html`<div class="pipeline-live-panel ${rowJob.cancelled ? "failed" : rowJob.exitCode === 0 ? "success" : "failed"}">
-                  <div class="admin-job-header compact">
-                    <strong>${rowJob.cancelled ? "Cancelled" : rowJob.exitCode === 0 ? "Completed" : "Failed"}</strong>
-                    <code>${rowJob.command || ""}</code>
-                  </div>
-                  <div class="admin-log-section">
-                    <div class="admin-log-bar">
-                      <button
-                        class="admin-log-toggle admin-log-button"
-                        data-expand-label="Show output"
-                        data-collapse-label="Hide output"
-                        data-lines=${String((rowJob.log || []).length)}
-                        onclick=${(event) => toggleLogSection(event, `row-log-${name}`)}
-                      >
-                        ${adminUiState[`row-log-${name}`] ? "Hide output" : "Show output"} (${(rowJob.log || []).length} lines)
-                      </button>
-                      ${copyIconButton(() => (rowJob.log || []).join(""), `Copy ${name} log`)}
-                    </div>
-                    <pre class="admin-job-log" ?hidden=${!adminUiState[`row-log-${name}`]}>${(rowJob.log || []).join("")}</pre>
-                  </div>
-                </div>`
-              : ""}
-          </article>`
+            </span>
+            <span class="admin-pipeline-lifecycle">${lifecycle?.refresh || (plan ? "unmanaged" : "unknown")}</span>
+            <span class="admin-row-chevron" aria-hidden="true">›</span>
+          </button>`
         })}
       </div>`}
 </div>`)
@@ -848,9 +939,9 @@ display(html`<div class="admin-pipeline-board">
 
 <div class="chart-section">
 
-## Fetch a New Wiki
+## Start or inspect a project
 
-<div class="note">Pick a Wikipedia language edition to start the full pipeline (fetch → patrol fetch → ingest → compute → patrol compute → publish). The picker covers every Wikipedia language edition published in the <code>mediawiki_history</code> dumps; the CLI will surface a clear error if a particular wiki uses a partitioning shape (monthly for <code>enwiki</code>, etc.) that the local fetch planner does not yet support.</div>
+<div class="note">Only lifecycle-registered projects should be processed. An unregistered project can be inspected, but must first be added as a publication-invisible qualification project before downloading or computing data.</div>
 
 ```js
 // Searchable project picker. It starts empty by default, opens the full
@@ -973,6 +1064,8 @@ const onboardingWiki = onboardingWikiOptionsSet.has(onboardingWikiTrimmed)
   ? onboardingWikiTrimmed
   : null
 const onboardingWikiUnknown = onboardingWikiTrimmed.length > 0 && onboardingWiki === null
+const onboardingLifecycle = onboardingWiki ? lifecycleStates[onboardingWiki] || null : null
+const onboardingCanRun = Boolean(onboardingLifecycle && ["scheduled", "manual", "qualification"].includes(onboardingLifecycle.refresh))
 ```
 
 ```js
@@ -997,15 +1090,16 @@ html`<div class="admin-fetch-actions">
   ${!apiStatus ? adminConnectionWarning() : ""}
   ${onboardingWikiOptions.length === 0 ? html`<div class="warning">No supported onboarding projects were reported by the admin API yet.</div>` : ""}
   ${onboardingWikiUnknown ? html`<div class="warning">No project matches <code>${onboardingWikiTrimmed}</code>. Click the field to reopen the full project list, or keep typing to narrow it down.</div>` : ""}
-  <button class="admin-btn primary" ?disabled=${!apiStatus} onclick=${() => {
+  ${onboardingWiki && !onboardingLifecycle ? html`<div class="warning"><strong>${onboardingWiki} is not registered.</strong> Its snapshot may be inspected, but processing is blocked until it is added to the lifecycle registry as a qualification or managed project.</div>` : ""}
+  <button class="admin-btn primary" ?disabled=${!apiStatus || !onboardingCanRun} onclick=${() => {
         const w = onboardingWiki
         const version = normalizeSnapshotVersion(snapshotVersion)
         if (!w) { alert("Pick a supported Wikipedia project."); return }
-        if (confirm("Run full pipeline for " + w + (version ? " at snapshot " + version : "") + "? This will download dumps, ingest, compute, and merge.")) {
+        if (confirm("Prepare a publication candidate for " + w + (version ? " at snapshot " + version : "") + "? This downloads, ingests, computes, and validates without publishing directly.")) {
           runCommand("run", {wiki: w, version})
         }
-      }} title=${actionTooltipWithApi("run", apiStatus)}>Run full pipeline</button>
-  <button class="admin-btn" ?disabled=${!apiStatus} title=${actionTooltipWithApi("fetch", apiStatus)} onclick=${() => {
+      }} title=${onboardingCanRun ? actionTooltipWithApi("run", apiStatus) : "Register this project in the lifecycle before processing"}>Prepare project data</button>
+  <button class="admin-btn" ?disabled=${!apiStatus || !onboardingCanRun} title=${onboardingCanRun ? actionTooltipWithApi("fetch", apiStatus) : "Register this project in the lifecycle before downloading data"} onclick=${() => {
         const w = onboardingWiki
         const version = normalizeSnapshotVersion(snapshotVersion)
         if (!w) { alert("Pick a supported Wikipedia project."); return }
@@ -1026,11 +1120,41 @@ html`<div class="admin-fetch-actions">
 
 ## Wiki Details
 
-<div class="note">Wiki Details follows the running wiki when a job is active; otherwise it shows the first tracked wiki.</div>
+<div class="note">Select a project in Pipeline Status to inspect its evidence and use stage-level recovery controls.</div>
 
 ```js
 const w = hasSelectedWiki ? wikiMap.get(selectedWiki) || emptyWikiStatus(selectedWiki) : emptyWikiStatus("—")
 const selectedWikiRunning = Boolean(job?.running && job?.progress?.wiki === selectedWiki)
+const selectedLifecycle = lifecycleStates[selectedWiki] || null
+const selectedJob = latestWikiJob(selectedWiki)
+const selectedFleetWork = fleetByWiki.get(selectedWiki) || null
+const selectedPlan = latestPlanByWiki.get(selectedWiki) || null
+```
+
+```js
+!hasSelectedWiki
+  ? html`<span></span>`
+  : html`<div class="admin-wiki-focus">
+      <div><span>Project</span><strong>${wikipediaProjectLabel(selectedWiki)}</strong></div>
+      <div><span>Operational state</span><strong>${statusLabels[operationalState(selectedWiki, w)] || operationLabel(operationalState(selectedWiki, w))}</strong></div>
+      <div><span>Lifecycle</span><strong>${selectedLifecycle?.refresh || "Not registered"}</strong></div>
+      <div><span>Snapshot</span><strong>${selectedPlan?.snapshot || w.snapshot?.version || w.raw?.version || "—"}</strong></div>
+    </div>
+    ${!selectedLifecycle ? html`<div class="warning"><strong>Processing is blocked.</strong> ${selectedWiki} has a source plan but is not registered in the lifecycle. Add it as a publication-invisible qualification project before continuing.</div>` : ""}
+    ${selectedFleetWork ? html`<div class="admin-run-evidence">
+      <strong>Fleet ${operationLabel(selectedFleetWork.state)}</strong>
+      <span>${selectedFleetWork.workerId || selectedFleetWork.resourceClass || "waiting for worker"} · snapshot ${selectedFleetWork.snapshot || "unknown"}${selectedFleetWork.heartbeatAt ? ` · heartbeat ${relativeTime(selectedFleetWork.heartbeatAt)}` : ""}</span>
+    </div>` : ""}
+    ${selectedJob ? html`<div class="admin-run-evidence ${operationTone(selectedJob.state || (selectedJob.exitCode === 0 ? "succeeded" : "failed"))}">
+      <div><strong>${operationLabel(selectedJob.state || (selectedJob.running ? "running" : selectedJob.exitCode === 0 ? "succeeded" : "failed"))}</strong><span>${selectedJob.stage || selectedJob.action || "pipeline"} · ${relativeTime(operationTimestamp(selectedJob))}</span></div>
+      <div class="admin-log-section">
+        <div class="admin-log-bar">
+          <button class="admin-log-toggle admin-log-button" data-lines=${String((selectedJob.log || []).length)} onclick=${(event) => toggleLogSection(event, `details-log-${selectedWiki}`)}>${adminUiState[`details-log-${selectedWiki}`] ? "Hide output" : "Show output"} (${(selectedJob.log || []).length} chunks)</button>
+          ${copyIconButton(() => (selectedJob.log || []).join(""), `Copy ${selectedWiki} run log`)}
+        </div>
+        <pre class="admin-job-log" ?hidden=${!adminUiState[`details-log-${selectedWiki}`]}>${(selectedJob.log || []).join("")}</pre>
+      </div>
+    </div>` : ""}`
 ```
 
 ### Maintenance
@@ -1039,13 +1163,14 @@ const selectedWikiRunning = Boolean(job?.running && job?.progress?.wiki === sele
 !hasSelectedWiki
   ? html`<span></span>`
   : html`${!apiStatus ? adminConnectionWarning() : ""}
+    ${!selectedLifecycle ? html`<p class="filter-desc">Stage actions are unavailable until this project has a lifecycle policy.</p>` : ""}
     <div class="admin-maintenance-actions">
-      <button class="admin-btn primary" ?disabled=${!apiStatus} title=${actionTooltipWithApi("run", apiStatus)} onclick=${() => runCommand("run", {wiki: selectedWiki, version: preferredSnapshotVersion(w)})}>run full pipeline</button>
-      <button class="admin-btn" ?disabled=${!apiStatus} title=${actionTooltipWithApi("fetch", apiStatus)} onclick=${() => runCommand("fetch", {wiki: selectedWiki, version: preferredSnapshotVersion(w)})}>fetch missing</button>
-      <button class="admin-btn" ?disabled=${!apiStatus} title=${actionTooltipWithApi("patrol-fetch", apiStatus)} onclick=${() => runCommand("patrol-fetch", selectedWiki)}>fetch patrol</button>
-      <button class="admin-btn" ?disabled=${!apiStatus} title=${actionTooltipWithApi("ingest", apiStatus)} onclick=${() => runCommand("ingest", selectedWiki)}>ingest</button>
-      <button class="admin-btn" ?disabled=${!apiStatus} title=${actionTooltipWithApi("compute", apiStatus)} onclick=${() => runCommand("compute", selectedWiki)}>compute core</button>
-      <button class="admin-btn" ?disabled=${!apiStatus} title=${actionTooltipWithApi("patrol-compute", apiStatus)} onclick=${() => runCommand("patrol-compute", selectedWiki)}>compute patrol only</button>
+      <button class="admin-btn primary" ?disabled=${!apiStatus || !selectedLifecycle} title=${actionTooltipWithApi("run", apiStatus)} onclick=${() => runCommand("run", {wiki: selectedWiki, version: preferredSnapshotVersion(w)})}>prepare update</button>
+      <button class="admin-btn" ?disabled=${!apiStatus || !selectedLifecycle} title=${actionTooltipWithApi("fetch", apiStatus)} onclick=${() => runCommand("fetch", {wiki: selectedWiki, version: preferredSnapshotVersion(w)})}>fetch missing</button>
+      <button class="admin-btn" ?disabled=${!apiStatus || !selectedLifecycle} title=${actionTooltipWithApi("patrol-fetch", apiStatus)} onclick=${() => runCommand("patrol-fetch", selectedWiki)}>fetch patrol</button>
+      <button class="admin-btn" ?disabled=${!apiStatus || !selectedLifecycle} title=${actionTooltipWithApi("ingest", apiStatus)} onclick=${() => runCommand("ingest", selectedWiki)}>ingest</button>
+      <button class="admin-btn" ?disabled=${!apiStatus || !selectedLifecycle} title=${actionTooltipWithApi("compute", apiStatus)} onclick=${() => runCommand("compute", selectedWiki)}>compute core</button>
+      <button class="admin-btn" ?disabled=${!apiStatus || !selectedLifecycle} title=${actionTooltipWithApi("patrol-compute", apiStatus)} onclick=${() => runCommand("patrol-compute", selectedWiki)}>compute patrol only</button>
       <button class="admin-btn" ?disabled=${!apiStatus} title=${actionTooltipWithApi("merge", apiStatus)} onclick=${() => runCommand("merge")}>publish site data</button>
       <button class="admin-btn" ?disabled=${!apiStatus} title=${actionTooltipWithApi("cleanup", apiStatus)} onclick=${() => runCommand("cleanup", selectedWiki)}>cleanup</button>
       ${selectedWikiRunning ? html`<button class="admin-btn danger" ?disabled=${!apiStatus} title=${actionTooltipWithApi("cancel", apiStatus)} onclick=${() => runCommand("cancel")}>cancel running job</button>` : ""}
@@ -1059,7 +1184,7 @@ const selectedWikiRunning = Boolean(job?.running && job?.progress?.wiki === sele
   ? html`<div class="warning">No wiki is available yet. Start a pipeline run to populate this section.</div>`
   : w.raw.files > 0
   ? html`<p><strong>${w.raw.files}</strong> dump files, <strong>${w.raw.size}</strong> total · dump version <code>${w.raw.version}</code>
-    ${apiStatus ? html` · <button class="admin-btn refetch small" title=${actionTooltipWithApi("fetch", apiStatus)} onclick=${() => { if(confirm("Fetch missing dump files for " + selectedWiki + "? Existing files will be skipped.")) runCommand("fetch", {wiki: selectedWiki, version: preferredSnapshotVersion(w)}) }}>fetch missing</button>` : ""}
+    ${apiStatus && selectedLifecycle ? html` · <button class="admin-btn refetch small" title=${actionTooltipWithApi("fetch", apiStatus)} onclick=${() => { if(confirm("Fetch missing dump files for " + selectedWiki + "? Existing files will be skipped.")) runCommand("fetch", {wiki: selectedWiki, version: preferredSnapshotVersion(w)}) }}>fetch missing</button>` : ""}
     </p>
     ${Inputs.table(w.raw.details.map(d => ({file: d.name, size: d.size, downloaded: d.date})), {
       header: {file: "File", size: "Size", downloaded: "Downloaded"},
@@ -1069,7 +1194,7 @@ const selectedWikiRunning = Boolean(job?.running && job?.progress?.wiki === sele
   ? html`<p>The raw transport files were cleaned after validating snapshot <code>${w.snapshot.version}</code>.
       The immutable ingest generation remains ready with <strong>${w.ingest?.rows || 0}</strong> rows.</p>`
   : html`<div class="warning">No raw dumps or validated snapshot found for <strong>${selectedWiki}</strong>.</div>
-    ${apiStatus
+    ${apiStatus && selectedLifecycle
       ? html`<button class="admin-btn primary" title=${actionTooltipWithApi("fetch", apiStatus)} onclick=${() => runCommand("fetch", {wiki: selectedWiki, version: preferredSnapshotVersion(w)})}>Fetch missing</button>`
       : html`<pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && ${runnerCommand()} ${cliFlags(currentManifest)} fetch ${selectedWiki}</pre>`
     }`
@@ -1091,7 +1216,7 @@ const selectedWikiRunning = Boolean(job?.running && job?.progress?.wiki === sele
       <li>autopatrol groups: ${w.patrol?.groups ? "ready" : "missing"}</li>
     </ul>`
   : html`<div class="warning">No patrol data found for <strong>${selectedWiki}</strong>.</div>
-    ${apiStatus
+    ${apiStatus && selectedLifecycle
       ? html`<button class="admin-btn" title=${actionTooltipWithApi("patrol-fetch", apiStatus)} onclick=${() => runCommand("patrol-fetch", selectedWiki)}>Fetch patrol data</button>`
       : html`<pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && ${runnerCommand()} ${cliFlags(currentManifest)} patrol-fetch ${selectedWiki}</pre>`
     }`
@@ -1106,14 +1231,14 @@ const selectedWikiRunning = Boolean(job?.running && job?.progress?.wiki === sele
   ? html`<p><strong>${w.parquet.done}/${w.parquet.total}</strong> files converted, <strong>${w.parquet.size}</strong> total${
       w.parquet.in_progress > 0 ? html` — <span style="color:orange">ingesting (${w.parquet.in_progress} in progress)</span>` : ""
     }${w.parquet.missing.length > 0 ? html` — <span style="color:tomato">${w.parquet.missing.length} missing</span>` : ""
-    }${apiStatus && w.parquet.missing.length > 0 ? html` · <button class="admin-btn small" title=${actionTooltipWithApi("ingest", apiStatus)} onclick=${() => runCommand("ingest", selectedWiki)}>ingest missing</button>` : ""}
+    }${apiStatus && selectedLifecycle && w.parquet.missing.length > 0 ? html` · <button class="admin-btn small" title=${actionTooltipWithApi("ingest", apiStatus)} onclick=${() => runCommand("ingest", selectedWiki)}>ingest missing</button>` : ""}
     </p>
     ${w.parquet.missing.length > 0
       ? html`<details><summary>Missing files</summary><ul>${w.parquet.missing.map(f => html`<li><code>${f}</code></li>`)}</ul></details>`
       : ""
     }`
   : html`<div class="warning">No ingested data for <strong>${selectedWiki}</strong>.</div>
-    ${apiStatus
+    ${apiStatus && selectedLifecycle
       ? html`<button class="admin-btn" title=${actionTooltipWithApi("ingest", apiStatus)} onclick=${() => runCommand("ingest", selectedWiki)}>Ingest ${selectedWiki}</button>`
       : html`<pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && ${runnerCommand()} ${cliFlags(currentManifest)} ingest ${selectedWiki}</pre>`
     }`
@@ -1128,9 +1253,9 @@ const selectedWikiRunning = Boolean(job?.running && job?.progress?.wiki === sele
   ? html`${Inputs.table(w.metrics.map(m => ({metric: m.name, size: m.size_kb + " KB"})), {
       header: {metric: "Metric", size: "Size"}, sort: "metric"
     })}
-    ${apiStatus ? html`<button class="admin-btn small" title=${actionTooltipWithApi("compute", apiStatus)} onclick=${() => runCommand("compute", selectedWiki)}>recompute</button>` : ""}`
+    ${apiStatus && selectedLifecycle ? html`<button class="admin-btn small" title=${actionTooltipWithApi("compute", apiStatus)} onclick=${() => runCommand("compute", selectedWiki)}>recompute</button>` : ""}`
   : html`<div class="warning">No metrics computed for <strong>${selectedWiki}</strong>.</div>
-    ${apiStatus
+    ${apiStatus && selectedLifecycle
       ? html`<button class="admin-btn" title=${actionTooltipWithApi("compute", apiStatus)} onclick=${() => runCommand("compute", selectedWiki)}>Compute ${selectedWiki}</button>`
       : html`<pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && ${runnerCommand()} ${cliFlags(currentManifest)} compute ${selectedWiki}</pre>`
     }`
@@ -1832,12 +1957,187 @@ currentManifest.merged.length > 0
   max-height: none;
 }
 [data-theme="dark"] .admin-job-log { background: #1a1a1a; }
+.admin-command-header {
+  --admin-ink: #243347;
+  --admin-blue: #315b8a;
+  --admin-line: color-mix(in srgb, var(--theme-foreground-faintest) 88%, transparent);
+  display: grid;
+  grid-template-columns: minmax(13rem, 0.8fr) minmax(28rem, 2fr) auto;
+  align-items: stretch;
+  border-block: 1px solid var(--admin-line);
+  margin: 1rem 0 1.5rem;
+  background: color-mix(in srgb, var(--theme-background) 96%, #e8eef5 4%);
+}
+.admin-command-health {
+  display: grid;
+  align-content: center;
+  gap: 0.12rem;
+  padding: 1rem 1.1rem;
+  border-left: 5px solid #2e7d32;
+}
+.admin-command-health.attention { border-left-color: #c13c32; }
+.admin-command-health strong { font-size: 1.05rem; }
+.admin-command-health > span:last-child { color: var(--theme-foreground-muted); font-size: 0.78rem; }
+.admin-command-kicker {
+  color: var(--theme-foreground-muted);
+  font-size: 0.64rem;
+  font-weight: 750;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+.admin-command-facts {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 0;
+  border-inline: 1px solid var(--admin-line);
+}
+.admin-command-facts > div { padding: 0.9rem 1rem; border-left: 1px solid var(--admin-line); }
+.admin-command-facts > div:first-child { border-left: 0; }
+.admin-command-facts dt,
+.admin-wiki-focus span {
+  color: var(--theme-foreground-muted);
+  font-size: 0.64rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+.admin-command-facts dd { margin: 0.3rem 0 0; font-size: 0.78rem; font-weight: 650; }
+.admin-command-facts dd.ok { color: #2e7d32; }
+.admin-command-facts dd.bad { color: #c62828; }
+.admin-command-session { display: grid; align-content: center; gap: 0.2rem; padding: 0.9rem 1rem; font-size: 0.75rem; }
+.admin-activity-ledger { border-top: 1px solid var(--theme-foreground-faintest); }
+.admin-activity-row {
+  appearance: none;
+  width: 100%;
+  display: grid;
+  grid-template-columns: 7.5rem minmax(12rem, 1fr) 5rem 6rem;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.72rem 0.35rem 0.72rem 0.85rem;
+  border: 0;
+  border-bottom: 1px solid var(--theme-foreground-faintest);
+  border-left: 3px solid transparent;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.admin-activity-row:hover { background: color-mix(in srgb, #315b8a 6%, transparent); }
+.admin-activity-row:disabled { cursor: default; opacity: 1; }
+.admin-activity-row.danger { border-left-color: #c13c32; background: color-mix(in srgb, #c13c32 4%, transparent); }
+.admin-activity-row.active { border-left-color: #315b8a; }
+.admin-activity-row.waiting { border-left-color: #7e6ab0; }
+.admin-activity-row.success { border-left-color: #2e7d32; }
+.admin-activity-state { font-size: 0.72rem; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; }
+.admin-activity-main { display: grid; min-width: 0; }
+.admin-activity-main strong { font-family: var(--sans-serif); font-size: 0.88rem; }
+.admin-activity-main span,
+.admin-activity-source,
+.admin-activity-row time { color: var(--theme-foreground-muted); font-size: 0.72rem; }
+.admin-activity-source { text-transform: uppercase; letter-spacing: 0.06em; }
+.admin-pipeline-summary.concise {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  border-block: 1px solid var(--theme-foreground-faintest);
+}
+.admin-pipeline-summary.concise > div { display: flex; align-items: baseline; gap: 0.45rem; padding: 0.7rem 0.85rem; border-left: 1px solid var(--theme-foreground-faintest); }
+.admin-pipeline-summary.concise > div:first-child { border-left: 0; }
+.admin-pipeline-summary.concise strong { font-size: 1.15rem; font-variant-numeric: tabular-nums; }
+.admin-pipeline-summary.concise span { color: var(--theme-foreground-muted); font-size: 0.7rem; }
+.admin-pipeline-summary.concise .danger strong { color: #c62828; }
+.admin-pipeline-toolbar { display: flex; justify-content: space-between; align-items: end; gap: 1rem; }
+.admin-pipeline-toolbar form { margin: 0; }
+.admin-pipeline-toolbar > span { color: var(--theme-foreground-muted); font-size: 0.72rem; }
+.admin-pipeline-list { border-top: 1px solid var(--theme-foreground-faintest); }
+.admin-pipeline-row {
+  appearance: none;
+  width: 100%;
+  display: grid;
+  grid-template-columns: minmax(10rem, 1.15fr) minmax(10rem, 1fr) minmax(18rem, 2fr) 6rem 1rem;
+  align-items: center;
+  gap: 0.9rem;
+  min-height: 4.2rem;
+  padding: 0.55rem 0.75rem;
+  border: 0;
+  border-bottom: 1px solid var(--theme-foreground-faintest);
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.admin-pipeline-row:hover,
+.admin-pipeline-row.selected { background: color-mix(in srgb, #315b8a 7%, transparent); }
+.admin-pipeline-row.selected { box-shadow: inset 3px 0 #315b8a; }
+.admin-pipeline-identity,
+.admin-pipeline-state,
+.admin-pipeline-state > span { display: grid; min-width: 0; }
+.admin-pipeline-identity strong { font-size: 0.9rem; }
+.admin-pipeline-identity small,
+.admin-pipeline-state small { overflow: hidden; color: var(--theme-foreground-muted); font-size: 0.68rem; text-overflow: ellipsis; white-space: nowrap; }
+.admin-pipeline-state { grid-template-columns: 0.55rem minmax(0, 1fr); align-items: center; gap: 0.5rem; }
+.admin-pipeline-state > i { width: 0.5rem; height: 0.5rem; border-radius: 50%; background: var(--state-color); box-shadow: 0 0 0 3px color-mix(in srgb, var(--state-color) 14%, transparent); }
+.admin-pipeline-state strong { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; }
+.admin-stage-rail { display: grid; grid-template-columns: repeat(6, minmax(1.3rem, 1fr)); gap: 0.3rem; }
+.admin-stage-rail > i { position: relative; height: 0.35rem; border-radius: 99px; background: color-mix(in srgb, var(--theme-foreground-faintest) 90%, transparent); }
+.admin-stage-rail > i.done { background: #3d8a53; }
+.admin-stage-rail > i.active { background: #315b8a; animation: admin-pulse 1.7s ease-in-out infinite; }
+.admin-stage-rail > i.todo { background: #d98c2f; }
+.admin-stage-rail > i.blocked { background: color-mix(in srgb, var(--theme-foreground-muted) 25%, transparent); }
+.admin-stage-rail > i span { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+@keyframes admin-pulse { 50% { opacity: 0.45; } }
+.admin-pipeline-lifecycle { color: var(--theme-foreground-muted); font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.05em; }
+.admin-row-chevron { color: var(--theme-foreground-muted); font-size: 1.25rem; }
+.admin-empty-state { display: grid; gap: 0.2rem; border-block: 1px solid var(--theme-foreground-faintest); }
+.admin-wiki-focus { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-bottom: 0.75rem; border-block: 1px solid var(--theme-foreground-faintest); }
+.admin-wiki-focus > div { display: grid; gap: 0.25rem; padding: 0.75rem 0.85rem; border-left: 1px solid var(--theme-foreground-faintest); }
+.admin-wiki-focus > div:first-child { border-left: 0; }
+.admin-wiki-focus strong { font-size: 0.78rem; }
+.admin-run-evidence { display: grid; gap: 0.45rem; margin: 0.65rem 0; border-left: 3px solid #315b8a; background: color-mix(in srgb, #315b8a 5%, transparent); padding: 0.75rem 0.85rem; }
+.admin-run-evidence.danger { border-left-color: #c13c32; background: color-mix(in srgb, #c13c32 5%, transparent); }
+.admin-run-evidence.success { border-left-color: #2e7d32; }
+.admin-run-evidence > div:first-child { display: flex; justify-content: space-between; gap: 1rem; }
+.admin-run-evidence span { color: var(--theme-foreground-muted); font-size: 0.74rem; }
+.admin-btn:disabled { cursor: not-allowed; opacity: 0.48; transform: none; box-shadow: none; }
+.admin-refresh-panel { overflow-x: auto; }
+.admin-health-alerts { display: grid; border-top: 1px solid var(--theme-foreground-faintest); }
+.admin-health-alerts > div { display: grid; grid-template-columns: minmax(10rem, 0.45fr) minmax(16rem, 1.55fr); gap: 0.8rem; padding: 0.55rem 0.75rem; border-bottom: 1px solid var(--theme-foreground-faintest); border-left: 3px solid #c13c32; }
+.admin-health-alerts > div.warning { border-left-color: #d98c2f; margin: 0; border-radius: 0; background: transparent; }
+.admin-health-alerts strong { font-size: 0.68rem; letter-spacing: 0.05em; text-transform: uppercase; }
+.admin-health-alerts span { color: var(--theme-foreground-muted); font-size: 0.74rem; }
+.admin-health-clear { padding: 0.65rem 0.8rem; border-left: 3px solid #2e7d32; color: #2e7d32; font-size: 0.76rem; font-weight: 700; }
+.admin-history-details { margin-top: 0.25rem; }
+.admin-history-details summary { cursor: pointer; color: var(--theme-foreground-muted); font-size: 0.74rem; font-weight: 700; }
+[data-theme="dark"] .admin-command-header { --admin-ink: #d7e2ee; background: color-mix(in srgb, var(--theme-background) 96%, #26384c 4%); }
+@media (prefers-reduced-motion: reduce) {
+  .admin-stage-rail > i.active,
+  .admin-job-panel.running .admin-progress-fill { animation: none; }
+}
 @media (max-width: 1100px) {
+  .admin-command-header { grid-template-columns: 1fr; }
+  .admin-command-facts { border: 0; border-block: 1px solid var(--admin-line); }
+  .admin-command-session { grid-auto-flow: column; justify-content: start; }
+  .admin-pipeline-row { grid-template-columns: minmax(9rem, 1fr) minmax(9rem, 1fr) minmax(14rem, 1.5fr) 5rem 1rem; }
   .pipeline-stage-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 }
 @media (max-width: 760px) {
+  .admin-command-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .admin-command-facts > div:nth-child(3) { border-left: 0; }
+  .admin-command-facts > div:nth-child(n+3) { border-top: 1px solid var(--admin-line); }
+  .admin-activity-row { grid-template-columns: 6.5rem minmax(0, 1fr) 4.5rem; gap: 0.6rem; }
+  .admin-activity-source { display: none; }
+  .admin-pipeline-summary.concise { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .admin-pipeline-summary.concise > div:nth-child(3) { border-left: 0; }
+  .admin-pipeline-summary.concise > div:nth-child(n+3) { border-top: 1px solid var(--theme-foreground-faintest); }
+  .admin-pipeline-row { grid-template-columns: minmax(7.8rem, 0.8fr) minmax(8.5rem, 1fr) 1rem; gap: 0.65rem; }
+  .admin-stage-rail { grid-column: 1 / -1; grid-row: 2; }
+  .admin-pipeline-lifecycle { display: none; }
+  .admin-row-chevron { grid-column: 3; grid-row: 1; }
+  .admin-wiki-focus { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .admin-wiki-focus > div:nth-child(3) { border-left: 0; }
+  .admin-wiki-focus > div:nth-child(n+3) { border-top: 1px solid var(--theme-foreground-faintest); }
+  .admin-run-evidence > div:first-child { display: grid; }
   .pipeline-stage-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
