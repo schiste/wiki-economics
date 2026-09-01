@@ -43,7 +43,6 @@ const adminUiState = globalThis.__wikiEconAdminState ??= {
   showJobLog: false,
   onboardingWiki: null,
   snapshotVersion: "",
-  snapshotVersionDirty: false,
   lastKnownRunner: null,
   onboardingMode: "qualification",
   onboardingResourceClass: "medium_large",
@@ -1234,7 +1233,6 @@ const snapshotVersionInput = Inputs.text({
 })
 snapshotVersionInput.addEventListener("input", () => {
   adminUiState.snapshotVersion = snapshotVersionInput.value
-  adminUiState.snapshotVersionDirty = true
 })
 const snapshotVersion = view(snapshotVersionInput)
 ```
