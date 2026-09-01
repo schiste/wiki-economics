@@ -3191,6 +3191,27 @@ mod tests {
     }
 
     #[test]
+    fn exact_snapshot_validation_accepts_and_receipts_a_complete_inventory() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let transport = FakeTransport::with_head_outcomes([ok_head(Some(42), true)]);
+
+        validate_completed_snapshot_with_transport(
+            &transport,
+            "http://example.invalid",
+            data_dir.path(),
+            "simplewiki",
+            "2026-08",
+        )?;
+
+        let plan =
+            SnapshotPlan::resolve_from_base("http://example.invalid", "simplewiki", "2026-08")?;
+        assert!(read_remote_inventory(data_dir.path(), &plan)?.is_some());
+        assert_eq!(transport.get_requests(), 0);
+        assert_eq!(transport.head_requests(), 1);
+        Ok(())
+    }
+
+    #[test]
     fn cached_snapshot_resolution_reuses_completed_fallback_inventory() -> Result<()> {
         let data_dir = TestDir::new()?;
         let now = Utc.with_ymd_and_hms(2026, 8, 22, 0, 0, 0).unwrap();
