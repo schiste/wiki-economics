@@ -106,11 +106,9 @@ function wikipediaProjectSearchText(wiki) {
 }
 
 function preferredSnapshotVersion(wikiStatus = null) {
-  return validSnapshotVersion(wikiStatus?.snapshot?.version)
-    ?? validSnapshotVersion(wikiStatus?.raw?.version)
-    ?? validSnapshotVersion(adminUiState.snapshotVersion)
-    ?? validSnapshotVersion(jobStatus.value?.suggestedVersion)
-    ?? null
+  // A version is a strict operator pin, never a calendar-derived default.
+  // Leaving it blank delegates selection to Rust's completed-dump resolver.
+  return validSnapshotVersion(adminUiState.snapshotVersion) ?? null
 }
 
 function setLogButtonLabel(button, expanded) {
@@ -402,7 +400,6 @@ const freshness = job?.freshness || {status: "unknown", alerts: [], summary: {}}
 const snapshotPlans = job?.snapshotPlans || []
 const latestPlanByWiki = new Map(snapshotPlans.map((plan) => [plan.wiki, plan]))
 const supportedWikis = Array.from(new Set(job?.supportedWikis || [])).sort((a, b) => a.localeCompare(b))
-const suggestedVersion = normalizeSnapshotVersion(job?.suggestedVersion) || ""
 ```
 
 <p class="filter-desc">Last scanned: ${currentManifest.generated_at}${apiStatus ? html` · <span style="color:#2e7d32">API connected</span>` : html` · ${adminConnectionHelp()}`}</p>
@@ -1229,13 +1226,10 @@ const onboardingResourceClass = view(onboardingResourceInput)
 ```
 
 ```js
-const snapshotVersionDefault = adminUiState.snapshotVersionDirty
-  ? adminUiState.snapshotVersion
-  : (adminUiState.snapshotVersion || suggestedVersion || "")
 const snapshotVersionInput = Inputs.text({
-  label: "Snapshot",
-  value: snapshotVersionDefault,
-  placeholder: suggestedVersion || "YYYY-MM",
+  label: "Exact snapshot (optional)",
+  value: adminUiState.snapshotVersion,
+  placeholder: "Latest completed snapshot",
   submit: false
 })
 snapshotVersionInput.addEventListener("input", () => {
@@ -1244,6 +1238,8 @@ snapshotVersionInput.addEventListener("input", () => {
 })
 const snapshotVersion = view(snapshotVersionInput)
 ```
+
+<div class="admin-field-help">Leave this blank to resolve and pin the latest completed Wikimedia dump. Enter <code>YYYY-MM</code> only when intentionally reproducing an exact snapshot; unavailable or incomplete pins fail before download.</div>
 
 ```js
 html`<div class="admin-onboarding-console">
@@ -1258,7 +1254,7 @@ html`<div class="admin-onboarding-console">
     <button class="admin-btn" ?disabled=${!apiStatus} onclick=${() => registerWiki(onboardingWiki, onboardingMode, onboardingResourceClass)}>Add project</button>
     <button class="admin-btn primary" ?disabled=${!apiStatus} onclick=${() => {
       const version = normalizeSnapshotVersion(snapshotVersion)
-      if (confirm(`Add ${onboardingWiki} and start its ${onboardingMode} pipeline${version ? ` for ${version}` : ""}?`)) {
+      if (confirm(`Add ${onboardingWiki} and start its ${onboardingMode} pipeline${version ? ` for exact snapshot ${version}` : " using the latest completed snapshot"}?`)) {
         registerWiki(onboardingWiki, onboardingMode, onboardingResourceClass, {start: true, version})
       }
     }}>Add & start ${onboardingMode === "qualification" ? "qualification" : "preparation"}</button>
@@ -1267,7 +1263,7 @@ html`<div class="admin-onboarding-console">
         const version = normalizeSnapshotVersion(snapshotVersion)
         if (!w) { alert("Pick a supported Wikipedia project."); return }
         const action = onboardingLifecycle?.refresh === "qualification" ? "qualify" : "run"
-        if (confirm(`${action === "qualify" ? "Qualify" : "Prepare"} ${w}${version ? ` at snapshot ${version}` : ""}?`)) {
+        if (confirm(`${action === "qualify" ? "Qualify" : "Prepare"} ${w}${version ? ` at exact snapshot ${version}` : " using the latest completed snapshot"}?`)) {
           runCommand(action, {wiki: w, version})
         }
       }}>${onboardingLifecycle?.refresh === "qualification" ? "Run full qualification" : "Prepare project data"}</button>`}
@@ -2302,6 +2298,7 @@ currentManifest.merged.length > 0
 .admin-registration-callout { display: grid; gap: 0.2rem; padding: 0.75rem 0.9rem; border-left: 3px solid #d98c2f; background: color-mix(in srgb, #d98c2f 7%, transparent); }
 .admin-registration-callout.registered { border-left-color: #3d8a53; background: color-mix(in srgb, #3d8a53 7%, transparent); }
 .admin-registration-callout span { color: var(--theme-foreground-muted); font-size: 0.76rem; }
+.admin-field-help { max-width: 48rem; margin-top: -0.4rem; color: var(--theme-foreground-muted); font-size: 0.72rem; line-height: 1.45; }
 .admin-registration-policy { display: grid; grid-template-columns: minmax(16rem, 1.5fr) minmax(13rem, 1fr); gap: 0.8rem; max-width: 48rem; }
 .admin-registration-policy form { margin: 0; }
 .admin-empty-state { display: grid; gap: 0.2rem; border-block: 1px solid var(--theme-foreground-faintest); }

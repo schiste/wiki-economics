@@ -1316,13 +1316,6 @@ function loadSupportedWikipedias() {
   return supportedWikisCache;
 }
 
-function suggestedSnapshotVersion(now = new Date()) {
-  const currentMonth = now.getUTCMonth();
-  const year = currentMonth === 0 ? now.getUTCFullYear() - 1 : now.getUTCFullYear();
-  const month = currentMonth === 0 ? 12 : currentMonth;
-  return `${year}-${String(month).padStart(2, "0")}`;
-}
-
 function adminRunId(action, wiki, now = new Date()) {
   const timestamp = now.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
   const subject = wiki || "global";
@@ -1674,7 +1667,6 @@ function buildStatusPayload(req, session) {
     wikiJobHistory: Object.fromEntries(lastWikiJobHistory.entries()),
     globalJobHistory: lastGlobalJobHistory,
     supportedWikis: loadSupportedWikipedias(),
-    suggestedVersion: suggestedSnapshotVersion(),
     adminEnabled: ADMIN_ENABLED,
     adminPort: PORT,
     environment: RUNTIME_ENV,

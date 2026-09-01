@@ -189,6 +189,7 @@ test("local mode exposes the legacy /api/status endpoint without auth", async (t
   assert.equal(body.auth.enabled, false);
   assert.equal(body.auth.authenticated, true);
   assert.equal(body.adminEnabled, true);
+  assert.equal("suggestedVersion" in body, false, "calendar months must not masquerade as completed snapshots");
 });
 
 test("hosted mode redirects /admin to the login page when no session is present", async (t) => {
