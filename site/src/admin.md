@@ -104,7 +104,7 @@ function wikipediaProjectSearchText(wiki) {
   return `${wiki} ${wikipediaProjectLabel(wiki)}`.toLowerCase()
 }
 
-function preferredSnapshotVersion(wikiStatus = null) {
+function preferredSnapshotVersion() {
   // A version is a strict operator pin, never a calendar-derived default.
   // Leaving it blank delegates selection to Rust's completed-dump resolver.
   return validSnapshotVersion(adminUiState.snapshotVersion) ?? null
@@ -971,7 +971,7 @@ function pipelineDossier(name, wiki, state, lifecycle, direct, fleetWork, plan, 
           <span>${step.label}</span><strong>${stageCaption(wiki, step.key)}</strong>
           <button class="admin-stage-button" ?disabled=${!canRun || stepState === "blocked" || operationActive}
             title=${actionTooltipWithApi(action, apiStatus)}
-            onclick=${() => runCommand(action, action === "merge" ? null : {wiki: name, version: action === "fetch" ? preferredSnapshotVersion(wiki) : null})}>
+            onclick=${() => runCommand(action, action === "merge" ? null : {wiki: name, version: action === "fetch" ? preferredSnapshotVersion() : null})}>
             ${stepState === "done" ? "Run again" : "Run stage"}
           </button>
         </div>`
@@ -982,7 +982,7 @@ function pipelineDossier(name, wiki, state, lifecycle, direct, fleetWork, plan, 
         if (confirm(`Add ${name} as a publication-invisible qualification project?`)) registerWiki(name, "qualification", "medium_large")
       }}>Add as qualification</button>` : html`
         <button class="admin-btn primary" ?disabled=${!apiStatus || operationActive}
-          onclick=${() => runCommand(isQualification ? "qualify" : "run", {wiki: name, version: preferredSnapshotVersion(wiki)})}>
+          onclick=${() => runCommand(isQualification ? "qualify" : "run", {wiki: name, version: preferredSnapshotVersion()})}>
           ${isQualification ? "Run full qualification" : "Prepare full update"}
         </button>
         <button class="admin-btn" ?disabled=${!apiStatus || operationActive} onclick=${() => runCommand("patrol-rebuild", name)}>Rebuild patrol</button>
@@ -1335,8 +1335,8 @@ const selectedPlan = latestPlanByWiki.get(selectedWiki) || null
   : html`${!apiStatus ? adminConnectionWarning() : ""}
     ${!selectedLifecycle ? html`<p class="filter-desc">Stage actions are unavailable until this project has a lifecycle policy.</p>` : ""}
     <div class="admin-maintenance-actions">
-      <button class="admin-btn primary" ?disabled=${!apiStatus || !selectedLifecycle || selectedWikiRunning} title=${actionTooltipWithApi(selectedLifecycle?.refresh === "qualification" ? "qualify" : "run", apiStatus)} onclick=${() => runCommand(selectedLifecycle?.refresh === "qualification" ? "qualify" : "run", {wiki: selectedWiki, version: preferredSnapshotVersion(w)})}>${selectedLifecycle?.refresh === "qualification" ? "run full qualification" : "prepare update"}</button>
-      <button class="admin-btn" ?disabled=${!apiStatus || !selectedLifecycle} title=${actionTooltipWithApi("fetch", apiStatus)} onclick=${() => runCommand("fetch", {wiki: selectedWiki, version: preferredSnapshotVersion(w)})}>fetch missing</button>
+      <button class="admin-btn primary" ?disabled=${!apiStatus || !selectedLifecycle || selectedWikiRunning} title=${actionTooltipWithApi(selectedLifecycle?.refresh === "qualification" ? "qualify" : "run", apiStatus)} onclick=${() => runCommand(selectedLifecycle?.refresh === "qualification" ? "qualify" : "run", {wiki: selectedWiki, version: preferredSnapshotVersion()})}>${selectedLifecycle?.refresh === "qualification" ? "run full qualification" : "prepare update"}</button>
+      <button class="admin-btn" ?disabled=${!apiStatus || !selectedLifecycle} title=${actionTooltipWithApi("fetch", apiStatus)} onclick=${() => runCommand("fetch", {wiki: selectedWiki, version: preferredSnapshotVersion()})}>fetch missing</button>
       <button class="admin-btn" ?disabled=${!apiStatus || !selectedLifecycle} title=${actionTooltipWithApi("patrol-fetch", apiStatus)} onclick=${() => runCommand("patrol-fetch", selectedWiki)}>fetch patrol</button>
       <button class="admin-btn" ?disabled=${!apiStatus || !selectedLifecycle} title=${actionTooltipWithApi("ingest", apiStatus)} onclick=${() => runCommand("ingest", selectedWiki)}>ingest</button>
       <button class="admin-btn" ?disabled=${!apiStatus || !selectedLifecycle} title=${actionTooltipWithApi("compute", apiStatus)} onclick=${() => runCommand("compute", selectedWiki)}>compute core</button>
@@ -1359,7 +1359,7 @@ const selectedPlan = latestPlanByWiki.get(selectedWiki) || null
   ? html`<div class="warning">No wiki is available yet. Start a pipeline run to populate this section.</div>`
   : w.raw.files > 0
   ? html`<p><strong>${w.raw.files}</strong> dump files, <strong>${w.raw.size}</strong> total · dump version <code>${w.raw.version}</code>
-    ${apiStatus && selectedLifecycle ? html` · <button class="admin-btn refetch small" title=${actionTooltipWithApi("fetch", apiStatus)} onclick=${() => { if(confirm("Fetch missing dump files for " + selectedWiki + "? Existing files will be skipped.")) runCommand("fetch", {wiki: selectedWiki, version: preferredSnapshotVersion(w)}) }}>fetch missing</button>` : ""}
+    ${apiStatus && selectedLifecycle ? html` · <button class="admin-btn refetch small" title=${actionTooltipWithApi("fetch", apiStatus)} onclick=${() => { if(confirm("Fetch missing dump files for " + selectedWiki + "? Existing files will be skipped.")) runCommand("fetch", {wiki: selectedWiki, version: preferredSnapshotVersion()}) }}>fetch missing</button>` : ""}
     </p>
     ${Inputs.table(w.raw.details.map(d => ({file: d.name, size: d.size, downloaded: d.date})), {
       header: {file: "File", size: "Size", downloaded: "Downloaded"},
@@ -1370,7 +1370,7 @@ const selectedPlan = latestPlanByWiki.get(selectedWiki) || null
       The immutable ingest generation remains ready with <strong>${w.ingest?.rows || 0}</strong> rows.</p>`
   : html`<div class="warning">No raw dumps or validated snapshot found for <strong>${selectedWiki}</strong>.</div>
     ${apiStatus && selectedLifecycle
-      ? html`<button class="admin-btn primary" title=${actionTooltipWithApi("fetch", apiStatus)} onclick=${() => runCommand("fetch", {wiki: selectedWiki, version: preferredSnapshotVersion(w)})}>Fetch missing</button>`
+      ? html`<button class="admin-btn primary" title=${actionTooltipWithApi("fetch", apiStatus)} onclick=${() => runCommand("fetch", {wiki: selectedWiki, version: preferredSnapshotVersion()})}>Fetch missing</button>`
       : html`<pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && ${runnerCommand()} ${cliFlags(currentManifest)} fetch ${selectedWiki}</pre>`
     }`
 ```

@@ -3209,6 +3209,17 @@ mod tests {
         assert!(read_remote_inventory(data_dir.path(), &plan)?.is_some());
         assert_eq!(transport.get_requests(), 0);
         assert_eq!(transport.head_requests(), 1);
+
+        let cached_transport = FakeTransport::default();
+        validate_completed_snapshot_with_transport(
+            &cached_transport,
+            "http://example.invalid",
+            data_dir.path(),
+            "simplewiki",
+            "2026-08",
+        )
+        .expect("the authenticated inventory should make validation a no-op");
+        assert_eq!(cached_transport.head_requests(), 0);
         Ok(())
     }
 
