@@ -5014,21 +5014,23 @@ mod tests {
     fn publication_rejects_collapsed_anonymous_editor_identities() -> Result<()> {
         let root = TestDir::new()?;
         let path = root.path().join("gdp_user_type_share.parquet");
-        let mut collapsed = df!(
-            "year_month" => ["2025-06"],
-            "user_type" => ["anonymous"],
-            "edits" => [SUBSTANTIAL_ANONYMOUS_EDITS as u32],
-            "editors" => [1_u32],
-        )?;
+        let collapsed_columns = vec![
+            Column::new("year_month".into(), ["2025-06"]),
+            Column::new("user_type".into(), ["anonymous"]),
+            Column::new("edits".into(), [SUBSTANTIAL_ANONYMOUS_EDITS as u32]),
+            Column::new("editors".into(), [1_u32]),
+        ];
+        let mut collapsed = DataFrame::new_infer_height(collapsed_columns)?;
         ParquetWriter::new(File::create(&path)?).finish(&mut collapsed)?;
         assert!(validate_editor_identity_semantics(&path).is_err());
 
-        let mut valid = df!(
-            "year_month" => ["2025-06", "2025-07"],
-            "user_type" => ["anonymous", "registered"],
-            "edits" => [SUBSTANTIAL_ANONYMOUS_EDITS as u32, 5_u32],
-            "editors" => [2_u32, 1_u32],
-        )?;
+        let valid_columns = vec![
+            Column::new("year_month".into(), ["2025-06", "2025-07"]),
+            Column::new("user_type".into(), ["anonymous", "registered"]),
+            Column::new("edits".into(), [SUBSTANTIAL_ANONYMOUS_EDITS as u32, 5_u32]),
+            Column::new("editors".into(), [2_u32, 1_u32]),
+        ];
+        let mut valid = DataFrame::new_infer_height(valid_columns)?;
         ParquetWriter::new(File::create(&path)?).finish(&mut valid)?;
         validate_editor_identity_semantics(&path)
     }

@@ -4046,14 +4046,16 @@ fn compute_all_selected(
         "selected production cross-snapshot cache policy"
     );
 
-    let analytical_partitions_scanned = compute_all_incremental_cached(
+    let cross_snapshot_cache = cross_snapshot.as_ref();
+    let compute_result = compute_all_incremental_cached(
         wiki,
         data_dir,
         output_dir,
         snapshot,
         plan,
-        cross_snapshot.as_ref(),
-    )?;
+        cross_snapshot_cache,
+    );
+    let analytical_partitions_scanned = compute_result?;
     if plan.page_week.must_compute() {
         compute_page_weekly_edits_for_snapshot_cached(
             wiki,
@@ -4304,7 +4306,7 @@ mod tests {
 
     #[test]
     fn period_workforce_deduplicates_namespaces_and_months() -> Result<()> {
-        let base = DataFrame::new_infer_height(vec![
+        let columns = vec![
             Column::new(
                 "year_month".into(),
                 vec!["2024-01", "2024-01", "2024-02", "2024-02"],
@@ -4318,7 +4320,8 @@ mod tests {
             Column::new("page_namespace".into(), vec![0_i32, 1, 0, 0]),
             Column::new("revision_id".into(), vec![1_i64, 2, 3, 4]),
             Column::new("revision_text_bytes_diff".into(), vec![1_i64; 4]),
-        ])?;
+        ];
+        let base = DataFrame::new_infer_height(columns)?;
         let editor_months = gdp_editor_month_frame(&base)?;
 
         let monthly = gdp_activity_tiers_for_period(&editor_months, ActivityPeriod::Month)?;

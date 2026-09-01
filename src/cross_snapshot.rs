@@ -655,10 +655,8 @@ pub(crate) fn qualify(
             qualification_sha256: String::new(),
         };
         qualification.qualification_sha256 = qualification.canonical_hash()?;
-        atomic_json(
-            &production_qualification_path(data_dir, wiki),
-            &qualification,
-        )?;
+        let qualification_path = production_qualification_path(data_dir, wiki);
+        atomic_json(&qualification_path, &qualification)?;
         Ok(report)
     })();
     if result.is_err() {
@@ -725,6 +723,8 @@ mod tests {
         fs::remove_file(&receipt)?;
         assert!(cache.load("monthly", "v1", digest, "gdp")?.is_none());
         assert_eq!(cache.stats().missing_receipts, 1);
+        assert!(!cache.reusable("monthly", "v1", digest, "gdp")?);
+        assert_eq!(cache.stats().missing_receipts, 2);
         fs::write(&receipt, &receipt_bytes)?;
         fs::write(&receipt, b"not json")?;
         assert!(cache.load("monthly", "v1", digest, "gdp").is_err());
