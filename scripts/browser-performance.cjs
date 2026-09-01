@@ -114,6 +114,34 @@ async function waitForFile(file, timeoutMs = 10000) {
   throw new Error(`timed out waiting for ${file}`);
 }
 
+async function launchChrome({budgets, attempts = 3, startupTimeoutMs = 15000,
+  executable = chromeExecutable(), spawnChrome = spawn, awaitActivePort = waitForFile} = {}) {
+  const failures = [];
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    const userData = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-chrome-"));
+    const activePort = path.join(userData, "DevToolsActivePort");
+    const stderr = [];
+    const chrome = spawnChrome(executable, ["--headless=new", "--no-sandbox", "--disable-gpu", "--disable-background-networking",
+      "--disable-default-apps", "--disable-extensions", "--disable-sync", "--metrics-recording-only", "--no-first-run",
+      `--js-flags=--max-old-space-size=${budgets.reference_device.javascript_heap_limit_mib}`,
+      "--remote-debugging-port=0", `--user-data-dir=${userData}`, "about:blank"], {stdio: ["ignore", "ignore", "pipe"]});
+    chrome.stderr?.on("data", chunk => {
+      if (stderr.reduce((bytes, part) => bytes + part.length, 0) < 8192) stderr.push(Buffer.from(chunk));
+    });
+    try {
+      const [port] = (await awaitActivePort(activePort, startupTimeoutMs)).trim().split("\n");
+      if (!/^\d+$/.test(port)) throw new Error(`invalid DevTools port ${JSON.stringify(port)}`);
+      return {chrome, port, userData};
+    } catch (error) {
+      await terminateChild(chrome);
+      fs.rmSync(userData, {recursive: true, force: true, maxRetries: 5, retryDelay: 100});
+      const diagnostic = Buffer.concat(stderr).toString("utf8").trim();
+      failures.push(`attempt ${attempt}: ${error.message}${diagnostic ? `; stderr: ${diagnostic}` : ""}`);
+    }
+  }
+  throw new Error(`Chrome failed to start after ${attempts} attempts\n${failures.join("\n")}`);
+}
+
 class Cdp {
   constructor(url) {
     this.nextId = 1;
@@ -191,15 +219,12 @@ async function runBrowserPerformance({distDir, budgets}) {
   const browserIndex = JSON.parse(fs.readFileSync(path.join(distDir, "browser-data", "index.json"), "utf8"));
   const staticArtifacts = validateStaticBudgets(distDir, budgets);
   const {server, origin} = await startServer(distDir);
-  const userData = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-chrome-"));
-  const activePort = path.join(userData, "DevToolsActivePort");
-  const chrome = spawn(chromeExecutable(), ["--headless=new", "--no-sandbox", "--disable-gpu", "--disable-background-networking",
-    "--disable-default-apps", "--disable-extensions", "--disable-sync", "--metrics-recording-only", "--no-first-run",
-    `--js-flags=--max-old-space-size=${budgets.reference_device.javascript_heap_limit_mib}`,
-    "--remote-debugging-port=0", `--user-data-dir=${userData}`, "about:blank"], {stdio: "ignore"});
+  let chrome;
+  let port;
+  let userData;
   let cdp;
   try {
-    const [port] = (await waitForFile(activePort)).trim().split("\n");
+    ({chrome, port, userData} = await launchChrome({budgets}));
     const target = await fetch(`http://127.0.0.1:${port}/json/new?about:blank`, {method: "PUT"}).then(response => response.json());
     cdp = new Cdp(target.webSocketDebuggerUrl);
     await cdp.open();
@@ -288,9 +313,9 @@ async function runBrowserPerformance({distDir, budgets}) {
       warm_indexeddb: {wiki: "nlwiki", cache_hits: warmLoad.cacheHits, parquet_requests: warmRequests.length}, profiles};
   } finally {
     cdp?.close();
-    await terminateChild(chrome);
+    if (chrome) await terminateChild(chrome);
     await new Promise(resolve => server.close(resolve));
-    fs.rmSync(userData, {recursive: true, force: true, maxRetries: 5, retryDelay: 100});
+    if (userData) fs.rmSync(userData, {recursive: true, force: true, maxRetries: 5, retryDelay: 100});
   }
 }
 
@@ -318,4 +343,4 @@ async function main() {
 
 if (require.main === module) main().catch(error => { console.error(error.stack || error.message); process.exitCode = 1; });
 
-module.exports = {listFiles, parseArguments, runBrowserPerformance, terminateChild, validateProfile, validateStaticBudgets};
+module.exports = {launchChrome, listFiles, parseArguments, runBrowserPerformance, terminateChild, validateProfile, validateStaticBudgets};

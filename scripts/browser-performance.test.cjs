@@ -6,7 +6,7 @@ const os = require("node:os");
 const path = require("node:path");
 const {EventEmitter} = require("node:events");
 const {afterEach, test} = require("node:test");
-const {parseArguments, terminateChild, validateProfile, validateStaticBudgets} = require("./browser-performance.cjs");
+const {launchChrome, parseArguments, terminateChild, validateProfile, validateStaticBudgets} = require("./browser-performance.cjs");
 
 const budgets = JSON.parse(fs.readFileSync(path.resolve(__dirname, "../config/browser-performance-budgets.json")));
 const roots = [];
@@ -71,4 +71,39 @@ test("browser teardown escalates to SIGKILL and waits for process exit", async (
   };
   await terminateChild(child, 1);
   assert.deepEqual(signals, ["SIGTERM", "SIGKILL"]);
+});
+
+test("browser startup retries with a clean profile", async () => {
+  const profiles = [];
+  const children = [];
+  const spawnChrome = (_executable, arguments_) => {
+    const child = new EventEmitter();
+    child.exitCode = null;
+    child.signalCode = null;
+    child.stderr = new EventEmitter();
+    child.kill = signal => {
+      child.signalCode = signal;
+      process.nextTick(() => child.emit("exit"));
+      return true;
+    };
+    profiles.push(arguments_.find(argument => argument.startsWith("--user-data-dir=")).slice("--user-data-dir=".length));
+    children.push(child);
+    return child;
+  };
+  let calls = 0;
+  const browser = await launchChrome({budgets, executable: "/test/chrome", spawnChrome,
+    awaitActivePort: async () => {
+      calls += 1;
+      if (calls === 1) {
+        children[0].stderr.emit("data", Buffer.from("transient startup failure"));
+        throw new Error("missing DevToolsActivePort");
+      }
+      return "9222\n";
+    }});
+  roots.push(browser.userData);
+  assert.equal(browser.port, "9222");
+  assert.equal(calls, 2);
+  assert.equal(fs.existsSync(profiles[0]), false);
+  assert.equal(fs.existsSync(profiles[1]), true);
+  await terminateChild(browser.chrome);
 });
