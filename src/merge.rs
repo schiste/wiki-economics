@@ -1024,7 +1024,7 @@ mod tests {
         let script = generator_dir.path().join("manifest.json.sh");
         fs::write(&script, "#!/bin/sh\nprintf '{\"ok\":true}'\n")?;
 
-        materialize_manifest_from_dir(output_dir.path(), generator_dir.path())?;
+        materialize_manifest(output_dir.path(), generator_dir.path())?;
 
         assert_eq!(
             fs::read_to_string(output_dir.path().join("manifest.json"))?,

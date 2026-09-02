@@ -3061,19 +3061,27 @@ mod tests {
 
     #[test]
     fn manifest_materialization_has_a_narrow_explicit_cli() -> Result<()> {
-        let cli = Cli::try_parse_from([
-            "wiki-econ",
-            "--output-dir",
-            "combined",
-            "manifest-materialize",
-            "--generator-dir",
-            "site/data-build",
+        let output = TestDir::new()?;
+        let generators = TestDir::new()?;
+        fs::write(
+            generators.path().join("manifest.json.sh"),
+            "#!/bin/sh\nprintf '{\"materialized\":true}'\n",
+        )?;
+        let cli = Cli::try_parse_from(vec![
+            "wiki-econ".to_string(),
+            "--output-dir".to_string(),
+            output.path().display().to_string(),
+            "manifest-materialize".to_string(),
+            "--generator-dir".to_string(),
+            generators.path().display().to_string(),
         ])?;
-        assert!(matches!(
-            cli.command,
-            Commands::ManifestMaterialize { generator_dir }
-                if generator_dir.as_path() == Path::new("site/data-build")
-        ));
+
+        run_with_ops(cli, &RecordingOps::default())?;
+
+        assert_eq!(
+            fs::read_to_string(output.path().join("manifest.json"))?,
+            "{\"materialized\":true}"
+        );
         Ok(())
     }
 
