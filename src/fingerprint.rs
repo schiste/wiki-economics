@@ -11,6 +11,8 @@ use tracing::{info, warn};
 const RECEIPT_SCHEMA_VERSION: u32 = 1;
 const SITE_ALGORITHM_VERSION: &str = "observable-static-site-v8-plain-distribution-artifacts";
 const DASHBOARD_DEFAULTS_ALGORITHM_VERSION: &str =
+    "rust-dashboard-defaults-v2-publication-receipt-generator-source";
+const LEGACY_DASHBOARD_DEFAULTS_ALGORITHM_VERSION: &str =
     "rust-dashboard-defaults-v1-publication-receipt-generator-source";
 const PARQUET_SUMMARY_BATCH_ROWS: usize = 250_000;
 const DATE_COLUMNS: [&str; 6] = [
@@ -785,7 +787,6 @@ fn dashboard_defaults_inputs(output_dir: &Path, workspace_dir: &Path) -> Result<
             format!("data/{}", crate::publication::RECEIPT_FILE),
             output_dir.join(crate::publication::RECEIPT_FILE),
         ),
-        TrackedPath::new("data/manifest.json", output_dir.join("manifest.json")),
         TrackedPath::new("workspace/Cargo.toml", workspace_dir.join("Cargo.toml")),
         TrackedPath::new("workspace/Cargo.lock", workspace_dir.join("Cargo.lock")),
     ];
@@ -796,17 +797,38 @@ fn dashboard_defaults_inputs(output_dir: &Path, workspace_dir: &Path) -> Result<
     })
 }
 
+fn legacy_dashboard_defaults_inputs(
+    output_dir: &Path,
+    workspace_dir: &Path,
+    defaults_dir: &Path,
+) -> Result<Vec<TrackedPath>> {
+    let mut inputs = dashboard_defaults_inputs(output_dir, workspace_dir)?;
+    inputs.push(TrackedPath::new(
+        "data/manifest.json",
+        defaults_dir.join("manifest.json"),
+    ));
+    inputs.sort_by(|left, right| left.identity.cmp(&right.identity));
+    Ok(inputs)
+}
+
 fn dashboard_defaults_receipt_path(output_dir: &Path) -> PathBuf {
     output_dir.join("_stages").join("dashboard-defaults.json")
 }
 
-fn dashboard_defaults_spec(selected: &str) -> StageSpec<'_> {
+fn dashboard_defaults_spec_with_version<'a>(
+    selected: &'a str,
+    algorithm_version: &'a str,
+) -> StageSpec<'a> {
     StageSpec {
         stage: "dashboard-defaults",
         scope: "published-site-defaults",
         selected_snapshot: Some(selected),
-        algorithm_version: DASHBOARD_DEFAULTS_ALGORITHM_VERSION,
+        algorithm_version,
     }
+}
+
+fn dashboard_defaults_spec(selected: &str) -> StageSpec<'_> {
+    dashboard_defaults_spec_with_version(selected, DASHBOARD_DEFAULTS_ALGORITHM_VERSION)
 }
 
 /// Return whether the immutable Rust-generated dashboard overlay can be reused
@@ -820,12 +842,40 @@ pub fn dashboard_defaults_are_reusable(
     let selected = site_selected_snapshots(output_dir)?;
     let inputs = dashboard_defaults_inputs(output_dir, workspace_dir)?;
     let outputs = collect_tracked_files(defaults_dir, "dashboard-defaults")?;
-    reusable(
+    let receipt_path = dashboard_defaults_receipt_path(output_dir);
+    if reusable(
+        &receipt_path,
+        dashboard_defaults_spec(&selected),
+        &inputs,
+        &outputs,
+    )? {
+        return Ok(true);
+    }
+
+    let legacy_inputs = legacy_dashboard_defaults_inputs(output_dir, workspace_dir, defaults_dir)?;
+    if !reusable(
+        &receipt_path,
+        dashboard_defaults_spec_with_version(
+            &selected,
+            LEGACY_DASHBOARD_DEFAULTS_ALGORITHM_VERSION,
+        ),
+        &legacy_inputs,
+        &outputs,
+    )? {
+        return Ok(false);
+    }
+
+    record(
         &dashboard_defaults_receipt_path(output_dir),
         dashboard_defaults_spec(&selected),
         &inputs,
         &outputs,
-    )
+    )?;
+    info!(
+        receipt = %receipt_path.display(),
+        "migrated dashboard defaults receipt without regenerating data"
+    );
+    Ok(true)
 }
 
 /// Authenticate a newly materialized dashboard overlay before it becomes the
@@ -1425,6 +1475,12 @@ mod tests {
             "frontend-only changes must not regenerate Rust defaults"
         );
 
+        fs::write(output.join("manifest.json"), r#"{"status":"refreshed"}"#)?;
+        assert!(
+            dashboard_defaults_are_reusable(&output, &workspace, &defaults)?,
+            "operational manifest changes must not regenerate Rust defaults"
+        );
+
         fs::write(workspace.join("src/dashboard.rs"), "fn generate_v2() {}")?;
         assert!(
             !dashboard_defaults_are_reusable(&output, &workspace, &defaults)
@@ -1435,6 +1491,52 @@ mod tests {
         assert!(
             !dashboard_defaults_are_reusable(&output, &workspace, &defaults)
                 .expect("defaults corruption should be evaluated")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dashboard_defaults_migrate_the_authenticated_legacy_receipt() -> Result<()> {
+        let dir = TestDir::new()?;
+        let output = dir.path().join("output");
+        let workspace = dir.path().join("workspace");
+        let defaults = dir.path().join("defaults");
+        fs::create_dir_all(output.join("_stages"))?;
+        fs::create_dir_all(workspace.join("src"))?;
+        fs::create_dir_all(&defaults)?;
+        fs::write(output.join(".publication-candidate.json"), "{}")?;
+        fs::write(
+            output.join(crate::publication::RECEIPT_FILE),
+            r#"{"selected_snapshot_versions":{"nlwiki":"2026-07"}}"#,
+        )?;
+        fs::write(output.join("manifest.json"), r#"{"generation":"old"}"#)?;
+        fs::write(defaults.join("manifest.json"), r#"{"generation":"old"}"#)?;
+        fs::write(defaults.join("gdp.json"), r#"{"rows":1}"#)?;
+        fs::write(workspace.join("src/dashboard.rs"), "fn generate() {}")?;
+        fs::write(workspace.join("Cargo.toml"), "[package]\nname='fixture'")?;
+        fs::write(workspace.join("Cargo.lock"), "version = 4")?;
+
+        let selected = site_selected_snapshots(&output)?;
+        let legacy_inputs = legacy_dashboard_defaults_inputs(&output, &workspace, &defaults)?;
+        let outputs = collect_tracked_files(&defaults, "dashboard-defaults")?;
+        record(
+            &dashboard_defaults_receipt_path(&output),
+            dashboard_defaults_spec_with_version(
+                &selected,
+                LEGACY_DASHBOARD_DEFAULTS_ALGORITHM_VERSION,
+            ),
+            &legacy_inputs,
+            &outputs,
+        )?;
+        fs::write(output.join("manifest.json"), r#"{"generation":"current"}"#)?;
+
+        assert!(dashboard_defaults_are_reusable(
+            &output, &workspace, &defaults
+        )?);
+        let migrated = read_receipt(&dashboard_defaults_receipt_path(&output))?;
+        assert_eq!(
+            migrated.algorithm_version,
+            DASHBOARD_DEFAULTS_ALGORITHM_VERSION
         );
         Ok(())
     }
