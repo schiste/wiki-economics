@@ -4118,6 +4118,7 @@ mod tests {
         let workspace_dir = TestDir::new()?;
         let defaults_dir = TestDir::new()?;
         fs::create_dir_all(workspace_dir.path().join("src"))?;
+        fs::create_dir_all(workspace_dir.path().join("config"))?;
         fs::write(
             output_dir.path().join(".publication-candidate.json"),
             r#"{"artifacts":[]}"#,
@@ -4136,7 +4137,7 @@ mod tests {
                 output_dir.path().join("nlwiki/page_weekly_edits.parquet"),
             ))
         {
-            let mut frame = df!("value" => [1_i64])?;
+            let mut frame = df!("wiki" => ["nlwiki"], "value" => [1_i64])?;
             ParquetWriter::new(fs::File::create(path)?).finish(&mut frame)?;
         }
         fs::write(output_dir.path().join("manifest.json"), "{}")?;
@@ -4145,6 +4146,13 @@ mod tests {
             "fn generate() {}",
         )
         .expect("dashboard generator fixture should be written");
+        fs::write(
+            workspace_dir
+                .path()
+                .join("config/editor-identity-transitions.json"),
+            "{}",
+        )
+        .expect("identity policy fixture should be written");
         fs::write(workspace_dir.path().join("Cargo.toml"), "[package]")?;
         fs::write(workspace_dir.path().join("Cargo.lock"), "version = 4")?;
         fs::write(defaults_dir.path().join("defaults.json"), "{}")?;

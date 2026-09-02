@@ -248,6 +248,15 @@ fn wiki_set(df: &DataFrame) -> Result<BTreeSet<String>> {
     Ok(values)
 }
 
+/// Return the exact wiki set that drives dashboard generation.
+///
+/// The defaults fingerprint calls this before deciding whether it may reuse
+/// cached JSON, so the weekly Parquet allowlist cannot diverge from the set
+/// that `materialize_into` will actually read from `gdp.parquet`.
+pub(crate) fn input_wikis(output_dir: &Path) -> Result<BTreeSet<String>> {
+    wiki_set(&read_parquet(output_dir, "gdp")?)
+}
+
 fn common_meta(range_frame: &DataFrame, namespace_frame: Option<&DataFrame>) -> Result<CommonMeta> {
     common_meta_with_overrides(
         range_frame,
