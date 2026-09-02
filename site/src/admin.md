@@ -6,7 +6,7 @@ title: Admin
 
 <div class="page-intro">
 
-See what is running, what needs attention, and what is ready to publish. Durable operator, fleet, snapshot, and publication evidence is reconciled into the same six-stage path for every wiki.
+See what is running, what needs attention, and what is ready to publish. Durable operator, fleet, snapshot, and publication evidence is reconciled into four human milestones for every wiki.
 
 </div>
 
@@ -445,7 +445,12 @@ for (const name of allWikiNames) {
 
 function latestWikiJob(name) {
   if (name === runningWiki && inlineRunningJob) return inlineRunningJob
-  return operatorOperationByWiki.get(name) || wikiJobMap[name] || wikiJobHistory[name]?.[0] || null
+  const candidates = [
+    operatorOperationByWiki.get(name),
+    wikiJobMap[name],
+    wikiJobHistory[name]?.[0]
+  ].filter(Boolean)
+  return candidates.sort((left, right) => Date.parse(operationTimestamp(right) || 0) - Date.parse(operationTimestamp(left) || 0))[0] || null
 }
 
 function operationalState(name, wiki) {
@@ -487,8 +492,10 @@ const wikiEntries = Array.from(wikiMap.entries()).sort(([leftName, left], [right
     || leftName.localeCompare(rightName)
 })
 const wikiNames = wikiEntries.map(([name]) => name)
+const activeOperatorWiki = adminOperations.running?.[0]?.wiki || adminOperations.queued?.[0]?.wiki || null
 const selectedWikiCandidate = (adminUiState.selectedWikiUser && wikiNames.includes(selectedWikiState) ? selectedWikiState : null)
   || runningWiki
+  || activeOperatorWiki
   || wikiNames[0]
   || "—"
 if (selectedWikiCandidate !== "—" && selectedWikiCandidate !== selectedWikiState) {
@@ -824,31 +831,46 @@ const statusColors = {
   cancelled: "#795548"
 }
 const statusLabels = {
-  complete: "Complete",
-  needs_fetch: "Needs fetch",
-  needs_patrol_fetch: "Needs patrol fetch",
-  needs_ingest: "Needs ingest",
-  needs_compute: "Needs compute",
-  needs_patrol_compute: "Needs patrol compute",
-  needs_merge: "Needs merge",
-  running: "Running",
-  queued: "Queued",
-  planned: "Plan only",
-  stalled: "Stalled",
-  quarantined: "Quarantined",
+  complete: "Published",
+  needs_fetch: "Not prepared",
+  needs_patrol_fetch: "Patrol source needed",
+  needs_ingest: "Data conversion needed",
+  needs_compute: "Metrics needed",
+  needs_patrol_compute: "Patrol metrics needed",
+  needs_merge: "Ready to publish",
+  running: "Working",
+  queued: "Waiting for worker",
+  planned: "Not managed",
+  stalled: "Worker stopped reporting",
+  quarantined: "Needs intervention",
   interrupted: "Interrupted",
-  failed: "Failed",
+  failed: "Needs attention",
   cancelled: "Cancelled"
 }
 
 const pipelineSteps = [
-  {key: "fetch", label: "History"},
-  {key: "patrol_fetch", label: "Patrol Source"},
-  {key: "ingest", label: "Ingest"},
-  {key: "compute", label: "Core Metrics"},
-  {key: "patrol_compute", label: "Patrol Metric"},
-  {key: "merge", label: "Site Data"},
+  {key: "source", label: "Data secured"},
+  {key: "metrics", label: "Metrics built"},
+  {key: "validation", label: "Checks passed"},
+  {key: "publication", label: "Published"},
 ]
+
+const technicalStageOrder = {
+  snapshot_resolve: 0,
+  fetch: 0,
+  source_window: 0,
+  ingest: 0,
+  patrol_fetch: 0,
+  compute: 1,
+  patrol_compute: 1,
+  candidate_validate: 2,
+  candidate_ready: 2,
+  merge: 3,
+  publication_prepare: 3,
+  publication_verify: 3,
+  site: 3,
+  publication_commit: 3,
+}
 
 function summarizeStatuses(entries) {
   return entries.reduce((acc, [, wiki]) => {
@@ -858,125 +880,119 @@ function summarizeStatuses(entries) {
   }, {})
 }
 
-function stageStateForWiki(wiki, stageKey, isRunning, runningProgress) {
-  const runningStage = runningProgress?.stage || null
-  const active = isRunning && runningStage === stageKey
-  if (active) return "active"
-  if (!isRunning && wiki.status === "complete") return "done"
+function milestoneState(wiki, milestoneKey, lifecycle, direct, state) {
+  const hasLivePublication = lifecycle?.publication === "published" && wiki.status === "complete"
+  const hiddenQualification = lifecycle?.publication === "hidden" && lifecycle?.refresh === "qualification"
+  if (milestoneKey === "publication" && hasLivePublication) return "done"
+  if (hasLivePublication && state === "complete") return "done"
+  if (milestoneKey === "publication" && hiddenQualification) return "not-applicable"
 
-  switch (stageKey) {
-    case "fetch":
-      return wiki.snapshot?.ready || wiki.raw.files > 0 ? "done" : "todo"
-    case "patrol_fetch":
-      return wiki.patrol?.source_ready ? "done" : (wiki.snapshot?.ready || wiki.raw.files > 0 ? "todo" : "blocked")
-    case "ingest":
-      return wiki.snapshot?.ready || (wiki.parquet.done > 0 && wiki.parquet.done >= wiki.parquet.total && wiki.parquet.in_progress === 0)
-        ? "done"
-        : wiki.raw.files > 0
-        ? "todo"
-        : "blocked"
-    case "compute": {
-      const coreMetricCount = (wiki.metrics || []).filter((metric) => metric.name !== "patrol").length
-      return coreMetricCount >= 8
-        ? "done"
-        : wiki.snapshot?.ready || wiki.parquet.done > 0
-        ? "todo"
-        : "blocked"
-    }
-    case "patrol_compute":
-      return wiki.patrol?.metric_ready ? "done" : (wiki.patrol?.source_ready ? "todo" : "blocked")
-    case "merge":
-      return wiki.dashboard.length > 0 ? "done" : ((wiki.metrics || []).length > 0 ? "todo" : "blocked")
-    default:
-      return "todo"
+  const stage = direct?.progress?.stage || direct?.stage || null
+  const activeIndex = technicalStageOrder[stage]
+  const milestoneIndex = pipelineSteps.findIndex((step) => step.key === milestoneKey)
+  const failed = ["failed", "interrupted", "quarantined", "stalled"].includes(state)
+  if (Number.isInteger(activeIndex)) {
+    if (milestoneIndex < activeIndex) return "done"
+    if (milestoneIndex === activeIndex) return failed ? "issue" : ["running", "cancelling"].includes(state) ? "active" : "issue"
   }
+
+  if (milestoneKey === "source") {
+    if ((direct?.progress?.completedSources || 0) >= (direct?.progress?.totalSources || Number.MAX_SAFE_INTEGER)) return "done"
+    if (wiki.snapshot?.ready || wiki.ingest?.ready || wiki.raw?.files > 0) return "done"
+  }
+  if (milestoneKey === "metrics" && (wiki.metrics || []).length >= 9) return "done"
+  if (milestoneKey === "validation" && ["ready", "needs_merge"].includes(state)) return "done"
+  return "future"
 }
 
-function stageCaption(wiki, stageKey) {
-  switch (stageKey) {
-    case "fetch":
-      return wiki.snapshot?.ready
-        ? `Snapshot ${wiki.snapshot.version || "ready"}`
-        : wiki.raw.files > 0 ? `${wiki.raw.files} files` : "Missing"
-    case "patrol_fetch":
-      return `${Number(wiki.patrol?.xml || 0) + Number(wiki.patrol?.events || 0) + Number(wiki.patrol?.rights || 0) + Number(wiki.patrol?.groups || 0)}/4 ready`
-    case "ingest":
-      return wiki.snapshot?.ready ? `${wiki.ingest?.rows || 0} rows` : `${wiki.parquet.done}/${wiki.parquet.total || 0}`
-    case "compute":
-      return `${(wiki.metrics || []).filter((metric) => metric.name !== "patrol").length}/8`
-    case "patrol_compute":
-      return wiki.patrol?.metric_ready ? "Ready" : "Pending"
-    case "merge":
-      return wiki.dashboard.length > 0 ? `${wiki.dashboard.length} files` : "Pending"
-    default:
-      return ""
+function milestoneCaption(wiki, milestoneKey, lifecycle, direct, state) {
+  const selectedSnapshot = direct?.selectedSnapshot || wiki.snapshot?.version || null
+  const milestoneStateValue = milestoneState(wiki, milestoneKey, lifecycle, direct, state)
+  if (milestoneStateValue === "active") return direct?.progress?.detail || direct?.stageLabel || "In progress"
+  if (milestoneStateValue === "issue") return `Stopped at ${direct?.stageLabel || "this step"}`
+  if (milestoneStateValue === "not-applicable") return "Hidden qualification"
+  if (milestoneKey === "source") {
+    if (wiki.snapshot?.mode === "retained-publication" && wiki.status === "complete") return "Validated; inputs retired"
+    return selectedSnapshot ? `Snapshot ${selectedSnapshot}` : milestoneStateValue === "done" ? "Ready" : "Not started"
   }
-}
-
-function stageAction(stageKey) {
-  return ({
-    fetch: "fetch",
-    patrol_fetch: "patrol-fetch",
-    ingest: "ingest",
-    compute: "compute",
-    patrol_compute: "patrol-compute",
-    merge: "merge"
-  })[stageKey]
+  if (milestoneKey === "metrics") return milestoneStateValue === "done" ? `${(wiki.metrics || []).length} artifacts` : "Waiting for data"
+  if (milestoneKey === "validation") return milestoneStateValue === "done" ? "Candidate accepted" : "Not run"
+  if (milestoneKey === "publication") return milestoneStateValue === "done" ? `Live${selectedSnapshot ? ` · ${selectedSnapshot}` : ""}` : "Not public"
+  return ""
 }
 
 function stateExplanation(name, wiki, state, lifecycle, direct, fleetWork) {
   if (!lifecycle) return `${name} is supported by the Rust source resolver, but has no lifecycle policy. Processing is intentionally blocked until an operator registers it.`
   if (state === "queued") return `The request is durable and waiting for the next ${direct?.resourceClass || lifecycle.fleet_resource_class || "assigned"} worker dispatch (at most ten minutes). It is safe to close this page.`
-  if (state === "running") return `A worker owns this operation. The heartbeat and current stage below distinguish healthy progress from a stalled process.`
+  if (state === "running") return `${direct?.stageLabel || "Pipeline work"} is in progress${direct?.progress?.detail ? `: ${direct.progress.detail}` : ""}. The worker heartbeat is current.`
   if (state === "stalled") return `The worker lease exists but its heartbeat is overdue. Recover the fleet lease before submitting duplicate work.`
   if (state === "quarantined") return `Automatic retries were exhausted. Review the final log excerpt, correct the cause, then explicitly retry.`
-  if (["failed", "interrupted"].includes(state)) return `The last operation did not finish. Completed source transactions remain reusable; retrying resumes from validated receipts rather than starting blindly from zero.`
+  if (["failed", "interrupted"].includes(state)) return direct?.errorSummary || `The last operation did not finish. Completed source transactions remain reusable; retrying resumes from validated receipts rather than starting blindly from zero.`
   if (state === "needs_fetch") return `No validated history source or selected snapshot is available yet. Fetch is the first unblocked stage.`
   if (state === "needs_patrol_fetch") return `Core history is present, but the independent patrol source generation is incomplete.`
   if (state === "needs_ingest") return `History sources exist but have not all been converted into validated metric-input fragments.`
   if (state === "needs_compute") return `The warehouse generation is ready, but one or more core metric families are missing or invalid.`
   if (state === "needs_patrol_compute") return `Patrol sources are ready, but the derived patrol metric has not been validated.`
   if (state === "needs_merge") return `Per-wiki metrics are ready. They have not yet been incorporated into the public publication generation.`
-  if (state === "complete") return `${name} has a complete published artifact set. Recalculation controls remain available for algorithm changes or validation work.`
+  if (state === "complete") {
+    if (lifecycle.publication === "published") return `${name} is live with a complete published artifact set. Redownloadable build inputs may be intentionally retired after validation to save storage.`
+    if (lifecycle.refresh === "paused") return `${name} is a retained imported dataset. It remains public, but automatic refresh is paused.`
+    return `${name} has a complete artifact set.`
+  }
   if (fleetWork) return `Fleet state ${fleetWork.state} was inferred from the durable work item and lease evidence.`
   return `The state was inferred from lifecycle policy, snapshot receipts, source markers, metric artifacts, and publication files.`
 }
 
 function evidenceItems(name, wiki, lifecycle, direct, fleetWork, plan) {
+  const sourceProgress = direct?.progress
+  const sourceEvidence = sourceProgress?.totalSources
+    ? `${sourceProgress.completedSources || 0}/${sourceProgress.totalSources} source files · ${formatRefreshBytes(sourceProgress.downloadedBytes)}`
+    : wiki.snapshot?.ready
+      ? `${wiki.ingest?.rows || 0} validated rows`
+      : wiki.retention?.valid && wiki.retention?.history_input === "purge_after_ready" && wiki.status === "complete"
+        ? "validated, then retired by policy"
+        : `${wiki.raw?.files || 0} raw files · ${wiki.parquet?.done || 0}/${wiki.parquet?.total || 0} ingested`
   return [
     ["Lifecycle", lifecycle ? `${lifecycle.publication} / ${lifecycle.refresh}` : "not registered"],
-    ["Snapshot", plan?.snapshot || wiki.snapshot?.version || wiki.raw?.version || "not selected"],
-    ["History", wiki.snapshot?.ready ? `${wiki.ingest?.rows || 0} validated rows` : `${wiki.raw?.files || 0} raw files · ${wiki.parquet?.done || 0}/${wiki.parquet?.total || 0} ingested`],
+    ["Snapshot", direct?.selectedSnapshot || plan?.snapshot || wiki.snapshot?.version || wiki.raw?.version || "not selected"],
+    ["Source data", sourceEvidence],
     ["Metrics", `${(wiki.metrics || []).length} core/patrol artifacts · ${wiki.dashboard?.length || 0} published files`],
     ["Last activity", direct ? `${operationLabel(direct.state || (direct.exitCode === 0 ? "succeeded" : "failed"))} · ${relativeTime(operationTimestamp(direct))}` : "no operator run recorded"],
     ["Worker", fleetWork ? `${fleetWork.workerId || fleetWork.resourceClass || "unclaimed"} · ${fleetWork.heartbeatAt ? `heartbeat ${relativeTime(fleetWork.heartbeatAt)}` : "no heartbeat"}` : "no fleet lease"]
   ]
 }
 
-function pipelineDossier(name, wiki, state, lifecycle, direct, fleetWork, plan, isRunning) {
+function pipelineDossier(name, wiki, state, lifecycle, direct, fleetWork, plan) {
   const canRun = Boolean(apiStatus && lifecycle)
   const isQualification = lifecycle?.publication === "hidden" && lifecycle?.refresh === "qualification"
   const operationActive = ["queued", "running", "cancelling"].includes(direct?.state) || direct?.running
   const log = (direct?.log || []).join("")
+  const progress = direct?.progress || null
+  const progressPercent = Number.isFinite(progress?.percent) ? progress.percent : null
+  const stoppedWithExplanation = direct?.errorSummary && ["failed", "interrupted", "quarantined"].includes(state)
   return html`<section class="admin-pipeline-dossier" aria-label=${`${name} pipeline details`}>
-    <div class="admin-dossier-summary">
-      <div><span class="admin-command-kicker">What this means</span><p>${stateExplanation(name, wiki, state, lifecycle, direct, fleetWork)}</p></div>
-      <dl>${evidenceItems(name, wiki, lifecycle, direct, fleetWork, plan).map(([label, value]) => html`<div><dt>${label}</dt><dd>${value}</dd></div>`)}</dl>
+    <div class="admin-dossier-lead ${operationTone(state)}">
+      <span class="admin-command-kicker">${statusLabels[state] || operationLabel(state)}</span>
+      <strong>${state === "running" ? direct?.stageLabel || "Pipeline running" : state === "failed" ? `Stopped during ${direct?.stageLabel || "pipeline work"}` : wikipediaProjectLabel(name)}</strong>
+      <p>${stoppedWithExplanation
+        ? "No candidate was published. Validated source transactions remain reusable; the specific cause is shown below."
+        : stateExplanation(name, wiki, state, lifecycle, direct, fleetWork)}</p>
+      ${progressPercent != null && operationActive ? html`<div class="admin-human-progress" aria-label=${`${progressPercent}% of source files complete`}>
+        <div><span>${progress?.detail || "Working"}</span><strong>${progressPercent}%</strong></div>
+        <div class="admin-human-progress-track"><i style=${`width:${progressPercent}%`}></i></div>
+        <small>${progress?.ingestedRows ? `${progress.ingestedRows.toLocaleString()} rows ingested` : ""}${progress?.downloadedBytes ? ` · ${formatRefreshBytes(progress.downloadedBytes)} transferred` : ""}</small>
+      </div>` : ""}
+      ${stoppedWithExplanation ? html`<div class="admin-human-error"><strong>Why it stopped</strong><span>${direct.errorSummary}</span></div>` : ""}
     </div>
-    <div class="admin-dossier-stages">
+    <div class="admin-milestone-line" aria-label="Project lifecycle">
       ${pipelineSteps.map((step) => {
-        const stepState = stageStateForWiki(wiki, step.key, isRunning, direct?.progress)
-        const action = stageAction(step.key)
-        return html`<div class="admin-dossier-stage ${stepState}">
-          <span>${step.label}</span><strong>${stageCaption(wiki, step.key)}</strong>
-          <button class="admin-stage-button" ?disabled=${!canRun || stepState === "blocked" || operationActive}
-            title=${actionTooltipWithApi(action, apiStatus)}
-            onclick=${() => runCommand(action, action === "merge" ? null : {wiki: name, version: action === "fetch" ? preferredSnapshotVersion() : null})}>
-            ${stepState === "done" ? "Run again" : "Run stage"}
-          </button>
+        const stepState = milestoneState(wiki, step.key, lifecycle, direct, state)
+        return html`<div class="admin-milestone ${stepState}">
+          <i aria-hidden="true"></i><span>${step.label}</span><strong>${milestoneCaption(wiki, step.key, lifecycle, direct, state)}</strong>
         </div>`
       })}
     </div>
+    <dl class="admin-dossier-facts">${evidenceItems(name, wiki, lifecycle, direct, fleetWork, plan).map(([label, value]) => html`<div><dt>${label}</dt><dd>${value}</dd></div>`)}</dl>
     <div class="admin-dossier-actions">
       ${!lifecycle ? html`<button class="admin-btn primary" ?disabled=${!apiStatus} onclick=${() => {
         if (confirm(`Add ${name} as a publication-invisible qualification project?`)) registerWiki(name, "qualification", "medium_large")
@@ -990,8 +1006,27 @@ function pipelineDossier(name, wiki, state, lifecycle, direct, fleetWork, plan, 
       ${["stalled", "quarantined"].includes(state) ? html`<button class="admin-btn" ?disabled=${!apiStatus} onclick=${() => runCommand(direct?.requestId ? "recover-admin" : "fleet-recover")}>${direct?.requestId ? "Recover operator queue" : "Recover fleet lease"}</button>` : ""}
       ${operationActive ? html`<button class="admin-btn danger" ?disabled=${!apiStatus} onclick=${() => runCommand("cancel", {requestId: direct?.requestId, wiki: name})}>Cancel operation</button>` : ""}
     </div>
+    ${lifecycle ? html`<details class="admin-advanced-actions"><summary>Advanced stage controls</summary><div>
+      <button class="admin-btn" ?disabled=${!canRun || operationActive} onclick=${() => runCommand("fetch", {wiki: name, version: preferredSnapshotVersion()})}>Fetch history</button>
+      <button class="admin-btn" ?disabled=${!canRun || operationActive} onclick=${() => runCommand("ingest", name)}>Ingest</button>
+      <button class="admin-btn" ?disabled=${!canRun || operationActive} onclick=${() => runCommand("compute", name)}>Compute metrics</button>
+      <button class="admin-btn" ?disabled=${!canRun || operationActive} onclick=${() => runCommand("patrol-fetch", name)}>Fetch patrol</button>
+      <button class="admin-btn" ?disabled=${!canRun || operationActive} onclick=${() => runCommand("patrol-compute", name)}>Compute patrol</button>
+      <button class="admin-btn" ?disabled=${!canRun || operationActive} onclick=${() => runCommand("cleanup", name)}>Clean staging</button>
+    </div></details>` : ""}
     ${log ? html`<details class="admin-dossier-log"><summary>Latest output (${(direct.log || []).length} chunks)</summary><pre class="admin-job-log">${log}</pre></details>` : ""}
   </section>`
+}
+
+function projectRowDetail(name, wiki, state, lifecycle, direct, fleetWork) {
+  if (state === "running") return direct?.progress?.detail || direct?.stageLabel || "Pipeline work is in progress"
+  if (state === "queued") return "Saved safely; waiting for the next available worker"
+  if (["failed", "interrupted", "quarantined", "stalled"].includes(state)) {
+    return direct?.errorSummary || stateExplanation(name, wiki, state, lifecycle, direct, fleetWork)
+  }
+  if (state === "complete" && lifecycle?.refresh === "paused") return "Published imported data · automatic updates paused"
+  if (state === "complete") return `Snapshot ${direct?.selectedSnapshot || wiki.snapshot?.version || "published"} is live and usable`
+  return stateExplanation(name, wiki, state, lifecycle, direct, fleetWork)
 }
 
 ```
@@ -1026,21 +1061,19 @@ display(html`<div class="admin-pipeline-board">
     ? html`<div class="admin-empty-state"><strong>Nothing matches this view.</strong><span>Choose another filter to inspect the full inventory.</span></div>`
     : html`<div class="admin-pipeline-list" role="list">
         ${visibleWikiEntries.map(([name, wiki]) => {
-          const isRunning = inlineRunningJob && name === runningWiki
-          const state = operationalState(name, wiki)
           const lifecycle = lifecycleStates[name] || null
           const direct = latestWikiJob(name)
           const fleetWork = fleetByWiki.get(name)
           const plan = latestPlanByWiki.get(name)
+          const state = operationalState(name, wiki)
+          const isRunning = ["running", "cancelling"].includes(state)
           const stageDetail = isRunning
-            ? `${inlineRunningJob.progress?.stage || inlineRunningJob.stage || "starting"} · ${inlineRunningJob.progress?.pct || 0}%`
-            : fleetWork
-            ? `${fleetWork.workerId || fleetWork.resourceClass || "fleet"}${fleetWork.snapshot ? ` · ${fleetWork.snapshot}` : ""}`
+            ? `${direct?.stageLabel || direct?.stage || "Starting"}${direct?.progress?.percent != null ? ` · ${direct.progress.percent}%` : ""}`
             : direct
-            ? `${direct.stage || direct.action || "run"} · ${relativeTime(operationTimestamp(direct))}`
-            : plan && !wiki.tracked
-            ? `${plan.snapshot} plan · no worker`
-            : lifecycle?.freshness || lifecycle?.refresh || "inventory"
+              ? `${relativeTime(operationTimestamp(direct))}`
+              : fleetWork
+                ? `${fleetWork.workerId || fleetWork.resourceClass || "fleet"}${fleetWork.snapshot ? ` · ${fleetWork.snapshot}` : ""}`
+                : lifecycle?.refresh || "inventory"
           const expanded = selectedWiki === name
           return html`<div class="admin-pipeline-entry" role="listitem">
           <button
@@ -1055,16 +1088,16 @@ display(html`<div class="admin-pipeline-board">
               <i style=${`--state-color:${statusColors[state] || "#607d8b"}`}></i>
               <span><strong>${statusLabels[state] || operationLabel(state)}</strong><small>${stageDetail}</small></span>
             </span>
-            <span class="admin-stage-rail" aria-label="Pipeline stages">
+            <span class="admin-pipeline-message">${projectRowDetail(name, wiki, state, lifecycle, direct, fleetWork)}</span>
+            <span class="admin-stage-rail" aria-label="Project lifecycle">
               ${pipelineSteps.map((step) => {
-                const stageState = stageStateForWiki(wiki, step.key, isRunning, inlineRunningJob?.progress)
-                return html`<i class=${stageState} title=${`${step.label}: ${stageCaption(wiki, step.key)}`}><span>${step.label}</span></i>`
+                const stepState = milestoneState(wiki, step.key, lifecycle, direct, state)
+                return html`<i class=${stepState} title=${`${step.label}: ${milestoneCaption(wiki, step.key, lifecycle, direct, state)}`}><span>${step.label}</span></i>`
               })}
             </span>
-            <span class="admin-pipeline-lifecycle">${lifecycle?.refresh || (plan ? "unmanaged" : "unknown")}</span>
             <span class="admin-row-chevron" aria-hidden="true">${expanded ? "⌄" : "›"}</span>
           </button>
-          ${expanded ? pipelineDossier(name, wiki, state, lifecycle, direct, fleetWork, plan, isRunning) : ""}
+          ${expanded ? pipelineDossier(name, wiki, state, lifecycle, direct, fleetWork, plan) : ""}
           </div>`
         })}
       </div>`}
@@ -1285,18 +1318,13 @@ html`<div class="admin-onboarding-console">
 
 <div class="chart-section">
 
-## Evidence and manual controls
+## Artifact inventory
 
-<div class="note">Select a project in Pipeline Status to inspect its evidence and use stage-level recovery controls.</div>
+<div class="note">Low-level files for the project selected above. Status, diagnosis, logs, and recovery actions live in its expanded project row.</div>
 
 ```js
 const w = hasSelectedWiki ? wikiMap.get(selectedWiki) || emptyWikiStatus(selectedWiki) : emptyWikiStatus("—")
-const selectedWikiRunning = Boolean(
-  (job?.running && job?.progress?.wiki === selectedWiki)
-  || ["queued", "running", "cancelling"].includes(operatorOperationByWiki.get(selectedWiki)?.state)
-)
 const selectedLifecycle = lifecycleStates[selectedWiki] || null
-const selectedJob = latestWikiJob(selectedWiki)
 const selectedFleetWork = fleetByWiki.get(selectedWiki) || null
 const selectedPlan = latestPlanByWiki.get(selectedWiki) || null
 ```
@@ -1314,42 +1342,7 @@ const selectedPlan = latestPlanByWiki.get(selectedWiki) || null
     ${selectedFleetWork ? html`<div class="admin-run-evidence">
       <strong>Fleet ${operationLabel(selectedFleetWork.state)}</strong>
       <span>${selectedFleetWork.workerId || selectedFleetWork.resourceClass || "waiting for worker"} · snapshot ${selectedFleetWork.snapshot || "unknown"}${selectedFleetWork.heartbeatAt ? ` · heartbeat ${relativeTime(selectedFleetWork.heartbeatAt)}` : ""}</span>
-    </div>` : ""}
-    ${selectedJob ? html`<div class="admin-run-evidence ${operationTone(selectedJob.state || (selectedJob.exitCode === 0 ? "succeeded" : "failed"))}">
-      <div><strong>${operationLabel(selectedJob.state || (selectedJob.running ? "running" : selectedJob.exitCode === 0 ? "succeeded" : "failed"))}</strong><span>${selectedJob.stage || selectedJob.action || "pipeline"} · ${relativeTime(operationTimestamp(selectedJob))}</span></div>
-      <div class="admin-log-section">
-        <div class="admin-log-bar">
-          <button class="admin-log-toggle admin-log-button" data-lines=${String((selectedJob.log || []).length)} onclick=${(event) => toggleLogSection(event, `details-log-${selectedWiki}`)}>${adminUiState[`details-log-${selectedWiki}`] ? "Hide output" : "Show output"} (${(selectedJob.log || []).length} chunks)</button>
-          ${copyIconButton(() => (selectedJob.log || []).join(""), `Copy ${selectedWiki} run log`)}
-        </div>
-        <pre class="admin-job-log" ?hidden=${!adminUiState[`details-log-${selectedWiki}`]}>${(selectedJob.log || []).join("")}</pre>
-      </div>
     </div>` : ""}`
-```
-
-### Maintenance
-
-```js
-!hasSelectedWiki
-  ? html`<span></span>`
-  : html`${!apiStatus ? adminConnectionWarning() : ""}
-    ${!selectedLifecycle ? html`<p class="filter-desc">Stage actions are unavailable until this project has a lifecycle policy.</p>` : ""}
-    <div class="admin-maintenance-actions">
-      <button class="admin-btn primary" ?disabled=${!apiStatus || !selectedLifecycle || selectedWikiRunning} title=${actionTooltipWithApi(selectedLifecycle?.refresh === "qualification" ? "qualify" : "run", apiStatus)} onclick=${() => runCommand(selectedLifecycle?.refresh === "qualification" ? "qualify" : "run", {wiki: selectedWiki, version: preferredSnapshotVersion()})}>${selectedLifecycle?.refresh === "qualification" ? "run full qualification" : "prepare update"}</button>
-      <button class="admin-btn" ?disabled=${!apiStatus || !selectedLifecycle} title=${actionTooltipWithApi("fetch", apiStatus)} onclick=${() => runCommand("fetch", {wiki: selectedWiki, version: preferredSnapshotVersion()})}>fetch missing</button>
-      <button class="admin-btn" ?disabled=${!apiStatus || !selectedLifecycle} title=${actionTooltipWithApi("patrol-fetch", apiStatus)} onclick=${() => runCommand("patrol-fetch", selectedWiki)}>fetch patrol</button>
-      <button class="admin-btn" ?disabled=${!apiStatus || !selectedLifecycle} title=${actionTooltipWithApi("ingest", apiStatus)} onclick=${() => runCommand("ingest", selectedWiki)}>ingest</button>
-      <button class="admin-btn" ?disabled=${!apiStatus || !selectedLifecycle} title=${actionTooltipWithApi("compute", apiStatus)} onclick=${() => runCommand("compute", selectedWiki)}>compute core</button>
-      <button class="admin-btn" ?disabled=${!apiStatus || !selectedLifecycle} title=${actionTooltipWithApi("patrol-compute", apiStatus)} onclick=${() => runCommand("patrol-compute", selectedWiki)}>compute patrol only</button>
-      <button class="admin-btn" ?disabled=${!apiStatus || !selectedLifecycle} title=${actionTooltipWithApi("patrol-rebuild", apiStatus)} onclick=${() => runCommand("patrol-rebuild", selectedWiki)}>rebuild patrol</button>
-      <button class="admin-btn" ?disabled=${!apiStatus} title=${actionTooltipWithApi("merge", apiStatus)} onclick=${() => runCommand("merge")}>merge site data</button>
-      <button class="admin-btn" ?disabled=${!apiStatus} title=${actionTooltipWithApi("publish", apiStatus)} onclick=${() => runCommand("publish")}>publish ready candidates</button>
-      <button class="admin-btn" ?disabled=${!apiStatus} title=${actionTooltipWithApi("site", apiStatus)} onclick=${() => runCommand("site")}>rebuild website only</button>
-      <button class="admin-btn" ?disabled=${!apiStatus} title=${actionTooltipWithApi("fleet-recover", apiStatus)} onclick=${() => runCommand("fleet-recover")}>recover stale fleet work</button>
-      ${adminOperations.executionMode === "queue" ? html`<button class="admin-btn" ?disabled=${!apiStatus} title=${actionTooltipWithApi("recover-admin", apiStatus)} onclick=${() => runCommand("recover-admin")}>recover stale operator work</button>` : ""}
-      <button class="admin-btn" ?disabled=${!apiStatus} title=${actionTooltipWithApi("cleanup", apiStatus)} onclick=${() => runCommand("cleanup", selectedWiki)}>cleanup</button>
-      ${selectedWikiRunning ? html`<button class="admin-btn danger" ?disabled=${!apiStatus} title=${actionTooltipWithApi("cancel", apiStatus)} onclick=${() => runCommand("cancel", {requestId: selectedJob?.requestId, wiki: selectedWiki})}>cancel queued/running job</button>` : ""}
-    </div>`
 ```
 
 ### Raw Dumps
@@ -2229,7 +2222,7 @@ currentManifest.merged.length > 0
   appearance: none;
   width: 100%;
   display: grid;
-  grid-template-columns: minmax(10rem, 1.15fr) minmax(10rem, 1fr) minmax(18rem, 2fr) 6rem 1rem;
+  grid-template-columns: minmax(10rem, 0.9fr) minmax(10rem, 0.9fr) minmax(16rem, 1.6fr) minmax(8rem, 0.8fr) 1rem;
   align-items: center;
   gap: 0.9rem;
   min-height: 4.2rem;
@@ -2252,13 +2245,24 @@ currentManifest.merged.length > 0
 .admin-pipeline-state small { overflow: hidden; color: var(--theme-foreground-muted); font-size: 0.68rem; text-overflow: ellipsis; white-space: nowrap; }
 .admin-pipeline-state { grid-template-columns: 0.55rem minmax(0, 1fr); align-items: center; gap: 0.5rem; }
 .admin-pipeline-state > i { width: 0.5rem; height: 0.5rem; border-radius: 50%; background: var(--state-color); box-shadow: 0 0 0 3px color-mix(in srgb, var(--state-color) 14%, transparent); }
-.admin-pipeline-state strong { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em; }
-.admin-stage-rail { display: grid; grid-template-columns: repeat(6, minmax(1.3rem, 1fr)); gap: 0.3rem; }
+.admin-pipeline-state strong { font-size: 0.76rem; letter-spacing: 0.01em; }
+.admin-pipeline-message {
+  display: -webkit-box;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--theme-foreground-muted);
+  font-size: 0.73rem;
+  line-height: 1.4;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+.admin-stage-rail { display: grid; grid-template-columns: repeat(4, minmax(1.3rem, 1fr)); gap: 0.3rem; }
 .admin-stage-rail > i { position: relative; height: 0.35rem; border-radius: 99px; background: color-mix(in srgb, var(--theme-foreground-faintest) 90%, transparent); }
 .admin-stage-rail > i.done { background: #3d8a53; }
 .admin-stage-rail > i.active { background: #315b8a; animation: admin-pulse 1.7s ease-in-out infinite; }
-.admin-stage-rail > i.todo { background: #d98c2f; }
-.admin-stage-rail > i.blocked { background: color-mix(in srgb, var(--theme-foreground-muted) 25%, transparent); }
+.admin-stage-rail > i.issue { background: #c13c32; }
+.admin-stage-rail > i.future { background: color-mix(in srgb, var(--theme-foreground-muted) 22%, transparent); }
+.admin-stage-rail > i.not-applicable { background: transparent; border: 1px dashed color-mix(in srgb, var(--theme-foreground-muted) 32%, transparent); }
 .admin-stage-rail > i span { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
 @keyframes admin-pulse { 50% { opacity: 0.45; } }
 .admin-pipeline-lifecycle { color: var(--theme-foreground-muted); font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.05em; }
@@ -2269,27 +2273,39 @@ currentManifest.merged.length > 0
   border-left: 3px solid #315b8a;
   background: color-mix(in srgb, var(--theme-background) 96%, #dfe9f3 4%);
 }
-.admin-dossier-summary { display: grid; grid-template-columns: minmax(16rem, 0.8fr) minmax(28rem, 1.4fr); }
-.admin-dossier-summary > div { padding: 1rem; }
-.admin-dossier-summary p { max-width: 62ch; margin: 0.35rem 0 0; font-size: 0.82rem; line-height: 1.55; }
-.admin-dossier-summary dl { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); margin: 0; border-left: 1px solid var(--theme-foreground-faintest); }
-.admin-dossier-summary dl div { min-width: 0; padding: 0.75rem; border-left: 1px solid var(--theme-foreground-faintest); border-bottom: 1px solid var(--theme-foreground-faintest); }
-.admin-dossier-summary dl div:nth-child(3n + 1) { border-left: 0; }
-.admin-dossier-summary dt { color: var(--theme-foreground-muted); font-size: 0.62rem; font-weight: 750; letter-spacing: 0.08em; text-transform: uppercase; }
-.admin-dossier-summary dd { margin: 0.22rem 0 0; overflow-wrap: anywhere; font-size: 0.72rem; font-weight: 650; }
-.admin-dossier-stages { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); border-top: 1px solid var(--theme-foreground-faintest); }
-.admin-dossier-stage { display: grid; align-content: start; gap: 0.18rem; min-height: 6.3rem; padding: 0.72rem; border-left: 1px solid var(--theme-foreground-faintest); box-shadow: inset 0 3px var(--stage-color, #8793a1); }
-.admin-dossier-stage:first-child { border-left: 0; }
-.admin-dossier-stage.done { --stage-color: #3d8a53; }
-.admin-dossier-stage.active { --stage-color: #315b8a; }
-.admin-dossier-stage.todo { --stage-color: #d98c2f; }
-.admin-dossier-stage.blocked { --stage-color: #9aa0a7; opacity: 0.72; }
-.admin-dossier-stage > span { color: var(--theme-foreground-muted); font-size: 0.62rem; font-weight: 750; letter-spacing: 0.06em; text-transform: uppercase; }
-.admin-dossier-stage > strong { min-height: 2em; font-size: 0.74rem; }
-.admin-stage-button { justify-self: start; margin-top: auto; padding: 0; border: 0; background: transparent; color: #315b8a; font-size: 0.68rem; font-weight: 750; cursor: pointer; }
-.admin-stage-button:hover { text-decoration: underline; }
-.admin-stage-button:disabled { color: var(--theme-foreground-muted); cursor: not-allowed; text-decoration: none; }
+.admin-dossier-lead { display: grid; gap: 0.32rem; padding: 1rem 1.05rem; border-left: 4px solid #738091; }
+.admin-dossier-lead.active { border-left-color: #315b8a; }
+.admin-dossier-lead.danger { border-left-color: #c13c32; background: color-mix(in srgb, #c13c32 4%, transparent); }
+.admin-dossier-lead.success { border-left-color: #3d8a53; }
+.admin-dossier-lead > strong { font-size: 1.02rem; }
+.admin-dossier-lead > p { max-width: 72ch; margin: 0; font-size: 0.82rem; line-height: 1.55; }
+.admin-human-progress { display: grid; gap: 0.35rem; max-width: 46rem; margin-top: 0.45rem; }
+.admin-human-progress > div:first-child { display: flex; justify-content: space-between; gap: 1rem; font-size: 0.75rem; }
+.admin-human-progress-track { height: 0.5rem; overflow: hidden; border-radius: 99px; background: color-mix(in srgb, var(--theme-foreground-muted) 16%, transparent); }
+.admin-human-progress-track i { display: block; height: 100%; border-radius: inherit; background: #315b8a; }
+.admin-human-progress small { color: var(--theme-foreground-muted); font-size: 0.68rem; }
+.admin-human-error { display: grid; gap: 0.15rem; max-width: 70ch; margin-top: 0.45rem; padding: 0.7rem 0.8rem; border-left: 3px solid #c13c32; background: color-mix(in srgb, #c13c32 7%, transparent); }
+.admin-human-error strong { font-size: 0.72rem; }
+.admin-human-error span { font-size: 0.76rem; line-height: 1.45; }
+.admin-milestone-line { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-top: 1px solid var(--theme-foreground-faintest); }
+.admin-milestone { position: relative; display: grid; grid-template-columns: 0.8rem minmax(0, 1fr); gap: 0.15rem 0.45rem; min-height: 4.2rem; padding: 0.75rem; border-left: 1px solid var(--theme-foreground-faintest); }
+.admin-milestone:first-child { border-left: 0; }
+.admin-milestone > i { grid-row: 1 / 3; width: 0.7rem; height: 0.7rem; margin-top: 0.14rem; border-radius: 50%; border: 2px solid #a2aab3; background: var(--theme-background); }
+.admin-milestone.done > i { border-color: #3d8a53; background: #3d8a53; box-shadow: inset 0 0 0 2px var(--theme-background); }
+.admin-milestone.active > i { border-color: #315b8a; background: #315b8a; animation: admin-pulse 1.7s ease-in-out infinite; }
+.admin-milestone.issue > i { border-color: #c13c32; background: #c13c32; }
+.admin-milestone.not-applicable > i { border-style: dashed; }
+.admin-milestone > span { color: var(--theme-foreground-muted); font-size: 0.63rem; font-weight: 750; letter-spacing: 0.05em; text-transform: uppercase; }
+.admin-milestone > strong { font-size: 0.72rem; line-height: 1.35; }
+.admin-dossier-facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); margin: 0; border-top: 1px solid var(--theme-foreground-faintest); }
+.admin-dossier-facts > div { min-width: 0; padding: 0.7rem 0.8rem; border-left: 1px solid var(--theme-foreground-faintest); border-bottom: 1px solid var(--theme-foreground-faintest); }
+.admin-dossier-facts > div:nth-child(3n + 1) { border-left: 0; }
+.admin-dossier-facts dt { color: var(--theme-foreground-muted); font-size: 0.61rem; font-weight: 750; letter-spacing: 0.07em; text-transform: uppercase; }
+.admin-dossier-facts dd { margin: 0.2rem 0 0; overflow-wrap: anywhere; font-size: 0.72rem; font-weight: 650; }
 .admin-dossier-actions { display: flex; flex-wrap: wrap; gap: 0.4rem; padding: 0.75rem 1rem; border-top: 1px solid var(--theme-foreground-faintest); }
+.admin-advanced-actions { border-top: 1px solid var(--theme-foreground-faintest); }
+.admin-advanced-actions summary { padding: 0.65rem 1rem; color: var(--theme-foreground-muted); font-size: 0.72rem; font-weight: 700; cursor: pointer; }
+.admin-advanced-actions > div { display: flex; flex-wrap: wrap; gap: 0.4rem; padding: 0 1rem 0.8rem; }
 .admin-dossier-log { border-top: 1px solid var(--theme-foreground-faintest); }
 .admin-dossier-log summary { padding: 0.6rem 1rem; color: var(--theme-foreground-muted); font-size: 0.72rem; font-weight: 700; cursor: pointer; }
 .admin-onboarding-console { display: grid; gap: 0.75rem; }
@@ -2328,11 +2344,7 @@ currentManifest.merged.length > 0
   .admin-command-header { grid-template-columns: 1fr; }
   .admin-command-facts { border: 0; border-block: 1px solid var(--admin-line); }
   .admin-command-session { grid-auto-flow: column; justify-content: start; }
-  .admin-pipeline-row { grid-template-columns: minmax(9rem, 1fr) minmax(9rem, 1fr) minmax(14rem, 1.5fr) 5rem 1rem; }
-  .admin-dossier-summary { grid-template-columns: 1fr; }
-  .admin-dossier-summary dl { border-left: 0; border-top: 1px solid var(--theme-foreground-faintest); }
-  .admin-dossier-stages { grid-template-columns: repeat(3, minmax(0, 1fr)); }
-  .admin-dossier-stage:nth-child(4) { border-left: 0; }
+  .admin-pipeline-row { grid-template-columns: minmax(9rem, 0.8fr) minmax(9rem, 0.8fr) minmax(13rem, 1.2fr) minmax(7rem, 0.7fr) 1rem; }
   .pipeline-stage-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
@@ -2346,17 +2358,18 @@ currentManifest.merged.length > 0
   .admin-pipeline-summary.concise { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .admin-pipeline-summary.concise > div:nth-child(3) { border-left: 0; }
   .admin-pipeline-summary.concise > div:nth-child(n+3) { border-top: 1px solid var(--theme-foreground-faintest); }
-  .admin-pipeline-row { grid-template-columns: minmax(7.8rem, 0.8fr) minmax(8.5rem, 1fr) 1rem; gap: 0.65rem; }
-  .admin-stage-rail { grid-column: 1 / -1; grid-row: 2; }
-  .admin-pipeline-lifecycle { display: none; }
+  .admin-pipeline-row { grid-template-columns: minmax(7.8rem, 0.8fr) minmax(8.5rem, 1fr) 1rem; gap: 0.55rem 0.65rem; padding-block: 0.75rem; }
+  .admin-pipeline-message { grid-column: 1 / -1; grid-row: 2; -webkit-line-clamp: 3; }
+  .admin-stage-rail { grid-column: 1 / -1; grid-row: 3; }
   .admin-row-chevron { grid-column: 3; grid-row: 1; }
   .admin-pipeline-dossier { margin-inline: 0; }
-  .admin-dossier-summary dl { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .admin-dossier-summary dl div:nth-child(3n + 1) { border-left: 1px solid var(--theme-foreground-faintest); }
-  .admin-dossier-summary dl div:nth-child(odd) { border-left: 0; }
-  .admin-dossier-stages { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .admin-dossier-stage:nth-child(4) { border-left: 1px solid var(--theme-foreground-faintest); }
-  .admin-dossier-stage:nth-child(odd) { border-left: 0; }
+  .admin-milestone-line { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .admin-milestone:nth-child(3),
+  .admin-milestone:nth-child(4) { border-top: 1px solid var(--theme-foreground-faintest); }
+  .admin-milestone:nth-child(3) { border-left: 0; }
+  .admin-dossier-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .admin-dossier-facts > div:nth-child(3n + 1) { border-left: 1px solid var(--theme-foreground-faintest); }
+  .admin-dossier-facts > div:nth-child(odd) { border-left: 0; }
   .admin-registration-policy { grid-template-columns: 1fr; }
   .admin-wiki-focus { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .admin-wiki-focus > div:nth-child(3) { border-left: 0; }
