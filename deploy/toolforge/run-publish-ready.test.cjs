@@ -31,6 +31,18 @@ test("publisher uses a lock path accepted and released by the lock helper", (con
   assert.equal(fs.existsSync(lock), false);
 });
 
+test("lock helper preserves failure status and still releases its heartbeat lock", (context) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-failed-lock-"));
+  context.after(() => fs.rmSync(directory, {recursive: true, force: true}));
+  const lock = path.join(directory, ".publication.lock");
+  const result = spawnSync("bash", [lockScript, lock, "publication", "60", "bash", "-c", "exit 23"], {
+    encoding: "utf8",
+    env: {...process.env, WIKI_ECON_RUN_ID: "publisher-failed-lock-test", WIKI_ECON_LOCK_HEARTBEAT_SECS: "1"},
+  });
+  assert.equal(result.status, 23, result.stderr || result.stdout);
+  assert.equal(fs.existsSync(lock), false);
+});
+
 test("publisher exits before the site build for an unchanged selection", () => {
   const prepare = transactionScript.indexOf("publication-prepare-ready");
   const noOpState = transactionScript.indexOf("no_op)");

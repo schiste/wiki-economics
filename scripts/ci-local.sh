@@ -70,6 +70,7 @@ node --test deploy/toolforge/run-record.test.cjs
 
 echo "==> node --test deploy/toolforge/run-refresh.test.cjs"
 node --test deploy/toolforge/run-refresh.test.cjs
+node --test deploy/toolforge/run-publish-ready.test.cjs
 
 echo "==> node --test deploy/toolforge/prune-releases.test.cjs"
 node --test deploy/toolforge/prune-releases.test.cjs

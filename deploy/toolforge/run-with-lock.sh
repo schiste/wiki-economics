@@ -158,4 +158,6 @@ fi
 heartbeat_pid=$!
 
 echo "==> Acquired $scope lock for run $run_id"
-"$@"
+command_status=0
+"$@" || command_status=$?
+exit "$command_status"

@@ -151,6 +151,7 @@ jobs:
           node --test site/freshness.test.cjs
           node --test deploy/toolforge/run-record.test.cjs
           node --test deploy/toolforge/run-refresh.test.cjs
+          node --test deploy/toolforge/run-publish-ready.test.cjs
           node --test deploy/toolforge/install-binary.test.cjs
           node --test deploy/toolforge/download-release.test.cjs
           node --test deploy/toolforge/download-site-source.test.cjs
