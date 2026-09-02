@@ -3063,18 +3063,15 @@ mod tests {
     fn manifest_materialization_has_a_narrow_explicit_cli() -> Result<()> {
         let output = TestDir::new()?;
         let generators = TestDir::new()?;
-        fs::write(
-            generators.path().join("manifest.json.sh"),
-            "#!/bin/sh\nprintf '{\"materialized\":true}'\n",
-        )?;
+        let generator = generators.path().join("manifest.json.sh");
+        fs::write(generator, "#!/bin/sh\nprintf '{\"materialized\":true}'\n")?;
         let cli = Cli::try_parse_from(vec![
             "wiki-econ".to_string(),
             "--output-dir".to_string(),
             output.path().display().to_string(),
             "manifest-materialize".to_string(),
             "--generator-dir".to_string(),
-            generators.path().display().to_string(),
-        ])?;
+            generators.path().display().to_string()])?;
 
         run_with_ops(cli, &RecordingOps::default())?;
 
