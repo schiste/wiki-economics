@@ -272,6 +272,23 @@ test("generation readiness follows the pointer and strict ingest receipt without
   assert.equal(manifest.wikis.logs, undefined);
 });
 
+test("manifest generation timestamp can be pinned by the publication environment", async () => {
+  const current = fixture("environment-timestamp");
+  const manifest = await buildManifest({
+    root,
+    dataDir: current.dataDir,
+    outputDir: current.outputDir,
+    lifecycle: lifecycle(),
+    rowCounter: rows({events: 10, rights: 2, metric: 5}),
+    environment: {
+      WIKI_ECON_MANIFEST_GENERATED_AT: "2026-08-23T12:00:00Z",
+      WIKI_ECON_SOURCE_COMMIT: "a".repeat(40),
+    },
+  });
+  assert.equal(manifest.generated_at, "2026-08-23T12:00:00Z");
+  assert.equal(manifest.provenance.generated_at, "2026-08-23T12:00:00Z");
+});
+
 test("published readiness survives policy-driven retirement of redownloadable inputs", async () => {
   const current = fixture("published-after-input-retirement");
   fs.rmSync(path.join(current.dataDir, "parquet", "nlwiki"), {recursive: true, force: true});

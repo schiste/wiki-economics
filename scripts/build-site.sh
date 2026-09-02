@@ -62,6 +62,57 @@ verify_publication_receipt() {
 verify_publication_receipt
 
 if [ "${WIKI_ECON_REQUIRE_PUBLICATION_GATE:-0}" = "1" ]; then
+  # The operational manifest is read by the authenticated admin API as well
+  # as copied into the static site. A site-source-only release can change its
+  # lifecycle interpretation without running the Rust merge generator, so
+  # refresh it before checking whether the site itself is reusable.
+  manifest_path="$WIKI_ECON_OUTPUT_DIR/manifest.json"
+  manifest_generator="$WIKI_ECON_SITE_DIR/data-build/manifest.json.sh"
+  expected_manifest_commit="${WIKI_ECON_SITE_SOURCE_COMMIT:-${WIKI_ECON_SOURCE_COMMIT:-}}"
+  current_manifest_commit="$(node -e '
+    const fs = require("node:fs");
+    try {
+      const manifest = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      process.stdout.write(manifest?.provenance?.generating_commit || "");
+    } catch {}
+  ' "$manifest_path")"
+
+  if [ -z "$expected_manifest_commit" ] || [ "$current_manifest_commit" != "$expected_manifest_commit" ]; then
+    [ -x "$manifest_generator" ] || {
+      echo "Operational manifest generator is missing or not executable: $manifest_generator" >&2
+      exit 1
+    }
+    manifest_generated_at="$(node -e '
+      const fs = require("node:fs");
+      const manifest = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+      const value = manifest.generated_at;
+      if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(value)) process.exit(1);
+      process.stdout.write(value);
+    ' "$manifest_path")" || {
+      echo "Existing operational manifest has no valid deterministic timestamp: $manifest_path" >&2
+      exit 1
+    }
+    manifest_staging="$(mktemp "$WIKI_ECON_OUTPUT_DIR/.manifest.json.${WIKI_ECON_RUN_ID:-site}.XXXXXX")"
+    if ! WIKI_ECON_MANIFEST_GENERATED_AT="$manifest_generated_at" "$manifest_generator" > "$manifest_staging"; then
+      rm -f -- "$manifest_staging"
+      echo "Operational manifest regeneration failed; keeping the published manifest" >&2
+      exit 1
+    fi
+    if ! node -e '
+      const fs = require("node:fs");
+      const [source, destination] = process.argv.slice(1);
+      JSON.parse(fs.readFileSync(source, "utf8"));
+      const descriptor = fs.openSync(source, "r");
+      try { fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
+      fs.renameSync(source, destination);
+    ' "$manifest_staging" "$manifest_path"; then
+      rm -f -- "$manifest_staging"
+      echo "Operational manifest validation or atomic publication failed" >&2
+      exit 1
+    fi
+    echo "==> Refreshed operational manifest for site source ${expected_manifest_commit:-unknown}"
+  fi
+
   if wiki_econ_run_cli site-fingerprint-check \
     --site-dir "$WIKI_ECON_SITE_DIR" \
     --dist-dir "$WIKI_ECON_SITE_DIST_DIR"; then

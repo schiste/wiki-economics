@@ -558,7 +558,12 @@ async function buildManifest(options = {}) {
   const licensing = options.licensing || publicationLicensing(
     options.licensingFile || path.join(repositoryRoot, "config", "publication-licensing.json"),
   );
-  const generatedAt = options.generatedAt || new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+  const generatedAt = options.generatedAt || environment.WIKI_ECON_MANIFEST_GENERATED_AT
+    || new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(generatedAt)
+      || Number.isNaN(Date.parse(generatedAt))) {
+    throw new Error(`invalid manifest generation timestamp: ${generatedAt}`);
+  }
   if (!lifecycle?.publication_contract?.datasets || !lifecycle?.wikis) throw new Error(`invalid wiki lifecycle registry: ${lifecycleFile}`);
   const rowCounter = options.rowCounter || parquetRowCounter();
   const merged = fileList(outputDir);

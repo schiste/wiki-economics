@@ -32,6 +32,10 @@ if [ "\${FAKE_BUILD_FAIL:-0}" = 1 ]; then exit 1; fi
 fs.mkdirSync(path.join(fakeRoot, "deploy", "toolforge"), {recursive: true});
 fs.mkdirSync(fakeBin, {recursive: true});
 fs.mkdirSync(path.join(outputDir, "nlwiki"), {recursive: true});
+fs.writeFileSync(path.join(outputDir, "manifest.json"), JSON.stringify({
+  generated_at: "2026-08-23T12:00:00Z",
+  provenance: {generating_commit: "previous"},
+}));
 const browserSource = path.join(outputDir, "nlwiki", "gdp.parquet");
 fs.writeFileSync(browserSource, "browser-data");
 const browserBytes = fs.statSync(browserSource).size;
@@ -129,7 +133,16 @@ test("site builds are switched atomically and failed staging is discarded", () =
 test("a reusable site skips Node dependency installation", () => {
   const cacheHitSite = path.join(fakeRoot, "cache-hit-site");
   const npmLog = path.join(fixtureRoot, "cache-hit-npm.log");
-  fs.mkdirSync(cacheHitSite, {recursive: true});
+  fs.mkdirSync(path.join(cacheHitSite, "data-build"), {recursive: true});
+  fs.writeFileSync(
+    path.join(cacheHitSite, "data-build", "manifest.json.sh"),
+    `#!/bin/sh
+set -eu
+printf '{"generated_at":"%s","refreshed":true,"provenance":{"generating_commit":"%s"}}\\n' \
+  "$WIKI_ECON_MANIFEST_GENERATED_AT" "\${WIKI_ECON_SITE_SOURCE_COMMIT:-fixture}"
+`,
+    {mode: 0o755},
+  );
 
   const result = runBuild({
     FAKE_NPM_LOG: npmLog,
@@ -143,6 +156,11 @@ test("a reusable site skips Node dependency installation", () => {
   assert.match(result.stdout, /Site inputs unchanged; reusing published site/);
   assert.equal(fs.existsSync(npmLog), false);
   assert.equal(fs.existsSync(path.join(cacheHitSite, "node_modules")), false);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(outputDir, "manifest.json"), "utf8")), {
+    generated_at: "2026-08-23T12:00:00Z",
+    refreshed: true,
+    provenance: {generating_commit: "fixture"},
+  });
   const events = fs.readFileSync(stageEvents, "utf8").trim().split("\n").map(JSON.parse);
   assert.equal(events.at(-2).event, "reused");
   assert.equal(events.at(-1).event, "completed");
@@ -156,9 +174,22 @@ test("a frontend-only rebuild reuses the validated Rust dashboard defaults", () 
   const closureWikiEcon = path.join(closureBin, "wiki-econ");
   fs.mkdirSync(closureBin, {recursive: true});
   fs.mkdirSync(path.join(fakeSite, "src"), {recursive: true});
+  fs.mkdirSync(path.join(fakeSite, "data-build"), {recursive: true});
   fs.mkdirSync(path.join(fakeSite, "vendor", "observable-cache"), {recursive: true});
   fs.writeFileSync(path.join(fakeSite, "src", "index.md"), "# Frontend\n");
-  fs.writeFileSync(path.join(outputDir, "manifest.json"), "{}\n");
+  fs.writeFileSync(path.join(outputDir, "manifest.json"), JSON.stringify({
+    generated_at: "2026-08-23T12:00:00Z",
+    provenance: {generating_commit: "previous"},
+  }));
+  fs.writeFileSync(
+    path.join(fakeSite, "data-build", "manifest.json.sh"),
+    `#!/bin/sh
+set -eu
+printf '{"generated_at":"%s","provenance":{"generating_commit":"%s"}}\\n' \
+  "$WIKI_ECON_MANIFEST_GENERATED_AT" "\${WIKI_ECON_SITE_SOURCE_COMMIT:-fixture}"
+`,
+    {mode: 0o755},
+  );
   fs.copyFileSync(fakeNpm, path.join(closureBin, "npm"));
   fs.chmodSync(path.join(closureBin, "npm"), 0o755);
   fs.writeFileSync(
