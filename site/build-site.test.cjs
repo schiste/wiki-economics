@@ -133,39 +133,21 @@ test("site builds are switched atomically and failed staging is discarded", () =
   assert.equal(events.at(-1).stage, "site");
 });
 
-test("a reusable site skips Node dependency installation", () => {
+test("a reusable site preserves the publication-signed manifest byte for byte", () => {
   const cacheHitSite = path.join(fakeRoot, "cache-hit-site");
   const npmLog = path.join(fixtureRoot, "cache-hit-npm.log");
+  const commandLog = path.join(fixtureRoot, "cache-hit-commands.log");
   const manifestWikiEcon = path.join(fakeBin, "wiki-econ-manifest");
-  fs.mkdirSync(path.join(cacheHitSite, "data-build"), {recursive: true});
-  fs.writeFileSync(
-    path.join(cacheHitSite, "data-build", "manifest.json.sh"),
-    `#!/bin/sh
-set -eu
-printf '{"generated_at":"%s","refreshed":true,"provenance":{"generating_commit":"%s"}}\\n' \
-  "$WIKI_ECON_MANIFEST_GENERATED_AT" "\${WIKI_ECON_SITE_SOURCE_COMMIT:-fixture}"
-`,
-    {mode: 0o755},
+  fs.mkdirSync(cacheHitSite, {recursive: true});
+  const signedManifest = Buffer.from(
+    '{"generated_at":"2026-08-23T12:00:00Z","provenance":{"generating_commit":"previous"}}\n',
   );
+  fs.writeFileSync(path.join(outputDir, "manifest.json"), signedManifest);
   fs.writeFileSync(
     manifestWikiEcon,
     `#!/bin/sh
 set -eu
-output_dir=""
-generator_dir=""
-command_name=""
-previous=""
-for argument in "$@"; do
-  case "$previous" in
-    --output-dir) output_dir="$argument" ;;
-    --generator-dir) generator_dir="$argument" ;;
-  esac
-  [ "$argument" != manifest-materialize ] || command_name="$argument"
-  previous="$argument"
-done
-if [ "$command_name" = manifest-materialize ]; then
-  "$generator_dir/manifest.json.sh" > "$output_dir/manifest.json"
-fi
+printf '%s\\n' "$*" >> "$FAKE_COMMAND_LOG"
 exit 0
 `,
     {mode: 0o755},
@@ -178,17 +160,19 @@ exit 0
     WIKI_ECON_RUN_ID: "cache-hit-run",
     WIKI_ECON_SITE_DIR: cacheHitSite,
     WIKI_ECON_SOURCE_COMMIT: "c".repeat(40),
+    FAKE_COMMAND_LOG: commandLog,
   });
 
   assertBuildSucceeded(result);
   assert.match(result.stdout, /Site inputs unchanged; reusing published site/);
   assert.equal(fs.existsSync(npmLog), false);
   assert.equal(fs.existsSync(path.join(cacheHitSite, "node_modules")), false);
-  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(outputDir, "manifest.json"), "utf8")), {
-    generated_at: "2026-08-23T12:00:00Z",
-    refreshed: true,
-    provenance: {generating_commit: "fixture"},
-  });
+  assert.deepEqual(fs.readFileSync(path.join(outputDir, "manifest.json")), signedManifest);
+  const commands = fs.readFileSync(commandLog, "utf8").trim().split("\n");
+  assert.equal(commands.length, 2);
+  assert.match(commands[0], /publication-verify/);
+  assert.match(commands[1], /site-fingerprint-check/);
+  assert.equal(commands.some((command) => command.includes("manifest-materialize")), false);
   const events = fs.readFileSync(stageEvents, "utf8").trim().split("\n").map(JSON.parse);
   assert.equal(events.at(-2).event, "reused");
   assert.equal(events.at(-1).event, "completed");
@@ -228,7 +212,7 @@ command_name=""
 destination=""
 for argument in "$@"; do
   case "$argument" in
-    publication-verify|site-fingerprint-check|site-fingerprint-record|dashboard-materialize|dashboard-defaults-fingerprint-check|dashboard-defaults-fingerprint-record)
+    publication-verify|site-fingerprint-check|site-fingerprint-record|manifest-materialize|dashboard-materialize|dashboard-defaults-fingerprint-check|dashboard-defaults-fingerprint-record)
       command_name="$argument"
       ;;
   esac
@@ -271,6 +255,7 @@ esac
     WIKI_ECON_BIN: closureWikiEcon,
     WIKI_ECON_REQUIRE_PUBLICATION_GATE: "1",
     WIKI_ECON_VERIFY_SITE_CLOSURE: "1",
+    WIKI_ECON_SOURCE_COMMIT: "c".repeat(40),
     WIKI_ECON_SITE_DEFAULTS_DIR: defaultsDir,
     WIKI_ECON_RUN_RECORD_HELPER: path.join(fakeRoot, "deploy", "toolforge", "run-record.cjs"),
     FAKE_DEFAULTS_COMMAND_LOG: commandLog,
@@ -288,6 +273,7 @@ esac
   const commands = fs.readFileSync(commandLog, "utf8").trim().split("\n");
   assert.equal(commands.filter((command) => command === "dashboard-materialize").length, 1);
   assert.equal(commands.filter((command) => command === "dashboard-defaults-fingerprint-check").length, 1);
+  assert.equal(commands.some((command) => command === "manifest-materialize"), false);
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(distDir, "manifest.json"), "utf8")), {
     generation: "current",
   });
