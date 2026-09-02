@@ -239,11 +239,13 @@ if [ "${WIKI_ECON_VERIFY_SITE_CLOSURE:-1}" = "1" ]; then
     WIKI_ECON_SITE_SOURCE_DIR="$source_dir" \
     WIKI_ECON_SITE_DIST_DIR="$build_dir" \
     "$WIKI_ECON_ROOT/node_modules/.bin/observable" build --config "$WIKI_ECON_SITE_DIR/observablehq.config.js")
+  node "$ROOT/scripts/publish-static-root.cjs" "$source_dir" "$build_dir"
   node "$ROOT/scripts/publish-browser-data.cjs" "$WIKI_ECON_OUTPUT_DIR" "$build_dir"
   node "$ROOT/scripts/verify-site-dependencies.cjs" "$build_dir"
 else
   (cd "$WIKI_ECON_ROOT" && WIKI_ECON_SITE_DIST_DIR="$build_dir" \
     "$WIKI_ECON_ROOT/node_modules/.bin/observable" build --config "$WIKI_ECON_SITE_DIR/observablehq.config.js")
+  node "$ROOT/scripts/publish-static-root.cjs" "$WIKI_ECON_SITE_DIR/src" "$build_dir"
   node "$ROOT/scripts/publish-browser-data.cjs" "$WIKI_ECON_OUTPUT_DIR" "$build_dir"
 fi
 

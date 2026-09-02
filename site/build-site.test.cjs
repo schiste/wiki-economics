@@ -16,6 +16,8 @@ const distDir = path.join(fixtureRoot, "published", "site-dist");
 const stageEvents = path.join(fixtureRoot, "site-stage-events.jsonl");
 
 fs.mkdirSync(path.join(fakeRoot, "node_modules", ".bin"), {recursive: true});
+fs.mkdirSync(path.join(fakeSite, "src"), {recursive: true});
+fs.writeFileSync(path.join(fakeSite, "src", "robots.txt"), "User-agent: *\nCrawl-delay: 10\n");
 fs.writeFileSync(
   path.join(fakeRoot, "node_modules", ".bin", "observable"),
   `#!/bin/sh
@@ -242,6 +244,7 @@ case "$1" in
   */run-record.cjs|*/publish-browser-data.cjs|*/verify-site-dependencies.cjs) exit 0 ;;
   */prepare-site-source.cjs)
     mkdir -p "$3/data"
+    cp "$2/robots.txt" "$3/robots.txt"
     cp "$6" "$3/data/manifest.json"
     ;;
   *) exec ${JSON.stringify(process.execPath)} "$@" ;;

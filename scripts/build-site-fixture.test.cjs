@@ -9,6 +9,7 @@ const {after, test} = require("node:test");
 const {
   REQUIRED_ATTACHMENTS,
   REQUIRED_PAGES,
+  REQUIRED_ROOT_FILES,
   listFiles,
   parseArguments,
   verifyBuild,
@@ -41,6 +42,7 @@ test("built site verification requires every page and hashed attachment", () => 
   const data = path.join(dist, "_file", "data");
   fs.mkdirSync(data, {recursive: true});
   const browserDownloads = writeBrowserData(dist);
+  for (const file of REQUIRED_ROOT_FILES) fs.writeFileSync(path.join(dist, file), "User-agent: *\n");
   for (const page of REQUIRED_PAGES) {
     fs.writeFileSync(path.join(dist, page), '<!doctype html><a href="/legal">Legal</a>');
   }
@@ -93,6 +95,7 @@ test("built site verification fails closed on legal and manifest regressions", (
   const data = path.join(dist, "_file", "data");
   fs.mkdirSync(data, {recursive: true});
   writeBrowserData(dist);
+  for (const file of REQUIRED_ROOT_FILES) fs.writeFileSync(path.join(dist, file), "User-agent: *\n");
   for (const page of REQUIRED_PAGES) fs.writeFileSync(path.join(dist, page), '<a href="/legal">Legal</a>');
   for (const attachment of REQUIRED_ATTACHMENTS) {
     const extension = path.extname(attachment);

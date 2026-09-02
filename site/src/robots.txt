@@ -1,0 +1,14 @@
+# Wiki Economics publishes a small set of human-facing dashboard pages.
+# Generated datasets and operational endpoints are not useful search results.
+User-agent: *
+Allow: /
+Disallow: /admin
+Disallow: /admin-api/
+Disallow: /health/
+Disallow: /browser-data/
+Disallow: /data/
+Disallow: /*?*
+
+# A voluntary request honored by some crawlers. Request-rate enforcement, when
+# required, belongs at the HTTP ingress because robots.txt is not access control.
+Crawl-delay: 10

@@ -8,6 +8,7 @@ const path = require("node:path");
 const {spawnSync} = require("node:child_process");
 const {prepareSiteSource} = require("./prepare-site-source.cjs");
 const {publishBrowserData} = require("./publish-browser-data.cjs");
+const {publishStaticRoot} = require("./publish-static-root.cjs");
 const {verifySiteDependencies} = require("./verify-site-dependencies.cjs");
 
 const REQUIRED_PAGES = [
@@ -21,6 +22,7 @@ const REQUIRED_PAGES = [
   "legal.html",
   "patrol.html",
 ];
+const REQUIRED_ROOT_FILES = ["robots.txt"];
 const REQUIRED_ATTACHMENTS = [
   "defaults_business.json",
   "defaults_edit_variation.json",
@@ -65,6 +67,11 @@ function listFiles(directory, prefix = "") {
 }
 
 function verifyBuild(distDir) {
+  for (const file of REQUIRED_ROOT_FILES) {
+    if (!fs.statSync(path.join(distDir, file), {throwIfNoEntry: false})?.isFile()) {
+      throw new Error(`Observable build is missing root file ${file}`);
+    }
+  }
   for (const page of REQUIRED_PAGES) {
     const pagePath = path.join(distDir, page);
     if (!fs.statSync(pagePath, {throwIfNoEntry: false})?.isFile()) {
@@ -162,6 +169,7 @@ function buildFixture({dataDir, distDir, root = path.resolve(__dirname, ".."), r
     if (result.status !== 0) {
       throw new Error(`Observable build failed\n${result.stdout || ""}${result.stderr || ""}`);
     }
+    publishStaticRoot({sourceDir, distDir});
     publishBrowserData({dataDir, distDir});
     const files = verifyBuild(distDir);
     verifySiteDependencies(distDir);
@@ -186,4 +194,12 @@ if (require.main === module) {
   }
 }
 
-module.exports = {REQUIRED_ATTACHMENTS, REQUIRED_PAGES, buildFixture, listFiles, parseArguments, verifyBuild};
+module.exports = {
+  REQUIRED_ATTACHMENTS,
+  REQUIRED_PAGES,
+  REQUIRED_ROOT_FILES,
+  buildFixture,
+  listFiles,
+  parseArguments,
+  verifyBuild,
+};

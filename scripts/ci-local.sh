@@ -40,6 +40,7 @@ node --check scripts/verify-runtime.cjs
 node --check scripts/verify-site-dependencies.cjs
 node --check scripts/verify-site-reproducibility.cjs
 node --check scripts/publish-browser-data.cjs
+node --check scripts/publish-static-root.cjs
 node --check scripts/browser-performance.cjs
 node --check scripts/site-source-bundle.cjs
 
@@ -60,6 +61,9 @@ node --test site/build-site.test.cjs
 
 echo "==> node --test site/mobile-layout.test.cjs"
 node --test site/mobile-layout.test.cjs
+
+echo "==> node --test site/robots.test.cjs"
+node --test site/robots.test.cjs
 
 echo "==> node --test site/data-build/manifest.test.cjs site/freshness.test.cjs"
 node --test site/data-build/manifest.test.cjs
@@ -113,6 +117,7 @@ node --test scripts/qualify-capacity.test.cjs
 node --test scripts/verify-site-dependencies.test.cjs
 node --test scripts/verify-site-reproducibility.test.cjs
 node --test scripts/publish-browser-data.test.cjs
+node --test scripts/publish-static-root.test.cjs
 node --test scripts/browser-performance.test.cjs
 node --test scripts/check-compute-versions.test.cjs
 node --test scripts/check-fleet-qualification.test.cjs

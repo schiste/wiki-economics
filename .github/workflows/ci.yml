@@ -129,6 +129,7 @@ jobs:
           node --check scripts/deny-network.cjs
           node --check scripts/check-freshness.cjs
           node --check scripts/prepare-site-source.cjs
+          node --check scripts/publish-static-root.cjs
           node --check scripts/release-provenance.cjs
           node --check scripts/generate-sboms.cjs
           node --check scripts/generate-stack-reference.cjs
@@ -147,6 +148,7 @@ jobs:
           node --test site/admin-server.test.cjs
           node --test site/build-site.test.cjs
           node --test site/mobile-layout.test.cjs
+          node --test site/robots.test.cjs
           node --test site/data-build/manifest.test.cjs
           node --test site/freshness.test.cjs
           node --test deploy/toolforge/run-record.test.cjs
@@ -170,6 +172,7 @@ jobs:
           node --test scripts/build-site-fixture.test.cjs
           node --test scripts/check-freshness.test.cjs
           node --test scripts/prepare-site-source.test.cjs
+          node --test scripts/publish-static-root.test.cjs
           node --test scripts/release-provenance.test.cjs
           node --test scripts/generate-sboms.test.cjs
           node --test scripts/generate-stack-reference.test.cjs

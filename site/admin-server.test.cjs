@@ -296,6 +296,7 @@ test("static fallback serves site assets from SITE_DIST_DIR with per-path cache-
   fs.writeFileSync(path.join(distDir, "_observablehq", "client.js"), "console.log('ok')", "utf8");
   fs.mkdirSync(path.join(distDir, "_file"), { recursive: true });
   fs.writeFileSync(path.join(distDir, "_file", "data.csv"), "a,b\n1,2\n", "utf8");
+  fs.writeFileSync(path.join(distDir, "robots.txt"), "User-agent: *\nCrawl-delay: 10\n", "utf8");
 
   // $uri.html fallback, mirroring nginx's try_files $uri $uri.html $uri/ =404
   const extensionless = await invoke(module, { url: "/gdp", headers: { host } });
@@ -310,6 +311,11 @@ test("static fallback serves site assets from SITE_DIST_DIR with per-path cache-
   const file = await invoke(module, { url: "/_file/data.csv", headers: { host } });
   assert.equal(file.statusCode, 200);
   assert.equal(file.getHeader("cache-control"), "public, max-age=600");
+
+  const robots = await invoke(module, { url: "/robots.txt", headers: { host } });
+  assert.equal(robots.statusCode, 200);
+  assert.equal(robots.getHeader("content-type"), "text/plain; charset=utf-8");
+  assert.match(robots.text(), /Crawl-delay: 10/);
 
   const missing = await invoke(module, { url: "/does-not-exist", headers: { host } });
   assert.equal(missing.statusCode, 404);
