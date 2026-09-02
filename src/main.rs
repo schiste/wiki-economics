@@ -3065,13 +3065,15 @@ mod tests {
         let generators = TestDir::new()?;
         let generator = generators.path().join("manifest.json.sh");
         fs::write(generator, "#!/bin/sh\nprintf '{\"materialized\":true}'\n")?;
-        let cli = Cli::try_parse_from(vec![
+        let arguments = vec![
             "wiki-econ".to_string(),
             "--output-dir".to_string(),
             output.path().display().to_string(),
             "manifest-materialize".to_string(),
             "--generator-dir".to_string(),
-            generators.path().display().to_string()])?;
+            generators.path().display().to_string(),
+        ];
+        let cli = Cli::try_parse_from(arguments)?;
 
         run_with_ops(cli, &RecordingOps::default())?;
 
