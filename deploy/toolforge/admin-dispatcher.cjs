@@ -4,6 +4,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const {spawn} = require("node:child_process");
+const {summarizeOperationLog} = require("../../site/admin-operation-status.cjs");
 
 const ROOT = path.resolve(__dirname, "../..");
 const DATA_DIR = path.resolve(process.env.WIKI_ECON_DATA_DIR || path.join(ROOT, "data"));
@@ -230,6 +231,7 @@ async function executeClaim(claim) {
       NO_COLOR: "1",
       OBSERVABLE_TELEMETRY_DISABLE: "true",
       RUST_LOG: "info",
+      WIKI_ECON_LOG_ANSI: "0",
       WIKI_ECON_DATA_DIR: DATA_DIR,
       WIKI_ECON_OUTPUT_DIR: OUTPUT_DIR,
       WIKI_ECON_WIKI_LIFECYCLE_FILE: LIFECYCLE_PATH,
@@ -248,7 +250,15 @@ async function executeClaim(claim) {
       fs.appendFileSync(logPath, "\n[cancellation requested by operator]\n", "utf8");
     }
     const now = new Date().toISOString();
-    state = {...state, ...latest, state: state.cancelRequested ? "cancelling" : "running", heartbeatAt: now, updatedAt: now};
+    const operationSummary = summarizeOperationLog(state, logTail(logPath));
+    state = {
+      ...state,
+      ...latest,
+      ...operationSummary,
+      state: state.cancelRequested ? "cancelling" : "running",
+      heartbeatAt: now,
+      updatedAt: now,
+    };
     atomicWriteJson(runningPath, state);
   }, 5_000);
 
@@ -259,12 +269,14 @@ async function executeClaim(claim) {
   clearInterval(heartbeat);
   const finishedAt = new Date().toISOString();
   const cancelled = state.cancelRequested && result.signal === "SIGTERM";
+  const operationSummary = summarizeOperationLog(state, logTail(logPath));
   const completed = {
     ...state,
+    ...operationSummary,
     state: cancelled ? "cancelled" : result.code === 0 ? "succeeded" : "failed",
     exitCode: cancelled ? 130 : result.code,
     signal: result.signal,
-    error: result.error?.message || null,
+    error: result.error?.message || (result.code === 0 ? null : operationSummary.errorSummary),
     cancelRequested: Boolean(state.cancelRequested),
     finishedAt,
     heartbeatAt: finishedAt,

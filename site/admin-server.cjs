@@ -27,6 +27,7 @@ const {
   wikisWithState,
 } = require("../scripts/wiki-lifecycle.cjs");
 const {evaluateFreshness} = require("./freshness.cjs");
+const {stripAnsi, summarizeOperationLog} = require("./admin-operation-status.cjs");
 
 const ROOT = path.resolve(__dirname, "..");
 const RUNTIME_ENV = process.env.WIKI_ECON_ENV || "local";
@@ -867,15 +868,20 @@ function operationEntries(directory, limit = ADMIN_JOB_HISTORY_LIMIT) {
     .filter((entry) => entry?.schemaVersion === 1)
     .map((entry) => {
       const heartbeatAge = Date.now() - Date.parse(entry.heartbeatAt || entry.updatedAt || entry.startedAt || 0);
-      return ["running", "cancelling"].includes(entry.state)
+      const stateEntry = ["running", "cancelling"].includes(entry.state)
         && Number.isFinite(heartbeatAge) && heartbeatAge > ADMIN_OPERATION_STALE_MS
         ? {...entry, originalState: entry.state, state: "stalled", heartbeatAgeMs: heartbeatAge}
         : entry;
+      const rawLog = operationLogTail(entry.logPath).join("");
+      return {
+        ...stateEntry,
+        ...summarizeOperationLog(stateEntry, rawLog),
+        log: rawLog ? [stripAnsi(rawLog)] : [],
+      };
     })
     .sort((left, right) => Date.parse(right.updatedAt || right.requestedAt || 0)
       - Date.parse(left.updatedAt || left.requestedAt || 0))
-    .slice(0, limit)
-    .map((entry) => ({...entry, log: operationLogTail(entry.logPath)}));
+    .slice(0, limit);
 }
 
 function recoverStaleAdminOperations() {

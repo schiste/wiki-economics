@@ -48,6 +48,18 @@
     }
   },
   "wikis": {
+    "dewiki": {
+      "publication": "hidden",
+      "refresh": "qualification",
+      "provenance": "toolforge-admin:operator",
+      "fleet_resource_class": "medium_large",
+      "retention": {
+        "source_recoverability": "redownloadable",
+        "history_input": "purge_after_ready",
+        "patrol_source": "purge_after_ready",
+        "computed_rollback_generations": 1
+      }
+    },
     "elwiki": {
       "publication": "published",
       "refresh": "scheduled",

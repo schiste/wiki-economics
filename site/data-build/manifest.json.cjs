@@ -41,6 +41,43 @@ function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return null; }
 }
 
+function retentionSummary(dataDir, wiki) {
+  const directory = path.join(dataDir, "retention", wiki);
+  let names = [];
+  try {
+    names = fs.readdirSync(directory)
+      .filter((name) => /^\d{4}-\d{2}\.json$/.test(name))
+      .sort((left, right) => right.localeCompare(left));
+  } catch {}
+  for (const name of names) {
+    const snapshot = name.slice(0, -".json".length);
+    const receipt = readJson(path.join(directory, name));
+    const planPath = path.join(dataDir, "snapshots", wiki, snapshot, "source-plan.json");
+    const plan = statFile(planPath);
+    const planSha256 = plan
+      ? crypto.createHash("sha256").update(fs.readFileSync(planPath)).digest("hex")
+      : null;
+    const valid = receipt?.schema_version === 1
+      && receipt.wiki === wiki
+      && receipt.snapshot === snapshot
+      && ["authorized", "applied"].includes(receipt.state)
+      && /^[0-9a-f]{64}$/.test(receipt.authorized_ready_sha256 || "")
+      && /^[0-9a-f]{64}$/.test(receipt.source_plan_sha256 || "")
+      && receipt.source_plan_sha256 === planSha256;
+    if (valid) {
+      return {
+        valid: 1,
+        snapshot,
+        state: receipt.state,
+        history_input: receipt.history_input,
+        patrol_source: receipt.patrol_source,
+        removed_bytes: Number.isSafeInteger(receipt.removed_bytes) ? receipt.removed_bytes : 0,
+      };
+    }
+  }
+  return {valid: 0, snapshot: null, state: null, history_input: null, patrol_source: null, removed_bytes: 0};
+}
+
 function publicationLicensing(file = path.join(findRoot(), "config", "publication-licensing.json")) {
   const policy = readJson(file);
   if (policy?.schema_version !== 1
@@ -539,17 +576,18 @@ async function buildManifest(options = {}) {
     for (const wiki of discoverWikis(dataDir, outputDir, lifecycle)) {
       const lifecycleEntry = lifecycle.wikis[wiki] || null;
       const published = lifecycleEntry?.publication === "published";
-      const scheduled = lifecycleEntry?.refresh === "scheduled";
       const expected = Object.entries(lifecycle.publication_contract.datasets)
         .filter(([, contract]) => published && datasetApplies(contract, wiki)).map(([name]) => name);
       const requiredCore = CORE_METRICS.filter((metric) => expected.includes(metric));
       const patrolRequired = expected.includes("patrol");
       const raw = rawSummary(dataDir, wiki);
       const generation = generationSummary(dataDir, wiki);
+      const retention = retentionSummary(dataDir, wiki);
+      const selectedSnapshot = generation.version || retention.snapshot;
       const metrics = fileList(path.join(outputDir, wiki));
       const metricNames = new Set(metrics.map((entry) => entry.name));
-      const patrol = await patrolSummary(dataDir, outputDir, wiki, generation.version, patrolRequired, rowCounter);
-      const selectedProfile = workloadProfile(dataDir, wiki, generation.version);
+      const patrol = await patrolSummary(dataDir, outputDir, wiki, selectedSnapshot, patrolRequired, rowCounter);
+      const selectedProfile = workloadProfile(dataDir, wiki, selectedSnapshot);
       const missingCore = requiredCore.filter((metric) => !metricNames.has(metric));
       const missingMerged = expected.filter((metric) =>
         PARTITION_ONLY_METRICS.has(metric) ? !metricNames.has(metric) : !mergedNames.has(metric));
@@ -565,25 +603,42 @@ async function buildManifest(options = {}) {
           });
         }
       }
-      let status = "complete";
-      if (scheduled && !generation.pointer_ready && raw.files === 0) status = "needs_fetch";
-      else if (scheduled && !generation.ingest_ready) status = "needs_ingest";
-      else if (scheduled && patrolRequired && !patrol.source_ready) status = "needs_patrol_fetch";
-      else if (missingCore.length > 0 || (expected.includes("page_weekly_edits") && !metricNames.has("page_weekly_edits"))) status = "needs_compute";
-      else if (patrolRequired && !patrol.metric_ready) status = "needs_patrol_compute";
-      else if (missingMerged.length > 0) status = "needs_merge";
+      const pageWeekReady = !expected.includes("page_weekly_edits") || metricNames.has("page_weekly_edits");
+      const historyInputsRetired = retention.valid && retention.history_input === "purge_after_ready";
+      const patrolInputsRetired = retention.valid && retention.patrol_source === "purge_after_ready";
+      const publishedArtifactsReady = published && missingCore.length === 0 && pageWeekReady
+        && (!patrolRequired || patrol.metric_ready) && missingMerged.length === 0
+        && (generation.ingest_ready || historyInputsRetired)
+        && (!patrolRequired || patrol.source_ready || patrolInputsRetired);
+      let status = publishedArtifactsReady || lifecycleEntry?.refresh === "paused" ? "complete" : "needs_fetch";
+      // A published generation remains operationally complete after its
+      // redownloadable source/ingest layers are retired by policy. Those
+      // layers are recovery inputs, not public readiness requirements.
+      if (!publishedArtifactsReady && lifecycleEntry?.refresh !== "paused") {
+        if (generation.pointer_ready && !generation.ingest_ready) status = "needs_ingest";
+        else if (!generation.pointer_ready && raw.files > 0) status = "needs_ingest";
+        else if (missingCore.length > 0 || !pageWeekReady) status = generation.ingest_ready ? "needs_compute" : status;
+        else if (patrolRequired && !patrol.source_ready && !patrolInputsRetired) status = "needs_patrol_fetch";
+        else if (patrolRequired && !patrol.metric_ready) status = patrol.source_ready ? "needs_patrol_compute" : "needs_patrol_fetch";
+        else if (missingMerged.length > 0) status = "needs_merge";
+      }
       wikis[wiki] = {
         raw,
         snapshot: lifecycleEntry?.refresh === "paused"
           ? {version: lifecycleEntry.imported_cutoff || null, mode: "imported", ready: 1}
-          : {version: generation.version, mode: "generation", ready: generation.ingest_ready},
+          : {version: selectedSnapshot, mode: historyInputsRetired ? "retained-publication" : "generation",
+            ready: Number(Boolean(generation.ingest_ready || historyInputsRetired))},
         ingest: {ready: generation.ingest_ready, rows: generation.rows, sources: generation.sources,
           outputs: generation.outputs, size: humanBytes(generation.bytes), in_progress: generation.in_progress, error: generation.error},
         parquet: {done: generation.ingest_ready ? generation.sources : 0, total: generation.sources,
           size: humanBytes(generation.bytes), in_progress: generation.in_progress, missing: generation.error ? [generation.error] : []},
         metrics,
-        dashboard: merged,
+        // Root merged files are publication evidence only for projects that
+        // are actually part of the public lifecycle. A hidden qualification
+        // must never look complete merely because other wikis are live.
+        dashboard: published ? merged : [],
         patrol,
+        retention,
         workload_profile: selectedProfile,
         status,
       };
@@ -637,4 +692,4 @@ if (require.main === module) {
 }
 
 module.exports = {BROWSER_INDEX, browserDataSummary, buildManifest, datasetApplies, determinismContract, discoverWikis, generationSummary, humanBytes, parquetRowCounter,
-  patrolSummary, publicationLicensing, releaseProvenance, repositoryRootFromEnvironment, repositoryRuntimeProvenance, safeReceiptOutput};
+  patrolSummary, publicationLicensing, releaseProvenance, repositoryRootFromEnvironment, repositoryRuntimeProvenance, retentionSummary, safeReceiptOutput};

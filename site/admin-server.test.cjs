@@ -716,7 +716,15 @@ test("stale operator work is explained as stalled and can be safely requeued", a
     WIKI_ECON_ADMIN_OPERATION_STALE_SECS: "1",
   }, lifecycle, ({outputDir: fixtureOutput}) => {
     const running = path.join(fixtureOutput, "_admin", "operations", "running");
+    const logs = path.join(fixtureOutput, "_admin", "operations", "logs");
     fs.mkdirSync(running, {recursive: true});
+    fs.mkdirSync(logs, {recursive: true});
+    const logPath = path.join(logs, `${requestId}.log`);
+    fs.writeFileSync(logPath, [
+      'run_id=test INFO starting stage stage="source_window" wiki="nlwiki"',
+      'run_id=test INFO starting bounded source-window execution planned_sources=10 reused_sources=2 pending_sources=8',
+      'run_id=test INFO committed ingest source source="source-1" rows=42',
+    ].join("\n"));
     fs.writeFileSync(path.join(running, `${requestId}.json`), JSON.stringify({
       schemaVersion: 1,
       requestId,
@@ -728,11 +736,15 @@ test("stale operator work is explained as stalled and can be safely requeued", a
       startedAt: "2026-08-01T00:00:00Z",
       heartbeatAt: "2026-08-01T00:00:00Z",
       updatedAt: "2026-08-01T00:00:00Z",
+      logPath,
     }));
   });
 
   const before = JSON.parse((await invoke(module, {url: "/api/status", headers: {host}})).text());
   assert.equal(before.adminOperations.running[0].state, "stalled");
+  assert.equal(before.adminOperations.running[0].stage, "source_window");
+  assert.equal(before.adminOperations.running[0].progress.completedSources, 3);
+  assert.equal(before.adminOperations.running[0].progress.totalSources, 10);
 
   const recovered = await invoke(module, {
     method: "POST",

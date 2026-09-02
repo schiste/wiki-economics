@@ -69,6 +69,9 @@ function fixture(name) {
     schema_version: 1, wiki: "nlwiki", snapshot_version: snapshot,
   }));
   fs.mkdirSync(path.join(dataDir, "snapshots", "nlwiki", snapshot), {recursive: true});
+  fs.writeFileSync(path.join(dataDir, "snapshots", "nlwiki", snapshot, "source-plan.json"), JSON.stringify({
+    schema_version: 1, wiki: "nlwiki", snapshot,
+  }));
   fs.writeFileSync(path.join(dataDir, "snapshots", "nlwiki", snapshot, "workload-profile.json"), JSON.stringify({
     schema_version: 2,
     selection_algorithm_version: "adaptive-workload-profile-v2-measured",
@@ -199,6 +202,27 @@ function installPatrolGeneration(dataDir, wiki, snapshot) {
   return {manifestFile, patrolFile};
 }
 
+function installRetentionReceipt(dataDir, wiki, snapshot) {
+  const crypto = require("node:crypto");
+  const plan = path.join(dataDir, "snapshots", wiki, snapshot, "source-plan.json");
+  const directory = path.join(dataDir, "retention", wiki);
+  fs.mkdirSync(directory, {recursive: true});
+  fs.writeFileSync(path.join(directory, `${snapshot}.json`), JSON.stringify({
+    schema_version: 1,
+    wiki,
+    snapshot,
+    state: "applied",
+    authorized_ready_sha256: "a".repeat(64),
+    source_plan_sha256: crypto.createHash("sha256").update(fs.readFileSync(plan)).digest("hex"),
+    history_input: "purge_after_ready",
+    patrol_source: "purge_after_ready",
+    authorized_at_unix: 1,
+    applied_at_unix: 2,
+    removed_bytes: 1024,
+    removed_paths: [],
+  }));
+}
+
 test("generation readiness follows the pointer and strict ingest receipt without raw dumps", async () => {
   const current = fixture("complete");
   const manifest = await buildManifest({
@@ -246,6 +270,90 @@ test("generation readiness follows the pointer and strict ingest receipt without
   assert.equal(manifest.wikis._stages, undefined);
   assert.equal(manifest.wikis[".refresh-lock"], undefined);
   assert.equal(manifest.wikis.logs, undefined);
+});
+
+test("published readiness survives policy-driven retirement of redownloadable inputs", async () => {
+  const current = fixture("published-after-input-retirement");
+  fs.rmSync(path.join(current.dataDir, "parquet", "nlwiki"), {recursive: true, force: true});
+  fs.rmSync(path.join(current.dataDir, "warehouse", "nlwiki"), {recursive: true, force: true});
+  fs.rmSync(path.join(current.dataDir, "stages", "nlwiki"), {recursive: true, force: true});
+  fs.rmSync(path.join(current.dataDir, "snapshots", "nlwiki", "current-snapshot.json"), {force: true});
+  fs.rmSync(path.join(current.dataDir, "patrol", "nlwiki"), {recursive: true, force: true});
+  installRetentionReceipt(current.dataDir, "nlwiki", "2026-07");
+
+  const registry = lifecycle();
+  registry.wikis.nlwiki.retention = {
+    source_recoverability: "redownloadable",
+    history_input: "purge_after_ready",
+    patrol_source: "purge_after_ready",
+    computed_rollback_generations: 1,
+  };
+  const manifest = await buildManifest({
+    root,
+    dataDir: current.dataDir,
+    outputDir: current.outputDir,
+    lifecycle: registry,
+    rowCounter: rows({events: 0, rights: 0, metric: 5}),
+    generatedAt: "2026-09-02T08:00:00Z",
+    environment: {WIKI_ECON_RUN_ID: "retained-publication", WIKI_ECON_SOURCE_COMMIT: "a".repeat(40)},
+  });
+
+  assert.equal(manifest.wikis.nlwiki.status, "complete");
+  assert.equal(manifest.wikis.nlwiki.ingest.ready, 0);
+  assert.equal(manifest.wikis.nlwiki.patrol.source_ready, 0);
+  assert.equal(manifest.wikis.nlwiki.patrol.metric_ready, 1);
+  assert.equal(manifest.wikis.nlwiki.snapshot.version, "2026-07");
+  assert.equal(manifest.wikis.nlwiki.snapshot.mode, "retained-publication");
+  assert.equal(manifest.wikis.nlwiki.retention.valid, 1);
+  assert.equal(manifest.wikis.nlwiki.dashboard.length, metrics.length - 1);
+});
+
+test("retention policy without a matching receipt never hides missing inputs", async () => {
+  const current = fixture("retention-policy-is-not-proof");
+  fs.rmSync(path.join(current.dataDir, "parquet", "nlwiki"), {recursive: true, force: true});
+  fs.rmSync(path.join(current.dataDir, "warehouse", "nlwiki"), {recursive: true, force: true});
+  fs.rmSync(path.join(current.dataDir, "stages", "nlwiki"), {recursive: true, force: true});
+  fs.rmSync(path.join(current.dataDir, "snapshots", "nlwiki", "current-snapshot.json"), {force: true});
+  const registry = lifecycle();
+  registry.wikis.nlwiki.retention = {
+    source_recoverability: "redownloadable",
+    history_input: "purge_after_ready",
+    patrol_source: "purge_after_ready",
+    computed_rollback_generations: 1,
+  };
+  const manifest = await buildManifest({
+    root,
+    dataDir: current.dataDir,
+    outputDir: current.outputDir,
+    lifecycle: registry,
+    rowCounter: rows({events: 10, rights: 2, metric: 5}),
+  });
+
+  assert.equal(manifest.wikis.nlwiki.status, "needs_fetch");
+  assert.equal(manifest.wikis.nlwiki.retention.valid, 0);
+});
+
+test("hidden qualifications never inherit another project's merged dashboard readiness", async () => {
+  const current = fixture("hidden-qualification-isolation");
+  const registry = lifecycle();
+  registry.wikis.dewiki = {
+    publication: "hidden",
+    refresh: "qualification",
+    provenance: "toolforge-admin:test",
+  };
+
+  const manifest = await buildManifest({
+    root,
+    dataDir: current.dataDir,
+    outputDir: current.outputDir,
+    lifecycle: registry,
+    rowCounter: rows({events: 10, rights: 2, metric: 5}),
+    generatedAt: "2026-09-02T08:00:00Z",
+    environment: {WIKI_ECON_RUN_ID: "hidden-qualification", WIKI_ECON_SOURCE_COMMIT: "a".repeat(40)},
+  });
+
+  assert.equal(manifest.wikis.dewiki.status, "needs_fetch");
+  assert.deepEqual(manifest.wikis.dewiki.dashboard, []);
 });
 
 test("patrol readiness follows the selected immutable generation after raw cleanup", async () => {
