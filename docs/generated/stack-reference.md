@@ -72,6 +72,7 @@ datasets are `afwiki`, `arwiki`, `arzwiki`, `elwiki`, `eswiki`, `frwiki`, `hawik
 | `afwiki` | published | scheduled | toolforge | 10 days |
 | `arwiki` | published | scheduled | toolforge | 10 days |
 | `arzwiki` | published | scheduled | toolforge | 10 days |
+| `dewiki` | hidden | qualification | toolforge-admin:operator | — |
 | `elwiki` | published | scheduled | toolforge | 10 days |
 | `eswiki` | published | scheduled | toolforge | 10 days |
 | `frwiki` | published | scheduled | toolforge | 10 days |
