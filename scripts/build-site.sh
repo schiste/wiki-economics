@@ -265,7 +265,8 @@ if [ "${WIKI_ECON_VERIFY_SITE_CLOSURE:-1}" = "1" ]; then
     "$WIKI_ECON_SITE_DIR/src" \
     "$source_dir" \
     "$dashboard_dir" \
-    "$site_vendor_cache"
+    "$site_vendor_cache" \
+    "$WIKI_ECON_OUTPUT_DIR/manifest.json"
 
   offline_guard="$ROOT/scripts/deny-network.cjs"
   (cd "$WIKI_ECON_ROOT" && \

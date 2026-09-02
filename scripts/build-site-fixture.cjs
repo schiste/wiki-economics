@@ -143,6 +143,7 @@ function buildFixture({dataDir, distDir, root = path.resolve(__dirname, ".."), r
       destinationDir: sourceDir,
       dataDir,
       vendorCacheDir: path.join(root, "site", "vendor", "observable-cache"),
+      manifestPath: path.join(dataDir, "manifest.json"),
     });
     fs.rmSync(distDir, {recursive: true, force: true});
     const denyNetwork = path.join(root, "scripts", "deny-network.cjs");

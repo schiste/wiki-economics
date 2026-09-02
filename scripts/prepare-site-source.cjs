@@ -4,7 +4,35 @@
 const fs = require("node:fs");
 const path = require("node:path");
 
-function prepareSiteSource({sourceDir, destinationDir, dataDir, vendorCacheDir}) {
+function materializeImmutableFile(source, destination) {
+  try {
+    fs.linkSync(source, destination);
+  } catch (error) {
+    if (error.code !== "EXDEV") throw error;
+    const metadata = fs.statSync(source);
+    fs.copyFileSync(source, destination);
+    fs.utimesSync(destination, metadata.atime, metadata.mtime);
+  }
+}
+
+function materializeImmutableTree(sourceDir, destinationDir) {
+  fs.mkdirSync(destinationDir);
+  for (const name of fs.readdirSync(sourceDir).sort()) {
+    if (name === "manifest.json") continue;
+    const source = path.join(sourceDir, name);
+    const destination = path.join(destinationDir, name);
+    const metadata = fs.lstatSync(source);
+    if (metadata.isSymbolicLink()) throw new Error(`dashboard defaults contain a symlink: ${source}`);
+    if (metadata.isDirectory()) {
+      materializeImmutableTree(source, destination);
+      continue;
+    }
+    if (!metadata.isFile()) throw new Error(`dashboard defaults contain an unsupported entry: ${source}`);
+    materializeImmutableFile(source, destination);
+  }
+}
+
+function prepareSiteSource({sourceDir, destinationDir, dataDir, vendorCacheDir, manifestPath}) {
   for (const [label, directory] of Object.entries({sourceDir, dataDir, vendorCacheDir})) {
     if (!fs.statSync(directory, {throwIfNoEntry: false})?.isDirectory()) {
       throw new Error(`${label} does not exist: ${directory}`);
@@ -24,16 +52,21 @@ function prepareSiteSource({sourceDir, destinationDir, dataDir, vendorCacheDir})
   const cacheDir = path.join(destinationDir, ".observablehq", "cache");
   fs.mkdirSync(cacheDir, {recursive: true});
   fs.cpSync(vendorCacheDir, cacheDir, {recursive: true, dereference: false});
-  fs.symlinkSync(dataDir, path.join(destinationDir, "data"), "dir");
+  if (!manifestPath || !fs.statSync(manifestPath, {throwIfNoEntry: false})?.isFile()) {
+    throw new Error(`manifestPath does not exist: ${manifestPath}`);
+  }
+  const destinationDataDir = path.join(destinationDir, "data");
+  materializeImmutableTree(dataDir, destinationDataDir);
+  materializeImmutableFile(manifestPath, path.join(destinationDataDir, "manifest.json"));
   return destinationDir;
 }
 
 function main() {
-  const [sourceDir, destinationDir, dataDir, vendorCacheDir] = process.argv.slice(2).map((value) => value && path.resolve(value));
-  if (!vendorCacheDir) {
-    throw new Error("usage: prepare-site-source.cjs SOURCE_DIR DESTINATION_DIR DATA_DIR VENDOR_CACHE_DIR");
+  const [sourceDir, destinationDir, dataDir, vendorCacheDir, manifestPath] = process.argv.slice(2).map((value) => value && path.resolve(value));
+  if (!manifestPath) {
+    throw new Error("usage: prepare-site-source.cjs SOURCE_DIR DESTINATION_DIR DATA_DIR VENDOR_CACHE_DIR MANIFEST");
   }
-  prepareSiteSource({sourceDir, destinationDir, dataDir, vendorCacheDir});
+  prepareSiteSource({sourceDir, destinationDir, dataDir, vendorCacheDir, manifestPath});
 }
 
 if (require.main === module) {

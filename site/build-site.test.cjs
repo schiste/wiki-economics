@@ -25,6 +25,9 @@ if [ -n "\${FAKE_NPM_LOG:-}" ]; then
 fi
 mkdir -p "$WIKI_ECON_SITE_DIST_DIR"
 printf 'new release\\n' > "$WIKI_ECON_SITE_DIST_DIR/inequality.html"
+if [ -f "\${WIKI_ECON_SITE_SOURCE_DIR:-}/data/manifest.json" ]; then
+  cp "$WIKI_ECON_SITE_SOURCE_DIR/data/manifest.json" "$WIKI_ECON_SITE_DIST_DIR/manifest.json"
+fi
 if [ "\${FAKE_BUILD_FAIL:-0}" = 1 ]; then exit 1; fi
 `,
   {mode: 0o755},
@@ -253,7 +256,10 @@ set -eu
 case "$1" in
   -e) exec ${JSON.stringify(process.execPath)} "$@" ;;
   */run-record.cjs|*/publish-browser-data.cjs|*/verify-site-dependencies.cjs) exit 0 ;;
-  */prepare-site-source.cjs) mkdir -p "$3" ;;
+  */prepare-site-source.cjs)
+    mkdir -p "$3/data"
+    cp "$6" "$3/data/manifest.json"
+    ;;
   *) exec ${JSON.stringify(process.execPath)} "$@" ;;
 esac
 `,
@@ -274,6 +280,7 @@ esac
   assertBuildSucceeded(first);
   assert.equal(fs.lstatSync(defaultsDir).isSymbolicLink(), true);
   fs.writeFileSync(path.join(fakeSite, "src", "index.md"), "# Frontend changed\n");
+  fs.writeFileSync(path.join(outputDir, "manifest.json"), '{"generation":"current"}\n');
 
   const second = runBuild({...env, WIKI_ECON_RUN_ID: "defaults-second"});
   assertBuildSucceeded(second);
@@ -281,6 +288,9 @@ esac
   const commands = fs.readFileSync(commandLog, "utf8").trim().split("\n");
   assert.equal(commands.filter((command) => command === "dashboard-materialize").length, 1);
   assert.equal(commands.filter((command) => command === "dashboard-defaults-fingerprint-check").length, 1);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(distDir, "manifest.json"), "utf8")), {
+    generation: "current",
+  });
 });
 
 test("production refuses a network dependency install when the image is incomplete", () => {
