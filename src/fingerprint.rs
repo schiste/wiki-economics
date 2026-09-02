@@ -11,9 +11,22 @@ use tracing::{info, warn};
 const RECEIPT_SCHEMA_VERSION: u32 = 1;
 const SITE_ALGORITHM_VERSION: &str = "observable-static-site-v8-plain-distribution-artifacts";
 const DASHBOARD_DEFAULTS_ALGORITHM_VERSION: &str =
+    "rust-dashboard-defaults-v3-direct-metric-receipts-generator-source";
+const PREVIOUS_DASHBOARD_DEFAULTS_ALGORITHM_VERSION: &str =
     "rust-dashboard-defaults-v2-publication-receipt-generator-source";
 const LEGACY_DASHBOARD_DEFAULTS_ALGORITHM_VERSION: &str =
     "rust-dashboard-defaults-v1-publication-receipt-generator-source";
+pub(crate) const DASHBOARD_DEFAULT_METRIC_INPUTS: [&str; 9] = [
+    "business_funnel.parquet",
+    "gdp.parquet",
+    "gdp_activity_tiers.parquet",
+    "gdp_user_type_share.parquet",
+    "inequality.parquet",
+    "labor_churn.parquet",
+    "labor_cohorts.parquet",
+    "labor_monthly.parquet",
+    "patrol.parquet",
+];
 const PARQUET_SUMMARY_BATCH_ROWS: usize = 250_000;
 const DATE_COLUMNS: [&str; 6] = [
     "week_start",
@@ -735,7 +748,7 @@ fn atomic_write_receipt(receipt_path: &Path, receipt: &StageReceipt) -> Result<(
     write_result
 }
 
-fn site_selected_snapshots(output_dir: &Path) -> Result<String> {
+fn site_selected_snapshot_versions(output_dir: &Path) -> Result<Vec<(String, String)>> {
     let gate_bytes = fs::read(output_dir.join(crate::publication::RECEIPT_FILE))?;
     let gate: serde_json::Value = serde_json::from_slice(&gate_bytes)?;
     let snapshots = gate
@@ -744,11 +757,27 @@ fn site_selected_snapshots(output_dir: &Path) -> Result<String> {
         .context("publication gate receipt is missing selected snapshot versions")?;
     let mut selected: Vec<_> = snapshots
         .iter()
-        .filter_map(|(wiki, version)| version.as_str().map(|version| format!("{wiki}={version}")))
-        .collect();
+        .map(|(wiki, version)| {
+            version
+                .as_str()
+                .map(|version| (wiki.clone(), version.to_string()))
+                .with_context(|| format!("publication snapshot for {wiki} is not a string"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        !selected.is_empty(),
+        "publication gate receipt contains no selected snapshot versions"
+    );
     selected.sort();
-    let selected = selected.join(",");
     Ok(selected)
+}
+
+fn site_selected_snapshots(output_dir: &Path) -> Result<String> {
+    let selected: Vec<String> = site_selected_snapshot_versions(output_dir)?
+        .into_iter()
+        .map(|(wiki, version)| format!("{wiki}={version}"))
+        .collect();
+    Ok(selected.join(","))
 }
 
 fn site_source_inputs(site_dir: &Path) -> Result<Vec<TrackedPath>> {
@@ -777,7 +806,10 @@ fn site_source_inputs(site_dir: &Path) -> Result<Vec<TrackedPath>> {
     Ok(inputs)
 }
 
-fn dashboard_defaults_inputs(output_dir: &Path, workspace_dir: &Path) -> Result<Vec<TrackedPath>> {
+fn previous_dashboard_defaults_inputs(
+    output_dir: &Path,
+    workspace_dir: &Path,
+) -> Result<Vec<TrackedPath>> {
     let mut inputs = vec![
         TrackedPath::new(
             "data/.publication-candidate.json",
@@ -797,18 +829,98 @@ fn dashboard_defaults_inputs(output_dir: &Path, workspace_dir: &Path) -> Result<
     })
 }
 
+fn dashboard_defaults_inputs(output_dir: &Path, workspace_dir: &Path) -> Result<Vec<TrackedPath>> {
+    let mut inputs = DASHBOARD_DEFAULT_METRIC_INPUTS
+        .iter()
+        .map(|name| TrackedPath::new(format!("data/{name}"), output_dir.join(name)))
+        .collect::<Vec<_>>();
+    for (wiki, _) in site_selected_snapshot_versions(output_dir)? {
+        inputs.push(TrackedPath::new(
+            format!("data/{wiki}/page_weekly_edits.parquet"),
+            output_dir.join(&wiki).join("page_weekly_edits.parquet"),
+        ));
+    }
+    inputs.push(TrackedPath::new(
+        "workspace/Cargo.toml",
+        workspace_dir.join("Cargo.toml"),
+    ));
+    inputs.push(TrackedPath::new(
+        "workspace/Cargo.lock",
+        workspace_dir.join("Cargo.lock"),
+    ));
+    inputs.extend(collect_tracked_files(
+        &workspace_dir.join("src"),
+        "workspace/src",
+    )?);
+    inputs.sort_by(|left, right| left.identity.cmp(&right.identity));
+    Ok(inputs)
+}
+
 fn legacy_dashboard_defaults_inputs(
     output_dir: &Path,
     workspace_dir: &Path,
     defaults_dir: &Path,
 ) -> Result<Vec<TrackedPath>> {
-    let mut inputs = dashboard_defaults_inputs(output_dir, workspace_dir)?;
+    let mut inputs = previous_dashboard_defaults_inputs(output_dir, workspace_dir)?;
     inputs.push(TrackedPath::new(
         "data/manifest.json",
         defaults_dir.join("manifest.json"),
     ));
     inputs.sort_by(|left, right| left.identity.cmp(&right.identity));
     Ok(inputs)
+}
+
+#[derive(Deserialize)]
+struct DashboardCandidate {
+    schema_version: u8,
+    artifacts: Vec<DashboardCandidateArtifact>,
+}
+
+#[derive(Deserialize)]
+struct DashboardCandidateArtifact {
+    name: String,
+    bytes: u64,
+    sha256: String,
+}
+
+fn cached_dashboard_defaults_match_candidate(
+    output_dir: &Path,
+    defaults_dir: &Path,
+) -> Result<bool> {
+    let candidate: DashboardCandidate =
+        serde_json::from_slice(&fs::read(output_dir.join(".publication-candidate.json"))?)
+            .context("parse publication candidate while adopting dashboard defaults")?;
+    ensure!(
+        candidate.schema_version == 3,
+        "unsupported publication candidate schema for dashboard-defaults adoption"
+    );
+    let expected: std::collections::BTreeSet<_> = crate::dashboard::ARTIFACTS
+        .iter()
+        .map(|name| (*name).to_string())
+        .collect();
+    let mut observed = std::collections::BTreeSet::new();
+    for artifact in candidate
+        .artifacts
+        .iter()
+        .filter(|artifact| expected.contains(&artifact.name))
+    {
+        if !observed.insert(artifact.name.clone())
+            || artifact.bytes == 0
+            || artifact.sha256.len() != 64
+            || !artifact.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Ok(false);
+        }
+        let path = defaults_dir.join(&artifact.name);
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => metadata,
+            _ => return Ok(false),
+        };
+        if metadata.len() != artifact.bytes || sha256_file(&path)? != artifact.sha256 {
+            return Ok(false);
+        }
+    }
+    Ok(observed == expected)
 }
 
 fn dashboard_defaults_receipt_path(output_dir: &Path) -> PathBuf {
@@ -849,22 +961,44 @@ pub fn dashboard_defaults_are_reusable(
         return Ok(true);
     }
 
+    let previous_inputs = previous_dashboard_defaults_inputs(output_dir, workspace_dir)?;
+    let previous_spec = dashboard_defaults_spec_with_version(
+        &selected,
+        PREVIOUS_DASHBOARD_DEFAULTS_ALGORITHM_VERSION,
+    );
+    if reusable(&receipt_path, previous_spec, &previous_inputs, &outputs)? {
+        record(&receipt_path, current_spec, &inputs, &outputs)?;
+        info!(
+            receipt = %receipt_path.display(),
+            "migrated dashboard defaults v2 receipt without regenerating data"
+        );
+        return Ok(true);
+    }
+
     let legacy_inputs = legacy_dashboard_defaults_inputs(output_dir, workspace_dir, defaults_dir)?;
     let legacy_spec = dashboard_defaults_spec_with_version(
         &selected,
         LEGACY_DASHBOARD_DEFAULTS_ALGORITHM_VERSION,
     );
     let legacy_reusable = reusable(&receipt_path, legacy_spec, &legacy_inputs, &outputs)?;
-    if !legacy_reusable {
-        return Ok(false);
+    if legacy_reusable {
+        record(&receipt_path, current_spec, &inputs, &outputs)?;
+        info!(
+            receipt = %receipt_path.display(),
+            "migrated dashboard defaults legacy receipt without regenerating data"
+        );
+        return Ok(true);
     }
 
-    record(&receipt_path, current_spec, &inputs, &outputs)?;
-    info!(
-        receipt = %receipt_path.display(),
-        "migrated dashboard defaults receipt without regenerating data"
-    );
-    Ok(true)
+    if cached_dashboard_defaults_match_candidate(output_dir, defaults_dir)? {
+        record(&receipt_path, current_spec, &inputs, &outputs)?;
+        info!(
+            receipt = %receipt_path.display(),
+            "adopted publication-authenticated dashboard defaults without regenerating data"
+        );
+        return Ok(true);
+    }
+    Ok(false)
 }
 
 /// Authenticate a newly materialized dashboard overlay before it becomes the
@@ -1041,6 +1175,21 @@ pub fn record_site(output_dir: &Path, site_dir: &Path, dist_dir: &Path) -> Resul
 mod tests {
     use super::*;
     use crate::test_support::TestDir;
+
+    fn write_dashboard_metric_inputs(output: &Path, wiki: &str) -> Result<()> {
+        fs::create_dir_all(output.join(wiki))?;
+        for path in DASHBOARD_DEFAULT_METRIC_INPUTS
+            .iter()
+            .map(|name| output.join(name))
+            .chain(std::iter::once(
+                output.join(wiki).join("page_weekly_edits.parquet"),
+            ))
+        {
+            let mut frame = df!("value" => [1_i64])?;
+            ParquetWriter::new(File::create(path)?).finish(&mut frame)?;
+        }
+        Ok(())
+    }
 
     #[test]
     fn receipt_is_content_addressed_and_quickly_reusable() -> Result<()> {
@@ -1443,6 +1592,7 @@ mod tests {
             r#"{"selected_snapshot_versions":{"nlwiki":"2026-07"}}"#,
         )
         .expect("gate fixture should be written");
+        write_dashboard_metric_inputs(&output, "nlwiki")?;
         fs::write(output.join("manifest.json"), r#"{"status":"ready"}"#)?;
         fs::write(workspace.join("src/dashboard.rs"), "fn generate() {}")?;
         fs::write(workspace.join("Cargo.toml"), "[package]\nname='fixture'")?;
@@ -1468,6 +1618,16 @@ mod tests {
         assert!(
             dashboard_defaults_are_reusable(&output, &workspace, &defaults)?,
             "operational manifest changes must not regenerate Rust defaults"
+        );
+
+        fs::write(
+            output.join(".publication-candidate.json"),
+            r#"{"schema_version":3,"run_id":"new-no-op-run","artifacts":[]}"#,
+        )
+        .expect("no-op publication candidate should be written");
+        assert!(
+            dashboard_defaults_are_reusable(&output, &workspace, &defaults)?,
+            "publication run metadata must not regenerate unchanged Rust defaults"
         );
 
         fs::write(workspace.join("src/dashboard.rs"), "fn generate_v2() {}")?;
@@ -1500,6 +1660,7 @@ mod tests {
             r#"{"selected_snapshot_versions":{"nlwiki":"2026-07"}}"#,
         )
         .expect("publication receipt fixture should be writable");
+        write_dashboard_metric_inputs(&output, "nlwiki")?;
         fs::write(output.join("manifest.json"), r#"{"generation":"old"}"#)?;
         fs::write(defaults.join("manifest.json"), r#"{"generation":"old"}"#)?;
         fs::write(defaults.join("gdp.json"), r#"{"rows":1}"#)?;
@@ -1524,6 +1685,128 @@ mod tests {
         assert_eq!(
             migrated.algorithm_version,
             DASHBOARD_DEFAULTS_ALGORITHM_VERSION
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dashboard_defaults_migrate_the_authenticated_v2_receipt() -> Result<()> {
+        let dir = TestDir::new()?;
+        let output = dir.path().join("output");
+        let workspace = dir.path().join("workspace");
+        let defaults = dir.path().join("defaults");
+        fs::create_dir_all(output.join("_stages"))?;
+        fs::create_dir_all(workspace.join("src"))?;
+        fs::create_dir_all(&defaults)?;
+        fs::write(output.join(".publication-candidate.json"), "{}")?;
+        fs::write(
+            output.join(crate::publication::RECEIPT_FILE),
+            r#"{"selected_snapshot_versions":{"nlwiki":"2026-07"}}"#,
+        )
+        .expect("publication receipt fixture should be written");
+        write_dashboard_metric_inputs(&output, "nlwiki")?;
+        fs::write(defaults.join("gdp.json"), r#"{"rows":1}"#)?;
+        fs::write(workspace.join("src/dashboard.rs"), "fn generate() {}")?;
+        fs::write(workspace.join("Cargo.toml"), "[package]\nname='fixture'")?;
+        fs::write(workspace.join("Cargo.lock"), "version = 4")?;
+
+        let selected = site_selected_snapshots(&output)?;
+        let previous_inputs = previous_dashboard_defaults_inputs(&output, &workspace)?;
+        let outputs = collect_tracked_files(&defaults, "dashboard-defaults")?;
+        let previous_spec = dashboard_defaults_spec_with_version(
+            &selected,
+            PREVIOUS_DASHBOARD_DEFAULTS_ALGORITHM_VERSION,
+        );
+        let receipt_path = dashboard_defaults_receipt_path(&output);
+        record(&receipt_path, previous_spec, &previous_inputs, &outputs)?;
+
+        assert!(
+            dashboard_defaults_are_reusable(&output, &workspace, &defaults)
+                .expect("the authenticated v2 receipt should migrate")
+        );
+        assert_eq!(
+            read_receipt(&receipt_path)?.algorithm_version,
+            DASHBOARD_DEFAULTS_ALGORITHM_VERSION
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dashboard_defaults_adopt_only_an_exact_published_bundle() -> Result<()> {
+        let dir = TestDir::new()?;
+        let output = dir.path().join("output");
+        let workspace = dir.path().join("workspace");
+        let defaults = dir.path().join("defaults");
+        fs::create_dir_all(output.join("_stages"))?;
+        fs::create_dir_all(workspace.join("src"))?;
+        fs::create_dir_all(&defaults)?;
+        fs::write(
+            output.join(crate::publication::RECEIPT_FILE),
+            r#"{"selected_snapshot_versions":{"nlwiki":"2026-07"}}"#,
+        )
+        .expect("publication receipt fixture should be written");
+        write_dashboard_metric_inputs(&output, "nlwiki")?;
+        fs::write(workspace.join("src/dashboard.rs"), "fn generate() {}")?;
+        fs::write(workspace.join("Cargo.toml"), "[package]\nname='fixture'")?;
+        fs::write(workspace.join("Cargo.lock"), "version = 4")?;
+        fs::write(defaults.join("manifest.json"), r#"{"generation":"old"}"#)?;
+
+        let mut artifacts = Vec::new();
+        for (index, name) in crate::dashboard::ARTIFACTS.iter().enumerate() {
+            let path = defaults.join(name);
+            fs::write(&path, format!(r#"{{"artifact":{index}}}"#))?;
+            let metadata = fs::metadata(&path)?;
+            artifacts.push(serde_json::json!({
+                "name": name,
+                "bytes": metadata.len(),
+                "sha256": sha256_file(&path)?,
+            }));
+        }
+        let candidate_path = output.join(".publication-candidate.json");
+        let candidate = |artifacts: &[serde_json::Value]| {
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": 3,
+                "run_id": "published-run",
+                "artifacts": artifacts,
+            }))
+            .expect("candidate fixture should serialize")
+        };
+        fs::write(&candidate_path, candidate(&artifacts))
+            .expect("candidate fixture should be written");
+
+        assert!(
+            cached_dashboard_defaults_match_candidate(&output, &defaults)
+                .expect("the exact candidate bundle should match")
+        );
+        let valid_artifacts = artifacts.clone();
+        artifacts[0]["bytes"] = serde_json::json!(0);
+        fs::write(&candidate_path, candidate(&artifacts))?;
+        assert!(
+            !cached_dashboard_defaults_match_candidate(&output, &defaults)
+                .expect("zero-byte candidate metadata should fail closed")
+        );
+        artifacts = valid_artifacts.clone();
+        artifacts[0]["bytes"] = serde_json::json!(1);
+        fs::write(&candidate_path, candidate(&artifacts))?;
+        assert!(
+            !cached_dashboard_defaults_match_candidate(&output, &defaults)
+                .expect("mismatched candidate metadata should fail closed")
+        );
+        fs::write(&candidate_path, candidate(&valid_artifacts))?;
+
+        assert!(
+            dashboard_defaults_are_reusable(&output, &workspace, &defaults)
+                .expect("an exact published defaults bundle should be adopted")
+        );
+        assert_eq!(
+            read_receipt(&dashboard_defaults_receipt_path(&output))?.algorithm_version,
+            DASHBOARD_DEFAULTS_ALGORITHM_VERSION
+        );
+
+        fs::remove_file(defaults.join(crate::dashboard::ARTIFACTS[0]))?;
+        assert!(
+            !dashboard_defaults_are_reusable(&output, &workspace, &defaults)
+                .expect("a missing cached default must fail closed")
         );
         Ok(())
     }

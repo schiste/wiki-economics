@@ -4128,6 +4128,17 @@ mod tests {
             r#"{"selected_snapshot_versions":{"nlwiki":"2026-07"}}"#,
         )
         .expect("gate fixture should be written");
+        fs::create_dir_all(output_dir.path().join("nlwiki"))?;
+        for path in fingerprint::DASHBOARD_DEFAULT_METRIC_INPUTS
+            .iter()
+            .map(|name| output_dir.path().join(name))
+            .chain(std::iter::once(
+                output_dir.path().join("nlwiki/page_weekly_edits.parquet"),
+            ))
+        {
+            let mut frame = df!("value" => [1_i64])?;
+            ParquetWriter::new(fs::File::create(path)?).finish(&mut frame)?;
+        }
         fs::write(output_dir.path().join("manifest.json"), "{}")?;
         fs::write(
             workspace_dir.path().join("src/dashboard.rs"),
