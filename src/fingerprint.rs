@@ -843,34 +843,23 @@ pub fn dashboard_defaults_are_reusable(
     let inputs = dashboard_defaults_inputs(output_dir, workspace_dir)?;
     let outputs = collect_tracked_files(defaults_dir, "dashboard-defaults")?;
     let receipt_path = dashboard_defaults_receipt_path(output_dir);
-    if reusable(
-        &receipt_path,
-        dashboard_defaults_spec(&selected),
-        &inputs,
-        &outputs,
-    )? {
+    let current_spec = dashboard_defaults_spec(&selected);
+    let current_reusable = reusable(&receipt_path, current_spec, &inputs, &outputs)?;
+    if current_reusable {
         return Ok(true);
     }
 
     let legacy_inputs = legacy_dashboard_defaults_inputs(output_dir, workspace_dir, defaults_dir)?;
-    if !reusable(
-        &receipt_path,
-        dashboard_defaults_spec_with_version(
-            &selected,
-            LEGACY_DASHBOARD_DEFAULTS_ALGORITHM_VERSION,
-        ),
-        &legacy_inputs,
-        &outputs,
-    )? {
+    let legacy_spec = dashboard_defaults_spec_with_version(
+        &selected,
+        LEGACY_DASHBOARD_DEFAULTS_ALGORITHM_VERSION,
+    );
+    let legacy_reusable = reusable(&receipt_path, legacy_spec, &legacy_inputs, &outputs)?;
+    if !legacy_reusable {
         return Ok(false);
     }
 
-    record(
-        &dashboard_defaults_receipt_path(output_dir),
-        dashboard_defaults_spec(&selected),
-        &inputs,
-        &outputs,
-    )?;
+    record(&receipt_path, current_spec, &inputs, &outputs)?;
     info!(
         receipt = %receipt_path.display(),
         "migrated dashboard defaults receipt without regenerating data"
@@ -1505,10 +1494,12 @@ mod tests {
         fs::create_dir_all(workspace.join("src"))?;
         fs::create_dir_all(&defaults)?;
         fs::write(output.join(".publication-candidate.json"), "{}")?;
+        let publication_receipt = output.join(crate::publication::RECEIPT_FILE);
         fs::write(
-            output.join(crate::publication::RECEIPT_FILE),
+            publication_receipt,
             r#"{"selected_snapshot_versions":{"nlwiki":"2026-07"}}"#,
-        )?;
+        )
+        .expect("publication receipt fixture should be writable");
         fs::write(output.join("manifest.json"), r#"{"generation":"old"}"#)?;
         fs::write(defaults.join("manifest.json"), r#"{"generation":"old"}"#)?;
         fs::write(defaults.join("gdp.json"), r#"{"rows":1}"#)?;
@@ -1519,21 +1510,17 @@ mod tests {
         let selected = site_selected_snapshots(&output)?;
         let legacy_inputs = legacy_dashboard_defaults_inputs(&output, &workspace, &defaults)?;
         let outputs = collect_tracked_files(&defaults, "dashboard-defaults")?;
-        record(
-            &dashboard_defaults_receipt_path(&output),
-            dashboard_defaults_spec_with_version(
-                &selected,
-                LEGACY_DASHBOARD_DEFAULTS_ALGORITHM_VERSION,
-            ),
-            &legacy_inputs,
-            &outputs,
-        )?;
+        let legacy_spec = dashboard_defaults_spec_with_version(
+            &selected,
+            LEGACY_DASHBOARD_DEFAULTS_ALGORITHM_VERSION,
+        );
+        let receipt_path = dashboard_defaults_receipt_path(&output);
+        record(&receipt_path, legacy_spec, &legacy_inputs, &outputs)?;
         fs::write(output.join("manifest.json"), r#"{"generation":"current"}"#)?;
 
-        assert!(dashboard_defaults_are_reusable(
-            &output, &workspace, &defaults
-        )?);
-        let migrated = read_receipt(&dashboard_defaults_receipt_path(&output))?;
+        let reusable = dashboard_defaults_are_reusable(&output, &workspace, &defaults)?;
+        assert!(reusable);
+        let migrated = read_receipt(&receipt_path)?;
         assert_eq!(
             migrated.algorithm_version,
             DASHBOARD_DEFAULTS_ALGORITHM_VERSION
