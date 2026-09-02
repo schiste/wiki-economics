@@ -543,6 +543,13 @@ fn materialize_manifest_from_dir(output_dir: &Path, generator_dir: &Path) -> Res
     })
 }
 
+/// Rebuild only the operational publication manifest from verified artifact
+/// receipts. This is intentionally separate from `merge_outputs`: a
+/// site/admin interpretation change must not rewrite metric Parquets.
+pub fn materialize_manifest(output_dir: &Path, generator_dir: &Path) -> Result<()> {
+    materialize_manifest_from_dir(output_dir, generator_dir)
+}
+
 fn materialize_manifest_with_runner<F>(
     output_dir: &Path,
     generator_dir: &Path,

@@ -133,6 +133,7 @@ test("site builds are switched atomically and failed staging is discarded", () =
 test("a reusable site skips Node dependency installation", () => {
   const cacheHitSite = path.join(fakeRoot, "cache-hit-site");
   const npmLog = path.join(fixtureRoot, "cache-hit-npm.log");
+  const manifestWikiEcon = path.join(fakeBin, "wiki-econ-manifest");
   fs.mkdirSync(path.join(cacheHitSite, "data-build"), {recursive: true});
   fs.writeFileSync(
     path.join(cacheHitSite, "data-build", "manifest.json.sh"),
@@ -143,13 +144,37 @@ printf '{"generated_at":"%s","refreshed":true,"provenance":{"generating_commit":
 `,
     {mode: 0o755},
   );
+  fs.writeFileSync(
+    manifestWikiEcon,
+    `#!/bin/sh
+set -eu
+output_dir=""
+generator_dir=""
+command_name=""
+previous=""
+for argument in "$@"; do
+  case "$previous" in
+    --output-dir) output_dir="$argument" ;;
+    --generator-dir) generator_dir="$argument" ;;
+  esac
+  [ "$argument" != manifest-materialize ] || command_name="$argument"
+  previous="$argument"
+done
+if [ "$command_name" = manifest-materialize ]; then
+  "$generator_dir/manifest.json.sh" > "$output_dir/manifest.json"
+fi
+exit 0
+`,
+    {mode: 0o755},
+  );
 
   const result = runBuild({
     FAKE_NPM_LOG: npmLog,
-    WIKI_ECON_BIN: fakeWikiEcon,
+    WIKI_ECON_BIN: manifestWikiEcon,
     WIKI_ECON_REQUIRE_PUBLICATION_GATE: "1",
     WIKI_ECON_RUN_ID: "cache-hit-run",
     WIKI_ECON_SITE_DIR: cacheHitSite,
+    WIKI_ECON_SOURCE_COMMIT: "c".repeat(40),
   });
 
   assertBuildSucceeded(result);

@@ -407,6 +407,13 @@ enum Commands {
     /// Merge per-wiki outputs into combined parquet files
     Merge,
 
+    /// Rebuild only manifest.json from verified artifact receipts
+    ManifestMaterialize {
+        /// Directory containing manifest.json.sh and its dependencies
+        #[arg(long)]
+        generator_dir: PathBuf,
+    },
+
     /// Validate a merged artifact set and issue its publication receipt
     PublicationValidate,
 
@@ -1616,6 +1623,12 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             publication::begin_run(&output_dir, run_id.as_deref(), &[], None)?;
             run_timed_stage("merge", None, || {
                 ops.merge_outputs(&output_dir, run_id.as_deref())
+            })?;
+        }
+
+        Commands::ManifestMaterialize { generator_dir } => {
+            run_timed_stage("manifest_materialize", None, || {
+                merge::materialize_manifest(&output_dir, &generator_dir)
             })?;
         }
 
@@ -3043,6 +3056,24 @@ mod tests {
         run_with_ops(cli, &ops)?;
 
         assert_eq!(ops.calls.into_inner(), vec!["merge:combined"]);
+        Ok(())
+    }
+
+    #[test]
+    fn manifest_materialization_has_a_narrow_explicit_cli() -> Result<()> {
+        let cli = Cli::try_parse_from([
+            "wiki-econ",
+            "--output-dir",
+            "combined",
+            "manifest-materialize",
+            "--generator-dir",
+            "site/data-build",
+        ])?;
+        assert!(matches!(
+            cli.command,
+            Commands::ManifestMaterialize { generator_dir }
+                if generator_dir.as_path() == Path::new("site/data-build")
+        ));
         Ok(())
     }
 

@@ -77,7 +77,7 @@ if [ "${WIKI_ECON_REQUIRE_PUBLICATION_GATE:-0}" = "1" ]; then
     } catch {}
   ' "$manifest_path")"
 
-  if [ -z "$expected_manifest_commit" ] || [ "$current_manifest_commit" != "$expected_manifest_commit" ]; then
+  if [ -n "$expected_manifest_commit" ] && [ "$current_manifest_commit" != "$expected_manifest_commit" ]; then
     [ -x "$manifest_generator" ] || {
       echo "Operational manifest generator is missing or not executable: $manifest_generator" >&2
       exit 1
@@ -92,24 +92,8 @@ if [ "${WIKI_ECON_REQUIRE_PUBLICATION_GATE:-0}" = "1" ]; then
       echo "Existing operational manifest has no valid deterministic timestamp: $manifest_path" >&2
       exit 1
     }
-    manifest_staging="$(mktemp "$WIKI_ECON_OUTPUT_DIR/.manifest.json.${WIKI_ECON_RUN_ID:-site}.XXXXXX")"
-    if ! WIKI_ECON_MANIFEST_GENERATED_AT="$manifest_generated_at" "$manifest_generator" > "$manifest_staging"; then
-      rm -f -- "$manifest_staging"
-      echo "Operational manifest regeneration failed; keeping the published manifest" >&2
-      exit 1
-    fi
-    if ! node -e '
-      const fs = require("node:fs");
-      const [source, destination] = process.argv.slice(1);
-      JSON.parse(fs.readFileSync(source, "utf8"));
-      const descriptor = fs.openSync(source, "r");
-      try { fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
-      fs.renameSync(source, destination);
-    ' "$manifest_staging" "$manifest_path"; then
-      rm -f -- "$manifest_staging"
-      echo "Operational manifest validation or atomic publication failed" >&2
-      exit 1
-    fi
+    WIKI_ECON_MANIFEST_GENERATED_AT="$manifest_generated_at" \
+      wiki_econ_run_cli manifest-materialize --generator-dir "$(dirname "$manifest_generator")"
     echo "==> Refreshed operational manifest for site source ${expected_manifest_commit:-unknown}"
   fi
 
