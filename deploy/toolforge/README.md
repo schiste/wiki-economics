@@ -271,7 +271,7 @@ the field contract and operator checks.
 `wiki-econ-refresh` can still run the full fetch → ingest → compute → merge →
 site pipeline, which is unnecessary when only one part changed — a
 `site/`-only or `docs/`-only commit still has to wait through a full
-fetch/compute cycle before the new page is live. `jobs.yaml` also loads three
+fetch/compute cycle before the new page is live. `jobs.yaml` also defines three
 on-demand-only Jobs (no `schedule:`, so they never run on their own), each
 pointed at its own `run-refresh-<stage>.sh` wrapper (see the `run-refresh.sh`
 bullet above) which sets `WIKI_ECON_REFRESH_STAGE` and reuses `run-refresh.sh`
@@ -284,17 +284,23 @@ unmodified:
 - `wiki-econ-site` — the Observable production build only, against whatever
   a prior compute last published. `build-site.sh` re-verifies the
   publication gate itself, so this needs no wikis and no `run` invocation.
+  It deliberately skips remote snapshot discovery, so a frontend deployment
+  cannot select a newer dump or change data-freshness state.
   Before Observable runs, the deployed Rust binary regenerates dashboard JSON
   into a site-private temporary overlay from the authenticated merged
   Parquets. This lets a dashboard-generator fix ship without mutating the
   receipt-covered publication tree or recomputing history metrics; the
   overlay is removed after the atomic site switch.
 
-Trigger one manually the same way an operator manually fires the scheduled
-refresh, with `toolforge jobs restart <name>`:
+The scheduled-job loader deliberately removes these definitions after use.
+Start the site stage as an isolated one-off against the current image:
 
 ```sh
-become wiki-economics toolforge jobs restart wiki-econ-site
+become wiki-economics toolforge jobs run \
+  --command /workspace/deploy/toolforge/run-refresh-site.sh \
+  --image tool-wiki-economics/tool-wiki-economics:latest \
+  --filelog --mem 2Gi --cpu 1 --mount all \
+  wiki-econ-site
 ```
 
 All four legacy jobs — `wiki-econ-refresh` and the three on-demand
@@ -543,7 +549,7 @@ TOOLFORGE_SSH_TARGET=login.toolforge.org \
     "$site_sha" \
     "$site_release_dir/wiki-econ-site-source-$site_sha.tar.gz.sha256"
 ssh login.toolforge.org \
-  'become wiki-economics toolforge jobs restart wiki-econ-site'
+  'become wiki-economics toolforge jobs run --command /workspace/deploy/toolforge/run-refresh-site.sh --image tool-wiki-economics/tool-wiki-economics:latest --filelog --mem 2Gi --cpu 1 --mount all wiki-econ-site'
 ```
 
 The publisher verifies the independently installed site-source receipt, uses

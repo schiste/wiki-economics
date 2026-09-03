@@ -465,27 +465,38 @@ wiki_econ_record_stage_event completed cleanup_stale "" \
   "$(( ($(date +%s) - CLEANUP_STARTED_EPOCH) * 1000 ))"
 echo "==> Abandoned artifact cleanup: $cleanup_summary"
 echo "==> Binary release cleanup: $release_cleanup_summary"
-declare -a resolve_cmd=(
-  "$WIKI_ECON_BIN"
-  --data-dir "$WIKI_ECON_DATA_DIR"
-  --output-dir "$WIKI_ECON_OUTPUT_DIR"
-  --run-id "$WIKI_ECON_RUN_ID"
-  snapshot-resolve
-  "${wikis[@]}"
-)
-printf '==> %s' "${resolve_cmd[0]}"
-for arg in "${resolve_cmd[@]:1}"; do
-  printf ' %q' "$arg"
-done
-printf '\n'
-selected_snapshot="$(RUST_LOG=error "${resolve_cmd[@]}")"
-set_refresh_lock_snapshot "$selected_snapshot"
-
-echo "==> Toolforge refresh: ${wikis[*]} (snapshot $SELECTED_SNAPSHOT, stage $REFRESH_STAGE)"
 refresh_driver="${WIKI_ECON_REFRESH_DRIVER:-$ROOT/scripts/refresh.sh}"
-declare -a refresh_driver_cmd=(--version "$SELECTED_SNAPSHOT" "${wikis[@]}")
-if [ "$REFRESH_STAGE" != "all" ]; then
-  refresh_driver_cmd+=(--stage "$REFRESH_STAGE")
+declare -a refresh_driver_cmd=()
+if [ "$REFRESH_STAGE" = "site" ]; then
+  # A site-only deployment consumes the already-published receipt and does
+  # not prepare history. Discovering a newer remote dump here would mutate
+  # operational freshness state even though no worker was scheduled to build
+  # it, making an otherwise healthy frontend release look critically stale.
+  printf '%s\n' running > "$REFRESH_LOCK_DIR/run-state"
+  refresh_driver_cmd+=(--stage site)
+  echo "==> Toolforge site refresh against the current publication"
+else
+  declare -a resolve_cmd=(
+    "$WIKI_ECON_BIN"
+    --data-dir "$WIKI_ECON_DATA_DIR"
+    --output-dir "$WIKI_ECON_OUTPUT_DIR"
+    --run-id "$WIKI_ECON_RUN_ID"
+    snapshot-resolve
+    "${wikis[@]}"
+  )
+  printf '==> %s' "${resolve_cmd[0]}"
+  for arg in "${resolve_cmd[@]:1}"; do
+    printf ' %q' "$arg"
+  done
+  printf '\n'
+  selected_snapshot="$(RUST_LOG=error "${resolve_cmd[@]}")"
+  set_refresh_lock_snapshot "$selected_snapshot"
+
+  echo "==> Toolforge refresh: ${wikis[*]} (snapshot $SELECTED_SNAPSHOT, stage $REFRESH_STAGE)"
+  refresh_driver_cmd+=(--version "$SELECTED_SNAPSHOT" "${wikis[@]}")
+  if [ "$REFRESH_STAGE" != "all" ]; then
+    refresh_driver_cmd+=(--stage "$REFRESH_STAGE")
+  fi
 fi
 "$refresh_driver" "${refresh_driver_cmd[@]}"
 

@@ -252,6 +252,23 @@ test("an on-demand stage is passed through to the refresh driver", () => {
   );
 });
 
+test("a site-only refresh cannot discover or select a newer snapshot", () => {
+  const fixture = createFixture("site-without-discovery");
+  const result = runFixture(fixture, {
+    WIKI_ECON_REFRESH_STAGE: "site",
+    FAKE_DRIVER_ARGS: fixture.driverArgs,
+    FAKE_SNAPSHOT: "invalid-if-resolved",
+    WIKI_ECON_RUN_ID: "site-only-run",
+  });
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.equal(fs.readFileSync(fixture.driverArgs, "utf8").trim(), "--stage site");
+
+  const status = JSON.parse(fs.readFileSync(path.join(fixture.output, ".refresh-status.json"), "utf8"));
+  assert.equal(status.state, "succeeded");
+  assert.equal(status.selectedSnapshot, null);
+  assert.equal(status.stages.some((stage) => stage.stage === "snapshot_resolve"), false);
+});
+
 test("a demonstrably stale cross-job lock is recovered", () => {
   const fixture = createFixture("stale");
   const lockDir = path.join(fixture.output, ".refresh-lock");
