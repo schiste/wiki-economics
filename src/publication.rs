@@ -1613,9 +1613,14 @@ pub(crate) fn plan_wiki_preparation(
         "run ID already identifies a ready candidate"
     );
     let mut candidates = Vec::new();
+    let mut candidate_directories = Vec::new();
     if snapshot_root.is_dir() {
         for entry in fs::read_dir(&snapshot_root)? {
             let candidate_dir = entry?.path();
+            if !candidate_dir.is_dir() || candidate_dir == target_candidate {
+                continue;
+            }
+            candidate_directories.push(candidate_dir.clone());
             let ready_path = candidate_dir.join("ready.json");
             if !ready_path.is_file() {
                 continue;
@@ -1633,6 +1638,7 @@ pub(crate) fn plan_wiki_preparation(
     candidates.sort_by(|(left, _), (right, _)| {
         (left.ready_at_unix, &left.run_id).cmp(&(right.ready_at_unix, &right.run_id))
     });
+    candidate_directories.sort();
 
     let purged_snapshot = crate::retention::receipt_path(data_dir, wiki, snapshot)?.is_file();
     let purged_compute_current = match (purged_snapshot, candidates.last()) {
@@ -1664,12 +1670,19 @@ pub(crate) fn plan_wiki_preparation(
 
     let mut reusable_compute = BTreeMap::new();
     let mut reusable_patrol = None;
-    for (_, candidate_dir) in candidates.iter().rev().filter(|_| !purged_snapshot) {
+    for candidate_dir in candidate_directories
+        .iter()
+        .rev()
+        .filter(|_| !purged_snapshot)
+    {
         let compute =
             crate::compute::reusable_candidate_families(wiki, snapshot, data_dir, candidate_dir)?;
         let patrol =
             crate::patrol::reusable_candidate_files(wiki, snapshot, data_dir, candidate_dir)?;
-        if compute.len() == crate::compute::MetricFamily::ALL.len() && patrol.is_some() {
+        if candidate_dir.join("ready.json").is_file()
+            && compute.len() == crate::compute::MetricFamily::ALL.len()
+            && patrol.is_some()
+        {
             let indexed = indexed_latest_ready_candidate(data_dir, output_dir, wiki)?
                 .context("unchanged candidate has no recoverable ready index")?;
             ensure!(
@@ -1735,7 +1748,83 @@ pub(crate) fn plan_wiki_preparation(
         "planned invalidated candidate stages"
     );
     Ok(WikiPreparationPlan::Build {
-        same_snapshot_candidate: !candidates.is_empty() || legacy_same_snapshot,
+        same_snapshot_candidate: !candidate_directories.is_empty() || legacy_same_snapshot,
+        compute_reused,
+        patrol_reused,
+    })
+}
+
+/// Reuse independently receipted work from an interrupted qualification run.
+///
+/// A logging dump is published independently from MediaWiki History. When it
+/// is late, core computation must remain durable so a later retry only has to
+/// fetch and compute patrol data. Qualification directories are never
+/// publication eligible, and every reused file is still authenticated by its
+/// family receipt before it is copied into the new run directory.
+pub(crate) fn plan_wiki_qualification_preparation(
+    data_dir: &Path,
+    output_dir: &Path,
+    wiki: &str,
+    snapshot: &str,
+    run_id: &str,
+) -> Result<WikiPreparationPlan> {
+    ensure!(valid_component(wiki), "unsafe qualification wiki");
+    storage::validate_snapshot_version(snapshot)?;
+    ensure!(valid_component(run_id), "unsafe qualification run ID");
+    let snapshot_root = output_dir.join("_qualifications").join(wiki).join(snapshot);
+    let target = wiki_qualification_dir(output_dir, wiki, snapshot, run_id)?;
+    ensure!(
+        !target.join("qualification.json").exists(),
+        "run ID already identifies a completed qualification"
+    );
+
+    let mut prior_directories = Vec::new();
+    if snapshot_root.is_dir() {
+        for entry in fs::read_dir(&snapshot_root)? {
+            let path = entry?.path();
+            if path.is_dir() && path != target {
+                prior_directories.push(path);
+            }
+        }
+    }
+    prior_directories.sort();
+
+    let mut reusable_compute = BTreeMap::new();
+    let mut reusable_patrol = None;
+    for source in prior_directories.iter().rev() {
+        for (family, files) in
+            crate::compute::reusable_candidate_families(wiki, snapshot, data_dir, source)?
+        {
+            reusable_compute
+                .entry(family)
+                .or_insert_with(|| (source.clone(), files));
+        }
+        if reusable_patrol.is_none()
+            && let Some(files) =
+                crate::patrol::reusable_candidate_files(wiki, snapshot, data_dir, source)?
+        {
+            reusable_patrol = Some((source.clone(), files));
+        }
+    }
+
+    for (source, files) in reusable_compute.values() {
+        copy_candidate_files(source, &target, files)?;
+    }
+    reusable_patrol.as_ref().map_or(Ok(()), |(source, files)| {
+        copy_candidate_files(source, &target, files)
+    })?;
+    let compute_reused = reusable_compute.len() == crate::compute::MetricFamily::ALL.len();
+    let patrol_reused = reusable_patrol.is_some();
+    info!(
+        wiki,
+        snapshot,
+        compute_reused,
+        compute_families_reused = reusable_compute.len(),
+        patrol_reused,
+        "planned resumable qualification stages"
+    );
+    Ok(WikiPreparationPlan::Build {
+        same_snapshot_candidate: !prior_directories.is_empty(),
         compute_reused,
         patrol_reused,
     })
@@ -5989,6 +6078,91 @@ mod tests {
             copy_candidate_files(&copy_root, &copy_target, &[copy_root.join("missing")],).is_err()
         );
         assert!(!abandoned_temporary.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn preparation_planner_recovers_receipted_work_from_an_interrupted_candidate() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let ready = fixture.ready_candidate("interrupted-source")?;
+        let source = ready
+            .parent()
+            .context("interrupted candidate should have a parent")?
+            .to_path_buf();
+        fs::remove_file(&ready)?;
+
+        let plan = plan_wiki_preparation(
+            fixture.data.path(),
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            "resumed-candidate",
+        )?;
+        assert_eq!(
+            plan,
+            WikiPreparationPlan::Build {
+                same_snapshot_candidate: true,
+                compute_reused: true,
+                patrol_reused: true,
+            }
+        );
+        let resumed = wiki_candidate_dir(
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            "resumed-candidate",
+        )?;
+        assert!(source.join("_stages/compute/monthly/nlwiki.json").is_file());
+        assert!(resumed.join("nlwiki/page_weekly_edits.parquet").is_file());
+        assert!(resumed.join("nlwiki/patrol.parquet").is_file());
+        assert!(
+            resumed
+                .join("_stages/compute/monthly/nlwiki.json")
+                .is_file()
+        );
+        assert!(resumed.join("_stages/patrol_compute/nlwiki.json").is_file());
+        assert!(!resumed.join("ready.json").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn qualification_planner_recovers_core_before_a_late_patrol_dump() -> Result<()> {
+        let fixture = Fixture::new()?;
+        prepare_hidden_qualification_fixture(&fixture, "waiting-for-patrol");
+        let waiting = wiki_qualification_dir(
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            "waiting-for-patrol",
+        )?;
+        crate::compute::record_candidate_fingerprint_for_test(
+            "nlwiki",
+            "2026-03",
+            fixture.data.path(),
+            &waiting,
+        )?;
+
+        let plan = plan_wiki_qualification_preparation(
+            fixture.data.path(),
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            "patrol-retry",
+        )?;
+        assert_eq!(
+            plan,
+            WikiPreparationPlan::Build {
+                same_snapshot_candidate: true,
+                compute_reused: true,
+                patrol_reused: false,
+            }
+        );
+        let resumed =
+            wiki_qualification_dir(fixture.output.path(), "nlwiki", "2026-03", "patrol-retry")?;
+        assert!(resumed.join("nlwiki/gdp.parquet").is_file());
+        assert!(resumed.join("nlwiki/page_weekly_edits.parquet").is_file());
+        assert!(!resumed.join("_stages/patrol_compute/nlwiki.json").exists());
+        assert!(!resumed.join("qualification.json").exists());
         Ok(())
     }
 

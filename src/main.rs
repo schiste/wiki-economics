@@ -486,6 +486,16 @@ enum Commands {
         wikis: Vec<String>,
     },
 
+    /// Fetch the selected patrol generation and compute its metrics atomically
+    PatrolRefresh {
+        /// Wiki database names
+        wikis: Vec<String>,
+
+        /// Recompute all patrol months from scratch after fetching
+        #[arg(long, default_value_t = false)]
+        rebuild: bool,
+    },
+
     /// Compute patrol metrics only
     PatrolCompute {
         /// Wiki database names
@@ -755,6 +765,20 @@ trait Ops {
         self.prepare_wiki_snapshot(wiki, version, data_dir, run_id, window_size)
     }
     fn plan_candidate_preparation(
+        &self,
+        _wiki: &str,
+        _version: &str,
+        _data_dir: &Path,
+        _output_dir: &Path,
+        _run_id: &str,
+    ) -> Result<publication::WikiPreparationPlan> {
+        Ok(publication::WikiPreparationPlan::Build {
+            same_snapshot_candidate: false,
+            compute_reused: false,
+            patrol_reused: false,
+        })
+    }
+    fn plan_qualification_preparation(
         &self,
         _wiki: &str,
         _version: &str,
@@ -1072,6 +1096,19 @@ impl Ops for RealOps {
         publication::plan_wiki_preparation(data_dir, output_dir, wiki, version, run_id)
     }
 
+    fn plan_qualification_preparation(
+        &self,
+        wiki: &str,
+        version: &str,
+        data_dir: &Path,
+        output_dir: &Path,
+        run_id: &str,
+    ) -> Result<publication::WikiPreparationPlan> {
+        publication::plan_wiki_qualification_preparation(
+            data_dir, output_dir, wiki, version, run_id,
+        )
+    }
+
     fn cached_patrol_sources_available(&self, wiki: &str, data_dir: &Path) -> bool {
         patrol::cached_sources_available(data_dir, wiki)
     }
@@ -1370,13 +1407,6 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
                     compute_reused,
                     patrol_reused,
                 } => {
-                    if !ops.cached_patrol_generation_available(&wiki, &version, &data_dir) {
-                        run_timed_stage("patrol_preflight", Some(&wiki), || {
-                            ops.preflight_patrol_for_snapshot(&wiki, &version, &data_dir)
-                        })?;
-                    } else {
-                        record_reused_stage("patrol_preflight", Some(&wiki));
-                    }
                     run_timed_stage("source_window", Some(&wiki), || {
                         ops.prepare_candidate_snapshot(
                             &wiki,
@@ -1386,15 +1416,6 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
                             source_window_size,
                         )
                     })?;
-                    if same_snapshot_candidate
-                        && ops.cached_patrol_generation_available(&wiki, &version, &data_dir)
-                    {
-                        record_skipped_stage("patrol_fetch", Some(&wiki));
-                    } else {
-                        run_timed_stage("patrol_fetch", Some(&wiki), || {
-                            ops.fetch_patrol_for_snapshot(&wiki, &version, &data_dir)
-                        })?;
-                    }
                     if compute_reused {
                         record_reused_stage("compute", Some(&wiki));
                     } else {
@@ -1403,8 +1424,29 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
                         })?;
                     }
                     if patrol_reused {
+                        record_reused_stage("patrol_preflight", Some(&wiki));
+                        record_reused_stage("patrol_fetch", Some(&wiki));
                         record_reused_stage("patrol_compute", Some(&wiki));
                     } else {
+                        let patrol_cached =
+                            ops.cached_patrol_generation_available(&wiki, &version, &data_dir);
+                        if !patrol_cached {
+                            // Patrol is an independent upstream publication.
+                            // Run this after durable core computation so a late
+                            // logging dump defers only patrol work.
+                            run_timed_stage("patrol_preflight", Some(&wiki), || {
+                                ops.preflight_patrol_for_snapshot(&wiki, &version, &data_dir)
+                            })?;
+                        } else {
+                            record_reused_stage("patrol_preflight", Some(&wiki));
+                        }
+                        if same_snapshot_candidate && patrol_cached {
+                            record_skipped_stage("patrol_fetch", Some(&wiki));
+                        } else {
+                            run_timed_stage("patrol_fetch", Some(&wiki), || {
+                                ops.fetch_patrol_for_snapshot(&wiki, &version, &data_dir)
+                            })?;
+                        }
                         run_timed_stage("patrol_compute", Some(&wiki), || {
                             ops.compute_candidate_patrol(&wiki, &version, &data_dir, &candidate_dir)
                         })?;
@@ -1537,13 +1579,6 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             ops.persist_snapshot_plans(std::slice::from_ref(&wiki), &version, &data_dir)?;
             let qualification_dir =
                 publication::wiki_qualification_dir(&output_dir, &wiki, &version, run_id)?;
-            if !ops.cached_patrol_generation_available(&wiki, &version, &data_dir) {
-                run_timed_stage("patrol_preflight", Some(&wiki), || {
-                    ops.preflight_patrol_for_snapshot(&wiki, &version, &data_dir)
-                })?;
-            } else {
-                record_reused_stage("patrol_preflight", Some(&wiki));
-            }
             run_timed_stage("source_window", Some(&wiki), || {
                 ops.prepare_candidate_snapshot(
                     &wiki,
@@ -1553,15 +1588,51 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
                     source_window_size,
                 )
             })?;
-            run_timed_stage("patrol_fetch", Some(&wiki), || {
-                ops.fetch_patrol_for_snapshot(&wiki, &version, &data_dir)
+            let preparation = run_timed_stage("qualification_discovery", Some(&wiki), || {
+                ops.plan_qualification_preparation(&wiki, &version, &data_dir, &output_dir, run_id)
             })?;
-            run_timed_stage("compute", Some(&wiki), || {
-                ops.compute_candidate(&wiki, &version, &data_dir, &qualification_dir)
-            })?;
-            run_timed_stage("patrol_compute", Some(&wiki), || {
-                ops.compute_candidate_patrol(&wiki, &version, &data_dir, &qualification_dir)
-            })?;
+            let publication::WikiPreparationPlan::Build {
+                same_snapshot_candidate,
+                compute_reused,
+                patrol_reused,
+            } = preparation
+            else {
+                anyhow::bail!(
+                    "qualification preparation unexpectedly resolved as a publication no-op"
+                )
+            };
+            if compute_reused {
+                record_reused_stage("compute", Some(&wiki));
+            } else {
+                run_timed_stage("compute", Some(&wiki), || {
+                    ops.compute_candidate(&wiki, &version, &data_dir, &qualification_dir)
+                })?;
+            }
+            if patrol_reused {
+                record_reused_stage("patrol_preflight", Some(&wiki));
+                record_reused_stage("patrol_fetch", Some(&wiki));
+                record_reused_stage("patrol_compute", Some(&wiki));
+            } else {
+                let patrol_cached =
+                    ops.cached_patrol_generation_available(&wiki, &version, &data_dir);
+                if !patrol_cached {
+                    run_timed_stage("patrol_preflight", Some(&wiki), || {
+                        ops.preflight_patrol_for_snapshot(&wiki, &version, &data_dir)
+                    })?;
+                } else {
+                    record_reused_stage("patrol_preflight", Some(&wiki));
+                }
+                if same_snapshot_candidate && patrol_cached {
+                    record_skipped_stage("patrol_fetch", Some(&wiki));
+                } else {
+                    run_timed_stage("patrol_fetch", Some(&wiki), || {
+                        ops.fetch_patrol_for_snapshot(&wiki, &version, &data_dir)
+                    })?;
+                }
+                run_timed_stage("patrol_compute", Some(&wiki), || {
+                    ops.compute_candidate_patrol(&wiki, &version, &data_dir, &qualification_dir)
+                })?;
+            }
             let receipt = run_timed_stage("qualification_validate", Some(&wiki), || {
                 ops.mark_qualification_ready(
                     &data_dir,
@@ -1770,6 +1841,17 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             for wiki in &wikis {
                 run_timed_stage("patrol_fetch", Some(wiki), || {
                     ops.fetch_patrol(wiki, &data_dir)
+                })?;
+            }
+        }
+
+        Commands::PatrolRefresh { wikis, rebuild } => {
+            for wiki in &wikis {
+                run_timed_stage("patrol_fetch", Some(wiki), || {
+                    ops.fetch_patrol(wiki, &data_dir)
+                })?;
+                run_timed_stage("patrol_compute", Some(wiki), || {
+                    ops.compute_patrol(wiki, &data_dir, &output_dir, rebuild, None)
                 })?;
             }
         }
@@ -2771,8 +2853,8 @@ mod tests {
             ops.calls.into_inner(),
             vec![
                 "source_window:nlwiki:2026-07:fixtures/data:2",
-                "fetch_patrol:nlwiki:fixtures/data",
                 "compute:nlwiki:fixtures/data:fixtures/output/_candidates/nlwiki/2026-07/run-7",
+                "fetch_patrol:nlwiki:fixtures/data",
                 "compute_patrol:nlwiki:fixtures/data:fixtures/output/_candidates/nlwiki/2026-07/run-7:false:_",
                 "candidate_ready:nlwiki:2026-07:run-7",
             ]
@@ -2810,8 +2892,8 @@ mod tests {
             vec![
                 "qualification_lifecycle:itwiki",
                 "source_window:itwiki:2026-07:qualification/data:1",
-                "fetch_patrol:itwiki:qualification/data",
                 "compute:itwiki:qualification/data:qualification/output/_qualifications/itwiki/2026-07/qualify-7",
+                "fetch_patrol:itwiki:qualification/data",
                 "compute_patrol:itwiki:qualification/data:qualification/output/_qualifications/itwiki/2026-07/qualify-7:false:_",
                 "qualification_ready:itwiki:2026-07:qualify-7",
             ]
@@ -3268,6 +3350,30 @@ mod tests {
         assert_eq!(
             ops.calls.into_inner(),
             vec!["compute_patrol:frwiki:d:o:false:_"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn run_with_ops_dispatches_guarded_patrol_refresh() -> Result<()> {
+        init_test_tracing();
+        let cli = Cli::try_parse_from([
+            "wiki-econ",
+            "--data-dir",
+            "d",
+            "--output-dir",
+            "o",
+            "patrol-refresh",
+            "frwiki",
+            "--rebuild",
+        ])?;
+        let ops = RecordingOps::default();
+
+        run_with_ops(cli, &ops)?;
+
+        assert_eq!(
+            ops.calls.into_inner(),
+            vec!["fetch_patrol:frwiki:d", "compute_patrol:frwiki:d:o:true:_"]
         );
         Ok(())
     }

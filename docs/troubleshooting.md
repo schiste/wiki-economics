@@ -32,15 +32,17 @@ the pipeline still produces output.
 This is a normal upstream-readiness state. A history snapshot such as
 `2026-08` is paired with the dated `20260901` logging dump. If Wikimedia's
 `dumpstatus.json` reports that neither the recombined nor split logging job is
-complete, preparation stops before downloading history and records
-`patrol-source-status.json` with `state: waiting_upstream`.
+complete, preparation records
+`patrol-source-status.json` with `state: waiting_upstream`. History ingest and
+core metric computation complete first and remain independently receipted, so
+the next attempt resumes at patrol rather than rebuilding the wiki.
 
 Do not replace the dated URL with `/latest/` and do not delete already
 committed history inputs. Fleet workers release their lease, preserve the
 attempt count, and defer the task for a later readiness check. A manual admin
-operation is likewise shown as “Waiting for Wikimedia.” Retry after the dump
-job completes; the exact same source plan and committed transactions will be
-reused.
+operation is likewise shown as “Waiting for Wikimedia” and is automatically
+requeued with a bounded delay. When the dump completes, the exact same source
+plan and committed transactions are reused.
 
 ## Patrol Parquets are empty after a successful-looking fetch
 

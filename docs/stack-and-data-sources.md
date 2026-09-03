@@ -47,9 +47,11 @@ mutable `/latest/` alias. These dumps are used specifically for:
 - **Patrol events** (`log_type=patrol`) — records of editors reviewing new pages and edits
 - **User rights changes** (`log_type=rights`) — used to reconstruct which editors held autopatrol permissions at any given time
 
-Patrol inventory resolution runs before the much larger history transfer. If
-neither logging job is complete, the run records `waiting_upstream` and exits
-without consuming a retry or redownloading already committed history sources.
+Patrol inventory resolution runs after durable history ingest and core
+computation. If neither logging job is complete, the run records
+`waiting_upstream` without consuming a retry; a later run reuses the committed
+history transactions and independently receipted core metrics, then resumes at
+patrol fetch.
 The XML is streamed and parsed on-the-fly without loading the full file into memory. Wikimedia
 logging dumps may contain concatenated gzip members, so the Rust reader decodes every member as
 one continuous XML stream. The fetch log reports total log items, recognized patrol events,
