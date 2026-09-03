@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tracing::info;
@@ -41,6 +42,28 @@ const WEEKLY_PRIMARY_BUCKET_COUNT_ENV: &str = "WIKI_ECON_WEEKLY_PRIMARY_BUCKET_C
 const WEEKLY_SECONDARY_BUCKET_COUNT_ENV: &str = "WIKI_ECON_WEEKLY_SECONDARY_BUCKET_COUNT";
 const SCRATCH_DIR_ENV: &str = "WIKI_ECON_SCRATCH_DIR";
 const EDITOR_ACTOR_COLUMN: &str = "editor_actor";
+pub(crate) const EDITOR_IDENTITY_REPORT: &str = "editor_identity_coverage.json";
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct EditorIdentityCoveragePeriod {
+    pub(crate) year_month: String,
+    pub(crate) user_type: String,
+    pub(crate) total_edits: u64,
+    pub(crate) identified_edits: u64,
+    pub(crate) excluded_edits: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub(crate) struct EditorIdentityCoverageReport {
+    pub(crate) schema_version: u32,
+    pub(crate) wiki: String,
+    pub(crate) snapshot: Option<String>,
+    pub(crate) algorithm_version: String,
+    pub(crate) total_edits: u64,
+    pub(crate) identified_edits: u64,
+    pub(crate) excluded_edits: u64,
+    pub(crate) periods: Vec<EditorIdentityCoveragePeriod>,
+}
 
 pub(crate) fn snapshot_contains_complete_month(snapshot: &str, event_month: &str) -> bool {
     event_month <= snapshot
@@ -471,15 +494,13 @@ impl RegisteredState {
         let total_edits = partial.column("total_edits")?.u32()?;
         let cohort_years = partial.column("cohort_year")?.i32()?;
 
-        for idx in 0..partial.height() {
-            let (Some(user_id), Some(user_total_edits), Some(cohort_year)) = (
-                user_ids.get(idx),
-                total_edits.get(idx),
-                cohort_years.get(idx),
-            ) else {
-                continue;
-            };
-
+        for (user_id, user_total_edits, cohort_year) in (0..partial.height()).filter_map(|idx| {
+            Some((
+                user_ids.get(idx)?,
+                total_edits.get(idx)?,
+                cohort_years.get(idx)?,
+            ))
+        }) {
             self.funnel_stats
                 .entry(user_id)
                 .and_modify(|(existing_cohort_year, edits)| {
@@ -792,9 +813,23 @@ fn analytical_projection(df: LazyFrame, schema: &Schema) -> Result<DataFrame> {
             event_user_is_temporary.clone(),
         )
     };
-    let editor_actor = if schema.get("event_user_text").is_some() {
+    let historical_actor = schema.get("event_user_text_historical").is_some();
+    let current_actor = schema.get("event_user_text").is_some();
+    let actor_text = match (historical_actor, current_actor) {
+        (true, true) => when(
+            col("event_user_text_historical")
+                .is_not_null()
+                .and(col("event_user_text_historical").neq(lit(""))),
+        )
+        .then(col("event_user_text_historical"))
+        .otherwise(col("event_user_text")),
+        (true, false) => col("event_user_text_historical"),
+        (false, true) => col("event_user_text"),
+        (false, false) => lit(NULL).cast(DataType::String),
+    };
+    let editor_actor = if historical_actor || current_actor {
         when(col("event_user_id").is_null())
-            .then(col("event_user_text"))
+            .then(actor_text)
             .otherwise(lit(NULL).cast(DataType::String))
     } else {
         lit(NULL).cast(DataType::String)
@@ -837,7 +872,6 @@ fn analytical_projection(df: LazyFrame, schema: &Schema) -> Result<DataFrame> {
             },
         ])
         .collect()?;
-    validate_editor_identity_inputs(&projected)?;
     Ok(projected)
 }
 
@@ -849,9 +883,22 @@ pub(super) fn editor_identity_expr() -> Expr {
     as_struct(vec![col("event_user_id"), col(EDITOR_ACTOR_COLUMN)])
 }
 
+pub(super) fn editor_identity_available_expr() -> Expr {
+    col("event_user_id")
+        .is_not_null()
+        .or(col(EDITOR_ACTOR_COLUMN)
+            .is_not_null()
+            .and(col(EDITOR_ACTOR_COLUMN).neq(lit(""))))
+}
+
+fn unique_identified_editors_expr() -> Expr {
+    editor_identity_expr()
+        .filter(editor_identity_available_expr())
+        .n_unique()
+}
+
 pub(super) fn ensure_editor_identity_inputs(frame: &DataFrame) -> Result<DataFrame> {
     if frame.column(EDITOR_ACTOR_COLUMN).is_ok() {
-        validate_editor_identity_inputs(frame)?;
         return Ok(frame.clone());
     }
     let projected = frame
@@ -859,7 +906,6 @@ pub(super) fn ensure_editor_identity_inputs(frame: &DataFrame) -> Result<DataFra
         .lazy()
         .with_column(lit(NULL).cast(DataType::String).alias(EDITOR_ACTOR_COLUMN))
         .collect()?;
-    validate_editor_identity_inputs(&projected)?;
     Ok(projected)
 }
 
@@ -869,29 +915,10 @@ fn ensure_editor_identity_key(frame: &DataFrame) -> Result<DataFrame> {
     }
     ensure_editor_identity_inputs(frame)?
         .lazy()
+        .filter(editor_identity_available_expr())
         .with_column(editor_identity_expr().alias("editor_identity"))
         .collect()
         .map_err(Into::into)
-}
-
-fn validate_editor_identity_inputs(frame: &DataFrame) -> Result<()> {
-    let invalid = frame
-        .clone()
-        .lazy()
-        .filter(
-            col("event_user_id").is_null().and(
-                col(EDITOR_ACTOR_COLUMN)
-                    .is_null()
-                    .or(col(EDITOR_ACTOR_COLUMN).eq(lit(""))),
-            ),
-        )
-        .limit(1)
-        .collect()?;
-    anyhow::ensure!(
-        invalid.height() == 0,
-        "editor identity is unavailable: rows without event_user_id require event_user_text; rebuild the snapshot with the qualified metric-input schema"
-    );
-    Ok(())
 }
 
 /// Load the minimal base dataset for metric computation into memory once.
@@ -1041,7 +1068,7 @@ fn gdp_monthly_frame(base: &DataFrame) -> Result<DataFrame> {
                 .cast(DataType::UInt32)
                 .sum()
                 .alias("reverted_edits"),
-            editor_identity_expr().n_unique().alias("unique_editors"),
+            unique_identified_editors_expr().alias("unique_editors"),
             col("is_minor")
                 .cast(DataType::UInt32)
                 .sum()
@@ -1068,15 +1095,166 @@ fn gdp_type_share_frame(base: &DataFrame) -> Result<DataFrame> {
         .agg([
             col("revision_id").count().alias("edits"),
             col("revision_text_bytes_diff").sum().alias("net_bytes"),
-            editor_identity_expr().n_unique().alias("editors"),
+            unique_identified_editors_expr().alias("editors"),
         ])
         .collect()
         .map_err(Into::into)
 }
 
+fn editor_identity_coverage_frame(base: &DataFrame) -> Result<DataFrame> {
+    ensure_editor_identity_inputs(base)?
+        .lazy()
+        .group_by([col("year_month"), col("user_type")])
+        .agg([
+            col("revision_id").count().alias("total_edits"),
+            col("revision_id")
+                .filter(editor_identity_available_expr())
+                .count()
+                .alias("identified_edits"),
+            col("revision_id")
+                .filter(editor_identity_available_expr().not())
+                .count()
+                .alias("excluded_edits"),
+        ])
+        .collect()
+        .map_err(Into::into)
+}
+
+fn editor_identity_report_path(output_dir: &Path, wiki: &str) -> PathBuf {
+    output_dir.join(wiki).join(EDITOR_IDENTITY_REPORT)
+}
+
+fn write_editor_identity_coverage(
+    wiki: &str,
+    snapshot: Option<&str>,
+    output_dir: &Path,
+    frames: Vec<DataFrame>,
+) -> Result<()> {
+    let frame =
+        concat_frames(frames)?.sort(["year_month", "user_type"], SortMultipleOptions::default())?;
+    let months = frame.column("year_month")?.str()?;
+    let user_types = frame.column("user_type")?.str()?;
+    let totals = frame.column("total_edits")?.u32()?;
+    let identified = frame.column("identified_edits")?.u32()?;
+    let excluded = frame.column("excluded_edits")?.u32()?;
+    let mut periods = Vec::with_capacity(frame.height());
+    let mut total_edits = 0_u64;
+    let mut identified_edits = 0_u64;
+    let mut excluded_edits = 0_u64;
+    for row in 0..frame.height() {
+        let period = EditorIdentityCoveragePeriod {
+            year_month: months
+                .get(row)
+                .context("identity coverage month is null")?
+                .to_string(),
+            user_type: user_types
+                .get(row)
+                .context("identity coverage user type is null")?
+                .to_string(),
+            total_edits: u64::from(totals.get(row).context("identity coverage total is null")?),
+            identified_edits: u64::from(
+                identified
+                    .get(row)
+                    .context("identity coverage identified total is null")?,
+            ),
+            excluded_edits: u64::from(
+                excluded
+                    .get(row)
+                    .context("identity coverage excluded total is null")?,
+            ),
+        };
+        anyhow::ensure!(
+            period.total_edits == period.identified_edits + period.excluded_edits,
+            "editor identity coverage does not conserve edits"
+        );
+        total_edits = total_edits
+            .checked_add(period.total_edits)
+            .context("identity coverage total overflow")?;
+        identified_edits = identified_edits
+            .checked_add(period.identified_edits)
+            .context("identity coverage identified total overflow")?;
+        excluded_edits = excluded_edits
+            .checked_add(period.excluded_edits)
+            .context("identity coverage excluded total overflow")?;
+        periods.push(period);
+    }
+    anyhow::ensure!(
+        total_edits == identified_edits + excluded_edits,
+        "editor identity report does not conserve edits"
+    );
+    let report = EditorIdentityCoverageReport {
+        schema_version: 1,
+        wiki: wiki.to_string(),
+        snapshot: snapshot.map(str::to_string),
+        algorithm_version: monthly::ALGORITHM_VERSION.to_string(),
+        total_edits,
+        identified_edits,
+        excluded_edits,
+        periods,
+    };
+    let path = editor_identity_report_path(output_dir, wiki);
+    let pending = PendingOutput::new(path)?;
+    let mut file = File::create(&pending.temp_path)?;
+    serde_json::to_writer_pretty(&mut file, &report)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    drop(file);
+    pending.publish()?;
+    info!(
+        wiki,
+        total_edits, identified_edits, excluded_edits, "recorded editor identity coverage"
+    );
+    Ok(())
+}
+
+pub(crate) fn read_editor_identity_coverage(
+    output_dir: &Path,
+    wiki: &str,
+) -> Result<Option<EditorIdentityCoverageReport>> {
+    let path = editor_identity_report_path(output_dir, wiki);
+    if !path.is_file() {
+        return Ok(None);
+    }
+    let report: EditorIdentityCoverageReport = serde_json::from_slice(&fs::read(&path)?)?;
+    let mut period_total = 0_u64;
+    let mut period_identified = 0_u64;
+    let mut period_excluded = 0_u64;
+    let mut previous: Option<(&str, &str)> = None;
+    for period in &report.periods {
+        let key = (period.year_month.as_str(), period.user_type.as_str());
+        anyhow::ensure!(
+            previous.is_none_or(|prior| prior < key)
+                && period.total_edits == period.identified_edits + period.excluded_edits,
+            "invalid editor identity coverage period for {wiki}"
+        );
+        previous = Some(key);
+        period_total = period_total
+            .checked_add(period.total_edits)
+            .context("identity coverage period total overflow")?;
+        period_identified = period_identified
+            .checked_add(period.identified_edits)
+            .context("identity coverage period identified total overflow")?;
+        period_excluded = period_excluded
+            .checked_add(period.excluded_edits)
+            .context("identity coverage period excluded total overflow")?;
+    }
+    anyhow::ensure!(
+        report.schema_version == 1
+            && report.wiki == wiki
+            && report.algorithm_version == monthly::ALGORITHM_VERSION
+            && report.total_edits == report.identified_edits + report.excluded_edits
+            && report.total_edits == period_total
+            && report.identified_edits == period_identified
+            && report.excluded_edits == period_excluded,
+        "invalid editor identity coverage report for {wiki}"
+    );
+    Ok(Some(report))
+}
+
 fn gdp_editor_month_frame(base: &DataFrame) -> Result<DataFrame> {
     ensure_editor_identity_inputs(base)?
         .lazy()
+        .filter(editor_identity_available_expr())
         .group_by([
             col("year_month"),
             col("year_month_key"),
@@ -1349,7 +1527,7 @@ fn labor_monthly_frame(base: &DataFrame) -> Result<DataFrame> {
         .lazy()
         .group_by([col("year_month"), col("page_namespace"), col("user_type")])
         .agg([
-            editor_identity_expr().n_unique().alias("unique_editors"),
+            unique_identified_editors_expr().alias("unique_editors"),
             col("revision_id").count().alias("total_edits"),
             col("revision_text_bytes_diff").sum().alias("net_bytes"),
             col("is_reverted")
@@ -1364,7 +1542,11 @@ fn labor_monthly_frame(base: &DataFrame) -> Result<DataFrame> {
 fn registered_editor_totals(base: &DataFrame) -> Result<DataFrame> {
     base.clone()
         .lazy()
-        .filter(col("user_type").eq(lit("registered")))
+        .filter(
+            col("user_type")
+                .eq(lit("registered"))
+                .and(col("event_user_id").is_not_null()),
+        )
         .group_by([col("event_user_id")])
         .agg([
             col("revision_id").count().alias("total_edits"),
@@ -3182,6 +3364,7 @@ fn compute_all_incremental_cached(
     let mut inequality_frames = Vec::new();
     let mut gdp_frames = Vec::new();
     let mut gdp_type_frames = Vec::new();
+    let mut identity_coverage_frames = Vec::new();
     let mut gdp_tier_frames = Vec::new();
     let mut gdp_editor_month_frames = Vec::new();
     let mut gdp_activity_month_digests = Vec::new();
@@ -3290,6 +3473,7 @@ fn compute_all_incremental_cached(
                 || gdp_type_share_frame(&base),
             );
             gdp_type_frames.push(gdp_type?);
+            identity_coverage_frames.push(editor_identity_coverage_frame(&base)?);
             let labor_monthly = cached_or_compute(
                 cross_snapshot,
                 "monthly",
@@ -3348,11 +3532,15 @@ fn compute_all_incremental_cached(
     if plan.monthly.must_compute() {
         let result = write_monthly_outputs(
             wiki,
+            snapshot,
             output_dir,
-            inequality_frames,
-            gdp_frames,
-            gdp_type_frames,
-            labor_monthly_frames,
+            MonthlyFrames {
+                inequality_frames,
+                gdp_frames,
+                gdp_type_frames,
+                identity_coverage_frames,
+                labor_monthly_frames,
+            },
         );
         result.context("failed to write partitioned monthly-family outputs")?;
     }
@@ -3453,32 +3641,39 @@ fn finish_activity_year_cached(
     finish_activity_year(editor_month_frames, output_frames)
 }
 
-fn write_monthly_outputs(
-    wiki: &str,
-    output_dir: &Path,
+struct MonthlyFrames {
     inequality_frames: Vec<DataFrame>,
     gdp_frames: Vec<DataFrame>,
     gdp_type_frames: Vec<DataFrame>,
+    identity_coverage_frames: Vec<DataFrame>,
     labor_monthly_frames: Vec<DataFrame>,
+}
+
+fn write_monthly_outputs(
+    wiki: &str,
+    snapshot: Option<&str>,
+    output_dir: &Path,
+    frames: MonthlyFrames,
 ) -> Result<()> {
-    let mut inequality_out = concat_frames(inequality_frames)?;
+    let mut inequality_out = concat_frames(frames.inequality_frames)?;
     inequality_out =
         inequality_out.sort(["year_month", "user_type"], SortMultipleOptions::default())?;
     add_wiki_column(&mut inequality_out, wiki)?;
     write_output(&mut inequality_out, wiki, "inequality", output_dir)?;
 
-    let mut gdp_out = concat_frames(gdp_frames)?;
+    let mut gdp_out = concat_frames(frames.gdp_frames)?;
     gdp_out = sort_frame(gdp_out, ["year_month", "page_namespace", "user_type"])?;
     add_wiki_column(&mut gdp_out, wiki)?;
     write_output(&mut gdp_out, wiki, "gdp", output_dir)?;
 
-    let mut gdp_type_out = concat_frames(gdp_type_frames)?;
+    let mut gdp_type_out = concat_frames(frames.gdp_type_frames)?;
     gdp_type_out =
         gdp_type_out.sort(["year_month", "user_type"], SortMultipleOptions::default())?;
     add_wiki_column(&mut gdp_type_out, wiki)?;
     write_output(&mut gdp_type_out, wiki, "gdp_user_type_share", output_dir)?;
+    write_editor_identity_coverage(wiki, snapshot, output_dir, frames.identity_coverage_frames)?;
 
-    let mut labor_monthly_out = concat_frames(labor_monthly_frames)?;
+    let mut labor_monthly_out = concat_frames(frames.labor_monthly_frames)?;
     labor_monthly_out = sort_frame(
         labor_monthly_out,
         ["year_month", "page_namespace", "user_type"],
@@ -3517,11 +3712,15 @@ fn compute_nonweekly_flat(
     if plan.monthly.must_compute() {
         let result = write_monthly_outputs(
             wiki,
+            None,
             output_dir,
-            vec![inequality::compute_frame(base)?],
-            vec![gdp_monthly_frame(base)?],
-            vec![gdp_type_share_frame(base)?],
-            vec![labor_monthly_frame(base)?],
+            MonthlyFrames {
+                inequality_frames: vec![inequality::compute_frame(base)?],
+                gdp_frames: vec![gdp_monthly_frame(base)?],
+                gdp_type_frames: vec![gdp_type_share_frame(base)?],
+                identity_coverage_frames: vec![editor_identity_coverage_frame(base)?],
+                labor_monthly_frames: vec![labor_monthly_frame(base)?],
+            },
         );
         result.context("failed to write flat monthly-family outputs")?;
     }
@@ -3648,7 +3847,7 @@ fn family_outputs(
     wiki: &str,
     output_dir: &Path,
 ) -> Vec<fingerprint::TrackedPath> {
-    family
+    let mut outputs = family
         .metrics()
         .iter()
         .map(|metric| {
@@ -3657,7 +3856,14 @@ fn family_outputs(
                 output_dir.join(wiki).join(format!("{metric}.parquet")),
             )
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if family == MetricFamily::Monthly {
+        outputs.push(fingerprint::TrackedPath::new(
+            format!("output/{wiki}/{EDITOR_IDENTITY_REPORT}"),
+            editor_identity_report_path(output_dir, wiki),
+        ));
+    }
+    outputs
 }
 
 fn compute_stage_outputs(wiki: &str, output_dir: &Path) -> Vec<fingerprint::TrackedPath> {
@@ -3815,7 +4021,10 @@ pub(crate) fn reusable_candidate_families(
         let mut files = family_outputs(family, wiki, candidate_dir)
             .into_iter()
             .flat_map(|output| {
-                let receipt = crate::artifact_receipt::sidecar_path(&output.path).ok();
+                let receipt = (output.path.extension().and_then(|value| value.to_str())
+                    == Some("parquet"))
+                .then(|| crate::artifact_receipt::sidecar_path(&output.path).ok())
+                .flatten();
                 std::iter::once(output.path).chain(receipt)
             })
             .collect::<Vec<_>>();
@@ -3937,6 +4146,25 @@ pub(crate) fn record_candidate_fingerprint_for_test(
     data_dir: &Path,
     candidate_dir: &Path,
 ) -> Result<()> {
+    let report_path = editor_identity_report_path(candidate_dir, wiki);
+    if !report_path.is_file() {
+        let gdp_share = ParquetReader::new(
+            File::open(candidate_dir.join(wiki).join("gdp_user_type_share.parquet"))
+                .expect("candidate GDP share fixture should exist"),
+        )
+        .finish()?;
+        let coverage = gdp_share
+            .lazy()
+            .select([
+                col("year_month"),
+                col("user_type"),
+                col("edits").alias("total_edits"),
+                col("edits").alias("identified_edits"),
+                lit(0_i32).cast(DataType::UInt32).alias("excluded_edits"),
+            ])
+            .collect()?;
+        write_editor_identity_coverage(wiki, Some(snapshot), candidate_dir, vec![coverage])?;
+    }
     let weekly_config = WeeklyAggregationConfig::for_snapshot(data_dir, wiki, Some(snapshot))?;
     for family in MetricFamily::ALL {
         let algorithm = family.algorithm_version(&weekly_config);
@@ -4803,7 +5031,7 @@ mod tests {
         .map_err(Into::into)
     }
 
-    fn anonymous_identity_input(include_actor_text: bool) -> Result<DataFrame> {
+    fn anonymous_identity_input(include_historical_actor_text: bool) -> Result<DataFrame> {
         let mut columns = vec![
             Column::new(
                 "event_timestamp".into(),
@@ -4826,10 +5054,14 @@ mod tests {
             Column::new("is_reverted".into(), vec![false, false, false]),
             Column::new("is_minor".into(), vec![false, false, false]),
         ];
-        if include_actor_text {
+        if include_historical_actor_text {
+            columns.push(Column::new(
+                "event_user_text_historical".into(),
+                vec!["192.0.2.1", "192.0.2.1", "198.51.100.4"],
+            ));
             columns.push(Column::new(
                 "event_user_text".into(),
-                vec!["192.0.2.1", "192.0.2.1", "198.51.100.4"],
+                vec![None::<&str>, None, None],
             ));
         }
         DataFrame::new_infer_height(columns).map_err(Into::into)
@@ -4884,7 +5116,7 @@ mod tests {
     }
 
     #[test]
-    fn anonymous_actor_text_provides_distinct_editor_identity() -> Result<()> {
+    fn historical_anonymous_actor_text_provides_distinct_editor_identity() -> Result<()> {
         let input = anonymous_identity_input(true)?;
         let schema = input.schema().clone();
         let projected = analytical_projection(input.lazy(), schema.as_ref())?;
@@ -4900,12 +5132,54 @@ mod tests {
     }
 
     #[test]
-    fn anonymous_rows_without_actor_text_fail_closed() -> Result<()> {
+    fn suppressed_identity_rows_are_counted_but_not_collapsed() -> Result<()> {
         let input = anonymous_identity_input(false)?;
         let schema = input.schema().clone();
-        let error = analytical_projection(input.lazy(), schema.as_ref())
-            .expect_err("anonymous rows without an actor identity must fail");
-        assert!(error.to_string().contains("event_user_text"));
+        let projected = analytical_projection(input.lazy(), schema.as_ref())?;
+        let type_share = gdp_type_share_frame(&projected)?;
+        assert_eq!(type_share.column("edits")?.u32()?.get(0), Some(3));
+        assert_eq!(type_share.column("editors")?.u32()?.get(0), Some(0));
+        assert_eq!(inequality::compute_frame(&projected)?.height(), 0);
+
+        let output = TestDir::new()?;
+        assert!(read_editor_identity_coverage(output.path(), "testwiki")?.is_none());
+        write_editor_identity_coverage(
+            "testwiki",
+            Some("2025-05"),
+            output.path(),
+            vec![editor_identity_coverage_frame(&projected)?],
+        )
+        .expect("suppressed identity coverage should be writable");
+        let report = read_editor_identity_coverage(output.path(), "testwiki")?
+            .expect("identity coverage report should exist");
+        assert_eq!(report.total_edits, 3);
+        assert_eq!(report.identified_edits, 0);
+        assert_eq!(report.excluded_edits, 3);
+        assert_eq!(report.periods[0].excluded_edits, 3);
+        Ok(())
+    }
+
+    #[test]
+    fn analytical_projection_supports_each_actor_schema_generation() -> Result<()> {
+        for (keep_historical, keep_current, expected) in [
+            (true, false, Some("192.0.2.1")),
+            (false, true, None),
+            (false, false, None),
+        ] {
+            let mut input = anonymous_identity_input(true)?;
+            if !keep_historical {
+                input.drop_in_place("event_user_text_historical")?;
+            }
+            if !keep_current {
+                input.drop_in_place("event_user_text")?;
+            }
+            let schema = input.schema().clone();
+            let projected = analytical_projection(input.lazy(), schema.as_ref())?;
+            assert_eq!(
+                projected.column(EDITOR_ACTOR_COLUMN)?.str()?.get(0),
+                expected
+            );
+        }
         Ok(())
     }
 
@@ -5176,11 +5450,23 @@ mod tests {
         assert!(
             write_monthly_outputs(
                 "malformed-monthly",
+                None,
                 malformed_monthly_output.path(),
-                vec![inequality::compute_frame(&base).expect("inequality fixture should compute")],
-                vec![gdp_monthly_frame(&base).expect("GDP fixture should compute")],
-                vec![gdp_type_share_frame(&base).expect("GDP share fixture should compute")],
-                vec![malformed_labor],
+                MonthlyFrames {
+                    inequality_frames: vec![
+                        inequality::compute_frame(&base)
+                            .expect("inequality fixture should compute")
+                    ],
+                    gdp_frames: vec![gdp_monthly_frame(&base).expect("GDP fixture should compute")],
+                    gdp_type_frames: vec![
+                        gdp_type_share_frame(&base).expect("GDP share fixture should compute")
+                    ],
+                    identity_coverage_frames: vec![
+                        editor_identity_coverage_frame(&base)
+                            .expect("identity coverage fixture should compute")
+                    ],
+                    labor_monthly_frames: vec![malformed_labor],
+                },
             )
             .is_err(),
             "missing labor sort keys must fail before publication"

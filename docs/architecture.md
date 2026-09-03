@@ -47,6 +47,17 @@ pointer and therefore never scans two full monthly snapshots together. The
 older generation remains a rollback source until the site build succeeds;
 `snapshot-finalize` then removes it and any pre-generation legacy partitions.
 
+Editor identity is generation-aware. Ingest preserves
+`event_user_text_historical` alongside `event_user_id`; metric computation uses
+the numeric user ID when present and the historical actor text otherwise.
+Revision-deleted identities with neither value remain in edit, byte, and
+page-week totals but are excluded from editor-level distributions. Every clean
+compute writes a deterministic `editor_identity_coverage.json` report with the
+excluded edit contribution by month and user type. A qualification run may
+discard and redownload only a finalized, reproducible input generation whose
+ingest algorithm is obsolete; source plans and remote inventory receipts are
+retained so that the replacement remains pinned and resumable.
+
 ## Fetching
 
 Fetch logic lives in [src/fetch.rs](../src/fetch.rs).

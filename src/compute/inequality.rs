@@ -4,7 +4,10 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use tracing::debug;
 
-use super::{editor_identity_expr, ensure_editor_identity_inputs, write_output};
+use super::{
+    editor_identity_available_expr, editor_identity_expr, ensure_editor_identity_inputs,
+    write_output,
+};
 
 type InequalityRow = (String, String, f64, f64, f64, usize, usize, usize);
 
@@ -86,6 +89,7 @@ fn min_editors_50pct(sorted_desc: &[f64]) -> usize {
 pub fn compute_frame(base: &DataFrame) -> Result<DataFrame> {
     let editor_monthly = ensure_editor_identity_inputs(base)?
         .lazy()
+        .filter(editor_identity_available_expr())
         .group_by([col("year_month"), col("user_type"), editor_identity_expr()])
         .agg([col("revision_id").count().alias("edits")])
         .collect()?;

@@ -3,7 +3,10 @@ use polars::prelude::*;
 use std::path::Path;
 use tracing::debug;
 
-use super::{editor_identity_expr, ensure_editor_identity_inputs, write_output};
+use super::{
+    editor_identity_available_expr, editor_identity_expr, ensure_editor_identity_inputs,
+    write_output,
+};
 
 /// Compute GDP-style metrics: output, productivity, sectoral breakdown.
 pub fn compute(wiki: &str, base: &DataFrame, output_dir: &Path) -> Result<()> {
@@ -37,7 +40,10 @@ pub fn compute(wiki: &str, base: &DataFrame, output_dir: &Path) -> Result<()> {
                 .sum()
                 .alias("reverted_edits"),
             // Unique editors
-            editor_identity_expr().n_unique().alias("unique_editors"),
+            editor_identity_expr()
+                .filter(editor_identity_available_expr())
+                .n_unique()
+                .alias("unique_editors"),
             // Minor edits
             col("is_minor")
                 .cast(DataType::UInt32)
@@ -75,7 +81,10 @@ pub fn compute(wiki: &str, base: &DataFrame, output_dir: &Path) -> Result<()> {
         .agg([
             col("revision_id").count().alias("edits"),
             col("revision_text_bytes_diff").sum().alias("net_bytes"),
-            editor_identity_expr().n_unique().alias("editors"),
+            editor_identity_expr()
+                .filter(editor_identity_available_expr())
+                .n_unique()
+                .alias("editors"),
         ])
         .sort(["year_month", "user_type"], SortMultipleOptions::default())
         .collect()?;

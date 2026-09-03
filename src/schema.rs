@@ -96,6 +96,7 @@ pub const INGEST_COLUMNS: &[&str] = &[
     "event_type",
     "event_timestamp",
     "event_user_id",
+    "event_user_text_historical",
     "event_user_text",
     "event_user_is_bot_by",
     "event_user_is_anonymous",
@@ -122,6 +123,7 @@ pub const WAREHOUSE_COLUMNS: &[&str] = &[
     "wiki_db",
     "event_timestamp",
     "event_user_id",
+    "event_user_text_historical",
     "event_user_text",
     "event_user_is_bot_by",
     "event_user_is_anonymous",
@@ -168,6 +170,7 @@ pub const ANALYTICAL_COLUMNS: &[&str] = &[
 pub const METRIC_INPUT_COLUMNS: &[&str] = &[
     "event_timestamp",
     "event_user_id",
+    "event_user_text_historical",
     "event_user_text",
     "event_user_is_bot_by",
     "event_user_is_anonymous",
@@ -234,6 +237,7 @@ mod tests {
         }
         for required in [
             "event_timestamp",
+            "event_user_text_historical",
             "event_user_text",
             "event_user_is_bot_by",
             "event_user_is_anonymous",

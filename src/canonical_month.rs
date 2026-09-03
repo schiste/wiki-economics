@@ -10,8 +10,8 @@ use std::path::{Path, PathBuf};
 
 use crate::{schema, storage};
 
-pub(crate) const LOGICAL_SCHEMA_VERSION: u32 = 2;
-pub(crate) const ENCODING_VERSION: &str = "metric-input-canonical-row-v1";
+pub(crate) const LOGICAL_SCHEMA_VERSION: u32 = 3;
+pub(crate) const ENCODING_VERSION: &str = "metric-input-canonical-row-v2-historical-actor";
 const RECEIPT_SCHEMA_VERSION: u32 = 1;
 const BATCH_ROWS: usize = 100_000;
 
@@ -43,6 +43,7 @@ pub(crate) struct MonthInventory {
 struct CanonicalRow {
     event_timestamp: Option<String>,
     event_user_id: Option<i64>,
+    event_user_text_historical: Option<String>,
     event_user_text: Option<String>,
     event_user_is_bot_by: Option<String>,
     event_user_is_anonymous: Option<bool>,
@@ -61,6 +62,7 @@ impl CanonicalRow {
         Ok(Self {
             event_timestamp: string_at(frame, "event_timestamp", row)?,
             event_user_id: i64_at(frame, "event_user_id", row)?,
+            event_user_text_historical: string_at(frame, "event_user_text_historical", row)?,
             event_user_text: string_at(frame, "event_user_text", row)?,
             event_user_is_bot_by: string_at(frame, "event_user_is_bot_by", row)?,
             event_user_is_anonymous: bool_at(frame, "event_user_is_anonymous", row)?,
@@ -78,6 +80,7 @@ impl CanonicalRow {
     fn update_digest(&self, digest: &mut Sha256) {
         encode_string(digest, self.event_timestamp.as_deref());
         encode_i64(digest, self.event_user_id);
+        encode_string(digest, self.event_user_text_historical.as_deref());
         encode_string(digest, self.event_user_text.as_deref());
         encode_string(digest, self.event_user_is_bot_by.as_deref());
         encode_bool(digest, self.event_user_is_anonymous);
@@ -220,6 +223,7 @@ fn validate_schema(frame: &DataFrame) -> Result<()> {
     let expected = [
         ("event_timestamp", DataType::String),
         ("event_user_id", DataType::Int64),
+        ("event_user_text_historical", DataType::String),
         ("event_user_text", DataType::String),
         ("event_user_is_bot_by", DataType::String),
         ("event_user_is_anonymous", DataType::Boolean),
@@ -537,6 +541,13 @@ mod tests {
                 revisions.iter().map(|id| Some(*id)).collect::<Vec<_>>(),
             ),
             Column::new(
+                "event_user_text_historical".into(),
+                revisions
+                    .iter()
+                    .map(|id| Some(format!("historical-u{id}")))
+                    .collect::<Vec<_>>(),
+            ),
+            Column::new(
                 "event_user_text".into(),
                 revisions
                     .iter()
@@ -614,6 +625,30 @@ mod tests {
         let duplicate = duplicate?;
         assert_ne!(duplicate.digest, left.digest);
         assert_eq!(duplicate.rows, 5);
+        Ok(())
+    }
+
+    #[test]
+    fn historical_actor_text_is_part_of_the_canonical_identity() -> Result<()> {
+        let root = TestDir::new()?;
+        let first = root.path().join("first.parquet");
+        let second = root.path().join("second.parquet");
+        let mut left = frame(&[1])?;
+        let mut right = left.clone();
+        right
+            .replace(
+                "event_user_text_historical",
+                Column::new(
+                    "event_user_text_historical".into(),
+                    [Some("different-historical-actor")],
+                ),
+            )
+            .expect("historical actor fixture column should be replaceable");
+        write_frame(&first, &mut left)?;
+        write_frame(&second, &mut right)?;
+        let left = compute("testwiki", "2024-02", vec![first])?;
+        let right = compute("testwiki", "2024-02", vec![second])?;
+        assert_ne!(left.digest, right.digest);
         Ok(())
     }
 

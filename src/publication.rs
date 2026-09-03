@@ -283,6 +283,8 @@ struct ReadyWikiCandidate {
     cutoff_date: String,
     #[serde(default)]
     workload_profile: Option<crate::workload_profile::WorkloadProfile>,
+    #[serde(default)]
+    editor_identity_coverage: Option<crate::compute::EditorIdentityCoverageReport>,
     artifacts: Vec<PreparedArtifact>,
 }
 
@@ -319,6 +321,8 @@ struct QualificationReceipt {
     generating_commit: Option<String>,
     cutoff_date: String,
     workload_profile: crate::workload_profile::WorkloadProfile,
+    #[serde(default)]
+    editor_identity_coverage: Option<crate::compute::EditorIdentityCoverageReport>,
     artifacts: Vec<PreparedArtifact>,
 }
 
@@ -1207,6 +1211,14 @@ pub(crate) fn mark_wiki_candidate_ready(
     );
     let mut artifacts = Vec::new();
     let mut cutoff_date = None;
+    let editor_identity_coverage =
+        crate::compute::read_editor_identity_coverage(&candidate_dir, wiki)?;
+    ensure!(
+        editor_identity_coverage
+            .as_ref()
+            .is_none_or(|coverage| coverage.snapshot.as_deref() == Some(snapshot)),
+        "candidate editor identity coverage belongs to another snapshot"
+    );
     for spec in &METRICS {
         let contract = registry
             .publication_contract
@@ -1222,7 +1234,7 @@ pub(crate) fn mark_wiki_candidate_ready(
         let identity = format!("{wiki}/{}.parquet", spec.name);
         let (rows, summary) = receipted_summary(&path, &identity, spec)?;
         if spec.name == "gdp_user_type_share" {
-            validate_editor_identity_semantics(&path)?;
+            validate_editor_identity_semantics(&path, editor_identity_coverage.as_ref())?;
         }
         let minimum_rows = contract.minimum_rows(wiki);
         ensure!(
@@ -1268,6 +1280,7 @@ pub(crate) fn mark_wiki_candidate_ready(
         generating_commit: licensing::generating_commit(),
         cutoff_date: cutoff_date.context("candidate GDP cutoff is missing")?,
         workload_profile,
+        editor_identity_coverage,
         artifacts,
     };
     let generation_state =
@@ -1333,6 +1346,14 @@ pub(crate) fn mark_wiki_qualification_ready(
     let generation_state = generation.adopt(GState::Building, "recovered qualification run")?;
     let mut artifacts = Vec::new();
     let mut cutoff_date = None;
+    let editor_identity_coverage =
+        crate::compute::read_editor_identity_coverage(&qualification_dir, wiki)?;
+    ensure!(
+        editor_identity_coverage
+            .as_ref()
+            .is_none_or(|coverage| coverage.snapshot.as_deref() == Some(snapshot)),
+        "qualification editor identity coverage belongs to another snapshot"
+    );
     for spec in &METRICS {
         let path = qualification_dir
             .join(wiki)
@@ -1340,7 +1361,7 @@ pub(crate) fn mark_wiki_qualification_ready(
         let identity = format!("{wiki}/{}.parquet", spec.name);
         let (rows, summary) = receipted_summary(&path, &identity, spec)?;
         if spec.name == "gdp_user_type_share" {
-            validate_editor_identity_semantics(&path)?;
+            validate_editor_identity_semantics(&path, editor_identity_coverage.as_ref())?;
         }
         ensure!(
             rows > 0,
@@ -1383,6 +1404,7 @@ pub(crate) fn mark_wiki_qualification_ready(
         generating_commit: licensing::generating_commit(),
         cutoff_date: cutoff_date.context("qualification GDP cutoff is missing")?,
         workload_profile,
+        editor_identity_coverage,
         artifacts,
     };
     let generation_state = if generation_state.state == GState::Building {
@@ -4272,7 +4294,24 @@ fn validate_snapshot_cutoff(wiki: &str, snapshot: &str, cutoff: &str) -> Result<
     Ok(())
 }
 
-fn validate_editor_identity_semantics(path: &Path) -> Result<()> {
+fn validate_editor_identity_semantics(
+    path: &Path,
+    coverage: Option<&crate::compute::EditorIdentityCoverageReport>,
+) -> Result<()> {
+    let coverage_by_period = coverage
+        .map(|report| {
+            report
+                .periods
+                .iter()
+                .map(|period| {
+                    (
+                        (period.year_month.as_str(), period.user_type.as_str()),
+                        (period.identified_edits, period.excluded_edits),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
     let columns = vec![
         "year_month".to_string(),
         "user_type".to_string(),
@@ -4293,15 +4332,23 @@ fn validate_editor_identity_semantics(path: &Path) -> Result<()> {
             let edit_count = u64::from(edits.get(row).context("editor identity edits is null")?);
             let editor_count =
                 u64::from(editors.get(row).context("editor identity count is null")?);
+            let (identified_edits, excluded_edits) = coverage_by_period
+                .get(&(month, user_type))
+                .copied()
+                .unwrap_or((edit_count, 0));
             ensure!(
-                edit_count == 0 || editor_count > 0,
-                "{month} {user_type} has {edit_count} edits but no editor identities"
+                identified_edits + excluded_edits == edit_count,
+                "{month} {user_type} editor identity coverage does not conserve edits"
+            );
+            ensure!(
+                identified_edits == 0 || editor_count > 0,
+                "{month} {user_type} has {identified_edits} attributable edits but no editor identities"
             );
             ensure!(
                 user_type != "anonymous"
-                    || edit_count < SUBSTANTIAL_ANONYMOUS_EDITS
+                    || identified_edits < SUBSTANTIAL_ANONYMOUS_EDITS
                     || editor_count > 1,
-                "{month} has {edit_count} anonymous edits collapsed into one identity; rebuild the qualified metric-input generation"
+                "{month} has {identified_edits} attributable anonymous edits collapsed into one identity; rebuild the qualified metric-input generation"
             );
         }
     }
@@ -5136,7 +5183,7 @@ mod tests {
         ];
         let mut collapsed = DataFrame::new_infer_height(collapsed_columns)?;
         ParquetWriter::new(File::create(&path)?).finish(&mut collapsed)?;
-        assert!(validate_editor_identity_semantics(&path).is_err());
+        assert!(validate_editor_identity_semantics(&path, None).is_err());
 
         let valid_columns = vec![
             Column::new("year_month".into(), ["2025-06", "2025-07"]),
@@ -5146,7 +5193,36 @@ mod tests {
         ];
         let mut valid = DataFrame::new_infer_height(valid_columns)?;
         ParquetWriter::new(File::create(&path)?).finish(&mut valid)?;
-        validate_editor_identity_semantics(&path)
+        validate_editor_identity_semantics(&path, None)?;
+
+        let mut suppressed = DataFrame::new_infer_height(vec![
+            Column::new("year_month".into(), ["2025-08"]),
+            Column::new("user_type".into(), ["anonymous"]),
+            Column::new("edits".into(), [SUBSTANTIAL_ANONYMOUS_EDITS as u32]),
+            Column::new("editors".into(), [0_u32]),
+        ])
+        .expect("suppressed identity fixture should be valid");
+        ParquetWriter::new(File::create(&path)?).finish(&mut suppressed)?;
+        let mut coverage = crate::compute::EditorIdentityCoverageReport {
+            schema_version: 1,
+            wiki: "nlwiki".to_string(),
+            snapshot: Some("2025-08".to_string()),
+            algorithm_version: "test-monthly-algorithm".to_string(),
+            total_edits: SUBSTANTIAL_ANONYMOUS_EDITS,
+            identified_edits: 0,
+            excluded_edits: SUBSTANTIAL_ANONYMOUS_EDITS,
+            periods: vec![crate::compute::EditorIdentityCoveragePeriod {
+                year_month: "2025-08".to_string(),
+                user_type: "anonymous".to_string(),
+                total_edits: SUBSTANTIAL_ANONYMOUS_EDITS,
+                identified_edits: 0,
+                excluded_edits: SUBSTANTIAL_ANONYMOUS_EDITS,
+            }],
+        };
+        validate_editor_identity_semantics(&path, Some(&coverage))?;
+        coverage.periods[0].excluded_edits -= 1;
+        assert!(validate_editor_identity_semantics(&path, Some(&coverage)).is_err());
+        Ok(())
     }
 
     fn string_value(name: &str) -> &str {
@@ -6508,6 +6584,15 @@ mod tests {
             )
             .expect("new candidate receipt should copy");
         }
+        fs::copy(
+            candidate_2
+                .join("nlwiki")
+                .join(crate::compute::EDITOR_IDENTITY_REPORT),
+            candidate_3
+                .join("nlwiki")
+                .join(crate::compute::EDITOR_IDENTITY_REPORT),
+        )
+        .expect("cloned candidate identity coverage should copy");
         for relative in [
             "_stages/compute/monthly/nlwiki.json",
             "_stages/compute/activity_tiers/nlwiki.json",
@@ -7133,6 +7218,28 @@ mod tests {
                 .iter()
                 .any(|artifact| { artifact.path.ends_with("business_funnel.parquet") })
         );
+        let candidate_dir = ready_path
+            .parent()
+            .context("ready receipt should have a candidate directory")?;
+        let coverage_path = candidate_dir
+            .join("nlwiki")
+            .join(crate::compute::EDITOR_IDENTITY_REPORT);
+        let mut coverage: crate::compute::EditorIdentityCoverageReport = read_json(&coverage_path)?;
+        coverage.snapshot = Some("2026-02".to_string());
+        atomic_json(&coverage_path, &coverage)?;
+        assert!(
+            mark_wiki_candidate_ready(
+                fixture.data.path(),
+                fixture.output.path(),
+                &fixture.lifecycle_path,
+                "nlwiki",
+                "2026-03",
+                "candidate-subset",
+            )
+            .is_err()
+        );
+        coverage.snapshot = Some("2026-03".to_string());
+        atomic_json(&coverage_path, &coverage)?;
         crate::generation_lifecycle::transition(
             fixture.output.path(),
             "nlwiki",
@@ -7209,6 +7316,13 @@ mod tests {
             )
             .expect("qualification metric should copy");
         }
+        crate::compute::record_candidate_fingerprint_for_test(
+            "nlwiki",
+            "2026-03",
+            fixture.data.path(),
+            &qualification,
+        )
+        .expect("qualification identity coverage should record");
     }
 
     #[test]
@@ -7275,6 +7389,30 @@ mod tests {
             read_json(&receipt_path).expect("qualification receipt should load");
         assert!(!receipt.publication_eligible);
         assert_eq!(receipt.artifacts.len(), METRICS.len());
+        let qualification_dir = receipt_path
+            .parent()
+            .expect("qualification receipt should have a directory");
+        let coverage_path = qualification_dir
+            .join("nlwiki")
+            .join(crate::compute::EDITOR_IDENTITY_REPORT);
+        let mut coverage: crate::compute::EditorIdentityCoverageReport =
+            read_json(&coverage_path).expect("qualification coverage should load");
+        coverage.snapshot = Some("2026-02".to_string());
+        atomic_json(&coverage_path, &coverage)
+            .expect("mismatched qualification coverage should persist");
+        assert!(
+            mark_wiki_qualification_ready(
+                fixture.data.path(),
+                fixture.output.path(),
+                &fixture.lifecycle_path,
+                "nlwiki",
+                "2026-03",
+                "qualification-1",
+            )
+            .is_err()
+        );
+        coverage.snapshot = Some("2026-03".to_string());
+        atomic_json(&coverage_path, &coverage).expect("qualification coverage should restore");
         assert_eq!(
             mark_wiki_qualification_ready(
                 fixture.data.path(),

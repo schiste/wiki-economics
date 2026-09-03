@@ -21,7 +21,7 @@ use crate::{schema, storage};
 
 const INGEST_CHUNK_BYTES: usize = 32 * 1024 * 1024;
 pub(crate) const INGEST_ALGORITHM_VERSION: &str =
-    "history-tsv-to-qualified-metric-input-v7-generation-schema-v2";
+    "history-tsv-to-qualified-metric-input-v8-historical-actor-generation-schema-v2";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SourceIngestCommit {
@@ -1140,6 +1140,7 @@ mod tests {
             ("event_type", event_type),
             ("event_timestamp", timestamp),
             ("event_user_id", user_id),
+            ("event_user_text_historical", "ExampleUserAtRevision"),
             ("event_user_text", "ExampleUser"),
             ("event_user_is_anonymous", "false"),
             ("event_user_is_temporary", "false"),
@@ -1347,7 +1348,13 @@ mod tests {
         assert!(storage::collect_parquet_files(&roots.analytical)?.is_empty());
         assert!(storage::collect_parquet_files(&roots.warehouse)?.is_empty());
         let metric_input_root = roots.metric_input.as_ref().expect("metric input root");
-        assert_eq!(storage::collect_parquet_files(metric_input_root)?.len(), 1);
+        let metric_input_files = storage::collect_parquet_files(metric_input_root)?;
+        assert_eq!(metric_input_files.len(), 1);
+        let ingested = ParquetReader::new(File::open(&metric_input_files[0])?).finish()?;
+        assert_eq!(
+            ingested.column("event_user_text_historical")?.str()?.get(0),
+            Some("ExampleUserAtRevision")
+        );
         Ok(())
     }
 

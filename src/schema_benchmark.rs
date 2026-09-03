@@ -295,6 +295,7 @@ mod tests {
         for name in schema::WAREHOUSE_COLUMNS {
             let column = match *name {
                 "event_timestamp"
+                | "event_user_text_historical"
                 | "event_user_text"
                 | "event_user_is_bot_by"
                 | "page_title"
@@ -356,7 +357,8 @@ mod tests {
                     (*name).into(),
                     ["2026-01-01 00:00:00.0", "2026-01-02 00:00:00.0"],
                 ),
-                "event_user_text"
+                "event_user_text_historical"
+                | "event_user_text"
                 | "event_user_is_bot_by"
                 | "page_title"
                 | "year_month"

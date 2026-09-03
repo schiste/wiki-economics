@@ -66,6 +66,12 @@
       "paths": ["src/compute/mod.rs"],
       "reason": "Editor-identity, complete-month invalidation, and coverage-only refactors do not change page-week aggregation semantics or bytes.",
       "base_commit": "828fa51ae56e4ab1fb29dfc1855bc50e9281023c"
+    },
+    {
+      "family": "page_week",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Historical editor identity and suppression accounting affect editor-based families only; page-week aggregation semantics and bytes are unchanged.",
+      "base_commit": "629ff53fd87e8396f5e4254fadf82f354578f7ab"
     }
   ]
 }
