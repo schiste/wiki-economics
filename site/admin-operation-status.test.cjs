@@ -74,3 +74,26 @@ test("operation summaries retain the requested snapshot when the bounded log has
   assert.equal(summary.selectedSnapshot, "2026-07");
   assert.equal(summary.stage, "compute");
 });
+
+test("operation summaries use byte-weighted progress for uneven source files", () => {
+  const summary = summarizeOperationLog({}, [
+    'run_id=test INFO starting stage stage="source_window" wiki="dewiki"',
+    'run_id=test INFO starting bounded source-window execution planned_sources=10 reused_sources=2 planned_bytes=1000 reused_bytes=100 pending_sources=8',
+    'run_id=test INFO resource governor source progress sample={"downloaded_bytes":400,"ingested_rows":12}',
+  ].join("\n"));
+  assert.equal(summary.progress.percent, 50);
+  assert.equal(summary.progress.plannedBytes, 1000);
+  assert.equal(summary.progress.reusedBytes, 100);
+  assert.equal(summary.progress.completedBytes, 500);
+});
+
+test("operation summaries distinguish incomplete logging dumps from defects", () => {
+  const summary = summarizeOperationLog({}, [
+    'run_id=test INFO starting stage stage="patrol_preflight" wiki="dewiki"',
+    'Error: UPSTREAM_WAITING: Wikimedia logging dump 20260901 for dewiki/2026-08 is not complete (recombined=waiting, split=waiting); validated history transactions remain reusable',
+  ].join("\n"));
+  assert.equal(summary.stage, "patrol_preflight");
+  assert.equal(summary.retryable, true);
+  assert.equal(summary.remediationCode, "upstream_logging_waiting");
+  assert.match(summary.errorSummary, /will not be downloaded again/);
+});

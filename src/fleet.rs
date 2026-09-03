@@ -529,6 +529,43 @@ pub(crate) fn fail(
     fail_claim_at(queue_root, &claim, error, max_attempts, now)
 }
 
+/// Release a live lease without consuming a retry when a required upstream
+/// dump is still being generated. The immutable task remains pending and is
+/// ineligible until the recorded retry time.
+pub(crate) fn defer(
+    queue_root: &Path,
+    claim_path: &Path,
+    reason: &str,
+    retry_after_secs: u64,
+) -> Result<PathBuf> {
+    ensure!(
+        retry_after_secs > 0,
+        "fleet defer interval must be positive"
+    );
+    let claim: FleetClaim = read_json(claim_path)?;
+    claim.validate()?;
+    ensure_live_owner(queue_root, &claim)?;
+    let now = now_unix()?;
+    let mut task = claim.task.clone();
+    task.not_before_unix = now.saturating_add(retry_after_secs);
+    atomic_write_json(&pending_path(queue_root, &task.wiki), &task)?;
+    let receipt = queue_root
+        .join("deferred")
+        .join(format!("{}-{}-{}.json", task.wiki, task.task_id, now));
+    let deferred = serde_json::json!({
+        "schema_version": 1,
+        "reason": concise_error(reason),
+        "deferred_at_unix": now,
+        "not_before_unix": task.not_before_unix,
+        "attempt": task.attempt,
+        "claim": claim,
+    });
+    atomic_write_json(&receipt, &deferred)?;
+    fs::remove_dir_all(lease_dir(queue_root, &task.wiki))?;
+    sync_dir(queue_root)?;
+    Ok(receipt)
+}
+
 fn fail_claim_at(
     queue_root: &Path,
     claim: &FleetClaim,
@@ -697,6 +734,7 @@ fn initialize(root: &Path) -> Result<()> {
         "leases",
         "completed",
         "failures",
+        "deferred",
         "superseded",
         "quarantine",
         "notifications/ready",
@@ -1069,6 +1107,26 @@ mod tests {
         let retried: FleetTask = read_json(&pending_path(root.path(), "nlwiki"))?;
         assert_eq!(retried.attempt, 1);
         assert!(!lease_dir(root.path(), &claim.task.wiki).exists());
+        Ok(())
+    }
+
+    #[test]
+    fn upstream_deferral_preserves_attempt_and_releases_the_lease() -> Result<()> {
+        let root = TestDir::new()?;
+        enqueue_fixture(root.path(), "dewiki", "2026-08", "controller-1", 100)?;
+        let claim = claim_at(root.path(), ResourceClass::Small, "worker-1", 60, 101)?
+            .context("task should be claimable")?;
+        let claim_path = root.path().join("claim.json");
+        atomic_write_json(&claim_path, &claim)?;
+        let reason = "Wikimedia logging dump is still building";
+        let receipt = defer(root.path(), &claim_path, reason, 21_600)?;
+        assert!(receipt.is_file());
+        assert!(!lease_dir(root.path(), "dewiki").exists());
+        let pending: FleetTask = read_json(&pending_path(root.path(), "dewiki"))?;
+        assert_eq!(pending.attempt, 0);
+        assert!(pending.not_before_unix >= 21_600);
+        assert!(claim_at(root.path(), ResourceClass::Small, "worker-2", 60, 102)?.is_none());
+        assert!(defer(root.path(), &claim_path, "again", 0).is_err());
         Ok(())
     }
 

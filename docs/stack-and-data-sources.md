@@ -37,11 +37,19 @@ Dumps are partitioned yearly for most wikis and monthly for the largest projects
 
 ### MediaWiki logging dumps
 
-XML dumps of the `logging` table, fetched from `dumps.wikimedia.org/<wiki>/latest/<wiki>-latest-pages-logging.xml.gz`. Used specifically for:
+XML dumps of the `logging` table, selected from the exact dated dump that
+covers the chosen MediaWiki History snapshot. For example, history snapshot
+`2026-08` requires the completed `20260901` logging dump. The pipeline reads
+that dump's `dumpstatus.json`, prefers the completed recombined artifact, and
+falls back to the complete ordered set of split artifacts. It never uses the
+mutable `/latest/` alias. These dumps are used specifically for:
 
 - **Patrol events** (`log_type=patrol`) — records of editors reviewing new pages and edits
 - **User rights changes** (`log_type=rights`) — used to reconstruct which editors held autopatrol permissions at any given time
 
+Patrol inventory resolution runs before the much larger history transfer. If
+neither logging job is complete, the run records `waiting_upstream` and exits
+without consuming a retry or redownloading already committed history sources.
 The XML is streamed and parsed on-the-fly without loading the full file into memory. Wikimedia
 logging dumps may contain concatenated gzip members, so the Rust reader decodes every member as
 one continuous XML stream. The fetch log reports total log items, recognized patrol events,

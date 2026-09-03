@@ -10,6 +10,11 @@ monthly source artifacts and never overwrites `patrol.parquet` or
 
 The implementation guarantees:
 
+- an exact dated source plan is pinned before any history source is downloaded;
+- incomplete upstream logging dumps become a resumable `waiting_upstream`
+  state rather than a late pipeline failure;
+- a complete split logging dump is accepted when its recombined artifact is
+  not yet available;
 - concatenated multi-member gzip input is completely decoded;
 - source transport identity and parse counts are retained;
 - a parser change creates a different immutable generation;
@@ -24,6 +29,10 @@ The implementation guarantees:
 For snapshot `2026-08`, the selected source layout is:
 
 ```text
+data/snapshots/<wiki>/2026-08/
+  patrol-source-plan.json
+  # patrol-source-status.json exists only while waiting for upstream
+
 data/patrol/<wiki>/
   current-generation.json
   generations/2026-08/<sha256(parser-version)>/
@@ -32,7 +41,17 @@ data/patrol/<wiki>/
     rights/year=YYYY/month=YYYY-MM/part-00000.parquet
 ```
 
-`generation.json` records the remote URL, content length, ETag and
+The source plan records the history snapshot, required logging date, coverage,
+layout, sorted source allowlist, upstream size/MD5/SHA-1 identities, and a
+canonical plan hash. It is written atomically and is immutable for the run.
+The generator accepts either the single completed recombined file or the
+complete contiguous sequence of split files; missing and duplicate split
+parts fail closed.
+
+`generation.json` records each remote URL, content length, upstream and
+downloaded checksums,
+source-plan identity,
+history snapshot and coverage, ETag and
 Last-Modified values when supplied, downloaded SHA-256, parser version,
 autopatrol groups, total/patrol/rights/skipped counts, and every monthly
 artifact's rows, bytes, SHA-256, ordering contract, and observed modification
@@ -91,17 +110,22 @@ wiki-econ --data-dir "$WIKI_ECON_DATA_DIR" --output-dir "$WIKI_ECON_OUTPUT_DIR" 
 
 Both commands pin themselves to the wiki's validated core
 `current-snapshot.json` pointer; they do not independently resolve a snapshot.
+Preparation and qualification call the same patrol preflight before starting
+history transfer. Exit code `75` means the exact upstream logging dump is not
+complete yet and is safe to retry later; it is not a corrupt local candidate.
 
 Use `--rebuild` only to invalidate the patrol computation deliberately. The
 source generation stays reusable unless its parser version changes.
 
 After a run, verify:
 
-1. `current-generation.json` selects the intended snapshot;
-2. `generation.json` counts conserve `total = patrol + rights + skipped`;
-3. the patrol compute stage reports reused versus rebuilt artifacts;
-4. the output receipt and public manifest select the same snapshot;
-5. patrol and rights counts remain non-zero for a substantial managed wiki.
+1. `patrol-source-plan.json` selects the exact dated dump and covers the
+   intended history snapshot;
+2. `current-generation.json` selects the intended snapshot;
+3. `generation.json` counts conserve `total = patrol + rights + skipped`;
+4. the patrol compute stage reports reused versus rebuilt artifacts;
+5. the output receipt and public manifest select the same snapshot;
+6. patrol and rights counts remain non-zero for a substantial managed wiki.
 
 Deleting cache data is not a repair strategy. A corrupt cache receipt or
 artifact is rejected and only that content-addressed unit is rebuilt. A corrupt

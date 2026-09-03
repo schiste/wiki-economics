@@ -49,9 +49,10 @@ idle_secs="${WIKI_ECON_FLEET_IDLE_SECS:-60}"
 heartbeat_secs="${WIKI_ECON_FLEET_HEARTBEAT_SECS:-60}"
 lease_timeout_secs="${WIKI_ECON_FLEET_LEASE_TIMEOUT_SECS:-900}"
 max_attempts="${WIKI_ECON_FLEET_MAX_ATTEMPTS:-3}"
+upstream_retry_secs="${WIKI_ECON_UPSTREAM_RETRY_SECS:-21600}"
 prepare_lock_stale_secs="${WIKI_ECON_PREPARE_LOCK_STALE_SECS:-$lease_timeout_secs}"
 prepare_wrapper="${WIKI_ECON_FLEET_PREPARE_WRAPPER:-$ROOT/deploy/toolforge/run-prepare-wiki.sh}"
-for value in "$idle_secs" "$heartbeat_secs" "$lease_timeout_secs" "$max_attempts" "$prepare_lock_stale_secs"; do
+for value in "$idle_secs" "$heartbeat_secs" "$lease_timeout_secs" "$max_attempts" "$prepare_lock_stale_secs" "$upstream_retry_secs"; do
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || { echo "Fleet timing and retry settings must be positive integers" >&2; exit 2; }
 done
 [ -x "$prepare_wrapper" ] || { echo "Fleet preparation wrapper is not executable: $prepare_wrapper" >&2; exit 2; }
@@ -126,7 +127,32 @@ process.stdout.write(`${claim.task.wiki} ${claim.task.snapshot} ${claim.task.tas
   export WIKI_ECON_RUN_ID="fleet-$worker_id-$wiki-${task_id:0:12}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
   export WIKI_ECON_PREPARE_SNAPSHOT="$snapshot"
   task_error="candidate preparation failed for $wiki/$snapshot"
+  set +e
   "$prepare_wrapper" "$wiki"
+  prepare_status=$?
+  set -e
+  if [ "$prepare_status" -eq 75 ]; then
+    task_error="waiting for upstream patrol inventory for $wiki/$snapshot"
+    "$WIKI_ECON_BIN" \
+      --data-dir "$WIKI_ECON_DATA_DIR" \
+      --output-dir "$WIKI_ECON_OUTPUT_DIR" \
+      fleet-defer --queue-dir "$queue_dir" --receipt "$claim_receipt" \
+      --retry-after-secs "$upstream_retry_secs" --reason "$task_error"
+    task_finished=1
+    kill "$heartbeat_pid" 2>/dev/null || true
+    wait "$heartbeat_pid" 2>/dev/null || true
+    heartbeat_pid=""
+    rm -f -- "$claim_receipt"
+    trap - EXIT INT TERM
+    unset WIKI_ECON_RUN_ID WIKI_ECON_PREPARE_SNAPSHOT
+    if [ "$once" -eq 1 ]; then
+      exit 0
+    fi
+    continue
+  fi
+  if [ "$prepare_status" -ne 0 ]; then
+    exit "$prepare_status"
+  fi
   task_error="fleet completion failed for $wiki/$snapshot"
   "$WIKI_ECON_BIN" \
     --data-dir "$WIKI_ECON_DATA_DIR" \

@@ -459,6 +459,7 @@ function operationalState(name, wiki) {
   const fleetWork = fleetByWiki.get(name)
   if (direct?.running || direct?.state === "running" || direct?.state === "cancelling") return direct.state || "running"
   if (direct?.state === "queued") return "queued"
+  if (direct?.state === "waiting_upstream") return "waiting_upstream"
   if (fleetWork?.state) return fleetWork.state
   if (direct?.interrupted) return "interrupted"
   if (direct?.cancelled) return "cancelled"
@@ -472,9 +473,10 @@ const operationalPriority = {
   quarantined: 1,
   interrupted: 2,
   failed: 3,
-  running: 4,
-  cancelling: 5,
-  queued: 6,
+  waiting_upstream: 4,
+  running: 5,
+  cancelling: 6,
+  queued: 7,
   planned: 7,
   needs_fetch: 10,
   needs_patrol_fetch: 11,
@@ -604,6 +606,7 @@ function operationLabel(state) {
     running: "Running",
     cancelling: "Cancelling",
     queued: "Queued",
+    waiting_upstream: "Waiting upstream",
     stalled: "Stalled",
     quarantined: "Quarantined",
     succeeded: "Succeeded",
@@ -616,7 +619,7 @@ function operationLabel(state) {
 function operationTone(state) {
   if (["failed", "interrupted", "quarantined", "stalled"].includes(state)) return "danger"
   if (["running", "cancelling"].includes(state)) return "active"
-  if (state === "queued") return "waiting"
+  if (["queued", "waiting_upstream"].includes(state)) return "waiting"
   if (state === "succeeded") return "success"
   return "neutral"
 }
@@ -824,6 +827,7 @@ const statusColors = {
   needs_merge: "#1565c0",
   running: "#1565c0",
   queued: "#5c6bc0",
+  waiting_upstream: "#7e6ab0",
   planned: "#607d8b",
   stalled: "#c62828",
   quarantined: "#c62828",
@@ -841,6 +845,7 @@ const statusLabels = {
   needs_merge: "Ready to publish",
   running: "Working",
   queued: "Waiting for worker",
+  waiting_upstream: "Waiting for Wikimedia",
   planned: "Not managed",
   stalled: "Worker stopped reporting",
   quarantined: "Needs intervention",
@@ -858,6 +863,7 @@ const pipelineSteps = [
 
 const technicalStageOrder = {
   snapshot_resolve: 0,
+  patrol_preflight: 0,
   fetch: 0,
   source_window: 0,
   ingest: 0,
@@ -935,6 +941,7 @@ function stateExplanation(name, wiki, state, lifecycle, direct, fleetWork) {
           : "It is waiting for the scheduled operator worker."
     return `${position}${pickup} The request is durable, so it is safe to close this page.`
   }
+  if (state === "waiting_upstream") return direct?.errorSummary || fleetWork?.error || `Wikimedia has not finished the logging dump required by this snapshot. Completed history work remains reusable.`
   if (state === "running") return `${direct?.stageLabel || "Pipeline work"} is in progress${direct?.progress?.detail ? `: ${direct.progress.detail}` : ""}. The worker heartbeat is current.`
   if (state === "stalled") return `The worker lease exists but its heartbeat is overdue. Recover the fleet lease before submitting duplicate work.`
   if (state === "quarantined") return `Automatic retries were exhausted. Review the final log excerpt, correct the cause, then explicitly retry.`
@@ -980,11 +987,11 @@ function pipelineDossier(name, wiki, state, lifecycle, direct, fleetWork, plan) 
   const log = (direct?.log || []).join("")
   const progress = direct?.progress || null
   const progressPercent = Number.isFinite(progress?.percent) ? progress.percent : null
-  const stoppedWithExplanation = direct?.errorSummary && ["failed", "interrupted", "quarantined"].includes(state)
+  const stoppedWithExplanation = direct?.errorSummary && ["failed", "interrupted", "quarantined", "waiting_upstream"].includes(state)
   return html`<section class="admin-pipeline-dossier" aria-label=${`${name} pipeline details`}>
     <div class="admin-dossier-lead ${operationTone(state)}">
       <span class="admin-command-kicker">${statusLabels[state] || operationLabel(state)}</span>
-      <strong>${state === "running" ? direct?.stageLabel || "Pipeline running" : state === "failed" ? `Stopped during ${direct?.stageLabel || "pipeline work"}` : wikipediaProjectLabel(name)}</strong>
+      <strong>${state === "running" ? direct?.stageLabel || "Pipeline running" : state === "failed" ? `Stopped during ${direct?.stageLabel || "pipeline work"}` : state === "waiting_upstream" ? "Waiting for upstream data" : wikipediaProjectLabel(name)}</strong>
       <p>${stoppedWithExplanation
         ? "No candidate was published. Validated source transactions remain reusable; the specific cause is shown below."
         : stateExplanation(name, wiki, state, lifecycle, direct, fleetWork)}</p>
@@ -1040,7 +1047,7 @@ function pipelineDossier(name, wiki, state, lifecycle, direct, fleetWork, plan) 
 function projectRowDetail(name, wiki, state, lifecycle, direct, fleetWork) {
   if (state === "running") return direct?.progress?.detail || direct?.stageLabel || "Pipeline work is in progress"
   if (state === "queued") return "Saved safely; waiting for the next available worker"
-  if (["failed", "interrupted", "quarantined", "stalled"].includes(state)) {
+  if (["failed", "interrupted", "quarantined", "stalled", "waiting_upstream"].includes(state)) {
     return direct?.errorSummary || stateExplanation(name, wiki, state, lifecycle, direct, fleetWork)
   }
   if (state === "complete" && lifecycle?.refresh === "paused") return "Published imported data · automatic updates paused"

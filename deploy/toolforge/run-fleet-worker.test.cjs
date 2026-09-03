@@ -13,7 +13,7 @@ afterEach(() => {
   while (roots.length) fs.rmSync(roots.pop(), {recursive: true, force: true});
 });
 
-function fixture({failPrepare = false} = {}) {
+function fixture({prepareExit = 0, failPrepare = false} = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-fleet-worker-"));
   roots.push(root);
   const log = path.join(root, "calls.log");
@@ -29,7 +29,7 @@ receipt=""
 resource_class=""
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    fleet-claim|fleet-heartbeat|fleet-complete|fleet-fail|fleet-recover) command="$1" ;;
+    fleet-claim|fleet-heartbeat|fleet-complete|fleet-fail|fleet-defer|fleet-recover) command="$1" ;;
     --receipt) shift; receipt="$1" ;;
     --resource-class) shift; resource_class="$1" ;;
   esac
@@ -46,7 +46,7 @@ fi
   fs.writeFileSync(prepare, `#!/bin/sh
 set -eu
 printf 'prepare %s %s %s stale=%s\n' "$1" "$WIKI_ECON_PREPARE_SNAPSHOT" "$WIKI_ECON_RUN_ID" "$WIKI_ECON_PREPARE_LOCK_STALE_SECS" >> "${log}"
-exit ${failPrepare ? 1 : 0}
+exit ${failPrepare ? 1 : prepareExit}
 `, {mode: 0o755});
   return {root, log, binary, prepare};
 }
@@ -98,6 +98,14 @@ test("failed preparation is returned to the bounded retry path", () => {
   const {result, calls} = runWorker({failPrepare: true});
   assert.notEqual(result.status, 0);
   assert.ok(calls.includes("fleet-fail"));
+  assert.ok(!calls.includes("fleet-complete"));
+});
+
+test("upstream readiness waits release the task without consuming a retry", () => {
+  const {result, calls} = runWorker({prepareExit: 75});
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.ok(calls.includes("fleet-defer"));
+  assert.ok(!calls.includes("fleet-fail"));
   assert.ok(!calls.includes("fleet-complete"));
 });
 

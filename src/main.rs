@@ -306,6 +306,21 @@ enum Commands {
         max_attempts: u32,
     },
 
+    /// Defer a fleet task without consuming a retry while upstream data is incomplete
+    FleetDefer {
+        #[arg(long)]
+        queue_dir: PathBuf,
+
+        #[arg(long)]
+        receipt: PathBuf,
+
+        #[arg(long)]
+        reason: String,
+
+        #[arg(long, default_value_t = 21_600)]
+        retry_after_secs: u64,
+    },
+
     /// Recover expired fleet leases without claiming new work
     FleetRecover {
         #[arg(long)]
@@ -649,6 +664,14 @@ trait Ops {
     ) -> Result<()> {
         self.fetch_patrol(wiki, data_dir)
     }
+    fn preflight_patrol_for_snapshot(
+        &self,
+        _wiki: &str,
+        _version: &str,
+        _data_dir: &Path,
+    ) -> Result<()> {
+        Ok(())
+    }
     fn ingest_wiki(
         &self,
         wiki: &str,
@@ -881,6 +904,15 @@ impl Ops for RealOps {
         data_dir: &std::path::Path,
     ) -> Result<()> {
         patrol::fetch_patrol_for_snapshot(wiki, version, data_dir)
+    }
+
+    fn preflight_patrol_for_snapshot(
+        &self,
+        wiki: &str,
+        version: &str,
+        data_dir: &Path,
+    ) -> Result<()> {
+        patrol::preflight_patrol_for_snapshot(wiki, version, data_dir)
     }
 
     fn ingest_wiki(
@@ -1256,6 +1288,9 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             };
             ops.persist_snapshot_plans(&wikis, &version, &data_dir)?;
             for wiki in &wikis {
+                run_timed_stage("patrol_preflight", Some(wiki), || {
+                    ops.preflight_patrol_for_snapshot(wiki, &version, &data_dir)
+                })?;
                 run_timed_stage("fetch", Some(wiki), || {
                     ops.fetch_wiki(wiki, &version, &data_dir)
                 })?;
@@ -1335,6 +1370,13 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
                     compute_reused,
                     patrol_reused,
                 } => {
+                    if !ops.cached_patrol_generation_available(&wiki, &version, &data_dir) {
+                        run_timed_stage("patrol_preflight", Some(&wiki), || {
+                            ops.preflight_patrol_for_snapshot(&wiki, &version, &data_dir)
+                        })?;
+                    } else {
+                        record_reused_stage("patrol_preflight", Some(&wiki));
+                    }
                     run_timed_stage("source_window", Some(&wiki), || {
                         ops.prepare_candidate_snapshot(
                             &wiki,
@@ -1452,6 +1494,16 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             println!("{{\"quarantined\":{quarantined}}}");
         }
 
+        Commands::FleetDefer {
+            queue_dir,
+            receipt,
+            reason,
+            retry_after_secs,
+        } => {
+            let deferred = fleet::defer(&queue_dir, &receipt, &reason, retry_after_secs)?;
+            println!("{}", deferred.display());
+        }
+
         Commands::FleetRecover {
             queue_dir,
             max_attempts,
@@ -1485,6 +1537,13 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             ops.persist_snapshot_plans(std::slice::from_ref(&wiki), &version, &data_dir)?;
             let qualification_dir =
                 publication::wiki_qualification_dir(&output_dir, &wiki, &version, run_id)?;
+            if !ops.cached_patrol_generation_available(&wiki, &version, &data_dir) {
+                run_timed_stage("patrol_preflight", Some(&wiki), || {
+                    ops.preflight_patrol_for_snapshot(&wiki, &version, &data_dir)
+                })?;
+            } else {
+                record_reused_stage("patrol_preflight", Some(&wiki));
+            }
             run_timed_stage("source_window", Some(&wiki), || {
                 ops.prepare_candidate_snapshot(
                     &wiki,
@@ -1835,6 +1894,13 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             for wiki in &wikis {
                 info!(wiki = wiki, stage = ?stage, "running pipeline stage");
                 if stage.runs_ingest() {
+                    if !ops.cached_patrol_generation_available(wiki, &version, &data_dir) {
+                        run_timed_stage("patrol_preflight", Some(wiki), || {
+                            ops.preflight_patrol_for_snapshot(wiki, &version, &data_dir)
+                        })?;
+                    } else {
+                        record_reused_stage("patrol_preflight", Some(wiki));
+                    }
                     run_timed_stage("source_window", Some(wiki), || {
                         ops.prepare_wiki_snapshot(
                             wiki,
@@ -1868,11 +1934,22 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
     Ok(())
 }
 
-fn main() -> Result<()> {
+fn main() {
     let cli = Cli::parse();
     let run_id = logging_run_id(&cli);
     init_tracing(&run_id);
-    run_with_ops(cli, &RealOps)
+    if let Err(error) = run_with_ops(cli, &RealOps) {
+        eprintln!("Error: {error:#}");
+        std::process::exit(error_exit_code(&error));
+    }
+}
+
+fn error_exit_code(error: &anyhow::Error) -> i32 {
+    if patrol::is_upstream_waiting(error) {
+        75
+    } else {
+        1
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -2017,7 +2094,29 @@ mod tests {
             Ok(crate::patrol::PatrolTransportResponse::from_bytes(body))
         }
 
-        fn get_json(&self, _url: &str) -> Result<Value> {
+        fn get_json(&self, url: &str) -> Result<Value> {
+            if url.ends_with("/dumpstatus.json") {
+                let parts = url
+                    .trim_end_matches("/dumpstatus.json")
+                    .rsplit('/')
+                    .collect::<Vec<_>>();
+                let date = parts.first().context("test dump date")?;
+                let wiki = parts.get(1).context("test dump wiki")?;
+                let body = self
+                    .bodies
+                    .lock()
+                    .expect("test transport bodies lock should not be poisoned")
+                    .front()
+                    .cloned()
+                    .context("test patrol body")?;
+                let name = format!("{wiki}-{date}-pages-logging.xml.gz");
+                return Ok(json!({"jobs": {
+                    "xmlpagelogsdumprecombine": {"status": "done", "updated": "fixture", "files": {
+                        (name.clone()): {"size": body.len(), "url": format!("/{wiki}/{date}/{name}"), "md5": "0".repeat(32), "sha1": hex::encode(<sha1::Sha1 as sha1::Digest>::digest(&body))}
+                    }},
+                    "xmlpagelogsdump": {"status": "waiting", "files": {}}
+                } }));
+            }
             self.json_values
                 .lock()
                 .expect("test transport json values lock should not be poisoned")
@@ -2699,7 +2798,10 @@ mod tests {
             "--source-window-size",
             "1",
         ])?;
-        let ops = RecordingOps::default();
+        let ops = RecordingOps {
+            cached_patrol_sources: true,
+            ..RecordingOps::default()
+        };
 
         run_with_ops(cli, &ops)?;
 
@@ -3265,6 +3367,49 @@ mod tests {
     }
 
     #[test]
+    fn fleet_defer_cli_releases_an_upstream_wait_without_a_retry() -> Result<()> {
+        let queue = TestDir::new()?;
+        let queue_root = queue.path();
+        let class = fleet::ResourceClass::Small;
+        let wiki = "dewiki";
+        let snapshot = "2026-08";
+        let producer = "controller-test";
+        let signals = fleet::SchedulingSignals {
+            source_layout: snapshot_plan::SourceLayout::Yearly,
+            source_count: 1,
+            compressed_source_bytes: Some(1),
+            prior_rows: None,
+            fragment_count: None,
+            historical_memory_peak_bytes: None,
+            historical_scratch_peak_bytes: None,
+            observed_throughput_rows_per_second: None,
+        };
+        fleet::enqueue(queue_root, wiki, snapshot, class, signals, producer)?;
+        let claim = fleet::claim(queue_root, class, "worker-test", 900)?
+            .context("fixture task should be claimable")?;
+        let receipt = queue.path().join("claim.json");
+        fleet::write_claim_receipt(&receipt, &claim)?;
+
+        let cli = Cli {
+            data_dir: queue.path().join("data"),
+            output_dir: queue.path().join("output"),
+            run_id: None,
+            command: Commands::FleetDefer {
+                queue_dir: queue.path().to_path_buf(),
+                receipt,
+                reason: "upstream logging dump is waiting".to_string(),
+                retry_after_secs: 21_600,
+            },
+        };
+        run_with_ops(cli, &RecordingOps::default())?;
+        let pending: fleet::FleetTask =
+            serde_json::from_slice(&fs::read(queue.path().join("pending/dewiki.json"))?)?;
+        assert_eq!(pending.attempt, 0);
+        assert!(!queue.path().join("leases/dewiki").exists());
+        Ok(())
+    }
+
+    #[test]
     fn determinism_verify_cli_compares_distinct_worker_builds() -> Result<()> {
         let root = TestDir::new()?;
         let baseline = root.path().join("baseline");
@@ -3636,7 +3781,10 @@ mod tests {
             "--source-window-size",
             "3",
         ])?;
-        let ops = RecordingOps::default();
+        let ops = RecordingOps {
+            cached_patrol_sources: true,
+            ..RecordingOps::default()
+        };
 
         run_with_ops(cli, &ops)?;
 
@@ -3850,14 +3998,11 @@ mod tests {
             })],
         ));
         let guard = crate::patrol::install_test_transport(fake_transport);
-        ops.fetch_patrol("patrolwiki", data_dir.path())?;
         assert!(
-            data_dir
-                .path()
-                .join("patrol")
-                .join("patrolwiki")
-                .join("patrol.parquet")
-                .exists()
+            ops.fetch_patrol("patrolwiki", data_dir.path())
+                .expect_err("patrol fetch without a selected history generation must fail")
+                .to_string()
+                .contains("selected history snapshot")
         );
         drop(guard);
 
@@ -3903,7 +4048,9 @@ mod tests {
             vec![json!({"query": {"usergroups": []}})],
         ));
         let snapshot_guard = crate::patrol::install_test_transport(snapshot_transport);
+        ops.preflight_patrol_for_snapshot("patrolsnapshotwiki", patrol_snapshot, data_dir.path())?;
         ops.fetch_patrol_for_snapshot("patrolsnapshotwiki", patrol_snapshot, data_dir.path())?;
+        ops.preflight_patrol_for_snapshot("patrolsnapshotwiki", patrol_snapshot, data_dir.path())?;
         assert!(ops.cached_patrol_generation_available(
             "patrolsnapshotwiki",
             patrol_snapshot,
@@ -3952,6 +4099,15 @@ mod tests {
         let stale_gone = !parts_dir.join("stale.parquet").exists();
         assert!(stale_gone);
         Ok(())
+    }
+
+    #[test]
+    fn upstream_waits_use_the_temporary_failure_exit_code() {
+        assert_eq!(error_exit_code(&anyhow::anyhow!("ordinary failure")), 1);
+        assert_eq!(
+            error_exit_code(&crate::patrol::upstream_waiting_error_for_test()),
+            75
+        );
     }
 
     #[test]

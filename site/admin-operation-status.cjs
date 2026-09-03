@@ -4,6 +4,7 @@ const ANSI_ESCAPE = /\x1b\[[0-?]*[ -/]*[@-~]/g;
 
 const STAGE_LABELS = Object.freeze({
   snapshot_resolve: "Choosing a completed snapshot",
+  patrol_preflight: "Checking logging-dump readiness",
   source_window: "Downloading and ingesting history",
   patrol_fetch: "Preparing patrol sources",
   compute: "Computing metrics",
@@ -48,6 +49,15 @@ function unique(values) {
 
 function classifyError(message) {
   if (!message) return {errorSummary: null, retryable: null, remediationCode: null, remediation: null};
+  if (/UPSTREAM_WAITING:.*Wikimedia logging dump/i.test(message)) {
+    const dumpDate = message.match(/logging dump (\d{8})/)?.[1] || "required";
+    return {
+      errorSummary: `Waiting for Wikimedia to finish the ${dumpDate} logging dump. Completed history ingestion is retained and will not be downloaded again.`,
+      retryable: true,
+      remediationCode: "upstream_logging_waiting",
+      remediation: "No repair is required. Recheck upstream readiness later; the next run resumes with patrol preparation.",
+    };
+  }
   if (/editor identity is unavailable/i.test(message)) {
     return {
       errorSummary: "The ingested history contains editors without a usable ID or name. Retrying unchanged inputs will fail again; the input generation needs a compatible identity policy before metrics can be computed.",
@@ -115,6 +125,16 @@ function summarizeOperationLog(entry = {}, rawLog = "") {
   const ingestedRows = lastInteger(text, /"ingested_rows":(\d+)/g)
     ?? entry.progress?.ingestedRows
     ?? null;
+  const plannedBytes = lastInteger(text, /\b(?:planned_bytes|total_compressed_bytes)=(?:"?(\d+)"?)/g)
+    ?? entry.progress?.plannedBytes
+    ?? null;
+  const reusedBytes = lastInteger(text, /\breused_bytes=(?:"?(\d+)"?)/g)
+    ?? entry.progress?.reusedBytes
+    ?? 0;
+  const completedBytes = Math.min(
+    plannedBytes || Number.MAX_SAFE_INTEGER,
+    reusedBytes + (downloadedBytes || 0),
+  );
 
   const errorLine = lastCapture(text, /^Error:\s*(.+)$/gm);
   const rawError = errorLine || entry.rawError || entry.error || null;
@@ -123,7 +143,9 @@ function summarizeOperationLog(entry = {}, rawLog = "") {
   let percent = null;
   let detail = null;
   if (stage === "source_window" && plannedSources) {
-    percent = Math.min(100, Math.round((completedSources / plannedSources) * 100));
+    percent = plannedBytes
+      ? Math.min(100, Math.round((completedBytes / plannedBytes) * 100))
+      : Math.min(100, Math.round((completedSources / plannedSources) * 100));
     detail = `${Math.min(completedSources, plannedSources)} of ${plannedSources} history files safely ingested`;
     if (currentSource && completedSources < plannedSources) detail += ` · ${currentSource}`;
   } else if (stage) {
@@ -144,6 +166,9 @@ function summarizeOperationLog(entry = {}, rawLog = "") {
       completedSourceIds,
       currentSource,
       downloadedBytes,
+      plannedBytes,
+      reusedBytes,
+      completedBytes,
       ingestedRows,
     },
     rawError,

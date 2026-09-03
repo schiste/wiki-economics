@@ -1269,6 +1269,12 @@ function readFleetStatus(now = Date.now()) {
   const leaseEntries = directoryJsonEntries(path.join(FLEET_QUEUE_DIR, "leases"), { directories: true });
   const quarantineEntries = directoryJsonEntries(path.join(FLEET_QUEUE_DIR, "quarantine"), { limit: 25 });
   const failureEntries = directoryJsonEntries(path.join(FLEET_QUEUE_DIR, "failures"), { limit: 25 });
+  const deferredEntries = directoryJsonEntries(path.join(FLEET_QUEUE_DIR, "deferred"), { limit: 100 });
+  const deferredByWiki = new Map();
+  for (const entry of deferredEntries) {
+    const wiki = fleetWikiFrom(entry.value, entry.file);
+    if (wiki && !deferredByWiki.has(wiki)) deferredByWiki.set(wiki, entry);
+  }
   // Completed tasks are append-only evidence. The dashboard needs their count,
   // not every receipt body, so avoid decoding the full archive on each poll.
   const completedCount = safeReadDir(path.join(FLEET_QUEUE_DIR, "completed")).length;
@@ -1278,13 +1284,19 @@ function readFleetStatus(now = Date.now()) {
     const task = fleetTaskFrom(entry.value);
     const wiki = fleetWikiFrom(entry.value, entry.file);
     if (!wiki) continue;
+    const deferred = deferredByWiki.get(wiki);
+    const notBeforeUnix = task.not_before_unix ?? null;
+    const waitingUpstream = deferred
+      && deferred.value?.claim?.task?.task_id === task.task_id
+      && Number(notBeforeUnix || 0) * 1000 > now;
     byWiki.set(wiki, {
       wiki,
-      state: "queued",
+      state: waitingUpstream ? "waiting_upstream" : "queued",
       snapshot: task.snapshot ?? null,
       resourceClass: task.resource_class ?? null,
       attempt: task.attempt ?? 0,
-      notBeforeUnix: task.not_before_unix ?? null,
+      notBeforeUnix,
+      error: waitingUpstream ? deferred.value.reason : null,
       updatedAt: entry.modifiedAt,
       taskId: task.task_id ?? null,
     });
@@ -1328,7 +1340,7 @@ function readFleetStatus(now = Date.now()) {
   }
 
   const work = Array.from(byWiki.values()).sort((left, right) => {
-    const priority = { stalled: 0, quarantined: 1, running: 2, queued: 3 };
+    const priority = { stalled: 0, quarantined: 1, running: 2, waiting_upstream: 3, queued: 4 };
     return (priority[left.state] ?? 9) - (priority[right.state] ?? 9)
       || String(left.wiki).localeCompare(String(right.wiki));
   });
@@ -1336,6 +1348,7 @@ function readFleetStatus(now = Date.now()) {
     queueDir: FLEET_QUEUE_DIR,
     counts: {
       queued: work.filter((entry) => entry.state === "queued").length,
+      waitingUpstream: work.filter((entry) => entry.state === "waiting_upstream").length,
       running: work.filter((entry) => entry.state === "running").length,
       stalled: work.filter((entry) => entry.state === "stalled").length,
       quarantined: quarantineEntries.length,

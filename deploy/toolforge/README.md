@@ -123,14 +123,22 @@ and higher resource envelope are being qualified.
   atomically switched and the prior site release is removed. Raw `.bz2` dump
   cleanup happens inside the pipeline itself, not in this script. `wiki-econ
   run` processes `WIKI_ECON_SOURCE_WINDOW_SIZE` planned sources at a time
-  (Toolforge defaults to one and rejects values outside 1–4). Each source is
-  downloaded to pipeline-owned staging, stream-ingested, validated, committed
+  (Toolforge defaults to two and rejects values outside 1–4). With that
+  default, one source may download while the preceding source is ingested;
+  the zero-capacity handoff bounds raw staging to two sources and keeps a
+  single active Parquet ingestion writer. Each source is downloaded to
+  pipeline-owned staging, stream-ingested, validated, committed
   with an atomic strict marker, and immediately deleted. This bounds compressed
   raw storage to the selected window instead of retaining the whole wiki dump.
   Run-qualified partial files are adopted and resumed after interruption;
   completed source markers let a restart continue at the first unfinished
   source. The candidate generation is selected only after the exact plan,
   marker inventory, Parquet footers, and row totals all validate.
+  Before any history source starts, patrol preflight pins the exact completed
+  dated logging inventory covering the chosen snapshot. An incomplete
+  upstream logging dump exits with code 75. Fleet workers translate that into
+  an atomic deferred task without consuming a retry; admin operations display
+  it as `waiting_upstream` rather than a pipeline failure.
   The [Rust resource governor](../../docs/resource-governor.md) independently
   caps concurrency and admits each source against cgroup memory, filesystem
   reserve, scratch, and file-descriptor signals. Thus a window of four is an

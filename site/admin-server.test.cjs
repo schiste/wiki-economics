@@ -908,6 +908,44 @@ test("admin dispatcher claims and completes one queued operation", async (t) => 
   assert.equal(fs.readdirSync(path.join(operationRoot, "history")).length, 1);
 });
 
+test("admin dispatcher records upstream dump waits without reporting a pipeline defect", async (t) => {
+  const operationRoot = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-admin-waiting-test-"));
+  t.after(() => fs.rmSync(operationRoot, {recursive: true, force: true}));
+  const queuedDir = path.join(operationRoot, "queued");
+  fs.mkdirSync(queuedDir, {recursive: true});
+  const binary = path.join(operationRoot, "waiting-bin.sh");
+  fs.writeFileSync(binary, "#!/bin/sh\necho 'Error: UPSTREAM_WAITING: Wikimedia logging dump 20260901 for dewiki/2026-08 is not complete (recombined=waiting, split=waiting); validated history transactions remain reusable' >&2\nexit 75\n");
+  fs.chmodSync(binary, 0o755);
+  const request = {
+    schemaVersion: 1,
+    requestId: "admin-test-dewiki-qualify",
+    runId: "admin-test-dewiki-qualify",
+    action: "qualify",
+    wiki: "dewiki",
+    version: "2026-08",
+    requestedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    state: "queued",
+  };
+  fs.writeFileSync(path.join(queuedDir, `${request.requestId}.json`), JSON.stringify(request));
+  const dispatcherPath = require.resolve("../deploy/toolforge/admin-dispatcher.cjs");
+  delete require.cache[dispatcherPath];
+  const previousRoot = process.env.WIKI_ECON_ADMIN_OPERATION_DIR;
+  const previousBin = process.env.WIKI_ECON_BIN;
+  process.env.WIKI_ECON_ADMIN_OPERATION_DIR = operationRoot;
+  process.env.WIKI_ECON_BIN = binary;
+  const dispatcher = require(dispatcherPath);
+  const completed = await dispatcher.run();
+  if (previousRoot == null) delete process.env.WIKI_ECON_ADMIN_OPERATION_DIR;
+  else process.env.WIKI_ECON_ADMIN_OPERATION_DIR = previousRoot;
+  if (previousBin == null) delete process.env.WIKI_ECON_BIN;
+  else process.env.WIKI_ECON_BIN = previousBin;
+  delete require.cache[dispatcherPath];
+  assert.equal(completed.state, "waiting_upstream");
+  assert.equal(completed.exitCode, 75);
+  assert.equal(completed.remediationCode, "upstream_logging_waiting");
+});
+
 test("admin prepare action is durable and never invokes the legacy publishing run command", async (t) => {
   const lifecycle = {
     schema_version: 1,

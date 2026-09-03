@@ -270,10 +270,12 @@ async function executeClaim(claim) {
   const finishedAt = new Date().toISOString();
   const cancelled = state.cancelRequested && result.signal === "SIGTERM";
   const operationSummary = summarizeOperationLog(state, logTail(logPath));
+  const waitingUpstream = result.code === 75
+    || operationSummary.remediationCode === "upstream_logging_waiting";
   const completed = {
     ...state,
     ...operationSummary,
-    state: cancelled ? "cancelled" : result.code === 0 ? "succeeded" : "failed",
+    state: cancelled ? "cancelled" : result.code === 0 ? "succeeded" : waitingUpstream ? "waiting_upstream" : "failed",
     exitCode: cancelled ? 130 : result.code,
     signal: result.signal,
     error: result.error?.message || (result.code === 0 ? null : operationSummary.errorSummary),

@@ -27,6 +27,21 @@ interested in patrol metrics, run `cargo run --release -- compute
 <wiki>` once and ignore the patrol failure mode for now — the rest of
 the pipeline still produces output.
 
+## Patrol preflight reports `UPSTREAM_WAITING`
+
+This is a normal upstream-readiness state. A history snapshot such as
+`2026-08` is paired with the dated `20260901` logging dump. If Wikimedia's
+`dumpstatus.json` reports that neither the recombined nor split logging job is
+complete, preparation stops before downloading history and records
+`patrol-source-status.json` with `state: waiting_upstream`.
+
+Do not replace the dated URL with `/latest/` and do not delete already
+committed history inputs. Fleet workers release their lease, preserve the
+attempt count, and defer the task for a later readiness check. A manual admin
+operation is likewise shown as “Waiting for Wikimedia.” Retry after the dump
+job completes; the exact same source plan and committed transactions will be
+reused.
+
 ## Patrol Parquets are empty after a successful-looking fetch
 
 Logging dumps can be concatenated multi-member gzip streams. The Rust patrol parser reads every
