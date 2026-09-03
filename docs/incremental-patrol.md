@@ -10,7 +10,7 @@ monthly source artifacts and never overwrites `patrol.parquet` or
 
 The implementation guarantees:
 
-- an exact dated source plan is pinned before any history source is downloaded;
+- an exact dated source plan is pinned before any patrol source is downloaded;
 - incomplete upstream logging dumps become a resumable `waiting_upstream`
   state rather than a late pipeline failure;
 - a complete split logging dump is accepted when its recombined artifact is
@@ -98,6 +98,12 @@ The final per-wiki `patrol.parquet` is assembled from deterministic monthly
 parts. Patrol remains independent of core-history family receipts: a parser or
 rights change never invalidates GDP, activity, lifecycle, or page-week output.
 
+An incomplete upstream logging dump is a deferred dependency, not a failed
+computation. History ingestion and core metric receipts remain reusable. The
+admin dispatcher automatically requeues the same operation after six hours by
+default (configurable with `WIKI_ECON_ADMIN_UPSTREAM_RETRY_SECS`) without
+consuming its stale-process retry budget or blocking unrelated queued work.
+
 ## Validation and recovery
 
 Normal commands remain:
@@ -106,13 +112,18 @@ Normal commands remain:
 wiki-econ --data-dir "$WIKI_ECON_DATA_DIR" patrol-fetch nlwiki
 wiki-econ --data-dir "$WIKI_ECON_DATA_DIR" --output-dir "$WIKI_ECON_OUTPUT_DIR" \
   patrol-compute nlwiki
+wiki-econ --data-dir "$WIKI_ECON_DATA_DIR" --output-dir "$WIKI_ECON_OUTPUT_DIR" \
+  patrol-refresh nlwiki
 ```
 
 Both commands pin themselves to the wiki's validated core
 `current-snapshot.json` pointer; they do not independently resolve a snapshot.
-Preparation and qualification call the same patrol preflight before starting
-history transfer. Exit code `75` means the exact upstream logging dump is not
+The admin uses `patrol-refresh`, which always resolves/fetches the selected
+patrol generation before computing it. Preparation and qualification make
+history ingestion and core computation durable before patrol readiness can
+defer the run. Exit code `75` means the exact upstream logging dump is not
 complete yet and is safe to retry later; it is not a corrupt local candidate.
+The next run reuses independently receipted core families and resumes at patrol.
 
 Use `--rebuild` only to invalidate the patrol computation deliberately. The
 source generation stays reusable unless its parser version changes.

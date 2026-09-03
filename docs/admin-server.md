@@ -56,6 +56,7 @@ refuses to start with `WIKI_ECON_ADMIN_AUTH_MODE=none`.
 | `WIKI_ECON_ADMIN_ALLOWED_USERNAMES` | empty | Comma/newline-separated allowlist of authorized operator Wikimedia usernames (case-sensitive). |
 | `WIKI_ECON_ADMIN_SESSION_SECRET` | empty | HMAC secret used to sign the short-lived session and OAuth-state cookies. Use 32+ random bytes. |
 | `WIKI_ECON_ADMIN_SESSION_TTL_SECS` | `28800` | Session lifetime in seconds. |
+| `WIKI_ECON_ADMIN_UPSTREAM_RETRY_SECS` | `21600` | Delay before automatically rechecking a qualification waiting on an incomplete Wikimedia logging dump. The wait does not consume the stale-process retry budget. |
 | `WIKI_ECON_ADMIN_SECURE_COOKIES` | `1` in production | Adds the `Secure` flag to auth cookies. |
 | `WIKI_ECON_ADMIN_MEDIAWIKI_HOST` | `https://meta.wikimedia.org` | Base URL of the MediaWiki OAuth2 host. |
 | `WIKI_ECON_ADMIN_MEDIAWIKI_CLIENT_ID` | empty | OAuth2 consumer client ID, from `Special:OAuthConsumerRegistration`. |
@@ -97,7 +98,7 @@ Supported endpoints:
 | `POST` | `/merge` | Run `wiki-econ merge`. |
 | `POST` | `/run` | Run the full `fetch → ingest → compute → merge` pipeline for a wiki. |
 | `POST` | `/patrol-fetch` | Run `wiki-econ patrol-fetch <wiki>`. |
-| `POST` | `/patrol-compute` | Run `wiki-econ patrol-compute <wiki>`. |
+| `POST` | `/patrol-compute` | Run the guarded `wiki-econ patrol-refresh <wiki>` fetch→compute flow. |
 | `POST` | `/cleanup` | Remove `.tmp`, invalid marker files, and partial outputs for a wiki. |
 | `POST` | `/cancel` | Cancel the current job. |
 

@@ -5,6 +5,7 @@ const ANSI_ESCAPE = /\x1b\[[0-?]*[ -/]*[@-~]/g;
 const STAGE_LABELS = Object.freeze({
   snapshot_resolve: "Choosing a completed snapshot",
   patrol_preflight: "Checking logging-dump readiness",
+  qualification_discovery: "Recovering reusable qualification work",
   source_window: "Downloading and ingesting history",
   patrol_fetch: "Preparing patrol sources",
   compute: "Computing metrics",
@@ -55,7 +56,7 @@ function classifyError(message) {
       errorSummary: `Waiting for Wikimedia to finish the ${dumpDate} logging dump. Completed history ingestion is retained and will not be downloaded again.`,
       retryable: true,
       remediationCode: "upstream_logging_waiting",
-      remediation: "No repair is required. Recheck upstream readiness later; the next run resumes with patrol preparation.",
+      remediation: "No repair is required. The admin will recheck automatically; the next run resumes with patrol preparation.",
     };
   }
   if (/editor identity is unavailable/i.test(message)) {
@@ -64,6 +65,14 @@ function classifyError(message) {
       retryable: false,
       remediationCode: "editor_identity_unavailable",
       remediation: "Correct or rebuild the qualified metric-input generation, then explicitly acknowledge the retry.",
+    };
+  }
+  if (/No patrol data for .*Run `patrol-fetch` first/i.test(message)) {
+    return {
+      errorSummary: "Patrol computation has no validated source generation.",
+      retryable: false,
+      remediationCode: "patrol_source_missing",
+      remediation: "Use Patrol refresh; it checks upstream readiness, fetches the selected generation, and only then computes patrol metrics.",
     };
   }
   if (/HTTP 404 Not Found/i.test(message)) {

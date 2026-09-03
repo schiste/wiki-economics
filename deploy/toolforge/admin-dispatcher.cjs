@@ -19,6 +19,14 @@ const OPERATION_DIR = path.resolve(
 const BIN = process.env.WIKI_ECON_BIN || path.join(ROOT, "target", "release", "wiki-econ");
 const LOG_TAIL_BYTES = 128 * 1024;
 const STALE_OPERATION_MS = Number.parseInt(process.env.WIKI_ECON_ADMIN_OPERATION_STALE_SECS || "600", 10) * 1_000;
+const configuredUpstreamRetrySecs = Number.parseInt(
+  process.env.WIKI_ECON_ADMIN_UPSTREAM_RETRY_SECS || "21600",
+  10,
+);
+const UPSTREAM_RETRY_MS = Number.isSafeInteger(configuredUpstreamRetrySecs)
+  && configuredUpstreamRetrySecs >= 60
+  ? configuredUpstreamRetrySecs * 1_000
+  : 21_600_000;
 
 function directories() {
   const result = {
@@ -73,9 +81,9 @@ function commandFor(request) {
     case "patrol-fetch":
       return {program: BIN, args: [...common, "patrol-fetch", wiki]};
     case "patrol-compute":
-      return {program: BIN, args: [...common, "patrol-compute", wiki]};
+      return {program: BIN, args: [...common, "patrol-refresh", wiki]};
     case "patrol-rebuild":
-      return {program: BIN, args: [...common, "patrol-compute", wiki, "--rebuild"]};
+      return {program: BIN, args: [...common, "patrol-refresh", wiki, "--rebuild"]};
     case "merge":
       return {program: BIN, args: [...common, "merge"]};
     case "fleet-recover":
@@ -109,6 +117,9 @@ function claimNextOperation() {
   for (const name of names) {
     const queuedPath = path.join(dirs.queued, name);
     const runningPath = path.join(dirs.running, name);
+    const queued = readJson(queuedPath);
+    const notBefore = Date.parse(queued?.notBefore || 0);
+    if (Number.isFinite(notBefore) && notBefore > Date.now()) continue;
     try {
       fs.renameSync(queuedPath, runningPath);
     } catch (error) {
@@ -288,6 +299,23 @@ async function executeClaim(claim) {
   fs.appendFileSync(logPath, `\n[finished state=${completed.state} exit=${completed.exitCode}]\n`, "utf8");
   atomicWriteJson(path.join(dirs.history, `${Date.now()}-${request.requestId}.json`), completed);
   fs.unlinkSync(runningPath);
+  if (completed.state === "waiting_upstream") {
+    const notBefore = new Date(Date.now() + UPSTREAM_RETRY_MS).toISOString();
+    atomicWriteJson(path.join(dirs.queued, path.basename(runningPath)), {
+      ...request,
+      state: "waiting_upstream",
+      retryCount: Number(request.retryCount || 0),
+      upstreamWaitCount: Number(request.upstreamWaitCount || 0) + 1,
+      notBefore,
+      heartbeatAt: finishedAt,
+      updatedAt: finishedAt,
+      logPath,
+      error: completed.error,
+      errorSummary: completed.errorSummary,
+      remediationCode: completed.remediationCode,
+      remediation: completed.remediation,
+    });
+  }
   return completed;
 }
 

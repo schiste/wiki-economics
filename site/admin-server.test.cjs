@@ -908,6 +908,26 @@ test("admin dispatcher claims and completes one queued operation", async (t) => 
   assert.equal(fs.readdirSync(path.join(operationRoot, "history")).length, 1);
 });
 
+test("admin dispatcher patrol actions always fetch before compute", () => {
+  const dispatcherPath = require.resolve("../deploy/toolforge/admin-dispatcher.cjs");
+  delete require.cache[dispatcherPath];
+  const dispatcher = require(dispatcherPath);
+
+  const refresh = dispatcher.commandFor({
+    action: "patrol-compute",
+    wiki: "nlwiki",
+    runId: "admin-patrol-refresh",
+  });
+  const rebuild = dispatcher.commandFor({
+    action: "patrol-rebuild",
+    wiki: "nlwiki",
+    runId: "admin-patrol-rebuild",
+  });
+
+  assert.deepEqual(refresh.args.slice(-2), ["patrol-refresh", "nlwiki"]);
+  assert.deepEqual(rebuild.args.slice(-3), ["patrol-refresh", "nlwiki", "--rebuild"]);
+});
+
 test("admin dispatcher records upstream dump waits without reporting a pipeline defect", async (t) => {
   const operationRoot = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-admin-waiting-test-"));
   t.after(() => fs.rmSync(operationRoot, {recursive: true, force: true}));
@@ -944,6 +964,31 @@ test("admin dispatcher records upstream dump waits without reporting a pipeline 
   assert.equal(completed.state, "waiting_upstream");
   assert.equal(completed.exitCode, 75);
   assert.equal(completed.remediationCode, "upstream_logging_waiting");
+  const deferredNames = fs.readdirSync(path.join(operationRoot, "queued"));
+  assert.deepEqual(deferredNames, [`${request.requestId}.json`]);
+  const deferred = JSON.parse(
+    fs.readFileSync(path.join(operationRoot, "queued", deferredNames[0]), "utf8"),
+  );
+  assert.equal(deferred.state, "waiting_upstream");
+  assert.equal(deferred.retryCount, 0);
+  assert.equal(deferred.upstreamWaitCount, 1);
+  assert.ok(Date.parse(deferred.notBefore) > Date.now());
+  assert.equal(dispatcher.claimNextOperation(), null, "a deferred retry must not hot-loop");
+
+  const unrelated = {
+    ...request,
+    requestId: "zz-admin-test-nlwiki-fetch",
+    runId: "zz-admin-test-nlwiki-fetch",
+    action: "fetch",
+    wiki: "nlwiki",
+    version: "2026-08",
+  };
+  fs.writeFileSync(
+    path.join(operationRoot, "queued", `${unrelated.requestId}.json`),
+    JSON.stringify(unrelated),
+  );
+  const unrelatedClaim = dispatcher.claimNextOperation();
+  assert.equal(unrelatedClaim.request.requestId, unrelated.requestId);
 });
 
 test("admin prepare action is durable and never invokes the legacy publishing run command", async (t) => {

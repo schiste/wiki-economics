@@ -300,8 +300,8 @@ function actionLabel(action) {
     case "patrol-fetch": return "fetch patrol"
     case "ingest": return "ingest"
     case "compute": return "compute"
-    case "patrol-compute": return "patrol compute"
-    case "patrol-rebuild": return "rebuild patrol"
+    case "patrol-compute": return "refresh patrol"
+    case "patrol-rebuild": return "refetch and rebuild patrol"
     case "merge": return "merge data"
     case "publish": return "publish candidates"
     case "site": return "rebuild site"
@@ -328,9 +328,9 @@ function actionTooltip(action) {
     case "compute":
       return "Compute the core economic metrics from the ingested parquet data for this wiki."
     case "patrol-compute":
-      return "Compute the patrol-specific metrics incrementally, resuming from existing month shards; full rebuilds stay CLI-only."
+      return "Check upstream readiness, fetch any missing patrol sources, then resume patrol computation from existing month shards."
     case "patrol-rebuild":
-      return "Discard and rebuild only this wiki's patrol metrics from its validated patrol sources."
+      return "Check upstream readiness, fetch any missing patrol sources, then rebuild only this wiki's patrol metrics."
     case "merge":
       return "Regenerate merged publication data without rebuilding the website."
     case "publish":
@@ -941,7 +941,13 @@ function stateExplanation(name, wiki, state, lifecycle, direct, fleetWork) {
           : "It is waiting for the scheduled operator worker."
     return `${position}${pickup} The request is durable, so it is safe to close this page.`
   }
-  if (state === "waiting_upstream") return direct?.errorSummary || fleetWork?.error || `Wikimedia has not finished the logging dump required by this snapshot. Completed history work remains reusable.`
+  if (state === "waiting_upstream") {
+    const cause = direct?.errorSummary || fleetWork?.error || "Wikimedia has not finished the logging dump required by this snapshot."
+    const retry = direct?.earliestDispatchAt
+      ? ` The admin will check again ${relativeTime(direct.earliestDispatchAt)} (${formatRefreshTimestamp(direct.earliestDispatchAt)}).`
+      : " The worker will check again automatically."
+    return `${cause}${retry}`
+  }
   if (state === "running") return `${direct?.stageLabel || "Pipeline work"} is in progress${direct?.progress?.detail ? `: ${direct.progress.detail}` : ""}. The worker heartbeat is current.`
   if (state === "stalled") return `The worker lease exists but its heartbeat is overdue. Recover the fleet lease before submitting duplicate work.`
   if (state === "quarantined") return `Automatic retries were exhausted. Review the final log excerpt, correct the cause, then explicitly retry.`
@@ -983,7 +989,7 @@ function evidenceItems(name, wiki, lifecycle, direct, fleetWork, plan) {
 function pipelineDossier(name, wiki, state, lifecycle, direct, fleetWork, plan) {
   const canRun = Boolean(apiStatus && lifecycle)
   const isQualification = lifecycle?.publication === "hidden" && lifecycle?.refresh === "qualification"
-  const operationActive = ["queued", "running", "cancelling"].includes(direct?.state) || direct?.running
+  const operationActive = ["queued", "waiting_upstream", "running", "cancelling"].includes(direct?.state) || direct?.running
   const log = (direct?.log || []).join("")
   const progress = direct?.progress || null
   const progressPercent = Number.isFinite(progress?.percent) ? progress.percent : null
@@ -992,7 +998,9 @@ function pipelineDossier(name, wiki, state, lifecycle, direct, fleetWork, plan) 
     <div class="admin-dossier-lead ${operationTone(state)}">
       <span class="admin-command-kicker">${statusLabels[state] || operationLabel(state)}</span>
       <strong>${state === "running" ? direct?.stageLabel || "Pipeline running" : state === "failed" ? `Stopped during ${direct?.stageLabel || "pipeline work"}` : state === "waiting_upstream" ? "Waiting for upstream data" : wikipediaProjectLabel(name)}</strong>
-      <p>${stoppedWithExplanation
+      <p>${state === "waiting_upstream"
+        ? stateExplanation(name, wiki, state, lifecycle, direct, fleetWork)
+        : stoppedWithExplanation
         ? "No candidate was published. Validated source transactions remain reusable; the specific cause is shown below."
         : stateExplanation(name, wiki, state, lifecycle, direct, fleetWork)}</p>
       ${progressPercent != null && operationActive ? html`<div class="admin-human-progress" aria-label=${`${progressPercent}% of source files complete`}>
@@ -1027,7 +1035,9 @@ function pipelineDossier(name, wiki, state, lifecycle, direct, fleetWork, plan) 
           }}>
           ${direct?.state === "failed" && direct?.retryable === false ? "Retry after remediation" : isQualification ? "Run full qualification" : "Prepare full update"}
         </button>
-        <button class="admin-btn" ?disabled=${!apiStatus || operationActive} onclick=${() => runCommand("patrol-rebuild", name)}>Rebuild patrol</button>
+        ${isQualification
+          ? html`<button class="admin-btn" ?disabled=${!apiStatus || operationActive} onclick=${() => runCommand("qualify", {wiki: name, version: preferredSnapshotVersion()})}>Resume when patrol is ready</button>`
+          : html`<button class="admin-btn" ?disabled=${!apiStatus || operationActive} onclick=${() => runCommand("patrol-rebuild", name)}>Refetch and rebuild patrol</button>`}
         <button class="admin-btn" ?disabled=${!apiStatus} onclick=${() => runCommand("cleanup", name)}>Clean stale staging</button>`}
       ${["stalled", "quarantined"].includes(state) ? html`<button class="admin-btn" ?disabled=${!apiStatus} onclick=${() => runCommand(direct?.requestId ? "recover-admin" : "fleet-recover")}>${direct?.requestId ? "Recover operator queue" : "Recover fleet lease"}</button>` : ""}
       ${operationActive ? html`<button class="admin-btn danger" ?disabled=${!apiStatus} onclick=${() => runCommand("cancel", {requestId: direct?.requestId, wiki: name})}>Cancel operation</button>` : ""}
@@ -1036,8 +1046,10 @@ function pipelineDossier(name, wiki, state, lifecycle, direct, fleetWork, plan) 
       <button class="admin-btn" ?disabled=${!canRun || operationActive} onclick=${() => runCommand("fetch", {wiki: name, version: preferredSnapshotVersion()})}>Fetch history</button>
       <button class="admin-btn" ?disabled=${!canRun || operationActive} onclick=${() => runCommand("ingest", name)}>Ingest</button>
       <button class="admin-btn" ?disabled=${!canRun || operationActive} onclick=${() => runCommand("compute", name)}>Compute metrics</button>
-      <button class="admin-btn" ?disabled=${!canRun || operationActive} onclick=${() => runCommand("patrol-fetch", name)}>Fetch patrol</button>
-      <button class="admin-btn" ?disabled=${!canRun || operationActive} onclick=${() => runCommand("patrol-compute", name)}>Compute patrol</button>
+      ${!isQualification ? html`
+        <button class="admin-btn" ?disabled=${!canRun || operationActive} onclick=${() => runCommand("patrol-fetch", name)}>Fetch patrol</button>
+        <button class="admin-btn" ?disabled=${!canRun || operationActive} onclick=${() => runCommand("patrol-compute", name)}>Refresh patrol</button>
+      ` : ""}
       <button class="admin-btn" ?disabled=${!canRun || operationActive} onclick=${() => runCommand("cleanup", name)}>Clean staging</button>
     </div></details>` : ""}
     ${log ? html`<details class="admin-dossier-log"><summary>Latest output (${(direct.log || []).length} chunks)</summary><pre class="admin-job-log">${log}</pre></details>` : ""}

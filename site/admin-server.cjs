@@ -966,7 +966,8 @@ function readAdminOperations() {
   const scheduled = queued.map((entry, index) => ({
     ...entry,
     queuePosition: index + 1,
-    earliestDispatchAt: running.length === 0 && index === 0 ? nextDispatchAt() : null,
+    earliestDispatchAt: entry.notBefore
+      || (running.length === 0 && index === 0 ? nextDispatchAt() : null),
     waitingForActiveOperation: running.length > 0,
     waitingForEarlierRequest: index > 0,
   }));
@@ -2195,10 +2196,10 @@ async function handleRequest(req, res) {
                   "--data-dir", DATA_DIR,
                   "--output-dir", OUTPUT_DIR,
                   "--run-id", runId,
-                  "patrol-compute", wiki,
+                  "patrol-refresh", wiki,
                   ...(action === "patrol-rebuild" ? ["--rebuild"] : []),
                 ],
-                label: `${resolveRunner().label} --data-dir ${DATA_DIR} --output-dir ${OUTPUT_DIR} --run-id ${runId} patrol-compute ${wiki}${action === "patrol-rebuild" ? " --rebuild" : ""}`,
+                label: `${resolveRunner().label} --data-dir ${DATA_DIR} --output-dir ${OUTPUT_DIR} --run-id ${runId} patrol-refresh ${wiki}${action === "patrol-rebuild" ? " --rebuild" : ""}`,
               }
             : null;
           break;
@@ -2239,10 +2240,10 @@ async function handleRequest(req, res) {
         proc,
         action,
         wiki: wiki || null,
-        stage: ["run", "qualify"].includes(action)
-          ? "fetch"
-          : action === "patrol-rebuild"
-            ? "patrol_compute"
+          stage: ["run", "qualify"].includes(action)
+            ? "fetch"
+            : ["patrol-compute", "patrol-rebuild"].includes(action)
+            ? "patrol_fetch"
             : action.replace("-", "_"),
         expectedTotal: null,
         cancelRequested: false,

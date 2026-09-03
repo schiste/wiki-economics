@@ -97,3 +97,14 @@ test("operation summaries distinguish incomplete logging dumps from defects", ()
   assert.equal(summary.remediationCode, "upstream_logging_waiting");
   assert.match(summary.errorSummary, /will not be downloaded again/);
 });
+
+test("operation summaries stop retry loops for compute without patrol sources", () => {
+  const summary = summarizeOperationLog({}, [
+    'run_id=test INFO starting stage stage="patrol_compute" wiki="dewiki"',
+    "Error: No patrol data for dewiki. Run `patrol-fetch` first.",
+  ].join("\n"));
+  assert.equal(summary.stage, "patrol_compute");
+  assert.equal(summary.retryable, false);
+  assert.equal(summary.remediationCode, "patrol_source_missing");
+  assert.match(summary.remediation, /Patrol refresh/);
+});
