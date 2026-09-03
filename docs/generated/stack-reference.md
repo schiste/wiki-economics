@@ -39,6 +39,7 @@ This table is resolved from `cargo metadata --locked`, not copied from
 | `rustix` | `1.1.4` | filesystem durability operations | `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT` |
 | `serde` | `1.0.229` | typed serialization contracts | `MIT OR Apache-2.0` |
 | `serde_json` | `1.0.151` | JSON manifests, receipts, and status records | `MIT OR Apache-2.0` |
+| `sha1` | `0.11.0` | Wikimedia dump inventory checksum verification | `MIT OR Apache-2.0` |
 | `sha2` | `0.11.0` | content and artifact fingerprints | `MIT OR Apache-2.0` |
 | `tracing` | `0.1.44` | structured pipeline events | `MIT` |
 | `tracing-subscriber` | `0.3.23` | structured log formatting and filtering | `MIT` |

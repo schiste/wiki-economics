@@ -6,7 +6,7 @@ use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufWriter};
 use std::marker::PhantomData;
 
-const GENERATION_SCHEMA_VERSION: u32 = 2;
+const GENERATION_SCHEMA_VERSION: u32 = 3;
 const ARTIFACT_ORDERING: &str = "timestamp-logical-fields-v1";
 #[cfg(not(test))]
 const EXTERNAL_SORT_BATCH_ROWS: usize = PARQUET_BATCH_ROWS;
@@ -48,7 +48,8 @@ pub(super) struct PatrolGeneration {
     pub(super) wiki: String,
     pub(super) snapshot: String,
     pub(super) parser_version: String,
-    pub(super) source: LoggingSourceIdentity,
+    pub(super) plan: plan::PatrolSourcePlan,
+    pub(super) sources: Vec<LoggingSourceIdentity>,
     pub(super) stats: LoggingParseStats,
     pub(super) autopatrol_groups: Vec<String>,
     pub(super) patrol_months: Vec<MonthArtifact>,
@@ -481,6 +482,7 @@ pub(super) fn fetch<T: PatrolTransport + ?Sized>(
         publish_current_pointer(data_dir, wiki, &generation)?;
         return Ok(generation);
     }
+    preflight(transport, wiki, snapshot, data_dir)?;
     anyhow::ensure!(
         !final_root.exists(),
         "incomplete patrol generation already exists: {}",
@@ -513,6 +515,67 @@ pub(super) fn fetch<T: PatrolTransport + ?Sized>(
     validate(&final_root, wiki, snapshot, &generation)?;
     publish_current_pointer(data_dir, wiki, &generation)?;
     Ok(generation)
+}
+
+pub(super) fn preflight<T: PatrolTransport + ?Sized>(
+    transport: &T,
+    wiki: &str,
+    snapshot: &str,
+    data_dir: &Path,
+) -> Result<()> {
+    if exists(data_dir, wiki, snapshot) {
+        load(data_dir, wiki, snapshot)?;
+        return Ok(());
+    }
+    let source_plan = plan::PatrolSourcePlan::load_or_resolve(transport, wiki, snapshot, data_dir)?;
+    anyhow::ensure!(
+        source_plan.coverage_through == snapshot,
+        "patrol source coverage does not match history snapshot"
+    );
+    let legacy_meta = data_dir
+        .join("patrol")
+        .join(wiki)
+        .join("autopatrol_groups.json");
+    if legacy_meta.is_file() {
+        let cached: serde_json::Value = serde_json::from_slice(&fs::read(&legacy_meta)?)?;
+        if cached
+            .get("history_snapshot")
+            .and_then(serde_json::Value::as_str)
+            == Some(snapshot)
+            && cached
+                .get("logging_dump_date")
+                .and_then(serde_json::Value::as_str)
+                == Some(source_plan.logging_dump_date.as_str())
+        {
+            info!(
+                wiki,
+                snapshot, "reusing patrol dependency preflight receipt"
+            );
+            return Ok(());
+        }
+    }
+    let mut groups = fetch_autopatrol_groups(transport, wiki)?;
+    if groups.is_empty() && legacy_meta.is_file() {
+        groups = load_cached_autopatrol_groups(&legacy_meta)?;
+    }
+    groups.sort();
+    groups.dedup();
+    let dependency_receipt = serde_json::json!({
+        "wiki": wiki,
+        "history_snapshot": snapshot,
+        "logging_dump_date": source_plan.logging_dump_date,
+        "autopatrol_groups": groups,
+    });
+    atomic_json(&legacy_meta, &dependency_receipt)?;
+    info!(
+        wiki,
+        snapshot,
+        logging_dump_date = source_plan.logging_dump_date,
+        source_count = source_plan.sources.len(),
+        source_plan_sha256 = source_plan.plan_sha256,
+        "patrol external dependency preflight succeeded"
+    );
+    Ok(())
 }
 
 fn publish_current_pointer(
@@ -552,23 +615,51 @@ fn build_generation<T: PatrolTransport + ?Sized>(
     data_dir: &Path,
     staging: &Path,
 ) -> Result<PatrolGeneration> {
-    let source_path = staging.join("source.xml.gz");
-    let source = download_logging_dump(transport, wiki, &source_path)?;
+    let source_plan = plan::PatrolSourcePlan::load_or_resolve(transport, wiki, snapshot, data_dir)?;
     let legacy_meta = data_dir
         .join("patrol")
         .join(wiki)
         .join("autopatrol_groups.json");
-    let mut autopatrol_groups = fetch_autopatrol_groups(transport, wiki)?;
-    if autopatrol_groups.is_empty() {
-        autopatrol_groups = load_cached_autopatrol_groups(&legacy_meta)?;
-    }
+    // `preflight` publishes this dependency receipt even when the wiki has no
+    // group granting autopatrol. An empty list is valid data, not a cache miss;
+    // fetching it again here would make one logical source transaction depend
+    // on a second mutable API response.
+    let mut autopatrol_groups = load_cached_autopatrol_groups(&legacy_meta)?;
     autopatrol_groups.sort();
     autopatrol_groups.dedup();
 
     let mut patrol_writer = MonthlyPatrolWriter::new(staging);
     let mut rights_writer = MonthlyRightsWriter::new(staging);
-    let stats = parse_logging_events(&source_path, &mut patrol_writer, &mut rights_writer)?;
-    validate_logging_parse(&source_path, stats)?;
+    let mut stats = LoggingParseStats::default();
+    let mut sources = Vec::with_capacity(source_plan.sources.len());
+    let mut compressed_bytes = 0_u64;
+    for (index, spec) in source_plan.sources.iter().enumerate() {
+        let source_path = staging.join(format!("source-{index:04}.xml.gz"));
+        let source = download_logging_source(transport, wiki, spec, &source_path)?;
+        compressed_bytes = compressed_bytes
+            .checked_add(source.content_length)
+            .context("patrol source bytes overflow")?;
+        let parsed = parse_logging_events(&source_path, &mut patrol_writer, &mut rights_writer)?;
+        stats.total_log_items = stats
+            .total_log_items
+            .checked_add(parsed.total_log_items)
+            .context("patrol item count overflow")?;
+        stats.patrol_events = stats
+            .patrol_events
+            .checked_add(parsed.patrol_events)
+            .context("patrol event count overflow")?;
+        stats.rights_events = stats
+            .rights_events
+            .checked_add(parsed.rights_events)
+            .context("rights event count overflow")?;
+        stats.skipped_events = stats
+            .skipped_events
+            .checked_add(parsed.skipped_events)
+            .context("skipped event count overflow")?;
+        fs::remove_file(&source_path).context("failed to release parsed patrol source")?;
+        sources.push(source);
+    }
+    validate_logging_parse_totals(compressed_bytes, stats, &source_plan.logging_dump_date)?;
     let patrol_files = patrol_writer.finish()?;
     let rights_files = rights_writer.finish()?;
     anyhow::ensure!(
@@ -587,7 +678,8 @@ fn build_generation<T: PatrolTransport + ?Sized>(
         wiki: wiki.to_string(),
         snapshot: snapshot.to_string(),
         parser_version: PATROL_PARSER_VERSION.to_string(),
-        source,
+        plan: source_plan,
+        sources,
         stats,
         autopatrol_groups,
         patrol_months,
@@ -598,27 +690,41 @@ fn build_generation<T: PatrolTransport + ?Sized>(
     generation.manifest_sha256 = generation.canonical_hash()?;
     validate(staging, wiki, snapshot, &generation)?;
     atomic_json(&staging.join("generation.json"), &generation)?;
-    fs::remove_file(&source_path).context("failed to release committed patrol logging source")?;
     File::open(staging)?.sync_all()?;
     Ok(generation)
 }
 
 fn validate(root: &Path, wiki: &str, snapshot: &str, generation: &PatrolGeneration) -> Result<()> {
+    generation.plan.validate(wiki, snapshot)?;
     anyhow::ensure!(
         generation.schema_version == GENERATION_SCHEMA_VERSION
             && generation.wiki == wiki
             && generation.snapshot == snapshot
             && generation.parser_version == PATROL_PARSER_VERSION
+            && generation.plan.wiki == wiki
+            && generation.plan.history_snapshot == snapshot
+            && generation.plan.coverage_through == snapshot
+            && !generation.sources.is_empty()
+            && generation.sources.len() == generation.plan.sources.len()
             && generation.stats.total_log_items
                 == generation.stats.patrol_events
                     + generation.stats.rights_events
                     + generation.stats.skipped_events
-            && generation.source.downloaded_sha256.len() == 64
             && generation
-                .source
-                .downloaded_sha256
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit())
+                .sources
+                .iter()
+                .zip(&generation.plan.sources)
+                .all(|(source, spec)| source.source_id == spec.source_id
+                    && source.remote_url == spec.url.as_str()
+                    && source.content_length == spec.expected_size
+                    && source.upstream_md5.eq_ignore_ascii_case(&spec.md5)
+                    && source.upstream_sha1.eq_ignore_ascii_case(&spec.sha1)
+                    && source.downloaded_sha1.eq_ignore_ascii_case(&spec.sha1)
+                    && source.downloaded_sha256.len() == 64
+                    && source
+                        .downloaded_sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_hexdigit()))
             && generation.manifest_sha256 == generation.canonical_hash()?,
         "patrol generation identity changed"
     );
@@ -629,6 +735,17 @@ fn validate(root: &Path, wiki: &str, snapshot: &str, generation: &PatrolGenerati
         "patrol rights timeline identity changed"
     );
     Ok(())
+}
+
+pub(super) fn source_set_digest(sources: &[LoggingSourceIdentity]) -> String {
+    let mut digest = Sha256::new();
+    for source in sources {
+        digest.update(source.source_id.as_bytes());
+        digest.update([0]);
+        digest.update(source.downloaded_sha256.as_bytes());
+        digest.update([0]);
+    }
+    hex::encode(digest.finalize())
 }
 
 fn validate_artifacts(root: &Path, artifacts: &[MonthArtifact]) -> Result<()> {

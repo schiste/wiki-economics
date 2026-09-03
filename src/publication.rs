@@ -525,6 +525,16 @@ struct PatrolSourceReport {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 struct PatrolGenerationReport {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    history_snapshot: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    logging_dump_date: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    coverage_through: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_plan_sha256: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_count: Option<u64>,
     remote_url: String,
     content_length: u64,
     etag: Option<String>,
@@ -551,10 +561,19 @@ fn patrol_source_report_with_generation(
             source.patrol_events > 0 && source.rights_events > 0,
             "scheduled wiki {wiki} has empty patrol or rights source data"
         );
+        ensure!(
+            source.history_snapshot == source.coverage_through,
+            "scheduled wiki {wiki} has patrol coverage from another history snapshot"
+        );
         return Ok(PatrolSourceReport {
             patrol_events: source.patrol_events,
             rights_events: source.rights_events,
             generation: Some(PatrolGenerationReport {
+                history_snapshot: Some(source.history_snapshot),
+                logging_dump_date: Some(source.logging_dump_date),
+                coverage_through: Some(source.coverage_through),
+                source_plan_sha256: Some(source.source_plan_sha256),
+                source_count: Some(source.source_count),
                 remote_url: source.remote_url,
                 content_length: source.content_length,
                 etag: source.etag,
@@ -4726,6 +4745,11 @@ mod tests {
     fn generation_patrol_source_report_preserves_authenticated_provenance() -> Result<()> {
         let data = TestDir::new()?;
         let source = crate::patrol::PatrolSourceSummary {
+            history_snapshot: "2026-08".to_string(),
+            logging_dump_date: "20260901".to_string(),
+            coverage_through: "2026-08".to_string(),
+            source_plan_sha256: "c".repeat(64),
+            source_count: 1,
             remote_url: "https://dumps.wikimedia.org/test.xml.gz".to_string(),
             content_length: 123,
             etag: Some("fixture".to_string()),
@@ -4745,6 +4769,7 @@ mod tests {
         let generation = report.generation.context("generation report is missing")?;
         assert_eq!(generation.downloaded_sha256, "a".repeat(64));
         assert_eq!(generation.manifest_sha256, "b".repeat(64));
+        assert_eq!(generation.coverage_through.as_deref(), Some("2026-08"));
 
         let mut empty = source;
         empty.rights_events = 0;

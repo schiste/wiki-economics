@@ -38,6 +38,7 @@ url = { version = "2", features = ["serde"] }
 regex = "1"
 fs4 = "1.1.0"
 sha2 = "0.11"
+sha1 = "0.11"
 hex = "0.4"
 rustix = { version = "1", features = ["fs"] }
 

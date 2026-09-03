@@ -36,6 +36,7 @@ struct FakePatrolTransport {
     response_etag: Option<String>,
     response_last_modified: Option<String>,
     response_content_length: Option<u64>,
+    dump_status_values: Mutex<VecDeque<Value>>,
 }
 
 impl FakePatrolTransport {
@@ -48,6 +49,7 @@ impl FakePatrolTransport {
             response_etag: None,
             response_last_modified: None,
             response_content_length: None,
+            dump_status_values: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -59,6 +61,11 @@ impl FakePatrolTransport {
 
     fn with_response_content_length(mut self, content_length: u64) -> Self {
         self.response_content_length = Some(content_length);
+        self
+    }
+
+    fn with_dump_statuses(mut self, values: Vec<Value>) -> Self {
+        self.dump_status_values = Mutex::new(values.into());
         self
     }
 
@@ -103,6 +110,31 @@ impl PatrolTransport for FakePatrolTransport {
     }
 
     fn get_json(&self, url: &str) -> Result<Value> {
+        if url.ends_with("/dumpstatus.json") {
+            if let Some(value) = self
+                .dump_status_values
+                .lock()
+                .expect("dump status lock should not be poisoned")
+                .pop_front()
+            {
+                return Ok(value);
+            }
+            let parts = url
+                .trim_end_matches("/dumpstatus.json")
+                .rsplit('/')
+                .collect::<Vec<_>>();
+            let dump_date = parts.first().context("test dump date")?;
+            let wiki = parts.get(1).context("test dump wiki")?;
+            let body = self
+                .get_bodies
+                .lock()
+                .expect("transport bodies lock should not be poisoned")
+                .front()
+                .cloned()
+                .context("test patrol source body")?;
+            let name = format!("{wiki}-{dump_date}-pages-logging.xml.gz");
+            return Ok(completed_dump_status(&name, &body));
+        }
         self.json_calls
             .lock()
             .expect("transport json calls lock should not be poisoned")
@@ -113,6 +145,53 @@ impl PatrolTransport for FakePatrolTransport {
             .pop_front()
             .ok_or_else(|| anyhow::anyhow!("test transport should have a queued JSON response"))
     }
+}
+
+fn source_sha1(bytes: &[u8]) -> String {
+    hex::encode(<sha1::Sha1 as sha1::Digest>::digest(bytes))
+}
+
+fn completed_dump_status(name: &str, bytes: &[u8]) -> Value {
+    let wiki = name.split('-').next().expect("test wiki");
+    let date = name.split('-').nth(1).expect("test date");
+    json!({
+        "jobs": {
+            "xmlpagelogsdumprecombine": {
+                "status": "done",
+                "updated": "2026-09-04 00:00:00",
+                "files": {
+                    (name): {
+                        "size": bytes.len(),
+                        "url": format!("/{wiki}/{date}/{name}"),
+                        "md5": "0".repeat(32),
+                        "sha1": source_sha1(bytes),
+                    }
+                }
+            },
+            "xmlpagelogsdump": {"status": "waiting", "updated": "", "files": {}}
+        }
+    })
+}
+
+fn test_source_spec(wiki: &str, snapshot: &str, bytes: &[u8]) -> Result<plan::PatrolSourceSpec> {
+    let year: u32 = snapshot[..4].parse()?;
+    let month: u32 = snapshot[5..].parse()?;
+    let (year, month) = if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    };
+    let date = format!("{year:04}{month:02}01");
+    let source_id = format!("{wiki}-{date}-pages-logging.xml.gz");
+    Ok(plan::PatrolSourceSpec {
+        url: url::Url::parse(&format!(
+            "https://dumps.wikimedia.org/{wiki}/{date}/{source_id}"
+        ))?,
+        source_id,
+        expected_size: u64::try_from(bytes.len())?,
+        md5: "0".repeat(32),
+        sha1: source_sha1(bytes),
+    })
 }
 
 fn gzip_bytes(content: &str) -> Result<Vec<u8>> {
@@ -493,6 +572,7 @@ fn fetch_autopatrol_groups_handles_short_circuit_and_parses_rights() -> Result<(
                 .to_string()
         ]
     );
+
     Ok(())
 }
 
@@ -571,6 +651,15 @@ fn reqwest_patrol_transport_accepts_only_an_exactly_complete_range() -> Result<(
     Ok(())
 }
 
+#[cfg(coverage)]
+#[test]
+fn snapshot_patrol_entrypoints_require_a_coverage_transport() -> Result<()> {
+    let data_dir = TestDir::new()?;
+    assert!(fetch_patrol_for_snapshot("testwiki", "2026-08", data_dir.path()).is_err());
+    assert!(preflight_patrol_for_snapshot("testwiki", "2026-08", data_dir.path()).is_err());
+    Ok(())
+}
+
 #[test]
 fn download_logging_dump_writes_and_resumes_existing_files() -> Result<()> {
     init_test_tracing();
@@ -582,24 +671,27 @@ fn download_logging_dump_writes_and_resumes_existing_files() -> Result<()> {
     // appends additional bytes; the magic check still passes because the
     // file's first two bytes never change after the initial write.
     let first = FakePatrolTransport::new(vec![b"\x1f\x8b\x08".to_vec()], Vec::new());
-    download_logging_dump(&first, "testwiki", &dest)?;
+    let first_spec = test_source_spec("testwiki", "2026-08", b"\x1f\x8b\x08")?;
+    download_logging_source(&first, "testwiki", &first_spec, &dest)?;
     assert_eq!(fs::read(&dest)?, b"\x1f\x8b\x08");
     assert_eq!(
         first.get_calls(),
         vec![(
-            "https://dumps.wikimedia.org/testwiki/latest/testwiki-latest-pages-logging.xml.gz"
+            "https://dumps.wikimedia.org/testwiki/20260901/testwiki-20260901-pages-logging.xml.gz"
                 .to_string(),
             None,
         )]
     );
 
     let second = FakePatrolTransport::new(vec![b"def".to_vec()], Vec::new());
-    download_logging_dump(&second, "testwiki", &dest)?;
+    let complete = b"\x1f\x8b\x08def";
+    let second_spec = test_source_spec("testwiki", "2026-08", complete)?;
+    download_logging_source(&second, "testwiki", &second_spec, &dest)?;
     assert_eq!(fs::read(&dest)?, b"\x1f\x8b\x08def");
     assert_eq!(
         second.get_calls(),
         vec![(
-            "https://dumps.wikimedia.org/testwiki/latest/testwiki-latest-pages-logging.xml.gz"
+            "https://dumps.wikimedia.org/testwiki/20260901/testwiki-20260901-pages-logging.xml.gz"
                 .to_string(),
             Some(3),
         )]
@@ -617,7 +709,8 @@ fn download_logging_dump_rejects_payload_with_bad_gzip_magic() -> Result<()> {
     // magic check must reject the response and remove the corrupt file so
     // that ingest never sees it.
     let transport = FakePatrolTransport::new(vec![b"<!DOCTYPE htm".to_vec()], Vec::new());
-    let err = download_logging_dump(&transport, "testwiki", &dest)
+    let spec = test_source_spec("testwiki", "2026-08", b"<!DOCTYPE htm")?;
+    let err = download_logging_source(&transport, "testwiki", &spec, &dest)
         .expect_err("non-gzip payload must fail magic check");
     assert!(err.to_string().contains("gzip magic"));
     assert!(!dest.exists(), "corrupt patrol dump should be removed");
@@ -632,7 +725,8 @@ fn download_logging_dump_rejects_short_payload() -> Result<()> {
 
     // A single-byte response is shorter than the 2-byte gzip magic header.
     let transport = FakePatrolTransport::new(vec![b"\x1f".to_vec()], Vec::new());
-    let err = download_logging_dump(&transport, "testwiki", &dest)
+    let spec = test_source_spec("testwiki", "2026-08", b"\x1f")?;
+    let err = download_logging_source(&transport, "testwiki", &spec, &dest)
         .expect_err("1-byte payload must fail magic check");
     assert!(err.to_string().contains("gzip magic"));
     assert!(!dest.exists());
@@ -645,9 +739,10 @@ fn download_logging_dump_rejects_a_mismatched_transport_length() -> Result<()> {
     let dest = temp_dir.path().join("patrol.xml.gz");
     let body = gzip_bytes("<mediawiki></mediawiki>")?;
     let expected = u64::try_from(body.len())? + 1;
-    let transport =
-        FakePatrolTransport::new(vec![body], Vec::new()).with_response_content_length(expected);
-    let error = download_logging_dump(&transport, "testwiki", &dest)
+    let transport = FakePatrolTransport::new(vec![body.clone()], Vec::new())
+        .with_response_content_length(expected);
+    let spec = test_source_spec("testwiki", "2026-08", &body)?;
+    let error = download_logging_source(&transport, "testwiki", &spec, &dest)
         .expect_err("a mismatched response length must fail closed");
     assert!(error.to_string().contains("length changed"));
     assert!(!dest.exists());
@@ -697,7 +792,7 @@ autopatrolled,sysop</params>
         })],
     );
 
-    fetch_patrol("testwiki", data_dir.path())?;
+    fetch_patrol_with_transport("testwiki", data_dir.path(), transport.as_ref())?;
 
     let patrol_df = read_parquet_df(&patrol_dir.join("patrol.parquet"), None)?;
     assert_eq!(patrol_df.height(), 1);
@@ -717,7 +812,7 @@ autopatrolled,sysop</params>
     assert_eq!(
         transport.get_calls(),
         vec![(
-            "https://dumps.wikimedia.org/testwiki/latest/testwiki-latest-pages-logging.xml.gz"
+            "https://dumps.wikimedia.org/testwiki/20260901/testwiki-20260901-pages-logging.xml.gz"
                 .to_string(),
             None,
         )]
@@ -735,6 +830,280 @@ autopatrolled,sysop</params>
             .exists(),
         "the compressed source should be released after both Parquet outputs commit"
     );
+
+    let direct_dir = TestDir::new()?;
+    let direct_transport = FakePatrolTransport::new(
+        vec![gzip_bytes(xml)?],
+        vec![json!({
+            "query": {
+                "usergroups": [
+                    { "name": "patroller", "rights": ["autopatrol"] }
+                ]
+            }
+        })],
+    );
+    fetch_patrol_with_transport("testwiki", direct_dir.path(), &direct_transport)?;
+    let direct_meta = direct_dir
+        .path()
+        .join("patrol/testwiki/autopatrol_groups.json");
+    assert_eq!(
+        read_json(&direct_meta)?["autopatrol_groups"],
+        json!(["patroller"])
+    );
+    Ok(())
+}
+
+#[test]
+fn patrol_plan_waits_for_completed_inventory_then_resolves_without_history_work() -> Result<()> {
+    let data_dir = TestDir::new()?;
+    let waiting = json!({
+        "jobs": {
+            "xmlpagelogsdumprecombine": {"status": "waiting", "updated": "", "files": {}},
+            "xmlpagelogsdump": {"status": "waiting", "updated": "", "files": {}}
+        }
+    });
+    let waiting_transport =
+        FakePatrolTransport::new(Vec::new(), Vec::new()).with_dump_statuses(vec![waiting]);
+    let error = plan::PatrolSourcePlan::load_or_resolve(
+        &waiting_transport,
+        "testwiki",
+        "2026-08",
+        data_dir.path(),
+    )
+    .expect_err("an incomplete upstream dump must wait");
+    assert!(plan::is_upstream_waiting(&error));
+    let status: Value = serde_json::from_slice(&fs::read(plan::status_path(
+        data_dir.path(),
+        "testwiki",
+        "2026-08",
+    )?)?)?;
+    assert_eq!(status["state"], "waiting_upstream");
+    assert!(!plan::plan_path(data_dir.path(), "testwiki", "2026-08")?.exists());
+
+    let body = gzip_bytes("<mediawiki></mediawiki>")?;
+    let completed = completed_dump_status("testwiki-20260901-pages-logging.xml.gz", &body);
+    let ready_transport =
+        FakePatrolTransport::new(vec![body], Vec::new()).with_dump_statuses(vec![completed]);
+    let resolved = plan::PatrolSourcePlan::load_or_resolve(
+        &ready_transport,
+        "testwiki",
+        "2026-08",
+        data_dir.path(),
+    )?;
+    assert_eq!(resolved.logging_dump_date, "20260901");
+    assert_eq!(resolved.coverage_through, "2026-08");
+    assert!(!plan::status_path(data_dir.path(), "testwiki", "2026-08")?.exists());
+
+    let blocked_status = plan::status_path(data_dir.path(), "testwiki", "2026-08")?;
+    fs::create_dir(&blocked_status)?;
+    assert!(
+        plan::PatrolSourcePlan::load_or_resolve(
+            &ready_transport,
+            "testwiki",
+            "2026-08",
+            data_dir.path(),
+        )
+        .is_err(),
+        "a stale status that cannot be removed must fail closed"
+    );
+    Ok(())
+}
+
+#[test]
+fn patrol_plan_handles_year_rollover_and_cleans_failed_atomic_publication() -> Result<()> {
+    let year_root = TestDir::new()?;
+    let body = gzip_bytes("<mediawiki></mediawiki>")?;
+    let year_transport = FakePatrolTransport::new(vec![body.clone()], Vec::new());
+    let year_plan = plan::PatrolSourcePlan::load_or_resolve(
+        &year_transport,
+        "testwiki",
+        "2026-12",
+        year_root.path(),
+    )?;
+    assert_eq!(year_plan.logging_dump_date, "20270101");
+
+    let blocked_root = TestDir::new()?;
+    let destination = plan::plan_path(blocked_root.path(), "testwiki", "2026-12")?;
+    fs::create_dir_all(&destination)?;
+    let blocked_transport = FakePatrolTransport::new(vec![body], Vec::new());
+    assert!(
+        plan::PatrolSourcePlan::load_or_resolve(
+            &blocked_transport,
+            "testwiki",
+            "2026-12",
+            blocked_root.path(),
+        )
+        .is_err()
+    );
+    let parent = destination.parent().context("plan parent")?;
+    assert!(fs::read_dir(parent)?.all(|entry| {
+        !entry
+            .expect("plan directory entry")
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")
+    }));
+    Ok(())
+}
+
+#[test]
+fn patrol_plan_uses_complete_split_inventory_and_rejects_incomplete_metadata() -> Result<()> {
+    let data_dir = TestDir::new()?;
+    let split = json!({
+        "jobs": {
+            "xmlpagelogsdumprecombine": {"status": "waiting", "updated": "", "files": {}},
+            "xmlpagelogsdump": {
+                "status": "done",
+                "updated": "2026-09-04 00:00:00",
+                "files": {
+                    "testwiki-20260901-pages-logging2.xml.gz": {"size": 2, "url": "/testwiki/20260901/testwiki-20260901-pages-logging2.xml.gz", "md5": "11111111111111111111111111111111", "sha1": "1111111111111111111111111111111111111111"},
+                    "testwiki-20260901-pages-logging1.xml.gz": {"size": 1, "url": "/testwiki/20260901/testwiki-20260901-pages-logging1.xml.gz", "md5": "00000000000000000000000000000000", "sha1": "0000000000000000000000000000000000000000"}
+                }
+            }
+        }
+    });
+    let transport =
+        FakePatrolTransport::new(Vec::new(), Vec::new()).with_dump_statuses(vec![split]);
+    let resolved = plan::PatrolSourcePlan::load_or_resolve(
+        &transport,
+        "testwiki",
+        "2026-08",
+        data_dir.path(),
+    )?;
+    assert_eq!(resolved.layout, plan::PatrolSourceLayout::Split);
+    assert_eq!(resolved.sources.len(), 2);
+    assert!(resolved.sources[0].source_id.ends_with("logging1.xml.gz"));
+
+    let bad_root = TestDir::new()?;
+    let bad = json!({
+        "jobs": {
+            "xmlpagelogsdumprecombine": {"status": "done", "files": {
+                "testwiki-20260901-pages-logging.xml.gz": {"size": 1, "url": "/testwiki/20260901/testwiki-20260901-pages-logging.xml.gz", "md5": "0", "sha1": "0"}
+            }},
+            "xmlpagelogsdump": {"status": "waiting", "files": {}}
+        }
+    });
+    let bad_transport =
+        FakePatrolTransport::new(Vec::new(), Vec::new()).with_dump_statuses(vec![bad]);
+    assert!(
+        plan::PatrolSourcePlan::load_or_resolve(
+            &bad_transport,
+            "testwiki",
+            "2026-08",
+            bad_root.path(),
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn patrol_plan_orders_double_digit_split_parts_numerically() -> Result<()> {
+    let data_dir = TestDir::new()?;
+    let mut files = serde_json::Map::new();
+    for index in (1..=12).rev() {
+        let name = format!("manywiki-20260901-pages-logging{index}.xml.gz");
+        files.insert(
+            name.clone(),
+            json!({
+                "size": index,
+                "url": format!("/manywiki/20260901/{name}"),
+                "md5": format!("{index:032x}"),
+                "sha1": format!("{index:040x}")
+            }),
+        );
+    }
+    let status = json!({
+        "jobs": {
+            "xmlpagelogsdumprecombine": {"status": "waiting", "files": {}},
+            "xmlpagelogsdump": {
+                "status": "done",
+                "updated": "2026-09-04 00:00:00",
+                "files": Value::Object(files)
+            }
+        }
+    });
+    let transport =
+        FakePatrolTransport::new(Vec::new(), Vec::new()).with_dump_statuses(vec![status]);
+
+    let plan = plan::PatrolSourcePlan::load_or_resolve(
+        &transport,
+        "manywiki",
+        "2026-08",
+        data_dir.path(),
+    )?;
+    assert!(plan.sources[1].source_id.ends_with("logging2.xml.gz"));
+    assert!(plan.sources[9].source_id.ends_with("logging10.xml.gz"));
+    assert!(plan.sources[11].source_id.ends_with("logging12.xml.gz"));
+    Ok(())
+}
+
+#[test]
+fn patrol_generation_streams_every_pinned_split_source() -> Result<()> {
+    let data_dir = TestDir::new()?;
+    let patrol_body = gzip_bytes(
+        r#"<mediawiki><logitem><id>1</id><timestamp>2026-01-02T00:00:00Z</timestamp><contributor><username>P</username></contributor><type>patrol</type><params>2
+1
+0</params></logitem></mediawiki>"#,
+    )?;
+    let rights_body = gzip_bytes(
+        r#"<mediawiki><logitem><id>2</id><timestamp>2026-01-01T00:00:00Z</timestamp><type>rights</type><logtitle>User:Editor</logtitle><params>editor
+autopatrolled</params></logitem></mediawiki>"#,
+    )?;
+    let split = json!({
+        "jobs": {
+            "xmlpagelogsdumprecombine": {"status": "waiting", "updated": "", "files": {}},
+            "xmlpagelogsdump": {
+                "status": "done",
+                "updated": "2026-09-04 00:00:00",
+                "files": {
+                    "splitwiki-20260901-pages-logging2.xml.gz": {
+                        "size": rights_body.len(),
+                        "url": "/splitwiki/20260901/splitwiki-20260901-pages-logging2.xml.gz",
+                        "md5": "1".repeat(32),
+                        "sha1": source_sha1(&rights_body)
+                    },
+                    "splitwiki-20260901-pages-logging1.xml.gz": {
+                        "size": patrol_body.len(),
+                        "url": "/splitwiki/20260901/splitwiki-20260901-pages-logging1.xml.gz",
+                        "md5": "0".repeat(32),
+                        "sha1": source_sha1(&patrol_body)
+                    }
+                }
+            }
+        }
+    });
+    let transport = FakePatrolTransport::new(
+        vec![patrol_body, rights_body],
+        vec![json!({"query": {"usergroups": []}})],
+    )
+    .with_dump_statuses(vec![split]);
+
+    let generated = generation::fetch(&transport, "splitwiki", "2026-08", data_dir.path())?;
+    assert_eq!(generated.plan.layout, plan::PatrolSourceLayout::Split);
+    assert_eq!(generated.sources.len(), 2);
+    assert_eq!(generated.stats.total_log_items, 2);
+    assert_eq!(generated.stats.patrol_events, 1);
+    assert_eq!(generated.stats.rights_events, 1);
+    assert_eq!(generated.patrol_months.len(), 1);
+    assert_eq!(generated.rights_months.len(), 1);
+    assert_eq!(transport.get_calls().len(), 2);
+    Ok(())
+}
+
+#[test]
+fn patrol_source_checksum_mismatch_is_removed_and_fails_closed() -> Result<()> {
+    let temp_dir = TestDir::new()?;
+    let destination = temp_dir.path().join("patrol.xml.gz");
+    let body = gzip_bytes("<mediawiki></mediawiki>")?;
+    let transport = FakePatrolTransport::new(vec![body.clone()], Vec::new());
+    let mut source = test_source_spec("testwiki", "2026-08", &body)?;
+    source.sha1 = "f".repeat(40);
+
+    let error = download_logging_source(&transport, "testwiki", &source, &destination)
+        .expect_err("a source whose bytes do not match the pinned inventory must fail");
+    assert!(error.to_string().contains("SHA-1 mismatch"));
+    assert!(!destination.exists());
     Ok(())
 }
 
@@ -872,6 +1241,8 @@ editor</params></logitem>
     )
     .with_response_identity("\"logging-v1\"", "Wed, 26 Aug 2026 00:00:00 GMT");
 
+    generation::preflight(&transport, "testwiki", "2026-08", data_dir.path())?;
+    generation::preflight(&transport, "testwiki", "2026-08", data_dir.path())?;
     let generation = generation::fetch(&transport, "testwiki", "2026-08", data_dir.path())?;
     assert_eq!(generation.stats.total_log_items, 4);
     assert_eq!(generation.stats.patrol_events, 2);
@@ -879,12 +1250,15 @@ editor</params></logitem>
     assert_eq!(generation.patrol_months.len(), 2);
     assert_eq!(generation.rights_months.len(), 2);
     assert_eq!(
-        generation.source.content_length,
+        generation.sources[0].content_length,
         u64::try_from(source.len())?
     );
-    assert_eq!(generation.source.etag.as_deref(), Some("\"logging-v1\""));
     assert_eq!(
-        generation.source.last_modified.as_deref(),
+        generation.sources[0].etag.as_deref(),
+        Some("\"logging-v1\"")
+    );
+    assert_eq!(
+        generation.sources[0].last_modified.as_deref(),
         Some("Wed, 26 Aug 2026 00:00:00 GMT")
     );
     assert_eq!(generation.parser_version, PATROL_PARSER_VERSION);
@@ -927,6 +1301,7 @@ editor</params></logitem>
 
     let reused = generation::fetch(&transport, "testwiki", "2026-08", data_dir.path())?;
     assert_eq!(reused, generation);
+    generation::preflight(&transport, "testwiki", "2026-08", data_dir.path())?;
     assert_eq!(transport.get_calls().len(), 1);
 
     let first_patrol = root.join(&generation.patrol_months[0].relative_path);
@@ -971,9 +1346,14 @@ fn patrol_generation_handles_empty_sources_and_cleans_failed_staging() -> Result
             .ends_with(".tmp")
     }));
 
+    let incomplete_source = gzip_bytes("<mediawiki></mediawiki>")?;
+    let unused = FakePatrolTransport::new(
+        vec![incomplete_source],
+        vec![json!({"query": {"usergroups": []}})],
+    );
+    generation::preflight(&unused, "incompletewiki", "2026-08", data_dir.path())?;
     let incomplete = generation::generation_dir(data_dir.path(), "incompletewiki", "2026-08")?;
     fs::create_dir_all(&incomplete)?;
-    let unused = FakePatrolTransport::new(Vec::new(), Vec::new());
     assert!(generation::fetch(&unused, "incompletewiki", "2026-08", data_dir.path()).is_err());
 
     let blocked = data_dir.path().join("blocked-generation.json");

@@ -9,7 +9,8 @@ use reqwest::StatusCode;
 use reqwest::blocking::Client;
 use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, ETAG, HeaderMap, LAST_MODIFIED, RANGE};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
+use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
@@ -28,7 +29,7 @@ const PARQUET_BATCH_ROWS: usize = 50_000;
 const SUBSTANTIAL_LOGGING_DUMP_BYTES: u64 = 1024 * 1024;
 const SUBSTANTIAL_LOG_ITEMS: usize = 10_000;
 const PATROL_COMPUTE_ALGORITHM_VERSION: &str = "patrol-metrics-v5-complete-snapshot-months";
-const PATROL_PARSER_VERSION: &str = "patrol-logging-multigzip-monthly-v2-external-sort";
+const PATROL_PARSER_VERSION: &str = "patrol-logging-pinned-plan-v3-external-sort";
 const REVISION_COLUMNS: &[&str] = &[
     "revision_id",
     "event_timestamp",
@@ -173,15 +174,24 @@ struct LoggingParseStats {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct LoggingSourceIdentity {
+    source_id: String,
     remote_url: String,
     content_length: u64,
     etag: Option<String>,
     last_modified: Option<String>,
     downloaded_sha256: String,
+    upstream_md5: String,
+    upstream_sha1: String,
+    downloaded_sha1: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct PatrolSourceSummary {
+    pub(crate) history_snapshot: String,
+    pub(crate) logging_dump_date: String,
+    pub(crate) coverage_through: String,
+    pub(crate) source_plan_sha256: String,
+    pub(crate) source_count: u64,
     pub(crate) remote_url: String,
     pub(crate) content_length: u64,
     pub(crate) etag: Option<String>,
@@ -204,12 +214,26 @@ pub(crate) fn source_generation_summary(
         return Ok(None);
     }
     let source = generation::load(data_dir, wiki, snapshot)?;
+    let content_length = source.sources.iter().try_fold(0_u64, |total, item| {
+        total
+            .checked_add(item.content_length)
+            .context("patrol source byte total overflow")
+    })?;
     Ok(Some(PatrolSourceSummary {
-        remote_url: source.source.remote_url,
-        content_length: source.source.content_length,
-        etag: source.source.etag,
-        last_modified: source.source.last_modified,
-        downloaded_sha256: source.source.downloaded_sha256,
+        history_snapshot: source.plan.history_snapshot.clone(),
+        logging_dump_date: source.plan.logging_dump_date.clone(),
+        coverage_through: source.plan.coverage_through.clone(),
+        source_plan_sha256: source.plan.plan_sha256.clone(),
+        source_count: u64::try_from(source.sources.len())?,
+        remote_url: source.plan.dump_status_url.to_string(),
+        content_length,
+        etag: (source.sources.len() == 1)
+            .then(|| source.sources[0].etag.clone())
+            .flatten(),
+        last_modified: (source.sources.len() == 1)
+            .then(|| source.sources[0].last_modified.clone())
+            .flatten(),
+        downloaded_sha256: generation::source_set_digest(&source.sources),
         parser_version: source.parser_version,
         total_log_items: u64::try_from(source.stats.total_log_items)?,
         patrol_events: u64::try_from(source.stats.patrol_events)?,
@@ -396,7 +420,7 @@ pub(crate) fn install_test_transport(
     let lock = TEST_TRANSPORT_LOCK
         .get_or_init(|| std::sync::Mutex::new(()))
         .lock()
-        .expect("test transport lock should not be poisoned");
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     TEST_TRANSPORT.with(|cell| {
         *cell.borrow_mut() = Some(transport);
     });
@@ -412,47 +436,65 @@ pub fn fetch_patrol(wiki: &str, data_dir: &Path) -> Result<()> {
     if let Some(snapshot) = storage::current_snapshot_version(data_dir, wiki)? {
         return fetch_patrol_for_snapshot(wiki, &snapshot, data_dir);
     }
-    #[cfg(coverage)]
-    {
-        let transport = configured_test_transport()
-            .expect("install_test_transport must be used before fetch_patrol in coverage tests");
-        return fetch_patrol_with_transport(wiki, data_dir, transport.as_ref());
-    }
-
-    #[cfg(all(test, not(coverage)))]
-    if let Some(transport) = configured_test_transport() {
-        return fetch_patrol_with_transport(wiki, data_dir, transport.as_ref());
-    }
-
-    #[cfg(not(coverage))]
-    let transport = build_transport()?;
-    #[cfg(not(coverage))]
-    return fetch_patrol_with_transport(wiki, data_dir, &transport);
+    anyhow::bail!(
+        "patrol fetch requires a selected history snapshot for {wiki}; prepare or select a generation first"
+    )
 }
 
 pub(crate) fn fetch_patrol_for_snapshot(wiki: &str, snapshot: &str, data_dir: &Path) -> Result<()> {
     storage::validate_snapshot_version(snapshot)?;
-    #[cfg(coverage)]
-    {
-        let transport = configured_test_transport()
-            .expect("install_test_transport must be used before patrol generation fetch");
-        generation::fetch(transport.as_ref(), wiki, snapshot, data_dir)?;
-        return Ok(());
-    }
-
-    #[cfg(all(test, not(coverage)))]
+    #[cfg(any(test, coverage))]
     if let Some(transport) = configured_test_transport() {
         generation::fetch(transport.as_ref(), wiki, snapshot, data_dir)?;
         return Ok(());
     }
-
     #[cfg(not(coverage))]
-    let transport = build_transport()?;
-    #[cfg(not(coverage))]
-    generation::fetch(&transport, wiki, snapshot, data_dir)?;
-    Ok(())
+    {
+        let transport = build_transport()?;
+        generation::fetch(&transport, wiki, snapshot, data_dir)?;
+        Ok(())
+    }
+    #[cfg(coverage)]
+    anyhow::bail!("install_test_transport must be used before patrol generation fetch")
 }
 
+pub(crate) fn preflight_patrol_for_snapshot(
+    wiki: &str,
+    snapshot: &str,
+    data_dir: &Path,
+) -> Result<()> {
+    storage::validate_snapshot_version(snapshot)?;
+    #[cfg(any(test, coverage))]
+    if let Some(transport) = configured_test_transport() {
+        generation::preflight(transport.as_ref(), wiki, snapshot, data_dir)?;
+        return Ok(());
+    }
+    #[cfg(not(coverage))]
+    {
+        let transport = build_transport()?;
+        generation::preflight(&transport, wiki, snapshot, data_dir)
+    }
+    #[cfg(coverage)]
+    anyhow::bail!("install_test_transport must be used before patrol dependency preflight")
+}
+
+pub(crate) fn is_upstream_waiting(error: &anyhow::Error) -> bool {
+    plan::is_upstream_waiting(error)
+}
+
+#[cfg(test)]
+pub(crate) fn upstream_waiting_error_for_test() -> anyhow::Error {
+    plan::UpstreamWaiting {
+        wiki: "testwiki".to_string(),
+        history_snapshot: "2026-08".to_string(),
+        logging_dump_date: "20260901".to_string(),
+        recombined_status: "waiting".to_string(),
+        split_status: "waiting".to_string(),
+    }
+    .into()
+}
+
+#[cfg(test)]
 fn fetch_patrol_with_transport<T: PatrolTransport + ?Sized>(
     wiki: &str,
     data_dir: &Path,
@@ -466,14 +508,20 @@ fn fetch_patrol_with_transport<T: PatrolTransport + ?Sized>(
     let rights_path = patrol_dir.join("rights.parquet");
     let meta_path = patrol_dir.join("autopatrol_groups.json");
 
-    download_logging_dump(transport, wiki, &xml_path)?;
+    let snapshot = "2026-08";
+    let source_plan = plan::PatrolSourcePlan::load_or_resolve(transport, wiki, snapshot, data_dir)?;
+    anyhow::ensure!(
+        source_plan.sources.len() == 1,
+        "legacy test fetch requires one patrol source"
+    );
+    download_logging_source(transport, wiki, &source_plan.sources[0], &xml_path)?;
 
     info!(wiki = wiki, path = %xml_path.display(), "querying siteinfo API for autopatrol groups");
     let mut autopatrol_groups = fetch_autopatrol_groups(transport, wiki)?;
     if autopatrol_groups.is_empty() {
         autopatrol_groups = load_cached_autopatrol_groups(&meta_path)?;
     }
-    let meta_bytes = serde_json::to_vec_pretty(&json!({
+    let meta_bytes = serde_json::to_vec_pretty(&serde_json::json!({
         "wiki": wiki,
         "autopatrol_groups": autopatrol_groups,
     }))?;
@@ -944,15 +992,16 @@ fn extend_lookup_once(
     Ok(())
 }
 
-fn download_logging_dump<T: PatrolTransport + ?Sized>(
+fn download_logging_source<T: PatrolTransport + ?Sized>(
     transport: &T,
     wiki: &str,
+    source: &plan::PatrolSourceSpec,
     dest_path: &Path,
 ) -> Result<LoggingSourceIdentity> {
-    let url = format!("{PATROL_DUMP_BASE}/{wiki}/latest/{wiki}-latest-pages-logging.xml.gz");
+    let url = source.url.as_str();
     let existing_size = dest_path.metadata().map(|meta| meta.len()).unwrap_or(0);
     info!(wiki = wiki, url = %url, resume_from = existing_size, "downloading patrol log dump");
-    let mut response = transport.get(&url, (existing_size > 0).then_some(existing_size))?;
+    let mut response = transport.get(url, (existing_size > 0).then_some(existing_size))?;
     let expected_length = response.content_length;
     let etag = response.etag.take();
     let last_modified = response.last_modified.take();
@@ -994,24 +1043,66 @@ fn download_logging_dump<T: PatrolTransport + ?Sized>(
         return Err(integrity_error);
     }
 
-    let (content_length, downloaded_sha256) = storage::sha256_file(dest_path)?;
-    if let Some(expected) = expected_length
-        && expected != content_length
+    let (content_length, downloaded_sha256, downloaded_sha1) = hash_logging_source(dest_path)?;
+    if expected_length.is_some_and(|expected| expected != content_length)
+        || source.expected_size != content_length
     {
         let _ = fs::remove_file(dest_path);
         anyhow::bail!(
-            "patrol logging source length changed during download (expected {expected}, received {content_length})"
+            "patrol logging source length changed during download (inventory expected {}, transport expected {:?}, received {content_length})",
+            source.expected_size,
+            expected_length
+        );
+    }
+    if downloaded_sha1 != source.sha1.to_ascii_lowercase() {
+        let _ = fs::remove_file(dest_path);
+        anyhow::bail!(
+            "patrol logging source SHA-1 mismatch for {} (expected {}, received {})",
+            source.source_id,
+            source.sha1,
+            downloaded_sha1
         );
     }
 
     info!(wiki = wiki, path = %dest_path.display(), "downloaded patrol log dump");
     Ok(LoggingSourceIdentity {
-        remote_url: url,
+        source_id: source.source_id.clone(),
+        remote_url: url.to_string(),
         content_length,
         etag,
         last_modified,
         downloaded_sha256,
+        upstream_md5: source.md5.clone(),
+        upstream_sha1: source.sha1.clone(),
+        downloaded_sha1,
     })
+}
+
+fn hash_logging_source(path: &Path) -> Result<(u64, String, String)> {
+    let file = File::open(path)?;
+    storage::prepare_sequential_read(&file);
+    let mut reader = BufReader::new(file.try_clone()?);
+    let mut sha256 = Sha256::new();
+    let mut sha1 = Sha1::default();
+    let mut bytes = 0_u64;
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        sha256.update(&buffer[..read]);
+        sha1::Digest::update(&mut sha1, &buffer[..read]);
+        bytes = bytes
+            .checked_add(u64::try_from(read)?)
+            .context("patrol source size overflow")?;
+    }
+    storage::discard_file_cache(&file, 0, bytes);
+    Ok((
+        bytes,
+        hex::encode(sha256.finalize()),
+        hex::encode(sha1::Digest::finalize(sha1)),
+    ))
 }
 
 /// Magic-byte check for gzipped patrol log dumps. See `fetch::verify_bz2_magic`
@@ -1163,14 +1254,23 @@ fn parse_logging_events<P: PatrolSink + ?Sized, R: RightsSink + ?Sized>(
     Ok(stats)
 }
 
+#[cfg(test)]
 fn validate_logging_parse(xml_path: &Path, stats: LoggingParseStats) -> Result<()> {
     let compressed_bytes = fs::metadata(xml_path)?.len();
+    validate_logging_parse_totals(compressed_bytes, stats, &xml_path.display().to_string())
+}
+
+fn validate_logging_parse_totals(
+    compressed_bytes: u64,
+    stats: LoggingParseStats,
+    source_identity: &str,
+) -> Result<()> {
     let substantial = compressed_bytes >= SUBSTANTIAL_LOGGING_DUMP_BYTES
         || stats.total_log_items >= SUBSTANTIAL_LOG_ITEMS;
     anyhow::ensure!(
         !substantial || stats.patrol_events + stats.rights_events > 0,
         "substantial logging dump {} produced zero patrol or rights events (compressed_bytes={}, total_log_items={}, skipped_events={})",
-        xml_path.display(),
+        source_identity,
         compressed_bytes,
         stats.total_log_items,
         stats.skipped_events,
@@ -2438,6 +2538,7 @@ fn round1(value: f64) -> f64 {
 
 mod generation;
 mod incremental;
+mod plan;
 
 #[cfg(test)]
 mod tests;

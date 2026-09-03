@@ -25,6 +25,7 @@ const RUST_ROLES = {
   rustix: "filesystem durability operations",
   serde: "typed serialization contracts",
   serde_json: "JSON manifests, receipts, and status records",
+  sha1: "Wikimedia dump inventory checksum verification",
   sha2: "content and artifact fingerprints",
   tracing: "structured pipeline events",
   "tracing-subscriber": "structured log formatting and filtering",
