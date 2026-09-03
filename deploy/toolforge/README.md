@@ -134,11 +134,13 @@ and higher resource envelope are being qualified.
   completed source markers let a restart continue at the first unfinished
   source. The candidate generation is selected only after the exact plan,
   marker inventory, Parquet footers, and row totals all validate.
-  Before any history source starts, patrol preflight pins the exact completed
-  dated logging inventory covering the chosen snapshot. An incomplete
-  upstream logging dump exits with code 75. Fleet workers translate that into
-  an atomic deferred task without consuming a retry; admin operations display
-  it as `waiting_upstream` rather than a pipeline failure.
+  After history ingest and core computation are durably receipted, patrol
+  preflight pins the exact completed dated logging inventory covering the
+  chosen snapshot. An incomplete upstream logging dump exits with code 75.
+  Fleet workers translate that into an atomic deferred task without consuming
+  a retry; admin operations display it as `waiting_upstream` and automatically
+  schedule a later readiness check. The next attempt reuses the completed core
+  work and resumes at patrol.
   The [Rust resource governor](../../docs/resource-governor.md) independently
   caps concurrency and admits each source against cgroup memory, filesystem
   reserve, scratch, and file-descriptor signals. Thus a window of four is an
