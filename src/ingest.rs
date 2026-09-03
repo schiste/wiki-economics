@@ -861,6 +861,84 @@ fn ingest_stage_outputs(
     Ok(outputs)
 }
 
+pub(crate) fn reset_obsolete_qualification_generation(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot_version: &str,
+) -> Result<bool> {
+    storage::validate_snapshot_version(snapshot_version)?;
+    let roots = IngestRoots::snapshot(data_dir, wiki, snapshot_version)?;
+    let manifest = storage::generation_manifest_path(data_dir, wiki, snapshot_version)?;
+    let compaction = crate::compaction::manifest_path(data_dir, wiki, snapshot_version)?;
+    if !manifest.exists() && !compaction.exists() {
+        return Ok(false);
+    }
+    let outputs = ingest_stage_outputs(data_dir, wiki, &roots)?;
+    let receipt = fingerprint::data_stage_receipt_path(data_dir, wiki, snapshot_version, "ingest");
+    let current = !outputs.is_empty()
+        && fingerprint::outputs_reusable(
+            &receipt,
+            StageSpec {
+                stage: "ingest",
+                scope: wiki,
+                selected_snapshot: Some(snapshot_version),
+                algorithm_version: INGEST_ALGORITHM_VERSION,
+            },
+            &outputs,
+        )
+        .unwrap_or(false);
+    if current {
+        return Ok(false);
+    }
+
+    let generated_paths = [
+        roots.analytical,
+        roots.warehouse,
+        roots
+            .metric_input
+            .context("qualification generation has no metric-input root")?,
+        manifest,
+        compaction.clone(),
+        compaction.with_file_name("compaction-transaction.json"),
+        receipt,
+        crate::canonical_month::inventory_path(data_dir, wiki, snapshot_version)?
+            .parent()
+            .context("canonical month inventory has no generation directory")?
+            .to_path_buf(),
+    ];
+    let mut removable_paths = Vec::new();
+    for path in generated_paths {
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        ensure!(
+            !metadata.file_type().is_symlink() && (metadata.is_dir() || metadata.is_file()),
+            "refusing to reset unsafe qualification input {}",
+            path.display()
+        );
+        removable_paths.push((path, metadata));
+    }
+    if storage::current_snapshot_version(data_dir, wiki)?.as_deref() == Some(snapshot_version) {
+        storage::restore_current_snapshot(data_dir, wiki, None)?;
+    }
+    let removed = removable_paths.len();
+    for (path, metadata) in removable_paths {
+        if metadata.is_dir() {
+            fs::remove_dir_all(&path)?;
+        } else {
+            fs::remove_file(&path)?;
+        }
+    }
+    info!(
+        wiki,
+        snapshot_version,
+        removed_paths = removed,
+        algorithm_version = INGEST_ALGORITHM_VERSION,
+        "reset reproducible obsolete qualification input"
+    );
+    Ok(removed > 0)
+}
+
 #[cfg(test)]
 fn ingest_stage_inputs(
     data_dir: &Path,
@@ -1306,6 +1384,108 @@ mod tests {
         )
         .expect("worker-independent ingest fragments must qualify");
         assert_eq!(report.artifact_count, expected_sources);
+        Ok(())
+    }
+
+    #[test]
+    fn obsolete_qualification_generation_reset_preserves_source_evidence() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let wiki = "testwiki";
+        let snapshot = "2026-08";
+        prepare_compaction_fixture(data_dir.path(), wiki, snapshot)?;
+        finalize_snapshot_ingest(wiki, snapshot, data_dir.path())?;
+        let plan = crate::snapshot_plan::plan_path(data_dir.path(), wiki, snapshot)?;
+        let receipt =
+            fingerprint::data_stage_receipt_path(data_dir.path(), wiki, snapshot, "ingest");
+        assert!(
+            !reset_obsolete_qualification_generation(data_dir.path(), wiki, snapshot,)
+                .expect("the current ingest generation should be reusable")
+        );
+        let mut obsolete = fingerprint::read_receipt(&receipt)?;
+        obsolete.algorithm_version = "obsolete-ingest-algorithm".to_string();
+        fs::write(&receipt, serde_json::to_vec_pretty(&obsolete)?)?;
+        let identity_dir = crate::canonical_month::inventory_path(data_dir.path(), wiki, snapshot)?
+            .parent()
+            .expect("identity inventory should have a parent")
+            .to_path_buf();
+        fs::create_dir_all(&identity_dir)?;
+        fs::write(identity_dir.join("stale.json"), b"{}")?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let pointer = storage::snapshot_pointer_path(data_dir.path(), wiki);
+            let parent = pointer.parent().context("snapshot pointer parent")?;
+            let original = fs::metadata(parent)?.permissions();
+            let mut locked = original.clone();
+            locked.set_mode(0o500);
+            fs::set_permissions(parent, locked)?;
+            let failed = reset_obsolete_qualification_generation(data_dir.path(), wiki, snapshot);
+            fs::set_permissions(parent, original)?;
+            assert!(failed.is_err());
+            assert_eq!(
+                storage::current_snapshot_version(data_dir.path(), wiki)?.as_deref(),
+                Some(snapshot)
+            );
+        }
+
+        assert!(
+            reset_obsolete_qualification_generation(data_dir.path(), wiki, snapshot,)
+                .expect("obsolete qualification input should reset")
+        );
+        assert!(plan.is_file());
+        assert!(!receipt.exists());
+        assert!(!identity_dir.exists());
+        assert_eq!(
+            storage::current_snapshot_version(data_dir.path(), wiki)?,
+            None
+        );
+        assert!(
+            !reset_obsolete_qualification_generation(data_dir.path(), wiki, snapshot,)
+                .expect("a completed reset should be idempotent")
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn obsolete_qualification_reset_rejects_unsafe_generated_paths_before_pointer_switch()
+    -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let wiki = "testwiki";
+        let snapshot = "2026-08";
+        prepare_compaction_fixture(data_dir.path(), wiki, snapshot)?;
+        finalize_snapshot_ingest(wiki, snapshot, data_dir.path())?;
+        let receipt =
+            fingerprint::data_stage_receipt_path(data_dir.path(), wiki, snapshot, "ingest");
+        let mut obsolete = fingerprint::read_receipt(&receipt)?;
+        obsolete.algorithm_version = "obsolete-ingest-algorithm".to_string();
+        fs::write(&receipt, serde_json::to_vec_pretty(&obsolete)?)?;
+
+        let roots = IngestRoots::snapshot(data_dir.path(), wiki, snapshot)?;
+        let unsafe_path = roots.analytical;
+        if unsafe_path.exists() {
+            fs::remove_dir_all(&unsafe_path)
+                .expect("analytical fixture should be removable before replacing it");
+        }
+        fs::create_dir_all(unsafe_path.parent().context("unsafe fixture parent")?)?;
+        let target = data_dir.path().join("outside-reset");
+        fs::create_dir_all(&target)?;
+        std::os::unix::fs::symlink(target, &unsafe_path)?;
+
+        assert!(reset_obsolete_qualification_generation(data_dir.path(), wiki, snapshot,).is_err());
+        assert_eq!(
+            storage::current_snapshot_version(data_dir.path(), wiki)?.as_deref(),
+            Some(snapshot)
+        );
+        fs::remove_file(&unsafe_path)?;
+        fs::create_dir_all(&unsafe_path)?;
+        storage::restore_current_snapshot(data_dir.path(), wiki, None)?;
+        assert!(
+            reset_obsolete_qualification_generation(data_dir.path(), wiki, snapshot,)
+                .expect("obsolete input without a selected pointer should reset")
+        );
         Ok(())
     }
 

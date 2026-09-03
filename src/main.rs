@@ -839,6 +839,12 @@ trait Ops {
     fn ensure_qualification_wiki(&self, lifecycle: &Path, wiki: &str) -> Result<()> {
         publication::ensure_qualification_wiki(lifecycle, wiki)
     }
+    fn reset_obsolete_qualification_generation(
+        &self,
+        wiki: &str,
+        version: &str,
+        data_dir: &Path,
+    ) -> Result<bool>;
     fn mark_qualification_ready(
         &self,
         data_dir: &Path,
@@ -911,6 +917,15 @@ impl Ops for RealOps {
         data_dir: &Path,
     ) -> Result<()> {
         fetch::validate_completed_snapshot(data_dir, wiki, version)
+    }
+
+    fn reset_obsolete_qualification_generation(
+        &self,
+        wiki: &str,
+        version: &str,
+        data_dir: &Path,
+    ) -> Result<bool> {
+        ingest::reset_obsolete_qualification_generation(data_dir, wiki, version)
     }
 
     fn fetch_wiki(&self, wiki: &str, version: &str, data_dir: &std::path::Path) -> Result<()> {
@@ -1577,6 +1592,9 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             };
             let source_window_size = source_window::configured_window_size(source_window_size)?;
             ops.persist_snapshot_plans(std::slice::from_ref(&wiki), &version, &data_dir)?;
+            if ops.reset_obsolete_qualification_generation(&wiki, &version, &data_dir)? {
+                record_skipped_stage("obsolete_input_retired", Some(&wiki));
+            }
             let qualification_dir =
                 publication::wiki_qualification_dir(&output_dir, &wiki, &version, run_id)?;
             run_timed_stage("source_window", Some(&wiki), || {
@@ -2136,6 +2154,7 @@ mod tests {
         qualification_preparation_plans: RefCell<VecDeque<publication::WikiPreparationPlan>>,
         preparation_error: bool,
         cached_patrol_sources: bool,
+        reset_obsolete_input: bool,
     }
 
     impl RecordingOps {
@@ -2362,6 +2381,18 @@ mod tests {
                 data_dir.display()
             ));
             Ok(())
+        }
+
+        fn reset_obsolete_qualification_generation(
+            &self,
+            wiki: &str,
+            version: &str,
+            _data_dir: &Path,
+        ) -> Result<bool> {
+            if self.reset_obsolete_input {
+                self.record(format!("reset_obsolete_input:{wiki}:{version}"));
+            }
+            Ok(self.reset_obsolete_input)
         }
 
         fn prepare_wiki_snapshot(
@@ -2612,6 +2643,15 @@ mod tests {
     }
 
     impl Ops for FailingOps {
+        fn reset_obsolete_qualification_generation(
+            &self,
+            _wiki: &str,
+            _version: &str,
+            _data_dir: &Path,
+        ) -> Result<bool> {
+            Ok(false)
+        }
+
         fn fetch_wiki(&self, _wiki: &str, _version: &str, _data_dir: &Path) -> Result<()> {
             if self.fail_stage == "fetch" {
                 anyhow::bail!("fetch failed");
@@ -2902,6 +2942,7 @@ mod tests {
         ])?;
         let ops = RecordingOps {
             cached_patrol_sources: true,
+            reset_obsolete_input: true,
             ..RecordingOps::default()
         };
 
@@ -2911,6 +2952,7 @@ mod tests {
             ops.calls.into_inner(),
             vec![
                 "qualification_lifecycle:itwiki",
+                "reset_obsolete_input:itwiki:2026-07",
                 "source_window:itwiki:2026-07:qualification/data:1",
                 "compute:itwiki:qualification/data:qualification/output/_qualifications/itwiki/2026-07/qualify-7",
                 "fetch_patrol:itwiki:qualification/data",
@@ -4148,6 +4190,10 @@ mod tests {
         assert!(
             crate::snapshot_plan::plan_path(data_dir.path(), "simplewiki", "2026-07")?.is_file()
         );
+        assert!(
+            !ops.reset_obsolete_qualification_generation("simplewiki", "2026-07", data_dir.path(),)
+                .expect("an absent obsolete generation should be a no-op")
+        );
         assert_eq!(
             ops.plan_qualification_preparation(
                 "simplewiki",
@@ -5027,6 +5073,7 @@ mod tests {
         ops.fetch_wiki("frwiki", "2026-02", data_dir)?;
         ops.fetch_patrol("frwiki", data_dir)?;
         ops.ingest_wiki("frwiki", None, data_dir)?;
+        assert!(!ops.reset_obsolete_qualification_generation("frwiki", "2026-02", data_dir,)?);
         ops.cleanup_raw_dump("frwiki", data_dir)?;
         ops.compute_all("frwiki", data_dir, output_dir)?;
         ops.compute_patrol("frwiki", data_dir, output_dir, false, None)?;
