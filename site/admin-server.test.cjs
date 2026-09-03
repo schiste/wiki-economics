@@ -697,6 +697,18 @@ test("production execution mode queues heavy work and supports cancellation", as
   assert.equal(status.executionMode, "queue");
   assert.equal(status.adminOperations.counts.queued, 1);
   assert.equal(status.adminOperations.queued[0].wiki, "nlwiki");
+  assert.equal(status.adminOperations.queued[0].queuePosition, 1);
+  assert.match(status.adminOperations.queued[0].earliestDispatchAt, /Z$/);
+  assert.deepEqual(status.adminOperations.dispatcher.minuteSlotsUtc, [3, 13, 23, 33, 43, 53]);
+
+  const duplicate = await invoke(module, {
+    method: "POST",
+    url: "/api/compute",
+    headers: {host, "content-type": "application/json"},
+    body: JSON.stringify({wiki: "nlwiki"}),
+  });
+  assert.equal(duplicate.statusCode, 409);
+  assert.match(JSON.parse(duplicate.text()).error, /already has run queued/);
 
   const cancelled = await invoke(module, {
     method: "POST",
@@ -707,6 +719,103 @@ test("production execution mode queues heavy work and supports cancellation", as
   assert.equal(cancelled.statusCode, 200);
   assert.equal(JSON.parse(cancelled.text()).cancelled, true);
   assert.equal(fs.existsSync(queuedPath), false);
+});
+
+test("non-retryable failures require explicit remediation acknowledgement", async (t) => {
+  const lifecycle = {
+    schema_version: 1,
+    publication_contract: {datasets: {}},
+    wikis: {
+      dewiki: {
+        refresh: "qualification",
+        publication: "hidden",
+        provenance: "toolforge",
+      },
+    },
+  };
+  const failedRequestId = "admin-failed-dewiki-qualify";
+  const {module, host, outputDir, tempRoot} = await startServer(t, {
+    ...LOCAL_ENV,
+    WIKI_ECON_ADMIN_EXECUTION_MODE: "queue",
+  }, lifecycle, ({dataDir, outputDir: fixtureOutput}) => {
+    const history = path.join(fixtureOutput, "_admin", "operations", "history");
+    const logs = path.join(fixtureOutput, "_admin", "operations", "logs");
+    fs.mkdirSync(history, {recursive: true});
+    fs.mkdirSync(logs, {recursive: true});
+    const logPath = path.join(logs, `${failedRequestId}.log`);
+    fs.writeFileSync(logPath, [
+      'run_id=test INFO selected completed Wikimedia snapshot version="2026-07" lag_months=2',
+      'run_id=test INFO starting stage stage="compute" wiki="dewiki"',
+      "Error: editor identity is unavailable: rows without event_user_id require event_user_text",
+    ].join("\n"));
+    fs.writeFileSync(path.join(history, `1-${failedRequestId}.json`), JSON.stringify({
+      schemaVersion: 1,
+      requestId: failedRequestId,
+      runId: failedRequestId,
+      action: "qualify",
+      wiki: "dewiki",
+      version: null,
+      state: "failed",
+      exitCode: 1,
+      requestedAt: "2026-09-01T00:00:00Z",
+      updatedAt: "2026-09-01T00:01:00Z",
+      finishedAt: "2026-09-01T00:01:00Z",
+      logPath,
+    }));
+    const planDir = path.join(dataDir, "snapshots", "dewiki", "2026-07");
+    fs.mkdirSync(planDir, {recursive: true});
+    fs.writeFileSync(
+      path.join(planDir, "source-plan.json"),
+      JSON.stringify({wiki: "dewiki", snapshot: "2026-07", sources: []}),
+    );
+  });
+
+  const blocked = await invoke(module, {
+    method: "POST",
+    url: "/api/qualify",
+    headers: {host, "content-type": "application/json"},
+    body: JSON.stringify({wiki: "dewiki"}),
+  });
+  assert.equal(blocked.statusCode, 409);
+  assert.match(JSON.parse(blocked.text()).error, /will not repeat unchanged work/);
+
+  const acknowledged = await invoke(module, {
+    method: "POST",
+    url: "/api/qualify",
+    headers: {host, "content-type": "application/json"},
+    body: JSON.stringify({wiki: "dewiki", acknowledgeBlockedRetry: true}),
+  });
+  assert.equal(acknowledged.statusCode, 202);
+  const body = JSON.parse(acknowledged.text());
+  assert.equal(body.operation.blockedRetryAcknowledged, true);
+  assert.equal(body.operation.supersedesFailedRequestId, failedRequestId);
+  assert.equal(
+    fs.existsSync(path.join(outputDir, "_admin", "operations", "queued", `${body.requestId}.json`)),
+    true,
+  );
+
+  const cancelled = await invoke(module, {
+    method: "POST",
+    url: "/api/cancel",
+    headers: {host, "content-type": "application/json"},
+    body: JSON.stringify({requestId: body.requestId}),
+  });
+  assert.equal(cancelled.statusCode, 200);
+  const rolloverPlanDir = path.join(tempRoot, "data", "snapshots", "dewiki", "2026-08");
+  fs.mkdirSync(rolloverPlanDir, {recursive: true});
+  fs.writeFileSync(
+    path.join(rolloverPlanDir, "source-plan.json"),
+    JSON.stringify({wiki: "dewiki", snapshot: "2026-08", sources: []}),
+  );
+
+  const rollover = await invoke(module, {
+    method: "POST",
+    url: "/api/qualify",
+    headers: {host, "content-type": "application/json"},
+    body: JSON.stringify({wiki: "dewiki"}),
+  });
+  assert.equal(rollover.statusCode, 202, rollover.text());
+  assert.equal(JSON.parse(rollover.text()).operation.blockedRetryAcknowledged, false);
 });
 
 test("stale operator work is explained as stalled and can be safely requeued", async (t) => {

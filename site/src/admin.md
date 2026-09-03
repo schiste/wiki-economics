@@ -246,7 +246,8 @@ async function runCommand(action, wikiOrOptions = null) {
       ...(requestedVersion ? {version: requestedVersion} : {}),
       ...(options.requestId ? {requestId: options.requestId} : {}),
       ...(options.mode ? {mode: options.mode} : {}),
-      ...(options.resourceClass ? {resourceClass: options.resourceClass} : {})
+      ...(options.resourceClass ? {resourceClass: options.resourceClass} : {}),
+      ...(options.acknowledgeBlockedRetry ? {acknowledgeBlockedRetry: true} : {})
     })
     const r = await fetch(`${API}/${action}`, {
       method: "POST",
@@ -923,7 +924,17 @@ function milestoneCaption(wiki, milestoneKey, lifecycle, direct, state) {
 
 function stateExplanation(name, wiki, state, lifecycle, direct, fleetWork) {
   if (!lifecycle) return `${name} is supported by the Rust source resolver, but has no lifecycle policy. Processing is intentionally blocked until an operator registers it.`
-  if (state === "queued") return `The request is durable and waiting for the next ${direct?.resourceClass || lifecycle.fleet_resource_class || "assigned"} worker dispatch (at most ten minutes). It is safe to close this page.`
+  if (state === "queued") {
+    const position = direct?.queuePosition ? `Queue position ${direct.queuePosition}. ` : ""
+    const pickup = direct?.waitingForActiveOperation
+      ? "It will start after the active operator operation finishes."
+      : direct?.waitingForEarlierRequest
+        ? "It will start after the earlier queued operator requests finish."
+        : direct?.earliestDispatchAt
+          ? `Earliest scheduled pickup is ${formatRefreshTimestamp(direct.earliestDispatchAt)} (${relativeTime(direct.earliestDispatchAt)}).`
+          : "It is waiting for the scheduled operator worker."
+    return `${position}${pickup} The request is durable, so it is safe to close this page.`
+  }
   if (state === "running") return `${direct?.stageLabel || "Pipeline work"} is in progress${direct?.progress?.detail ? `: ${direct.progress.detail}` : ""}. The worker heartbeat is current.`
   if (state === "stalled") return `The worker lease exists but its heartbeat is overdue. Recover the fleet lease before submitting duplicate work.`
   if (state === "quarantined") return `Automatic retries were exhausted. Review the final log excerpt, correct the cause, then explicitly retry.`
@@ -982,7 +993,7 @@ function pipelineDossier(name, wiki, state, lifecycle, direct, fleetWork, plan) 
         <div class="admin-human-progress-track"><i style=${`width:${progressPercent}%`}></i></div>
         <small>${progress?.ingestedRows ? `${progress.ingestedRows.toLocaleString()} rows ingested` : ""}${progress?.downloadedBytes ? ` · ${formatRefreshBytes(progress.downloadedBytes)} transferred` : ""}</small>
       </div>` : ""}
-      ${stoppedWithExplanation ? html`<div class="admin-human-error"><strong>Why it stopped</strong><span>${direct.errorSummary}</span></div>` : ""}
+      ${stoppedWithExplanation ? html`<div class="admin-human-error"><strong>Why it stopped</strong><span>${direct.errorSummary}</span>${direct.remediation ? html`<small>${direct.remediation}</small>` : ""}</div>` : ""}
     </div>
     <div class="admin-milestone-line" aria-label="Project lifecycle">
       ${pipelineSteps.map((step) => {
@@ -998,8 +1009,16 @@ function pipelineDossier(name, wiki, state, lifecycle, direct, fleetWork, plan) 
         if (confirm(`Add ${name} as a publication-invisible qualification project?`)) registerWiki(name, "qualification", "medium_large")
       }}>Add as qualification</button>` : html`
         <button class="admin-btn primary" ?disabled=${!apiStatus || operationActive}
-          onclick=${() => runCommand(isQualification ? "qualify" : "run", {wiki: name, version: preferredSnapshotVersion()})}>
-          ${isQualification ? "Run full qualification" : "Prepare full update"}
+          onclick=${() => {
+            const blocked = direct?.state === "failed" && direct?.retryable === false
+            if (blocked && !confirm(`${direct.errorSummary}\n\n${direct.remediation}\n\nConfirm only after that remediation has been completed.`)) return
+            runCommand(isQualification ? "qualify" : "run", {
+              wiki: name,
+              version: preferredSnapshotVersion(),
+              acknowledgeBlockedRetry: blocked
+            })
+          }}>
+          ${direct?.state === "failed" && direct?.retryable === false ? "Retry after remediation" : isQualification ? "Run full qualification" : "Prepare full update"}
         </button>
         <button class="admin-btn" ?disabled=${!apiStatus || operationActive} onclick=${() => runCommand("patrol-rebuild", name)}>Rebuild patrol</button>
         <button class="admin-btn" ?disabled=${!apiStatus} onclick=${() => runCommand("cleanup", name)}>Clean stale staging</button>`}
@@ -2287,6 +2306,7 @@ currentManifest.merged.length > 0
 .admin-human-error { display: grid; gap: 0.15rem; max-width: 70ch; margin-top: 0.45rem; padding: 0.7rem 0.8rem; border-left: 3px solid #c13c32; background: color-mix(in srgb, #c13c32 7%, transparent); }
 .admin-human-error strong { font-size: 0.72rem; }
 .admin-human-error span { font-size: 0.76rem; line-height: 1.45; }
+.admin-human-error small { margin-top: 0.2rem; color: var(--theme-foreground-muted); font-size: 0.7rem; line-height: 1.45; }
 .admin-milestone-line { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-top: 1px solid var(--theme-foreground-faintest); }
 .admin-milestone { position: relative; display: grid; grid-template-columns: 0.8rem minmax(0, 1fr); gap: 0.15rem 0.45rem; min-height: 4.2rem; padding: 0.75rem; border-left: 1px solid var(--theme-foreground-faintest); }
 .admin-milestone:first-child { border-left: 0; }

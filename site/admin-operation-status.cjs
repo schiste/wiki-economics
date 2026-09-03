@@ -46,15 +46,34 @@ function unique(values) {
   return Array.from(new Set(values.filter(Boolean)));
 }
 
-function conciseError(message) {
-  if (!message) return null;
+function classifyError(message) {
+  if (!message) return {errorSummary: null, retryable: null, remediationCode: null, remediation: null};
   if (/editor identity is unavailable/i.test(message)) {
-    return "The ingested history contains editors without a usable ID or name. Retrying unchanged inputs will fail again; the input generation needs a compatible identity policy before metrics can be computed.";
+    return {
+      errorSummary: "The ingested history contains editors without a usable ID or name. Retrying unchanged inputs will fail again; the input generation needs a compatible identity policy before metrics can be computed.",
+      retryable: false,
+      remediationCode: "editor_identity_unavailable",
+      remediation: "Correct or rebuild the qualified metric-input generation, then explicitly acknowledge the retry.",
+    };
   }
   if (/HTTP 404 Not Found/i.test(message)) {
-    return "The requested Wikimedia snapshot is not available. Leave the snapshot field blank to use the latest completed dump, or choose an available exact version.";
+    return {
+      errorSummary: "The requested Wikimedia snapshot is not available. Leave the snapshot field blank to use the latest completed dump, or choose an available exact version.",
+      retryable: false,
+      remediationCode: "snapshot_unavailable",
+      remediation: "Select an available snapshot or leave the snapshot blank before retrying.",
+    };
   }
-  return message.replace(/^Error:\s*/i, "").trim();
+  return {
+    errorSummary: message.replace(/^Error:\s*/i, "").trim(),
+    retryable: true,
+    remediationCode: null,
+    remediation: "Review the log, correct any external cause, and retry. Validated source transactions remain reusable.",
+  };
+}
+
+function conciseError(message) {
+  return classifyError(message).errorSummary;
 }
 
 function summarizeOperationLog(entry = {}, rawLog = "") {
@@ -99,7 +118,7 @@ function summarizeOperationLog(entry = {}, rawLog = "") {
 
   const errorLine = lastCapture(text, /^Error:\s*(.+)$/gm);
   const rawError = errorLine || entry.rawError || entry.error || null;
-  const errorSummary = conciseError(rawError);
+  const failure = classifyError(rawError);
 
   let percent = null;
   let detail = null;
@@ -128,12 +147,13 @@ function summarizeOperationLog(entry = {}, rawLog = "") {
       ingestedRows,
     },
     rawError,
-    errorSummary,
+    ...failure,
   };
 }
 
 module.exports = {
   STAGE_LABELS,
+  classifyError,
   conciseError,
   stripAnsi,
   summarizeOperationLog,

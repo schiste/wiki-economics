@@ -53,6 +53,9 @@ const ADMIN_OPERATION_DIR = process.env.WIKI_ECON_ADMIN_OPERATION_DIR
 const ADMIN_EXECUTION_MODE = process.env.WIKI_ECON_ADMIN_EXECUTION_MODE
   || (RUNTIME_ENV === "production" ? "queue" : "direct");
 const ADMIN_OPERATION_STALE_MS = Number.parseInt(process.env.WIKI_ECON_ADMIN_OPERATION_STALE_SECS || "600", 10) * 1_000;
+const ADMIN_DISPATCH_MINUTES = parseDispatchMinutes(
+  process.env.WIKI_ECON_ADMIN_DISPATCH_MINUTES || "3,13,23,33,43,53",
+);
 // These ledgers live on Toolforge NFS, so webservice pod replacement cannot
 // turn an interrupted operator action into an apparently idle pipeline.
 const DEFAULT_RUNNER = {
@@ -147,6 +150,30 @@ if (AUTH_ENABLED) {
 function parsePositiveInt(value, fallback) {
   const parsed = Number.parseInt(value || "", 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function parseDispatchMinutes(value) {
+  const minutes = String(value || "")
+    .split(",")
+    .map((part) => Number.parseInt(part.trim(), 10))
+    .filter((minute) => Number.isInteger(minute) && minute >= 0 && minute < 60);
+  return Array.from(new Set(minutes)).sort((left, right) => left - right);
+}
+
+function nextDispatchAt(after = new Date(), slotsAhead = 0) {
+  if (ADMIN_DISPATCH_MINUTES.length === 0) return null;
+  const cursor = new Date(after);
+  cursor.setUTCSeconds(0, 0);
+  cursor.setUTCMinutes(cursor.getUTCMinutes() + 1);
+  let remaining = slotsAhead;
+  for (let checked = 0; checked < 24 * 60 * 8; checked += 1) {
+    if (ADMIN_DISPATCH_MINUTES.includes(cursor.getUTCMinutes())) {
+      if (remaining === 0) return cursor.toISOString();
+      remaining -= 1;
+    }
+    cursor.setUTCMinutes(cursor.getUTCMinutes() + 1);
+  }
+  return null;
 }
 
 function requestHeaderValue(req, name) {
@@ -932,20 +959,69 @@ function recoverStaleAdminOperations() {
 
 function readAdminOperations() {
   const directories = operationDirectories();
-  const queued = operationEntries(directories.queued);
+  const queued = operationEntries(directories.queued)
+    .sort((left, right) => Date.parse(left.requestedAt || 0) - Date.parse(right.requestedAt || 0));
   const running = operationEntries(directories.running);
   const recent = operationEntries(directories.history);
+  const scheduled = queued.map((entry, index) => ({
+    ...entry,
+    queuePosition: index + 1,
+    earliestDispatchAt: running.length === 0 && index === 0 ? nextDispatchAt() : null,
+    waitingForActiveOperation: running.length > 0,
+    waitingForEarlierRequest: index > 0,
+  }));
   return {
     executionMode: ADMIN_EXECUTION_MODE,
     counts: {queued: queued.length, running: running.length},
-    queued,
+    dispatcher: {
+      kind: ADMIN_EXECUTION_MODE === "queue" ? "scheduled-single-flight" : "direct",
+      minuteSlotsUtc: ADMIN_DISPATCH_MINUTES,
+      nextDispatchAt: nextDispatchAt(),
+      running: running.length > 0,
+    },
+    queued: scheduled,
     running,
     recent,
   };
 }
 
-function queueAdminOperation({ action, wiki, version, requestedBy }) {
+function queueAdminOperation({ action, wiki, version, requestedBy, acknowledgeBlockedRetry = false }) {
   const directories = operationDirectories();
+  const active = [
+    ...operationEntries(directories.running, Number.MAX_SAFE_INTEGER),
+    ...operationEntries(directories.queued, Number.MAX_SAFE_INTEGER),
+  ];
+  const sameScope = (entry) => wiki ? entry.wiki === wiki : entry.wiki == null;
+  const conflict = active.find(sameScope);
+  if (conflict) {
+    throw new Error(
+      `${wiki || "A global operation"} already has ${conflict.action || "work"} ${conflict.state}; `
+      + `follow request ${conflict.requestId} instead of creating duplicate work`,
+    );
+  }
+  const latestPlan = wiki
+    ? readSnapshotPlans()
+      .filter((plan) => plan.wiki === wiki)
+      .sort((left, right) => right.snapshot.localeCompare(left.snapshot))[0]
+    : null;
+  const requestedSnapshot = version || latestPlan?.snapshot || null;
+  const blockedFailure = operationEntries(directories.history, Number.MAX_SAFE_INTEGER).find((entry) => {
+    const failedSnapshot = entry.selectedSnapshot || entry.version || null;
+    const sameSnapshot = requestedSnapshot && failedSnapshot
+      ? requestedSnapshot === failedSnapshot
+      : (entry.version || null) === (version || null);
+    return entry.state === "failed"
+      && entry.retryable === false
+      && entry.action === action
+      && sameScope(entry)
+      && sameSnapshot;
+  });
+  if (blockedFailure && !acknowledgeBlockedRetry) {
+    throw new Error(
+      `${blockedFailure.errorSummary} ${blockedFailure.remediation} `
+      + "The admin will not repeat unchanged work automatically.",
+    );
+  }
   const requestId = adminRunId(action, wiki);
   const requestedAt = new Date().toISOString();
   const request = {
@@ -961,6 +1037,8 @@ function queueAdminOperation({ action, wiki, version, requestedBy }) {
     updatedAt: requestedAt,
     state: "queued",
     cancelRequested: false,
+    blockedRetryAcknowledged: Boolean(blockedFailure && acknowledgeBlockedRetry),
+    supersedesFailedRequestId: blockedFailure?.requestId || null,
     logPath: path.join(directories.logs, `${requestId}.log`),
   };
   atomicWriteJson(path.join(directories.queued, `${requestId}.json`), request);
@@ -1860,7 +1938,13 @@ async function handleRequest(req, res) {
           });
           const nextAction = mode === "qualification" ? "qualify" : "run";
           if (ADMIN_EXECUTION_MODE === "queue") {
-            const request = queueAdminOperation({action: nextAction, wiki, version, requestedBy: operator});
+            const request = queueAdminOperation({
+              action: nextAction,
+              wiki,
+              version,
+              requestedBy: operator,
+              acknowledgeBlockedRetry: params.acknowledgeBlockedRetry === true,
+            });
             writeJson(res, 202, {
               registered: true,
               queued: true,
@@ -1950,13 +2034,23 @@ async function handleRequest(req, res) {
       }
 
       if (ADMIN_EXECUTION_MODE === "queue" && (wikiActions.has(action) || globalActions.has(action))) {
-        const request = queueAdminOperation({action, wiki, version, requestedBy: operator});
-        writeJson(res, 202, {
-          started: false,
-          queued: true,
-          requestId: request.requestId,
-          operation: request,
-        });
+        try {
+          const request = queueAdminOperation({
+            action,
+            wiki,
+            version,
+            requestedBy: operator,
+            acknowledgeBlockedRetry: params.acknowledgeBlockedRetry === true,
+          });
+          writeJson(res, 202, {
+            started: false,
+            queued: true,
+            requestId: request.requestId,
+            operation: request,
+          });
+        } catch (error) {
+          writeJson(res, 409, {error: error.message});
+        }
         return;
       }
 

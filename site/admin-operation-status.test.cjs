@@ -60,6 +60,9 @@ test("operation summaries turn permanent identity failures into actionable expla
   assert.equal(summary.stage, "compute");
   assert.match(summary.errorSummary, /Retrying unchanged inputs will fail again/);
   assert.match(summary.errorSummary, /compatible identity policy/);
+  assert.equal(summary.retryable, false);
+  assert.equal(summary.remediationCode, "editor_identity_unavailable");
+  assert.match(summary.remediation, /explicitly acknowledge/);
 });
 
 test("operation summaries retain the requested snapshot when the bounded log has no resolver line", () => {
