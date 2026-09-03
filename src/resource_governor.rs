@@ -255,6 +255,12 @@ pub(crate) struct ResourceObservation {
     pub(crate) cpu_throttled_usec: Option<u64>,
     pub(crate) read_bytes: Option<u64>,
     pub(crate) write_bytes: Option<u64>,
+    pub(crate) downloaded_bytes: u64,
+    pub(crate) ingested_rows: u64,
+    pub(crate) download_elapsed_ms: u64,
+    pub(crate) ingest_elapsed_ms: u64,
+    pub(crate) download_bytes_per_second: Option<u64>,
+    pub(crate) ingest_rows_per_second: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -326,7 +332,10 @@ impl ResourceGovernor {
         let total_source_bytes = checked_sum(source_bytes.iter().flatten().copied())?;
         let mut ordered = source_bytes.iter().flatten().copied().collect::<Vec<_>>();
         ordered.sort_unstable_by(|left, right| right.cmp(left));
-        let window_limit = maximum_window_sources.min(self.budget.source_worker_limit);
+        // Source-window execution may retain the source currently being
+        // ingested plus one download-ahead source. Account for the complete
+        // configured window independently of the HTTP worker count.
+        let window_limit = maximum_window_sources;
         let window_bytes = checked_sum(ordered.into_iter().take(window_limit))?;
         let estimated_additional = total_source_bytes
             .checked_add(window_bytes)
@@ -677,6 +686,13 @@ impl GovernorState {
 
     fn completed_observation(&self) -> ResourceObservation {
         let mut observation = self.observation.clone();
+        observation.downloaded_bytes = self.downloaded_bytes;
+        observation.ingested_rows = self.ingested_rows;
+        observation.download_elapsed_ms = self.download_elapsed_ms;
+        observation.ingest_elapsed_ms = self.ingest_elapsed_ms;
+        observation.download_bytes_per_second =
+            throughput(self.downloaded_bytes, self.download_elapsed_ms);
+        observation.ingest_rows_per_second = throughput(self.ingested_rows, self.ingest_elapsed_ms);
         if let (Some(first), Some(last)) = (self.first_observation, self.latest_observation) {
             observation.cpu_usage_usec = option_delta(last.cpu.usage_usec, first.cpu.usage_usec);
             observation.cpu_user_usec = option_delta(last.cpu.user_usec, first.cpu.user_usec);

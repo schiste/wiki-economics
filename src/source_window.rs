@@ -1,12 +1,11 @@
 use anyhow::{Context, Result};
-use rayon::prelude::*;
 use serde::Serialize;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::time::Instant;
 use tracing::info;
 
-use crate::resource_governor::{GovernorPaths, ResourceGovernor};
+use crate::resource_governor::{GovernorPaths, ResourceGovernor, SourcePermit};
 use crate::snapshot_plan::{SnapshotPlan, SourceSpec};
 use crate::{fetch, ingest, workload_profile};
 
@@ -225,7 +224,24 @@ fn process_source<O: SourceTransactionOps>(
     source: &SourceSpec,
     expected_bytes: u64,
 ) -> Result<u64> {
-    let permit = execution
+    let fetched = fetch_source_transaction(ops, execution, source, expected_bytes)?;
+    ingest_fetched_source(ops, execution, fetched)
+}
+
+struct FetchedSource {
+    source: SourceSpec,
+    path: std::path::PathBuf,
+    downloaded_bytes: u64,
+    download_elapsed_ms: u64,
+}
+
+fn fetch_source_transaction<O: SourceTransactionOps>(
+    ops: &O,
+    execution: &SourceExecution<'_>,
+    source: &SourceSpec,
+    expected_bytes: u64,
+) -> Result<FetchedSource> {
+    let permit: Option<SourcePermit> = execution
         .governor
         .map(|governor| governor.admit_source(expected_bytes))
         .transpose()?;
@@ -244,33 +260,120 @@ fn process_source<O: SourceTransactionOps>(
         source.source_id
     );
     let downloaded_bytes = path.metadata()?.len();
+    if let Some(permit) = permit {
+        permit.complete();
+    }
+    Ok(FetchedSource {
+        source: source.clone(),
+        path,
+        downloaded_bytes,
+        download_elapsed_ms,
+    })
+}
+
+fn ingest_fetched_source<O: SourceTransactionOps>(
+    ops: &O,
+    execution: &SourceExecution<'_>,
+    fetched: FetchedSource,
+) -> Result<u64> {
     let ingest_started = Instant::now();
     let commit = ops.ingest_source(
         execution.wiki,
         execution.snapshot,
         execution.data_dir,
-        &path,
+        &fetched.path,
         execution.run_id,
     )?;
     let ingest_elapsed_ms = ingest_started.elapsed().as_millis() as u64;
     anyhow::ensure!(
-        commit.source_id == source.source_id,
+        commit.source_id == fetched.source.source_id,
         "ingest committed the wrong source for {}",
-        source.source_id
+        fetched.source.source_id
     );
     let rows = u64::try_from(commit.rows)?;
     if let Some(governor) = execution.governor {
         governor.record_source_progress(
-            downloaded_bytes,
-            download_elapsed_ms,
+            fetched.downloaded_bytes,
+            fetched.download_elapsed_ms,
             rows,
             ingest_elapsed_ms,
         )?;
     }
-    if let Some(permit) = permit {
-        permit.complete();
-    }
     Ok(rows)
+}
+
+fn process_source_window<O: SourceTransactionOps>(
+    ops: &O,
+    execution: &SourceExecution<'_>,
+    sources: &[SourceSpec],
+    expected_sizes: &[Option<u64>],
+) -> Result<Vec<u64>> {
+    anyhow::ensure!(
+        sources.len() == expected_sizes.len(),
+        "source-window size inventory changed"
+    );
+    if sources.len() < 2 {
+        return sources
+            .iter()
+            .zip(expected_sizes)
+            .map(|(source, expected)| {
+                process_source(
+                    ops,
+                    execution,
+                    source,
+                    expected.context("source size became unknown after preflight")?,
+                )
+            })
+            .collect();
+    }
+
+    // A rendezvous channel permits exactly one source to download while the
+    // previously downloaded source is ingested. The producer cannot start a
+    // third source until the consumer accepts the second, bounding raw files
+    // to the configured two-source window without concurrent Parquet writers.
+    std::thread::scope(|scope| {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<Result<FetchedSource>>(0);
+        let producer = scope.spawn(move || {
+            for (source, expected) in sources.iter().zip(expected_sizes) {
+                let fetched = expected
+                    .context("source size became unknown after preflight")
+                    .and_then(|bytes| fetch_source_transaction(ops, execution, source, bytes));
+                let failed = fetched.is_err();
+                if sender.send(fetched).is_err() || failed {
+                    break;
+                }
+            }
+        });
+        let mut rows = Vec::with_capacity(sources.len());
+        let mut failure = None;
+        for _ in sources {
+            match receiver.recv() {
+                Ok(Ok(fetched)) => match ingest_fetched_source(ops, execution, fetched) {
+                    Ok(count) => rows.push(count),
+                    Err(error) => {
+                        failure = Some(error);
+                        break;
+                    }
+                },
+                Ok(Err(error)) => {
+                    failure = Some(error);
+                    break;
+                }
+                Err(error) => {
+                    failure = Some(anyhow::anyhow!("source prefetch worker stopped: {error}"));
+                    break;
+                }
+            }
+        }
+        drop(receiver);
+        producer
+            .join()
+            .map_err(|_| anyhow::anyhow!("source prefetch worker panicked"))?;
+        if let Some(error) = failure {
+            return Err(error);
+        }
+        Ok(rows)
+    })
 }
 
 /// Execute a snapshot as bounded, independently committed source
@@ -416,6 +519,14 @@ fn prepare_snapshot_with_ops<O: SourceTransactionOps>(
     let reused_sources = planned_sources
         .checked_sub(pending.len())
         .context("pending source inventory exceeds snapshot plan")?;
+    let pending_bytes = source_sizes.iter().try_fold(0_u64, |total, bytes| {
+        total
+            .checked_add(bytes.unwrap_or_default())
+            .context("pending source byte total overflow")
+    })?;
+    let planned_bytes = workload_profile::load(data_dir, wiki, snapshot)?
+        .map(|profile| profile.signals.total_compressed_bytes);
+    let reused_bytes = planned_bytes.map(|total| total.saturating_sub(pending_bytes));
     info!(
         wiki,
         snapshot,
@@ -425,6 +536,8 @@ fn prepare_snapshot_with_ops<O: SourceTransactionOps>(
         reused_sources,
         pending_sources = pending.len(),
         recovered_inputs,
+        planned_bytes = planned_bytes.unwrap_or_default(),
+        reused_bytes = reused_bytes.unwrap_or_default(),
         "starting bounded source-window execution"
     );
 
@@ -432,11 +545,6 @@ fn prepare_snapshot_with_ops<O: SourceTransactionOps>(
         .map(|governor| governor.budget().source_worker_limit)
         .unwrap_or(1)
         .min(window_size);
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(source_worker_limit)
-        .thread_name(|index| format!("source-worker-{index}"))
-        .build()
-        .context("failed to create governed source worker pool")?;
     let execution = SourceExecution {
         wiki,
         snapshot,
@@ -450,17 +558,12 @@ fn prepare_snapshot_with_ops<O: SourceTransactionOps>(
             .iter()
             .position(|candidate| candidate.source_id == sources[0].source_id)
             .context("source window is not part of pending inventory")?;
-        let rows = pool.install(|| {
-            sources
-                .par_iter()
-                .enumerate()
-                .map(|(index, source)| {
-                    let expected_bytes = source_sizes[offset + index]
-                        .context("source size became unknown after preflight")?;
-                    process_source(ops, &execution, source, expected_bytes)
-                })
-                .collect::<Result<Vec<_>>>()
-        })?;
+        let rows = process_source_window(
+            ops,
+            &execution,
+            sources,
+            &source_sizes[offset..offset + sources.len()],
+        )?;
         let rows = rows.into_iter().try_fold(0_u64, |total, rows| {
             total
                 .checked_add(rows)
@@ -473,6 +576,31 @@ fn prepare_snapshot_with_ops<O: SourceTransactionOps>(
     })?;
 
     ops.finalize(wiki, snapshot, data_dir, select_generation)?;
+    if let Some(governor) = governor {
+        let observation = governor.observation();
+        let fragment_count = crate::storage::read_generation_manifest(data_dir, wiki, snapshot)
+            .ok()
+            .and_then(|manifest| u64::try_from(manifest.fragments.len()).ok());
+        let observations = workload_profile::WorkloadObservations {
+            schema_version: 1,
+            fragment_count,
+            peak_memory_bytes: observation
+                .cgroup_reported_peak_bytes
+                .into_iter()
+                .chain(observation.cgroup_current_peak_bytes)
+                .chain(observation.rss_peak_bytes)
+                .max(),
+            peak_scratch_bytes: Some(observation.scratch_peak_bytes),
+            throughput_rows_per_second: observation.ingest_rows_per_second,
+        };
+        workload_profile::record_observations(data_dir, wiki, observations)?;
+        info!(
+            wiki,
+            snapshot,
+            observation = %serde_json::to_string(&observation)?,
+            "persisted completed source-window resource observation"
+        );
+    }
     let summary = SourceWindowSummary {
         wiki: wiki.to_string(),
         snapshot: snapshot.to_string(),
@@ -510,6 +638,7 @@ mod tests {
         wrong_path: bool,
         wrong_commit: bool,
         ingest_error: bool,
+        panic_fetch: bool,
     }
 
     impl SourceTransactionOps for FakeOps {
@@ -553,6 +682,7 @@ mod tests {
             _run_id: &str,
             source: &SourceSpec,
         ) -> Result<std::path::PathBuf> {
+            assert!(!self.panic_fetch, "injected source prefetch panic");
             self.windows
                 .lock()
                 .expect("fake windows mutex poisoned")
@@ -973,6 +1103,66 @@ mod tests {
             .to_string()
             .contains("injected ingest failure")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn pipelined_source_failures_stop_without_finalizing() -> Result<()> {
+        let run = |ops: &FakeOps, root: &Path, run_id: &str| {
+            prepare_snapshot_with_ops(
+                ops,
+                "enwiki",
+                "2001-02",
+                root,
+                run_id,
+                ExecutionMode {
+                    window_size: 2,
+                    select_generation: false,
+                },
+                None,
+            )
+        };
+        let pending = SnapshotPlan::resolve("enwiki", "2001-02")?
+            .sources
+            .into_iter()
+            .take(2)
+            .collect::<Vec<_>>();
+
+        let fetch_root = TestDir::new()?;
+        let fetch_error = FakeOps {
+            planned: 2,
+            pending: pending.clone(),
+            path_count_delta: -1,
+            ..FakeOps::default()
+        };
+        assert!(run(&fetch_error, fetch_root.path(), "fetch-error").is_err());
+        assert!(!fetch_error.finalized.load(Ordering::Relaxed));
+
+        let ingest_root = TestDir::new()?;
+        let ingest_error = FakeOps {
+            planned: 2,
+            pending: pending.clone(),
+            ingest_error: true,
+            ..FakeOps::default()
+        };
+        assert!(run(&ingest_error, ingest_root.path(), "ingest-error").is_err());
+        assert!(!ingest_error.finalized.load(Ordering::Relaxed));
+
+        let panic_root = TestDir::new()?;
+        let panic = FakeOps {
+            planned: 2,
+            pending,
+            panic_fetch: true,
+            ..FakeOps::default()
+        };
+        let error = run(&panic, panic_root.path(), "panic")
+            .expect_err("a producer panic must become a normal pipeline error");
+        assert!(
+            error
+                .to_string()
+                .contains("source prefetch worker panicked")
+        );
+        assert!(!panic.finalized.load(Ordering::Relaxed));
         Ok(())
     }
 
