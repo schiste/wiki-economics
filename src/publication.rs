@@ -6082,14 +6082,16 @@ mod tests {
     }
 
     #[test]
-    fn preparation_planner_recovers_receipted_work_from_an_interrupted_candidate() -> Result<()> {
-        let fixture = Fixture::new()?;
-        let ready = fixture.ready_candidate("interrupted-source")?;
+    fn preparation_planner_recovers_receipted_work_from_an_interrupted_candidate() {
+        let fixture = Fixture::new().expect("interrupted candidate fixture should initialize");
+        let ready = fixture
+            .ready_candidate("interrupted-source")
+            .expect("interrupted candidate should become ready before fault injection");
         let source = ready
             .parent()
-            .context("interrupted candidate should have a parent")?
+            .expect("interrupted candidate should have a parent")
             .to_path_buf();
-        fs::remove_file(&ready)?;
+        fs::remove_file(&ready).expect("ready receipt fault injection should succeed");
 
         let plan = plan_wiki_preparation(
             fixture.data.path(),
@@ -6097,7 +6099,8 @@ mod tests {
             "nlwiki",
             "2026-03",
             "resumed-candidate",
-        )?;
+        )
+        .expect("interrupted candidate should resume from receipts");
         assert_eq!(
             plan,
             WikiPreparationPlan::Build {
@@ -6111,7 +6114,8 @@ mod tests {
             "nlwiki",
             "2026-03",
             "resumed-candidate",
-        )?;
+        )
+        .expect("resumed candidate path should resolve");
         assert!(source.join("_stages/compute/monthly/nlwiki.json").is_file());
         assert!(resumed.join("nlwiki/page_weekly_edits.parquet").is_file());
         assert!(resumed.join("nlwiki/patrol.parquet").is_file());
@@ -6122,25 +6126,42 @@ mod tests {
         );
         assert!(resumed.join("_stages/patrol_compute/nlwiki.json").is_file());
         assert!(!resumed.join("ready.json").exists());
-        Ok(())
     }
 
     #[test]
-    fn qualification_planner_recovers_core_before_a_late_patrol_dump() -> Result<()> {
-        let fixture = Fixture::new()?;
+    fn qualification_planner_recovers_core_before_a_late_patrol_dump() {
+        let fixture = Fixture::new().expect("qualification recovery fixture should initialize");
+        let empty_plan = plan_wiki_qualification_preparation(
+            fixture.data.path(),
+            fixture.output.path(),
+            "dewiki",
+            "2026-04",
+            "empty-qualification",
+        )
+        .expect("a first qualification run should require a build");
+        assert_eq!(
+            empty_plan,
+            WikiPreparationPlan::Build {
+                same_snapshot_candidate: false,
+                compute_reused: false,
+                patrol_reused: false,
+            }
+        );
         prepare_hidden_qualification_fixture(&fixture, "waiting-for-patrol");
         let waiting = wiki_qualification_dir(
             fixture.output.path(),
             "nlwiki",
             "2026-03",
             "waiting-for-patrol",
-        )?;
+        )
+        .expect("waiting qualification path should resolve");
         crate::compute::record_candidate_fingerprint_for_test(
             "nlwiki",
             "2026-03",
             fixture.data.path(),
             &waiting,
-        )?;
+        )
+        .expect("core family receipts should record");
 
         let plan = plan_wiki_qualification_preparation(
             fixture.data.path(),
@@ -6148,7 +6169,8 @@ mod tests {
             "nlwiki",
             "2026-03",
             "patrol-retry",
-        )?;
+        )
+        .expect("core-only qualification work should resume");
         assert_eq!(
             plan,
             WikiPreparationPlan::Build {
@@ -6158,12 +6180,36 @@ mod tests {
             }
         );
         let resumed =
-            wiki_qualification_dir(fixture.output.path(), "nlwiki", "2026-03", "patrol-retry")?;
+            wiki_qualification_dir(fixture.output.path(), "nlwiki", "2026-03", "patrol-retry")
+                .expect("resumed qualification path should resolve");
         assert!(resumed.join("nlwiki/gdp.parquet").is_file());
         assert!(resumed.join("nlwiki/page_weekly_edits.parquet").is_file());
         assert!(!resumed.join("_stages/patrol_compute/nlwiki.json").exists());
         assert!(!resumed.join("qualification.json").exists());
-        Ok(())
+
+        crate::patrol::record_candidate_fingerprint_for_test(
+            "nlwiki",
+            "2026-03",
+            fixture.data.path(),
+            &waiting,
+        )
+        .expect("patrol receipt should record once its source is available");
+        let complete = plan_wiki_qualification_preparation(
+            fixture.data.path(),
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            "complete-retry",
+        )
+        .expect("independently complete qualification work should be reusable");
+        assert_eq!(
+            complete,
+            WikiPreparationPlan::Build {
+                same_snapshot_candidate: true,
+                compute_reused: true,
+                patrol_reused: true,
+            }
+        );
     }
 
     #[test]

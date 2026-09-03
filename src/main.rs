@@ -2133,6 +2133,7 @@ mod tests {
     struct RecordingOps {
         calls: RefCell<Vec<String>>,
         preparation_plans: RefCell<VecDeque<publication::WikiPreparationPlan>>,
+        qualification_preparation_plans: RefCell<VecDeque<publication::WikiPreparationPlan>>,
         preparation_error: bool,
         cached_patrol_sources: bool,
     }
@@ -2396,6 +2397,25 @@ mod tests {
                     patrol_reused: false,
                 },
             ))
+        }
+
+        fn plan_qualification_preparation(
+            &self,
+            _wiki: &str,
+            _version: &str,
+            _data_dir: &Path,
+            _output_dir: &Path,
+            _run_id: &str,
+        ) -> Result<publication::WikiPreparationPlan> {
+            Ok(self
+                .qualification_preparation_plans
+                .borrow_mut()
+                .pop_front()
+                .unwrap_or(publication::WikiPreparationPlan::Build {
+                    same_snapshot_candidate: false,
+                    compute_reused: false,
+                    patrol_reused: false,
+                }))
         }
 
         fn cached_patrol_sources_available(&self, _wiki: &str, _data_dir: &Path) -> bool {
@@ -3010,6 +3030,136 @@ mod tests {
     }
 
     #[test]
+    fn preparation_skips_a_cached_patrol_download_but_computes_its_metric() -> Result<()> {
+        let cli = Cli::try_parse_from([
+            "wiki-econ",
+            "--data-dir",
+            "fixtures/data",
+            "--output-dir",
+            "fixtures/output",
+            "--run-id",
+            "cached-patrol-run",
+            "prepare-wiki",
+            "nlwiki",
+            "--version",
+            "2026-07",
+        ])?;
+        let ops = RecordingOps {
+            preparation_plans: RefCell::new(VecDeque::from([
+                publication::WikiPreparationPlan::Build {
+                    same_snapshot_candidate: true,
+                    compute_reused: true,
+                    patrol_reused: false,
+                },
+            ])),
+            cached_patrol_sources: true,
+            ..RecordingOps::default()
+        };
+
+        run_with_ops(cli, &ops)?;
+
+        assert_eq!(
+            ops.calls.into_inner(),
+            vec![
+                "source_window:nlwiki:2026-07:fixtures/data:1",
+                "compute_patrol:nlwiki:fixtures/data:fixtures/output/_candidates/nlwiki/2026-07/cached-patrol-run:false:_",
+                "candidate_ready:nlwiki:2026-07:cached-patrol-run",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn qualification_reuses_complete_work_and_rejects_an_impossible_noop() -> Result<()> {
+        let command = || {
+            Cli::try_parse_from([
+                "wiki-econ",
+                "--data-dir",
+                "qualification/data",
+                "--output-dir",
+                "qualification/output",
+                "--run-id",
+                "qualification-reuse",
+                "qualify-wiki",
+                "itwiki",
+                "--version",
+                "2026-07",
+            ])
+        };
+        let reused = RecordingOps {
+            qualification_preparation_plans: RefCell::new(VecDeque::from([
+                publication::WikiPreparationPlan::Build {
+                    same_snapshot_candidate: true,
+                    compute_reused: true,
+                    patrol_reused: true,
+                },
+            ])),
+            ..RecordingOps::default()
+        };
+        run_with_ops(command()?, &reused)?;
+        assert_eq!(
+            reused.calls.into_inner(),
+            vec![
+                "qualification_lifecycle:itwiki",
+                "source_window:itwiki:2026-07:qualification/data:1",
+                "qualification_ready:itwiki:2026-07:qualification-reuse",
+            ]
+        );
+
+        let impossible = RecordingOps {
+            qualification_preparation_plans: RefCell::new(VecDeque::from([
+                publication::WikiPreparationPlan::NoOp {
+                    ready_path: PathBuf::from("not-publication-eligible"),
+                },
+            ])),
+            ..RecordingOps::default()
+        };
+        let error = run_with_ops(command()?, &impossible)
+            .expect_err("a qualification planner must never return a publication no-op");
+        assert!(error.to_string().contains("unexpectedly resolved"));
+        Ok(())
+    }
+
+    #[test]
+    fn qualification_skips_a_cached_patrol_download() -> Result<()> {
+        let cli = Cli::try_parse_from([
+            "wiki-econ",
+            "--data-dir",
+            "qualification/data",
+            "--output-dir",
+            "qualification/output",
+            "--run-id",
+            "qualification-cached-patrol",
+            "qualify-wiki",
+            "itwiki",
+            "--version",
+            "2026-07",
+        ])?;
+        let ops = RecordingOps {
+            qualification_preparation_plans: RefCell::new(VecDeque::from([
+                publication::WikiPreparationPlan::Build {
+                    same_snapshot_candidate: true,
+                    compute_reused: true,
+                    patrol_reused: false,
+                },
+            ])),
+            cached_patrol_sources: true,
+            ..RecordingOps::default()
+        };
+        run_with_ops(cli, &ops)?;
+        assert_eq!(
+            ops.calls.into_inner(),
+            vec![
+                "qualification_lifecycle:itwiki",
+                "source_window:itwiki:2026-07:qualification/data:1",
+                "compute_patrol:itwiki:qualification/data:qualification/output/_qualifications/itwiki/2026-07/qualification-cached-patrol:false:_",
+                "qualification_ready:itwiki:2026-07:qualification-cached-patrol",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn ops_default_publication_methods_delegate_and_fail_closed() -> Result<()> {
         let root = TestDir::new()?;
         let data = root.path().join("data");
@@ -3048,6 +3198,21 @@ mod tests {
         );
         assert_eq!(
             ops.plan_candidate_preparation("nlwiki", "2026-07", &data, &output, "candidate",)?,
+            publication::WikiPreparationPlan::Build {
+                same_snapshot_candidate: false,
+                compute_reused: false,
+                patrol_reused: false,
+            }
+        );
+        assert_eq!(
+            ops.plan_qualification_preparation(
+                "itwiki",
+                "2026-07",
+                &data,
+                &output,
+                "qualification",
+            )
+            .expect("default qualification planner should succeed"),
             publication::WikiPreparationPlan::Build {
                 same_snapshot_candidate: false,
                 compute_reused: false,
@@ -3982,6 +4147,21 @@ mod tests {
         ops.persist_snapshot_plans(&["simplewiki".to_string()], "2026-07", data_dir.path())?;
         assert!(
             crate::snapshot_plan::plan_path(data_dir.path(), "simplewiki", "2026-07")?.is_file()
+        );
+        assert_eq!(
+            ops.plan_qualification_preparation(
+                "simplewiki",
+                "2026-07",
+                data_dir.path(),
+                output_dir.path(),
+                "qualification-plan",
+            )
+            .expect("real qualification planning should delegate"),
+            publication::WikiPreparationPlan::Build {
+                same_snapshot_candidate: false,
+                compute_reused: false,
+                patrol_reused: false,
+            }
         );
 
         let raw_ingest_dir = data_dir.path().join("raw").join("ingestwiki");
