@@ -41,6 +41,7 @@ data/patrol/<wiki>/
   generations/2026-08/<sha256(parser-version)>/
     generation.json
     indefinitely-blocked-accounts.json
+    blocks/year=YYYY/month=YYYY-MM/part-00000.parquet
     patrol/year=YYYY/month=YYYY-MM/part-00000.parquet
     rights/year=YYYY/month=YYYY-MM/part-00000.parquet
 ```
@@ -58,13 +59,21 @@ source-plan identity,
 history snapshot and coverage, ETag and
 Last-Modified values when supplied, downloaded SHA-256, parser version,
 autopatrol groups, total/patrol/rights/local-block/skipped counts, the
-indefinite-block index identity and row count, and every monthly
+indefinite-block index identity and row count, and every monthly patrol,
+rights, and account-block
 artifact's rows, bytes, SHA-256, ordering contract, and observed modification
 time. The manifest has a canonical semantic hash. The atomic current pointer
 also records the exact manifest-file hash so non-Rust readiness tooling can
 verify the selected receipt without parsing nanosecond integers imprecisely.
 
-`indefinitely-blocked-accounts.json` contains only normalized local account
+Each monthly `blocks` Parquet retains one row per recognized local
+block/reblock/unblock event: timestamp, log ID, normalized target account,
+action, and resulting duration class. These internal rows preserve whether and
+when an account was ever locally blocked without exposing the event history in
+the public browser datasets. They are externally sorted in bounded batches,
+content-hashed, and owned by the snapshot generation.
+
+`indefinitely-blocked-accounts.json` is derived from that complete history and contains only normalized local account
 names whose latest public transition through the selected snapshot leaves an
 indefinite block in force. IPs, ranges, autoblocks, temporary-account names,
 suppressed targets, and global locks are excluded. Finite blocks and later
@@ -80,7 +89,7 @@ scope dimension is rolled out, while ingest and unrelated artifacts remain
 reusable.
 
 The downloaded gzip is deleted only after all monthly Parquets, the block
-index, and the synced manifest are durable. A failed build removes only its identified staging
+history, the current-state index, and the synced manifest are durable. A failed build removes only its identified staging
 directory. An incomplete final generation fails closed and is not silently
 adopted.
 

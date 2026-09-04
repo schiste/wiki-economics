@@ -47,9 +47,9 @@ mutable `/latest/` alias. These dumps are used specifically for:
 - **Patrol events** (`log_type=patrol`) — records of editors reviewing new pages and edits
 - **User rights changes** (`log_type=rights`) — used to reconstruct which editors held autopatrol permissions at any given time
 - **Local account blocks** (`log_type=block`) — reduced at the selected
-  snapshot cutoff to a deterministic index of accounts whose latest local
-  state is indefinitely blocked; IP/range/autoblock, temporary-account and
-  global-lock semantics are deliberately outside this dimension
+  snapshot cutoff to a deterministic current-state index and retained as
+  immutable monthly transition history; IP/range/autoblock, temporary-account
+  and global-lock semantics are deliberately outside this dimension
 
 Patrol inventory resolution runs after durable history ingest and core
 computation. If neither logging job is complete, the run records

@@ -1259,7 +1259,11 @@ editor</params></logitem>
   <logitem><id>8</id><timestamp>2026-02-10T12:00:00Z</timestamp><type>block</type><action>block</action><logtitle>User:Restored editor</logtitle><params>infinity</params></logitem>
   <logitem><id>9</id><timestamp>2026-02-11T12:00:00Z</timestamp><type>block</type><action>unblock</action><logtitle>User:Restored_editor</logtitle><params></params></logitem>
 </mediawiki>"#;
-    let source = gzip_bytes(xml)?;
+    let block_member = xml
+        .find("  <logitem><id>7</id>")
+        .context("generation fixture should contain a block-history member")?;
+    let mut source = gzip_bytes(&xml[..block_member])?;
+    source.extend(gzip_bytes(&xml[block_member..])?);
     let transport = FakePatrolTransport::new(
         vec![source.clone()],
         vec![json!({
@@ -1281,6 +1285,7 @@ editor</params></logitem>
     assert_eq!(generation.stats.unblock_events, 1);
     assert_eq!(generation.patrol_months.len(), 2);
     assert_eq!(generation.rights_months.len(), 2);
+    assert_eq!(generation.block_months.len(), 1);
     assert_eq!(
         generation.sources[0].content_length,
         u64::try_from(source.len())?
@@ -1297,6 +1302,10 @@ editor</params></logitem>
     let root = generation::generation_dir(data_dir.path(), "testwiki", "2026-08")?;
     assert!(root.join("generation.json").is_file());
     assert!(root.join("indefinitely-blocked-accounts.json").is_file());
+    assert!(
+        root.join("blocks/year=2026/month=2026-02/part-00000.parquet")
+            .is_file()
+    );
     assert!(!root.join("source.xml.gz").exists());
     assert!(
         root.join("patrol/year=2026/month=2026-01/part-00000.parquet")
@@ -1330,6 +1339,8 @@ editor</params></logitem>
     assert_eq!(summary.rights_events, 2);
     assert_eq!(summary.local_account_block_events, 3);
     assert_eq!(summary.indefinitely_blocked_accounts, 1);
+    assert_eq!(summary.block_history_months, 1);
+    assert!(summary.block_history_bytes > 0);
     assert_eq!(summary.skipped_events, 2);
     assert_eq!(summary.manifest_sha256, generation.manifest_sha256);
     assert!(source_generation_summary(data_dir.path(), "testwiki", "2026-07")?.is_none());
@@ -1344,6 +1355,40 @@ editor</params></logitem>
     assert_eq!(blocked.accounts.len(), 1);
     assert_eq!(blocked.accounts[0].normalized_name, "Blocked editor");
     assert_eq!(blocked.accounts[0].latest_transition_log_id, 7);
+
+    let block_history = read_parquet_df(
+        &generation::artifact_path(&root, &generation.block_months[0])?,
+        None,
+    )?;
+    assert_eq!(block_history.height(), 3);
+    assert_eq!(
+        block_history
+            .column("target_user")?
+            .str()?
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![
+            Some("Blocked editor"),
+            Some("Restored editor"),
+            Some("Restored editor")
+        ]
+    );
+    assert_eq!(
+        block_history
+            .column("action")?
+            .str()?
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![Some("block"), Some("block"), Some("unblock")]
+    );
+    assert_eq!(
+        block_history
+            .column("resulting_state")?
+            .str()?
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![Some("indefinite"), Some("indefinite"), Some("unblocked")]
+    );
 
     let blocked_path = root.join("indefinitely-blocked-accounts.json");
     let original_blocked = fs::read(&blocked_path)?;
@@ -2107,6 +2152,7 @@ fn patrol_generation_sorts_unordered_multi_member_events_deterministically() -> 
 0</params></logitem>
 <logitem><id>19</id><timestamp>2024-02-10T00:00:00Z</timestamp><type>rights</type><logtitle>User:Editor</logtitle><params>editor
 autopatrolled</params></logitem>
+<logitem><id>30</id><timestamp>2024-02-15T00:00:00Z</timestamp><type>block</type><action>block</action><logtitle>User:Later</logtitle><params>infinity</params></logitem>
 "#
     .to_string();
     let mut second_member = String::new();
@@ -2116,7 +2162,10 @@ autopatrolled</params></logitem>
         ));
     }
     second_member.push_str(
-        r#"<logitem><id>10</id><timestamp>2024-01-05T00:00:00Z</timestamp><type>rights</type><logtitle>User:Editor</logtitle><params>editor
+        r#"<logitem><id>12</id><timestamp>2024-01-12T00:00:00Z</timestamp><type>block</type><action>unblock</action><logtitle>User:Earlier</logtitle><params></params></logitem>
+<logitem><id>11</id><timestamp>2024-01-11T00:00:00Z</timestamp><type>block</type><action>block</action><logtitle>User:Earlier</logtitle><params>infinity</params></logitem>
+<logitem><id>13</id><timestamp>2024-01-13T00:00:00Z</timestamp><type>block</type><action>block</action><logtitle>User:Later</logtitle><params>2 weeks</params></logitem>
+<logitem><id>10</id><timestamp>2024-01-05T00:00:00Z</timestamp><type>rights</type><logtitle>User:Editor</logtitle><params>editor
 autopatrolled</params></logitem>
 </mediawiki>"#,
     );
@@ -2141,6 +2190,7 @@ autopatrolled</params></logitem>
     let second = build(second_root.path())?;
     assert_eq!(first.patrol_months.len(), 2);
     assert_eq!(first.rights_months.len(), 2);
+    assert_eq!(first.block_months.len(), 2);
     assert_eq!(
         first
             .patrol_months
@@ -2153,6 +2203,26 @@ autopatrolled</params></logitem>
             .collect::<Vec<_>>(),
         second
             .patrol_months
+            .iter()
+            .map(|artifact| (
+                &artifact.event_month,
+                &artifact.artifact_sha256,
+                artifact.rows
+            ))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        first
+            .block_months
+            .iter()
+            .map(|artifact| (
+                &artifact.event_month,
+                &artifact.artifact_sha256,
+                artifact.rows
+            ))
+            .collect::<Vec<_>>(),
+        second
+            .block_months
             .iter()
             .map(|artifact| (
                 &artifact.event_month,
@@ -2228,6 +2298,47 @@ autopatrolled</params></logitem>
             .flatten()
             .collect::<Vec<_>>(),
         vec!["2024-01-05 00:00:00"]
+    );
+    let january_blocks = first
+        .block_months
+        .iter()
+        .find(|artifact| artifact.event_month == "2024-01")
+        .context("January block artifact should exist")?;
+    let january_blocks = read_parquet_df(
+        &generation::artifact_path(&generation_root, january_blocks)?,
+        None,
+    )?;
+    assert_eq!(
+        january_blocks
+            .column("timestamp")?
+            .str()?
+            .iter()
+            .flatten()
+            .collect::<Vec<_>>(),
+        vec![
+            "2024-01-11 00:00:00",
+            "2024-01-12 00:00:00",
+            "2024-01-13 00:00:00"
+        ]
+    );
+    assert_eq!(
+        january_blocks
+            .column("resulting_state")?
+            .str()?
+            .iter()
+            .flatten()
+            .collect::<Vec<_>>(),
+        vec!["indefinite", "unblocked", "finite"]
+    );
+    let blocked =
+        generation::load_indefinitely_blocked_accounts(first_root.path(), "orderwiki", "2026-08")?;
+    assert_eq!(
+        blocked
+            .accounts
+            .iter()
+            .map(|account| account.normalized_name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["Later"]
     );
     assert!(!generation_root.join(".spool").exists());
     Ok(())

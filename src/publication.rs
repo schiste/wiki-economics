@@ -552,6 +552,10 @@ struct PatrolGenerationReport {
     indefinitely_blocked_accounts: u64,
     #[serde(default)]
     unclassified_block_duration_events: u64,
+    #[serde(default)]
+    block_history_months: u64,
+    #[serde(default)]
+    block_history_bytes: u64,
     skipped_events: u64,
     manifest_sha256: String,
 }
@@ -594,6 +598,8 @@ fn patrol_source_report_with_generation(
                 local_account_block_events: source.local_account_block_events,
                 indefinitely_blocked_accounts: source.indefinitely_blocked_accounts,
                 unclassified_block_duration_events: source.unclassified_block_duration_events,
+                block_history_months: source.block_history_months,
+                block_history_bytes: source.block_history_bytes,
                 skipped_events: source.skipped_events,
                 manifest_sha256: source.manifest_sha256,
             }),
@@ -4907,6 +4913,8 @@ mod tests {
             local_account_block_events: 0,
             indefinitely_blocked_accounts: 0,
             unclassified_block_duration_events: 0,
+            block_history_months: 0,
+            block_history_bytes: 0,
             skipped_events: 3,
             manifest_sha256: "b".repeat(64),
         };

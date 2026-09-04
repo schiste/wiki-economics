@@ -29,7 +29,7 @@ const PARQUET_BATCH_ROWS: usize = 50_000;
 const SUBSTANTIAL_LOGGING_DUMP_BYTES: u64 = 1024 * 1024;
 const SUBSTANTIAL_LOG_ITEMS: usize = 10_000;
 const PATROL_COMPUTE_ALGORITHM_VERSION: &str = "patrol-metrics-v5-complete-snapshot-months";
-const PATROL_PARSER_VERSION: &str = "patrol-logging-pinned-plan-v4-indefinite-account-block-index";
+const PATROL_PARSER_VERSION: &str = "patrol-logging-pinned-plan-v5-monthly-account-block-history";
 const REVISION_COLUMNS: &[&str] = &[
     "revision_id",
     "event_timestamp",
@@ -119,6 +119,15 @@ struct RightsBatch {
     new_groups: Vec<String>,
 }
 
+#[derive(Default)]
+struct AccountBlockBatch {
+    timestamp: Vec<String>,
+    log_id: Vec<i64>,
+    target_user: Vec<String>,
+    action: Vec<String>,
+    resulting_state: Vec<String>,
+}
+
 impl PatrolBatch {
     fn take_columns(&mut self) -> Vec<Column> {
         vec![
@@ -147,6 +156,21 @@ impl RightsBatch {
             Column::new("target_user".into(), std::mem::take(&mut self.target_user)),
             Column::new("old_groups".into(), std::mem::take(&mut self.old_groups)),
             Column::new("new_groups".into(), std::mem::take(&mut self.new_groups)),
+        ]
+    }
+}
+
+impl AccountBlockBatch {
+    fn take_columns(&mut self) -> Vec<Column> {
+        vec![
+            Column::new("timestamp".into(), std::mem::take(&mut self.timestamp)),
+            Column::new("log_id".into(), std::mem::take(&mut self.log_id)),
+            Column::new("target_user".into(), std::mem::take(&mut self.target_user)),
+            Column::new("action".into(), std::mem::take(&mut self.action)),
+            Column::new(
+                "resulting_state".into(),
+                std::mem::take(&mut self.resulting_state),
+            ),
         ]
     }
 }
@@ -210,6 +234,8 @@ pub(crate) struct PatrolSourceSummary {
     pub(crate) local_account_block_events: u64,
     pub(crate) indefinitely_blocked_accounts: u64,
     pub(crate) unclassified_block_duration_events: u64,
+    pub(crate) block_history_months: u64,
+    pub(crate) block_history_bytes: u64,
     pub(crate) skipped_events: u64,
     pub(crate) manifest_sha256: String,
 }
@@ -252,6 +278,15 @@ pub(crate) fn source_generation_summary(
         unclassified_block_duration_events: u64::try_from(
             source.stats.unclassified_block_duration_events,
         )?,
+        block_history_months: u64::try_from(source.block_months.len())?,
+        block_history_bytes: source
+            .block_months
+            .iter()
+            .try_fold(0_u64, |total, artifact| {
+                total
+                    .checked_add(artifact.bytes)
+                    .context("account block history byte total overflow")
+            })?,
         skipped_events: u64::try_from(source.stats.skipped_events)?,
         manifest_sha256: source.manifest_sha256,
     }))
@@ -269,12 +304,22 @@ struct RightsWriter {
     batch_rows: usize,
 }
 
+struct AccountBlockWriter {
+    writer: polars::io::parquet::write::BatchedWriter<File>,
+    batch: AccountBlockBatch,
+    batch_rows: usize,
+}
+
 trait PatrolSink {
     fn add_patrol(&mut self, row: PatrolRow) -> Result<()>;
 }
 
 trait RightsSink {
     fn add_rights(&mut self, row: RightsRow) -> Result<()>;
+}
+
+trait AccountBlockSink {
+    fn add_account_block(&mut self, row: AccountBlockEventRow) -> Result<()>;
 }
 
 #[cfg_attr(coverage, allow(dead_code))]
@@ -734,11 +779,64 @@ enum AccountBlockState {
     Unclassified,
 }
 
+impl AccountBlockState {
+    fn event_label(self, action: &str) -> &'static str {
+        if action == "unblock" {
+            return "unblocked";
+        }
+        match self {
+            Self::Indefinite => "indefinite",
+            Self::NotIndefinite => "finite",
+            Self::Unclassified => "unclassified",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 struct AccountBlockTransition {
     timestamp: String,
     log_id: i64,
     state: AccountBlockState,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+struct AccountBlockEventRow {
+    timestamp: String,
+    log_id: i64,
+    target_user: String,
+    action: String,
+    resulting_state: AccountBlockState,
+}
+
+impl AccountBlockEventRow {
+    fn transition(&self) -> AccountBlockTransition {
+        AccountBlockTransition {
+            timestamp: self.timestamp.clone(),
+            log_id: self.log_id,
+            state: self.resulting_state,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+struct AccountBlockStateSortRow {
+    target_user: String,
+    timestamp: String,
+    log_id: i64,
+    action: String,
+    resulting_state: AccountBlockState,
+}
+
+impl From<&AccountBlockEventRow> for AccountBlockStateSortRow {
+    fn from(row: &AccountBlockEventRow) -> Self {
+        Self {
+            target_user: row.target_user.clone(),
+            timestamp: row.timestamp.clone(),
+            log_id: row.log_id,
+            action: row.action.clone(),
+            resulting_state: row.resulting_state,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1849,7 +1947,7 @@ fn parse_logging_events_with_blocks<P: PatrolSink + ?Sized, R: RightsSink + ?Siz
     snapshot: Option<&str>,
     patrol_writer: &mut P,
     rights_writer: &mut R,
-    mut block_transitions: Option<&mut HashMap<String, AccountBlockTransition>>,
+    mut block_writer: Option<&mut dyn AccountBlockSink>,
 ) -> Result<LoggingParseStats> {
     let file = File::open(xml_path)?;
     let compressed_bytes = file.metadata()?.len();
@@ -1896,22 +1994,17 @@ fn parse_logging_events_with_blocks<P: PatrolSink + ?Sized, R: RightsSink + ?Siz
                                 }
                                 item if matches!(item.log_type.as_deref(), Some("block"))
                                     && snapshot.is_some()
-                                    && block_transitions.is_some() =>
+                                    && block_writer.is_some() =>
                                 {
-                                    if let Some((target, transition)) =
-                                        parse_account_block_transition(
-                                            item,
-                                            snapshot.expect("guarded snapshot"),
-                                            &mut stats,
-                                        )?
-                                    {
-                                        update_named_block_transition(
-                                            block_transitions
-                                                .as_deref_mut()
-                                                .expect("guarded block transition collector"),
-                                            target,
-                                            transition,
-                                        )?;
+                                    if let Some(row) = parse_account_block_transition(
+                                        item,
+                                        snapshot.expect("guarded snapshot"),
+                                        &mut stats,
+                                    )? {
+                                        block_writer
+                                            .as_deref_mut()
+                                            .expect("guarded account-block writer")
+                                            .add_account_block(row)?;
                                     } else {
                                         stats.skipped_events += 1;
                                     }
@@ -2153,9 +2246,10 @@ fn parse_account_block_transition_for_staging(
 ) -> Result<Option<(String, AccountBlockTransition)>> {
     let action = item.log_action.clone().unwrap_or_default();
     let parsed = parse_account_block_transition_common(item, snapshot)?;
-    let Some((target, transition)) = parsed else {
+    let Some(row) = parsed else {
         return Ok(None);
     };
+    let transition = row.transition();
     checked_increment(
         &mut stats.local_account_block_events,
         "local account block event",
@@ -2174,24 +2268,24 @@ fn parse_account_block_transition_for_staging(
             "unclassified account block duration event",
         )?,
     }
-    Ok(Some((target, transition)))
+    Ok(Some((row.target_user, transition)))
 }
 
 fn parse_account_block_transition(
     item: LogItem,
     snapshot: &str,
     stats: &mut LoggingParseStats,
-) -> Result<Option<(String, AccountBlockTransition)>> {
+) -> Result<Option<AccountBlockEventRow>> {
     let action = item.log_action.clone().unwrap_or_default();
     let parsed = parse_account_block_transition_common(item, snapshot)?;
-    let Some((target, transition)) = parsed else {
+    let Some(row) = parsed else {
         return Ok(None);
     };
     stats.local_account_block_events = stats
         .local_account_block_events
         .checked_add(1)
         .context("local account block event count overflow")?;
-    match (action.as_str(), transition.state) {
+    match (action.as_str(), row.resulting_state) {
         ("unblock", _) => {
             stats.unblock_events = stats
                 .unblock_events
@@ -2217,13 +2311,13 @@ fn parse_account_block_transition(
                 .context("unclassified block duration event count overflow")?
         }
     }
-    Ok(Some((target, transition)))
+    Ok(Some(row))
 }
 
 fn parse_account_block_transition_common(
     item: LogItem,
     snapshot: &str,
-) -> Result<Option<(String, AccountBlockTransition)>> {
+) -> Result<Option<AccountBlockEventRow>> {
     let action = item.log_action.as_deref().unwrap_or_default();
     if !matches!(action, "block" | "reblock" | "unblock") {
         return Ok(None);
@@ -2248,14 +2342,13 @@ fn parse_account_block_transition_common(
     } else {
         classify_block_duration(item.params.as_deref())
     };
-    Ok(Some((
-        target,
-        AccountBlockTransition {
-            timestamp,
-            log_id: item.log_id.unwrap_or_default(),
-            state,
-        },
-    )))
+    Ok(Some(AccountBlockEventRow {
+        timestamp,
+        log_id: item.log_id.unwrap_or_default(),
+        target_user: target,
+        action: action.to_string(),
+        resulting_state: state,
+    }))
 }
 
 fn checked_increment(value: &mut u64, label: &str) -> Result<()> {
@@ -2671,6 +2764,59 @@ impl RightsSink for RightsWriter {
     }
 }
 
+impl AccountBlockWriter {
+    fn new(path: &Path) -> Result<Self> {
+        Self::new_with_batch_rows(path, PARQUET_BATCH_ROWS)
+    }
+
+    fn new_with_batch_rows(path: &Path, batch_rows: usize) -> Result<Self> {
+        let file = File::create(path)?;
+        let schema = account_block_schema();
+        let writer = ParquetWriter::new(file)
+            .with_compression(ParquetCompression::Zstd(None))
+            .batched(&schema)?;
+        Ok(Self {
+            writer,
+            batch: AccountBlockBatch::default(),
+            batch_rows,
+        })
+    }
+
+    fn add(&mut self, row: AccountBlockEventRow) -> Result<()> {
+        let resulting_state = row.resulting_state.event_label(&row.action).to_string();
+        self.batch.timestamp.push(row.timestamp);
+        self.batch.log_id.push(row.log_id);
+        self.batch.target_user.push(row.target_user);
+        self.batch.action.push(row.action);
+        self.batch.resulting_state.push(resulting_state);
+        if self.batch.timestamp.len() >= self.batch_rows {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        if self.batch.timestamp.is_empty() {
+            return Ok(());
+        }
+        let df = DataFrame::new_infer_height(self.batch.take_columns())?;
+        self.writer.write_batch(&df)?;
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<()> {
+        self.flush()?;
+        self.writer.finish()?;
+        Ok(())
+    }
+}
+
+impl AccountBlockSink for AccountBlockWriter {
+    fn add_account_block(&mut self, row: AccountBlockEventRow) -> Result<()> {
+        self.add(row)
+    }
+}
+
 fn patrol_schema() -> Schema {
     Schema::from_iter([
         Field::new("log_id".into(), DataType::Int64),
@@ -2690,6 +2836,16 @@ fn rights_schema() -> Schema {
         Field::new("target_user".into(), DataType::String),
         Field::new("old_groups".into(), DataType::String),
         Field::new("new_groups".into(), DataType::String),
+    ])
+}
+
+fn account_block_schema() -> Schema {
+    Schema::from_iter([
+        Field::new("timestamp".into(), DataType::String),
+        Field::new("log_id".into(), DataType::Int64),
+        Field::new("target_user".into(), DataType::String),
+        Field::new("action".into(), DataType::String),
+        Field::new("resulting_state".into(), DataType::String),
     ])
 }
 

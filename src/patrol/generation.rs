@@ -6,7 +6,7 @@ use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufWriter};
 use std::marker::PhantomData;
 
-const GENERATION_SCHEMA_VERSION: u32 = 4;
+const GENERATION_SCHEMA_VERSION: u32 = 5;
 const ARTIFACT_ORDERING: &str = "timestamp-logical-fields-v1";
 const BLOCKED_ACCOUNT_ORDERING: &str = "normalized-account-name-v1";
 #[cfg(not(test))]
@@ -86,6 +86,8 @@ pub(super) struct PatrolGeneration {
     pub(super) patrol_months: Vec<MonthArtifact>,
     pub(super) rights_months: Vec<MonthArtifact>,
     pub(super) rights_timeline_digest: String,
+    pub(super) block_months: Vec<MonthArtifact>,
+    pub(super) block_timeline_digest: String,
     pub(super) blocked_accounts: BlockedAccountArtifact,
     pub(super) manifest_sha256: String,
 }
@@ -117,6 +119,12 @@ pub(super) struct MonthlyPatrolWriter {
 
 pub(super) struct MonthlyRightsWriter {
     spool: MonthlySpool<RightsRow>,
+}
+
+pub(super) struct MonthlyAccountBlockWriter {
+    spool: MonthlySpool<AccountBlockEventRow>,
+    state_spool_path: PathBuf,
+    state_spool: BufWriter<File>,
 }
 
 impl<T: Serialize> MonthlySpool<T> {
@@ -252,6 +260,114 @@ impl RightsSink for MonthlyRightsWriter {
         let month = event_month(&row.timestamp)?;
         self.spool.add(&month, &row)
     }
+}
+
+impl MonthlyAccountBlockWriter {
+    fn new(root: &Path) -> Result<Self> {
+        let state_spool_path = root.join(".spool/block-index/events.jsonl");
+        ensure_parent_dir(&state_spool_path)?;
+        let state_spool = BufWriter::new(File::create(&state_spool_path)?);
+        Ok(Self {
+            spool: MonthlySpool::new(root, "blocks"),
+            state_spool_path,
+            state_spool,
+        })
+    }
+
+    fn finish(mut self) -> Result<(Vec<PathBuf>, Vec<IndefinitelyBlockedAccount>)> {
+        self.state_spool.flush()?;
+        self.state_spool.get_ref().sync_all()?;
+        let state_spool_bytes = self.state_spool.get_ref().metadata()?.len();
+        storage::discard_file_cache(self.state_spool.get_ref(), 0, state_spool_bytes);
+        drop(self.state_spool);
+
+        let root = self.spool.root.clone();
+        let state_spool_path = self.state_spool_path;
+        let months = self.spool.finish()?;
+        let mut completed = Vec::with_capacity(months.len());
+        for (month, spool) in months {
+            let final_path = month_path(&root, "blocks", &month)?;
+            ensure_parent_dir(&final_path)?;
+            let temporary = final_path.with_extension("parquet.tmp");
+            let _ = fs::remove_file(&temporary);
+            let mut writer = AccountBlockWriter::new(&temporary)?;
+            external_sort_spool::<AccountBlockEventRow, _>(&spool, |row| writer.add(row))?;
+            writer.finish()?;
+            commit_month_artifact(&temporary, &final_path)?;
+            storage::discard_path_cache(&final_path);
+            completed.push(final_path);
+        }
+        remove_spool_tree(&root, "blocks")?;
+        let current = if state_spool_bytes == 0 {
+            fs::remove_file(&state_spool_path)?;
+            Vec::new()
+        } else {
+            reduce_block_state_spool(&state_spool_path)?
+        };
+        remove_spool_tree(&root, "block-index")?;
+        Ok((completed, current))
+    }
+}
+
+impl AccountBlockSink for MonthlyAccountBlockWriter {
+    fn add_account_block(&mut self, row: AccountBlockEventRow) -> Result<()> {
+        let month = event_month(&row.timestamp)?;
+        self.spool.add(&month, &row)?;
+        serde_json::to_writer(&mut self.state_spool, &AccountBlockStateSortRow::from(&row))?;
+        self.state_spool.write_all(b"\n")?;
+        Ok(())
+    }
+}
+
+fn reduce_block_state_spool(path: &Path) -> Result<Vec<IndefinitelyBlockedAccount>> {
+    let mut latest = None::<AccountBlockStateSortRow>;
+    let mut accounts = Vec::new();
+    external_sort_spool::<AccountBlockStateSortRow, _>(path, |row| {
+        if latest
+            .as_ref()
+            .is_some_and(|existing| existing.target_user != row.target_user)
+        {
+            finish_block_state(latest.take().expect("guarded latest state"), &mut accounts)?;
+        } else if let Some(existing) = latest.as_ref()
+            && existing.timestamp == row.timestamp
+            && existing.log_id == row.log_id
+        {
+            anyhow::ensure!(
+                existing.action == row.action && existing.resulting_state == row.resulting_state,
+                "conflicting account block transitions for {} at {} / {}",
+                row.target_user,
+                row.timestamp,
+                row.log_id
+            );
+        }
+        latest = Some(row);
+        Ok(())
+    })?;
+    if let Some(latest) = latest {
+        finish_block_state(latest, &mut accounts)?;
+    }
+    Ok(accounts)
+}
+
+fn finish_block_state(
+    latest: AccountBlockStateSortRow,
+    accounts: &mut Vec<IndefinitelyBlockedAccount>,
+) -> Result<()> {
+    anyhow::ensure!(
+        latest.resulting_state != AccountBlockState::Unclassified,
+        "latest local block duration for {} cannot be classified at {} / {}",
+        latest.target_user,
+        latest.timestamp,
+        latest.log_id
+    );
+    if latest.resulting_state == AccountBlockState::Indefinite {
+        accounts.push(IndefinitelyBlockedAccount {
+            normalized_name: latest.target_user,
+            latest_transition_timestamp: latest.timestamp,
+            latest_transition_log_id: latest.log_id,
+        });
+    }
+    Ok(())
 }
 
 fn spool_path(root: &Path, kind: &str, month: &str) -> Result<PathBuf> {
@@ -677,7 +793,7 @@ fn build_generation<T: PatrolTransport + ?Sized>(
 
     let mut patrol_writer = MonthlyPatrolWriter::new(staging);
     let mut rights_writer = MonthlyRightsWriter::new(staging);
-    let mut block_transitions = HashMap::<String, AccountBlockTransition>::new();
+    let mut block_writer = MonthlyAccountBlockWriter::new(staging)?;
     let mut stats = LoggingParseStats::default();
     let mut sources = Vec::with_capacity(source_plan.sources.len());
     let mut compressed_bytes = 0_u64;
@@ -692,7 +808,7 @@ fn build_generation<T: PatrolTransport + ?Sized>(
             Some(snapshot),
             &mut patrol_writer,
             &mut rights_writer,
-            Some(&mut block_transitions),
+            Some(&mut block_writer),
         )?;
         stats.total_log_items = stats
             .total_log_items
@@ -736,6 +852,7 @@ fn build_generation<T: PatrolTransport + ?Sized>(
     validate_logging_parse_totals(compressed_bytes, stats, &source_plan.logging_dump_date)?;
     let patrol_files = patrol_writer.finish()?;
     let rights_files = rights_writer.finish()?;
+    let (block_files, indefinitely_blocked_accounts) = block_writer.finish()?;
     anyhow::ensure!(
         stats.patrol_events == 0 || !patrol_files.is_empty(),
         "patrol events were parsed without monthly artifacts"
@@ -744,11 +861,20 @@ fn build_generation<T: PatrolTransport + ?Sized>(
         stats.rights_events == 0 || !rights_files.is_empty(),
         "rights events were parsed without monthly artifacts"
     );
+    anyhow::ensure!(
+        stats.local_account_block_events == 0 || !block_files.is_empty(),
+        "account block events were parsed without monthly artifacts"
+    );
     let patrol_months = artifact_receipts(staging, &patrol_files)?;
     let rights_months = artifact_receipts(staging, &rights_files)?;
     let rights_timeline_digest = timeline_digest(&rights_months);
+    let block_months = artifact_receipts(staging, &block_files)?;
+    let block_timeline_digest = timeline_digest_with_domain(
+        b"wiki-economics\0account-block-timeline\0v1\0",
+        &block_months,
+    );
     let blocked_accounts =
-        write_blocked_account_index(staging, wiki, snapshot, &block_transitions)?;
+        write_blocked_account_index(staging, wiki, snapshot, indefinitely_blocked_accounts)?;
     info!(
         wiki,
         snapshot,
@@ -769,6 +895,8 @@ fn build_generation<T: PatrolTransport + ?Sized>(
         patrol_months,
         rights_months,
         rights_timeline_digest,
+        block_months,
+        block_timeline_digest,
         blocked_accounts,
         manifest_sha256: String::new(),
     };
@@ -816,10 +944,30 @@ fn validate(root: &Path, wiki: &str, snapshot: &str, generation: &PatrolGenerati
     );
     validate_artifacts(root, &generation.patrol_months)?;
     validate_artifacts(root, &generation.rights_months)?;
+    validate_artifacts(root, &generation.block_months)?;
     validate_blocked_account_artifact(root, wiki, snapshot, &generation.blocked_accounts)?;
     anyhow::ensure!(
         generation.rights_timeline_digest == timeline_digest(&generation.rights_months),
         "patrol rights timeline identity changed"
+    );
+    anyhow::ensure!(
+        generation.block_timeline_digest
+            == timeline_digest_with_domain(
+                b"wiki-economics\0account-block-timeline\0v1\0",
+                &generation.block_months,
+            ),
+        "account block timeline identity changed"
+    );
+    anyhow::ensure!(
+        generation.stats.local_account_block_events
+            == usize::try_from(
+                generation
+                    .block_months
+                    .iter()
+                    .try_fold(0_u64, |total, artifact| total.checked_add(artifact.rows))
+                    .context("account block history row count overflow")?
+            )?,
+        "account block history rows do not match parser totals"
     );
     Ok(())
 }
@@ -873,26 +1021,8 @@ fn write_blocked_account_index(
     root: &Path,
     wiki: &str,
     snapshot: &str,
-    transitions: &HashMap<String, AccountBlockTransition>,
+    accounts: Vec<IndefinitelyBlockedAccount>,
 ) -> Result<BlockedAccountArtifact> {
-    let unresolved_latest = transitions
-        .values()
-        .filter(|transition| transition.state == AccountBlockState::Unclassified)
-        .count();
-    anyhow::ensure!(
-        unresolved_latest == 0,
-        "{wiki}/{snapshot} has {unresolved_latest} accounts whose latest local block duration cannot be classified"
-    );
-    let mut accounts = transitions
-        .iter()
-        .filter(|(_, transition)| transition.state == AccountBlockState::Indefinite)
-        .map(|(name, transition)| IndefinitelyBlockedAccount {
-            normalized_name: name.clone(),
-            latest_transition_timestamp: transition.timestamp.clone(),
-            latest_transition_log_id: transition.log_id,
-        })
-        .collect::<Vec<_>>();
-    accounts.sort();
     let index = IndefinitelyBlockedAccountIndex {
         schema_version: 1,
         wiki: wiki.to_string(),
@@ -1028,8 +1158,12 @@ fn checked_artifact_path(root: &Path, relative: &str) -> Result<PathBuf> {
 }
 
 fn timeline_digest(artifacts: &[MonthArtifact]) -> String {
+    timeline_digest_with_domain(b"wiki-economics\0patrol-rights-timeline\0v1\0", artifacts)
+}
+
+fn timeline_digest_with_domain(domain: &[u8], artifacts: &[MonthArtifact]) -> String {
     let mut digest = Sha256::new();
-    digest.update(b"wiki-economics\0patrol-rights-timeline\0v1\0");
+    digest.update(domain);
     for artifact in artifacts {
         update_string(&mut digest, &artifact.event_month);
         update_string(&mut digest, &artifact.artifact_sha256);
