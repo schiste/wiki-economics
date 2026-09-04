@@ -1352,35 +1352,33 @@ fn account_creation_staging_report_uses_creation_cohorts_and_lifetime_edits() ->
             history_row_with_user_id(wiki, "2026-07-01 00:00:00.0", "Other", "999", "2"),
         ],
     )?;
-    let logging = r#"<mediawiki>
-<logitem><id>1</id><timestamp>2025-01-01T00:00:00Z</timestamp><contributor><username>Edited</username><id>101</id></contributor><type>newusers</type><action>create</action><logtitle>User:Edited</logtitle><params>a:1:{s:9:"4::userid";i:101;}</params></logitem>
+    let logging = r#"<?xml version="1.0"?><mediawiki>
+<logitem><id>1</id><timestamp>2025-01-01T00:00:00Z</timestamp><contributor><username>Edited</username><id>101</id></contributor><type>newusers</type><action>create</action><logtitle>User:Edited</logtitle><params><![CDATA[a:1:{s:9:"4::userid";i:101;}]]></params></logitem>
 <logitem><id>2</id><timestamp>2025-01-02T00:00:00Z</timestamp><contributor><username>Never edited</username><id>102</id></contributor><type>newusers</type><action>create</action><logtitle>User:Never edited</logtitle><params>102</params></logitem>
 <logitem><id>3</id><timestamp>2025-02-01T00:00:00Z</timestamp><contributor><username>~2025-1</username><id>103</id></contributor><type>newusers</type><action>autocreate</action><logtitle>User:~2025-1</logtitle><params>103</params></logitem>
+<logitem><id>4</id><timestamp>2025-01-03T00:00:00Z</timestamp><contributor><username>Edited</username><id>101</id></contributor><type>newusers</type><action>create</action><logtitle>User:Edited</logtitle><params>101</params></logitem>
+<logitem><id>5</id><timestamp>2026-09-01T00:00:00Z</timestamp><contributor><username>Future</username><id>104</id></contributor><type>newusers</type><action>create</action><logtitle>User:Future</logtitle><params>104</params></logitem>
+<logitem><id>6</id><timestamp>2025-01-04T00:00:00Z</timestamp><type>rights</type><logtitle>User:Edited</logtitle><params></params></logitem>
 </mediawiki>"#;
     let split_at = logging
         .find("<logitem><id>2</id>")
         .context("account fixture split point")?;
     let mut logging_source = gzip_bytes(&logging[..split_at])?;
     logging_source.extend(gzip_bytes(&logging[split_at..])?);
-    let transport = FakePatrolTransport::new(
+    let transport = Arc::new(FakePatrolTransport::new(
         vec![logging_source],
         vec![json!({"query": {"usergroups": []}})],
-    );
+    ));
+    let _transport = install_test_transport(transport);
     let destination = root
         .path()
         .join("staging/account-creations/accountwiki.json");
-    build_account_creation_staging_report_with_transport(
-        &transport,
-        wiki,
-        snapshot,
-        &data_dir,
-        &destination,
-    )?;
+    build_account_creation_staging_report(wiki, snapshot, &data_dir, &destination)?;
     let report: Value = serde_json::from_slice(&fs::read(destination)?)?;
     assert_eq!(report["wiki"], wiki);
     assert_eq!(report["snapshot"], snapshot);
     assert_eq!(report["license_spdx"], "MIT");
-    assert_eq!(report["account_creation_events"], 3);
+    assert_eq!(report["account_creation_events"], 5);
     assert_eq!(report["permanent_accounts"], 2);
     assert_eq!(report["temporary_accounts"], 1);
     assert_eq!(report["rows"][0]["year_month"], "2025-01");
@@ -1394,6 +1392,113 @@ fn account_creation_staging_report_uses_creation_cohorts_and_lifetime_edits() ->
         fs::read_dir(data_dir.join("staging/account-creations").join(wiki))?.count(),
         0
     );
+    Ok(())
+}
+
+#[test]
+fn account_creation_extraction_fails_closed_and_cleans_logging_staging() -> Result<()> {
+    for (wiki, logging, expected) in [
+        (
+            "malformedwiki",
+            "<mediawiki><logitem></wrong>",
+            "expected `</logitem>`",
+        ),
+        (
+            "unresolvedwiki",
+            r#"<mediawiki><logitem><id>1</id><timestamp>2025-01-01T00:00:00Z</timestamp><contributor><username>Missing</username><id>101</id></contributor><type>newusers</type><action>create2</action><logtitle>User:Missing</logtitle><params></params></logitem></mediawiki>"#,
+            "without a stable target user ID",
+        ),
+        (
+            "temporarywiki",
+            r#"<mediawiki><logitem><id>1</id><timestamp>2025-01-01T00:00:00Z</timestamp><contributor><username>~2025-1</username><id>101</id></contributor><type>newusers</type><action>autocreate</action><logtitle>User:~2025-1</logtitle><params>101</params></logitem></mediawiki>"#,
+            "no permanent account creations",
+        ),
+    ] {
+        let directory = TestDir::new()?;
+        let transport = FakePatrolTransport::new(vec![gzip_bytes(logging)?], Vec::new());
+        let destination = directory.path().join("report.json");
+        let error = build_account_creation_staging_report_with_transport(
+            &transport,
+            wiki,
+            "2026-08",
+            directory.path(),
+            &destination,
+        )
+        .expect_err("invalid account-creation input must fail closed");
+        assert!(error.to_string().contains(expected), "{error:#}");
+        assert!(!destination.exists());
+        let staging = directory
+            .path()
+            .join("staging/account-creations")
+            .join(wiki);
+        assert_eq!(fs::read_dir(staging)?.count(), 0);
+    }
+    Ok(())
+}
+
+#[cfg(coverage)]
+#[test]
+fn account_creation_wrapper_requires_an_installed_coverage_transport() {
+    let lock = TEST_TRANSPORT_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    TEST_TRANSPORT.with(|cell| cell.borrow_mut().take());
+    let error = build_account_creation_staging_report(
+        "svwiki",
+        "2026-08",
+        Path::new("data"),
+        Path::new("report.json"),
+    )
+    .expect_err("coverage extraction requires an injected transport");
+    assert!(error.to_string().contains("install_test_transport"));
+    drop(lock);
+}
+
+#[test]
+fn account_creation_history_fallback_scans_and_reclaims_source_windows() -> Result<()> {
+    let directory = TestDir::new()?;
+    let source_path = directory.path().join("history.tsv.bz2");
+    let mut encoder = BzEncoder::new(File::create(&source_path)?, BzCompression::best());
+    for row in [
+        history_row_with_user_id("simplewiki", "2025-01-01 00:00:00.0", "A", "101", "1"),
+        history_row_with_user_id("simplewiki", "2025-01-02 00:00:00.0", "Other", "999", "2"),
+    ] {
+        encoder.write_all(row.as_bytes())?;
+        encoder.write_all(b"\n")?;
+    }
+    encoder.finish()?;
+    let source_bytes = fs::metadata(&source_path)?.len();
+    let plan = crate::snapshot_plan::SnapshotPlan::resolve("simplewiki", "2026-08")?;
+    assert_eq!(plan.sources.len(), 1);
+    let mut accounts = HashMap::from([
+        (101_i64, ("2025-01".to_string(), false)),
+        (102_i64, ("2025-01".to_string(), false)),
+    ]);
+    let scan =
+        scan_account_history_source_plan_with(&plan, &mut accounts, |_| Ok(source_path.clone()))?;
+    assert_eq!(scan.mode, "bounded_source_window");
+    assert_eq!(scan.sources, 1);
+    assert_eq!(scan.bytes, source_bytes);
+    assert_eq!(scan.revision_rows, 2);
+    assert!(accounts[&101].1);
+    assert!(!accounts[&102].1);
+    assert!(!source_path.exists());
+    Ok(())
+}
+
+#[cfg(coverage)]
+#[test]
+fn account_creation_coverage_build_rejects_uninjected_source_scan() -> Result<()> {
+    let directory = TestDir::new()?;
+    let error = mark_accounts_with_revisions(
+        "simplewiki",
+        "2026-08",
+        directory.path(),
+        &mut HashMap::new(),
+    )
+    .expect_err("coverage build has no production downloader");
+    assert!(error.to_string().contains("test source loader"));
     Ok(())
 }
 

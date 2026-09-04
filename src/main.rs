@@ -735,9 +735,7 @@ trait Ops {
         version: &str,
         data_dir: &Path,
         destination: &Path,
-    ) -> Result<()> {
-        patrol::build_account_creation_staging_report(wiki, version, data_dir, destination)
-    }
+    ) -> Result<()>;
     fn benchmark(
         &self,
         wikis: &[String],
@@ -2767,6 +2765,19 @@ mod tests {
             Ok(())
         }
 
+        fn build_account_creation_staging_report(
+            &self,
+            _wiki: &str,
+            _version: &str,
+            _data_dir: &Path,
+            _destination: &Path,
+        ) -> Result<()> {
+            if self.fail_stage == "account_creations" {
+                anyhow::bail!("account creation failed");
+            }
+            Ok(())
+        }
+
         fn benchmark(
             &self,
             _wikis: &[String],
@@ -3681,6 +3692,45 @@ mod tests {
             "staging/svwiki.json",
         ])?;
         assert!(run_with_ops(missing_snapshot, &RecordingOps::default()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn real_ops_rejects_invalid_account_creation_snapshot() {
+        let ops = RealOps;
+        assert!(
+            ops.build_account_creation_staging_report(
+                "svwiki",
+                "not-a-snapshot",
+                Path::new("data"),
+                Path::new("output.json"),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn failing_ops_exercises_account_creation_failure_contract() -> Result<()> {
+        FailingOps { fail_stage: "none" }
+            .build_account_creation_staging_report(
+                "svwiki",
+                "2026-08",
+                Path::new("data"),
+                Path::new("report.json"),
+            )
+            .expect("non-failing account creation operation should succeed");
+        assert!(
+            FailingOps {
+                fail_stage: "account_creations"
+            }
+            .build_account_creation_staging_report(
+                "svwiki",
+                "2026-08",
+                Path::new("data"),
+                Path::new("report.json"),
+            )
+            .is_err()
+        );
         Ok(())
     }
 

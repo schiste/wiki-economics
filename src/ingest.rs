@@ -30,6 +30,45 @@ pub(crate) struct SourceIngestCommit {
     pub(crate) reused: bool,
 }
 
+/// Scan one validated MediaWiki History source without materializing a
+/// DataFrame, visiting only stable user IDs attached to public revision-create
+/// events. This is used by bounded staging analyses after retained metric input
+/// has been retired.
+pub(crate) fn scan_revision_user_ids(source: &Path, mut visit: impl FnMut(i64)) -> Result<u64> {
+    let file = File::open(source).with_context(|| format!("cannot open {}", source.display()))?;
+    let decoder = BzDecoder::new(BufReader::with_capacity(8 * 1024 * 1024, file));
+    let mut reader = BufReader::with_capacity(8 * 1024 * 1024, decoder);
+    let mut line = Vec::new();
+    let mut revisions = 0_u64;
+    loop {
+        line.clear();
+        if reader.read_until(b'\n', &mut line)? == 0 {
+            break;
+        }
+        let mut fields = line.splitn(8, |byte| *byte == b'\t');
+        let _wiki = fields.next();
+        let _event_log_id = fields.next();
+        let event_entity = fields.next();
+        let event_type = fields.next();
+        let _event_timestamp = fields.next();
+        let _event_comment = fields.next();
+        let event_user_id = fields.next();
+        if event_entity != Some(b"revision".as_slice()) || event_type != Some(b"create".as_slice())
+        {
+            continue;
+        }
+        revisions = revisions
+            .checked_add(1)
+            .context("revision row count overflow")?;
+        let Some(value) = event_user_id.filter(|value| !value.is_empty()) else {
+            continue;
+        };
+        let user_id = std::str::from_utf8(value)?.parse::<i64>()?;
+        visit(user_id);
+    }
+    Ok(revisions)
+}
+
 #[derive(Clone, Debug)]
 struct IngestRoots {
     analytical: PathBuf,
@@ -1254,6 +1293,27 @@ mod tests {
             encoder.write_all(b"\n")?;
         }
         encoder.finish()?;
+        Ok(())
+    }
+
+    #[test]
+    fn revision_user_id_scan_is_bounded_and_filters_non_revision_events() -> Result<()> {
+        let directory = TestDir::new()?;
+        let source = directory.path().join("history.tsv.bz2");
+        write_bz2_dump(
+            &source,
+            &[
+                sample_row("2026-01-01 00:00:00.0", "42", "1", "revision", "create"),
+                sample_row("2026-01-02 00:00:00.0", "", "2", "revision", "create"),
+                sample_row("2026-01-03 00:00:00.0", "43", "3", "revision", "delete"),
+                sample_row("2026-01-04 00:00:00.0", "44", "4", "page", "create"),
+            ],
+        )
+        .expect("history scan fixture should be writable");
+        let mut ids = Vec::new();
+        let revision_rows = scan_revision_user_ids(&source, |user_id| ids.push(user_id))?;
+        assert_eq!(revision_rows, 2);
+        assert_eq!(ids, [42]);
         Ok(())
     }
 

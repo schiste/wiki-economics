@@ -555,32 +555,7 @@ fn build_account_creation_staging_report_with_transport<T: PatrolTransport + ?Si
         "{wiki}/{snapshot} has no permanent account creations in logging coverage"
     );
 
-    let revision_layer = storage::snapshot_compute_layer(
-        data_dir,
-        wiki,
-        snapshot,
-        storage::GenerationLayer::Warehouse,
-    )?;
-    let revision_files =
-        storage::snapshot_fragment_files(data_dir, wiki, snapshot, revision_layer)?;
-    anyhow::ensure!(
-        !revision_files.is_empty(),
-        "account-creation staging requires the retained {wiki}/{snapshot} metric-input generation"
-    );
-    for path in revision_files {
-        let mut reader = storage::SequentialParquetReader::new(
-            &path,
-            Some(projection(&["event_user_id"])),
-            PARQUET_BATCH_ROWS,
-        )?;
-        while let Some(batch) = reader.next_batch()? {
-            for user_id in batch.column("event_user_id")?.i64()?.iter().flatten() {
-                if let Some((_, edited)) = accounts.get_mut(&user_id) {
-                    *edited = true;
-                }
-            }
-        }
-    }
+    let history_scan = mark_accounts_with_revisions(wiki, snapshot, data_dir, &mut accounts)?;
 
     let mut monthly = BTreeMap::<String, (u32, u32)>::new();
     for (month, edited) in accounts.into_values() {
@@ -630,12 +605,12 @@ fn build_account_creation_staging_report_with_transport<T: PatrolTransport + ?Si
         compressed_source_bytes: parse_stats.compressed_bytes,
         total_log_items: parse_stats.total_log_items,
         account_creation_events: parse_stats.account_creation_events,
-        permanent_accounts: u64::try_from(
-            rows.iter()
-                .map(|row| row.accounts_created as usize)
-                .sum::<usize>(),
-        )?,
+        permanent_accounts: rows.iter().map(|row| u64::from(row.accounts_created)).sum(),
         temporary_accounts: parse_stats.temporary_accounts,
+        history_scan_mode: history_scan.mode,
+        history_sources: history_scan.sources,
+        history_source_bytes: history_scan.bytes,
+        history_revision_rows: history_scan.revision_rows,
         definition: "Permanent local accounts created in each month, split by whether the selected public history snapshot contains at least one revision attributed to that local user ID; temporary accounts are excluded.",
         rows,
     };
@@ -658,6 +633,132 @@ struct AccountCreationParseStats {
     permanent_creation_events: u64,
     temporary_accounts: u64,
     unresolved_permanent: u64,
+}
+
+#[derive(Debug)]
+struct AccountCreationHistoryScan {
+    mode: &'static str,
+    sources: u32,
+    bytes: u64,
+    revision_rows: u64,
+}
+
+fn mark_accounts_with_revisions(
+    wiki: &str,
+    snapshot: &str,
+    data_dir: &Path,
+    accounts: &mut HashMap<i64, (String, bool)>,
+) -> Result<AccountCreationHistoryScan> {
+    let retained = storage::snapshot_compute_layer(
+        data_dir,
+        wiki,
+        snapshot,
+        storage::GenerationLayer::Warehouse,
+    )
+    .and_then(|layer| storage::snapshot_fragment_files(data_dir, wiki, snapshot, layer));
+    if let Ok(files) = retained
+        && !files.is_empty()
+    {
+        let mut bytes = 0_u64;
+        let mut revision_rows = 0_u64;
+        for path in &files {
+            bytes = bytes
+                .checked_add(fs::metadata(path)?.len())
+                .context("retained history byte count overflow")?;
+            let columns = projection(&["event_user_id"]);
+            let mut reader =
+                storage::SequentialParquetReader::new(path, Some(columns), PARQUET_BATCH_ROWS)
+                    .with_context(|| format!("cannot scan retained history {}", path.display()))?;
+            while let Some(batch) = reader.next_batch()? {
+                revision_rows = revision_rows
+                    .checked_add(u64::try_from(batch.height())?)
+                    .context("retained revision row count overflow")?;
+                for user_id in batch.column("event_user_id")?.i64()?.iter().flatten() {
+                    if let Some((_, edited)) = accounts.get_mut(&user_id) {
+                        *edited = true;
+                    }
+                }
+            }
+        }
+        return Ok(AccountCreationHistoryScan {
+            mode: "retained_metric_input",
+            sources: u32::try_from(files.len())?,
+            bytes,
+            revision_rows,
+        });
+    }
+
+    scan_account_history_source_plan(wiki, snapshot, data_dir, accounts)
+}
+
+#[cfg(not(coverage))]
+fn scan_account_history_source_plan(
+    wiki: &str,
+    snapshot: &str,
+    data_dir: &Path,
+    accounts: &mut HashMap<i64, (String, bool)>,
+) -> Result<AccountCreationHistoryScan> {
+    let (plan, _) = crate::snapshot_plan::SnapshotPlan::load_or_resolve(data_dir, wiki, snapshot)?;
+    let run_id = format!("account-creations-{wiki}-{snapshot}-{}", std::process::id());
+    scan_account_history_source_plan_with(&plan, accounts, |source| {
+        crate::fetch::fetch_snapshot_source_window(
+            wiki,
+            snapshot,
+            data_dir,
+            &run_id,
+            std::slice::from_ref(source),
+        )?
+        .into_iter()
+        .next()
+        .context("history source window returned no source")
+    })
+}
+
+#[cfg(coverage)]
+fn scan_account_history_source_plan(
+    _wiki: &str,
+    _snapshot: &str,
+    _data_dir: &Path,
+    _accounts: &mut HashMap<i64, (String, bool)>,
+) -> Result<AccountCreationHistoryScan> {
+    anyhow::bail!("bounded history source scan is unavailable without a test source loader")
+}
+
+fn scan_account_history_source_plan_with<F>(
+    plan: &crate::snapshot_plan::SnapshotPlan,
+    accounts: &mut HashMap<i64, (String, bool)>,
+    mut load_source: F,
+) -> Result<AccountCreationHistoryScan>
+where
+    F: FnMut(&crate::snapshot_plan::SourceSpec) -> Result<PathBuf>,
+{
+    let mut bytes = 0_u64;
+    let mut revision_rows = 0_u64;
+    for source in &plan.sources {
+        let path = load_source(source)?;
+        bytes = bytes
+            .checked_add(fs::metadata(&path)?.len())
+            .context("history source byte count overflow")?;
+        revision_rows = revision_rows
+            .checked_add(crate::ingest::scan_revision_user_ids(&path, |user_id| {
+                if let Some((_, edited)) = accounts.get_mut(&user_id) {
+                    *edited = true;
+                }
+            })?)
+            .context("history revision row count overflow")?;
+        fs::remove_file(&path).context("failed to release scanned history source")?;
+        let parent = path
+            .parent()
+            .context("history source has no parent directory")?;
+        let directory = File::open(parent)?;
+        directory.sync_all()?;
+    }
+    Ok(AccountCreationHistoryScan {
+        mode: "bounded_source_window",
+        sources: u32::try_from(plan.sources.len())?,
+        bytes,
+        revision_rows,
+    })
 }
 
 impl AccountCreationParseStats {
@@ -1526,52 +1627,53 @@ fn parse_account_creation_events(
                         current_tag = None;
                     }
                     "logitem" => {
-                        if let Some(item) = current.take() {
-                            stats.total_log_items = stats
-                                .total_log_items
+                        let item = current
+                            .take()
+                            .context("account logitem ended without a matching start")?;
+                        stats.total_log_items = stats
+                            .total_log_items
+                            .checked_add(1)
+                            .context("account logging item count overflow")?;
+                        if matches!(item.log_type.as_deref(), Some("newusers")) {
+                            stats.account_creation_events = stats
+                                .account_creation_events
                                 .checked_add(1)
-                                .context("account logging item count overflow")?;
-                            if matches!(item.log_type.as_deref(), Some("newusers")) {
-                                stats.account_creation_events = stats
-                                    .account_creation_events
-                                    .checked_add(1)
-                                    .context("account creation event count overflow")?;
-                                let row = item.into_new_user_row();
-                                let month = row
-                                    .timestamp
-                                    .get(..7)
-                                    .context("newusers timestamp has no event month")?
-                                    .to_string();
-                                storage::validate_snapshot_version(&month)?;
-                                if compute::snapshot_contains_complete_month(snapshot, &month) {
-                                    if row.is_temporary {
-                                        stats.temporary_accounts = stats
-                                            .temporary_accounts
-                                            .checked_add(1)
-                                            .context("temporary account count overflow")?;
-                                        let count = temporary_by_month.entry(month).or_default();
-                                        *count = count
-                                            .checked_add(1)
-                                            .context("temporary account month count overflow")?;
-                                    } else if let Some(user_id) = row.target_user_id {
-                                        stats.permanent_creation_events = stats
-                                            .permanent_creation_events
-                                            .checked_add(1)
-                                            .context("permanent account count overflow")?;
-                                        if let Some((existing_month, _)) = accounts.get(&user_id) {
-                                            anyhow::ensure!(
-                                                existing_month == &month,
-                                                "account {user_id} has creation events in multiple months"
-                                            );
-                                        } else {
-                                            accounts.insert(user_id, (month, false));
-                                        }
+                                .context("account creation event count overflow")?;
+                            let row = item.into_new_user_row();
+                            let month = row
+                                .timestamp
+                                .get(..7)
+                                .context("newusers timestamp has no event month")?
+                                .to_string();
+                            storage::validate_snapshot_version(&month)?;
+                            if compute::snapshot_contains_complete_month(snapshot, &month) {
+                                if row.is_temporary {
+                                    stats.temporary_accounts = stats
+                                        .temporary_accounts
+                                        .checked_add(1)
+                                        .context("temporary account count overflow")?;
+                                    let count = temporary_by_month.entry(month).or_default();
+                                    *count = count
+                                        .checked_add(1)
+                                        .context("temporary account month count overflow")?;
+                                } else if let Some(user_id) = row.target_user_id {
+                                    stats.permanent_creation_events = stats
+                                        .permanent_creation_events
+                                        .checked_add(1)
+                                        .context("permanent account count overflow")?;
+                                    if let Some((existing_month, _)) = accounts.get(&user_id) {
+                                        anyhow::ensure!(
+                                            existing_month == &month,
+                                            "account {user_id} has creation events in multiple months"
+                                        );
                                     } else {
-                                        stats.unresolved_permanent = stats
-                                            .unresolved_permanent
-                                            .checked_add(1)
-                                            .context("unresolved account count overflow")?;
+                                        accounts.insert(user_id, (month, false));
                                     }
+                                } else {
+                                    stats.unresolved_permanent = stats
+                                        .unresolved_permanent
+                                        .checked_add(1)
+                                        .context("unresolved account count overflow")?;
                                 }
                             }
                         }
@@ -1749,6 +1851,10 @@ struct AccountCreationStagingReport {
     account_creation_events: u64,
     permanent_accounts: u64,
     temporary_accounts: u64,
+    history_scan_mode: &'static str,
+    history_sources: u32,
+    history_source_bytes: u64,
+    history_revision_rows: u64,
     definition: &'static str,
     rows: Vec<AccountCreationMonth>,
 }

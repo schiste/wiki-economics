@@ -1322,24 +1322,22 @@ pub fn write_site_fixture(output_dir: &Path) -> Result<()> {
     fs::create_dir_all(output_dir)?;
     let staging_account_dir = output_dir.join("_staging/account-creations");
     fs::create_dir_all(&staging_account_dir)?;
-    fs::write(
-        staging_account_dir.join("svwiki.json"),
-        serde_json::to_vec_pretty(&json!({
-            "schema_version": 1,
-            "metric_version": "account-creations-v1-permanent-local-account-lifetime-public-edit",
-            "license_spdx": "MIT",
-            "attribution": "Derived from Wikimedia Foundation public datasets",
-            "wiki": "svwiki",
-            "snapshot": "2026-01",
-            "logging_dump_date": "20260201",
-            "source_plan_sha256": "a".repeat(64),
-            "definition": "Deterministic site fixture",
-            "rows": [
-                {"year_month": "2025-12", "accounts_created": 20, "accounts_with_edits": 8, "accounts_without_edits": 12, "temporary_accounts_excluded": 0},
-                {"year_month": "2026-01", "accounts_created": 25, "accounts_with_edits": 10, "accounts_without_edits": 15, "temporary_accounts_excluded": 2}
-            ]
-        }))?,
-    )?;
+    let account_fixture = serde_json::to_vec_pretty(&json!({
+        "schema_version": 1,
+        "metric_version": "account-creations-v1-permanent-local-account-lifetime-public-edit",
+        "license_spdx": "MIT",
+        "attribution": "Derived from Wikimedia Foundation public datasets",
+        "wiki": "svwiki",
+        "snapshot": "2026-01",
+        "logging_dump_date": "20260201",
+        "source_plan_sha256": "a".repeat(64),
+        "definition": "Deterministic site fixture",
+        "rows": [
+            {"year_month": "2025-12", "accounts_created": 20, "accounts_with_edits": 8, "accounts_without_edits": 12, "temporary_accounts_excluded": 0},
+            {"year_month": "2026-01", "accounts_created": 25, "accounts_with_edits": 10, "accounts_without_edits": 15, "temporary_accounts_excluded": 2}
+        ]
+    }))?;
+    fs::write(staging_account_dir.join("svwiki.json"), account_fixture)?;
     let fixtures = [
         (
         "business_funnel",
