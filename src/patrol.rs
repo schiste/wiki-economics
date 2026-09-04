@@ -773,6 +773,14 @@ where
 }
 
 impl AccountCreationParseStats {
+    fn record_cross_month_duplicate(&mut self) -> Result<()> {
+        self.cross_month_duplicate_events = self
+            .cross_month_duplicate_events
+            .checked_add(1)
+            .context("cross-month duplicate account count overflow")?;
+        Ok(())
+    }
+
     fn add(&mut self, other: Self) -> Result<()> {
         for (target, value, label) in [
             (&mut self.total_log_items, other.total_log_items, "log item"),
@@ -1679,12 +1687,7 @@ fn parse_account_creation_events(
                                         .context("permanent account count overflow")?;
                                     if let Some((existing_month, _)) = accounts.get_mut(&user_id) {
                                         if existing_month != &month {
-                                            stats.cross_month_duplicate_events = stats
-                                                .cross_month_duplicate_events
-                                                .checked_add(1)
-                                                .context(
-                                                    "cross-month duplicate account count overflow",
-                                                )?;
+                                            stats.record_cross_month_duplicate()?;
                                             if month < *existing_month {
                                                 *existing_month = month;
                                             }

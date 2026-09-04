@@ -1403,6 +1403,22 @@ fn account_creation_staging_report_uses_creation_cohorts_and_lifetime_edits() ->
 }
 
 #[test]
+fn account_creation_duplicate_counter_fails_closed_on_overflow() {
+    let mut stats = AccountCreationParseStats {
+        cross_month_duplicate_events: u64::MAX,
+        ..AccountCreationParseStats::default()
+    };
+    let error = stats
+        .record_cross_month_duplicate()
+        .expect_err("duplicate counter overflow must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("duplicate account count overflow")
+    );
+}
+
+#[test]
 fn account_creation_extraction_fails_closed_and_cleans_logging_staging() -> Result<()> {
     for (wiki, logging, expected) in [
         (
