@@ -563,28 +563,15 @@ fn build_account_creation_staging_report_with_transport<T: PatrolTransport + ?Si
         data_dir,
         &mut accounts,
         &mut fallback_accounts,
-    )?;
+    );
+    let history_scan = history_scan?;
 
     let mut monthly = BTreeMap::<String, (u32, u32)>::new();
     for (month, edited) in accounts.into_values() {
-        let counts = monthly.entry(month).or_default();
-        counts.0 = counts.0.checked_add(1).context("account count overflow")?;
-        if edited {
-            counts.1 = counts
-                .1
-                .checked_add(1)
-                .context("edited account count overflow")?;
-        }
+        accumulate_account_month(&mut monthly, month, edited)?;
     }
     for (month, edited, _) in fallback_accounts.into_values() {
-        let counts = monthly.entry(month).or_default();
-        counts.0 = counts.0.checked_add(1).context("account count overflow")?;
-        if edited {
-            counts.1 = counts
-                .1
-                .checked_add(1)
-                .context("edited account count overflow")?;
-        }
+        accumulate_account_month(&mut monthly, month, edited)?;
     }
     for month in temporary_by_month.keys() {
         monthly.entry(month.clone()).or_default();
@@ -788,20 +775,22 @@ where
         bytes = bytes
             .checked_add(fs::metadata(&path)?.len())
             .context("history source byte count overflow")?;
+        let source_revision_rows = crate::ingest::scan_revision_user_identities(
+            &path,
+            |user_id, historical_name, current_name| {
+                mark_account_revision(
+                    user_id,
+                    historical_name,
+                    current_name,
+                    accounts,
+                    fallback_accounts,
+                    &fallback_by_name,
+                );
+            },
+        );
+        let source_revision_rows = source_revision_rows?;
         revision_rows = revision_rows
-            .checked_add(crate::ingest::scan_revision_user_identities(
-                &path,
-                |user_id, historical_name, current_name| {
-                    mark_account_revision(
-                        user_id,
-                        historical_name,
-                        current_name,
-                        accounts,
-                        fallback_accounts,
-                        &fallback_by_name,
-                    );
-                },
-            )?)
+            .checked_add(source_revision_rows)
             .context("history revision row count overflow")?;
         fs::remove_file(&path).context("failed to release scanned history source")?;
         let parent = path
@@ -816,6 +805,22 @@ where
         bytes,
         revision_rows,
     })
+}
+
+fn accumulate_account_month(
+    monthly: &mut BTreeMap<String, (u32, u32)>,
+    month: String,
+    edited: bool,
+) -> Result<()> {
+    let counts = monthly.entry(month).or_default();
+    counts.0 = counts.0.checked_add(1).context("account count overflow")?;
+    if edited {
+        counts.1 = counts
+            .1
+            .checked_add(1)
+            .context("edited account count overflow")?;
+    }
+    Ok(())
 }
 
 fn fallback_name_index(
@@ -861,6 +866,14 @@ impl AccountCreationParseStats {
             .cross_month_duplicate_events
             .checked_add(1)
             .context("cross-month duplicate account count overflow")?;
+        Ok(())
+    }
+
+    fn record_fallback_identity(&mut self) -> Result<()> {
+        self.fallback_identity_accounts = self
+            .fallback_identity_accounts
+            .checked_add(1)
+            .context("fallback-identity account count overflow")?;
         Ok(())
     }
 
@@ -1801,12 +1814,7 @@ fn parse_account_creation_events(
                                         } else {
                                             fallback_accounts
                                                 .insert(log_id, (month, false, target_user));
-                                            stats.fallback_identity_accounts = stats
-                                                .fallback_identity_accounts
-                                                .checked_add(1)
-                                                .context(
-                                                    "fallback-identity account count overflow",
-                                                )?;
+                                            stats.record_fallback_identity()?;
                                         }
                                     } else {
                                         stats.unresolved_permanent = stats

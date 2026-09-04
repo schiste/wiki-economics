@@ -1362,6 +1362,7 @@ fn account_creation_staging_report_uses_creation_cohorts_and_lifetime_edits() ->
 <logitem><id>6</id><timestamp>2026-09-01T00:00:00Z</timestamp><contributor><username>Future</username><id>104</id></contributor><type>newusers</type><action>create</action><logtitle>User:Future</logtitle><params>104</params></logitem>
 <logitem><id>7</id><timestamp>2025-01-04T00:00:00Z</timestamp><type>rights</type><logtitle>User:Edited</logtitle><params></params></logitem>
 <logitem><id>8</id><timestamp>2025-03-01T00:00:00Z</timestamp><contributor><username>Administrator</username><id>999</id></contributor><type>newusers</type><action>create2</action><logtitle>User:Legacy</logtitle><params></params></logitem>
+<logitem><id>8</id><timestamp>2025-03-01T00:00:00Z</timestamp><contributor><username>Administrator</username><id>999</id></contributor><type>newusers</type><action>create2</action><logtitle>User:Legacy</logtitle><params></params></logitem>
 </mediawiki>"#;
     let split_at = logging
         .find("<logitem><id>2</id>")
@@ -1381,10 +1382,10 @@ fn account_creation_staging_report_uses_creation_cohorts_and_lifetime_edits() ->
     assert_eq!(report["wiki"], wiki);
     assert_eq!(report["snapshot"], snapshot);
     assert_eq!(report["license_spdx"], "MIT");
-    assert_eq!(report["account_creation_events"], 7);
-    assert_eq!(report["permanent_account_creation_events"], 5);
+    assert_eq!(report["account_creation_events"], 8);
+    assert_eq!(report["permanent_account_creation_events"], 6);
     assert_eq!(report["permanent_accounts"], 3);
-    assert_eq!(report["duplicate_permanent_creation_events"], 2);
+    assert_eq!(report["duplicate_permanent_creation_events"], 3);
     assert_eq!(report["cross_month_duplicate_events"], 1);
     assert_eq!(report["fallback_identity_accounts"], 1);
     assert_eq!(report["temporary_accounts"], 1);
@@ -1422,6 +1423,40 @@ fn account_creation_duplicate_counter_fails_closed_on_overflow() {
             .to_string()
             .contains("duplicate account count overflow")
     );
+}
+
+#[test]
+fn account_creation_fallback_counter_fails_closed_on_overflow() {
+    let mut stats = AccountCreationParseStats {
+        fallback_identity_accounts: u64::MAX,
+        ..AccountCreationParseStats::default()
+    };
+    let error = stats
+        .record_fallback_identity()
+        .expect_err("fallback identity counter overflow must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("fallback-identity account count overflow")
+    );
+}
+
+#[cfg(coverage)]
+#[test]
+fn account_creation_report_propagates_missing_history_scan() -> Result<()> {
+    let directory = TestDir::new()?;
+    let logging = r#"<mediawiki><logitem><id>1</id><timestamp>2025-01-01T00:00:00Z</timestamp><contributor><username>Editor</username><id>101</id></contributor><type>newusers</type><action>create</action><logtitle>User:Editor</logtitle><params>101</params></logitem></mediawiki>"#;
+    let transport = FakePatrolTransport::new(vec![gzip_bytes(logging)?], Vec::new());
+    let error = build_account_creation_staging_report_with_transport(
+        &transport,
+        "simplewiki",
+        "2026-08",
+        directory.path(),
+        &directory.path().join("report.json"),
+    )
+    .expect_err("coverage build cannot fetch retired history inputs");
+    assert!(error.to_string().contains("test source loader"));
+    Ok(())
 }
 
 #[test]
