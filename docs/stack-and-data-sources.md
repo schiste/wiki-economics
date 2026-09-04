@@ -46,6 +46,10 @@ mutable `/latest/` alias. These dumps are used specifically for:
 
 - **Patrol events** (`log_type=patrol`) — records of editors reviewing new pages and edits
 - **User rights changes** (`log_type=rights`) — used to reconstruct which editors held autopatrol permissions at any given time
+- **Local account blocks** (`log_type=block`) — reduced at the selected
+  snapshot cutoff to a deterministic index of accounts whose latest local
+  state is indefinitely blocked; IP/range/autoblock, temporary-account and
+  global-lock semantics are deliberately outside this dimension
 
 Patrol inventory resolution runs after durable history ingest and core
 computation. If neither logging job is complete, the run records
@@ -55,8 +59,9 @@ patrol fetch.
 The XML is streamed and parsed on-the-fly without loading the full file into memory. Wikimedia
 logging dumps may contain concatenated gzip members, so the Rust reader decodes every member as
 one continuous XML stream. The fetch log reports total log items, recognized patrol events,
-recognized rights events, and skipped events. A substantial dump that produces no relevant events
-is rejected instead of publishing empty Parquet files.
+recognized rights events, recognized local account-block transitions, final indefinitely blocked
+accounts, and skipped events. A substantial dump that produces no relevant events is rejected
+instead of publishing empty Parquet files.
 
 ### MediaWiki API
 

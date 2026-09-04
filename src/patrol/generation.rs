@@ -6,8 +6,9 @@ use std::fs::OpenOptions;
 use std::io::{self, BufRead, BufWriter};
 use std::marker::PhantomData;
 
-const GENERATION_SCHEMA_VERSION: u32 = 3;
+const GENERATION_SCHEMA_VERSION: u32 = 4;
 const ARTIFACT_ORDERING: &str = "timestamp-logical-fields-v1";
+const BLOCKED_ACCOUNT_ORDERING: &str = "normalized-account-name-v1";
 #[cfg(not(test))]
 const EXTERNAL_SORT_BATCH_ROWS: usize = PARQUET_BATCH_ROWS;
 #[cfg(test)]
@@ -43,6 +44,36 @@ pub(super) struct MonthArtifact {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub(super) struct BlockedAccountArtifact {
+    pub(super) relative_path: String,
+    pub(super) artifact_sha256: String,
+    pub(super) bytes: u64,
+    pub(super) rows: u64,
+    pub(super) observed_modified_unix_nanos: u128,
+    pub(super) ordering_contract: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct IndefinitelyBlockedAccount {
+    pub(crate) normalized_name: String,
+    pub(crate) latest_transition_timestamp: String,
+    pub(crate) latest_transition_log_id: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct IndefinitelyBlockedAccountIndex {
+    pub(crate) schema_version: u32,
+    pub(crate) wiki: String,
+    pub(crate) snapshot: String,
+    pub(crate) parser_version: String,
+    pub(crate) definition: String,
+    pub(crate) accounts: Vec<IndefinitelyBlockedAccount>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct PatrolGeneration {
     schema_version: u32,
     pub(super) wiki: String,
@@ -55,6 +86,7 @@ pub(super) struct PatrolGeneration {
     pub(super) patrol_months: Vec<MonthArtifact>,
     pub(super) rights_months: Vec<MonthArtifact>,
     pub(super) rights_timeline_digest: String,
+    pub(super) blocked_accounts: BlockedAccountArtifact,
     pub(super) manifest_sha256: String,
 }
 
@@ -470,6 +502,21 @@ pub(super) fn tracked_inputs(
     )])
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn load_indefinitely_blocked_accounts(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot: &str,
+) -> Result<IndefinitelyBlockedAccountIndex> {
+    let root = generation_dir(data_dir, wiki, snapshot)?;
+    let generation = load(data_dir, wiki, snapshot)?;
+    let path = checked_artifact_path(&root, &generation.blocked_accounts.relative_path)?;
+    let index: IndefinitelyBlockedAccountIndex = serde_json::from_slice(&fs::read(&path)?)
+        .with_context(|| format!("invalid blocked-account index {}", path.display()))?;
+    validate_blocked_account_index(wiki, snapshot, &index)?;
+    Ok(index)
+}
+
 pub(super) fn fetch<T: PatrolTransport + ?Sized>(
     transport: &T,
     wiki: &str,
@@ -630,6 +677,7 @@ fn build_generation<T: PatrolTransport + ?Sized>(
 
     let mut patrol_writer = MonthlyPatrolWriter::new(staging);
     let mut rights_writer = MonthlyRightsWriter::new(staging);
+    let mut block_transitions = HashMap::<String, AccountBlockTransition>::new();
     let mut stats = LoggingParseStats::default();
     let mut sources = Vec::with_capacity(source_plan.sources.len());
     let mut compressed_bytes = 0_u64;
@@ -639,7 +687,13 @@ fn build_generation<T: PatrolTransport + ?Sized>(
         compressed_bytes = compressed_bytes
             .checked_add(source.content_length)
             .context("patrol source bytes overflow")?;
-        let parsed = parse_logging_events(&source_path, &mut patrol_writer, &mut rights_writer)?;
+        let parsed = parse_logging_events_with_blocks(
+            &source_path,
+            Some(snapshot),
+            &mut patrol_writer,
+            &mut rights_writer,
+            Some(&mut block_transitions),
+        )?;
         stats.total_log_items = stats
             .total_log_items
             .checked_add(parsed.total_log_items)
@@ -652,6 +706,26 @@ fn build_generation<T: PatrolTransport + ?Sized>(
             .rights_events
             .checked_add(parsed.rights_events)
             .context("rights event count overflow")?;
+        stats.local_account_block_events = stats
+            .local_account_block_events
+            .checked_add(parsed.local_account_block_events)
+            .context("local account block event count overflow")?;
+        stats.indefinite_block_events = stats
+            .indefinite_block_events
+            .checked_add(parsed.indefinite_block_events)
+            .context("indefinite block event count overflow")?;
+        stats.finite_block_events = stats
+            .finite_block_events
+            .checked_add(parsed.finite_block_events)
+            .context("finite block event count overflow")?;
+        stats.unblock_events = stats
+            .unblock_events
+            .checked_add(parsed.unblock_events)
+            .context("account unblock event count overflow")?;
+        stats.unclassified_block_duration_events = stats
+            .unclassified_block_duration_events
+            .checked_add(parsed.unclassified_block_duration_events)
+            .context("unclassified block duration event count overflow")?;
         stats.skipped_events = stats
             .skipped_events
             .checked_add(parsed.skipped_events)
@@ -673,6 +747,16 @@ fn build_generation<T: PatrolTransport + ?Sized>(
     let patrol_months = artifact_receipts(staging, &patrol_files)?;
     let rights_months = artifact_receipts(staging, &rights_files)?;
     let rights_timeline_digest = timeline_digest(&rights_months);
+    let blocked_accounts =
+        write_blocked_account_index(staging, wiki, snapshot, &block_transitions)?;
+    info!(
+        wiki,
+        snapshot,
+        local_account_block_events = stats.local_account_block_events,
+        indefinitely_blocked_accounts = blocked_accounts.rows,
+        unclassified_block_duration_events = stats.unclassified_block_duration_events,
+        "captured snapshot-scoped indefinite local account blocks"
+    );
     let mut generation = PatrolGeneration {
         schema_version: GENERATION_SCHEMA_VERSION,
         wiki: wiki.to_string(),
@@ -685,6 +769,7 @@ fn build_generation<T: PatrolTransport + ?Sized>(
         patrol_months,
         rights_months,
         rights_timeline_digest,
+        blocked_accounts,
         manifest_sha256: String::new(),
     };
     generation.manifest_sha256 = generation.canonical_hash()?;
@@ -709,6 +794,7 @@ fn validate(root: &Path, wiki: &str, snapshot: &str, generation: &PatrolGenerati
             && generation.stats.total_log_items
                 == generation.stats.patrol_events
                     + generation.stats.rights_events
+                    + generation.stats.local_account_block_events
                     + generation.stats.skipped_events
             && generation
                 .sources
@@ -730,6 +816,7 @@ fn validate(root: &Path, wiki: &str, snapshot: &str, generation: &PatrolGenerati
     );
     validate_artifacts(root, &generation.patrol_months)?;
     validate_artifacts(root, &generation.rights_months)?;
+    validate_blocked_account_artifact(root, wiki, snapshot, &generation.blocked_accounts)?;
     anyhow::ensure!(
         generation.rights_timeline_digest == timeline_digest(&generation.rights_months),
         "patrol rights timeline identity changed"
@@ -779,6 +866,120 @@ fn validate_artifacts(root: &Path, artifacts: &[MonthArtifact]) -> Result<()> {
         }
         previous = Some(artifact.event_month.clone());
     }
+    Ok(())
+}
+
+fn write_blocked_account_index(
+    root: &Path,
+    wiki: &str,
+    snapshot: &str,
+    transitions: &HashMap<String, AccountBlockTransition>,
+) -> Result<BlockedAccountArtifact> {
+    let unresolved_latest = transitions
+        .values()
+        .filter(|transition| transition.state == AccountBlockState::Unclassified)
+        .count();
+    anyhow::ensure!(
+        unresolved_latest == 0,
+        "{wiki}/{snapshot} has {unresolved_latest} accounts whose latest local block duration cannot be classified"
+    );
+    let mut accounts = transitions
+        .iter()
+        .filter(|(_, transition)| transition.state == AccountBlockState::Indefinite)
+        .map(|(name, transition)| IndefinitelyBlockedAccount {
+            normalized_name: name.clone(),
+            latest_transition_timestamp: transition.timestamp.clone(),
+            latest_transition_log_id: transition.log_id,
+        })
+        .collect::<Vec<_>>();
+    accounts.sort();
+    let index = IndefinitelyBlockedAccountIndex {
+        schema_version: 1,
+        wiki: wiki.to_string(),
+        snapshot: snapshot.to_string(),
+        parser_version: PATROL_PARSER_VERSION.to_string(),
+        definition: "Accounts whose latest public local block/reblock/unblock transition through the selected snapshot leaves an indefinite block in force; IPs, ranges, autoblocks, temporary accounts, suppressed targets, and non-local global locks are excluded.".to_string(),
+        accounts,
+    };
+    validate_blocked_account_index(wiki, snapshot, &index)?;
+    let path = root.join("indefinitely-blocked-accounts.json");
+    atomic_json(&path, &index)?;
+    let metadata = fs::metadata(&path)?;
+    let (bytes, artifact_sha256) = storage::sha256_file(&path)?;
+    Ok(BlockedAccountArtifact {
+        relative_path: "indefinitely-blocked-accounts.json".to_string(),
+        artifact_sha256,
+        bytes,
+        rows: u64::try_from(index.accounts.len())?,
+        observed_modified_unix_nanos: modified_nanos(&metadata)?,
+        ordering_contract: BLOCKED_ACCOUNT_ORDERING.to_string(),
+    })
+}
+
+fn validate_blocked_account_artifact(
+    root: &Path,
+    wiki: &str,
+    snapshot: &str,
+    artifact: &BlockedAccountArtifact,
+) -> Result<()> {
+    anyhow::ensure!(
+        artifact.relative_path == "indefinitely-blocked-accounts.json"
+            && artifact.ordering_contract == BLOCKED_ACCOUNT_ORDERING
+            && artifact.artifact_sha256.len() == 64
+            && artifact
+                .artifact_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()),
+        "blocked-account artifact inventory is invalid"
+    );
+    let path = checked_artifact_path(root, &artifact.relative_path)?;
+    let metadata = fs::metadata(&path)?;
+    anyhow::ensure!(
+        metadata.is_file() && metadata.len() == artifact.bytes,
+        "blocked-account artifact size changed"
+    );
+    let (_, sha256) = storage::sha256_file(&path)?;
+    anyhow::ensure!(
+        sha256 == artifact.artifact_sha256,
+        "blocked-account artifact identity changed"
+    );
+    let index: IndefinitelyBlockedAccountIndex = serde_json::from_slice(&fs::read(&path)?)?;
+    validate_blocked_account_index(wiki, snapshot, &index)?;
+    anyhow::ensure!(
+        u64::try_from(index.accounts.len())? == artifact.rows,
+        "blocked-account artifact row count changed"
+    );
+    Ok(())
+}
+
+fn validate_blocked_account_index(
+    wiki: &str,
+    snapshot: &str,
+    index: &IndefinitelyBlockedAccountIndex,
+) -> Result<()> {
+    let sorted_unique = index
+        .accounts
+        .windows(2)
+        .all(|pair| pair[0].normalized_name < pair[1].normalized_name);
+    anyhow::ensure!(
+        index.schema_version == 1
+            && index.wiki == wiki
+            && index.snapshot == snapshot
+            && index.parser_version == PATROL_PARSER_VERSION
+            && sorted_unique
+            && index.accounts.iter().all(|account| {
+                !account.normalized_name.is_empty()
+                    && normalize_account_name(&account.normalized_name) == account.normalized_name
+                    && account
+                        .latest_transition_timestamp
+                        .get(..7)
+                        .is_some_and(|month| {
+                            storage::validate_snapshot_version(month).is_ok()
+                                && compute::snapshot_contains_complete_month(snapshot, month)
+                        })
+            }),
+        "blocked-account index is invalid for {wiki}/{snapshot}"
+    );
     Ok(())
 }
 

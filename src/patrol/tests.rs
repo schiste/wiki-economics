@@ -1212,6 +1212,11 @@ autopatrolled</params>
             total_log_items: 4,
             patrol_events: 1,
             rights_events: 1,
+            local_account_block_events: 0,
+            indefinite_block_events: 0,
+            finite_block_events: 0,
+            unblock_events: 0,
+            unclassified_block_duration_events: 0,
             skipped_events: 2,
         }
     );
@@ -1250,6 +1255,9 @@ autopatrolled</params></logitem>
 editor</params></logitem>
   <logitem><id>5</id><timestamp>2026-02-07T12:00:00Z</timestamp><contributor><username>Editor</username><id>42</id></contributor><type>newusers</type><action>create</action><logtitle>User:Editor</logtitle><params>a:1:{s:9:"4::userid";i:42;}</params></logitem>
   <logitem><id>6</id><timestamp>2026-02-08T12:00:00Z</timestamp><contributor><username>~2026-1</username><id>43</id></contributor><type>newusers</type><action>autocreate</action><logtitle>User:~2026-1</logtitle><params>43</params></logitem>
+  <logitem><id>7</id><timestamp>2026-02-09T12:00:00Z</timestamp><type>block</type><action>block</action><logtitle>User:Blocked_editor</logtitle><params>infinity</params></logitem>
+  <logitem><id>8</id><timestamp>2026-02-10T12:00:00Z</timestamp><type>block</type><action>block</action><logtitle>User:Restored editor</logtitle><params>infinity</params></logitem>
+  <logitem><id>9</id><timestamp>2026-02-11T12:00:00Z</timestamp><type>block</type><action>unblock</action><logtitle>User:Restored_editor</logtitle><params></params></logitem>
 </mediawiki>"#;
     let source = gzip_bytes(xml)?;
     let transport = FakePatrolTransport::new(
@@ -1265,9 +1273,12 @@ editor</params></logitem>
     generation::preflight(&transport, "testwiki", "2026-08", data_dir.path())?;
     generation::preflight(&transport, "testwiki", "2026-08", data_dir.path())?;
     let generation = generation::fetch(&transport, "testwiki", "2026-08", data_dir.path())?;
-    assert_eq!(generation.stats.total_log_items, 6);
+    assert_eq!(generation.stats.total_log_items, 9);
     assert_eq!(generation.stats.patrol_events, 2);
     assert_eq!(generation.stats.rights_events, 2);
+    assert_eq!(generation.stats.local_account_block_events, 3);
+    assert_eq!(generation.stats.indefinite_block_events, 2);
+    assert_eq!(generation.stats.unblock_events, 1);
     assert_eq!(generation.patrol_months.len(), 2);
     assert_eq!(generation.rights_months.len(), 2);
     assert_eq!(
@@ -1285,6 +1296,7 @@ editor</params></logitem>
     assert_eq!(generation.parser_version, PATROL_PARSER_VERSION);
     let root = generation::generation_dir(data_dir.path(), "testwiki", "2026-08")?;
     assert!(root.join("generation.json").is_file());
+    assert!(root.join("indefinitely-blocked-accounts.json").is_file());
     assert!(!root.join("source.xml.gz").exists());
     assert!(
         root.join("patrol/year=2026/month=2026-01/part-00000.parquet")
@@ -1313,9 +1325,11 @@ editor</params></logitem>
     );
     let summary = source_generation_summary(data_dir.path(), "testwiki", "2026-08")?
         .context("test patrol generation summary is missing")?;
-    assert_eq!(summary.total_log_items, 6);
+    assert_eq!(summary.total_log_items, 9);
     assert_eq!(summary.patrol_events, 2);
     assert_eq!(summary.rights_events, 2);
+    assert_eq!(summary.local_account_block_events, 3);
+    assert_eq!(summary.indefinitely_blocked_accounts, 1);
     assert_eq!(summary.skipped_events, 2);
     assert_eq!(summary.manifest_sha256, generation.manifest_sha256);
     assert!(source_generation_summary(data_dir.path(), "testwiki", "2026-07")?.is_none());
@@ -1324,6 +1338,22 @@ editor</params></logitem>
     assert_eq!(reused, generation);
     generation::preflight(&transport, "testwiki", "2026-08", data_dir.path())?;
     assert_eq!(transport.get_calls().len(), 1);
+
+    let blocked =
+        generation::load_indefinitely_blocked_accounts(data_dir.path(), "testwiki", "2026-08")?;
+    assert_eq!(blocked.accounts.len(), 1);
+    assert_eq!(blocked.accounts[0].normalized_name, "Blocked editor");
+    assert_eq!(blocked.accounts[0].latest_transition_log_id, 7);
+
+    let blocked_path = root.join("indefinitely-blocked-accounts.json");
+    let original_blocked = fs::read(&blocked_path)?;
+    fs::write(&blocked_path, b"{}")?;
+    assert!(generation::load(data_dir.path(), "testwiki", "2026-08").is_err());
+    fs::write(&blocked_path, original_blocked)?;
+    assert_eq!(
+        generation::load(data_dir.path(), "testwiki", "2026-08")?,
+        generation
+    );
 
     let first_patrol = root.join(&generation.patrol_months[0].relative_path);
     let original_patrol = fs::read(&first_patrol)?;
@@ -1334,6 +1364,34 @@ editor</params></logitem>
     );
     fs::write(&first_patrol, b"corrupt")?;
     assert!(generation::load(data_dir.path(), "testwiki", "2026-08").is_err());
+    Ok(())
+}
+
+#[test]
+fn production_block_index_fails_closed_on_an_unclassified_latest_transition() -> Result<()> {
+    let data_dir = TestDir::new()?;
+    let xml = r#"<mediawiki>
+  <logitem><id>1</id><timestamp>2026-01-05T12:00:00Z</timestamp><contributor><username>Patroller</username><id>10</id></contributor><type>patrol</type><logtitle>Page</logtitle><params>101
+100
+0</params></logitem>
+  <logitem><id>2</id><timestamp>2026-01-06T12:00:00Z</timestamp><type>rights</type><logtitle>User:Editor</logtitle><params>editor
+autopatrolled</params></logitem>
+  <logitem><id>3</id><timestamp>2026-02-09T12:00:00Z</timestamp><type>block</type><action>block</action><logtitle>User:Unclassified</logtitle><params>a:1:{broken</params></logitem>
+</mediawiki>"#;
+    let transport = FakePatrolTransport::new(
+        vec![gzip_bytes(xml)?],
+        vec![json!({"query": {"usergroups": []}})],
+    );
+    let error = generation::fetch(&transport, "blockwiki", "2026-08", data_dir.path())
+        .expect_err("an ambiguous latest block state must not publish an index");
+    assert!(error.to_string().contains("cannot be classified"));
+    assert!(!generation::manifest_path(data_dir.path(), "blockwiki", "2026-08")?.exists());
+    assert!(
+        !data_dir
+            .path()
+            .join("patrol/blockwiki/current-generation.json")
+            .exists()
+    );
     Ok(())
 }
 

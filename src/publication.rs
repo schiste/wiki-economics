@@ -546,6 +546,12 @@ struct PatrolGenerationReport {
     downloaded_sha256: String,
     parser_version: String,
     total_log_items: u64,
+    #[serde(default)]
+    local_account_block_events: u64,
+    #[serde(default)]
+    indefinitely_blocked_accounts: u64,
+    #[serde(default)]
+    unclassified_block_duration_events: u64,
     skipped_events: u64,
     manifest_sha256: String,
 }
@@ -585,6 +591,9 @@ fn patrol_source_report_with_generation(
                 downloaded_sha256: source.downloaded_sha256,
                 parser_version: source.parser_version,
                 total_log_items: source.total_log_items,
+                local_account_block_events: source.local_account_block_events,
+                indefinitely_blocked_accounts: source.indefinitely_blocked_accounts,
+                unclassified_block_duration_events: source.unclassified_block_duration_events,
                 skipped_events: source.skipped_events,
                 manifest_sha256: source.manifest_sha256,
             }),
@@ -4895,6 +4904,9 @@ mod tests {
             total_log_items: 15,
             patrol_events: 10,
             rights_events: 2,
+            local_account_block_events: 0,
+            indefinitely_blocked_accounts: 0,
+            unclassified_block_duration_events: 0,
             skipped_events: 3,
             manifest_sha256: "b".repeat(64),
         };
@@ -4906,6 +4918,9 @@ mod tests {
         assert_eq!(generation.downloaded_sha256, "a".repeat(64));
         assert_eq!(generation.manifest_sha256, "b".repeat(64));
         assert_eq!(generation.coverage_through.as_deref(), Some("2026-08"));
+        assert_eq!(generation.local_account_block_events, 0);
+        assert_eq!(generation.indefinitely_blocked_accounts, 0);
+        assert_eq!(generation.unclassified_block_duration_events, 0);
 
         let mut empty = source;
         empty.rights_events = 0;

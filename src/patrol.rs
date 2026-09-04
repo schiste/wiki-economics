@@ -29,7 +29,7 @@ const PARQUET_BATCH_ROWS: usize = 50_000;
 const SUBSTANTIAL_LOGGING_DUMP_BYTES: u64 = 1024 * 1024;
 const SUBSTANTIAL_LOG_ITEMS: usize = 10_000;
 const PATROL_COMPUTE_ALGORITHM_VERSION: &str = "patrol-metrics-v5-complete-snapshot-months";
-const PATROL_PARSER_VERSION: &str = "patrol-logging-pinned-plan-v3-external-sort";
+const PATROL_PARSER_VERSION: &str = "patrol-logging-pinned-plan-v4-indefinite-account-block-index";
 const REVISION_COLUMNS: &[&str] = &[
     "revision_id",
     "event_timestamp",
@@ -169,6 +169,11 @@ struct LoggingParseStats {
     total_log_items: usize,
     patrol_events: usize,
     rights_events: usize,
+    local_account_block_events: usize,
+    indefinite_block_events: usize,
+    finite_block_events: usize,
+    unblock_events: usize,
+    unclassified_block_duration_events: usize,
     skipped_events: usize,
 }
 
@@ -202,6 +207,9 @@ pub(crate) struct PatrolSourceSummary {
     pub(crate) total_log_items: u64,
     pub(crate) patrol_events: u64,
     pub(crate) rights_events: u64,
+    pub(crate) local_account_block_events: u64,
+    pub(crate) indefinitely_blocked_accounts: u64,
+    pub(crate) unclassified_block_duration_events: u64,
     pub(crate) skipped_events: u64,
     pub(crate) manifest_sha256: String,
 }
@@ -239,6 +247,11 @@ pub(crate) fn source_generation_summary(
         total_log_items: u64::try_from(source.stats.total_log_items)?,
         patrol_events: u64::try_from(source.stats.patrol_events)?,
         rights_events: u64::try_from(source.stats.rights_events)?,
+        local_account_block_events: u64::try_from(source.stats.local_account_block_events)?,
+        indefinitely_blocked_accounts: source.blocked_accounts.rows,
+        unclassified_block_duration_events: u64::try_from(
+            source.stats.unclassified_block_duration_events,
+        )?,
         skipped_events: u64::try_from(source.stats.skipped_events)?,
         manifest_sha256: source.manifest_sha256,
     }))
@@ -713,14 +726,15 @@ struct AccountCreationCounts {
     indefinitely_blocked_with_edits: u32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
 enum AccountBlockState {
     Indefinite,
     NotIndefinite,
     Unclassified,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 struct AccountBlockTransition {
     timestamp: String,
     log_id: i64,
@@ -1821,10 +1835,21 @@ fn wiki_to_api_domain(wiki: &str) -> Option<String> {
     None
 }
 
+#[cfg(any(test, coverage))]
 fn parse_logging_events<P: PatrolSink + ?Sized, R: RightsSink + ?Sized>(
     xml_path: &Path,
     patrol_writer: &mut P,
     rights_writer: &mut R,
+) -> Result<LoggingParseStats> {
+    parse_logging_events_with_blocks(xml_path, None, patrol_writer, rights_writer, None)
+}
+
+fn parse_logging_events_with_blocks<P: PatrolSink + ?Sized, R: RightsSink + ?Sized>(
+    xml_path: &Path,
+    snapshot: Option<&str>,
+    patrol_writer: &mut P,
+    rights_writer: &mut R,
+    mut block_transitions: Option<&mut HashMap<String, AccountBlockTransition>>,
 ) -> Result<LoggingParseStats> {
     let file = File::open(xml_path)?;
     let compressed_bytes = file.metadata()?.len();
@@ -1868,6 +1893,28 @@ fn parse_logging_events<P: PatrolSink + ?Sized, R: RightsSink + ?Sized>(
                                 item if matches!(item.log_type.as_deref(), Some("rights")) => {
                                     rights_writer.add_rights(item.into_rights_row())?;
                                     stats.rights_events += 1;
+                                }
+                                item if matches!(item.log_type.as_deref(), Some("block"))
+                                    && snapshot.is_some()
+                                    && block_transitions.is_some() =>
+                                {
+                                    if let Some((target, transition)) =
+                                        parse_account_block_transition(
+                                            item,
+                                            snapshot.expect("guarded snapshot"),
+                                            &mut stats,
+                                        )?
+                                    {
+                                        update_named_block_transition(
+                                            block_transitions
+                                                .as_deref_mut()
+                                                .expect("guarded block transition collector"),
+                                            target,
+                                            transition,
+                                        )?;
+                                    } else {
+                                        stats.skipped_events += 1;
+                                    }
                                 }
                                 _ => stats.skipped_events += 1,
                             }
@@ -2066,60 +2113,19 @@ fn record_account_block_transition(
     transitions: &mut HashMap<String, AccountBlockTransition>,
     stats: &mut AccountCreationParseStats,
 ) -> Result<()> {
-    let action = item.log_action.as_deref().unwrap_or_default();
-    if !matches!(action, "block" | "reblock" | "unblock") {
-        return Ok(());
-    }
-    let timestamp = item.timestamp.unwrap_or_default();
-    let month = timestamp
-        .get(..7)
-        .context("block timestamp has no event month")?;
-    storage::validate_snapshot_version(month)?;
-    if !compute::snapshot_contains_complete_month(snapshot, month) {
-        return Ok(());
-    }
-    let Some(target) = item
-        .log_title
-        .as_deref()
-        .and_then(account_block_target_name)
+    let Some((target, transition)) =
+        parse_account_block_transition_for_staging(item, snapshot, stats)?
     else {
         return Ok(());
     };
+    update_named_block_transition(transitions, target, transition)
+}
 
-    checked_increment(
-        &mut stats.local_account_block_events,
-        "local account block event",
-    )?;
-    let state = if action == "unblock" {
-        checked_increment(&mut stats.unblock_events, "account unblock event")?;
-        AccountBlockState::NotIndefinite
-    } else {
-        match classify_block_duration(item.params.as_deref()) {
-            AccountBlockState::Indefinite => {
-                checked_increment(
-                    &mut stats.indefinite_block_events,
-                    "indefinite account block event",
-                )?;
-                AccountBlockState::Indefinite
-            }
-            AccountBlockState::NotIndefinite => {
-                checked_increment(&mut stats.finite_block_events, "finite account block event")?;
-                AccountBlockState::NotIndefinite
-            }
-            AccountBlockState::Unclassified => {
-                checked_increment(
-                    &mut stats.unclassified_block_duration_events,
-                    "unclassified account block duration event",
-                )?;
-                AccountBlockState::Unclassified
-            }
-        }
-    };
-    let transition = AccountBlockTransition {
-        timestamp,
-        log_id: item.log_id.unwrap_or_default(),
-        state,
-    };
+fn update_named_block_transition(
+    transitions: &mut HashMap<String, AccountBlockTransition>,
+    target: String,
+    transition: AccountBlockTransition,
+) -> Result<()> {
     if let Some(existing) = transitions.get(&target) {
         let existing_order = (&existing.timestamp, existing.log_id);
         let new_order = (&transition.timestamp, transition.log_id);
@@ -2138,6 +2144,118 @@ fn record_account_block_transition(
     }
     transitions.insert(target, transition);
     Ok(())
+}
+
+fn parse_account_block_transition_for_staging(
+    item: LogItem,
+    snapshot: &str,
+    stats: &mut AccountCreationParseStats,
+) -> Result<Option<(String, AccountBlockTransition)>> {
+    let action = item.log_action.clone().unwrap_or_default();
+    let parsed = parse_account_block_transition_common(item, snapshot)?;
+    let Some((target, transition)) = parsed else {
+        return Ok(None);
+    };
+    checked_increment(
+        &mut stats.local_account_block_events,
+        "local account block event",
+    )?;
+    match (action.as_str(), transition.state) {
+        ("unblock", _) => checked_increment(&mut stats.unblock_events, "account unblock event")?,
+        (_, AccountBlockState::Indefinite) => checked_increment(
+            &mut stats.indefinite_block_events,
+            "indefinite account block event",
+        )?,
+        (_, AccountBlockState::NotIndefinite) => {
+            checked_increment(&mut stats.finite_block_events, "finite account block event")?;
+        }
+        (_, AccountBlockState::Unclassified) => checked_increment(
+            &mut stats.unclassified_block_duration_events,
+            "unclassified account block duration event",
+        )?,
+    }
+    Ok(Some((target, transition)))
+}
+
+fn parse_account_block_transition(
+    item: LogItem,
+    snapshot: &str,
+    stats: &mut LoggingParseStats,
+) -> Result<Option<(String, AccountBlockTransition)>> {
+    let action = item.log_action.clone().unwrap_or_default();
+    let parsed = parse_account_block_transition_common(item, snapshot)?;
+    let Some((target, transition)) = parsed else {
+        return Ok(None);
+    };
+    stats.local_account_block_events = stats
+        .local_account_block_events
+        .checked_add(1)
+        .context("local account block event count overflow")?;
+    match (action.as_str(), transition.state) {
+        ("unblock", _) => {
+            stats.unblock_events = stats
+                .unblock_events
+                .checked_add(1)
+                .context("account unblock event count overflow")?
+        }
+        (_, AccountBlockState::Indefinite) => {
+            stats.indefinite_block_events = stats
+                .indefinite_block_events
+                .checked_add(1)
+                .context("indefinite block event count overflow")?
+        }
+        (_, AccountBlockState::NotIndefinite) => {
+            stats.finite_block_events = stats
+                .finite_block_events
+                .checked_add(1)
+                .context("finite block event count overflow")?
+        }
+        (_, AccountBlockState::Unclassified) => {
+            stats.unclassified_block_duration_events = stats
+                .unclassified_block_duration_events
+                .checked_add(1)
+                .context("unclassified block duration event count overflow")?
+        }
+    }
+    Ok(Some((target, transition)))
+}
+
+fn parse_account_block_transition_common(
+    item: LogItem,
+    snapshot: &str,
+) -> Result<Option<(String, AccountBlockTransition)>> {
+    let action = item.log_action.as_deref().unwrap_or_default();
+    if !matches!(action, "block" | "reblock" | "unblock") {
+        return Ok(None);
+    }
+    let timestamp = item.timestamp.unwrap_or_default();
+    let month = timestamp
+        .get(..7)
+        .context("block timestamp has no event month")?;
+    storage::validate_snapshot_version(month)?;
+    if !compute::snapshot_contains_complete_month(snapshot, month) {
+        return Ok(None);
+    }
+    let Some(target) = item
+        .log_title
+        .as_deref()
+        .and_then(account_block_target_name)
+    else {
+        return Ok(None);
+    };
+    let state = if action == "unblock" {
+        AccountBlockState::NotIndefinite
+    } else {
+        classify_block_duration(item.params.as_deref())
+    };
+    Ok(Some((
+        target,
+        AccountBlockTransition {
+            timestamp,
+            log_id: item.log_id.unwrap_or_default(),
+            state,
+        },
+    )))
 }
 
 fn checked_increment(value: &mut u64, label: &str) -> Result<()> {

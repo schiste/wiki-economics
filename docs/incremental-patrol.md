@@ -17,6 +17,9 @@ The implementation guarantees:
   not yet available;
 - concatenated multi-member gzip input is completely decoded;
 - source transport identity and parse counts are retained;
+- local account block/reblock/unblock transitions are reduced to one
+  deterministic, snapshot-scoped indefinite-block index during the same XML
+  pass;
 - a parser change creates a different immutable generation;
 - computation materializes at most one source month, one revision month, and
   bounded lookup/state structures at a time;
@@ -37,6 +40,7 @@ data/patrol/<wiki>/
   current-generation.json
   generations/2026-08/<sha256(parser-version)>/
     generation.json
+    indefinitely-blocked-accounts.json
     patrol/year=YYYY/month=YYYY-MM/part-00000.parquet
     rights/year=YYYY/month=YYYY-MM/part-00000.parquet
 ```
@@ -53,14 +57,30 @@ downloaded checksums,
 source-plan identity,
 history snapshot and coverage, ETag and
 Last-Modified values when supplied, downloaded SHA-256, parser version,
-autopatrol groups, total/patrol/rights/skipped counts, and every monthly
+autopatrol groups, total/patrol/rights/local-block/skipped counts, the
+indefinite-block index identity and row count, and every monthly
 artifact's rows, bytes, SHA-256, ordering contract, and observed modification
 time. The manifest has a canonical semantic hash. The atomic current pointer
 also records the exact manifest-file hash so non-Rust readiness tooling can
 verify the selected receipt without parsing nanosecond integers imprecisely.
 
-The downloaded gzip is deleted only after all monthly Parquets and the synced
-manifest are durable. A failed build removes only its identified staging
+`indefinitely-blocked-accounts.json` contains only normalized local account
+names whose latest public transition through the selected snapshot leaves an
+indefinite block in force. IPs, ranges, autoblocks, temporary-account names,
+suppressed targets, and global locks are excluded. Finite blocks and later
+unblocks remove an account from the index. The index is sorted, immutable,
+content-hashed by `generation.json`, and fails closed when a latest block
+duration cannot be classified.
+
+This index is the production source dimension for the account-scope filter.
+It does not rewrite existing aggregate metrics when first introduced. Existing
+published rows remain the unfiltered baseline; account-dependent metric
+families can be regenerated independently from page-week and patrol when the
+scope dimension is rolled out, while ingest and unrelated artifacts remain
+reusable.
+
+The downloaded gzip is deleted only after all monthly Parquets, the block
+index, and the synced manifest are durable. A failed build removes only its identified staging
 directory. An incomplete final generation fails closed and is not silently
 adopted.
 
@@ -133,7 +153,8 @@ After a run, verify:
 1. `patrol-source-plan.json` selects the exact dated dump and covers the
    intended history snapshot;
 2. `current-generation.json` selects the intended snapshot;
-3. `generation.json` counts conserve `total = patrol + rights + skipped`;
+3. `generation.json` counts conserve
+   `total = patrol + rights + local account blocks + skipped`;
 4. the patrol compute stage reports reused versus rebuilt artifacts;
 5. the output receipt and public manifest select the same snapshot;
 6. patrol and rights counts remain non-zero for a substantial managed wiki.
