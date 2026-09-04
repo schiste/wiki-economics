@@ -1537,7 +1537,8 @@ mod tests {
         fs::write(
             output.join(crate::dashboard::ACCOUNT_CREATION_STAGING_PATH),
             r#"{"schema_version":1,"changed":true}"#,
-        )?;
+        )
+        .expect("changed account fixture should be written");
         assert!(
             !dashboard_defaults_are_reusable(&output, &workspace, &defaults)?,
             "staging account data must invalidate dashboard defaults"
@@ -1545,7 +1546,8 @@ mod tests {
         fs::write(
             output.join(crate::dashboard::ACCOUNT_CREATION_STAGING_PATH),
             r#"{"schema_version":1}"#,
-        )?;
+        )
+        .expect("account fixture should be restored");
 
         fs::write(
             output.join(".publication-candidate.json"),

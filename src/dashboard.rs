@@ -1928,6 +1928,43 @@ mod tests {
             .expect_err("a non-conserving account report must fail closed");
         assert!(error.to_string().contains("row conservation failed"));
         assert!(!rejected.path().join(ACCOUNT_CREATION_STAGING_PATH).exists());
+
+        fs::write(
+            &report_path,
+            serde_json::to_vec(&json!({
+                "schema_version": 1,
+                "metric_version": crate::patrol::ACCOUNT_CREATION_METRIC_VERSION,
+                "license_spdx": "MIT",
+                "wiki": "svwiki",
+                "snapshot": "2026-01",
+                "source_plan_sha256": "a".repeat(64),
+                "permanent_account_creation_events": 1,
+                "permanent_accounts": 1,
+                "duplicate_permanent_creation_events": 0,
+                "rows": [{
+                    "year_month": "2026-01",
+                    "accounts_created": 1,
+                    "accounts_with_edits": 1,
+                    "accounts_without_edits": 0,
+                    "temporary_accounts_excluded": 0
+                }]
+            }))?,
+        )?;
+        let blocked = TestDir::new()?;
+        let blocked_path = blocked.path().join(ACCOUNT_CREATION_STAGING_PATH);
+        fs::create_dir_all(&blocked_path)?;
+        let error = materialize_into(input.path(), blocked.path())
+            .expect_err("a directory cannot be replaced by the account report");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to publish account-creation staging report")
+        );
+        let temporary = blocked_path
+            .parent()
+            .expect("blocked fixture has a parent")
+            .join(format!(".svwiki.json.{}.tmp", std::process::id()));
+        assert!(!temporary.exists());
         Ok(())
     }
 
