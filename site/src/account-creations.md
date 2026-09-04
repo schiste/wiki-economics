@@ -15,6 +15,7 @@ import * as Inputs from "npm:@observablehq/inputs"
 import * as Plot from "npm:@observablehq/plot"
 import {fmtNum, toPeriod} from "./components/filters.js"
 import {withExport, pageExportBar} from "./components/exports.js"
+import {ACCOUNT_SCOPE_ALL, ACCOUNT_SCOPE_EXCLUDE_INDEFINITE, applyAccountScope} from "./components/account-cohorts.js"
 
 const report = await FileAttachment("data/_staging/account-creations/svwiki.json").json()
 ```
@@ -27,8 +28,17 @@ const granularity = view(Inputs.select(
 ```
 
 ```js
+const accountScope = view(Inputs.radio(new Map([
+  ["Include indefinitely blocked", ACCOUNT_SCOPE_ALL],
+  ["Exclude indefinitely blocked", ACCOUNT_SCOPE_EXCLUDE_INDEFINITE],
+]), {label: "Account scope", value: ACCOUNT_SCOPE_ALL}))
+```
+
+```js
+const scopedRows = report.rows.map(row => applyAccountScope(row, accountScope))
+
 const data = d3.rollups(
-  report.rows,
+  scopedRows,
   rows => ({
     accounts_created: d3.sum(rows, d => d.accounts_created),
     accounts_with_edits: d3.sum(rows, d => d.accounts_with_edits),
@@ -36,10 +46,11 @@ const data = d3.rollups(
     indefinitely_blocked_accounts: d3.sum(rows, d => d.indefinitely_blocked_accounts),
     indefinitely_blocked_with_edits: d3.sum(rows, d => d.indefinitely_blocked_with_edits),
     indefinitely_blocked_without_edits: d3.sum(rows, d => d.indefinitely_blocked_without_edits),
+    excluded_indefinitely_blocked_accounts: d3.sum(rows, d => d.excluded_indefinitely_blocked_accounts),
     temporary_accounts_excluded: d3.sum(rows, d => d.temporary_accounts_excluded),
   }),
   d => toPeriod(d.year_month, granularity)
-).map(([period, counts]) => ({period, ...counts}))
+).map(([period, counts]) => ({period, account_scope: accountScope, ...counts}))
   .sort((a, b) => d3.ascending(a.period, b.period))
 
 const split = data.flatMap(d => [
@@ -53,6 +64,7 @@ const indefinitelyBlockedSplit = data.flatMap(d => [
 const totalCreated = d3.sum(data, d => d.accounts_created)
 const totalWithEdits = d3.sum(data, d => d.accounts_with_edits)
 const totalIndefinitelyBlocked = d3.sum(data, d => d.indefinitely_blocked_accounts)
+const totalExcludedIndefinitelyBlocked = d3.sum(data, d => d.excluded_indefinitely_blocked_accounts)
 const conversion = totalCreated > 0 ? totalWithEdits / totalCreated : null
 const indefiniteBlockRate = totalCreated > 0 ? totalIndefinitelyBlocked / totalCreated : null
 const latest = data.at(-1)
@@ -79,9 +91,9 @@ pageExportBar([
     <div class="kpi-sub">across observed cohorts</div>
   </div>
   <div class="kpi-card">
-    <div class="kpi-value">${fmtNum(totalIndefinitelyBlocked)}</div>
-    <div class="kpi-label">Indefinitely locally blocked</div>
-    <div class="kpi-sub">${indefiniteBlockRate == null ? "—" : (indefiniteBlockRate * 100).toFixed(1) + "% of permanent cohorts"}</div>
+    <div class="kpi-value">${fmtNum(accountScope === ACCOUNT_SCOPE_EXCLUDE_INDEFINITE ? totalExcludedIndefinitelyBlocked : totalIndefinitelyBlocked)}</div>
+    <div class="kpi-label">${accountScope === ACCOUNT_SCOPE_EXCLUDE_INDEFINITE ? "Indefinitely blocked excluded" : "Indefinitely locally blocked"}</div>
+    <div class="kpi-sub">${accountScope === ACCOUNT_SCOPE_EXCLUDE_INDEFINITE ? "removed from every account view" : indefiniteBlockRate == null ? "—" : (indefiniteBlockRate * 100).toFixed(1) + "% of permanent cohorts"}</div>
   </div>
   <div class="kpi-card">
     <div class="kpi-value">${fmtNum(d3.sum(data, d => d.temporary_accounts_excluded))}</div>
@@ -114,6 +126,8 @@ withExport(Plot.plot({
 <div class="chart-section">
 
 ## Indefinitely locally blocked accounts
+
+<div class="note">${accountScope === ACCOUNT_SCOPE_EXCLUDE_INDEFINITE ? "The selected account scope excludes this entire cohort, so this graph is intentionally empty." : "Blocked accounts remain split by whether a public edit can be attributed to them."}</div>
 
 ```js
 withExport(Plot.plot({
@@ -154,6 +168,8 @@ withExport(Plot.plot({
 <details class="methodology"><summary>Definition and limitations</summary>
 
 `Accounts created = Accounts with edits + Accounts without edits`
+
+The **Account scope** filter applies before monthly cohorts are grouped into quarters or years and affects every account KPI, graph, tooltip, and CSV on this page. “Exclude indefinitely blocked” subtracts the exact blocked-with-edits and blocked-without-edits subsets, preserving the displayed cohort identity `Accounts created = Accounts with edits + Accounts without edits`. Temporary accounts remain excluded under either setting.
 
 Account creation comes from Wikimedia's snapshot-pinned `newusers` logging records. When the dump contains repeated creation records for one stable local user ID, the earliest observed creation month is used once. Legacy records without a target ID use the unique creation-log ID and target username, and are matched to revisions by historical or current username. Redacted legacy records without any public target identity are counted as creations but cannot match an edit or block.
 
