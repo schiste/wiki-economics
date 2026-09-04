@@ -1357,8 +1357,9 @@ fn account_creation_staging_report_uses_creation_cohorts_and_lifetime_edits() ->
 <logitem><id>2</id><timestamp>2025-01-02T00:00:00Z</timestamp><contributor><username>Never edited</username><id>102</id></contributor><type>newusers</type><action>create</action><logtitle>User:Never edited</logtitle><params>102</params></logitem>
 <logitem><id>3</id><timestamp>2025-02-01T00:00:00Z</timestamp><contributor><username>~2025-1</username><id>103</id></contributor><type>newusers</type><action>autocreate</action><logtitle>User:~2025-1</logtitle><params>103</params></logitem>
 <logitem><id>4</id><timestamp>2025-01-03T00:00:00Z</timestamp><contributor><username>Edited</username><id>101</id></contributor><type>newusers</type><action>create</action><logtitle>User:Edited</logtitle><params>101</params></logitem>
-<logitem><id>5</id><timestamp>2026-09-01T00:00:00Z</timestamp><contributor><username>Future</username><id>104</id></contributor><type>newusers</type><action>create</action><logtitle>User:Future</logtitle><params>104</params></logitem>
-<logitem><id>6</id><timestamp>2025-01-04T00:00:00Z</timestamp><type>rights</type><logtitle>User:Edited</logtitle><params></params></logitem>
+<logitem><id>5</id><timestamp>2024-12-31T00:00:00Z</timestamp><contributor><username>Edited</username><id>101</id></contributor><type>newusers</type><action>autocreate</action><logtitle>User:Edited</logtitle><params>101</params></logitem>
+<logitem><id>6</id><timestamp>2026-09-01T00:00:00Z</timestamp><contributor><username>Future</username><id>104</id></contributor><type>newusers</type><action>create</action><logtitle>User:Future</logtitle><params>104</params></logitem>
+<logitem><id>7</id><timestamp>2025-01-04T00:00:00Z</timestamp><type>rights</type><logtitle>User:Edited</logtitle><params></params></logitem>
 </mediawiki>"#;
     let split_at = logging
         .find("<logitem><id>2</id>")
@@ -1378,16 +1379,22 @@ fn account_creation_staging_report_uses_creation_cohorts_and_lifetime_edits() ->
     assert_eq!(report["wiki"], wiki);
     assert_eq!(report["snapshot"], snapshot);
     assert_eq!(report["license_spdx"], "MIT");
-    assert_eq!(report["account_creation_events"], 5);
+    assert_eq!(report["account_creation_events"], 6);
+    assert_eq!(report["permanent_account_creation_events"], 4);
     assert_eq!(report["permanent_accounts"], 2);
+    assert_eq!(report["duplicate_permanent_creation_events"], 2);
+    assert_eq!(report["cross_month_duplicate_events"], 1);
     assert_eq!(report["temporary_accounts"], 1);
-    assert_eq!(report["rows"][0]["year_month"], "2025-01");
-    assert_eq!(report["rows"][0]["accounts_created"], 2);
+    assert_eq!(report["rows"][0]["year_month"], "2024-12");
+    assert_eq!(report["rows"][0]["accounts_created"], 1);
     assert_eq!(report["rows"][0]["accounts_with_edits"], 1);
-    assert_eq!(report["rows"][0]["accounts_without_edits"], 1);
-    assert_eq!(report["rows"][1]["year_month"], "2025-02");
-    assert_eq!(report["rows"][1]["accounts_created"], 0);
-    assert_eq!(report["rows"][1]["temporary_accounts_excluded"], 1);
+    assert_eq!(report["rows"][0]["accounts_without_edits"], 0);
+    assert_eq!(report["rows"][1]["year_month"], "2025-01");
+    assert_eq!(report["rows"][1]["accounts_created"], 1);
+    assert_eq!(report["rows"][1]["accounts_without_edits"], 1);
+    assert_eq!(report["rows"][2]["year_month"], "2025-02");
+    assert_eq!(report["rows"][2]["accounts_created"], 0);
+    assert_eq!(report["rows"][2]["temporary_accounts_excluded"], 1);
     assert_eq!(
         fs::read_dir(data_dir.join("staging/account-creations").join(wiki))?.count(),
         0

@@ -1324,13 +1324,17 @@ pub fn write_site_fixture(output_dir: &Path) -> Result<()> {
     fs::create_dir_all(&staging_account_dir)?;
     let account_fixture = serde_json::to_vec_pretty(&json!({
         "schema_version": 1,
-        "metric_version": "account-creations-v1-permanent-local-account-lifetime-public-edit",
+        "metric_version": "account-creations-v2-earliest-permanent-local-account-lifetime-public-edit",
         "license_spdx": "MIT",
         "attribution": "Derived from Wikimedia Foundation public datasets",
         "wiki": "svwiki",
         "snapshot": "2026-01",
         "logging_dump_date": "20260201",
         "source_plan_sha256": "a".repeat(64),
+        "permanent_account_creation_events": 2,
+        "permanent_accounts": 2,
+        "duplicate_permanent_creation_events": 0,
+        "cross_month_duplicate_events": 0,
         "definition": "Deterministic site fixture",
         "rows": [
             {"year_month": "2025-12", "accounts_created": 20, "accounts_with_edits": 8, "accounts_without_edits": 12, "temporary_accounts_excluded": 0},

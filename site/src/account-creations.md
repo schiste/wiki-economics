@@ -119,7 +119,7 @@ withExport(Plot.plot({
 
 `Accounts created = Accounts with edits + Accounts without edits`
 
-Account creation comes from Wikimedia's snapshot-pinned `newusers` logging records. Permanent local accounts are matched by stable local user ID against every publicly attributable revision in the selected MediaWiki History snapshot. “Without edits” therefore means no matching public revision through **${report.snapshot}**, not necessarily no private, suppressed, or future activity. Temporary accounts are reported separately and excluded from both sides of the permanent-account split. Logging coverage begins when the wiki's public account-creation log becomes available.
+Account creation comes from Wikimedia's snapshot-pinned `newusers` logging records. When the dump contains repeated creation records for one stable local user ID, the earliest observed creation month is used once. Permanent local accounts are matched against every publicly attributable revision in the selected MediaWiki History snapshot. “Without edits” therefore means no matching public revision through **${report.snapshot}**, not necessarily no private, suppressed, or future activity. Temporary accounts and later duplicate creation records are excluded from both sides of the permanent-account split. Logging coverage begins when the wiki's public account-creation log becomes available.
 
 Source: svwiki logging dump `${report.logging_dump_date}` · history snapshot `${report.snapshot}` · algorithm `${report.metric_version}` · license `${report.license_spdx}`.
 

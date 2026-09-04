@@ -593,6 +593,10 @@ fn build_account_creation_staging_report_with_transport<T: PatrolTransport + ?Si
         }),
         "account-creation split does not conserve its cohort total"
     );
+    let permanent_accounts = rows
+        .iter()
+        .map(|row| u64::from(row.accounts_created))
+        .sum::<u64>();
     let report = AccountCreationStagingReport {
         schema_version: 1,
         metric_version: ACCOUNT_CREATION_METRIC_VERSION,
@@ -605,13 +609,19 @@ fn build_account_creation_staging_report_with_transport<T: PatrolTransport + ?Si
         compressed_source_bytes: parse_stats.compressed_bytes,
         total_log_items: parse_stats.total_log_items,
         account_creation_events: parse_stats.account_creation_events,
-        permanent_accounts: rows.iter().map(|row| u64::from(row.accounts_created)).sum(),
+        permanent_account_creation_events: parse_stats.permanent_creation_events,
+        permanent_accounts,
+        duplicate_permanent_creation_events: parse_stats
+            .permanent_creation_events
+            .checked_sub(permanent_accounts)
+            .context("permanent account creation event conservation failure")?,
+        cross_month_duplicate_events: parse_stats.cross_month_duplicate_events,
         temporary_accounts: parse_stats.temporary_accounts,
         history_scan_mode: history_scan.mode,
         history_sources: history_scan.sources,
         history_source_bytes: history_scan.bytes,
         history_revision_rows: history_scan.revision_rows,
-        definition: "Permanent local accounts created in each month, split by whether the selected public history snapshot contains at least one revision attributed to that local user ID; temporary accounts are excluded.",
+        definition: "Permanent local accounts grouped by their earliest observed creation-log month, split by whether the selected public history snapshot contains at least one revision attributed to that local user ID; later duplicate creation-log records and temporary accounts are excluded.",
         rows,
     };
     generation::atomic_json(destination, &report)?;
@@ -631,6 +641,7 @@ struct AccountCreationParseStats {
     total_log_items: u64,
     account_creation_events: u64,
     permanent_creation_events: u64,
+    cross_month_duplicate_events: u64,
     temporary_accounts: u64,
     unresolved_permanent: u64,
 }
@@ -774,6 +785,11 @@ impl AccountCreationParseStats {
                 &mut self.permanent_creation_events,
                 other.permanent_creation_events,
                 "permanent account creation event",
+            ),
+            (
+                &mut self.cross_month_duplicate_events,
+                other.cross_month_duplicate_events,
+                "cross-month duplicate account creation event",
             ),
             (
                 &mut self.temporary_accounts,
@@ -1661,11 +1677,18 @@ fn parse_account_creation_events(
                                         .permanent_creation_events
                                         .checked_add(1)
                                         .context("permanent account count overflow")?;
-                                    if let Some((existing_month, _)) = accounts.get(&user_id) {
-                                        anyhow::ensure!(
-                                            existing_month == &month,
-                                            "account {user_id} has creation events in multiple months"
-                                        );
+                                    if let Some((existing_month, _)) = accounts.get_mut(&user_id) {
+                                        if existing_month != &month {
+                                            stats.cross_month_duplicate_events = stats
+                                                .cross_month_duplicate_events
+                                                .checked_add(1)
+                                                .context(
+                                                    "cross-month duplicate account count overflow",
+                                                )?;
+                                            if month < *existing_month {
+                                                *existing_month = month;
+                                            }
+                                        }
                                     } else {
                                         accounts.insert(user_id, (month, false));
                                     }
@@ -1849,7 +1872,10 @@ struct AccountCreationStagingReport {
     compressed_source_bytes: u64,
     total_log_items: u64,
     account_creation_events: u64,
+    permanent_account_creation_events: u64,
     permanent_accounts: u64,
+    duplicate_permanent_creation_events: u64,
+    cross_month_duplicate_events: u64,
     temporary_accounts: u64,
     history_scan_mode: &'static str,
     history_sources: u32,
@@ -1860,7 +1886,7 @@ struct AccountCreationStagingReport {
 }
 
 const ACCOUNT_CREATION_METRIC_VERSION: &str =
-    "account-creations-v1-permanent-local-account-lifetime-public-edit";
+    "account-creations-v2-earliest-permanent-local-account-lifetime-public-edit";
 
 fn parse_new_user_id(params: &str) -> Option<i64> {
     let params = params.trim();
