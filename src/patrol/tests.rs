@@ -1363,6 +1363,7 @@ fn account_creation_staging_report_uses_creation_cohorts_and_lifetime_edits() ->
 <logitem><id>7</id><timestamp>2025-01-04T00:00:00Z</timestamp><type>rights</type><logtitle>User:Edited</logtitle><params></params></logitem>
 <logitem><id>8</id><timestamp>2025-03-01T00:00:00Z</timestamp><contributor><username>Administrator</username><id>999</id></contributor><type>newusers</type><action>create2</action><logtitle>User:Legacy</logtitle><params></params></logitem>
 <logitem><id>8</id><timestamp>2025-03-01T00:00:00Z</timestamp><contributor><username>Administrator</username><id>999</id></contributor><type>newusers</type><action>create2</action><logtitle>User:Legacy</logtitle><params></params></logitem>
+<logitem><id>9</id><timestamp>2025-04-01T00:00:00Z</timestamp><type>newusers</type><action>create</action><params></params></logitem>
 </mediawiki>"#;
     let split_at = logging
         .find("<logitem><id>2</id>")
@@ -1382,12 +1383,13 @@ fn account_creation_staging_report_uses_creation_cohorts_and_lifetime_edits() ->
     assert_eq!(report["wiki"], wiki);
     assert_eq!(report["snapshot"], snapshot);
     assert_eq!(report["license_spdx"], "MIT");
-    assert_eq!(report["account_creation_events"], 8);
-    assert_eq!(report["permanent_account_creation_events"], 6);
-    assert_eq!(report["permanent_accounts"], 3);
+    assert_eq!(report["account_creation_events"], 9);
+    assert_eq!(report["permanent_account_creation_events"], 7);
+    assert_eq!(report["permanent_accounts"], 4);
     assert_eq!(report["duplicate_permanent_creation_events"], 3);
     assert_eq!(report["cross_month_duplicate_events"], 1);
-    assert_eq!(report["fallback_identity_accounts"], 1);
+    assert_eq!(report["fallback_identity_accounts"], 2);
+    assert_eq!(report["opaque_identity_accounts"], 1);
     assert_eq!(report["temporary_accounts"], 1);
     assert_eq!(report["rows"][0]["year_month"], "2024-12");
     assert_eq!(report["rows"][0]["accounts_created"], 1);
@@ -1402,6 +1404,9 @@ fn account_creation_staging_report_uses_creation_cohorts_and_lifetime_edits() ->
     assert_eq!(report["rows"][3]["year_month"], "2025-03");
     assert_eq!(report["rows"][3]["accounts_created"], 1);
     assert_eq!(report["rows"][3]["accounts_with_edits"], 1);
+    assert_eq!(report["rows"][4]["year_month"], "2025-04");
+    assert_eq!(report["rows"][4]["accounts_created"], 1);
+    assert_eq!(report["rows"][4]["accounts_without_edits"], 1);
     assert_eq!(
         fs::read_dir(data_dir.join("staging/account-creations").join(wiki))?.count(),
         0
@@ -1438,6 +1443,22 @@ fn account_creation_fallback_counter_fails_closed_on_overflow() {
         error
             .to_string()
             .contains("fallback-identity account count overflow")
+    );
+}
+
+#[test]
+fn account_creation_opaque_counter_fails_closed_on_overflow() {
+    let mut stats = AccountCreationParseStats {
+        opaque_identity_accounts: u64::MAX,
+        ..AccountCreationParseStats::default()
+    };
+    let error = stats
+        .record_opaque_identity()
+        .expect_err("opaque identity counter overflow must fail closed");
+    assert!(
+        error
+            .to_string()
+            .contains("opaque-identity account count overflow")
     );
 }
 
@@ -1540,7 +1561,7 @@ fn account_creation_history_fallback_scans_and_reclaims_source_windows() -> Resu
         (102_i64, ("2025-01".to_string(), false)),
     ]);
     let mut fallback_accounts =
-        HashMap::from([(1_i64, ("2025-01".to_string(), false, "A".to_string()))]);
+        HashMap::from([(1_i64, ("2025-01".to_string(), false, Some("A".to_string())))]);
     let scan = scan_account_history_source_plan_with(
         &plan,
         &mut accounts,

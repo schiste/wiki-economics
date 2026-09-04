@@ -1324,7 +1324,7 @@ pub fn write_site_fixture(output_dir: &Path) -> Result<()> {
     fs::create_dir_all(&staging_account_dir)?;
     let account_fixture = serde_json::to_vec_pretty(&json!({
         "schema_version": 1,
-        "metric_version": "account-creations-v3-legacy-identity-earliest-permanent-account-lifetime-public-edit",
+        "metric_version": "account-creations-v4-redacted-legacy-identity-earliest-account-public-edit-match",
         "license_spdx": "MIT",
         "attribution": "Derived from Wikimedia Foundation public datasets",
         "wiki": "svwiki",
@@ -1336,6 +1336,7 @@ pub fn write_site_fixture(output_dir: &Path) -> Result<()> {
         "duplicate_permanent_creation_events": 0,
         "cross_month_duplicate_events": 0,
         "fallback_identity_accounts": 0,
+        "opaque_identity_accounts": 0,
         "definition": "Deterministic site fixture",
         "rows": [
             {"year_month": "2025-12", "accounts_created": 20, "accounts_with_edits": 8, "accounts_without_edits": 12, "temporary_accounts_excluded": 0},
