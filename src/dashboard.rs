@@ -1682,7 +1682,7 @@ pub fn write_site_fixture(output_dir: &Path) -> Result<()> {
             "media_type": "application/json",
         })))
         .chain(std::iter::once(json!({
-            "name": ACCOUNT_CREATION_STAGING_PATH,
+            "name": "svwiki.json",
             "license_spdx": licensing::ARTIFACT_LICENSE_SPDX,
             "media_type": "application/json",
         })))
