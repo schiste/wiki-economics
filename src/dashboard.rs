@@ -14,6 +14,7 @@ use crate::{licensing, storage};
 const LARGE_METRIC_BATCH_ROWS: usize = 250_000;
 const ALL_WIKIS_SCOPE: &str = "all";
 const INEQUALITY_DEFAULT_START_MONTH: &str = "2001-06";
+pub(crate) const ACCOUNT_CREATION_STAGING_PATH: &str = "_staging/account-creations/svwiki.json";
 
 pub const ARTIFACTS: [&str; 12] = [
     "defaults_business.json",
@@ -127,11 +128,143 @@ pub fn materialize_into(input_dir: &Path, destination_dir: &Path) -> Result<()> 
         "Rust dashboard generator did not produce the complete artifact set"
     );
     publish_json_set(destination_dir, &artifacts)?;
+    publish_account_creation_staging_report(input_dir, destination_dir)?;
     let retired = destination_dir.join("defaults_overview.json");
     if retired.is_file() {
         fs::remove_file(&retired)?;
         File::open(destination_dir)?.sync_all()?;
     }
+    Ok(())
+}
+
+fn publish_account_creation_staging_report(input_dir: &Path, destination_dir: &Path) -> Result<()> {
+    let source = input_dir.join(ACCOUNT_CREATION_STAGING_PATH);
+    if !source.try_exists()? {
+        return Ok(());
+    }
+    let value: Value = serde_json::from_slice(
+        &fs::read(&source)
+            .with_context(|| format!("missing account-creation staging report {source:?}"))?,
+    )
+    .with_context(|| format!("invalid account-creation staging report {source:?}"))?;
+    validate_account_creation_staging_report(&value)?;
+
+    let destination = destination_dir.join(ACCOUNT_CREATION_STAGING_PATH);
+    if source == destination {
+        return Ok(());
+    }
+    let parent = destination
+        .parent()
+        .context("account-creation staging destination has no parent")?;
+    fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(".svwiki.json.{}.tmp", std::process::id()));
+    let bytes = serde_json::to_vec(&value)?;
+    let mut file = File::create(&temporary)?;
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    if let Err(error) = fs::rename(&temporary, &destination) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error).context("failed to publish account-creation staging report");
+    }
+    File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+fn validate_account_creation_staging_report(report: &Value) -> Result<()> {
+    ensure!(
+        report["schema_version"] == 1,
+        "unsupported account-creation schema"
+    );
+    ensure!(
+        report["metric_version"] == crate::patrol::ACCOUNT_CREATION_METRIC_VERSION,
+        "unsupported account-creation metric version"
+    );
+    ensure!(
+        report["license_spdx"] == "MIT",
+        "account-creation report has no MIT license"
+    );
+    ensure!(
+        report["wiki"] == "svwiki",
+        "account-creation report is not for svwiki"
+    );
+    let snapshot = report["snapshot"]
+        .as_str()
+        .context("account-creation report has no snapshot")?;
+    storage::validate_snapshot_version(snapshot)?;
+    let source_hash = report["source_plan_sha256"]
+        .as_str()
+        .context("account-creation report has no source-plan identity")?;
+    ensure!(
+        source_hash.len() == 64 && source_hash.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "account-creation source-plan identity is invalid"
+    );
+    let expected_accounts = report["permanent_accounts"]
+        .as_u64()
+        .context("account-creation report has no permanent-account total")?;
+    let permanent_events = report["permanent_account_creation_events"]
+        .as_u64()
+        .context("account-creation report has no permanent-event total")?;
+    let duplicates = report["duplicate_permanent_creation_events"]
+        .as_u64()
+        .context("account-creation report has no duplicate-event total")?;
+    ensure!(
+        permanent_events
+            == expected_accounts
+                .checked_add(duplicates)
+                .context("account-creation event total overflow")?,
+        "account-creation event conservation failed"
+    );
+    let rows = report["rows"]
+        .as_array()
+        .context("account-creation report rows are missing")?;
+    ensure!(!rows.is_empty(), "account-creation report is empty");
+    let mut previous_month: Option<&str> = None;
+    let mut observed_accounts = 0_u64;
+    for row in rows {
+        let month = row["year_month"]
+            .as_str()
+            .context("account-creation row has no month")?;
+        ensure!(
+            month.len() == 7 && month.as_bytes()[4] == b'-',
+            "account-creation month is invalid"
+        );
+        storage::validate_snapshot_version(month)?;
+        ensure!(
+            previous_month.is_none_or(|previous| previous < month),
+            "account-creation months are not strictly ordered"
+        );
+        ensure!(
+            month <= snapshot,
+            "account-creation row exceeds its snapshot"
+        );
+        previous_month = Some(month);
+        let created = row["accounts_created"]
+            .as_u64()
+            .context("account-creation row has no creation count")?;
+        let with_edits = row["accounts_with_edits"]
+            .as_u64()
+            .context("account-creation row has no edited count")?;
+        let without_edits = row["accounts_without_edits"]
+            .as_u64()
+            .context("account-creation row has no unedited count")?;
+        ensure!(
+            created
+                == with_edits
+                    .checked_add(without_edits)
+                    .context("account-creation row total overflow")?,
+            "account-creation row conservation failed"
+        );
+        row["temporary_accounts_excluded"]
+            .as_u64()
+            .context("account-creation row has no temporary-account count")?;
+        observed_accounts = observed_accounts
+            .checked_add(created)
+            .context("account-creation report total overflow")?;
+    }
+    ensure!(
+        observed_accounts == expected_accounts,
+        "account-creation report total does not match its rows"
+    );
     Ok(())
 }
 
@@ -1324,19 +1457,27 @@ pub fn write_site_fixture(output_dir: &Path) -> Result<()> {
     fs::create_dir_all(&staging_account_dir)?;
     let account_fixture = serde_json::to_vec_pretty(&json!({
         "schema_version": 1,
-        "metric_version": "account-creations-v4-redacted-legacy-identity-earliest-account-public-edit-match",
+        "metric_version": crate::patrol::ACCOUNT_CREATION_METRIC_VERSION,
         "license_spdx": "MIT",
         "attribution": "Derived from Wikimedia Foundation public datasets",
         "wiki": "svwiki",
         "snapshot": "2026-01",
         "logging_dump_date": "20260201",
         "source_plan_sha256": "a".repeat(64),
-        "permanent_account_creation_events": 2,
-        "permanent_accounts": 2,
+        "compressed_source_bytes": 100,
+        "total_log_items": 50,
+        "account_creation_events": 47,
+        "permanent_account_creation_events": 45,
+        "permanent_accounts": 45,
         "duplicate_permanent_creation_events": 0,
         "cross_month_duplicate_events": 0,
         "fallback_identity_accounts": 0,
         "opaque_identity_accounts": 0,
+        "temporary_accounts": 2,
+        "history_scan_mode": "deterministic_fixture",
+        "history_sources": 1,
+        "history_source_bytes": 200,
+        "history_revision_rows": 18,
         "definition": "Deterministic site fixture",
         "rows": [
             {"year_month": "2025-12", "accounts_created": 20, "accounts_with_edits": 8, "accounts_without_edits": 12, "temporary_accounts_excluded": 0},
@@ -1541,7 +1682,7 @@ pub fn write_site_fixture(output_dir: &Path) -> Result<()> {
             "media_type": "application/json",
         })))
         .chain(std::iter::once(json!({
-            "name": "svwiki.json",
+            "name": ACCOUNT_CREATION_STAGING_PATH,
             "license_spdx": licensing::ARTIFACT_LICENSE_SPDX,
             "media_type": "application/json",
         })))
@@ -1691,6 +1832,10 @@ mod tests {
             assert_eq!(first_bytes, second_bytes, "{artifact} is not deterministic");
             serde_json::from_slice::<Value>(&first_bytes)?;
         }
+        let first_account = fs::read(first.path().join(ACCOUNT_CREATION_STAGING_PATH))?;
+        let second_account = fs::read(second.path().join(ACCOUNT_CREATION_STAGING_PATH))?;
+        assert_eq!(first_account, second_account);
+        validate_account_creation_staging_report(&serde_json::from_slice(&first_account)?)?;
         let gdp = read_json(&first.path().join("defaults_gdp.json"))?;
         assert_eq!(gdp["defaultWiki"], ALL_WIKIS_SCOPE);
         assert_eq!(gdp["maxMonth"], "2026-01");
@@ -1761,6 +1906,28 @@ mod tests {
         assert_eq!(global_inequality.column("wiki")?.str()?.get(0), Some("all"));
         assert_eq!(global_inequality.column("gini")?.f64()?.get(0), None);
         assert!(global_inequality.column("theil")?.f64()?.get(0).is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn immutable_dashboard_bundle_contains_only_a_valid_account_report() -> Result<()> {
+        let input = TestDir::new()?;
+        let destination = TestDir::new()?;
+        write_site_fixture(input.path())?;
+        materialize_into(input.path(), destination.path())?;
+        let published = destination.path().join(ACCOUNT_CREATION_STAGING_PATH);
+        assert!(published.is_file());
+        validate_account_creation_staging_report(&serde_json::from_slice(&fs::read(published)?)?)?;
+
+        let report_path = input.path().join(ACCOUNT_CREATION_STAGING_PATH);
+        let mut report: Value = serde_json::from_slice(&fs::read(&report_path)?)?;
+        report["rows"][0]["accounts_without_edits"] = json!(11);
+        fs::write(&report_path, serde_json::to_vec(&report)?)?;
+        let rejected = TestDir::new()?;
+        let error = materialize_into(input.path(), rejected.path())
+            .expect_err("a non-conserving account report must fail closed");
+        assert!(error.to_string().contains("row conservation failed"));
+        assert!(!rejected.path().join(ACCOUNT_CREATION_STAGING_PATH).exists());
         Ok(())
     }
 

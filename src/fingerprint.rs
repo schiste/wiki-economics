@@ -10,7 +10,8 @@ use tracing::{info, warn};
 
 const RECEIPT_SCHEMA_VERSION: u32 = 1;
 const SITE_ALGORITHM_VERSION: &str = "observable-static-site-v8-plain-distribution-artifacts";
-const DASHBOARD_DEFAULTS_ALGORITHM_VERSION: &str = "rust-dashboard-defaults-v4-exact-input-closure";
+const DASHBOARD_DEFAULTS_ALGORITHM_VERSION: &str =
+    "rust-dashboard-defaults-v5-account-creation-staging-closure";
 pub(crate) const DASHBOARD_DEFAULT_METRIC_INPUTS: [&str; 9] = [
     "business_funnel.parquet",
     "gdp.parquet",
@@ -821,6 +822,13 @@ fn dashboard_defaults_inputs(output_dir: &Path, workspace_dir: &Path) -> Result<
             output_dir.join(&wiki).join("page_weekly_edits.parquet"),
         ));
     }
+    let account_report = output_dir.join(crate::dashboard::ACCOUNT_CREATION_STAGING_PATH);
+    if account_report.try_exists()? {
+        inputs.push(TrackedPath::new(
+            format!("data/{}", crate::dashboard::ACCOUNT_CREATION_STAGING_PATH),
+            account_report,
+        ));
+    }
     inputs.push(TrackedPath::new(
         "workspace/Cargo.toml",
         workspace_dir.join("Cargo.toml"),
@@ -1079,6 +1087,9 @@ mod tests {
             let mut frame = df!("wiki" => [wiki], "value" => [1_i64])?;
             ParquetWriter::new(File::create(path)?).finish(&mut frame)?;
         }
+        let account_report = output.join(crate::dashboard::ACCOUNT_CREATION_STAGING_PATH);
+        fs::create_dir_all(account_report.parent().expect("fixture path has a parent"))?;
+        fs::write(account_report, r#"{"schema_version":1}"#)?;
         Ok(())
     }
 
@@ -1522,6 +1533,19 @@ mod tests {
             dashboard_defaults_are_reusable(&output, &workspace, &defaults)?,
             "operational manifest changes must not regenerate Rust defaults"
         );
+
+        fs::write(
+            output.join(crate::dashboard::ACCOUNT_CREATION_STAGING_PATH),
+            r#"{"schema_version":1,"changed":true}"#,
+        )?;
+        assert!(
+            !dashboard_defaults_are_reusable(&output, &workspace, &defaults)?,
+            "staging account data must invalidate dashboard defaults"
+        );
+        fs::write(
+            output.join(crate::dashboard::ACCOUNT_CREATION_STAGING_PATH),
+            r#"{"schema_version":1}"#,
+        )?;
 
         fs::write(
             output.join(".publication-candidate.json"),

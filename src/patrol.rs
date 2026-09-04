@@ -2039,7 +2039,7 @@ struct AccountCreationStagingReport {
     rows: Vec<AccountCreationMonth>,
 }
 
-const ACCOUNT_CREATION_METRIC_VERSION: &str =
+pub(crate) const ACCOUNT_CREATION_METRIC_VERSION: &str =
     "account-creations-v4-redacted-legacy-identity-earliest-account-public-edit-match";
 
 fn parse_new_user_id(params: &str) -> Option<i64> {
