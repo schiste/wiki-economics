@@ -510,6 +510,20 @@ enum Commands {
         limit_months: Option<usize>,
     },
 
+    /// Build the publication-invisible account-creation cohort experiment
+    AccountCreations {
+        /// Wiki database name
+        wiki: String,
+
+        /// Exact history/logging snapshot version (YYYY-MM)
+        #[arg(long)]
+        version: Option<String>,
+
+        /// Atomic JSON report consumed by the staging dashboard
+        #[arg(long)]
+        destination: PathBuf,
+    },
+
     /// Benchmark compute performance on existing parquet data
     Bench {
         /// Wiki database names
@@ -715,6 +729,15 @@ trait Ops {
         rebuild: bool,
         limit_months: Option<usize>,
     ) -> Result<()>;
+    fn build_account_creation_staging_report(
+        &self,
+        wiki: &str,
+        version: &str,
+        data_dir: &Path,
+        destination: &Path,
+    ) -> Result<()> {
+        patrol::build_account_creation_staging_report(wiki, version, data_dir, destination)
+    }
     fn benchmark(
         &self,
         wikis: &[String],
@@ -999,6 +1022,16 @@ impl Ops for RealOps {
         limit_months: Option<usize>,
     ) -> Result<()> {
         patrol::compute_patrol(wiki, data_dir, output_dir, rebuild, limit_months)
+    }
+
+    fn build_account_creation_staging_report(
+        &self,
+        wiki: &str,
+        version: &str,
+        data_dir: &Path,
+        destination: &Path,
+    ) -> Result<()> {
+        patrol::build_account_creation_staging_report(wiki, version, data_dir, destination)
     }
 
     fn benchmark(
@@ -1886,6 +1919,24 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             }
         }
 
+        Commands::AccountCreations {
+            wiki,
+            version,
+            destination,
+        } => {
+            let snapshot = match version {
+                Some(version) => version,
+                None => {
+                    storage::current_snapshot_version(&data_dir, &wiki)?.with_context(|| {
+                        format!("account creation requires a selected snapshot for {wiki}")
+                    })?
+                }
+            };
+            run_timed_stage("account_creation_extract", Some(&wiki), || {
+                ops.build_account_creation_staging_report(&wiki, &snapshot, &data_dir, &destination)
+            })?;
+        }
+
         Commands::Bench {
             wikis,
             warmup,
@@ -2482,6 +2533,21 @@ mod tests {
                 "compute_patrol:{wiki}:{}:{}:{rebuild}:{limit_str}",
                 data_dir.display(),
                 output_dir.display()
+            ));
+            Ok(())
+        }
+
+        fn build_account_creation_staging_report(
+            &self,
+            wiki: &str,
+            version: &str,
+            data_dir: &Path,
+            destination: &Path,
+        ) -> Result<()> {
+            self.record(format!(
+                "account_creations:{wiki}:{version}:{}:{}",
+                data_dir.display(),
+                destination.display()
             ));
             Ok(())
         }
@@ -3582,6 +3648,39 @@ mod tests {
             ops.calls.into_inner(),
             vec!["fetch_patrol:frwiki:d", "compute_patrol:frwiki:d:o:true:_"]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn run_with_ops_builds_account_creation_staging_report_for_pinned_snapshot() -> Result<()> {
+        let cli = Cli::try_parse_from([
+            "wiki-econ",
+            "--data-dir",
+            "d",
+            "account-creations",
+            "svwiki",
+            "--version",
+            "2026-07",
+            "--destination",
+            "staging/svwiki.json",
+        ])?;
+        let ops = RecordingOps::default();
+        run_with_ops(cli, &ops)?;
+        assert_eq!(
+            ops.calls.into_inner(),
+            vec!["account_creations:svwiki:2026-07:d:staging/svwiki.json"]
+        );
+
+        let missing_snapshot = Cli::try_parse_from([
+            "wiki-econ",
+            "--data-dir",
+            "missing",
+            "account-creations",
+            "svwiki",
+            "--destination",
+            "staging/svwiki.json",
+        ])?;
+        assert!(run_with_ops(missing_snapshot, &RecordingOps::default()).is_err());
         Ok(())
     }
 

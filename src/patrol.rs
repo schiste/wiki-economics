@@ -154,6 +154,7 @@ impl RightsBatch {
 #[derive(Default)]
 struct LogItem {
     log_type: Option<String>,
+    log_action: Option<String>,
     log_id: Option<i64>,
     timestamp: Option<String>,
     contributor_name: Option<String>,
@@ -456,6 +457,240 @@ pub(crate) fn fetch_patrol_for_snapshot(wiki: &str, snapshot: &str, data_dir: &P
     }
     #[cfg(coverage)]
     anyhow::bail!("install_test_transport must be used before patrol generation fetch")
+}
+
+/// Build the publication-invisible account-creation experiment from one
+/// snapshot-pinned logging generation and the matching public revision history.
+/// Permanent local accounts are keyed by their MediaWiki user ID; temporary
+/// accounts are reported separately and never mixed into the permanent cohort.
+pub(crate) fn build_account_creation_staging_report(
+    wiki: &str,
+    snapshot: &str,
+    data_dir: &Path,
+    destination: &Path,
+) -> Result<()> {
+    storage::validate_snapshot_version(snapshot)?;
+    #[cfg(any(test, coverage))]
+    if let Some(transport) = configured_test_transport() {
+        return build_account_creation_staging_report_with_transport(
+            transport.as_ref(),
+            wiki,
+            snapshot,
+            data_dir,
+            destination,
+        );
+    }
+    #[cfg(not(coverage))]
+    {
+        let transport = build_transport()?;
+        build_account_creation_staging_report_with_transport(
+            &transport,
+            wiki,
+            snapshot,
+            data_dir,
+            destination,
+        )
+    }
+    #[cfg(coverage)]
+    anyhow::bail!("install_test_transport must be used before account-creation extraction")
+}
+
+fn build_account_creation_staging_report_with_transport<T: PatrolTransport + ?Sized>(
+    transport: &T,
+    wiki: &str,
+    snapshot: &str,
+    data_dir: &Path,
+    destination: &Path,
+) -> Result<()> {
+    let source_plan = plan::PatrolSourcePlan::load_or_resolve(transport, wiki, snapshot, data_dir)?;
+    anyhow::ensure!(
+        source_plan.coverage_through == snapshot,
+        "account-creation logging coverage does not match history snapshot"
+    );
+    let staging_parent = data_dir
+        .join("staging")
+        .join("account-creations")
+        .join(wiki);
+    fs::create_dir_all(&staging_parent)?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    let staging = staging_parent.join(format!(".{snapshot}.{}.{}.tmp", std::process::id(), nonce));
+    fs::create_dir(&staging)?;
+    let mut accounts = HashMap::<i64, (String, bool)>::new();
+    let mut temporary_by_month = BTreeMap::<String, u32>::new();
+    let mut parse_stats = AccountCreationParseStats::default();
+    let extraction = (|| {
+        for (index, spec) in source_plan.sources.iter().enumerate() {
+            let path = staging.join(format!("source-{index:04}.xml.gz"));
+            let source = download_logging_source(transport, wiki, spec, &path)?;
+            parse_stats.compressed_bytes = parse_stats
+                .compressed_bytes
+                .checked_add(source.content_length)
+                .context("account-creation source byte count overflow")?;
+            let source_stats = parse_account_creation_events(
+                &path,
+                snapshot,
+                &mut accounts,
+                &mut temporary_by_month,
+            )?;
+            parse_stats.add(source_stats)?;
+            fs::remove_file(&path).context("failed to release parsed account logging source")?;
+        }
+        Ok::<(), anyhow::Error>(())
+    })();
+    if let Err(error) = extraction {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(error);
+    }
+    fs::remove_dir(&staging)
+        .context("failed to remove empty account-creation staging directory")?;
+    anyhow::ensure!(
+        parse_stats.unresolved_permanent == 0,
+        "{wiki}/{snapshot} has {} permanent account-creation events without a stable target user ID",
+        parse_stats.unresolved_permanent
+    );
+    anyhow::ensure!(
+        !accounts.is_empty(),
+        "{wiki}/{snapshot} has no permanent account creations in logging coverage"
+    );
+
+    let revision_layer = storage::snapshot_compute_layer(
+        data_dir,
+        wiki,
+        snapshot,
+        storage::GenerationLayer::Warehouse,
+    )?;
+    let revision_files =
+        storage::snapshot_fragment_files(data_dir, wiki, snapshot, revision_layer)?;
+    anyhow::ensure!(
+        !revision_files.is_empty(),
+        "account-creation staging requires the retained {wiki}/{snapshot} metric-input generation"
+    );
+    for path in revision_files {
+        let mut reader = storage::SequentialParquetReader::new(
+            &path,
+            Some(projection(&["event_user_id"])),
+            PARQUET_BATCH_ROWS,
+        )?;
+        while let Some(batch) = reader.next_batch()? {
+            for user_id in batch.column("event_user_id")?.i64()?.iter().flatten() {
+                if let Some((_, edited)) = accounts.get_mut(&user_id) {
+                    *edited = true;
+                }
+            }
+        }
+    }
+
+    let mut monthly = BTreeMap::<String, (u32, u32)>::new();
+    for (month, edited) in accounts.into_values() {
+        let counts = monthly.entry(month).or_default();
+        counts.0 = counts.0.checked_add(1).context("account count overflow")?;
+        if edited {
+            counts.1 = counts
+                .1
+                .checked_add(1)
+                .context("edited account count overflow")?;
+        }
+    }
+    for month in temporary_by_month.keys() {
+        monthly.entry(month.clone()).or_default();
+    }
+    let rows = monthly
+        .into_iter()
+        .map(|(year_month, (accounts_created, accounts_with_edits))| {
+            Ok(AccountCreationMonth {
+                temporary_accounts_excluded: temporary_by_month
+                    .remove(&year_month)
+                    .unwrap_or_default(),
+                accounts_without_edits: accounts_created
+                    .checked_sub(accounts_with_edits)
+                    .context("account-creation conservation failure")?,
+                year_month,
+                accounts_created,
+                accounts_with_edits,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    anyhow::ensure!(
+        rows.iter().all(|row| {
+            row.accounts_created == row.accounts_with_edits + row.accounts_without_edits
+        }),
+        "account-creation split does not conserve its cohort total"
+    );
+    let report = AccountCreationStagingReport {
+        schema_version: 1,
+        metric_version: ACCOUNT_CREATION_METRIC_VERSION,
+        license_spdx: "MIT",
+        attribution: "Derived from Wikimedia Foundation MediaWiki History and public logging dumps; Wikimedia projects and marks are not affiliated with this site.",
+        wiki: wiki.to_string(),
+        snapshot: snapshot.to_string(),
+        logging_dump_date: source_plan.logging_dump_date,
+        source_plan_sha256: source_plan.plan_sha256,
+        compressed_source_bytes: parse_stats.compressed_bytes,
+        total_log_items: parse_stats.total_log_items,
+        account_creation_events: parse_stats.account_creation_events,
+        permanent_accounts: u64::try_from(
+            rows.iter()
+                .map(|row| row.accounts_created as usize)
+                .sum::<usize>(),
+        )?,
+        temporary_accounts: parse_stats.temporary_accounts,
+        definition: "Permanent local accounts created in each month, split by whether the selected public history snapshot contains at least one revision attributed to that local user ID; temporary accounts are excluded.",
+        rows,
+    };
+    generation::atomic_json(destination, &report)?;
+    info!(
+        wiki,
+        snapshot,
+        months = report.rows.len(),
+        path = %destination.display(),
+        "wrote account-creation staging report"
+    );
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct AccountCreationParseStats {
+    compressed_bytes: u64,
+    total_log_items: u64,
+    account_creation_events: u64,
+    permanent_creation_events: u64,
+    temporary_accounts: u64,
+    unresolved_permanent: u64,
+}
+
+impl AccountCreationParseStats {
+    fn add(&mut self, other: Self) -> Result<()> {
+        for (target, value, label) in [
+            (&mut self.total_log_items, other.total_log_items, "log item"),
+            (
+                &mut self.account_creation_events,
+                other.account_creation_events,
+                "account creation event",
+            ),
+            (
+                &mut self.permanent_creation_events,
+                other.permanent_creation_events,
+                "permanent account creation event",
+            ),
+            (
+                &mut self.temporary_accounts,
+                other.temporary_accounts,
+                "temporary account",
+            ),
+            (
+                &mut self.unresolved_permanent,
+                other.unresolved_permanent,
+                "unresolved permanent account",
+            ),
+        ] {
+            *target = target
+                .checked_add(value)
+                .with_context(|| format!("{label} count overflow"))?;
+        }
+        Ok(())
+    }
 }
 
 pub(crate) fn preflight_patrol_for_snapshot(
@@ -1254,6 +1489,119 @@ fn parse_logging_events<P: PatrolSink + ?Sized, R: RightsSink + ?Sized>(
     Ok(stats)
 }
 
+fn parse_account_creation_events(
+    xml_path: &Path,
+    snapshot: &str,
+    accounts: &mut HashMap<i64, (String, bool)>,
+    temporary_by_month: &mut BTreeMap<String, u32>,
+) -> Result<AccountCreationParseStats> {
+    let file = File::open(xml_path)?;
+    let compressed_bytes = file.metadata()?.len();
+    crate::storage::prepare_sequential_read(&file);
+    let decoder = MultiGzDecoder::new(BufReader::new(file.try_clone()?));
+    let mut reader = Reader::from_reader(BufReader::new(decoder));
+    reader.config_mut().trim_text(true);
+
+    let mut buffer = Vec::new();
+    let mut current = None::<LogItem>;
+    let mut current_tag = None::<String>;
+    let mut in_contributor = false;
+    let mut stats = AccountCreationParseStats::default();
+    loop {
+        match reader.read_event_into(&mut buffer) {
+            Ok(Event::Start(event)) => {
+                let tag = local_name(&event);
+                match tag.as_str() {
+                    "logitem" => current = Some(LogItem::default()),
+                    "contributor" => in_contributor = true,
+                    _ if current.is_some() => current_tag = Some(tag),
+                    _ => {}
+                }
+            }
+            Ok(Event::End(event)) => {
+                let tag = String::from_utf8_lossy(event.local_name().as_ref()).to_string();
+                match tag.as_str() {
+                    "contributor" => {
+                        in_contributor = false;
+                        current_tag = None;
+                    }
+                    "logitem" => {
+                        if let Some(item) = current.take() {
+                            stats.total_log_items = stats
+                                .total_log_items
+                                .checked_add(1)
+                                .context("account logging item count overflow")?;
+                            if matches!(item.log_type.as_deref(), Some("newusers")) {
+                                stats.account_creation_events = stats
+                                    .account_creation_events
+                                    .checked_add(1)
+                                    .context("account creation event count overflow")?;
+                                let row = item.into_new_user_row();
+                                let month = row
+                                    .timestamp
+                                    .get(..7)
+                                    .context("newusers timestamp has no event month")?
+                                    .to_string();
+                                storage::validate_snapshot_version(&month)?;
+                                if compute::snapshot_contains_complete_month(snapshot, &month) {
+                                    if row.is_temporary {
+                                        stats.temporary_accounts = stats
+                                            .temporary_accounts
+                                            .checked_add(1)
+                                            .context("temporary account count overflow")?;
+                                        let count = temporary_by_month.entry(month).or_default();
+                                        *count = count
+                                            .checked_add(1)
+                                            .context("temporary account month count overflow")?;
+                                    } else if let Some(user_id) = row.target_user_id {
+                                        stats.permanent_creation_events = stats
+                                            .permanent_creation_events
+                                            .checked_add(1)
+                                            .context("permanent account count overflow")?;
+                                        if let Some((existing_month, _)) = accounts.get(&user_id) {
+                                            anyhow::ensure!(
+                                                existing_month == &month,
+                                                "account {user_id} has creation events in multiple months"
+                                            );
+                                        } else {
+                                            accounts.insert(user_id, (month, false));
+                                        }
+                                    } else {
+                                        stats.unresolved_permanent = stats
+                                            .unresolved_permanent
+                                            .checked_add(1)
+                                            .context("unresolved account count overflow")?;
+                                    }
+                                }
+                            }
+                        }
+                        current_tag = None;
+                    }
+                    _ => current_tag = None,
+                }
+            }
+            Ok(Event::Text(text)) => apply_decoded_log_text(
+                current.as_mut(),
+                current_tag.as_deref(),
+                in_contributor,
+                text.decode()?.into_owned(),
+            ),
+            Ok(Event::CData(text)) => apply_decoded_log_text(
+                current.as_mut(),
+                current_tag.as_deref(),
+                in_contributor,
+                text.decode()?.into_owned(),
+            ),
+            Ok(Event::Eof) => break,
+            Ok(_) => {}
+            Err(error) => return Err(error.into()),
+        }
+        buffer.clear();
+    }
+    crate::storage::discard_file_cache(&file, 0, compressed_bytes);
+    Ok(stats)
+}
+
 #[cfg(test)]
 fn validate_logging_parse(xml_path: &Path, stats: LoggingParseStats) -> Result<()> {
     let compressed_bytes = fs::metadata(xml_path)?.len();
@@ -1296,6 +1644,7 @@ fn apply_decoded_log_text(
 fn apply_log_text(item: &mut LogItem, tag: &str, in_contributor: bool, value: String) {
     match (tag, in_contributor) {
         ("type", _) => item.log_type = Some(value),
+        ("action", _) => item.log_action = Some(value),
         ("id", true) => item.contributor_id = parse_i64_opt(&value),
         ("id", false) => item.log_id = parse_i64_opt(&value),
         ("timestamp", _) => item.timestamp = Some(normalize_timestamp(&value)),
@@ -1351,6 +1700,75 @@ impl LogItem {
             new_groups,
         }
     }
+
+    fn into_new_user_row(self) -> NewUserRow {
+        let action = self.log_action.unwrap_or_default();
+        let target_user_id = self
+            .params
+            .as_deref()
+            .and_then(parse_new_user_id)
+            .or_else(|| {
+                matches!(action.as_str(), "create" | "autocreate" | "newusers")
+                    .then_some(self.contributor_id)
+                    .flatten()
+            });
+        let target_user = self.log_title;
+        let is_temporary = target_user
+            .as_deref()
+            .map(|title| title.rsplit_once(':').map_or(title, |(_, user)| user))
+            .is_some_and(|user| user.starts_with('~'));
+        NewUserRow {
+            timestamp: self.timestamp.unwrap_or_default(),
+            target_user_id,
+            is_temporary,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+struct AccountCreationMonth {
+    year_month: String,
+    accounts_created: u32,
+    accounts_with_edits: u32,
+    accounts_without_edits: u32,
+    temporary_accounts_excluded: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct AccountCreationStagingReport {
+    schema_version: u32,
+    metric_version: &'static str,
+    license_spdx: &'static str,
+    attribution: &'static str,
+    wiki: String,
+    snapshot: String,
+    logging_dump_date: String,
+    source_plan_sha256: String,
+    compressed_source_bytes: u64,
+    total_log_items: u64,
+    account_creation_events: u64,
+    permanent_accounts: u64,
+    temporary_accounts: u64,
+    definition: &'static str,
+    rows: Vec<AccountCreationMonth>,
+}
+
+const ACCOUNT_CREATION_METRIC_VERSION: &str =
+    "account-creations-v1-permanent-local-account-lifetime-public-edit";
+
+fn parse_new_user_id(params: &str) -> Option<i64> {
+    let params = params.trim();
+    if let Ok(value) = params.parse::<i64>() {
+        return Some(value);
+    }
+    static USER_ID: OnceLock<Regex> = OnceLock::new();
+    USER_ID
+        .get_or_init(|| {
+            Regex::new(r#"(?:4::)?userid\";i:(\d+)"#).expect("newusers userid expression is valid")
+        })
+        .captures(params)
+        .and_then(|capture| capture.get(1))
+        .and_then(|value| value.as_str().parse().ok())
 }
 
 #[derive(Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -1371,6 +1789,13 @@ struct RightsRow {
     target_user: String,
     old_groups: String,
     new_groups: String,
+}
+
+#[derive(Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+struct NewUserRow {
+    timestamp: String,
+    target_user_id: Option<i64>,
+    is_temporary: bool,
 }
 
 impl PatrolWriter {

@@ -201,13 +201,23 @@ fn gzip_bytes(content: &str) -> Result<Vec<u8>> {
 }
 
 fn history_row(wiki: &str, timestamp: &str, username: &str, revision_id: &str) -> String {
+    history_row_with_user_id(wiki, timestamp, username, "1", revision_id)
+}
+
+fn history_row_with_user_id(
+    wiki: &str,
+    timestamp: &str,
+    username: &str,
+    user_id: &str,
+    revision_id: &str,
+) -> String {
     let mut row = vec![String::new(); crate::schema::COLUMNS.len()];
     for (name, value) in [
         ("wiki_db", wiki),
         ("event_entity", "revision"),
         ("event_type", "create"),
         ("event_timestamp", timestamp),
-        ("event_user_id", "1"),
+        ("event_user_id", user_id),
         ("event_user_text", username),
         ("event_user_is_anonymous", "false"),
         ("event_user_is_temporary", "false"),
@@ -1174,6 +1184,15 @@ fn parse_logging_events_reads_all_gzip_members_and_reports_stats() -> Result<()>
     <params>editor
 autopatrolled</params>
   </logitem>
+  <logitem>
+    <id>4</id>
+    <timestamp>2026-01-04T00:00:00Z</timestamp>
+    <contributor><username>NewEditor</username><id>44</id></contributor>
+    <type>newusers</type>
+    <action>create</action>
+    <logtitle>User:NewEditor</logtitle>
+    <params><![CDATA[a:1:{s:9:"4::userid";i:44;}]]></params>
+  </logitem>
 </mediawiki>"#;
     let second_member = xml
         .find("  <logitem>\n    <id>2</id>")
@@ -1190,10 +1209,10 @@ autopatrolled</params>
     assert_eq!(
         stats,
         LoggingParseStats {
-            total_log_items: 3,
+            total_log_items: 4,
             patrol_events: 1,
             rights_events: 1,
-            skipped_events: 1,
+            skipped_events: 2,
         }
     );
     assert_eq!(read_parquet_df(&patrol_path, None)?.height(), 1);
@@ -1229,6 +1248,8 @@ autopatrolled</params></logitem>
 0</params></logitem>
   <logitem><id>4</id><timestamp>2026-02-06T12:00:00Z</timestamp><type>rights</type><logtitle>User:Editor</logtitle><params>autopatrolled
 editor</params></logitem>
+  <logitem><id>5</id><timestamp>2026-02-07T12:00:00Z</timestamp><contributor><username>Editor</username><id>42</id></contributor><type>newusers</type><action>create</action><logtitle>User:Editor</logtitle><params>a:1:{s:9:"4::userid";i:42;}</params></logitem>
+  <logitem><id>6</id><timestamp>2026-02-08T12:00:00Z</timestamp><contributor><username>~2026-1</username><id>43</id></contributor><type>newusers</type><action>autocreate</action><logtitle>User:~2026-1</logtitle><params>43</params></logitem>
 </mediawiki>"#;
     let source = gzip_bytes(xml)?;
     let transport = FakePatrolTransport::new(
@@ -1244,7 +1265,7 @@ editor</params></logitem>
     generation::preflight(&transport, "testwiki", "2026-08", data_dir.path())?;
     generation::preflight(&transport, "testwiki", "2026-08", data_dir.path())?;
     let generation = generation::fetch(&transport, "testwiki", "2026-08", data_dir.path())?;
-    assert_eq!(generation.stats.total_log_items, 4);
+    assert_eq!(generation.stats.total_log_items, 6);
     assert_eq!(generation.stats.patrol_events, 2);
     assert_eq!(generation.stats.rights_events, 2);
     assert_eq!(generation.patrol_months.len(), 2);
@@ -1292,10 +1313,10 @@ editor</params></logitem>
     );
     let summary = source_generation_summary(data_dir.path(), "testwiki", "2026-08")?
         .context("test patrol generation summary is missing")?;
-    assert_eq!(summary.total_log_items, 4);
+    assert_eq!(summary.total_log_items, 6);
     assert_eq!(summary.patrol_events, 2);
     assert_eq!(summary.rights_events, 2);
-    assert_eq!(summary.skipped_events, 0);
+    assert_eq!(summary.skipped_events, 2);
     assert_eq!(summary.manifest_sha256, generation.manifest_sha256);
     assert!(source_generation_summary(data_dir.path(), "testwiki", "2026-07")?.is_none());
 
@@ -1313,6 +1334,66 @@ editor</params></logitem>
     );
     fs::write(&first_patrol, b"corrupt")?;
     assert!(generation::load(data_dir.path(), "testwiki", "2026-08").is_err());
+    Ok(())
+}
+
+#[test]
+fn account_creation_staging_report_uses_creation_cohorts_and_lifetime_edits() -> Result<()> {
+    let root = TestDir::new()?;
+    let data_dir = root.path().join("data");
+    let wiki = "accountwiki";
+    let snapshot = "2026-08";
+    ingest_history_snapshot(
+        &data_dir,
+        wiki,
+        snapshot,
+        &[
+            history_row_with_user_id(wiki, "2025-03-01 00:00:00.0", "Edited", "101", "1"),
+            history_row_with_user_id(wiki, "2026-07-01 00:00:00.0", "Other", "999", "2"),
+        ],
+    )?;
+    let logging = r#"<mediawiki>
+<logitem><id>1</id><timestamp>2025-01-01T00:00:00Z</timestamp><contributor><username>Edited</username><id>101</id></contributor><type>newusers</type><action>create</action><logtitle>User:Edited</logtitle><params>a:1:{s:9:"4::userid";i:101;}</params></logitem>
+<logitem><id>2</id><timestamp>2025-01-02T00:00:00Z</timestamp><contributor><username>Never edited</username><id>102</id></contributor><type>newusers</type><action>create</action><logtitle>User:Never edited</logtitle><params>102</params></logitem>
+<logitem><id>3</id><timestamp>2025-02-01T00:00:00Z</timestamp><contributor><username>~2025-1</username><id>103</id></contributor><type>newusers</type><action>autocreate</action><logtitle>User:~2025-1</logtitle><params>103</params></logitem>
+</mediawiki>"#;
+    let split_at = logging
+        .find("<logitem><id>2</id>")
+        .context("account fixture split point")?;
+    let mut logging_source = gzip_bytes(&logging[..split_at])?;
+    logging_source.extend(gzip_bytes(&logging[split_at..])?);
+    let transport = FakePatrolTransport::new(
+        vec![logging_source],
+        vec![json!({"query": {"usergroups": []}})],
+    );
+    let destination = root
+        .path()
+        .join("staging/account-creations/accountwiki.json");
+    build_account_creation_staging_report_with_transport(
+        &transport,
+        wiki,
+        snapshot,
+        &data_dir,
+        &destination,
+    )?;
+    let report: Value = serde_json::from_slice(&fs::read(destination)?)?;
+    assert_eq!(report["wiki"], wiki);
+    assert_eq!(report["snapshot"], snapshot);
+    assert_eq!(report["license_spdx"], "MIT");
+    assert_eq!(report["account_creation_events"], 3);
+    assert_eq!(report["permanent_accounts"], 2);
+    assert_eq!(report["temporary_accounts"], 1);
+    assert_eq!(report["rows"][0]["year_month"], "2025-01");
+    assert_eq!(report["rows"][0]["accounts_created"], 2);
+    assert_eq!(report["rows"][0]["accounts_with_edits"], 1);
+    assert_eq!(report["rows"][0]["accounts_without_edits"], 1);
+    assert_eq!(report["rows"][1]["year_month"], "2025-02");
+    assert_eq!(report["rows"][1]["accounts_created"], 0);
+    assert_eq!(report["rows"][1]["temporary_accounts_excluded"], 1);
+    assert_eq!(
+        fs::read_dir(data_dir.join("staging/account-creations").join(wiki))?.count(),
+        0
+    );
     Ok(())
 }
 
@@ -2048,6 +2129,7 @@ fn writers_flush_empty_batches_and_at_threshold() -> Result<()> {
     })?;
     rights_writer.finish()?;
     assert_eq!(read_parquet_df(&rights_path, None)?.height(), 2);
+
     Ok(())
 }
 
