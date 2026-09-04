@@ -333,7 +333,9 @@ fn reduce_block_state_spool(path: &Path) -> Result<Vec<IndefinitelyBlockedAccoun
             && existing.log_id == row.log_id
         {
             anyhow::ensure!(
-                existing.action == row.action && existing.resulting_state == row.resulting_state,
+                existing.action == row.action
+                    && existing.resulting_state == row.resulting_state
+                    && existing.duration == row.duration,
                 "conflicting account block transitions for {} at {} / {}",
                 row.target_user,
                 row.timestamp,

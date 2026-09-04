@@ -126,6 +126,7 @@ struct AccountBlockBatch {
     target_user: Vec<String>,
     action: Vec<String>,
     resulting_state: Vec<String>,
+    duration: Vec<Option<String>>,
 }
 
 impl PatrolBatch {
@@ -171,6 +172,7 @@ impl AccountBlockBatch {
                 "resulting_state".into(),
                 std::mem::take(&mut self.resulting_state),
             ),
+            Column::new("duration".into(), std::mem::take(&mut self.duration)),
         ]
     }
 }
@@ -806,6 +808,7 @@ struct AccountBlockEventRow {
     target_user: String,
     action: String,
     resulting_state: AccountBlockState,
+    duration: Option<String>,
 }
 
 impl AccountBlockEventRow {
@@ -825,6 +828,7 @@ struct AccountBlockStateSortRow {
     log_id: i64,
     action: String,
     resulting_state: AccountBlockState,
+    duration: Option<String>,
 }
 
 impl From<&AccountBlockEventRow> for AccountBlockStateSortRow {
@@ -835,6 +839,7 @@ impl From<&AccountBlockEventRow> for AccountBlockStateSortRow {
             log_id: row.log_id,
             action: row.action.clone(),
             resulting_state: row.resulting_state,
+            duration: row.duration.clone(),
         }
     }
 }
@@ -2342,12 +2347,16 @@ fn parse_account_block_transition_common(
     } else {
         classify_block_duration(item.params.as_deref())
     };
+    let duration = (action != "unblock")
+        .then(|| normalized_block_duration(item.params.as_deref()))
+        .flatten();
     Ok(Some(AccountBlockEventRow {
         timestamp,
         log_id: item.log_id.unwrap_or_default(),
         target_user: target,
         action: action.to_string(),
         resulting_state: state,
+        duration,
     }))
 }
 
@@ -2433,6 +2442,35 @@ fn is_indefinite_duration(duration: &str) -> bool {
         duration.trim().to_ascii_lowercase().as_str(),
         "infinite" | "infinity" | "indefinite" | "indefinitely" | "never"
     )
+}
+
+fn normalized_block_duration(params: Option<&str>) -> Option<String> {
+    let params = params?.trim();
+    if params.is_empty() {
+        return None;
+    }
+    static NAMED_DURATION: OnceLock<Regex> = OnceLock::new();
+    let named = NAMED_DURATION.get_or_init(|| {
+        Regex::new(r#"5::duration\";s:\d+:\"([^\"]*)\""#)
+            .expect("block duration expression is valid")
+    });
+    static LEGACY_DURATION: OnceLock<Regex> = OnceLock::new();
+    let legacy = LEGACY_DURATION.get_or_init(|| {
+        Regex::new(r#"i:0;s:\d+:\"([^\"]*)\""#).expect("legacy block duration expression is valid")
+    });
+    if let Some(value) = named
+        .captures(params)
+        .or_else(|| legacy.captures(params))
+        .and_then(|capture| capture.get(1))
+        .map(|capture| capture.as_str().trim())
+        .filter(|value| !value.is_empty())
+    {
+        return Some(value.to_string());
+    }
+    (!params.starts_with("a:"))
+        .then(|| params.lines().next().unwrap_or_default().trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -2789,6 +2827,7 @@ impl AccountBlockWriter {
         self.batch.target_user.push(row.target_user);
         self.batch.action.push(row.action);
         self.batch.resulting_state.push(resulting_state);
+        self.batch.duration.push(row.duration);
         if self.batch.timestamp.len() >= self.batch_rows {
             self.flush()?;
         }
@@ -2846,6 +2885,7 @@ fn account_block_schema() -> Schema {
         Field::new("target_user".into(), DataType::String),
         Field::new("action".into(), DataType::String),
         Field::new("resulting_state".into(), DataType::String),
+        Field::new("duration".into(), DataType::String),
     ])
 }
 

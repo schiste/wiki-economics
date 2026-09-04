@@ -1389,6 +1389,14 @@ editor</params></logitem>
             .collect::<Vec<_>>(),
         vec![Some("indefinite"), Some("indefinite"), Some("unblocked")]
     );
+    assert_eq!(
+        block_history
+            .column("duration")?
+            .str()?
+            .iter()
+            .collect::<Vec<_>>(),
+        vec![Some("infinity"), Some("infinity"), None]
+    );
 
     let blocked_path = root.join("indefinitely-blocked-accounts.json");
     let original_blocked = fs::read(&blocked_path)?;
@@ -1584,6 +1592,15 @@ fn account_block_duration_classification_covers_current_and_legacy_formats() {
         classify_block_duration(Some("a:1:{broken")),
         AccountBlockState::Unclassified
     );
+    assert_eq!(
+        normalized_block_duration(Some(r#"a:1:{s:11:"5::duration";s:7:"2 weeks";}"#)).as_deref(),
+        Some("2 weeks")
+    );
+    assert_eq!(
+        normalized_block_duration(Some("infinity\nnocreate,noemail")).as_deref(),
+        Some("infinity")
+    );
+    assert_eq!(normalized_block_duration(Some("")), None);
 }
 
 #[test]

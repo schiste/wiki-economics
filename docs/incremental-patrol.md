@@ -68,7 +68,8 @@ verify the selected receipt without parsing nanosecond integers imprecisely.
 
 Each monthly `blocks` Parquet retains one row per recognized local
 block/reblock/unblock event: timestamp, log ID, normalized target account,
-action, and resulting duration class. These internal rows preserve whether and
+action, normalized source duration when present, and resulting state
+(`indefinite`, `finite`, `unblocked`, or `unclassified`). These internal rows preserve whether and
 when an account was ever locally blocked without exposing the event history in
 the public browser datasets. They are externally sorted in bounded batches,
 content-hashed, and owned by the snapshot generation.
