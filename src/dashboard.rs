@@ -1929,27 +1929,26 @@ mod tests {
         assert!(error.to_string().contains("row conservation failed"));
         assert!(!rejected.path().join(ACCOUNT_CREATION_STAGING_PATH).exists());
 
-        fs::write(
-            &report_path,
-            serde_json::to_vec(&json!({
-                "schema_version": 1,
-                "metric_version": crate::patrol::ACCOUNT_CREATION_METRIC_VERSION,
-                "license_spdx": "MIT",
-                "wiki": "svwiki",
-                "snapshot": "2026-01",
-                "source_plan_sha256": "a".repeat(64),
-                "permanent_account_creation_events": 1,
-                "permanent_accounts": 1,
-                "duplicate_permanent_creation_events": 0,
-                "rows": [{
-                    "year_month": "2026-01",
-                    "accounts_created": 1,
-                    "accounts_with_edits": 1,
-                    "accounts_without_edits": 0,
-                    "temporary_accounts_excluded": 0
-                }]
-            }))?,
-        )?;
+        let valid_report = serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "metric_version": crate::patrol::ACCOUNT_CREATION_METRIC_VERSION,
+            "license_spdx": "MIT",
+            "wiki": "svwiki",
+            "snapshot": "2026-01",
+            "source_plan_sha256": "a".repeat(64),
+            "permanent_account_creation_events": 1,
+            "permanent_accounts": 1,
+            "duplicate_permanent_creation_events": 0,
+            "rows": [{
+                "year_month": "2026-01",
+                "accounts_created": 1,
+                "accounts_with_edits": 1,
+                "accounts_without_edits": 0,
+                "temporary_accounts_excluded": 0
+            }]
+        }))
+        .expect("valid account fixture should serialize");
+        fs::write(&report_path, valid_report).expect("valid account fixture should be written");
         let blocked = TestDir::new()?;
         let blocked_path = blocked.path().join(ACCOUNT_CREATION_STAGING_PATH);
         fs::create_dir_all(&blocked_path)?;
