@@ -31,10 +31,14 @@ pub(crate) struct SourceIngestCommit {
 }
 
 /// Scan one validated MediaWiki History source without materializing a
-/// DataFrame, visiting only stable user IDs attached to public revision-create
+/// DataFrame, visiting only user identities attached to public revision-create
 /// events. This is used by bounded staging analyses after retained metric input
-/// has been retired.
-pub(crate) fn scan_revision_user_ids(source: &Path, mut visit: impl FnMut(i64)) -> Result<u64> {
+/// has been retired. Both historical and current names are exposed because old
+/// account-creation log records do not always contain a stable target user ID.
+pub(crate) fn scan_revision_user_identities(
+    source: &Path,
+    mut visit: impl FnMut(Option<i64>, Option<&str>, Option<&str>),
+) -> Result<u64> {
     let file = File::open(source).with_context(|| format!("cannot open {}", source.display()))?;
     let decoder = BzDecoder::new(BufReader::with_capacity(8 * 1024 * 1024, file));
     let mut reader = BufReader::with_capacity(8 * 1024 * 1024, decoder);
@@ -45,7 +49,7 @@ pub(crate) fn scan_revision_user_ids(source: &Path, mut visit: impl FnMut(i64)) 
         if reader.read_until(b'\n', &mut line)? == 0 {
             break;
         }
-        let mut fields = line.splitn(8, |byte| *byte == b'\t');
+        let mut fields = line.splitn(11, |byte| *byte == b'\t');
         let _wiki = fields.next();
         let _event_log_id = fields.next();
         let event_entity = fields.next();
@@ -53,6 +57,9 @@ pub(crate) fn scan_revision_user_ids(source: &Path, mut visit: impl FnMut(i64)) 
         let _event_timestamp = fields.next();
         let _event_comment = fields.next();
         let event_user_id = fields.next();
+        let _event_user_central_id = fields.next();
+        let event_user_text_historical = fields.next();
+        let event_user_text = fields.next();
         if event_entity != Some(b"revision".as_slice()) || event_type != Some(b"create".as_slice())
         {
             continue;
@@ -60,11 +67,20 @@ pub(crate) fn scan_revision_user_ids(source: &Path, mut visit: impl FnMut(i64)) 
         revisions = revisions
             .checked_add(1)
             .context("revision row count overflow")?;
-        let Some(value) = event_user_id.filter(|value| !value.is_empty()) else {
-            continue;
+        let user_id = if let Some(value) = event_user_id.filter(|value| !value.is_empty()) {
+            Some(std::str::from_utf8(value)?.parse::<i64>()?)
+        } else {
+            None
         };
-        let user_id = std::str::from_utf8(value)?.parse::<i64>()?;
-        visit(user_id);
+        let historical_name = event_user_text_historical
+            .filter(|value| !value.is_empty())
+            .map(std::str::from_utf8)
+            .transpose()?;
+        let current_name = event_user_text
+            .filter(|value| !value.is_empty())
+            .map(std::str::from_utf8)
+            .transpose()?;
+        visit(user_id, historical_name, current_name);
     }
     Ok(revisions)
 }
@@ -1310,10 +1326,31 @@ mod tests {
             ],
         )
         .expect("history scan fixture should be writable");
-        let mut ids = Vec::new();
-        let revision_rows = scan_revision_user_ids(&source, |user_id| ids.push(user_id))?;
+        let mut identities = Vec::new();
+        let revision_rows =
+            scan_revision_user_identities(&source, |user_id, historical_name, current_name| {
+                identities.push((
+                    user_id,
+                    historical_name.map(str::to_string),
+                    current_name.map(str::to_string),
+                ));
+            })?;
         assert_eq!(revision_rows, 2);
-        assert_eq!(ids, [42]);
+        assert_eq!(
+            identities,
+            [
+                (
+                    Some(42),
+                    Some("ExampleUserAtRevision".to_string()),
+                    Some("ExampleUser".to_string())
+                ),
+                (
+                    None,
+                    Some("ExampleUserAtRevision".to_string()),
+                    Some("ExampleUser".to_string())
+                )
+            ]
+        );
         Ok(())
     }
 

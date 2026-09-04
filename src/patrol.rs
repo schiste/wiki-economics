@@ -518,6 +518,7 @@ fn build_account_creation_staging_report_with_transport<T: PatrolTransport + ?Si
     let staging = staging_parent.join(format!(".{snapshot}.{}.{}.tmp", std::process::id(), nonce));
     fs::create_dir(&staging)?;
     let mut accounts = HashMap::<i64, (String, bool)>::new();
+    let mut fallback_accounts = HashMap::<i64, (String, bool, String)>::new();
     let mut temporary_by_month = BTreeMap::<String, u32>::new();
     let mut parse_stats = AccountCreationParseStats::default();
     let extraction = (|| {
@@ -532,6 +533,7 @@ fn build_account_creation_staging_report_with_transport<T: PatrolTransport + ?Si
                 &path,
                 snapshot,
                 &mut accounts,
+                &mut fallback_accounts,
                 &mut temporary_by_month,
             )?;
             parse_stats.add(source_stats)?;
@@ -547,7 +549,7 @@ fn build_account_creation_staging_report_with_transport<T: PatrolTransport + ?Si
         .context("failed to remove empty account-creation staging directory")?;
     anyhow::ensure!(
         parse_stats.unresolved_permanent == 0,
-        "{wiki}/{snapshot} has {} permanent account-creation events without a stable target user ID",
+        "{wiki}/{snapshot} has {} permanent account-creation events without a usable target identity",
         parse_stats.unresolved_permanent
     );
     anyhow::ensure!(
@@ -555,10 +557,26 @@ fn build_account_creation_staging_report_with_transport<T: PatrolTransport + ?Si
         "{wiki}/{snapshot} has no permanent account creations in logging coverage"
     );
 
-    let history_scan = mark_accounts_with_revisions(wiki, snapshot, data_dir, &mut accounts)?;
+    let history_scan = mark_accounts_with_revisions(
+        wiki,
+        snapshot,
+        data_dir,
+        &mut accounts,
+        &mut fallback_accounts,
+    )?;
 
     let mut monthly = BTreeMap::<String, (u32, u32)>::new();
     for (month, edited) in accounts.into_values() {
+        let counts = monthly.entry(month).or_default();
+        counts.0 = counts.0.checked_add(1).context("account count overflow")?;
+        if edited {
+            counts.1 = counts
+                .1
+                .checked_add(1)
+                .context("edited account count overflow")?;
+        }
+    }
+    for (month, edited, _) in fallback_accounts.into_values() {
         let counts = monthly.entry(month).or_default();
         counts.0 = counts.0.checked_add(1).context("account count overflow")?;
         if edited {
@@ -616,12 +634,13 @@ fn build_account_creation_staging_report_with_transport<T: PatrolTransport + ?Si
             .checked_sub(permanent_accounts)
             .context("permanent account creation event conservation failure")?,
         cross_month_duplicate_events: parse_stats.cross_month_duplicate_events,
+        fallback_identity_accounts: parse_stats.fallback_identity_accounts,
         temporary_accounts: parse_stats.temporary_accounts,
         history_scan_mode: history_scan.mode,
         history_sources: history_scan.sources,
         history_source_bytes: history_scan.bytes,
         history_revision_rows: history_scan.revision_rows,
-        definition: "Permanent local accounts grouped by their earliest observed creation-log month, split by whether the selected public history snapshot contains at least one revision attributed to that local user ID; later duplicate creation-log records and temporary accounts are excluded.",
+        definition: "Permanent local accounts grouped by their earliest observed creation-log month, split by whether the selected public history snapshot contains at least one revision attributed to that local user ID; legacy records without a target ID use their unique log ID and target name, while later duplicate stable-ID records and temporary accounts are excluded.",
         rows,
     };
     generation::atomic_json(destination, &report)?;
@@ -642,6 +661,7 @@ struct AccountCreationParseStats {
     account_creation_events: u64,
     permanent_creation_events: u64,
     cross_month_duplicate_events: u64,
+    fallback_identity_accounts: u64,
     temporary_accounts: u64,
     unresolved_permanent: u64,
 }
@@ -659,7 +679,9 @@ fn mark_accounts_with_revisions(
     snapshot: &str,
     data_dir: &Path,
     accounts: &mut HashMap<i64, (String, bool)>,
+    fallback_accounts: &mut HashMap<i64, (String, bool, String)>,
 ) -> Result<AccountCreationHistoryScan> {
+    let fallback_by_name = fallback_name_index(fallback_accounts);
     let retained = storage::snapshot_compute_layer(
         data_dir,
         wiki,
@@ -676,7 +698,11 @@ fn mark_accounts_with_revisions(
             bytes = bytes
                 .checked_add(fs::metadata(path)?.len())
                 .context("retained history byte count overflow")?;
-            let columns = projection(&["event_user_id"]);
+            let columns = projection(&[
+                "event_user_id",
+                "event_user_text_historical",
+                "event_user_text",
+            ]);
             let mut reader =
                 storage::SequentialParquetReader::new(path, Some(columns), PARQUET_BATCH_ROWS)
                     .with_context(|| format!("cannot scan retained history {}", path.display()))?;
@@ -684,10 +710,18 @@ fn mark_accounts_with_revisions(
                 revision_rows = revision_rows
                     .checked_add(u64::try_from(batch.height())?)
                     .context("retained revision row count overflow")?;
-                for user_id in batch.column("event_user_id")?.i64()?.iter().flatten() {
-                    if let Some((_, edited)) = accounts.get_mut(&user_id) {
-                        *edited = true;
-                    }
+                let user_ids = batch.column("event_user_id")?.i64()?;
+                let historical_names = batch.column("event_user_text_historical")?.str()?;
+                let current_names = batch.column("event_user_text")?.str()?;
+                for index in 0..batch.height() {
+                    mark_account_revision(
+                        user_ids.get(index),
+                        historical_names.get(index),
+                        current_names.get(index),
+                        accounts,
+                        fallback_accounts,
+                        &fallback_by_name,
+                    );
                 }
             }
         }
@@ -699,7 +733,7 @@ fn mark_accounts_with_revisions(
         });
     }
 
-    scan_account_history_source_plan(wiki, snapshot, data_dir, accounts)
+    scan_account_history_source_plan(wiki, snapshot, data_dir, accounts, fallback_accounts)
 }
 
 #[cfg(not(coverage))]
@@ -708,10 +742,11 @@ fn scan_account_history_source_plan(
     snapshot: &str,
     data_dir: &Path,
     accounts: &mut HashMap<i64, (String, bool)>,
+    fallback_accounts: &mut HashMap<i64, (String, bool, String)>,
 ) -> Result<AccountCreationHistoryScan> {
     let (plan, _) = crate::snapshot_plan::SnapshotPlan::load_or_resolve(data_dir, wiki, snapshot)?;
     let run_id = format!("account-creations-{wiki}-{snapshot}-{}", std::process::id());
-    scan_account_history_source_plan_with(&plan, accounts, |source| {
+    scan_account_history_source_plan_with(&plan, accounts, fallback_accounts, |source| {
         crate::fetch::fetch_snapshot_source_window(
             wiki,
             snapshot,
@@ -731,6 +766,7 @@ fn scan_account_history_source_plan(
     _snapshot: &str,
     _data_dir: &Path,
     _accounts: &mut HashMap<i64, (String, bool)>,
+    _fallback_accounts: &mut HashMap<i64, (String, bool, String)>,
 ) -> Result<AccountCreationHistoryScan> {
     anyhow::bail!("bounded history source scan is unavailable without a test source loader")
 }
@@ -738,11 +774,13 @@ fn scan_account_history_source_plan(
 fn scan_account_history_source_plan_with<F>(
     plan: &crate::snapshot_plan::SnapshotPlan,
     accounts: &mut HashMap<i64, (String, bool)>,
+    fallback_accounts: &mut HashMap<i64, (String, bool, String)>,
     mut load_source: F,
 ) -> Result<AccountCreationHistoryScan>
 where
     F: FnMut(&crate::snapshot_plan::SourceSpec) -> Result<PathBuf>,
 {
+    let fallback_by_name = fallback_name_index(fallback_accounts);
     let mut bytes = 0_u64;
     let mut revision_rows = 0_u64;
     for source in &plan.sources {
@@ -751,11 +789,19 @@ where
             .checked_add(fs::metadata(&path)?.len())
             .context("history source byte count overflow")?;
         revision_rows = revision_rows
-            .checked_add(crate::ingest::scan_revision_user_ids(&path, |user_id| {
-                if let Some((_, edited)) = accounts.get_mut(&user_id) {
-                    *edited = true;
-                }
-            })?)
+            .checked_add(crate::ingest::scan_revision_user_identities(
+                &path,
+                |user_id, historical_name, current_name| {
+                    mark_account_revision(
+                        user_id,
+                        historical_name,
+                        current_name,
+                        accounts,
+                        fallback_accounts,
+                        &fallback_by_name,
+                    );
+                },
+            )?)
             .context("history revision row count overflow")?;
         fs::remove_file(&path).context("failed to release scanned history source")?;
         let parent = path
@@ -770,6 +816,43 @@ where
         bytes,
         revision_rows,
     })
+}
+
+fn fallback_name_index(
+    fallback_accounts: &HashMap<i64, (String, bool, String)>,
+) -> HashMap<String, Vec<i64>> {
+    let mut by_name = HashMap::<String, Vec<i64>>::new();
+    for (log_id, (_, _, name)) in fallback_accounts {
+        by_name.entry(name.clone()).or_default().push(*log_id);
+    }
+    for log_ids in by_name.values_mut() {
+        log_ids.sort_unstable();
+    }
+    by_name
+}
+
+fn mark_account_revision(
+    user_id: Option<i64>,
+    historical_name: Option<&str>,
+    current_name: Option<&str>,
+    accounts: &mut HashMap<i64, (String, bool)>,
+    fallback_accounts: &mut HashMap<i64, (String, bool, String)>,
+    fallback_by_name: &HashMap<String, Vec<i64>>,
+) {
+    if let Some(user_id) = user_id
+        && let Some((_, edited)) = accounts.get_mut(&user_id)
+    {
+        *edited = true;
+    }
+    for name in [historical_name, current_name].into_iter().flatten() {
+        if let Some(log_ids) = fallback_by_name.get(name) {
+            for log_id in log_ids {
+                if let Some((_, edited, _)) = fallback_accounts.get_mut(log_id) {
+                    *edited = true;
+                }
+            }
+        }
+    }
 }
 
 impl AccountCreationParseStats {
@@ -798,6 +881,11 @@ impl AccountCreationParseStats {
                 &mut self.cross_month_duplicate_events,
                 other.cross_month_duplicate_events,
                 "cross-month duplicate account creation event",
+            ),
+            (
+                &mut self.fallback_identity_accounts,
+                other.fallback_identity_accounts,
+                "fallback-identity account",
             ),
             (
                 &mut self.temporary_accounts,
@@ -1618,6 +1706,7 @@ fn parse_account_creation_events(
     xml_path: &Path,
     snapshot: &str,
     accounts: &mut HashMap<i64, (String, bool)>,
+    fallback_accounts: &mut HashMap<i64, (String, bool, String)>,
     temporary_by_month: &mut BTreeMap<String, u32>,
 ) -> Result<AccountCreationParseStats> {
     let file = File::open(xml_path)?;
@@ -1680,26 +1769,51 @@ fn parse_account_creation_events(
                                     *count = count
                                         .checked_add(1)
                                         .context("temporary account month count overflow")?;
-                                } else if let Some(user_id) = row.target_user_id {
+                                } else {
                                     stats.permanent_creation_events = stats
                                         .permanent_creation_events
                                         .checked_add(1)
                                         .context("permanent account count overflow")?;
-                                    if let Some((existing_month, _)) = accounts.get_mut(&user_id) {
-                                        if existing_month != &month {
-                                            stats.record_cross_month_duplicate()?;
-                                            if month < *existing_month {
-                                                *existing_month = month;
+                                    if let Some(user_id) = row.target_user_id {
+                                        if let Some((existing_month, _)) =
+                                            accounts.get_mut(&user_id)
+                                        {
+                                            if existing_month != &month {
+                                                stats.record_cross_month_duplicate()?;
+                                                if month < *existing_month {
+                                                    *existing_month = month;
+                                                }
                                             }
+                                        } else {
+                                            accounts.insert(user_id, (month, false));
+                                        }
+                                    } else if let (Some(log_id), Some(target_user)) =
+                                        (row.log_id, row.target_user)
+                                    {
+                                        if let Some((existing_month, _, existing_user)) =
+                                            fallback_accounts.get(&log_id)
+                                        {
+                                            anyhow::ensure!(
+                                                existing_month == &month
+                                                    && existing_user == &target_user,
+                                                "account-creation log {log_id} has conflicting target identities"
+                                            );
+                                        } else {
+                                            fallback_accounts
+                                                .insert(log_id, (month, false, target_user));
+                                            stats.fallback_identity_accounts = stats
+                                                .fallback_identity_accounts
+                                                .checked_add(1)
+                                                .context(
+                                                    "fallback-identity account count overflow",
+                                                )?;
                                         }
                                     } else {
-                                        accounts.insert(user_id, (month, false));
+                                        stats.unresolved_permanent = stats
+                                            .unresolved_permanent
+                                            .checked_add(1)
+                                            .context("unresolved account count overflow")?;
                                     }
-                                } else {
-                                    stats.unresolved_permanent = stats
-                                        .unresolved_permanent
-                                        .checked_add(1)
-                                        .context("unresolved account count overflow")?;
                                 }
                             }
                         }
@@ -1840,14 +1954,21 @@ impl LogItem {
                     .then_some(self.contributor_id)
                     .flatten()
             });
-        let target_user = self.log_title;
+        let target_user = self.log_title.and_then(|title| {
+            let user = title
+                .split_once(':')
+                .map_or(title.as_str(), |(_, user)| user)
+                .trim();
+            (!user.is_empty()).then(|| user.to_string())
+        });
         let is_temporary = target_user
             .as_deref()
-            .map(|title| title.rsplit_once(':').map_or(title, |(_, user)| user))
             .is_some_and(|user| user.starts_with('~'));
         NewUserRow {
+            log_id: self.log_id.filter(|log_id| *log_id > 0),
             timestamp: self.timestamp.unwrap_or_default(),
             target_user_id,
+            target_user,
             is_temporary,
         }
     }
@@ -1879,6 +2000,7 @@ struct AccountCreationStagingReport {
     permanent_accounts: u64,
     duplicate_permanent_creation_events: u64,
     cross_month_duplicate_events: u64,
+    fallback_identity_accounts: u64,
     temporary_accounts: u64,
     history_scan_mode: &'static str,
     history_sources: u32,
@@ -1889,7 +2011,7 @@ struct AccountCreationStagingReport {
 }
 
 const ACCOUNT_CREATION_METRIC_VERSION: &str =
-    "account-creations-v2-earliest-permanent-local-account-lifetime-public-edit";
+    "account-creations-v3-legacy-identity-earliest-permanent-account-lifetime-public-edit";
 
 fn parse_new_user_id(params: &str) -> Option<i64> {
     let params = params.trim();
@@ -1928,8 +2050,10 @@ struct RightsRow {
 
 #[derive(Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 struct NewUserRow {
+    log_id: Option<i64>,
     timestamp: String,
     target_user_id: Option<i64>,
+    target_user: Option<String>,
     is_temporary: bool,
 }
 

@@ -1349,6 +1349,7 @@ fn account_creation_staging_report_uses_creation_cohorts_and_lifetime_edits() ->
         snapshot,
         &[
             history_row_with_user_id(wiki, "2025-03-01 00:00:00.0", "Edited", "101", "1"),
+            history_row_with_user_id(wiki, "2025-03-02 00:00:00.0", "Legacy", "105", "3"),
             history_row_with_user_id(wiki, "2026-07-01 00:00:00.0", "Other", "999", "2"),
         ],
     )?;
@@ -1360,6 +1361,7 @@ fn account_creation_staging_report_uses_creation_cohorts_and_lifetime_edits() ->
 <logitem><id>5</id><timestamp>2024-12-31T00:00:00Z</timestamp><contributor><username>Edited</username><id>101</id></contributor><type>newusers</type><action>autocreate</action><logtitle>User:Edited</logtitle><params>101</params></logitem>
 <logitem><id>6</id><timestamp>2026-09-01T00:00:00Z</timestamp><contributor><username>Future</username><id>104</id></contributor><type>newusers</type><action>create</action><logtitle>User:Future</logtitle><params>104</params></logitem>
 <logitem><id>7</id><timestamp>2025-01-04T00:00:00Z</timestamp><type>rights</type><logtitle>User:Edited</logtitle><params></params></logitem>
+<logitem><id>8</id><timestamp>2025-03-01T00:00:00Z</timestamp><contributor><username>Administrator</username><id>999</id></contributor><type>newusers</type><action>create2</action><logtitle>User:Legacy</logtitle><params></params></logitem>
 </mediawiki>"#;
     let split_at = logging
         .find("<logitem><id>2</id>")
@@ -1379,11 +1381,12 @@ fn account_creation_staging_report_uses_creation_cohorts_and_lifetime_edits() ->
     assert_eq!(report["wiki"], wiki);
     assert_eq!(report["snapshot"], snapshot);
     assert_eq!(report["license_spdx"], "MIT");
-    assert_eq!(report["account_creation_events"], 6);
-    assert_eq!(report["permanent_account_creation_events"], 4);
-    assert_eq!(report["permanent_accounts"], 2);
+    assert_eq!(report["account_creation_events"], 7);
+    assert_eq!(report["permanent_account_creation_events"], 5);
+    assert_eq!(report["permanent_accounts"], 3);
     assert_eq!(report["duplicate_permanent_creation_events"], 2);
     assert_eq!(report["cross_month_duplicate_events"], 1);
+    assert_eq!(report["fallback_identity_accounts"], 1);
     assert_eq!(report["temporary_accounts"], 1);
     assert_eq!(report["rows"][0]["year_month"], "2024-12");
     assert_eq!(report["rows"][0]["accounts_created"], 1);
@@ -1395,6 +1398,9 @@ fn account_creation_staging_report_uses_creation_cohorts_and_lifetime_edits() ->
     assert_eq!(report["rows"][2]["year_month"], "2025-02");
     assert_eq!(report["rows"][2]["accounts_created"], 0);
     assert_eq!(report["rows"][2]["temporary_accounts_excluded"], 1);
+    assert_eq!(report["rows"][3]["year_month"], "2025-03");
+    assert_eq!(report["rows"][3]["accounts_created"], 1);
+    assert_eq!(report["rows"][3]["accounts_with_edits"], 1);
     assert_eq!(
         fs::read_dir(data_dir.join("staging/account-creations").join(wiki))?.count(),
         0
@@ -1428,8 +1434,8 @@ fn account_creation_extraction_fails_closed_and_cleans_logging_staging() -> Resu
         ),
         (
             "unresolvedwiki",
-            r#"<mediawiki><logitem><id>1</id><timestamp>2025-01-01T00:00:00Z</timestamp><contributor><username>Missing</username><id>101</id></contributor><type>newusers</type><action>create2</action><logtitle>User:Missing</logtitle><params></params></logitem></mediawiki>"#,
-            "without a stable target user ID",
+            r#"<mediawiki><logitem><timestamp>2025-01-01T00:00:00Z</timestamp><type>newusers</type><action>create2</action><params></params></logitem></mediawiki>"#,
+            "without a usable target identity",
         ),
         (
             "temporarywiki",
@@ -1498,14 +1504,21 @@ fn account_creation_history_fallback_scans_and_reclaims_source_windows() -> Resu
         (101_i64, ("2025-01".to_string(), false)),
         (102_i64, ("2025-01".to_string(), false)),
     ]);
-    let scan =
-        scan_account_history_source_plan_with(&plan, &mut accounts, |_| Ok(source_path.clone()))?;
+    let mut fallback_accounts =
+        HashMap::from([(1_i64, ("2025-01".to_string(), false, "A".to_string()))]);
+    let scan = scan_account_history_source_plan_with(
+        &plan,
+        &mut accounts,
+        &mut fallback_accounts,
+        |_| Ok(source_path.clone()),
+    )?;
     assert_eq!(scan.mode, "bounded_source_window");
     assert_eq!(scan.sources, 1);
     assert_eq!(scan.bytes, source_bytes);
     assert_eq!(scan.revision_rows, 2);
     assert!(accounts[&101].1);
     assert!(!accounts[&102].1);
+    assert!(fallback_accounts[&1].1);
     assert!(!source_path.exists());
     Ok(())
 }
@@ -1518,6 +1531,7 @@ fn account_creation_coverage_build_rejects_uninjected_source_scan() -> Result<()
         "simplewiki",
         "2026-08",
         directory.path(),
+        &mut HashMap::new(),
         &mut HashMap::new(),
     )
     .expect_err("coverage build has no production downloader");
