@@ -1364,6 +1364,13 @@ fn account_creation_staging_report_uses_creation_cohorts_and_lifetime_edits() ->
 <logitem><id>8</id><timestamp>2025-03-01T00:00:00Z</timestamp><contributor><username>Administrator</username><id>999</id></contributor><type>newusers</type><action>create2</action><logtitle>User:Legacy</logtitle><params></params></logitem>
 <logitem><id>8</id><timestamp>2025-03-01T00:00:00Z</timestamp><contributor><username>Administrator</username><id>999</id></contributor><type>newusers</type><action>create2</action><logtitle>User:Legacy</logtitle><params></params></logitem>
 <logitem><id>9</id><timestamp>2025-04-01T00:00:00Z</timestamp><type>newusers</type><action>create</action><params></params></logitem>
+<logitem><id>10</id><timestamp>2025-01-05T00:00:00Z</timestamp><type>block</type><action>block</action><logtitle>User:Edited</logtitle><params>infinity</params></logitem>
+<logitem><id>11</id><timestamp>2025-02-05T00:00:00Z</timestamp><type>block</type><action>reblock</action><logtitle>User:Edited</logtitle><params>2 weeks</params></logitem>
+<logitem><id>12</id><timestamp>2025-02-06T00:00:00Z</timestamp><type>block</type><action>block</action><logtitle>User:Never_edited</logtitle><params><![CDATA[a:1:{s:11:"5::duration";s:8:"infinity";}]]></params></logitem>
+<logitem><id>13</id><timestamp>2025-04-06T00:00:00Z</timestamp><type>block</type><action>block</action><logtitle>User:Legacy</logtitle><params xml:space="preserve" /></logitem>
+<logitem><id>14</id><timestamp>2025-04-07T00:00:00Z</timestamp><type>block</type><action>block</action><logtitle>User:~2025-1</logtitle><params>infinity</params></logitem>
+<logitem><id>15</id><timestamp>2025-04-08T00:00:00Z</timestamp><type>block</type><action>block</action><logtitle>User:192.0.2.1</logtitle><params>infinity</params></logitem>
+<logitem><id>16</id><timestamp>2026-09-01T00:00:00Z</timestamp><type>block</type><action>block</action><logtitle>User:Edited</logtitle><params>infinity</params></logitem>
 </mediawiki>"#;
     let split_at = logging
         .find("<logitem><id>2</id>")
@@ -1380,9 +1387,11 @@ fn account_creation_staging_report_uses_creation_cohorts_and_lifetime_edits() ->
         .join("staging/account-creations/accountwiki.json");
     build_account_creation_staging_report(wiki, snapshot, &data_dir, &destination)?;
     let report: Value = serde_json::from_slice(&fs::read(destination)?)?;
+    assert_eq!(report["schema_version"], 2);
     assert_eq!(report["wiki"], wiki);
     assert_eq!(report["snapshot"], snapshot);
     assert_eq!(report["license_spdx"], "MIT");
+    assert_eq!(report["total_log_items"], 17);
     assert_eq!(report["account_creation_events"], 9);
     assert_eq!(report["permanent_account_creation_events"], 7);
     assert_eq!(report["permanent_accounts"], 4);
@@ -1391,19 +1400,30 @@ fn account_creation_staging_report_uses_creation_cohorts_and_lifetime_edits() ->
     assert_eq!(report["fallback_identity_accounts"], 2);
     assert_eq!(report["opaque_identity_accounts"], 1);
     assert_eq!(report["temporary_accounts"], 1);
+    assert_eq!(report["local_account_block_events"], 4);
+    assert_eq!(report["indefinite_block_events"], 3);
+    assert_eq!(report["finite_block_events"], 1);
+    assert_eq!(report["unblock_events"], 0);
+    assert_eq!(report["unclassified_block_duration_events"], 0);
+    assert_eq!(report["indefinitely_blocked_accounts"], 2);
     assert_eq!(report["rows"][0]["year_month"], "2024-12");
     assert_eq!(report["rows"][0]["accounts_created"], 1);
     assert_eq!(report["rows"][0]["accounts_with_edits"], 1);
     assert_eq!(report["rows"][0]["accounts_without_edits"], 0);
+    assert_eq!(report["rows"][0]["indefinitely_blocked_accounts"], 0);
     assert_eq!(report["rows"][1]["year_month"], "2025-01");
     assert_eq!(report["rows"][1]["accounts_created"], 1);
     assert_eq!(report["rows"][1]["accounts_without_edits"], 1);
+    assert_eq!(report["rows"][1]["indefinitely_blocked_accounts"], 1);
+    assert_eq!(report["rows"][1]["indefinitely_blocked_without_edits"], 1);
     assert_eq!(report["rows"][2]["year_month"], "2025-02");
     assert_eq!(report["rows"][2]["accounts_created"], 0);
     assert_eq!(report["rows"][2]["temporary_accounts_excluded"], 1);
     assert_eq!(report["rows"][3]["year_month"], "2025-03");
     assert_eq!(report["rows"][3]["accounts_created"], 1);
     assert_eq!(report["rows"][3]["accounts_with_edits"], 1);
+    assert_eq!(report["rows"][3]["indefinitely_blocked_accounts"], 1);
+    assert_eq!(report["rows"][3]["indefinitely_blocked_with_edits"], 1);
     assert_eq!(report["rows"][4]["year_month"], "2025-04");
     assert_eq!(report["rows"][4]["accounts_created"], 1);
     assert_eq!(report["rows"][4]["accounts_without_edits"], 1);
@@ -1428,6 +1448,370 @@ fn account_creation_duplicate_counter_fails_closed_on_overflow() {
             .to_string()
             .contains("duplicate account count overflow")
     );
+}
+
+#[test]
+fn account_block_duration_classification_covers_current_and_legacy_formats() {
+    assert_eq!(
+        classify_block_duration(Some(r#"a:1:{s:11:"5::duration";s:8:"infinity";}"#)),
+        AccountBlockState::Indefinite
+    );
+    assert_eq!(
+        classify_block_duration(Some(r#"a:1:{i:0;s:8:"infinite";}"#)),
+        AccountBlockState::Indefinite
+    );
+    assert_eq!(
+        classify_block_duration(Some(r#"a:1:{s:11:"5::duration";s:7:"2 weeks";}"#)),
+        AccountBlockState::NotIndefinite
+    );
+    assert_eq!(
+        classify_block_duration(Some("infinite\nnocreate,noemail")),
+        AccountBlockState::Indefinite
+    );
+    assert_eq!(
+        classify_block_duration(Some("2 weeks nocreate")),
+        AccountBlockState::NotIndefinite
+    );
+    assert_eq!(classify_block_duration(None), AccountBlockState::Indefinite);
+    assert_eq!(
+        classify_block_duration(Some("")),
+        AccountBlockState::Indefinite
+    );
+    assert_eq!(
+        classify_block_duration(Some("a:1:{broken")),
+        AccountBlockState::Unclassified
+    );
+}
+
+#[test]
+fn account_block_replay_uses_latest_transition_and_ignores_non_accounts() -> Result<()> {
+    let mut transitions = HashMap::new();
+    let mut stats = AccountCreationParseStats::default();
+    for (log_id, timestamp, action, target, params) in [
+        (2, "2025-02-01 00:00:00", "unblock", "User:Example", None),
+        (
+            1,
+            "2025-01-01 00:00:00",
+            "block",
+            "User:Example",
+            Some("infinity"),
+        ),
+        (
+            3,
+            "2025-03-01 00:00:00",
+            "block",
+            "User:192.0.2.1",
+            Some("infinity"),
+        ),
+        (
+            4,
+            "2025-03-01 00:00:00",
+            "block",
+            "User:~2025-1",
+            Some("infinity"),
+        ),
+    ] {
+        record_account_block_transition(
+            LogItem {
+                log_type: Some("block".to_string()),
+                log_action: Some(action.to_string()),
+                log_id: Some(log_id),
+                timestamp: Some(timestamp.to_string()),
+                log_title: Some(target.to_string()),
+                params: params.map(str::to_string),
+                ..LogItem::default()
+            },
+            "2026-08",
+            &mut transitions,
+            &mut stats,
+        )?;
+    }
+    assert_eq!(transitions.len(), 1);
+    assert_eq!(
+        transitions["Example"].state,
+        AccountBlockState::NotIndefinite
+    );
+    assert_eq!(stats.local_account_block_events, 2);
+    assert_eq!(stats.indefinite_block_events, 1);
+    assert_eq!(stats.unblock_events, 1);
+    Ok(())
+}
+
+#[test]
+fn account_block_helpers_fail_closed_and_cover_identity_edges() -> Result<()> {
+    assert_eq!(account_block_target_name("User:"), None);
+    assert_eq!(account_block_target_name("User:#42"), None);
+    assert_eq!(account_block_target_name("User:2001:db8::/32"), None);
+    assert_eq!(
+        account_block_target_name("User:Named_account"),
+        Some("Named account".to_string())
+    );
+    assert_eq!(
+        classify_block_duration(Some("a:0:{}")),
+        AccountBlockState::Indefinite
+    );
+    assert!(is_indefinite_duration(" NEVER "));
+
+    let mut transitions = HashMap::new();
+    let mut stats = AccountCreationParseStats::default();
+    record_account_block_transition(
+        LogItem {
+            log_type: Some("block".to_string()),
+            log_action: Some("move".to_string()),
+            timestamp: Some("2025-01-01 00:00:00".to_string()),
+            ..LogItem::default()
+        },
+        "2026-08",
+        &mut transitions,
+        &mut stats,
+    )?;
+    record_account_block_transition(
+        LogItem {
+            log_type: Some("block".to_string()),
+            log_action: Some("block".to_string()),
+            timestamp: Some("2025-01-01 00:00:00".to_string()),
+            log_title: None,
+            params: Some("infinity".to_string()),
+            ..LogItem::default()
+        },
+        "2026-08",
+        &mut transitions,
+        &mut stats,
+    )?;
+    let malformed = LogItem {
+        log_type: Some("block".to_string()),
+        log_action: Some("block".to_string()),
+        log_id: Some(5),
+        timestamp: Some("2025-02-01 00:00:00".to_string()),
+        log_title: Some("User:Unclassified".to_string()),
+        params: Some("a:1:{broken".to_string()),
+        ..LogItem::default()
+    };
+    record_account_block_transition(malformed, "2026-08", &mut transitions, &mut stats)?;
+    assert_eq!(stats.unclassified_block_duration_events, 1);
+    transitions.insert(
+        "Named account".to_string(),
+        AccountBlockTransition {
+            timestamp: "2025-01-01 00:00:00".to_string(),
+            log_id: 1,
+            state: AccountBlockState::Indefinite,
+        },
+    );
+    assert_eq!(
+        block_transition_for_name(&transitions, "Named_account").map(|value| value.state),
+        Some(AccountBlockState::Indefinite)
+    );
+    let error = resolve_indefinite_block_state(transitions.get("Unclassified"))
+        .expect_err("unclassified latest block state must fail closed");
+    assert!(error.to_string().contains("cannot be classified"));
+
+    record_account_block_transition(
+        LogItem {
+            log_type: Some("block".to_string()),
+            log_action: Some("block".to_string()),
+            log_id: Some(5),
+            timestamp: Some("2025-02-01 00:00:00".to_string()),
+            log_title: Some("User:Unclassified".to_string()),
+            params: Some("a:1:{broken".to_string()),
+            ..LogItem::default()
+        },
+        "2026-08",
+        &mut transitions,
+        &mut stats,
+    )?;
+
+    let conflict = record_account_block_transition(
+        LogItem {
+            log_type: Some("block".to_string()),
+            log_action: Some("block".to_string()),
+            log_id: Some(5),
+            timestamp: Some("2025-02-01 00:00:00".to_string()),
+            log_title: Some("User:Unclassified".to_string()),
+            params: Some("infinity".to_string()),
+            ..LogItem::default()
+        },
+        "2026-08",
+        &mut transitions,
+        &mut stats,
+    )
+    .expect_err("one log identity cannot describe conflicting block states");
+    assert!(
+        conflict
+            .to_string()
+            .contains("conflicting block transitions")
+    );
+
+    let mut account_transitions = HashMap::from([(
+        1,
+        AccountBlockTransition {
+            timestamp: "2025-01-01 00:00:00".to_string(),
+            log_id: 1,
+            state: AccountBlockState::NotIndefinite,
+        },
+    )]);
+    update_account_block_transition(
+        &mut account_transitions,
+        1,
+        AccountBlockTransition {
+            timestamp: "2025-02-01 00:00:00".to_string(),
+            log_id: 2,
+            state: AccountBlockState::Indefinite,
+        },
+    );
+    assert_eq!(account_transitions[&1].state, AccountBlockState::Indefinite);
+
+    let mut value = u64::MAX;
+    assert!(checked_increment(&mut value, "test").is_err());
+
+    for (stats, params, expected) in [
+        (
+            AccountCreationParseStats {
+                local_account_block_events: u64::MAX,
+                ..AccountCreationParseStats::default()
+            },
+            "infinity",
+            "local account block event count overflow",
+        ),
+        (
+            AccountCreationParseStats {
+                indefinite_block_events: u64::MAX,
+                ..AccountCreationParseStats::default()
+            },
+            "infinity",
+            "indefinite account block event count overflow",
+        ),
+        (
+            AccountCreationParseStats {
+                unclassified_block_duration_events: u64::MAX,
+                ..AccountCreationParseStats::default()
+            },
+            "a:1:{broken",
+            "unclassified account block duration event count overflow",
+        ),
+    ] {
+        let mut stats = stats;
+        let error = record_account_block_transition(
+            LogItem {
+                log_type: Some("block".to_string()),
+                log_action: Some("block".to_string()),
+                log_id: Some(100),
+                timestamp: Some("2025-03-01 00:00:00".to_string()),
+                log_title: Some("User:Overflow".to_string()),
+                params: Some(params.to_string()),
+                ..LogItem::default()
+            },
+            "2026-08",
+            &mut HashMap::new(),
+            &mut stats,
+        )
+        .expect_err("block counter overflow must fail closed");
+        assert!(error.to_string().contains(expected));
+    }
+    Ok(())
+}
+
+#[test]
+fn account_creation_count_overflows_fail_closed() {
+    for (counts, edited, blocked, expected) in [
+        (
+            AccountCreationCounts {
+                accounts_created: u32::MAX,
+                ..AccountCreationCounts::default()
+            },
+            false,
+            false,
+            "account count overflow",
+        ),
+        (
+            AccountCreationCounts {
+                accounts_with_edits: u32::MAX,
+                ..AccountCreationCounts::default()
+            },
+            true,
+            false,
+            "edited account count overflow",
+        ),
+        (
+            AccountCreationCounts {
+                indefinitely_blocked_accounts: u32::MAX,
+                ..AccountCreationCounts::default()
+            },
+            false,
+            true,
+            "indefinitely blocked account count overflow",
+        ),
+        (
+            AccountCreationCounts {
+                indefinitely_blocked_with_edits: u32::MAX,
+                ..AccountCreationCounts::default()
+            },
+            true,
+            true,
+            "edited indefinitely blocked account count overflow",
+        ),
+    ] {
+        let mut monthly = BTreeMap::from([("2025-01".to_string(), counts)]);
+        let error = accumulate_account_month(&mut monthly, "2025-01".to_string(), edited, blocked)
+            .expect_err("counter overflow must fail closed");
+        assert!(error.to_string().contains(expected));
+    }
+}
+
+#[test]
+fn account_creation_parser_propagates_conflicting_block_transitions() -> Result<()> {
+    let directory = TestDir::new()?;
+    let path = directory.path().join("logging.xml.gz");
+    let xml = r#"<mediawiki>
+<logitem><id>1</id><timestamp>2025-01-01T00:00:00Z</timestamp><type>newusers</type><action>create</action><params>101</params></logitem>
+<logitem><id>2</id><timestamp>2025-02-01T00:00:00Z</timestamp><type>block</type><action>block</action><logtitle>User:Conflict</logtitle><params>infinity</params></logitem>
+<logitem><id>2</id><timestamp>2025-02-01T00:00:00Z</timestamp><type>block</type><action>block</action><logtitle>User:Conflict</logtitle><params>2 weeks</params></logitem>
+</mediawiki>"#;
+    fs::write(&path, gzip_bytes(xml)?)?;
+    let error = parse_account_creation_events(
+        &path,
+        "2026-08",
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        &mut BTreeMap::new(),
+    )
+    .expect_err("conflicting block transitions must propagate from the parser");
+    assert!(error.to_string().contains("conflicting block transitions"));
+    Ok(())
+}
+
+#[test]
+fn account_creation_report_rejects_a_matched_unclassified_block_duration() -> Result<()> {
+    let directory = TestDir::new()?;
+    let data_dir = directory.path().join("data");
+    ingest_history_snapshot(
+        &data_dir,
+        "blockwiki",
+        "2026-08",
+        &[history_row_with_user_id(
+            "blockwiki",
+            "2025-01-02 00:00:00.0",
+            "Blocked",
+            "101",
+            "1",
+        )],
+    )?;
+    let logging = r#"<mediawiki>
+<logitem><id>1</id><timestamp>2025-01-01T00:00:00Z</timestamp><contributor><username>Blocked</username><id>101</id></contributor><type>newusers</type><action>create</action><logtitle>User:Blocked</logtitle><params>101</params></logitem>
+<logitem><id>2</id><timestamp>2025-02-01T00:00:00Z</timestamp><type>block</type><action>block</action><logtitle>User:Blocked</logtitle><params>a:1:{broken</params></logitem>
+</mediawiki>"#;
+    let transport = FakePatrolTransport::new(vec![gzip_bytes(logging)?], Vec::new());
+    let error = build_account_creation_staging_report_with_transport(
+        &transport,
+        "blockwiki",
+        "2026-08",
+        &data_dir,
+        &directory.path().join("report.json"),
+    )
+    .expect_err("matched unclassified block duration must fail closed");
+    assert!(error.to_string().contains("cannot be classified"));
+    Ok(())
 }
 
 #[test]
@@ -1562,12 +1946,19 @@ fn account_creation_history_fallback_scans_and_reclaims_source_windows() -> Resu
     ]);
     let mut fallback_accounts =
         HashMap::from([(1_i64, ("2025-01".to_string(), false, Some("A".to_string())))]);
-    let scan = scan_account_history_source_plan_with(
-        &plan,
-        &mut accounts,
-        &mut fallback_accounts,
-        |_| Ok(source_path.clone()),
-    )?;
+    let block_transitions = HashMap::new();
+    let mut account_block_transitions = HashMap::new();
+    let fallback_by_name = fallback_name_index(&fallback_accounts);
+    let mut matcher = AccountRevisionMatcher {
+        accounts: &mut accounts,
+        fallback_accounts: &mut fallback_accounts,
+        fallback_by_name,
+        block_transitions: &block_transitions,
+        account_block_transitions: &mut account_block_transitions,
+    };
+    let scan =
+        scan_account_history_source_plan_with(&plan, &mut matcher, |_| Ok(source_path.clone()))?;
+    drop(matcher);
     assert_eq!(scan.mode, "bounded_source_window");
     assert_eq!(scan.sources, 1);
     assert_eq!(scan.bytes, source_bytes);
@@ -1588,6 +1979,8 @@ fn account_creation_coverage_build_rejects_uninjected_source_scan() -> Result<()
         "2026-08",
         directory.path(),
         &mut HashMap::new(),
+        &mut HashMap::new(),
+        &HashMap::new(),
         &mut HashMap::new(),
     )
     .expect_err("coverage build has no production downloader");

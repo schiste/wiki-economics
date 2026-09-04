@@ -519,6 +519,8 @@ fn build_account_creation_staging_report_with_transport<T: PatrolTransport + ?Si
     fs::create_dir(&staging)?;
     let mut accounts = HashMap::<i64, (String, bool)>::new();
     let mut fallback_accounts = HashMap::<i64, (String, bool, Option<String>)>::new();
+    let mut account_names = HashMap::<i64, String>::new();
+    let mut block_transitions = HashMap::<String, AccountBlockTransition>::new();
     let mut temporary_by_month = BTreeMap::<String, u32>::new();
     let mut parse_stats = AccountCreationParseStats::default();
     let extraction = (|| {
@@ -534,6 +536,8 @@ fn build_account_creation_staging_report_with_transport<T: PatrolTransport + ?Si
                 snapshot,
                 &mut accounts,
                 &mut fallback_accounts,
+                &mut account_names,
+                &mut block_transitions,
                 &mut temporary_by_month,
             )?;
             parse_stats.add(source_stats)?;
@@ -557,38 +561,59 @@ fn build_account_creation_staging_report_with_transport<T: PatrolTransport + ?Si
         "{wiki}/{snapshot} has no permanent account creations in logging coverage"
     );
 
+    let mut account_block_transitions = HashMap::<i64, AccountBlockTransition>::new();
+    for (user_id, name) in &account_names {
+        if let Some(transition) = block_transition_for_name(&block_transitions, name) {
+            account_block_transitions.insert(*user_id, transition.clone());
+        }
+    }
     let history_scan = mark_accounts_with_revisions(
         wiki,
         snapshot,
         data_dir,
         &mut accounts,
         &mut fallback_accounts,
+        &block_transitions,
+        &mut account_block_transitions,
     );
     let history_scan = history_scan?;
 
-    let mut monthly = BTreeMap::<String, (u32, u32)>::new();
-    for (month, edited) in accounts.into_values() {
-        accumulate_account_month(&mut monthly, month, edited)?;
+    let mut monthly = BTreeMap::<String, AccountCreationCounts>::new();
+    for (user_id, (month, edited)) in accounts {
+        let indefinitely_blocked =
+            resolve_indefinite_block_state(account_block_transitions.get(&user_id))?;
+        accumulate_account_month(&mut monthly, month, edited, indefinitely_blocked)?;
     }
-    for (month, edited, _) in fallback_accounts.into_values() {
-        accumulate_account_month(&mut monthly, month, edited)?;
+    for (month, edited, name) in fallback_accounts.into_values() {
+        let transition = name
+            .as_deref()
+            .and_then(|name| block_transition_for_name(&block_transitions, name));
+        let indefinitely_blocked = resolve_indefinite_block_state(transition)?;
+        accumulate_account_month(&mut monthly, month, edited, indefinitely_blocked)?;
     }
     for month in temporary_by_month.keys() {
         monthly.entry(month.clone()).or_default();
     }
     let rows = monthly
         .into_iter()
-        .map(|(year_month, (accounts_created, accounts_with_edits))| {
+        .map(|(year_month, counts)| {
             Ok(AccountCreationMonth {
                 temporary_accounts_excluded: temporary_by_month
                     .remove(&year_month)
                     .unwrap_or_default(),
-                accounts_without_edits: accounts_created
-                    .checked_sub(accounts_with_edits)
+                accounts_without_edits: counts
+                    .accounts_created
+                    .checked_sub(counts.accounts_with_edits)
                     .context("account-creation conservation failure")?,
+                indefinitely_blocked_without_edits: counts
+                    .indefinitely_blocked_accounts
+                    .checked_sub(counts.indefinitely_blocked_with_edits)
+                    .context("indefinite-block conservation failure")?,
                 year_month,
-                accounts_created,
-                accounts_with_edits,
+                accounts_created: counts.accounts_created,
+                accounts_with_edits: counts.accounts_with_edits,
+                indefinitely_blocked_accounts: counts.indefinitely_blocked_accounts,
+                indefinitely_blocked_with_edits: counts.indefinitely_blocked_with_edits,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -598,12 +623,26 @@ fn build_account_creation_staging_report_with_transport<T: PatrolTransport + ?Si
         }),
         "account-creation split does not conserve its cohort total"
     );
+    anyhow::ensure!(
+        rows.iter().all(|row| {
+            row.indefinitely_blocked_accounts
+                == row.indefinitely_blocked_with_edits + row.indefinitely_blocked_without_edits
+                && row.indefinitely_blocked_with_edits <= row.accounts_with_edits
+                && row.indefinitely_blocked_without_edits <= row.accounts_without_edits
+        }),
+        "indefinite-block split does not conserve its cohort total"
+    );
     let permanent_accounts = rows
         .iter()
         .map(|row| u64::from(row.accounts_created))
         .sum::<u64>();
+    let indefinitely_blocked_accounts = rows.iter().try_fold(0_u64, |total, row| {
+        total
+            .checked_add(u64::from(row.indefinitely_blocked_accounts))
+            .context("indefinitely blocked account total overflow")
+    })?;
     let report = AccountCreationStagingReport {
-        schema_version: 1,
+        schema_version: 2,
         metric_version: ACCOUNT_CREATION_METRIC_VERSION,
         license_spdx: "MIT",
         attribution: "Derived from Wikimedia Foundation MediaWiki History and public logging dumps; Wikimedia projects and marks are not affiliated with this site.",
@@ -624,11 +663,17 @@ fn build_account_creation_staging_report_with_transport<T: PatrolTransport + ?Si
         fallback_identity_accounts: parse_stats.fallback_identity_accounts,
         opaque_identity_accounts: parse_stats.opaque_identity_accounts,
         temporary_accounts: parse_stats.temporary_accounts,
+        local_account_block_events: parse_stats.local_account_block_events,
+        indefinite_block_events: parse_stats.indefinite_block_events,
+        finite_block_events: parse_stats.finite_block_events,
+        unblock_events: parse_stats.unblock_events,
+        unclassified_block_duration_events: parse_stats.unclassified_block_duration_events,
+        indefinitely_blocked_accounts,
         history_scan_mode: history_scan.mode,
         history_sources: history_scan.sources,
         history_source_bytes: history_scan.bytes,
         history_revision_rows: history_scan.revision_rows,
-        definition: "Permanent local account-creation log events grouped by earliest observed month, split by whether the selected public history snapshot contains a matching public revision; legacy records use their unique log ID and target name when available, redacted identities cannot match an edit, later duplicate stable-ID records and temporary accounts are excluded.",
+        definition: "Permanent local account-creation log events grouped by earliest observed month, split by whether the selected public history snapshot contains a matching public revision and marked indefinitely locally blocked when the latest matching public block, reblock, or unblock transition at the snapshot cutoff leaves an indefinite block in force; legacy records use their unique log ID and target name when available, redacted identities cannot match an edit or block, later duplicate stable-ID records and temporary accounts are excluded.",
         rows,
     };
     generation::atomic_json(destination, &report)?;
@@ -653,6 +698,33 @@ struct AccountCreationParseStats {
     opaque_identity_accounts: u64,
     temporary_accounts: u64,
     unresolved_permanent: u64,
+    local_account_block_events: u64,
+    indefinite_block_events: u64,
+    finite_block_events: u64,
+    unblock_events: u64,
+    unclassified_block_duration_events: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct AccountCreationCounts {
+    accounts_created: u32,
+    accounts_with_edits: u32,
+    indefinitely_blocked_accounts: u32,
+    indefinitely_blocked_with_edits: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AccountBlockState {
+    Indefinite,
+    NotIndefinite,
+    Unclassified,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AccountBlockTransition {
+    timestamp: String,
+    log_id: i64,
+    state: AccountBlockState,
 }
 
 #[derive(Debug)]
@@ -669,8 +741,17 @@ fn mark_accounts_with_revisions(
     data_dir: &Path,
     accounts: &mut HashMap<i64, (String, bool)>,
     fallback_accounts: &mut HashMap<i64, (String, bool, Option<String>)>,
+    block_transitions: &HashMap<String, AccountBlockTransition>,
+    account_block_transitions: &mut HashMap<i64, AccountBlockTransition>,
 ) -> Result<AccountCreationHistoryScan> {
     let fallback_by_name = fallback_name_index(fallback_accounts);
+    let mut matcher = AccountRevisionMatcher {
+        accounts,
+        fallback_accounts,
+        fallback_by_name,
+        block_transitions,
+        account_block_transitions,
+    };
     let retained = storage::snapshot_compute_layer(
         data_dir,
         wiki,
@@ -703,13 +784,10 @@ fn mark_accounts_with_revisions(
                 let historical_names = batch.column("event_user_text_historical")?.str()?;
                 let current_names = batch.column("event_user_text")?.str()?;
                 for index in 0..batch.height() {
-                    mark_account_revision(
+                    matcher.mark(
                         user_ids.get(index),
                         historical_names.get(index),
                         current_names.get(index),
-                        accounts,
-                        fallback_accounts,
-                        &fallback_by_name,
                     );
                 }
             }
@@ -722,7 +800,7 @@ fn mark_accounts_with_revisions(
         });
     }
 
-    scan_account_history_source_plan(wiki, snapshot, data_dir, accounts, fallback_accounts)
+    scan_account_history_source_plan(wiki, snapshot, data_dir, &mut matcher)
 }
 
 #[cfg(not(coverage))]
@@ -730,12 +808,11 @@ fn scan_account_history_source_plan(
     wiki: &str,
     snapshot: &str,
     data_dir: &Path,
-    accounts: &mut HashMap<i64, (String, bool)>,
-    fallback_accounts: &mut HashMap<i64, (String, bool, Option<String>)>,
+    matcher: &mut AccountRevisionMatcher<'_>,
 ) -> Result<AccountCreationHistoryScan> {
     let (plan, _) = crate::snapshot_plan::SnapshotPlan::load_or_resolve(data_dir, wiki, snapshot)?;
     let run_id = format!("account-creations-{wiki}-{snapshot}-{}", std::process::id());
-    scan_account_history_source_plan_with(&plan, accounts, fallback_accounts, |source| {
+    scan_account_history_source_plan_with(&plan, matcher, |source| {
         crate::fetch::fetch_snapshot_source_window(
             wiki,
             snapshot,
@@ -754,22 +831,19 @@ fn scan_account_history_source_plan(
     _wiki: &str,
     _snapshot: &str,
     _data_dir: &Path,
-    _accounts: &mut HashMap<i64, (String, bool)>,
-    _fallback_accounts: &mut HashMap<i64, (String, bool, Option<String>)>,
+    _matcher: &mut AccountRevisionMatcher<'_>,
 ) -> Result<AccountCreationHistoryScan> {
     anyhow::bail!("bounded history source scan is unavailable without a test source loader")
 }
 
 fn scan_account_history_source_plan_with<F>(
     plan: &crate::snapshot_plan::SnapshotPlan,
-    accounts: &mut HashMap<i64, (String, bool)>,
-    fallback_accounts: &mut HashMap<i64, (String, bool, Option<String>)>,
+    matcher: &mut AccountRevisionMatcher<'_>,
     mut load_source: F,
 ) -> Result<AccountCreationHistoryScan>
 where
     F: FnMut(&crate::snapshot_plan::SourceSpec) -> Result<PathBuf>,
 {
-    let fallback_by_name = fallback_name_index(fallback_accounts);
     let mut bytes = 0_u64;
     let mut revision_rows = 0_u64;
     for source in &plan.sources {
@@ -780,14 +854,7 @@ where
         let source_revision_rows = crate::ingest::scan_revision_user_identities(
             &path,
             |user_id, historical_name, current_name| {
-                mark_account_revision(
-                    user_id,
-                    historical_name,
-                    current_name,
-                    accounts,
-                    fallback_accounts,
-                    &fallback_by_name,
-                );
+                matcher.mark(user_id, historical_name, current_name);
             },
         );
         let source_revision_rows = source_revision_rows?;
@@ -810,17 +877,33 @@ where
 }
 
 fn accumulate_account_month(
-    monthly: &mut BTreeMap<String, (u32, u32)>,
+    monthly: &mut BTreeMap<String, AccountCreationCounts>,
     month: String,
     edited: bool,
+    indefinitely_blocked: bool,
 ) -> Result<()> {
     let counts = monthly.entry(month).or_default();
-    counts.0 = counts.0.checked_add(1).context("account count overflow")?;
+    counts.accounts_created = counts
+        .accounts_created
+        .checked_add(1)
+        .context("account count overflow")?;
     if edited {
-        counts.1 = counts
-            .1
+        counts.accounts_with_edits = counts
+            .accounts_with_edits
             .checked_add(1)
             .context("edited account count overflow")?;
+    }
+    if indefinitely_blocked {
+        counts.indefinitely_blocked_accounts = counts
+            .indefinitely_blocked_accounts
+            .checked_add(1)
+            .context("indefinitely blocked account count overflow")?;
+        if edited {
+            counts.indefinitely_blocked_with_edits = counts
+                .indefinitely_blocked_with_edits
+                .checked_add(1)
+                .context("edited indefinitely blocked account count overflow")?;
+        }
     }
     Ok(())
 }
@@ -840,27 +923,93 @@ fn fallback_name_index(
     by_name
 }
 
-fn mark_account_revision(
-    user_id: Option<i64>,
-    historical_name: Option<&str>,
-    current_name: Option<&str>,
-    accounts: &mut HashMap<i64, (String, bool)>,
-    fallback_accounts: &mut HashMap<i64, (String, bool, Option<String>)>,
-    fallback_by_name: &HashMap<String, Vec<i64>>,
-) {
-    if let Some(user_id) = user_id
-        && let Some((_, edited)) = accounts.get_mut(&user_id)
-    {
-        *edited = true;
-    }
-    for name in [historical_name, current_name].into_iter().flatten() {
-        if let Some(log_ids) = fallback_by_name.get(name) {
-            for log_id in log_ids {
-                if let Some((_, edited, _)) = fallback_accounts.get_mut(log_id) {
-                    *edited = true;
+struct AccountRevisionMatcher<'a> {
+    accounts: &'a mut HashMap<i64, (String, bool)>,
+    fallback_accounts: &'a mut HashMap<i64, (String, bool, Option<String>)>,
+    fallback_by_name: HashMap<String, Vec<i64>>,
+    block_transitions: &'a HashMap<String, AccountBlockTransition>,
+    account_block_transitions: &'a mut HashMap<i64, AccountBlockTransition>,
+}
+
+impl AccountRevisionMatcher<'_> {
+    fn mark(
+        &mut self,
+        user_id: Option<i64>,
+        historical_name: Option<&str>,
+        current_name: Option<&str>,
+    ) {
+        if let Some(user_id) = user_id
+            && let Some((_, edited)) = self.accounts.get_mut(&user_id)
+        {
+            *edited = true;
+            for name in [historical_name, current_name].into_iter().flatten() {
+                if let Some(transition) = block_transition_for_name(self.block_transitions, name) {
+                    update_account_block_transition(
+                        self.account_block_transitions,
+                        user_id,
+                        transition.clone(),
+                    );
                 }
             }
         }
+        for name in [historical_name, current_name].into_iter().flatten() {
+            if let Some(log_ids) = self.fallback_by_name.get(name) {
+                for log_id in log_ids {
+                    if let Some((_, edited, _)) = self.fallback_accounts.get_mut(log_id) {
+                        *edited = true;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn block_transition_for_name<'a>(
+    transitions: &'a HashMap<String, AccountBlockTransition>,
+    name: &str,
+) -> Option<&'a AccountBlockTransition> {
+    let trimmed = name.trim();
+    transitions.get(trimmed).or_else(|| {
+        trimmed
+            .contains('_')
+            .then(|| normalize_account_name(trimmed))
+            .and_then(|normalized| transitions.get(&normalized))
+    })
+}
+
+fn update_account_block_transition(
+    transitions: &mut HashMap<i64, AccountBlockTransition>,
+    user_id: i64,
+    candidate: AccountBlockTransition,
+) {
+    let replace = transitions.get(&user_id).is_none_or(|existing| {
+        (&candidate.timestamp, candidate.log_id) > (&existing.timestamp, existing.log_id)
+    });
+    if replace {
+        transitions.insert(user_id, candidate);
+    }
+}
+
+fn resolve_indefinite_block_state(transition: Option<&AccountBlockTransition>) -> Result<bool> {
+    match transition {
+        Some(AccountBlockTransition {
+            state: AccountBlockState::Indefinite,
+            ..
+        }) => Ok(true),
+        Some(AccountBlockTransition {
+            timestamp,
+            log_id,
+            state: AccountBlockState::Unclassified,
+        }) => anyhow::bail!(
+            "latest matching local block duration cannot be classified at {} / {}",
+            timestamp,
+            log_id
+        ),
+        Some(AccountBlockTransition {
+            state: AccountBlockState::NotIndefinite,
+            ..
+        })
+        | None => Ok(false),
     }
 }
 
@@ -926,6 +1075,31 @@ impl AccountCreationParseStats {
                 &mut self.unresolved_permanent,
                 other.unresolved_permanent,
                 "unresolved permanent account",
+            ),
+            (
+                &mut self.local_account_block_events,
+                other.local_account_block_events,
+                "local account block event",
+            ),
+            (
+                &mut self.indefinite_block_events,
+                other.indefinite_block_events,
+                "indefinite account block event",
+            ),
+            (
+                &mut self.finite_block_events,
+                other.finite_block_events,
+                "finite account block event",
+            ),
+            (
+                &mut self.unblock_events,
+                other.unblock_events,
+                "account unblock event",
+            ),
+            (
+                &mut self.unclassified_block_duration_events,
+                other.unclassified_block_duration_events,
+                "unclassified account block duration event",
             ),
         ] {
             *target = target
@@ -1737,6 +1911,8 @@ fn parse_account_creation_events(
     snapshot: &str,
     accounts: &mut HashMap<i64, (String, bool)>,
     fallback_accounts: &mut HashMap<i64, (String, bool, Option<String>)>,
+    account_names: &mut HashMap<i64, String>,
+    block_transitions: &mut HashMap<String, AccountBlockTransition>,
     temporary_by_month: &mut BTreeMap<String, u32>,
 ) -> Result<AccountCreationParseStats> {
     let file = File::open(xml_path)?;
@@ -1805,6 +1981,11 @@ fn parse_account_creation_events(
                                         .checked_add(1)
                                         .context("permanent account count overflow")?;
                                     if let Some(user_id) = row.target_user_id {
+                                        if let Some(name) = row.target_user.as_deref() {
+                                            account_names
+                                                .entry(user_id)
+                                                .or_insert_with(|| normalize_account_name(name));
+                                        }
                                         if let Some((existing_month, _)) =
                                             accounts.get_mut(&user_id)
                                         {
@@ -1844,6 +2025,13 @@ fn parse_account_creation_events(
                                     }
                                 }
                             }
+                        } else if matches!(item.log_type.as_deref(), Some("block")) {
+                            record_account_block_transition(
+                                item,
+                                snapshot,
+                                block_transitions,
+                                &mut stats,
+                            )?;
                         }
                         current_tag = None;
                     }
@@ -1870,6 +2058,170 @@ fn parse_account_creation_events(
     }
     crate::storage::discard_file_cache(&file, 0, compressed_bytes);
     Ok(stats)
+}
+
+fn record_account_block_transition(
+    item: LogItem,
+    snapshot: &str,
+    transitions: &mut HashMap<String, AccountBlockTransition>,
+    stats: &mut AccountCreationParseStats,
+) -> Result<()> {
+    let action = item.log_action.as_deref().unwrap_or_default();
+    if !matches!(action, "block" | "reblock" | "unblock") {
+        return Ok(());
+    }
+    let timestamp = item.timestamp.unwrap_or_default();
+    let month = timestamp
+        .get(..7)
+        .context("block timestamp has no event month")?;
+    storage::validate_snapshot_version(month)?;
+    if !compute::snapshot_contains_complete_month(snapshot, month) {
+        return Ok(());
+    }
+    let Some(target) = item
+        .log_title
+        .as_deref()
+        .and_then(account_block_target_name)
+    else {
+        return Ok(());
+    };
+
+    checked_increment(
+        &mut stats.local_account_block_events,
+        "local account block event",
+    )?;
+    let state = if action == "unblock" {
+        checked_increment(&mut stats.unblock_events, "account unblock event")?;
+        AccountBlockState::NotIndefinite
+    } else {
+        match classify_block_duration(item.params.as_deref()) {
+            AccountBlockState::Indefinite => {
+                checked_increment(
+                    &mut stats.indefinite_block_events,
+                    "indefinite account block event",
+                )?;
+                AccountBlockState::Indefinite
+            }
+            AccountBlockState::NotIndefinite => {
+                checked_increment(&mut stats.finite_block_events, "finite account block event")?;
+                AccountBlockState::NotIndefinite
+            }
+            AccountBlockState::Unclassified => {
+                checked_increment(
+                    &mut stats.unclassified_block_duration_events,
+                    "unclassified account block duration event",
+                )?;
+                AccountBlockState::Unclassified
+            }
+        }
+    };
+    let transition = AccountBlockTransition {
+        timestamp,
+        log_id: item.log_id.unwrap_or_default(),
+        state,
+    };
+    if let Some(existing) = transitions.get(&target) {
+        let existing_order = (&existing.timestamp, existing.log_id);
+        let new_order = (&transition.timestamp, transition.log_id);
+        if existing_order == new_order {
+            anyhow::ensure!(
+                existing.state == transition.state,
+                "conflicting block transitions for {target} at {} / {}",
+                transition.timestamp,
+                transition.log_id
+            );
+            return Ok(());
+        }
+        if existing_order > new_order {
+            return Ok(());
+        }
+    }
+    transitions.insert(target, transition);
+    Ok(())
+}
+
+fn checked_increment(value: &mut u64, label: &str) -> Result<()> {
+    *value = value
+        .checked_add(1)
+        .with_context(|| format!("{label} count overflow"))?;
+    Ok(())
+}
+
+fn account_block_target_name(log_title: &str) -> Option<String> {
+    let target = log_title
+        .split_once(':')
+        .map_or(log_title, |(_, target)| target);
+    let target = normalize_account_name(target);
+    if target.is_empty() || target.starts_with(['#', '~']) || is_ip_block_target(&target) {
+        return None;
+    }
+    Some(target)
+}
+
+fn normalize_account_name(name: &str) -> String {
+    name.trim().replace('_', " ")
+}
+
+fn is_ip_block_target(target: &str) -> bool {
+    let address = target
+        .split_once('/')
+        .map_or(target, |(address, _)| address);
+    address.parse::<std::net::IpAddr>().is_ok()
+}
+
+fn classify_block_duration(params: Option<&str>) -> AccountBlockState {
+    let Some(params) = params.map(str::trim) else {
+        return AccountBlockState::Indefinite;
+    };
+    if params.is_empty() {
+        // MediaWiki's formatter defines old block records without a duration
+        // as indefinite. This is common in the earliest public logging rows.
+        return AccountBlockState::Indefinite;
+    }
+
+    static NAMED_DURATION: OnceLock<Regex> = OnceLock::new();
+    let named = NAMED_DURATION.get_or_init(|| {
+        Regex::new(r#"5::duration\";s:\d+:\"([^\"]*)\""#)
+            .expect("block duration expression is valid")
+    });
+    static LEGACY_DURATION: OnceLock<Regex> = OnceLock::new();
+    let legacy = LEGACY_DURATION.get_or_init(|| {
+        Regex::new(r#"i:0;s:\d+:\"([^\"]*)\""#).expect("legacy block duration expression is valid")
+    });
+    if let Some(duration) = named
+        .captures(params)
+        .or_else(|| legacy.captures(params))
+        .and_then(|capture| capture.get(1))
+        .map(|capture| capture.as_str())
+    {
+        return if is_indefinite_duration(duration) {
+            AccountBlockState::Indefinite
+        } else {
+            AccountBlockState::NotIndefinite
+        };
+    }
+    if params.starts_with("a:") {
+        return if params.ends_with('}') {
+            // A complete serialized legacy row with no duration uses the same
+            // MediaWiki default as an empty pre-serialization row.
+            AccountBlockState::Indefinite
+        } else {
+            AccountBlockState::Unclassified
+        };
+    }
+    let legacy_duration = params.lines().next().unwrap_or_default().trim();
+    if legacy_duration.is_empty() || is_indefinite_duration(legacy_duration) {
+        AccountBlockState::Indefinite
+    } else {
+        AccountBlockState::NotIndefinite
+    }
+}
+
+fn is_indefinite_duration(duration: &str) -> bool {
+    matches!(
+        duration.trim().to_ascii_lowercase().as_str(),
+        "infinite" | "infinity" | "indefinite" | "indefinitely" | "never"
+    )
 }
 
 #[cfg(test)]
@@ -2008,6 +2360,9 @@ struct AccountCreationMonth {
     accounts_created: u32,
     accounts_with_edits: u32,
     accounts_without_edits: u32,
+    indefinitely_blocked_accounts: u32,
+    indefinitely_blocked_with_edits: u32,
+    indefinitely_blocked_without_edits: u32,
     temporary_accounts_excluded: u32,
 }
 
@@ -2031,6 +2386,12 @@ struct AccountCreationStagingReport {
     fallback_identity_accounts: u64,
     opaque_identity_accounts: u64,
     temporary_accounts: u64,
+    local_account_block_events: u64,
+    indefinite_block_events: u64,
+    finite_block_events: u64,
+    unblock_events: u64,
+    unclassified_block_duration_events: u64,
+    indefinitely_blocked_accounts: u64,
     history_scan_mode: &'static str,
     history_sources: u32,
     history_source_bytes: u64,
@@ -2040,7 +2401,7 @@ struct AccountCreationStagingReport {
 }
 
 pub(crate) const ACCOUNT_CREATION_METRIC_VERSION: &str =
-    "account-creations-v4-redacted-legacy-identity-earliest-account-public-edit-match";
+    "account-creations-v5-indefinite-local-block-state-at-snapshot";
 
 fn parse_new_user_id(params: &str) -> Option<i64> {
     let params = params.trim();
