@@ -172,7 +172,7 @@ fn publish_account_creation_staging_report(input_dir: &Path, destination_dir: &P
 
 fn validate_account_creation_staging_report(report: &Value) -> Result<()> {
     ensure!(
-        report["schema_version"] == 1,
+        report["schema_version"] == 2,
         "unsupported account-creation schema"
     );
     ensure!(
@@ -214,12 +214,43 @@ fn validate_account_creation_staging_report(report: &Value) -> Result<()> {
                 .context("account-creation event total overflow")?,
         "account-creation event conservation failed"
     );
+    let expected_indefinitely_blocked = report["indefinitely_blocked_accounts"]
+        .as_u64()
+        .context("account-creation report has no indefinitely-blocked total")?;
+    ensure!(
+        expected_indefinitely_blocked <= expected_accounts,
+        "indefinitely-blocked total exceeds permanent accounts"
+    );
+    let local_block_events = report["local_account_block_events"]
+        .as_u64()
+        .context("account-creation report has no local block-event total")?;
+    let classified_block_events = [
+        "indefinite_block_events",
+        "finite_block_events",
+        "unblock_events",
+        "unclassified_block_duration_events",
+    ]
+    .into_iter()
+    .try_fold(0_u64, |total, field| {
+        total
+            .checked_add(
+                report[field]
+                    .as_u64()
+                    .with_context(|| format!("account-creation report has no {field} total"))?,
+            )
+            .context("account block-event total overflow")
+    })?;
+    ensure!(
+        local_block_events == classified_block_events,
+        "account block-event conservation failed"
+    );
     let rows = report["rows"]
         .as_array()
         .context("account-creation report rows are missing")?;
     ensure!(!rows.is_empty(), "account-creation report is empty");
     let mut previous_month: Option<&str> = None;
     let mut observed_accounts = 0_u64;
+    let mut observed_indefinitely_blocked = 0_u64;
     for row in rows {
         let month = row["year_month"]
             .as_str()
@@ -257,13 +288,38 @@ fn validate_account_creation_staging_report(report: &Value) -> Result<()> {
         row["temporary_accounts_excluded"]
             .as_u64()
             .context("account-creation row has no temporary-account count")?;
+        let indefinitely_blocked = row["indefinitely_blocked_accounts"]
+            .as_u64()
+            .context("account-creation row has no indefinitely-blocked count")?;
+        let indefinitely_blocked_with_edits = row["indefinitely_blocked_with_edits"]
+            .as_u64()
+            .context("account-creation row has no edited indefinitely-blocked count")?;
+        let indefinitely_blocked_without_edits = row["indefinitely_blocked_without_edits"]
+            .as_u64()
+            .context("account-creation row has no unedited indefinitely-blocked count")?;
+        ensure!(
+            indefinitely_blocked
+                == indefinitely_blocked_with_edits
+                    .checked_add(indefinitely_blocked_without_edits)
+                    .context("account-creation blocked row total overflow")?
+                && indefinitely_blocked_with_edits <= with_edits
+                && indefinitely_blocked_without_edits <= without_edits,
+            "account-creation blocked row conservation failed"
+        );
         observed_accounts = observed_accounts
             .checked_add(created)
             .context("account-creation report total overflow")?;
+        observed_indefinitely_blocked = observed_indefinitely_blocked
+            .checked_add(indefinitely_blocked)
+            .context("account-creation blocked report total overflow")?;
     }
     ensure!(
         observed_accounts == expected_accounts,
         "account-creation report total does not match its rows"
+    );
+    ensure!(
+        observed_indefinitely_blocked == expected_indefinitely_blocked,
+        "account-creation blocked total does not match its rows"
     );
     Ok(())
 }
@@ -1456,7 +1512,7 @@ pub fn write_site_fixture(output_dir: &Path) -> Result<()> {
     let staging_account_dir = output_dir.join("_staging/account-creations");
     fs::create_dir_all(&staging_account_dir)?;
     let account_fixture = serde_json::to_vec_pretty(&json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "metric_version": crate::patrol::ACCOUNT_CREATION_METRIC_VERSION,
         "license_spdx": "MIT",
         "attribution": "Derived from Wikimedia Foundation public datasets",
@@ -1474,14 +1530,20 @@ pub fn write_site_fixture(output_dir: &Path) -> Result<()> {
         "fallback_identity_accounts": 0,
         "opaque_identity_accounts": 0,
         "temporary_accounts": 2,
+        "local_account_block_events": 5,
+        "indefinite_block_events": 2,
+        "finite_block_events": 1,
+        "unblock_events": 2,
+        "unclassified_block_duration_events": 0,
+        "indefinitely_blocked_accounts": 3,
         "history_scan_mode": "deterministic_fixture",
         "history_sources": 1,
         "history_source_bytes": 200,
         "history_revision_rows": 18,
         "definition": "Deterministic site fixture",
         "rows": [
-            {"year_month": "2025-12", "accounts_created": 20, "accounts_with_edits": 8, "accounts_without_edits": 12, "temporary_accounts_excluded": 0},
-            {"year_month": "2026-01", "accounts_created": 25, "accounts_with_edits": 10, "accounts_without_edits": 15, "temporary_accounts_excluded": 2}
+            {"year_month": "2025-12", "accounts_created": 20, "accounts_with_edits": 8, "accounts_without_edits": 12, "indefinitely_blocked_accounts": 1, "indefinitely_blocked_with_edits": 1, "indefinitely_blocked_without_edits": 0, "temporary_accounts_excluded": 0},
+            {"year_month": "2026-01", "accounts_created": 25, "accounts_with_edits": 10, "accounts_without_edits": 15, "indefinitely_blocked_accounts": 2, "indefinitely_blocked_with_edits": 1, "indefinitely_blocked_without_edits": 1, "temporary_accounts_excluded": 2}
         ]
     }))?;
     fs::write(staging_account_dir.join("svwiki.json"), account_fixture)?;
@@ -1929,8 +1991,22 @@ mod tests {
         assert!(error.to_string().contains("row conservation failed"));
         assert!(!rejected.path().join(ACCOUNT_CREATION_STAGING_PATH).exists());
 
+        write_site_fixture(input.path())?;
+        let mut invalid_blocked: Value = serde_json::from_slice(&fs::read(&report_path)?)?;
+        invalid_blocked["rows"][0]["indefinitely_blocked_without_edits"] = json!(1);
+        fs::write(&report_path, serde_json::to_vec(&invalid_blocked)?)?;
+        let rejected = TestDir::new()?;
+        let error = materialize_into(input.path(), rejected.path())
+            .expect_err("a non-conserving indefinite-block split must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("blocked row conservation failed")
+        );
+        assert!(!rejected.path().join(ACCOUNT_CREATION_STAGING_PATH).exists());
+
         let valid_report = serde_json::to_vec(&json!({
-            "schema_version": 1,
+            "schema_version": 2,
             "metric_version": crate::patrol::ACCOUNT_CREATION_METRIC_VERSION,
             "license_spdx": "MIT",
             "wiki": "svwiki",
@@ -1939,11 +2015,20 @@ mod tests {
             "permanent_account_creation_events": 1,
             "permanent_accounts": 1,
             "duplicate_permanent_creation_events": 0,
+            "local_account_block_events": 1,
+            "indefinite_block_events": 1,
+            "finite_block_events": 0,
+            "unblock_events": 0,
+            "unclassified_block_duration_events": 0,
+            "indefinitely_blocked_accounts": 1,
             "rows": [{
                 "year_month": "2026-01",
                 "accounts_created": 1,
                 "accounts_with_edits": 1,
                 "accounts_without_edits": 0,
+                "indefinitely_blocked_accounts": 1,
+                "indefinitely_blocked_with_edits": 1,
+                "indefinitely_blocked_without_edits": 0,
                 "temporary_accounts_excluded": 0
             }]
         }))

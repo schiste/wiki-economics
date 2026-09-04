@@ -11,7 +11,7 @@ use tracing::{info, warn};
 const RECEIPT_SCHEMA_VERSION: u32 = 1;
 const SITE_ALGORITHM_VERSION: &str = "observable-static-site-v8-plain-distribution-artifacts";
 const DASHBOARD_DEFAULTS_ALGORITHM_VERSION: &str =
-    "rust-dashboard-defaults-v5-account-creation-staging-closure";
+    "rust-dashboard-defaults-v6-indefinite-local-account-blocks";
 pub(crate) const DASHBOARD_DEFAULT_METRIC_INPUTS: [&str; 9] = [
     "business_funnel.parquet",
     "gdp.parquet",

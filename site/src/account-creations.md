@@ -6,7 +6,7 @@ title: Account Creation
 
 <div class="page-intro">
 
-How many permanent local accounts are created on Swedish Wikipedia—and how many ever make at least one publicly attributable edit? This staging metric follows each monthly registration cohort through the complete selected history snapshot.
+How many permanent local accounts are created on Swedish Wikipedia, how many ever make a publicly attributable edit, and how many remain indefinitely locally blocked? This staging metric follows each monthly registration cohort through the complete selected history snapshot.
 
 </div>
 
@@ -33,6 +33,9 @@ const data = d3.rollups(
     accounts_created: d3.sum(rows, d => d.accounts_created),
     accounts_with_edits: d3.sum(rows, d => d.accounts_with_edits),
     accounts_without_edits: d3.sum(rows, d => d.accounts_without_edits),
+    indefinitely_blocked_accounts: d3.sum(rows, d => d.indefinitely_blocked_accounts),
+    indefinitely_blocked_with_edits: d3.sum(rows, d => d.indefinitely_blocked_with_edits),
+    indefinitely_blocked_without_edits: d3.sum(rows, d => d.indefinitely_blocked_without_edits),
     temporary_accounts_excluded: d3.sum(rows, d => d.temporary_accounts_excluded),
   }),
   d => toPeriod(d.year_month, granularity)
@@ -43,9 +46,15 @@ const split = data.flatMap(d => [
   {...d, status: "Made at least one edit", accounts: d.accounts_with_edits},
   {...d, status: "No edits in the snapshot", accounts: d.accounts_without_edits},
 ])
+const indefinitelyBlockedSplit = data.flatMap(d => [
+  {...d, status: "Made at least one edit", accounts: d.indefinitely_blocked_with_edits},
+  {...d, status: "No edits in the snapshot", accounts: d.indefinitely_blocked_without_edits},
+])
 const totalCreated = d3.sum(data, d => d.accounts_created)
 const totalWithEdits = d3.sum(data, d => d.accounts_with_edits)
+const totalIndefinitelyBlocked = d3.sum(data, d => d.indefinitely_blocked_accounts)
 const conversion = totalCreated > 0 ? totalWithEdits / totalCreated : null
+const indefiniteBlockRate = totalCreated > 0 ? totalIndefinitelyBlocked / totalCreated : null
 const latest = data.at(-1)
 const tickStep = Math.max(1, Math.floor(data.length / 18))
 ```
@@ -54,6 +63,7 @@ const tickStep = Math.max(1, Math.floor(data.length / 18))
 pageExportBar([
   {name: "account_creations", data},
   {name: "account_creation_edit_split", data: split},
+  {name: "account_creation_indefinite_blocks", data: indefinitelyBlockedSplit},
 ])
 ```
 
@@ -67,6 +77,11 @@ pageExportBar([
     <div class="kpi-value">${conversion == null ? "—" : (conversion * 100).toFixed(1) + "%"}</div>
     <div class="kpi-label">Ever edited</div>
     <div class="kpi-sub">across observed cohorts</div>
+  </div>
+  <div class="kpi-card">
+    <div class="kpi-value">${fmtNum(totalIndefinitelyBlocked)}</div>
+    <div class="kpi-label">Indefinitely locally blocked</div>
+    <div class="kpi-sub">${indefiniteBlockRate == null ? "—" : (indefiniteBlockRate * 100).toFixed(1) + "% of permanent cohorts"}</div>
   </div>
   <div class="kpi-card">
     <div class="kpi-value">${fmtNum(d3.sum(data, d => d.temporary_accounts_excluded))}</div>
@@ -98,6 +113,27 @@ withExport(Plot.plot({
 
 <div class="chart-section">
 
+## Indefinitely locally blocked accounts
+
+```js
+withExport(Plot.plot({
+  width,
+  height: 400,
+  color: {legend: true, domain: ["Made at least one edit", "No edits in the snapshot"], range: ["#7f1d1d", "#fca5a5"]},
+  x: {type: "band", label: "Creation period", tickRotate: -45, tickFilter: (d, i) => i % tickStep === 0},
+  y: {grid: true, label: "Accounts indefinitely locally blocked at cutoff", zero: true},
+  marks: [
+    Plot.barY(indefinitelyBlockedSplit, {x: "period", y: "accounts", fill: "status", order: ["Made at least one edit", "No edits in the snapshot"]}),
+    Plot.tip(indefinitelyBlockedSplit, Plot.pointerX({x: "period", y: "accounts", fill: "status", title: d => `${d.period}\n${d.status}: ${fmtNum(d.accounts)}\nIndefinitely blocked: ${fmtNum(d.indefinitely_blocked_accounts)}`})),
+    Plot.ruleY([0]),
+  ]
+}), indefinitelyBlockedSplit, "account_creation_indefinite_blocks")
+```
+
+</div>
+
+<div class="chart-section">
+
 ## Created accounts with and without edits
 
 ```js
@@ -119,7 +155,11 @@ withExport(Plot.plot({
 
 `Accounts created = Accounts with edits + Accounts without edits`
 
-Account creation comes from Wikimedia's snapshot-pinned `newusers` logging records. When the dump contains repeated creation records for one stable local user ID, the earliest observed creation month is used once. Legacy records without a target ID use the unique creation-log ID and target username, and are matched to revisions by historical or current username. Redacted legacy records without any public target identity are counted as creations but cannot match an edit. “Without edits” therefore means no matching public revision through **${report.snapshot}**, not necessarily no private, suppressed, renamed, or future activity. Temporary accounts and later duplicate stable-ID records are excluded from both sides of the permanent-account split. Logging coverage begins when the wiki's public account-creation log becomes available.
+Account creation comes from Wikimedia's snapshot-pinned `newusers` logging records. When the dump contains repeated creation records for one stable local user ID, the earliest observed creation month is used once. Legacy records without a target ID use the unique creation-log ID and target username, and are matched to revisions by historical or current username. Redacted legacy records without any public target identity are counted as creations but cannot match an edit or block.
+
+“Indefinitely locally blocked” means the latest matching public local `block`, `reblock`, or `unblock` transition at the **${report.snapshot}** cutoff leaves an indefinite block in force. It is not a claim that the account is community-banned or globally locked/blocked, and it can include indefinite partial blocks. Hidden targets and username histories unavailable in public data cannot be matched.
+
+“Without edits” means no matching public revision through **${report.snapshot}**, not necessarily no private, suppressed, renamed, or future activity. Temporary accounts and later duplicate stable-ID records are excluded from every permanent-account cohort. Logging coverage begins when the wiki's public account-creation log becomes available.
 
 Source: svwiki logging dump `${report.logging_dump_date}` · history snapshot `${report.snapshot}` · algorithm `${report.metric_version}` · license `${report.license_spdx}`.
 
