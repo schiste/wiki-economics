@@ -12,6 +12,7 @@ const {publishStaticRoot} = require("./publish-static-root.cjs");
 const {verifySiteDependencies} = require("./verify-site-dependencies.cjs");
 
 const REQUIRED_PAGES = [
+  "account-creations.html",
   "admin.html",
   "business.html",
   "edit-variation.html",
@@ -24,6 +25,7 @@ const REQUIRED_PAGES = [
 ];
 const REQUIRED_ROOT_FILES = ["robots.txt"];
 const REQUIRED_ATTACHMENTS = [
+  "svwiki.json",
   "defaults_business.json",
   "defaults_edit_variation.json",
   "defaults_gdp.json",

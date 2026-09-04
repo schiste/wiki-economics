@@ -249,6 +249,7 @@ document.addEventListener("DOMContentLoaded",function(){
     {
       name: "Staging",
       pages: [
+        { name: "Account Creation", path: "/account-creations" },
         { name: "Business Health", path: "/business" },
       ],
     },
