@@ -15,11 +15,12 @@ afterEach(() => {
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-site-source-"));
   roots.push(root);
-  for (const directory of ["site/src/components", "site/data-build"]) {
+  for (const directory of ["config/generated", "site/src/components", "site/data-build"]) {
     fs.mkdirSync(path.join(root, directory), {recursive: true});
   }
   const files = {
     "LICENSE": "MIT\n",
+    "config/generated/metric-catalog.json": "{\"schema_version\":1,\"metrics\":[]}\n",
     "package.json": "{}\n",
     "package-lock.json": "{}\n",
     "site/package.json": "{}\n",

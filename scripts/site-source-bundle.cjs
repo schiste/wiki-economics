@@ -8,6 +8,7 @@ const path = require("node:path");
 const PROVENANCE_FILE = "site-source-provenance.json";
 const ROOT_FILES = [
   "LICENSE",
+  "config/generated/metric-catalog.json",
   "package-lock.json",
   "package.json",
   "site/observablehq.config.js",

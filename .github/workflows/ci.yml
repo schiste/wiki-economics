@@ -48,6 +48,7 @@ jobs:
               - 'vendor/**'
               - 'deny.toml'
             site:
+              - 'config/generated/metric-catalog.json'
               - 'site/src/**'
               - 'site/data-build/**'
               - 'site/observablehq.config.js'

@@ -5,22 +5,44 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const {after, test} = require("node:test");
-const {buildManifest, determinismContract, generationSummary, parquetRowCounter, publicationLicensing, releaseProvenance, repositoryRootFromEnvironment, safeReceiptOutput} = require("./manifest.json.cjs");
+const {buildManifest, determinismContract, generationSummary, metricCatalog, parquetRowCounter, publicationLicensing, releaseProvenance, repositoryRootFromEnvironment, safeReceiptOutput} = require("./manifest.json.cjs");
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-manifest-"));
 const repositoryRoot = path.resolve(__dirname, "../..");
 after(() => fs.rmSync(root, {recursive: true, force: true}));
 
-const metrics = [
-  "business_funnel", "gdp", "gdp_activity_tiers", "gdp_user_type_share", "inequality",
-  "labor_churn", "labor_cohorts", "labor_monthly", "page_weekly_edits", "patrol",
-];
+const generatedMetricCatalog = require("../../config/generated/metric-catalog.json");
+const metrics = generatedMetricCatalog.metrics.map((metric) => metric.id);
 const dashboardJson = [
   "defaults_business", "defaults_edit_variation", "defaults_gdp", "defaults_inequality",
   "defaults_labor", "defaults_patrol", "meta_business", "meta_gdp",
   "meta_inequality", "meta_labor", "meta_patrol",
 ];
 const browserMetrics = metrics.filter((metric) => metric !== "page_weekly_edits");
+
+test("generated metric catalog validation is strict", () => {
+  assert.equal(metricCatalog(generatedMetricCatalog).length, metrics.length);
+  assert.throws(() => metricCatalog(null), /invalid generated metric catalog/);
+  assert.throws(() => metricCatalog({schema_version: 1, metrics: [{}]}), /invalid generated metric definition/);
+  const duplicate = structuredClone(generatedMetricCatalog);
+  duplicate.metrics.push(structuredClone(duplicate.metrics[0]));
+  assert.throws(() => metricCatalog(duplicate), /invalid generated metric definition/);
+});
+
+test("manifest generation rejects lifecycle metrics outside the canonical catalog", async () => {
+  const registry = lifecycle();
+  registry.publication_contract.datasets.unknown_metric = {coverage: "all_published"};
+  await assert.rejects(
+    () => buildManifest({
+      root,
+      repositoryRoot,
+      lifecycle: registry,
+      licensing: publicationLicensing(path.join(repositoryRoot, "config", "publication-licensing.json")),
+      generatedAt: "2026-08-30T00:00:00Z",
+    }),
+    /do not exactly match the generated metric catalog/,
+  );
+});
 
 test("detached site-source generators use the explicit runtime repository root", () => {
   const detached = path.join(root, "attested-site-source", "site", "data-build");

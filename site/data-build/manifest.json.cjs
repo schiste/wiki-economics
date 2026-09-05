@@ -5,11 +5,6 @@ const fs = require("node:fs");
 const path = require("node:path");
 const crypto = require("node:crypto");
 
-const CORE_METRICS = [
-  "business_funnel", "gdp", "gdp_activity_tiers", "gdp_user_type_share",
-  "inequality", "labor_churn", "labor_cohorts", "labor_monthly",
-];
-const PARTITION_ONLY_METRICS = new Set(["page_weekly_edits"]);
 const PUBLIC_JSON_ARTIFACTS = [
   "defaults_business", "defaults_edit_variation", "defaults_gdp",
   "defaults_inequality", "defaults_labor", "defaults_patrol",
@@ -39,6 +34,31 @@ function repositoryRootFromEnvironment(environment = process.env, start = __dirn
 
 function readJson(file) {
   try { return JSON.parse(fs.readFileSync(file, "utf8")); } catch { return null; }
+}
+
+function metricCatalog(document) {
+  if (document?.schema_version !== 1 || !Array.isArray(document.metrics) || document.metrics.length === 0) {
+    throw new Error("invalid generated metric catalog");
+  }
+  const ids = new Set();
+  for (const metric of document.metrics) {
+    if (typeof metric?.id !== "string" || ids.has(metric.id)
+        || typeof metric.family !== "string" || typeof metric.algorithm_version !== "string"
+        || !Array.isArray(metric.schema) || metric.schema.length === 0
+        || !Array.isArray(metric.aggregation) || metric.aggregation.length === 0
+        || !["merged_and_per_wiki", "per_wiki_only"].includes(metric.publication?.scope)
+        || metric.publication?.per_wiki_artifact !== `{wiki}/${metric.id}.parquet`
+        || metric.fingerprint?.artifact_identity !== `${metric.id}.parquet`
+        || metric.fingerprint?.family !== metric.family
+        || metric.fingerprint?.algorithm_version !== metric.algorithm_version
+        || !Array.isArray(metric.receipt?.conservation_columns)
+        || typeof metric.receipt?.ordering_contract !== "string"
+        || typeof metric.browser?.partitioning !== "string") {
+      throw new Error(`invalid generated metric definition: ${metric?.id || "unknown"}`);
+    }
+    ids.add(metric.id);
+  }
+  return document.metrics;
 }
 
 function retentionSummary(dataDir, wiki) {
@@ -558,6 +578,15 @@ async function buildManifest(options = {}) {
   const licensing = options.licensing || publicationLicensing(
     options.licensingFile || path.join(repositoryRoot, "config", "publication-licensing.json"),
   );
+  const catalog = metricCatalog(options.metricCatalog || readJson(
+    path.join(repositoryRoot, "config", "generated", "metric-catalog.json"),
+  ));
+  const coreMetrics = catalog
+    .filter((metric) => metric.publication.scope === "merged_and_per_wiki" && metric.family !== "patrol")
+    .map((metric) => metric.id);
+  const partitionOnlyMetrics = new Set(catalog
+    .filter((metric) => metric.publication.scope === "per_wiki_only")
+    .map((metric) => metric.id));
   const generatedAt = options.generatedAt || environment.WIKI_ECON_MANIFEST_GENERATED_AT
     || new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
   if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(generatedAt)
@@ -565,6 +594,11 @@ async function buildManifest(options = {}) {
     throw new Error(`invalid manifest generation timestamp: ${generatedAt}`);
   }
   if (!lifecycle?.publication_contract?.datasets || !lifecycle?.wikis) throw new Error(`invalid wiki lifecycle registry: ${lifecycleFile}`);
+  const catalogMetricIds = catalog.map((metric) => metric.id).sort();
+  const lifecycleMetricIds = Object.keys(lifecycle.publication_contract.datasets).sort();
+  if (JSON.stringify(catalogMetricIds) !== JSON.stringify(lifecycleMetricIds)) {
+    throw new Error("wiki lifecycle datasets do not exactly match the generated metric catalog");
+  }
   const rowCounter = options.rowCounter || parquetRowCounter();
   const merged = fileList(outputDir);
   const dashboardJson = fileList(outputDir, ".json")
@@ -583,7 +617,7 @@ async function buildManifest(options = {}) {
       const published = lifecycleEntry?.publication === "published";
       const expected = Object.entries(lifecycle.publication_contract.datasets)
         .filter(([, contract]) => published && datasetApplies(contract, wiki)).map(([name]) => name);
-      const requiredCore = CORE_METRICS.filter((metric) => expected.includes(metric));
+      const requiredCore = coreMetrics.filter((metric) => expected.includes(metric));
       const patrolRequired = expected.includes("patrol");
       const raw = rawSummary(dataDir, wiki);
       const generation = generationSummary(dataDir, wiki);
@@ -595,23 +629,26 @@ async function buildManifest(options = {}) {
       const selectedProfile = workloadProfile(dataDir, wiki, selectedSnapshot);
       const missingCore = requiredCore.filter((metric) => !metricNames.has(metric));
       const missingMerged = expected.filter((metric) =>
-        PARTITION_ONLY_METRICS.has(metric) ? !metricNames.has(metric) : !mergedNames.has(metric));
-      if (published && metricNames.has("page_weekly_edits")) {
-        const weeklyPath = path.join(outputDir, wiki, "page_weekly_edits.parquet");
-        const weekly = statFile(weeklyPath);
-        if (weekly) {
+        partitionOnlyMetrics.has(metric) ? !metricNames.has(metric) : !mergedNames.has(metric));
+      for (const metric of partitionOnlyMetrics) {
+        if (published && metricNames.has(metric)) {
+          const partitionPath = path.join(outputDir, wiki, `${metric}.parquet`);
+          const partition = statFile(partitionPath);
+          if (!partition) continue;
           downloadableArtifacts.push({
-            name: `${wiki}/page_weekly_edits.parquet`,
-            size_kb: Math.floor(weekly.size / 1024),
+            name: `${wiki}/${metric}.parquet`,
+            size_kb: Math.floor(partition.size / 1024),
             license_spdx: ARTIFACT_LICENSE_SPDX,
             media_type: "application/vnd.apache.parquet",
           });
         }
       }
-      const pageWeekReady = !expected.includes("page_weekly_edits") || metricNames.has("page_weekly_edits");
+      const partitionMetricsReady = expected
+        .filter((metric) => partitionOnlyMetrics.has(metric))
+        .every((metric) => metricNames.has(metric));
       const historyInputsRetired = retention.valid && retention.history_input === "purge_after_ready";
       const patrolInputsRetired = retention.valid && retention.patrol_source === "purge_after_ready";
-      const publishedArtifactsReady = published && missingCore.length === 0 && pageWeekReady
+      const publishedArtifactsReady = published && missingCore.length === 0 && partitionMetricsReady
         && (!patrolRequired || patrol.metric_ready) && missingMerged.length === 0
         && (generation.ingest_ready || historyInputsRetired)
         && (!patrolRequired || patrol.source_ready || patrolInputsRetired);
@@ -622,7 +659,7 @@ async function buildManifest(options = {}) {
       if (!publishedArtifactsReady && lifecycleEntry?.refresh !== "paused") {
         if (generation.pointer_ready && !generation.ingest_ready) status = "needs_ingest";
         else if (!generation.pointer_ready && raw.files > 0) status = "needs_ingest";
-        else if (missingCore.length > 0 || !pageWeekReady) status = generation.ingest_ready ? "needs_compute" : status;
+        else if (missingCore.length > 0 || !partitionMetricsReady) status = generation.ingest_ready ? "needs_compute" : status;
         else if (patrolRequired && !patrol.source_ready && !patrolInputsRetired) status = "needs_patrol_fetch";
         else if (patrolRequired && !patrol.metric_ready) status = patrol.source_ready ? "needs_patrol_compute" : "needs_patrol_fetch";
         else if (missingMerged.length > 0) status = "needs_merge";
@@ -696,5 +733,5 @@ if (require.main === module) {
   });
 }
 
-module.exports = {BROWSER_INDEX, browserDataSummary, buildManifest, datasetApplies, determinismContract, discoverWikis, generationSummary, humanBytes, parquetRowCounter,
+module.exports = {BROWSER_INDEX, browserDataSummary, buildManifest, datasetApplies, determinismContract, discoverWikis, generationSummary, humanBytes, metricCatalog, parquetRowCounter,
   patrolSummary, publicationLicensing, releaseProvenance, repositoryRootFromEnvironment, repositoryRuntimeProvenance, retentionSummary, safeReceiptOutput};
