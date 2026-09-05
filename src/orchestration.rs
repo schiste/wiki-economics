@@ -106,6 +106,24 @@ pub(crate) struct FleetDiscoveryRequest<'a> {
     pub(crate) snapshot: Option<&'a str>,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CandidateSourceRequest<'a> {
+    wiki: &'a str,
+    version: &'a str,
+    run_id: &'a str,
+    window_size: usize,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct CandidateMetricRequest<'a> {
+    wiki: &'a str,
+    version: &'a str,
+    destination: &'a Path,
+    same_snapshot_candidate: bool,
+    compute_reused: bool,
+    patrol_reused: bool,
+}
+
 pub(crate) trait SnapshotOps {
     fn resolve_snapshot(
         &self,
@@ -404,20 +422,22 @@ pub(crate) fn handle_fleet_discovery(
         ops.persist_snapshot_plans(std::slice::from_ref(&wiki), &version, context.paths.data)?;
         let (plan, _) =
             snapshot_plan::SnapshotPlan::load_or_resolve(context.paths.data, &wiki, &version)?;
-        let (resource_class, signals) = fleet::classify(
+        let classification = fleet::classify(
             context.paths.data,
             context.paths.output,
             &plan,
             overrides.get(&wiki).copied(),
-        )?;
-        report.merge(fleet::enqueue(
+        );
+        let (resource_class, signals) = classification?;
+        let enqueue = fleet::enqueue(
             request.queue_dir,
             &wiki,
             &version,
             resource_class,
             signals,
             controller_run_id,
-        )?);
+        );
+        report.merge(enqueue?);
     }
     Ok(report)
 }
@@ -503,13 +523,14 @@ pub(crate) fn handle_prepare_wiki(
     let source_window_size = source_window::configured_window_size(request.source_window_size)?;
     ops.persist_snapshot_plans(&wikis, &version, context.paths.data)?;
 
-    if request.mode == PreparationMode::Qualification
-        && ops.reset_obsolete_qualification_generation(
-            request.wiki,
-            &version,
-            context.paths.data,
-        )?
-    {
+    let retired_obsolete_input = if request.mode == PreparationMode::Qualification {
+        let reset =
+            ops.reset_obsolete_qualification_generation(request.wiki, &version, context.paths.data);
+        reset?
+    } else {
+        false
+    };
+    if retired_obsolete_input {
         record_skipped_stage("obsolete_input_retired", Some(request.wiki));
     }
 
@@ -517,23 +538,25 @@ pub(crate) fn handle_prepare_wiki(
         PreparationMode::Candidate => {
             publication::wiki_candidate_dir(context.paths.output, request.wiki, &version, run_id)?
         }
-        PreparationMode::Qualification => publication::wiki_qualification_dir(
-            context.paths.output,
-            request.wiki,
-            &version,
-            run_id,
-        )?,
+        PreparationMode::Qualification => {
+            let qualification = publication::wiki_qualification_dir(
+                context.paths.output,
+                request.wiki,
+                &version,
+                run_id,
+            );
+            qualification?
+        }
     };
 
     if request.mode == PreparationMode::Qualification {
-        prepare_candidate_source(
-            context,
-            ops,
-            request.wiki,
-            &version,
+        let source = CandidateSourceRequest {
+            wiki: request.wiki,
+            version: &version,
             run_id,
-            source_window_size,
-        )?;
+            window_size: source_window_size,
+        };
+        prepare_candidate_source(context, ops, source)?;
     }
 
     let discovery_stage = match request.mode {
@@ -563,42 +586,41 @@ pub(crate) fn handle_prepare_wiki(
         Ok(plan)
     })?;
 
-    let publication::WikiPreparationPlan::Build {
-        same_snapshot_candidate,
-        compute_reused,
-        patrol_reused,
-    } = preparation
-    else {
-        let publication::WikiPreparationPlan::NoOp { ready_path } = preparation else {
-            unreachable!("preparation plan variants are exhaustive")
-        };
-        if request.mode == PreparationMode::Qualification {
-            anyhow::bail!("qualification preparation unexpectedly resolved as a publication no-op");
+    let (same_snapshot_candidate, compute_reused, patrol_reused) = match preparation {
+        publication::WikiPreparationPlan::Build {
+            same_snapshot_candidate,
+            compute_reused,
+            patrol_reused,
+        } => (same_snapshot_candidate, compute_reused, patrol_reused),
+        publication::WikiPreparationPlan::NoOp { ready_path } => {
+            if request.mode == PreparationMode::Qualification {
+                anyhow::bail!(
+                    "qualification preparation unexpectedly resolved as a publication no-op"
+                );
+            }
+            info!(wiki = request.wiki, version, path = %ready_path.display(), "candidate preparation is a recorded no-op");
+            return Ok(ready_path);
         }
-        info!(wiki = request.wiki, version, path = %ready_path.display(), "candidate preparation is a recorded no-op");
-        return Ok(ready_path);
     };
 
     if request.mode == PreparationMode::Candidate {
-        prepare_candidate_source(
-            context,
-            ops,
-            request.wiki,
-            &version,
+        let source = CandidateSourceRequest {
+            wiki: request.wiki,
+            version: &version,
             run_id,
-            source_window_size,
-        )?;
+            window_size: source_window_size,
+        };
+        prepare_candidate_source(context, ops, source)?;
     }
-    execute_candidate_metrics(
-        context,
-        ops,
-        request.wiki,
-        &version,
-        &destination,
+    let metrics = CandidateMetricRequest {
+        wiki: request.wiki,
+        version: &version,
+        destination: &destination,
         same_snapshot_candidate,
         compute_reused,
         patrol_reused,
-    )?;
+    };
+    execute_candidate_metrics(context, ops, metrics)?;
 
     let validation_stage = match request.mode {
         PreparationMode::Candidate => "candidate_validate",
@@ -629,64 +651,66 @@ pub(crate) fn handle_prepare_wiki(
 fn prepare_candidate_source(
     context: RunContext<'_>,
     ops: &impl HistoryInputOps,
-    wiki: &str,
-    version: &str,
-    run_id: &str,
-    source_window_size: usize,
+    request: CandidateSourceRequest<'_>,
 ) -> Result<()> {
-    timed_stage("source_window", Some(wiki), || {
+    timed_stage("source_window", Some(request.wiki), || {
         ops.prepare_candidate_snapshot(
-            wiki,
-            version,
+            request.wiki,
+            request.version,
             context.paths.data,
-            run_id,
-            source_window_size,
+            request.run_id,
+            request.window_size,
         )
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 fn execute_candidate_metrics(
     context: RunContext<'_>,
     ops: &(impl PatrolOps + MetricComputeOps),
-    wiki: &str,
-    version: &str,
-    destination: &Path,
-    same_snapshot_candidate: bool,
-    compute_reused: bool,
-    patrol_reused: bool,
+    request: CandidateMetricRequest<'_>,
 ) -> Result<()> {
-    if compute_reused {
-        record_reused_stage("compute", Some(wiki));
+    if request.compute_reused {
+        record_reused_stage("compute", Some(request.wiki));
     } else {
-        timed_stage("compute", Some(wiki), || {
-            ops.compute_candidate(wiki, version, context.paths.data, destination)
+        timed_stage("compute", Some(request.wiki), || {
+            ops.compute_candidate(
+                request.wiki,
+                request.version,
+                context.paths.data,
+                request.destination,
+            )
         })?;
     }
-    if patrol_reused {
-        record_reused_stage("patrol_preflight", Some(wiki));
-        record_reused_stage("patrol_fetch", Some(wiki));
-        record_reused_stage("patrol_compute", Some(wiki));
+    if request.patrol_reused {
+        record_reused_stage("patrol_preflight", Some(request.wiki));
+        record_reused_stage("patrol_fetch", Some(request.wiki));
+        record_reused_stage("patrol_compute", Some(request.wiki));
         return Ok(());
     }
 
-    let patrol_cached = ops.cached_patrol_generation_available(wiki, version, context.paths.data);
+    let patrol_cached =
+        ops.cached_patrol_generation_available(request.wiki, request.version, context.paths.data);
     if patrol_cached {
-        record_reused_stage("patrol_preflight", Some(wiki));
+        record_reused_stage("patrol_preflight", Some(request.wiki));
     } else {
-        timed_stage("patrol_preflight", Some(wiki), || {
-            ops.preflight_patrol_for_snapshot(wiki, version, context.paths.data)
+        timed_stage("patrol_preflight", Some(request.wiki), || {
+            ops.preflight_patrol_for_snapshot(request.wiki, request.version, context.paths.data)
         })?;
     }
-    if same_snapshot_candidate && patrol_cached {
-        record_skipped_stage("patrol_fetch", Some(wiki));
+    if request.same_snapshot_candidate && patrol_cached {
+        record_skipped_stage("patrol_fetch", Some(request.wiki));
     } else {
-        timed_stage("patrol_fetch", Some(wiki), || {
-            ops.fetch_patrol_for_snapshot(wiki, version, context.paths.data)
+        timed_stage("patrol_fetch", Some(request.wiki), || {
+            ops.fetch_patrol_for_snapshot(request.wiki, request.version, context.paths.data)
         })?;
     }
-    timed_stage("patrol_compute", Some(wiki), || {
-        ops.compute_candidate_patrol(wiki, version, context.paths.data, destination)
+    timed_stage("patrol_compute", Some(request.wiki), || {
+        ops.compute_candidate_patrol(
+            request.wiki,
+            request.version,
+            context.paths.data,
+            request.destination,
+        )
     })
 }
 
@@ -723,12 +747,13 @@ pub(crate) fn handle_pipeline_run(
         .map(str::to_string)
         .unwrap_or_else(|| format!("manual-{}", std::process::id()));
     ops.persist_snapshot_plans(request.wikis, &version, context.paths.data)?;
-    publication::begin_run(
+    let run = publication::begin_run(
         context.paths.output,
         context.run_id,
         request.wikis,
         Some(&version),
-    )?;
+    );
+    run?;
     for wiki in request.wikis {
         info!(wiki, stage = ?request.stage, "running pipeline stage");
         if request.stage.runs_ingest() {
