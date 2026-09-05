@@ -11,6 +11,9 @@ monthly source artifacts and never overwrites `patrol.parquet` or
 The implementation guarantees:
 
 - an exact dated source plan is pinned before any patrol source is downloaded;
+- one canonical typed event stream decodes each logging source; patrol, rights,
+  local block history, and account creation consume typed events instead of
+  maintaining independent XML parsers;
 - incomplete upstream logging dumps become a resumable `waiting_upstream`
   state rather than a late pipeline failure;
 - a complete split logging dump is accepted when its recombined artifact is
@@ -93,6 +96,11 @@ The downloaded gzip is deleted only after all monthly Parquets, the block
 history, the current-state index, and the synced manifest are durable. A failed build removes only its identified staging
 directory. An incomplete final generation fails closed and is not silently
 adopted.
+
+`src/logging.rs` owns the streaming XML contract. It reads every member
+of concatenated gzip dumps and emits exactly one `LoggingEvent` per log item.
+The synchronous callback keeps memory bounded and lets each caller fan events
+out to its own accumulator or Parquet writer without exposing raw XML fields.
 
 ## Incremental dependency graph
 

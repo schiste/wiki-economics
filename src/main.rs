@@ -20,6 +20,7 @@ mod fleet;
 mod generation_lifecycle;
 mod ingest;
 mod licensing;
+mod logging;
 mod merge;
 mod metric_registry;
 mod observability;

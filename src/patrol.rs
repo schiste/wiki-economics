@@ -1,9 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::NaiveDateTime;
-use flate2::read::MultiGzDecoder;
 use polars::prelude::*;
-use quick_xml::Reader;
-use quick_xml::events::Event;
 use regex::Regex;
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
@@ -20,7 +17,16 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use tracing::{info, warn};
 
+use crate::logging::{
+    AccountCreationEvent as NewUserRow, BlockEvent, LoggingEvent, PatrolEvent as PatrolRow,
+    RightsEvent as RightsRow, normalize_timestamp,
+};
 use crate::{compute, fingerprint, storage};
+
+#[cfg(test)]
+use crate::logging::{
+    extract_php_array_body, extract_php_groups, parse_patrol_params, parse_rights_params,
+};
 
 #[cfg_attr(coverage, allow(dead_code))]
 const USER_AGENT: &str = "wiki-econ/0.1 (Wikipedia economic analysis research tool)";
@@ -29,7 +35,7 @@ const PARQUET_BATCH_ROWS: usize = 50_000;
 const SUBSTANTIAL_LOGGING_DUMP_BYTES: u64 = 1024 * 1024;
 const SUBSTANTIAL_LOG_ITEMS: usize = 10_000;
 const PATROL_COMPUTE_ALGORITHM_VERSION: &str = "patrol-metrics-v5-complete-snapshot-months";
-const PATROL_PARSER_VERSION: &str = "patrol-logging-pinned-plan-v5-monthly-account-block-history";
+const PATROL_PARSER_VERSION: &str = "patrol-logging-pinned-plan-v6-typed-event-stream";
 const REVISION_COLUMNS: &[&str] = &[
     "revision_id",
     "event_timestamp",
@@ -175,18 +181,6 @@ impl AccountBlockBatch {
             Column::new("duration".into(), std::mem::take(&mut self.duration)),
         ]
     }
-}
-
-#[derive(Default)]
-struct LogItem {
-    log_type: Option<String>,
-    log_action: Option<String>,
-    log_id: Option<i64>,
-    timestamp: Option<String>,
-    contributor_name: Option<String>,
-    contributor_id: Option<i64>,
-    log_title: Option<String>,
-    params: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -1954,101 +1948,53 @@ fn parse_logging_events_with_blocks<P: PatrolSink + ?Sized, R: RightsSink + ?Siz
     rights_writer: &mut R,
     mut block_writer: Option<&mut dyn AccountBlockSink>,
 ) -> Result<LoggingParseStats> {
-    let file = File::open(xml_path)?;
-    let compressed_bytes = file.metadata()?.len();
-    crate::storage::prepare_sequential_read(&file);
-    let decoder = MultiGzDecoder::new(BufReader::new(file.try_clone()?));
-    let mut reader = Reader::from_reader(BufReader::new(decoder));
-    reader.config_mut().trim_text(true);
-
-    let mut buffer = Vec::new();
-    let mut current = None::<LogItem>;
-    let mut current_tag = None::<String>;
-    let mut in_contributor = false;
     let mut stats = LoggingParseStats::default();
-
-    loop {
-        match reader.read_event_into(&mut buffer) {
-            Ok(Event::Start(event)) => {
-                let tag = local_name(&event);
-                match tag.as_str() {
-                    "logitem" => current = Some(LogItem::default()),
-                    "contributor" => in_contributor = true,
-                    _ if current.is_some() => current_tag = Some(tag),
-                    _ => {}
+    let summary = crate::logging::stream_file(xml_path, |event| {
+        match event {
+            LoggingEvent::Patrol(row) => {
+                patrol_writer.add_patrol(row)?;
+                stats.patrol_events = stats
+                    .patrol_events
+                    .checked_add(1)
+                    .context("patrol event count overflow")?;
+            }
+            LoggingEvent::Rights(row) => {
+                rights_writer.add_rights(row)?;
+                stats.rights_events = stats
+                    .rights_events
+                    .checked_add(1)
+                    .context("rights event count overflow")?;
+            }
+            LoggingEvent::Block(event) if snapshot.is_some() && block_writer.is_some() => {
+                let parsed = parse_account_block_transition(
+                    event,
+                    snapshot.expect("guarded snapshot"),
+                    &mut stats,
+                )?;
+                if let Some(row) = parsed {
+                    block_writer
+                        .as_deref_mut()
+                        .expect("guarded account-block writer")
+                        .add_account_block(row)?;
+                } else {
+                    stats.skipped_events = stats
+                        .skipped_events
+                        .checked_add(1)
+                        .context("skipped event count overflow")?;
                 }
             }
-            Ok(Event::End(event)) => {
-                let tag = String::from_utf8_lossy(event.local_name().as_ref()).to_string();
-                match tag.as_str() {
-                    "contributor" => {
-                        in_contributor = false;
-                        current_tag = None;
-                    }
-                    "logitem" => {
-                        if let Some(item) = current.take() {
-                            stats.total_log_items += 1;
-                            match item {
-                                item if matches!(item.log_type.as_deref(), Some("patrol")) => {
-                                    patrol_writer.add_patrol(item.into_patrol_row())?;
-                                    stats.patrol_events += 1;
-                                }
-                                item if matches!(item.log_type.as_deref(), Some("rights")) => {
-                                    rights_writer.add_rights(item.into_rights_row())?;
-                                    stats.rights_events += 1;
-                                }
-                                item if matches!(item.log_type.as_deref(), Some("block"))
-                                    && snapshot.is_some()
-                                    && block_writer.is_some() =>
-                                {
-                                    let parsed = parse_account_block_transition(
-                                        item,
-                                        snapshot.expect("guarded snapshot"),
-                                        &mut stats,
-                                    );
-                                    if let Some(row) = parsed? {
-                                        block_writer
-                                            .as_deref_mut()
-                                            .expect("guarded account-block writer")
-                                            .add_account_block(row)?;
-                                    } else {
-                                        stats.skipped_events += 1;
-                                    }
-                                }
-                                _ => stats.skipped_events += 1,
-                            }
-                        }
-                        current_tag = None;
-                    }
-                    _ => current_tag = None,
-                }
+            LoggingEvent::Block(_)
+            | LoggingEvent::AccountCreation(_)
+            | LoggingEvent::Other { .. } => {
+                stats.skipped_events = stats
+                    .skipped_events
+                    .checked_add(1)
+                    .context("skipped event count overflow")?;
             }
-            Ok(Event::Text(text)) => {
-                let decoded = text.decode()?.into_owned();
-                apply_decoded_log_text(
-                    current.as_mut(),
-                    current_tag.as_deref(),
-                    in_contributor,
-                    decoded,
-                );
-            }
-            Ok(Event::CData(text)) => {
-                let decoded = text.decode()?.into_owned();
-                apply_decoded_log_text(
-                    current.as_mut(),
-                    current_tag.as_deref(),
-                    in_contributor,
-                    decoded,
-                );
-            }
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(err) => return Err(err.into()),
         }
-        buffer.clear();
-    }
-
-    crate::storage::discard_file_cache(&file, 0, compressed_bytes);
+        Ok(())
+    })?;
+    stats.total_log_items = summary.total_log_items;
     Ok(stats)
 }
 
@@ -2061,159 +2007,103 @@ fn parse_account_creation_events(
     block_transitions: &mut HashMap<String, AccountBlockTransition>,
     temporary_by_month: &mut BTreeMap<String, u32>,
 ) -> Result<AccountCreationParseStats> {
-    let file = File::open(xml_path)?;
-    let compressed_bytes = file.metadata()?.len();
-    crate::storage::prepare_sequential_read(&file);
-    let decoder = MultiGzDecoder::new(BufReader::new(file.try_clone()?));
-    let mut reader = Reader::from_reader(BufReader::new(decoder));
-    reader.config_mut().trim_text(true);
-
-    let mut buffer = Vec::new();
-    let mut current = None::<LogItem>;
-    let mut current_tag = None::<String>;
-    let mut in_contributor = false;
     let mut stats = AccountCreationParseStats::default();
-    loop {
-        match reader.read_event_into(&mut buffer) {
-            Ok(Event::Start(event)) => {
-                let tag = local_name(&event);
-                match tag.as_str() {
-                    "logitem" => current = Some(LogItem::default()),
-                    "contributor" => in_contributor = true,
-                    _ if current.is_some() => current_tag = Some(tag),
-                    _ => {}
-                }
+    let summary = crate::logging::stream_file(xml_path, |event| {
+        match event {
+            LoggingEvent::AccountCreation(row) => record_account_creation_event(
+                row,
+                snapshot,
+                accounts,
+                fallback_accounts,
+                account_names,
+                temporary_by_month,
+                &mut stats,
+            )?,
+            LoggingEvent::Block(event) => {
+                record_account_block_transition(event, snapshot, block_transitions, &mut stats)?
             }
-            Ok(Event::End(event)) => {
-                let tag = String::from_utf8_lossy(event.local_name().as_ref()).to_string();
-                match tag.as_str() {
-                    "contributor" => {
-                        in_contributor = false;
-                        current_tag = None;
-                    }
-                    "logitem" => {
-                        let item = current
-                            .take()
-                            .context("account logitem ended without a matching start")?;
-                        stats.total_log_items = stats
-                            .total_log_items
-                            .checked_add(1)
-                            .context("account logging item count overflow")?;
-                        if matches!(item.log_type.as_deref(), Some("newusers")) {
-                            stats.account_creation_events = stats
-                                .account_creation_events
-                                .checked_add(1)
-                                .context("account creation event count overflow")?;
-                            let row = item.into_new_user_row();
-                            let month = row
-                                .timestamp
-                                .get(..7)
-                                .context("newusers timestamp has no event month")?
-                                .to_string();
-                            storage::validate_snapshot_version(&month)?;
-                            if compute::snapshot_contains_complete_month(snapshot, &month) {
-                                if row.is_temporary {
-                                    stats.temporary_accounts = stats
-                                        .temporary_accounts
-                                        .checked_add(1)
-                                        .context("temporary account count overflow")?;
-                                    let count = temporary_by_month.entry(month).or_default();
-                                    *count = count
-                                        .checked_add(1)
-                                        .context("temporary account month count overflow")?;
-                                } else {
-                                    stats.permanent_creation_events = stats
-                                        .permanent_creation_events
-                                        .checked_add(1)
-                                        .context("permanent account count overflow")?;
-                                    if let Some(user_id) = row.target_user_id {
-                                        if let Some(name) = row.target_user.as_deref() {
-                                            account_names
-                                                .entry(user_id)
-                                                .or_insert_with(|| normalize_account_name(name));
-                                        }
-                                        if let Some((existing_month, _)) =
-                                            accounts.get_mut(&user_id)
-                                        {
-                                            if existing_month != &month {
-                                                stats.record_cross_month_duplicate()?;
-                                                if month < *existing_month {
-                                                    *existing_month = month;
-                                                }
-                                            }
-                                        } else {
-                                            accounts.insert(user_id, (month, false));
-                                        }
-                                    } else if let Some(log_id) = row.log_id {
-                                        let target_user = row.target_user;
-                                        if let Some((existing_month, _, existing_user)) =
-                                            fallback_accounts.get(&log_id)
-                                        {
-                                            anyhow::ensure!(
-                                                existing_month == &month
-                                                    && existing_user == &target_user,
-                                                "account-creation log {log_id} has conflicting target identities"
-                                            );
-                                        } else {
-                                            let opaque = target_user.is_none();
-                                            fallback_accounts
-                                                .insert(log_id, (month, false, target_user));
-                                            stats.record_fallback_identity()?;
-                                            if opaque {
-                                                stats.record_opaque_identity()?;
-                                            }
-                                        }
-                                    } else {
-                                        stats.unresolved_permanent = stats
-                                            .unresolved_permanent
-                                            .checked_add(1)
-                                            .context("unresolved account count overflow")?;
-                                    }
-                                }
-                            }
-                        } else if matches!(item.log_type.as_deref(), Some("block")) {
-                            record_account_block_transition(
-                                item,
-                                snapshot,
-                                block_transitions,
-                                &mut stats,
-                            )?;
-                        }
-                        current_tag = None;
-                    }
-                    _ => current_tag = None,
-                }
-            }
-            Ok(Event::Text(text)) => apply_decoded_log_text(
-                current.as_mut(),
-                current_tag.as_deref(),
-                in_contributor,
-                text.decode()?.into_owned(),
-            ),
-            Ok(Event::CData(text)) => apply_decoded_log_text(
-                current.as_mut(),
-                current_tag.as_deref(),
-                in_contributor,
-                text.decode()?.into_owned(),
-            ),
-            Ok(Event::Eof) => break,
-            Ok(_) => {}
-            Err(error) => return Err(error.into()),
+            LoggingEvent::Patrol(_) | LoggingEvent::Rights(_) | LoggingEvent::Other { .. } => {}
         }
-        buffer.clear();
-    }
-    crate::storage::discard_file_cache(&file, 0, compressed_bytes);
+        Ok(())
+    })?;
+    stats.total_log_items =
+        u64::try_from(summary.total_log_items).context("account logging item count overflow")?;
     Ok(stats)
 }
 
+fn record_account_creation_event(
+    row: NewUserRow,
+    snapshot: &str,
+    accounts: &mut HashMap<i64, (String, bool)>,
+    fallback_accounts: &mut HashMap<i64, (String, bool, Option<String>)>,
+    account_names: &mut HashMap<i64, String>,
+    temporary_by_month: &mut BTreeMap<String, u32>,
+    stats: &mut AccountCreationParseStats,
+) -> Result<()> {
+    checked_increment(&mut stats.account_creation_events, "account creation event")?;
+    let month = row
+        .timestamp
+        .get(..7)
+        .context("newusers timestamp has no event month")?
+        .to_string();
+    storage::validate_snapshot_version(&month)?;
+    if !compute::snapshot_contains_complete_month(snapshot, &month) {
+        return Ok(());
+    }
+    if row.is_temporary {
+        checked_increment(&mut stats.temporary_accounts, "temporary account")?;
+        let count = temporary_by_month.entry(month).or_default();
+        *count = count
+            .checked_add(1)
+            .context("temporary account month count overflow")?;
+        return Ok(());
+    }
+
+    checked_increment(&mut stats.permanent_creation_events, "permanent account")?;
+    if let Some(user_id) = row.target_user_id {
+        if let Some(name) = row.target_user.as_deref() {
+            account_names
+                .entry(user_id)
+                .or_insert_with(|| normalize_account_name(name));
+        }
+        if let Some((existing_month, _)) = accounts.get_mut(&user_id) {
+            if existing_month != &month {
+                stats.record_cross_month_duplicate()?;
+                if month < *existing_month {
+                    *existing_month = month;
+                }
+            }
+        } else {
+            accounts.insert(user_id, (month, false));
+        }
+    } else if let Some(log_id) = row.log_id {
+        if let Some((existing_month, _, existing_user)) = fallback_accounts.get(&log_id) {
+            anyhow::ensure!(
+                existing_month == &month && existing_user == &row.target_user,
+                "account-creation log {log_id} has conflicting target identities"
+            );
+        } else {
+            let opaque = row.target_user.is_none();
+            fallback_accounts.insert(log_id, (month, false, row.target_user));
+            stats.record_fallback_identity()?;
+            if opaque {
+                stats.record_opaque_identity()?;
+            }
+        }
+    } else {
+        checked_increment(&mut stats.unresolved_permanent, "unresolved account")?;
+    }
+    Ok(())
+}
+
 fn record_account_block_transition(
-    item: LogItem,
+    event: BlockEvent,
     snapshot: &str,
     transitions: &mut HashMap<String, AccountBlockTransition>,
     stats: &mut AccountCreationParseStats,
 ) -> Result<()> {
     let Some((target, transition)) =
-        parse_account_block_transition_for_staging(item, snapshot, stats)?
+        parse_account_block_transition_for_staging(event, snapshot, stats)?
     else {
         return Ok(());
     };
@@ -2246,12 +2136,12 @@ fn update_named_block_transition(
 }
 
 fn parse_account_block_transition_for_staging(
-    item: LogItem,
+    event: BlockEvent,
     snapshot: &str,
     stats: &mut AccountCreationParseStats,
 ) -> Result<Option<(String, AccountBlockTransition)>> {
-    let action = item.log_action.clone().unwrap_or_default();
-    let parsed = parse_account_block_transition_common(item, snapshot)?;
+    let action = event.action.clone();
+    let parsed = parse_account_block_transition_common(event, snapshot)?;
     let Some(row) = parsed else {
         return Ok(None);
     };
@@ -2278,12 +2168,12 @@ fn parse_account_block_transition_for_staging(
 }
 
 fn parse_account_block_transition(
-    item: LogItem,
+    event: BlockEvent,
     snapshot: &str,
     stats: &mut LoggingParseStats,
 ) -> Result<Option<AccountBlockEventRow>> {
-    let action = item.log_action.clone().unwrap_or_default();
-    let parsed = parse_account_block_transition_common(item, snapshot)?;
+    let action = event.action.clone();
+    let parsed = parse_account_block_transition_common(event, snapshot)?;
     let Some(row) = parsed else {
         return Ok(None);
     };
@@ -2321,14 +2211,14 @@ fn parse_account_block_transition(
 }
 
 fn parse_account_block_transition_common(
-    item: LogItem,
+    event: BlockEvent,
     snapshot: &str,
 ) -> Result<Option<AccountBlockEventRow>> {
-    let action = item.log_action.as_deref().unwrap_or_default();
+    let action = event.action.as_str();
     if !matches!(action, "block" | "reblock" | "unblock") {
         return Ok(None);
     }
-    let timestamp = item.timestamp.unwrap_or_default();
+    let timestamp = event.timestamp;
     let month = timestamp
         .get(..7)
         .context("block timestamp has no event month")?;
@@ -2336,7 +2226,7 @@ fn parse_account_block_transition_common(
     if !compute::snapshot_contains_complete_month(snapshot, month) {
         return Ok(None);
     }
-    let Some(target) = item
+    let Some(target) = event
         .log_title
         .as_deref()
         .and_then(account_block_target_name)
@@ -2346,14 +2236,14 @@ fn parse_account_block_transition_common(
     let state = if action == "unblock" {
         AccountBlockState::NotIndefinite
     } else {
-        classify_block_duration(item.params.as_deref())
+        classify_block_duration(event.params.as_deref())
     };
     let duration = (action != "unblock")
-        .then(|| normalized_block_duration(item.params.as_deref()))
+        .then(|| normalized_block_duration(event.params.as_deref()))
         .flatten();
     Ok(Some(AccountBlockEventRow {
         timestamp,
-        log_id: item.log_id.unwrap_or_default(),
+        log_id: event.log_id.unwrap_or_default(),
         target_user: target,
         action: action.to_string(),
         resulting_state: state,
@@ -2498,112 +2388,6 @@ fn validate_logging_parse_totals(
     Ok(())
 }
 
-fn local_name(event: &quick_xml::events::BytesStart<'_>) -> String {
-    String::from_utf8_lossy(event.local_name().as_ref()).to_string()
-}
-
-fn apply_decoded_log_text(
-    item: Option<&mut LogItem>,
-    tag: Option<&str>,
-    in_contributor: bool,
-    value: String,
-) {
-    if let (Some(item), Some(tag)) = (item, tag) {
-        apply_log_text(item, tag, in_contributor, value);
-    }
-}
-
-fn apply_log_text(item: &mut LogItem, tag: &str, in_contributor: bool, value: String) {
-    match (tag, in_contributor) {
-        ("type", _) => item.log_type = Some(value),
-        ("action", _) => item.log_action = Some(value),
-        ("id", true) => item.contributor_id = parse_i64_opt(&value),
-        ("id", false) => item.log_id = parse_i64_opt(&value),
-        ("timestamp", _) => item.timestamp = Some(normalize_timestamp(&value)),
-        ("username", true) => item.contributor_name = Some(value),
-        ("logtitle", _) => item.log_title = Some(value),
-        ("params", _) => item.params = Some(value),
-        _ => {}
-    }
-}
-
-fn normalize_timestamp(timestamp: &str) -> String {
-    timestamp
-        .replace('T', " ")
-        .trim_end_matches('Z')
-        .split('.')
-        .next()
-        .unwrap_or(timestamp)
-        .to_string()
-}
-
-fn parse_i64_opt(value: &str) -> Option<i64> {
-    value.trim().parse().ok()
-}
-
-impl LogItem {
-    fn into_patrol_row(self) -> PatrolRow {
-        let params = self.params.unwrap_or_default();
-        let (current_revision_id, prev_revision_id, is_auto) = parse_patrol_params(&params);
-        PatrolRow {
-            log_id: self.log_id.unwrap_or(0),
-            timestamp: self.timestamp.unwrap_or_default(),
-            user: self.contributor_name,
-            user_id: self.contributor_id,
-            page_title: self.log_title,
-            current_revision_id,
-            prev_revision_id,
-            is_auto,
-        }
-    }
-
-    fn into_rights_row(self) -> RightsRow {
-        let log_title = self.log_title.unwrap_or_default();
-        let target_user = log_title
-            .split_once(':')
-            .map(|(_, rest)| rest.to_string())
-            .unwrap_or(log_title);
-        let params = self.params.unwrap_or_default();
-        let (old_groups, new_groups) = parse_rights_params(&params);
-        RightsRow {
-            timestamp: self.timestamp.unwrap_or_default(),
-            target_user,
-            old_groups,
-            new_groups,
-        }
-    }
-
-    fn into_new_user_row(self) -> NewUserRow {
-        let action = self.log_action.unwrap_or_default();
-        let target_user_id = self
-            .params
-            .as_deref()
-            .and_then(parse_new_user_id)
-            .or_else(|| {
-                matches!(action.as_str(), "create" | "autocreate" | "newusers")
-                    .then_some(self.contributor_id)
-                    .flatten()
-            });
-        let target_user = self.log_title.and_then(|title| {
-            let user = title
-                .split_once(':')
-                .map_or(title.as_str(), |(_, user)| user)
-                .trim();
-            (!user.is_empty()).then(|| user.to_string())
-        });
-        let is_temporary = target_user
-            .as_deref()
-            .is_some_and(|user| user.starts_with('~'));
-        NewUserRow {
-            log_id: self.log_id.filter(|log_id| *log_id > 0),
-            timestamp: self.timestamp.unwrap_or_default(),
-            target_user_id,
-            target_user,
-            is_temporary,
-        }
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct AccountCreationMonth {
     year_month: String,
@@ -2652,50 +2436,6 @@ struct AccountCreationStagingReport {
 
 pub(crate) const ACCOUNT_CREATION_METRIC_VERSION: &str =
     "account-creations-v5-indefinite-local-block-state-at-snapshot";
-
-fn parse_new_user_id(params: &str) -> Option<i64> {
-    let params = params.trim();
-    if let Ok(value) = params.parse::<i64>() {
-        return Some(value);
-    }
-    static USER_ID: OnceLock<Regex> = OnceLock::new();
-    USER_ID
-        .get_or_init(|| {
-            Regex::new(r#"(?:4::)?userid\";i:(\d+)"#).expect("newusers userid expression is valid")
-        })
-        .captures(params)
-        .and_then(|capture| capture.get(1))
-        .and_then(|value| value.as_str().parse().ok())
-}
-
-#[derive(Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-struct PatrolRow {
-    timestamp: String,
-    log_id: i64,
-    user: Option<String>,
-    user_id: Option<i64>,
-    page_title: Option<String>,
-    current_revision_id: i64,
-    prev_revision_id: i64,
-    is_auto: bool,
-}
-
-#[derive(Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-struct RightsRow {
-    timestamp: String,
-    target_user: String,
-    old_groups: String,
-    new_groups: String,
-}
-
-#[derive(Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-struct NewUserRow {
-    log_id: Option<i64>,
-    timestamp: String,
-    target_user_id: Option<i64>,
-    target_user: Option<String>,
-    is_temporary: bool,
-}
 
 impl PatrolWriter {
     fn new(path: &Path) -> Result<Self> {
@@ -2902,134 +2642,6 @@ fn load_cached_autopatrol_groups(meta_path: &Path) -> Result<Vec<String>> {
         .flatten()
         .filter_map(|entry| entry.as_str().map(|value| value.to_string()))
         .collect())
-}
-
-fn patrol_param_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| {
-        Regex::new(r#""(?P<field>[^"]+)";(?:(?:s:\d+:"(?P<str>[^"]*)")|(?:i:(?P<int>\d+)))"#)
-            .expect("valid patrol param regex")
-    })
-}
-
-fn rights_group_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| Regex::new(r#"s:\d+:"([^"]+)""#).expect("valid rights regex"))
-}
-
-fn parse_patrol_params(params: &str) -> (i64, i64, bool) {
-    if params.trim().is_empty() {
-        return (0, 0, false);
-    }
-    if params.trim_start().starts_with("a:") {
-        let mut current_revision_id = 0;
-        let mut prev_revision_id = 0;
-        let mut is_auto = false;
-        for captures in patrol_param_regex().captures_iter(params) {
-            let field = captures
-                .name("field")
-                .expect("patrol params regex should always capture field")
-                .as_str();
-            let string_value = captures.name("str").map(|m| m.as_str());
-            let int_value = captures
-                .name("int")
-                .and_then(|m| m.as_str().parse::<i64>().ok());
-            match field {
-                "4::curid" => {
-                    current_revision_id = string_value
-                        .and_then(|value| value.parse::<i64>().ok())
-                        .or(int_value)
-                        .unwrap_or(0);
-                }
-                "5::previd" => {
-                    prev_revision_id = string_value
-                        .and_then(|value| value.parse::<i64>().ok())
-                        .or(int_value)
-                        .unwrap_or(0);
-                }
-                "6::auto" => is_auto = int_value.unwrap_or_default() == 1,
-                _ => {}
-            }
-        }
-        return (current_revision_id, prev_revision_id, is_auto);
-    }
-
-    let mut lines = params.lines();
-    let current_revision_id = lines
-        .next()
-        .and_then(|value| value.trim().parse::<i64>().ok())
-        .unwrap_or_default();
-    let prev_revision_id = lines
-        .next()
-        .and_then(|value| value.trim().parse::<i64>().ok())
-        .unwrap_or_default();
-    let is_auto = lines
-        .next()
-        .map(|value| value.trim() == "1")
-        .unwrap_or(false);
-    (current_revision_id, prev_revision_id, is_auto)
-}
-
-fn parse_rights_params(params: &str) -> (String, String) {
-    if params.trim().is_empty() {
-        return (String::new(), String::new());
-    }
-
-    if params.contains("a:") {
-        let old_groups = extract_php_groups(params, "4::oldgroups");
-        let new_groups = extract_php_groups(params, "5::newgroups");
-        return (old_groups.join(","), new_groups.join(","));
-    }
-
-    let mut lines = params.lines();
-    (
-        lines.next().unwrap_or_default().trim().to_string(),
-        lines.next().unwrap_or_default().trim().to_string(),
-    )
-}
-
-fn extract_php_groups(params: &str, key: &str) -> Vec<String> {
-    let marker = format!(r#""{key}";"#);
-    let Some(start) = params.find(&marker) else {
-        return Vec::new();
-    };
-    let slice = &params[start + marker.len()..];
-    let Some(body) = extract_php_array_body(slice) else {
-        return Vec::new();
-    };
-    let mut values = Vec::new();
-    for capture in rights_group_regex().captures_iter(body) {
-        let value = capture
-            .get(1)
-            .expect("rights regex should always capture group names")
-            .as_str();
-        if value.chars().all(|ch| ch.is_ascii_digit()) && value.len() == 14 {
-            continue;
-        }
-        values.push(value.to_string());
-    }
-    values.sort();
-    values.dedup();
-    values
-}
-
-fn extract_php_array_body(value: &str) -> Option<&str> {
-    let open_brace = value.find('{')?;
-    let mut depth = 0_u32;
-    let end_offset = value[open_brace..]
-        .char_indices()
-        .find_map(|(offset, ch)| match ch {
-            '{' => {
-                depth += 1;
-                None
-            }
-            '}' => {
-                depth = depth.checked_sub(1)?;
-                (depth == 0).then_some(offset)
-            }
-            _ => None,
-        })?;
-    Some(&value[open_brace + 1..open_brace + end_offset])
 }
 
 fn collect_patrol_months(patrol_df: &DataFrame) -> Result<Vec<i32>> {

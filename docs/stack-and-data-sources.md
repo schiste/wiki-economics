@@ -94,11 +94,12 @@ The pipeline processes data in four stages:
 
 ### Rust — patrol pipeline
 
-`src/patrol.rs` handles patrol-specific logging dumps in the same Rust binary as
-the core pipeline. It parses concatenated multi-member gzip streams, extracts
-patrol and rights events, and computes latency, coverage, and concentration
-metrics. The former PyArrow patrol scripts were removed after their regression
-coverage was represented in Rust.
+`src/logging.rs` is the canonical typed, streaming decoder for logging
+dumps. It reads concatenated multi-member gzip streams once and classifies
+patrol, rights, local block-history, account-creation, and other events;
+`src/patrol.rs` consumes those typed events to build bounded artifacts and
+compute latency, coverage, and concentration metrics. The former PyArrow patrol
+scripts were removed after their regression coverage was represented in Rust.
 
 ### Observable Framework — dashboard
 

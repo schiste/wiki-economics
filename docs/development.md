@@ -190,8 +190,10 @@ The following are live architecture contracts, not incidental implementation det
 - merge uses Rust to refresh `defaults_*.json` and `meta_*.json`, then runs the
   checked-in `site/data-build/manifest.json.sh` entrypoint to validate and
   atomically publish `manifest.json`
-- patrol fetch and compute are Rust subcommands; patrol compute participates in
-  the same merge/default materialization path as the history metrics
+- patrol fetch and compute are Rust subcommands; the typed logging stream in
+  `src/logging.rs` is shared by patrol, rights, local block-history, and
+  account-creation consumers, and patrol compute participates in the same
+  merge/default materialization path as the history metrics
 - deterministic stage receipts live under `data/stages/` and `output/_stages/`; algorithm changes must increment the owning `*_ALGORITHM_VERSION` constant
 - core history compute has independent `monthly`, `activity_tiers`,
   `lifecycle`, and `page_week` receipts; patrol is not a core-history input

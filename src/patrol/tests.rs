@@ -1269,6 +1269,59 @@ autopatrolled</params>
 }
 
 #[test]
+fn typed_logging_stream_classifies_every_consumer_from_one_scan() -> Result<()> {
+    let temp_dir = TestDir::new()?;
+    let path = temp_dir.path().join("typed-events.xml.gz");
+    write_gz(
+        &path,
+        r#"<mediawiki>
+<logitem><id>1</id><timestamp>2026-01-01T00:00:00Z</timestamp><type>patrol</type><params>11
+10
+1</params></logitem>
+<logitem><id>2</id><timestamp>2026-01-02T00:00:00Z</timestamp><type>rights</type><logtitle>User:Editor</logtitle><params>editor
+sysop</params></logitem>
+<logitem><id>3</id><timestamp>2026-01-03T00:00:00Z</timestamp><type>block</type><action>block</action><logtitle>User:Editor</logtitle><params>infinity</params></logitem>
+<logitem><id>4</id><timestamp>2026-01-04T00:00:00Z</timestamp><contributor><id>44</id></contributor><type>newusers</type><action>create</action><logtitle>User:Editor</logtitle></logitem>
+<logitem><id>5</id><timestamp>2026-01-05T00:00:00Z</timestamp><type>move</type><action>move</action></logitem>
+</mediawiki>"#,
+    )?;
+
+    let mut events = Vec::new();
+    let summary = crate::logging::stream_file(&path, |event| {
+        events.push(event);
+        Ok(())
+    })?;
+    assert_eq!(summary.total_log_items, 5);
+    assert!(summary.compressed_bytes > 0);
+    assert!(matches!(
+        &events[0],
+        LoggingEvent::Patrol(row)
+            if row.current_revision_id == 11 && row.prev_revision_id == 10 && row.is_auto
+    ));
+    assert!(matches!(
+        &events[1],
+        LoggingEvent::Rights(row)
+            if row.target_user == "Editor" && row.old_groups == "editor" && row.new_groups == "sysop"
+    ));
+    assert!(matches!(
+        &events[2],
+        LoggingEvent::Block(row)
+            if row.action == "block" && row.log_title.as_deref() == Some("User:Editor")
+    ));
+    assert!(matches!(
+        &events[3],
+        LoggingEvent::AccountCreation(row)
+            if row.target_user_id == Some(44) && row.target_user.as_deref() == Some("Editor")
+    ));
+    assert!(matches!(
+        &events[4],
+        LoggingEvent::Other { log_type, log_action }
+            if log_type.as_deref() == Some("move") && log_action.as_deref() == Some("move")
+    ));
+    Ok(())
+}
+
+#[test]
 fn generation_fetch_is_snapshot_aware_monthly_and_provenanced() -> Result<()> {
     let data_dir = TestDir::new()?;
     let xml = r#"<mediawiki xmlns="http://www.mediawiki.org/xml/export-0.11/">
@@ -1661,14 +1714,12 @@ fn account_block_replay_uses_latest_transition_and_ignores_non_accounts() -> Res
         ),
     ] {
         record_account_block_transition(
-            LogItem {
-                log_type: Some("block".to_string()),
-                log_action: Some(action.to_string()),
+            BlockEvent {
+                action: action.to_string(),
                 log_id: Some(log_id),
-                timestamp: Some(timestamp.to_string()),
+                timestamp: timestamp.to_string(),
                 log_title: Some(target.to_string()),
                 params: params.map(str::to_string),
-                ..LogItem::default()
             },
             "2026-08",
             &mut transitions,
@@ -1704,37 +1755,33 @@ fn account_block_helpers_fail_closed_and_cover_identity_edges() -> Result<()> {
     let mut transitions = HashMap::new();
     let mut stats = AccountCreationParseStats::default();
     record_account_block_transition(
-        LogItem {
-            log_type: Some("block".to_string()),
-            log_action: Some("move".to_string()),
-            timestamp: Some("2025-01-01 00:00:00".to_string()),
-            ..LogItem::default()
+        BlockEvent {
+            action: "move".to_string(),
+            timestamp: "2025-01-01 00:00:00".to_string(),
+            ..BlockEvent::default()
         },
         "2026-08",
         &mut transitions,
         &mut stats,
     )?;
     record_account_block_transition(
-        LogItem {
-            log_type: Some("block".to_string()),
-            log_action: Some("block".to_string()),
-            timestamp: Some("2025-01-01 00:00:00".to_string()),
+        BlockEvent {
+            action: "block".to_string(),
+            timestamp: "2025-01-01 00:00:00".to_string(),
             log_title: None,
             params: Some("infinity".to_string()),
-            ..LogItem::default()
+            ..BlockEvent::default()
         },
         "2026-08",
         &mut transitions,
         &mut stats,
     )?;
-    let malformed = LogItem {
-        log_type: Some("block".to_string()),
-        log_action: Some("block".to_string()),
+    let malformed = BlockEvent {
+        action: "block".to_string(),
         log_id: Some(5),
-        timestamp: Some("2025-02-01 00:00:00".to_string()),
+        timestamp: "2025-02-01 00:00:00".to_string(),
         log_title: Some("User:Unclassified".to_string()),
         params: Some("a:1:{broken".to_string()),
-        ..LogItem::default()
     };
     record_account_block_transition(malformed, "2026-08", &mut transitions, &mut stats)?;
     assert_eq!(stats.unclassified_block_duration_events, 1);
@@ -1755,14 +1802,12 @@ fn account_block_helpers_fail_closed_and_cover_identity_edges() -> Result<()> {
     assert!(error.to_string().contains("cannot be classified"));
 
     record_account_block_transition(
-        LogItem {
-            log_type: Some("block".to_string()),
-            log_action: Some("block".to_string()),
+        BlockEvent {
+            action: "block".to_string(),
             log_id: Some(5),
-            timestamp: Some("2025-02-01 00:00:00".to_string()),
+            timestamp: "2025-02-01 00:00:00".to_string(),
             log_title: Some("User:Unclassified".to_string()),
             params: Some("a:1:{broken".to_string()),
-            ..LogItem::default()
         },
         "2026-08",
         &mut transitions,
@@ -1770,14 +1815,12 @@ fn account_block_helpers_fail_closed_and_cover_identity_edges() -> Result<()> {
     )?;
 
     let conflict = record_account_block_transition(
-        LogItem {
-            log_type: Some("block".to_string()),
-            log_action: Some("block".to_string()),
+        BlockEvent {
+            action: "block".to_string(),
             log_id: Some(5),
-            timestamp: Some("2025-02-01 00:00:00".to_string()),
+            timestamp: "2025-02-01 00:00:00".to_string(),
             log_title: Some("User:Unclassified".to_string()),
             params: Some("infinity".to_string()),
-            ..LogItem::default()
         },
         "2026-08",
         &mut transitions,
@@ -1840,14 +1883,12 @@ fn account_block_helpers_fail_closed_and_cover_identity_edges() -> Result<()> {
     ] {
         let mut stats = stats;
         let error = record_account_block_transition(
-            LogItem {
-                log_type: Some("block".to_string()),
-                log_action: Some("block".to_string()),
+            BlockEvent {
+                action: "block".to_string(),
                 log_id: Some(100),
-                timestamp: Some("2025-03-01 00:00:00".to_string()),
+                timestamp: "2025-03-01 00:00:00".to_string(),
                 log_title: Some("User:Overflow".to_string()),
                 params: Some(params.to_string()),
-                ..LogItem::default()
             },
             "2026-08",
             &mut HashMap::new(),
