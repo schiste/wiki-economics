@@ -1010,7 +1010,15 @@ mod tests {
             assert!(!definition.aggregation.is_empty());
         }
         assert!("not_a_metric".parse::<MetricId>().is_err());
+        assert_eq!(
+            "not_a_metric".parse::<MetricId>().unwrap_err().to_string(),
+            "unknown metric \"not_a_metric\""
+        );
         assert_eq!(MetricId::from_artifact_identity("manifest.json"), None);
+        assert_eq!(
+            field("runtime", std::hint::black_box(FieldKind::String)),
+            ("runtime", FieldKind::String)
+        );
     }
 
     #[test]
@@ -1090,13 +1098,15 @@ mod tests {
                     }
         }));
         let inequality = MetricId::Inequality.definition();
-        assert!(inequality.aggregation.iter().any(|rule| {
-            rule.columns.contains(&"theil")
-                && matches!(
-                    rule.semantics,
-                    AggregationSemantics::SufficientStatistic { .. }
-                )
-        }));
+        let theil = inequality
+            .aggregation
+            .iter()
+            .find(|rule| rule.columns.contains(&"theil"))
+            .expect("Theil should have an aggregation contract");
+        assert!(matches!(
+            theil.semantics,
+            AggregationSemantics::SufficientStatistic { .. }
+        ));
         let patrol = MetricId::Patrol.definition();
         assert!(patrol.aggregation.iter().any(|rule| {
             rule.columns.contains(&"median_latency_hours")

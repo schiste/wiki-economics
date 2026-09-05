@@ -735,14 +735,8 @@ mod tests {
 
     fn write_complete_wiki(root: &Path, wiki: &str) -> Result<()> {
         for definition in browser_metrics() {
-            write_metric(
-                root,
-                wiki,
-                definition.name,
-                definition
-                    .date_column
-                    .expect("browser metric should have a date column"),
-            )?;
+            write_metric(root, wiki, definition.name, definition.date_column.unwrap())
+                .expect("complete browser fixture metric should be writable");
         }
         Ok(())
     }
@@ -1056,7 +1050,8 @@ mod tests {
             "reverted_edits" => &[0_i64, 0],
             "unique_editors" => &[1_i64, 1],
             "minor_edits" => &[0_i64, 0],
-        )?;
+        )
+        .expect("GDP aggregation fixture should be valid");
         let result = aggregate_global_metric("gdp", source)?;
         assert_eq!(result.height(), 1);
         assert_eq!(result.column("bytes_per_edit")?.f64()?.get(0), Some(20.0));
@@ -1078,7 +1073,8 @@ mod tests {
             "patrolled_revisions" => &[8_i64, 4],
             "autopatrolled_revisions" => &[1_i64, 2],
             "total_revisions" => &[10_i64, 10],
-        )?;
+        )
+        .expect("patrol aggregation fixture should be valid");
         let result = aggregate_global_metric("patrol", source)?;
         assert_eq!(result.height(), 1);
         assert_eq!(result.column("total_patrols")?.i64()?.get(0), Some(30));
@@ -1086,6 +1082,10 @@ mod tests {
         assert_eq!(
             result.column("patrol_coverage_pct")?.f64()?.get(0),
             Some(60.0)
+        );
+        assert!(
+            aggregate_global_metric("page_weekly_edits", DataFrame::empty()).is_err(),
+            "page-week data must never be treated as a composable global metric"
         );
         assert_eq!(
             result.column("adjusted_coverage_pct")?.f64()?.get(0),

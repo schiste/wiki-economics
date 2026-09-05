@@ -4811,7 +4811,8 @@ mod tests {
                 Column::new("wiki".into(), ["nlwiki"]),
                 Column::new("value".into(), [1_i64]),
                 Column::new(date_column.into(), [date]),
-            ])?;
+            ])
+            .expect("dashboard fingerprint fixture should be valid");
             ParquetWriter::new(fs::File::create(path)?).finish(&mut frame)?;
         }
         fs::write(output_dir.path().join("manifest.json"), "{}")?;
@@ -5001,14 +5002,16 @@ mod tests {
                 check: false,
             }),
             &RecordingOps::default(),
-        )?;
+        )
+        .expect("metric catalog generation should succeed");
         run_with_ops(
             command(Commands::MetricCatalog {
                 workspace_dir: catalog_workspace.path().to_path_buf(),
                 check: true,
             }),
             &RecordingOps::default(),
-        )?;
+        )
+        .expect("metric catalog verification should succeed");
         Ok(())
     }
 

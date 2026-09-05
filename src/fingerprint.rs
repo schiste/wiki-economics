@@ -1120,7 +1120,8 @@ mod tests {
                 Column::new("wiki".into(), [wiki]),
                 Column::new("value".into(), [1_i64]),
                 Column::new(date_column.into(), [date]),
-            ])?;
+            ])
+            .expect("dashboard metric fixture should be valid");
             ParquetWriter::new(File::create(path)?).finish(&mut frame)?;
         }
         let account_report = output.join(crate::dashboard::ACCOUNT_CREATION_STAGING_PATH);

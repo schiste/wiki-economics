@@ -1101,7 +1101,8 @@ fn inequality_artifacts(frames: &Frames) -> Result<(Value, Value)> {
         if entry.source_rows == 0 {
             entry.single_min_editors_50pct = float(&frames.inequality, "min_editors_50pct", row)?;
             entry.single_gini = float(&frames.inequality, "gini", row)?;
-            entry.single_palma = float(&frames.inequality, "palma", row)?;
+            let single_palma = float(&frames.inequality, "palma", row)?;
+            entry.single_palma = single_palma;
         }
         entry.source_rows += 1;
         entry.total_editors += editors;
@@ -2118,20 +2119,20 @@ mod tests {
         write_site_fixture(output.path())?;
         let mut frames = Frames::read(output.path())?;
         frames.inequality = df!(
-            "wiki" => &["nlwiki", "nlwiki", "nlwiki"],
-            "year_month" => &["2001-05", "2001-06", "2001-01"],
-            "period" => &["2001-05", "2001-06", "2001"],
-            "period_start" => &["2001-05", "2001-06", "2001-01"],
-            "period_end" => &["2001-05", "2001-06", "2001-12"],
-            "period_type" => &["month", "month", "year"],
-            "period_months" => &[1_i64, 1, 12],
-            "user_type" => &["registered", "registered", "registered"],
-            "total_editors" => &[10_i64, 20_i64, 25_i64],
-            "total_edits" => &[100_i64, 200_i64, 300_i64],
-            "min_editors_50pct" => &[2_i64, 3_i64, 4_i64],
-            "gini" => &[0.5_f64, 0.6_f64, 0.7_f64],
-            "theil" => &[0.2_f64, 0.3_f64, 0.4_f64],
-            "palma" => &[1.0_f64, 1.5_f64, 2.0_f64],
+            "wiki" => &["nlwiki", "nlwiki", "nlwiki", "nlwiki"],
+            "year_month" => &["2001-05", "2001-06", "2001-01", "2000-01"],
+            "period" => &["2001-05", "2001-06", "2001", "2000"],
+            "period_start" => &["2001-05", "2001-06", "2001-01", "2000-01"],
+            "period_end" => &["2001-05", "2001-06", "2001-12", "2000-12"],
+            "period_type" => &["month", "month", "year", "year"],
+            "period_months" => &[1_i64, 1, 12, 12],
+            "user_type" => &["registered", "registered", "registered", "registered"],
+            "total_editors" => &[10_i64, 20_i64, 25_i64, 99_i64],
+            "total_edits" => &[100_i64, 200_i64, 300_i64, 999_i64],
+            "min_editors_50pct" => &[2_i64, 3_i64, 4_i64, 9_i64],
+            "gini" => &[0.5_f64, 0.6_f64, 0.7_f64, 0.9_f64],
+            "theil" => &[0.2_f64, 0.3_f64, 0.4_f64, 0.9_f64],
+            "palma" => &[1.0_f64, 1.5_f64, 2.0_f64, 9.0_f64],
         )
         .expect("inequality boundary fixture columns have equal lengths");
 
