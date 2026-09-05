@@ -309,11 +309,13 @@ Benchmark logic lives in [src/bench.rs](../src/bench.rs).
 
 Important decisions:
 
-- split-stage benchmarks still use `load_wiki()` and per-module compute functions
-- `compute_all` is benchmarked separately because it may use the incremental path
+- family benchmarks invoke the uncached production family executors
+- `compute_all` is benchmarked separately through the complete fingerprinted path
 - benchmark outputs are optional and disposable by default
 
-Interpret split timings and `compute_all` timings differently. They no longer necessarily measure the same execution model.
+Interpret family timings and `compute_all` timings differently: family timings
+measure forced execution, while `compute_all` includes production invalidation
+and may legitimately reuse outputs.
 
 ## Quality Gates
 

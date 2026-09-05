@@ -12,18 +12,19 @@ The benchmark expects the current analytical storage layout under `data/parquet/
 
 Per wiki it reports:
 
-- `load_wiki`
-- `inequality`
-- `labor`
-- `gdp`
+- `monthly`
+- `activity_tiers`
+- `lifecycle`
+- `page_week`
 - `compute_all`
 
-The benchmark measures two different execution styles:
+Each family timing invokes the same uncached family executor used by the
+production computation planner. `compute_all` then measures the complete
+fingerprinted production path in a separate clean output directory.
 
-- split metric timings (`load_wiki`, `inequality`, `labor`, `gdp`) still use one in-memory base frame
-- `compute_all` is timed separately end-to-end and may use the partitioned incremental compute path
-
-That distinction matters when comparing commits. If `compute_all` improves while `load_wiki` stays flat, the win likely came from the month-partitioned incremental path rather than from full-frame query changes.
+Family timings intentionally bypass same-output fingerprint reuse. This keeps
+them useful for comparing executor cost while `compute_all` remains the primary
+end-to-end production number.
 
 ## Output Summary
 
@@ -46,7 +47,7 @@ Kept outputs are written under `output/bench/<wiki>/iter-<n>/`.
 
 Each kept iteration has:
 
-- `split/` for the direct metric-module timings
+- `families/` for the production family-executor timings
 - `full/` for the `compute_all` end-to-end timing
 
 With the current storage layout, `data/parquet/<wiki>/` is the slim analytical layer, not the richer warehouse layer.

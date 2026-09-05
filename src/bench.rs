@@ -1,4 +1,5 @@
 use crate::compute;
+use crate::metric_registry::MetricFamily;
 use anyhow::{Context, Result};
 use polars::prelude::*;
 use std::fs;
@@ -67,29 +68,28 @@ struct OutputSummary {
 
 #[derive(Default)]
 struct Timings {
-    load_wiki: Vec<f64>,
-    inequality: Vec<f64>,
-    labor: Vec<f64>,
-    gdp: Vec<f64>,
+    monthly: Vec<f64>,
+    activity_tiers: Vec<f64>,
+    lifecycle: Vec<f64>,
+    page_week: Vec<f64>,
     compute_all: Vec<f64>,
 }
 
 impl Timings {
     fn record_iteration(&mut self, iteration: &IterationResult) {
-        self.load_wiki.push(to_ms(iteration.load_wiki));
-        self.inequality.push(to_ms(iteration.inequality));
-        self.labor.push(to_ms(iteration.labor));
-        self.gdp.push(to_ms(iteration.gdp));
+        self.monthly.push(to_ms(iteration.monthly));
+        self.activity_tiers.push(to_ms(iteration.activity_tiers));
+        self.lifecycle.push(to_ms(iteration.lifecycle));
+        self.page_week.push(to_ms(iteration.page_week));
         self.compute_all.push(to_ms(iteration.compute_all));
     }
 }
 
 struct IterationResult {
-    base_rows: usize,
-    load_wiki: Duration,
-    inequality: Duration,
-    labor: Duration,
-    gdp: Duration,
+    monthly: Duration,
+    activity_tiers: Duration,
+    lifecycle: Duration,
+    page_week: Duration,
     compute_all: Duration,
     outputs: Vec<OutputSummary>,
 }
@@ -122,25 +122,22 @@ pub fn run(
         }
 
         let mut timings = Timings::default();
-        let mut base_rows = 0usize;
         let mut outputs = Vec::new();
 
         for iteration in 0..iterations {
             let capture = iteration == 0;
             let result =
                 benchmark_iteration(wiki, data_dir, output_dir, iteration, keep_outputs, capture)?;
-            base_rows = result.base_rows;
             if capture {
                 outputs = result.outputs.clone();
             }
             timings.record_iteration(&result);
         }
 
-        println!("  base rows: {base_rows}");
-        print_stage_summary("load_wiki", &timings.load_wiki);
-        print_stage_summary("inequality", &timings.inequality);
-        print_stage_summary("labor", &timings.labor);
-        print_stage_summary("gdp", &timings.gdp);
+        print_stage_summary("monthly", &timings.monthly);
+        print_stage_summary("activity_tiers", &timings.activity_tiers);
+        print_stage_summary("lifecycle", &timings.lifecycle);
+        print_stage_summary("page_week", &timings.page_week);
         print_stage_summary("compute_all", &timings.compute_all);
 
         if !outputs.is_empty() {
@@ -167,13 +164,13 @@ fn benchmark_iteration(
     keep_outputs: bool,
     capture_outputs: bool,
 ) -> Result<IterationResult> {
-    let split_root = if keep_outputs {
+    let family_root = if keep_outputs {
         Some(
             output_dir
                 .join("bench")
                 .join(wiki)
                 .join(format!("iter-{iteration}"))
-                .join("split"),
+                .join("families"),
         )
     } else {
         None
@@ -190,25 +187,18 @@ fn benchmark_iteration(
         None
     };
 
-    let split_dir = ScratchDir::new(split_root.as_deref(), "wiki-econ-bench-split")?;
+    let family_dir = ScratchDir::new(family_root.as_deref(), "wiki-econ-bench-families")?;
     let full_dir = ScratchDir::new(full_root.as_deref(), "wiki-econ-bench-full")?;
 
-    let load_started = Instant::now();
-    let base = compute::load_wiki(wiki, data_dir)?;
-    let load_wiki = load_started.elapsed();
-    let base_rows = base.height();
-
-    let inequality_started = Instant::now();
-    compute::inequality::compute(wiki, &base, split_dir.path())?;
-    let inequality = inequality_started.elapsed();
-
-    let labor_started = Instant::now();
-    compute::labor::compute(wiki, &base, split_dir.path())?;
-    let labor = labor_started.elapsed();
-
-    let gdp_started = Instant::now();
-    compute::gdp::compute(wiki, &base, split_dir.path())?;
-    let gdp = gdp_started.elapsed();
+    let family_duration = |family| -> Result<Duration> {
+        let started = Instant::now();
+        compute::execute_family(wiki, data_dir, family_dir.path(), family)?;
+        Ok(started.elapsed())
+    };
+    let monthly = family_duration(MetricFamily::Monthly)?;
+    let activity_tiers = family_duration(MetricFamily::ActivityTiers)?;
+    let lifecycle = family_duration(MetricFamily::Lifecycle)?;
+    let page_week = family_duration(MetricFamily::PageWeek)?;
 
     let compute_all_started = Instant::now();
     compute::compute_all(wiki, data_dir, full_dir.path())?;
@@ -221,11 +211,10 @@ fn benchmark_iteration(
     };
 
     Ok(IterationResult {
-        base_rows,
-        load_wiki,
-        inequality,
-        labor,
-        gdp,
+        monthly,
+        activity_tiers,
+        lifecycle,
+        page_week,
         compute_all,
         outputs,
     })
@@ -421,7 +410,6 @@ mod tests {
         write_compute_input(data_dir.path(), wiki)?;
         let result = benchmark_iteration(wiki, data_dir.path(), output_dir.path(), 0, false, true)?;
 
-        assert_eq!(result.base_rows, 4);
         assert_eq!(result.outputs.len(), 8);
         assert!(
             result

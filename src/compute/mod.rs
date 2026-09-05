@@ -115,6 +115,21 @@ impl ComputePlan {
         }
     }
 
+    fn only(family: MetricFamily) -> Result<Self> {
+        anyhow::ensure!(
+            MetricFamily::CORE.contains(&family),
+            "{family:?} is not a core compute family"
+        );
+        let mut plan = Self {
+            monthly: Invalidation::Reuse,
+            activity_tiers: Invalidation::Reuse,
+            lifecycle: Invalidation::Reuse,
+            page_week: Invalidation::Reuse,
+        };
+        plan.set_invalidation(family, Invalidation::Recompute);
+        Ok(plan)
+    }
+
     fn invalidation(self, family: MetricFamily) -> Invalidation {
         match family {
             MetricFamily::Monthly => self.monthly,
@@ -1348,6 +1363,40 @@ pub(crate) fn record_candidate_fingerprint_for_test(
 pub fn compute_all(wiki: &str, data_dir: &Path, output_dir: &Path) -> Result<()> {
     let snapshot = storage::current_snapshot_version(data_dir, wiki)?;
     compute_all_selected(wiki, data_dir, output_dir, snapshot.as_deref())
+}
+
+/// Execute exactly one core metric family through the same uncached executor
+/// used by production. This deliberately bypasses fingerprint selection so a
+/// benchmark measures computation rather than a same-output reuse decision.
+pub(crate) fn execute_family(
+    wiki: &str,
+    data_dir: &Path,
+    output_dir: &Path,
+    family: MetricFamily,
+) -> Result<()> {
+    let snapshot = storage::current_snapshot_version(data_dir, wiki)?;
+    let plan = ComputePlan::only(family)?;
+    if family == MetricFamily::PageWeek {
+        let config = WeeklyAggregationConfig::for_snapshot(data_dir, wiki, snapshot.as_deref())?;
+        compute_page_weekly_edits_for_snapshot_cached(
+            wiki,
+            data_dir,
+            output_dir,
+            &config,
+            snapshot.as_deref(),
+            None,
+        )?;
+    } else {
+        compute_all_incremental_cached(
+            wiki,
+            data_dir,
+            output_dir,
+            snapshot.as_deref(),
+            plan,
+            None,
+        )?;
+    }
+    Ok(())
 }
 
 pub(crate) fn compute_all_for_snapshot(
