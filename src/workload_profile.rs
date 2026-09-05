@@ -717,27 +717,21 @@ mod tests {
         storage::write_test_marker_in(root.path(), &analytical, &plan.sources[0].source_id)?;
         storage::write_generation_manifest(root.path(), wiki, current)?;
         storage::publish_current_snapshot(root.path(), wiki, current)?;
-        let (_, source_plan_sha256) = storage::sha256_file(&crate::snapshot_plan::plan_path(
-            root.path(),
-            wiki,
-            current,
-        )?)?;
-        crate::retention::audit_or_apply(
-            root.path(),
-            crate::retention::RetentionAuthorization {
-                wiki: wiki.to_string(),
-                snapshot: current.to_string(),
-                ready_sha256: "a".repeat(64),
-                source_plan_sha256,
-                policy: crate::retention::RetentionPolicy {
-                    source_recoverability: crate::retention::SourceRecoverability::Redownloadable,
-                    history_input: crate::retention::InputRetention::PurgeAfterReady,
-                    patrol_source: crate::retention::InputRetention::Retain,
-                    computed_rollback_generations: 1,
-                },
+        let source_plan_path = crate::snapshot_plan::plan_path(root.path(), wiki, current)?;
+        let (_, source_plan_sha256) = storage::sha256_file(&source_plan_path)?;
+        let authorization = crate::retention::RetentionAuthorization {
+            wiki: wiki.to_string(),
+            snapshot: current.to_string(),
+            ready_sha256: "a".repeat(64),
+            source_plan_sha256,
+            policy: crate::retention::RetentionPolicy {
+                source_recoverability: crate::retention::SourceRecoverability::Redownloadable,
+                history_input: crate::retention::InputRetention::PurgeAfterReady,
+                patrol_source: crate::retention::InputRetention::Retain,
+                computed_rollback_generations: 1,
             },
-            true,
-        )?;
+        };
+        crate::retention::audit_or_apply(root.path(), authorization, true)?;
 
         assert_eq!(
             storage::current_snapshot_version(root.path(), wiki)?.as_deref(),
@@ -747,6 +741,8 @@ mod tests {
 
         let retention_path = crate::retention::receipt_path(root.path(), wiki, current)?;
         fs::write(&retention_path, b"{truncated")?;
+        assert!(prior_measured_rows(root.path(), wiki, candidate).is_err());
+        fs::remove_file(&retention_path)?;
         assert!(prior_measured_rows(root.path(), wiki, candidate).is_err());
         Ok(())
     }
