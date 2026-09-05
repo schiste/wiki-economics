@@ -1236,6 +1236,35 @@ autopatrolled</params>
     )
     .expect_err("malformed XML should fail");
     assert!(!err.to_string().is_empty());
+
+    let block_xml_path = temp_dir.path().join("blocks.xml.gz");
+    write_gz(
+        &block_xml_path,
+        r#"<mediawiki>
+<logitem><id>5</id><timestamp>2026-01-05T00:00:00Z</timestamp><type>block</type><action>block</action><logtitle>User:Blocked editor</logtitle><params>infinity</params></logitem>
+<logitem><id>6</id><timestamp>2026-01-06T00:00:00Z</timestamp><type>block</type><action>block</action><logtitle>User:192.0.2.1</logtitle><params>infinity</params></logitem>
+</mediawiki>"#,
+    )?;
+    let mut block_patrol =
+        PatrolWriter::new_with_batch_rows(&temp_dir.path().join("block-patrol.parquet"), 10)?;
+    let mut block_rights =
+        RightsWriter::new_with_batch_rows(&temp_dir.path().join("block-rights.parquet"), 10)?;
+    let block_path = temp_dir.path().join("account-blocks.parquet");
+    let mut block_writer = AccountBlockWriter::new_with_batch_rows(&block_path, 10)?;
+    let block_stats = parse_logging_events_with_blocks(
+        &block_xml_path,
+        Some("2026-08"),
+        &mut block_patrol,
+        &mut block_rights,
+        Some(&mut block_writer),
+    )?;
+    block_patrol.finish()?;
+    block_rights.finish()?;
+    block_writer.finish()?;
+    assert_eq!(block_stats.total_log_items, 2);
+    assert_eq!(block_stats.local_account_block_events, 1);
+    assert_eq!(block_stats.skipped_events, 1);
+    assert_eq!(read_parquet_df(&block_path, None)?.height(), 1);
     Ok(())
 }
 
@@ -2907,6 +2936,75 @@ fn writers_flush_empty_batches_and_at_threshold() -> Result<()> {
     rights_writer.finish()?;
     assert_eq!(read_parquet_df(&rights_path, None)?.height(), 2);
 
+    let block_path = temp_dir.path().join("blocks.parquet");
+    let mut block_writer = AccountBlockWriter::new_with_batch_rows(&block_path, 1)?;
+    block_writer.flush()?;
+    block_writer.add_account_block(AccountBlockEventRow {
+        timestamp: "2026-01-03 00:00:00".to_string(),
+        log_id: 3,
+        target_user: "Blocked editor".to_string(),
+        action: "block".to_string(),
+        resulting_state: AccountBlockState::Indefinite,
+        duration: Some("infinity".to_string()),
+    })?;
+    block_writer.finish()?;
+    assert_eq!(read_parquet_df(&block_path, None)?.height(), 1);
+
+    Ok(())
+}
+
+#[test]
+fn parity_adapter_covers_all_user_types_and_rejects_incomplete_primitives() -> Result<()> {
+    let user_types = ["registered", "anonymous", "temporary", "bot"];
+    let events = df!(
+        "wiki" => &["testwiki"; 4],
+        "year_month" => &["2026-01"; 4],
+        "page_namespace" => &[0_i32; 4],
+        "user_type" => &user_types,
+        "patroller" => &[Some("A"), Some("B"), Some("C"), Some("D")],
+        "latency_hours" => &[1.0_f64, 2.0, 3.0, 4.0],
+        "new_page" => &[true, false, true, false],
+    )
+    .expect("multi-type patrol fixture should be valid");
+    let coverage = df!(
+        "wiki" => &["testwiki"; 4],
+        "year_month" => &["2026-01"; 4],
+        "page_namespace" => &[0_i32; 4],
+        "user_type" => &user_types,
+        "patrolled_revisions" => &[1_i64; 4],
+        "autopatrolled_revisions" => &[0_i64; 4],
+        "total_revisions" => &[2_i64; 4],
+    )
+    .expect("multi-type patrol coverage fixture should be valid");
+    assert_eq!(
+        parity_fixture_metrics("testwiki", &events, &coverage)?.height(),
+        4
+    );
+
+    let invalid_events = df!(
+        "wiki" => &["testwiki"],
+        "year_month" => &["2026-01"],
+        "page_namespace" => &[0_i32],
+        "user_type" => &["unknown"],
+        "patroller" => &[Some("A")],
+        "latency_hours" => &[1.0_f64],
+        "new_page" => &[true],
+    )
+    .expect("invalid-type patrol fixture should still have a valid schema");
+    assert!(parity_fixture_metrics("testwiki", &invalid_events, &coverage).is_err());
+
+    for column in [
+        "patrolled_revisions",
+        "autopatrolled_revisions",
+        "total_revisions",
+    ] {
+        let mut invalid_coverage = coverage.clone();
+        invalid_coverage.replace(
+            column,
+            Series::new(column.into(), [None::<i64>, Some(1), Some(1), Some(1)]).into(),
+        )?;
+        assert!(parity_fixture_metrics("testwiki", &events, &invalid_coverage).is_err());
+    }
     Ok(())
 }
 

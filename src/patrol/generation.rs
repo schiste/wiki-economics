@@ -345,9 +345,10 @@ fn reduce_block_state_spool(path: &Path) -> Result<Vec<IndefinitelyBlockedAccoun
         latest = Some(row);
         Ok(())
     })?;
-    if let Some(latest) = latest {
-        finish_block_state(latest, &mut accounts)?;
-    }
+    let finish_result = latest
+        .map(|row| finish_block_state(row, &mut accounts))
+        .transpose();
+    finish_result?;
     Ok(accounts)
 }
 
@@ -960,15 +961,13 @@ fn validate(root: &Path, wiki: &str, snapshot: &str, generation: &PatrolGenerati
             ),
         "account block timeline identity changed"
     );
+    let block_history_rows = generation
+        .block_months
+        .iter()
+        .try_fold(0_u64, |total, artifact| total.checked_add(artifact.rows))
+        .context("account block history row count overflow")?;
     anyhow::ensure!(
-        generation.stats.local_account_block_events
-            == usize::try_from(
-                generation
-                    .block_months
-                    .iter()
-                    .try_fold(0_u64, |total, artifact| total.checked_add(artifact.rows))
-                    .context("account block history row count overflow")?
-            )?,
+        generation.stats.local_account_block_events == usize::try_from(block_history_rows)?,
         "account block history rows do not match parser totals"
     );
     Ok(())
@@ -1288,6 +1287,57 @@ mod directory_remove_tests {
         remove_directory_tree(&scratch)?;
         assert!(!scratch.exists());
         remove_directory_tree(&scratch)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod block_state_tests {
+    use super::*;
+    use crate::test_support::TestDir;
+
+    fn write_rows(path: &Path, rows: &[AccountBlockStateSortRow]) -> Result<()> {
+        let mut writer = BufWriter::new(File::create(path)?);
+        for row in rows {
+            serde_json::to_writer(&mut writer, row)?;
+            writer.write_all(b"\n")?;
+        }
+        writer.flush()?;
+        Ok(())
+    }
+
+    fn row(user: &str, action: &str, state: AccountBlockState) -> AccountBlockStateSortRow {
+        AccountBlockStateSortRow {
+            target_user: user.to_string(),
+            timestamp: "2026-01-01 00:00:00".to_string(),
+            log_id: 1,
+            action: action.to_string(),
+            resulting_state: state,
+            duration: Some("infinity".to_string()),
+        }
+    }
+
+    #[test]
+    fn block_state_reduction_deduplicates_identical_events_and_rejects_conflicts() -> Result<()> {
+        let root = TestDir::new()?;
+        let spool = root.path().join("events.jsonl");
+        let alice = row("Alice", "block", AccountBlockState::Indefinite);
+        let bob = row("Bob", "unblock", AccountBlockState::NotIndefinite);
+        write_rows(&spool, &[alice.clone(), alice.clone(), bob])?;
+        let accounts = reduce_block_state_spool(&spool)?;
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].normalized_name, "Alice");
+
+        let conflict = root.path().join("conflict.jsonl");
+        write_rows(
+            &conflict,
+            &[
+                alice,
+                row("Alice", "reblock", AccountBlockState::NotIndefinite),
+            ],
+        )
+        .expect("conflicting block-state fixture should be writable");
+        assert!(reduce_block_state_spool(&conflict).is_err());
         Ok(())
     }
 }

@@ -256,6 +256,8 @@ pub(crate) fn source_generation_summary(
             .checked_add(item.content_length)
             .context("patrol source byte total overflow")
     })?;
+    let unclassified_block_duration_events =
+        u64::try_from(source.stats.unclassified_block_duration_events)?;
     Ok(Some(PatrolSourceSummary {
         history_snapshot: source.plan.history_snapshot.clone(),
         logging_dump_date: source.plan.logging_dump_date.clone(),
@@ -277,9 +279,7 @@ pub(crate) fn source_generation_summary(
         rights_events: u64::try_from(source.stats.rights_events)?,
         local_account_block_events: u64::try_from(source.stats.local_account_block_events)?,
         indefinitely_blocked_accounts: source.blocked_accounts.rows,
-        unclassified_block_duration_events: u64::try_from(
-            source.stats.unclassified_block_duration_events,
-        )?,
+        unclassified_block_duration_events,
         block_history_months: u64::try_from(source.block_months.len())?,
         block_history_bytes: source
             .block_months
@@ -2001,11 +2001,12 @@ fn parse_logging_events_with_blocks<P: PatrolSink + ?Sized, R: RightsSink + ?Siz
                                     && snapshot.is_some()
                                     && block_writer.is_some() =>
                                 {
-                                    if let Some(row) = parse_account_block_transition(
+                                    let parsed = parse_account_block_transition(
                                         item,
                                         snapshot.expect("guarded snapshot"),
                                         &mut stats,
-                                    )? {
+                                    );
+                                    if let Some(row) = parsed? {
                                         block_writer
                                             .as_deref_mut()
                                             .expect("guarded account-block writer")
@@ -3691,6 +3692,11 @@ pub(crate) fn parity_fixture_metrics(
         if coverage_wikis.get(row) != Some(wiki) {
             continue;
         }
+        let user_type_result = parse_user_type(
+            coverage_types
+                .get(row)
+                .context("parity coverage user type is null")?,
+        );
         let key = MetricKey {
             year_month_key: parse_year_month_key(
                 coverage_months
@@ -3701,28 +3707,22 @@ pub(crate) fn parity_fixture_metrics(
             page_namespace: coverage_namespaces
                 .get(row)
                 .context("parity coverage namespace is null")?,
-            user_type: parse_user_type(
-                coverage_types
-                    .get(row)
-                    .context("parity coverage user type is null")?,
-            )?,
+            user_type: user_type_result?,
         };
-        summary.patrolled_revisions.insert(
-            key,
-            u64::try_from(
-                patrolled
-                    .get(row)
-                    .context("parity patrolled revisions are null")?,
-            )?,
+        let patrolled_result = u64::try_from(
+            patrolled
+                .get(row)
+                .context("parity patrolled revisions are null")?,
         );
-        summary.autopatrolled_revisions.insert(
-            key,
-            u64::try_from(
-                autopatrolled
-                    .get(row)
-                    .context("parity autopatrolled revisions are null")?,
-            )?,
+        summary.patrolled_revisions.insert(key, patrolled_result?);
+        let autopatrolled_result = u64::try_from(
+            autopatrolled
+                .get(row)
+                .context("parity autopatrolled revisions are null")?,
         );
+        summary
+            .autopatrolled_revisions
+            .insert(key, autopatrolled_result?);
         summary.total_revisions.insert(
             key,
             u64::try_from(total.get(row).context("parity total revisions are null")?)?,
