@@ -97,7 +97,7 @@ pub fn compute(wiki: &str, base: &DataFrame, output_dir: &Path) -> Result<()> {
     // --- 3. Activity tier breakdown ---
     // Classification is recomputed at each supported period length. A power
     // editor therefore means 100+ edits/month, 300+/quarter, or 1200+/year.
-    let mut tier_out = super::activity_tiers_all_periods(base.clone().collect()?)?;
+    let mut tier_out = super::activity::activity_tiers_all_periods(base.clone().collect()?)?;
     let wiki_col = Column::new("wiki".into(), vec![wiki; tier_out.height()]);
     tier_out.with_column(wiki_col)?;
     write_output(&mut tier_out, wiki, "gdp_activity_tiers", output_dir)?;

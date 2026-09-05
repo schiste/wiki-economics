@@ -5,7 +5,7 @@ use std::path::Path;
 use tracing::debug;
 
 use super::{
-    ActivityPeriod, editor_identity_available_expr, editor_identity_expr,
+    activity::ActivityPeriod, editor_identity_available_expr, editor_identity_expr,
     ensure_editor_identity_inputs, user_type_from_rank_expr, user_type_rank_expr, write_output,
 };
 
