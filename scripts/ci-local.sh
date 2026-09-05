@@ -125,6 +125,7 @@ node --test scripts/site-source-bundle.test.cjs
 node --test site/browser-cache.test.mjs
 node --test site/activity-tiers.test.mjs
 node --test site/wiki-scope.test.mjs
+node --test site/metric-parity.test.mjs
 node --test site/account-cohorts.test.mjs
 
 echo "==> node --test scripts/wiki-lifecycle.test.cjs"

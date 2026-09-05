@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "history": [
+    {"wiki":"alphawiki","timestamp":"2024-01-05 00:00:00.0","user_id":10,"historical_name":"Old name","current_name":"Renamed account","bot":false,"anonymous":false,"temporary":false,"indefinitely_blocked":false,"page_id":1,"page_title":"Alpha","namespace":0,"revision_id":1,"bytes_diff":100,"reverted":false,"minor":false},
+    {"wiki":"alphawiki","timestamp":"2024-01-06 00:00:00.0","user_id":10,"historical_name":"Old name","current_name":"Renamed account","bot":false,"anonymous":false,"temporary":false,"indefinitely_blocked":true,"page_id":2,"page_title":"Alpha talk","namespace":1,"revision_id":2,"bytes_diff":-20,"reverted":false,"minor":false},
+    {"wiki":"alphawiki","timestamp":"2024-02-05 00:00:00.0","user_id":10,"historical_name":"Renamed account","current_name":"Renamed account","bot":false,"anonymous":false,"temporary":false,"indefinitely_blocked":true,"page_id":1,"page_title":"Alpha","namespace":0,"revision_id":3,"bytes_diff":-30,"reverted":true,"minor":false},
+    {"wiki":"alphawiki","timestamp":"2024-01-07 00:00:00.0","user_id":20,"historical_name":"Worker","current_name":"WorkerBot","bot":false,"anonymous":false,"temporary":false,"indefinitely_blocked":false,"page_id":1,"page_title":"Alpha","namespace":0,"revision_id":4,"bytes_diff":40,"reverted":false,"minor":true},
+    {"wiki":"alphawiki","timestamp":"2024-02-06 00:00:00.0","user_id":20,"historical_name":"WorkerBot","current_name":"WorkerBot","bot":true,"anonymous":false,"temporary":false,"indefinitely_blocked":false,"page_id":2,"page_title":"Alpha talk","namespace":1,"revision_id":5,"bytes_diff":60,"reverted":false,"minor":false},
+    {"wiki":"alphawiki","timestamp":"2024-01-08 00:00:00.0","user_id":null,"historical_name":"192.0.2.1","current_name":"192.0.2.1","bot":false,"anonymous":true,"temporary":false,"indefinitely_blocked":false,"page_id":1,"page_title":"Alpha","namespace":0,"revision_id":6,"bytes_diff":10,"reverted":false,"minor":false},
+    {"wiki":"alphawiki","timestamp":"2024-02-08 00:00:00.0","user_id":null,"historical_name":"192.0.2.1","current_name":"192.0.2.1","bot":false,"anonymous":true,"temporary":false,"indefinitely_blocked":false,"page_id":2,"page_title":"Alpha talk","namespace":1,"revision_id":7,"bytes_diff":15,"reverted":false,"minor":false},
+    {"wiki":"alphawiki","timestamp":"2024-01-09 00:00:00.0","user_id":30,"historical_name":"~2024-1","current_name":"~2024-1","bot":false,"anonymous":false,"temporary":true,"indefinitely_blocked":false,"page_id":1,"page_title":"Alpha","namespace":0,"revision_id":8,"bytes_diff":25,"reverted":false,"minor":false},
+    {"wiki":"betawiki","timestamp":"2024-01-05 00:00:00.0","user_id":10,"historical_name":"Local one","current_name":"Local one","bot":false,"anonymous":false,"temporary":false,"indefinitely_blocked":false,"page_id":11,"page_title":"Beta","namespace":0,"revision_id":101,"bytes_diff":200,"reverted":false,"minor":false},
+    {"wiki":"betawiki","timestamp":"2024-02-05 00:00:00.0","user_id":10,"historical_name":"Local one","current_name":"Local one","bot":false,"anonymous":false,"temporary":false,"indefinitely_blocked":false,"page_id":11,"page_title":"Beta","namespace":0,"revision_id":102,"bytes_diff":50,"reverted":false,"minor":false},
+    {"wiki":"betawiki","timestamp":"2024-01-06 00:00:00.0","user_id":40,"historical_name":"Blocked account","current_name":"Blocked account","bot":false,"anonymous":false,"temporary":false,"indefinitely_blocked":true,"page_id":11,"page_title":"Beta","namespace":0,"revision_id":103,"bytes_diff":-100,"reverted":false,"minor":false},
+    {"wiki":"betawiki","timestamp":"2024-01-07 00:00:00.0","user_id":null,"historical_name":"192.0.2.1","current_name":"192.0.2.1","bot":false,"anonymous":true,"temporary":false,"indefinitely_blocked":false,"page_id":11,"page_title":"Beta","namespace":0,"revision_id":104,"bytes_diff":20,"reverted":false,"minor":false}
+  ],
+  "patrol_events": [
+    {"wiki":"alphawiki","year_month":"2024-01","namespace":0,"user_type":"registered","patroller":"Patroller A","latency_hours":1.0,"new_page":true},
+    {"wiki":"alphawiki","year_month":"2024-01","namespace":0,"user_type":"registered","patroller":"Patroller A","latency_hours":2.0,"new_page":false},
+    {"wiki":"alphawiki","year_month":"2024-01","namespace":0,"user_type":"registered","patroller":"Patroller B","latency_hours":10.0,"new_page":false},
+    {"wiki":"alphawiki","year_month":"2024-02","namespace":0,"user_type":"registered","patroller":"Patroller A","latency_hours":4.0,"new_page":false},
+    {"wiki":"alphawiki","year_month":"2024-02","namespace":0,"user_type":"registered","patroller":"Patroller C","latency_hours":8.0,"new_page":true},
+    {"wiki":"betawiki","year_month":"2024-01","namespace":0,"user_type":"registered","patroller":"Patroller A","latency_hours":3.0,"new_page":true}
+  ],
+  "patrol_coverage": [
+    {"wiki":"alphawiki","year_month":"2024-01","namespace":0,"user_type":"registered","patrolled_revisions":3,"autopatrolled_revisions":0,"total_revisions":4},
+    {"wiki":"alphawiki","year_month":"2024-02","namespace":0,"user_type":"registered","patrolled_revisions":2,"autopatrolled_revisions":1,"total_revisions":4},
+    {"wiki":"betawiki","year_month":"2024-01","namespace":0,"user_type":"registered","patrolled_revisions":1,"autopatrolled_revisions":1,"total_revisions":2}
+  ],
+  "custom_inputs": {
+    "gdp": [
+      {"wiki":"alphawiki","year_month":"2024-01","period":"2024","page_namespace":0,"user_type":"registered","gross_bytes_added":140,"net_bytes":140,"total_edits":2,"productive_edits":2,"reverted_edits":0,"minor_edits":1,"unique_editors":2},
+      {"wiki":"alphawiki","year_month":"2024-02","period":"2024","page_namespace":0,"user_type":"registered","gross_bytes_added":0,"net_bytes":-30,"total_edits":1,"productive_edits":0,"reverted_edits":1,"minor_edits":0,"unique_editors":1},
+      {"wiki":"betawiki","year_month":"2024-01","period":"2024","page_namespace":0,"user_type":"registered","gross_bytes_added":200,"net_bytes":100,"total_edits":2,"productive_edits":2,"reverted_edits":0,"minor_edits":0,"unique_editors":2},
+      {"wiki":"betawiki","year_month":"2024-02","period":"2024","page_namespace":0,"user_type":"registered","gross_bytes_added":50,"net_bytes":50,"total_edits":1,"productive_edits":1,"reverted_edits":0,"minor_edits":0,"unique_editors":1}
+    ],
+    "activity": [
+      {"wiki":"alphawiki","period":"2024","period_type":"year","user_type":"registered","activity_tier":"1-12 edits","tier_rank":0,"editors":1,"total_edits":3,"net_bytes":50,"gross_bytes":100},
+      {"wiki":"betawiki","period":"2024","period_type":"year","user_type":"registered","activity_tier":"1-12 edits","tier_rank":0,"editors":2,"total_edits":3,"net_bytes":150,"gross_bytes":250}
+    ],
+    "inequality": [
+      {"wiki":"alphawiki","period":"2024","period_type":"year","user_type":"registered","total_editors":1,"total_edits":3,"min_editors_50pct":1,"gini":0.0,"theil":0.0,"palma":0.0},
+      {"wiki":"betawiki","period":"2024","period_type":"year","user_type":"registered","total_editors":2,"total_edits":3,"min_editors_50pct":1,"gini":0.16666666666666674,"theil":0.056633012265132426,"palma":0.0}
+    ],
+    "patrol": [
+      {"wiki":"alphawiki","year_month":"2024-01","period":"2024","page_namespace":0,"user_type":"registered","total_patrols":3,"unique_patrollers":2,"patrol_new_pages":1,"patrol_diffs":2,"median_latency_hours":2.0,"p90_latency_hours":10.0,"patrolled_revisions":3,"autopatrolled_revisions":0,"total_revisions":4,"patrol_coverage_pct":75.0,"adjusted_coverage_pct":75.0,"top1_pct":66.7,"min_patrollers_50pct":1},
+      {"wiki":"alphawiki","year_month":"2024-02","period":"2024","page_namespace":0,"user_type":"registered","total_patrols":2,"unique_patrollers":2,"patrol_new_pages":1,"patrol_diffs":1,"median_latency_hours":4.0,"p90_latency_hours":8.0,"patrolled_revisions":2,"autopatrolled_revisions":1,"total_revisions":4,"patrol_coverage_pct":50.0,"adjusted_coverage_pct":75.0,"top1_pct":50.0,"min_patrollers_50pct":1},
+      {"wiki":"betawiki","year_month":"2024-01","period":"2024","page_namespace":0,"user_type":"registered","total_patrols":1,"unique_patrollers":1,"patrol_new_pages":1,"patrol_diffs":0,"median_latency_hours":3.0,"p90_latency_hours":3.0,"patrolled_revisions":1,"autopatrolled_revisions":1,"total_revisions":2,"patrol_coverage_pct":50.0,"adjusted_coverage_pct":100.0,"top1_pct":100.0,"min_patrollers_50pct":1}
+    ]
+  },
+  "expected": {
+    "gdp":{"period":"2024","gross_bytes_added":390,"net_bytes":260,"total_edits":6,"productive_edits":5,"reverted_edits":1,"bytes_per_edit":43.333333333333336},
+    "activity":{"period":"2024","unique_editors":3,"total_edits":6,"net_bytes":200,"gross_bytes":350},
+    "inequality":{"period":"2024","total_editors":3,"total_edits":6,"min_editors_50pct":null,"gini":null,"theil":0.08720802396075798,"palma":null},
+    "patrol":{"period":"2024","total_patrols":6,"unique_patrollers":null,"patrol_new_pages":3,"patrol_diffs":3,"median_latency_hours":null,"p90_latency_hours":null,"patrolled_revisions":6,"autopatrolled_revisions":2,"total_revisions":10,"patrol_coverage_pct":60.0,"adjusted_coverage_pct":80.0,"top1_pct":null,"min_patrollers_50pct":null}
+  }
+}

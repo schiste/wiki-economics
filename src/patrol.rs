@@ -3618,6 +3618,151 @@ fn patrol_metrics_frame(wiki: &str, rows: &[(MetricKey, PatrolRowMetrics)]) -> R
     DataFrame::new_infer_height(columns).map_err(Into::into)
 }
 
+/// Test adapter for the shared cross-layer parity fixture. The adapter feeds
+/// event-level patroller identities and coverage primitives through the same
+/// accumulator and row materialization used by production patrol compute.
+#[cfg(test)]
+pub(crate) fn parity_fixture_metrics(
+    wiki: &str,
+    events: &DataFrame,
+    coverage: &DataFrame,
+) -> Result<DataFrame> {
+    let parse_user_type = |value: &str| -> Result<UserType> {
+        match value {
+            "registered" => Ok(UserType::Registered),
+            "anonymous" => Ok(UserType::Anonymous),
+            "temporary" => Ok(UserType::Temporary),
+            "bot" => Ok(UserType::Bot),
+            _ => anyhow::bail!("unknown parity-fixture user type {value}"),
+        }
+    };
+    let mut stats = HashMap::<MetricKey, PatrolAccumulator>::new();
+    let event_wikis = events.column("wiki")?.str()?;
+    let event_months = events.column("year_month")?.str()?;
+    let event_namespaces = events.column("page_namespace")?.i32()?;
+    let event_types = events.column("user_type")?.str()?;
+    let patrollers = events.column("patroller")?.str()?;
+    let latencies = events.column("latency_hours")?.f64()?;
+    let new_pages = events.column("new_page")?.bool()?;
+    for row in 0..events.height() {
+        if event_wikis.get(row) != Some(wiki) {
+            continue;
+        }
+        let key = MetricKey {
+            year_month_key: parse_year_month_key(
+                event_months
+                    .get(row)
+                    .context("parity patrol month is null")?,
+            )
+            .context("parity patrol month is invalid")?,
+            page_namespace: event_namespaces
+                .get(row)
+                .context("parity patrol namespace is null")?,
+            user_type: parse_user_type(
+                event_types
+                    .get(row)
+                    .context("parity patrol user type is null")?,
+            )?,
+        };
+        let entry = stats.entry(key).or_default();
+        entry.total_patrols += 1;
+        if new_pages.get(row).unwrap_or(false) {
+            entry.patrol_new_pages += 1;
+        } else {
+            entry.patrol_diffs += 1;
+        }
+        if let Some(patroller) = patrollers.get(row) {
+            *entry.user_counts.entry(patroller.to_string()).or_insert(0) += 1;
+        }
+        if let Some(latency) = latencies.get(row) {
+            entry.latencies_hours.push(latency);
+        }
+    }
+
+    let mut summary = RevisionSummary::default();
+    let coverage_wikis = coverage.column("wiki")?.str()?;
+    let coverage_months = coverage.column("year_month")?.str()?;
+    let coverage_namespaces = coverage.column("page_namespace")?.i32()?;
+    let coverage_types = coverage.column("user_type")?.str()?;
+    let patrolled = coverage.column("patrolled_revisions")?.i64()?;
+    let autopatrolled = coverage.column("autopatrolled_revisions")?.i64()?;
+    let total = coverage.column("total_revisions")?.i64()?;
+    for row in 0..coverage.height() {
+        if coverage_wikis.get(row) != Some(wiki) {
+            continue;
+        }
+        let key = MetricKey {
+            year_month_key: parse_year_month_key(
+                coverage_months
+                    .get(row)
+                    .context("parity coverage month is null")?,
+            )
+            .context("parity coverage month is invalid")?,
+            page_namespace: coverage_namespaces
+                .get(row)
+                .context("parity coverage namespace is null")?,
+            user_type: parse_user_type(
+                coverage_types
+                    .get(row)
+                    .context("parity coverage user type is null")?,
+            )?,
+        };
+        summary.patrolled_revisions.insert(
+            key,
+            u64::try_from(
+                patrolled
+                    .get(row)
+                    .context("parity patrolled revisions are null")?,
+            )?,
+        );
+        summary.autopatrolled_revisions.insert(
+            key,
+            u64::try_from(
+                autopatrolled
+                    .get(row)
+                    .context("parity autopatrolled revisions are null")?,
+            )?,
+        );
+        summary.total_revisions.insert(
+            key,
+            u64::try_from(total.get(row).context("parity total revisions are null")?)?,
+        );
+    }
+
+    let keys = stats
+        .keys()
+        .chain(summary.total_revisions.keys())
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let rows = keys
+        .into_iter()
+        .map(|key| {
+            (
+                key,
+                PatrolRowMetrics::from_parts(
+                    stats.get(&key),
+                    summary
+                        .total_revisions
+                        .get(&key)
+                        .copied()
+                        .unwrap_or_default(),
+                    summary
+                        .patrolled_revisions
+                        .get(&key)
+                        .copied()
+                        .unwrap_or_default(),
+                    summary
+                        .autopatrolled_revisions
+                        .get(&key)
+                        .copied()
+                        .unwrap_or_default(),
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    patrol_metrics_frame(wiki, &rows)
+}
+
 fn summarize_patroller_concentration(entry: &PatrolAccumulator) -> (u32, f64, u32) {
     let unique = entry.user_counts.len() as u32;
     if entry.total_patrols == 0 {

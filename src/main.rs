@@ -22,6 +22,8 @@ mod ingest;
 mod licensing;
 mod merge;
 mod observability;
+#[cfg(test)]
+mod parity_tests;
 mod patrol;
 mod publication;
 mod resource_governor;
