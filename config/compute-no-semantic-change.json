@@ -150,6 +150,12 @@
       "paths": ["src/compute/mod.rs", "src/compute/weekly/mod.rs"],
       "reason": "Canonical registry adoption and coverage-oriented control-flow extraction leave page-week computation semantics and artifact bytes unchanged.",
       "base_commit": "da16b4e15850a00b76a8a6b61da6d85638398786"
+    },
+    {
+      "family": "lifecycle",
+      "paths": ["src/compute/gdp.rs", "src/compute/labor.rs"],
+      "reason": "Family-module extraction changes only sibling module paths used by the legacy parity adapters; lifecycle formulas and artifact bytes are unchanged.",
+      "base_commit": "da16b4e15850a00b76a8a6b61da6d85638398786"
     }
   ]
 }
