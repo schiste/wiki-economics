@@ -302,6 +302,31 @@ When adding logs, prefer stable fields like:
 - `bytes`
 - `elapsed_ms`
 
+## CLI orchestration boundaries
+
+The CLI parser in `src/main.rs` is only a dispatcher. Multi-stage behavior
+lives in typed handlers in `src/orchestration.rs` and receives a `RunContext`
+containing an immutable `AppPaths` view, run identity, and pinned start time.
+Commands with several related arguments use typed request values instead of
+passing loose path and mode parameters through the call graph.
+
+The former catch-all operations trait is split by capability: snapshot,
+history input, patrol, metric compute, candidate lifecycle, publication, and
+qualification. A handler requests only the capabilities it actually uses.
+Every production capability method is mandatory; there are no default
+success or no-op implementations that can silently skip required work.
+
+Candidate preparation and publication-invisible qualification share one
+mode-typed preparation state machine. Their intentional differences—lifecycle
+registration, source preparation order, destination, validation, and whether
+a publication no-op is legal—are selected explicitly by `PreparationMode`.
+Snapshot-scoped patrol generations are the only cache contract; the obsolete
+mutable singleton fallback is not part of orchestration.
+
+CLI routing tests compose capability-focused spy state with an explicit
+failure injector. This keeps reuse and error scenarios local to the capability
+being exercised instead of relying on one permissive global mock.
+
 ## Benchmarking
 
 Benchmark logic lives in [src/bench.rs](../src/bench.rs).
