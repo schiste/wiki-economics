@@ -1805,8 +1805,9 @@ pub fn write_browser_performance_fixture(output_dir: &Path) -> Result<()> {
         ("ptwiki", 3_000),
         ("frwiki", 21_000),
     ] {
-        for (metric, _) in crate::browser_data::BROWSER_METRICS {
-            let path = output_dir.join(wiki).join(format!("{metric}.parquet"));
+        for definition in crate::browser_data::browser_metrics() {
+            let metric = definition.name;
+            let path = output_dir.join(wiki).join(definition.id.parquet_name());
             let frame = ParquetReader::new(File::open(&path)?)
                 .set_low_memory(true)
                 .read_parallel(ParallelStrategy::None)
@@ -1955,7 +1956,7 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert_eq!(
             global_metrics.len(),
-            crate::browser_data::BROWSER_METRICS.len()
+            crate::browser_data::browser_metrics().count()
         );
         let global_inequality_file =
             File::open(first.path().join("_browser-global/inequality/2026.parquet"))?;

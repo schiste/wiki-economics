@@ -7,7 +7,10 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use crate::{artifact_receipt, licensing};
+use crate::{
+    artifact_receipt, licensing,
+    metric_registry::{self, BrowserPartitioning, MetricDefinition, MetricId},
+};
 
 pub const INDEX_FILENAME: &str = "browser-data-index.json";
 pub const INDEX_SCHEMA_VERSION: u32 = 3;
@@ -16,17 +19,11 @@ const GLOBAL_WIKI: &str = "all";
 const GLOBAL_ROOT: &str = "_browser-global";
 const GLOBAL_AGGREGATION_VERSION: &str = "global-browser-aggregate-v2-semantic-composition";
 
-pub const BROWSER_METRICS: [(&str, &str); 9] = [
-    ("business_funnel", "cohort_year"),
-    ("gdp", "year_month"),
-    ("gdp_activity_tiers", "period_start"),
-    ("gdp_user_type_share", "year_month"),
-    ("inequality", "period_start"),
-    ("labor_churn", "period"),
-    ("labor_cohorts", "year"),
-    ("labor_monthly", "year_month"),
-    ("patrol", "year_month"),
-];
+pub(crate) fn browser_metrics() -> impl Iterator<Item = &'static MetricDefinition> {
+    metric_registry::definitions().filter(|definition| {
+        definition.browser_partitioning == BrowserPartitioning::PerWikiAndGlobalYearShards
+    })
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -75,10 +72,7 @@ fn published_wikis(output_dir: &Path, allowlist: Option<&BTreeSet<String>>) -> R
         if wiki.starts_with('_') || allowlist.is_some_and(|allowed| !allowed.contains(&wiki)) {
             continue;
         }
-        if BROWSER_METRICS
-            .iter()
-            .any(|(metric, _)| entry.path().join(format!("{metric}.parquet")).is_file())
-        {
+        if browser_metrics().any(|metric| entry.path().join(metric.id.parquet_name()).is_file()) {
             wikis.push(wiki);
         }
     }
@@ -113,7 +107,11 @@ fn build_index_with_previous(
     let mut reused = 0_usize;
     let mut rebuilt = 0_usize;
     for wiki in wikis {
-        for (metric, date_column) in BROWSER_METRICS {
+        for definition in browser_metrics() {
+            let metric = definition.name;
+            let date_column = definition
+                .date_column
+                .expect("browser-partitioned metrics have a date column");
             let source = output_dir.join(&wiki).join(format!("{metric}.parquet"));
             if !source.is_file() {
                 continue;
@@ -193,7 +191,11 @@ fn build_index_with_previous(
             }
         }
     }
-    for (metric, date_column) in BROWSER_METRICS {
+    for definition in browser_metrics() {
+        let metric = definition.name;
+        let date_column = definition
+            .date_column
+            .expect("browser-partitioned metrics have a date column");
         let metric_root = output_dir.join(GLOBAL_ROOT).join(metric);
         if !metric_root.is_dir() {
             continue;
@@ -266,7 +268,8 @@ fn build_index_with_previous(
             &right.file,
         ))
     });
-    for (metric, _) in BROWSER_METRICS {
+    for definition in browser_metrics() {
+        let metric = definition.name;
         ensure!(
             entries.iter().any(|entry| entry.metric == metric),
             "browser data index has no partition for metric {metric}"
@@ -301,7 +304,11 @@ fn materialize_global_partitions(
     }
     fs::create_dir_all(&staging)?;
     let result = (|| -> Result<()> {
-        for (metric, date_column) in BROWSER_METRICS {
+        for definition in browser_metrics() {
+            let metric = definition.name;
+            let date_column = definition
+                .date_column
+                .expect("browser-partitioned metrics have a date column");
             let source = output_dir.join(format!("{metric}.parquet"));
             if !source.is_file() {
                 continue;
@@ -401,9 +408,10 @@ fn aggregate_global_metric(metric: &str, frame: DataFrame) -> Result<DataFrame> 
         "net_bytes",
         "reverted_edits",
     ];
-    let result = match metric {
-        "business_funnel" => aggregate_sums(frame, &["cohort_year"], FUNNEL_SUMS)?,
-        "gdp" => aggregate_sums(frame, GDP_KEYS, GDP_SUMS)?
+    let metric_id = metric.parse::<MetricId>()?;
+    let result = match metric_id {
+        MetricId::BusinessFunnel => aggregate_sums(frame, &["cohort_year"], FUNNEL_SUMS)?,
+        MetricId::Gdp => aggregate_sums(frame, GDP_KEYS, GDP_SUMS)?
             .lazy()
             .with_columns([
                 safe_ratio("net_bytes", "total_edits", "bytes_per_edit"),
@@ -411,20 +419,22 @@ fn aggregate_global_metric(metric: &str, frame: DataFrame) -> Result<DataFrame> 
                 safe_ratio("reverted_edits", "total_edits", "revert_rate"),
             ])
             .collect()?,
-        "gdp_activity_tiers" => aggregate_sums(frame, ACTIVITY_KEYS, ACTIVITY_SUMS)?,
-        "gdp_user_type_share" => aggregate_sums(frame, SHARE_KEYS, SHARE_SUMS)?,
-        "labor_churn" => aggregate_sums(frame, CHURN_KEYS, CHURN_SUMS)?
+        MetricId::GdpActivityTiers => aggregate_sums(frame, ACTIVITY_KEYS, ACTIVITY_SUMS)?,
+        MetricId::GdpUserTypeShare => aggregate_sums(frame, SHARE_KEYS, SHARE_SUMS)?,
+        MetricId::LaborChurn => aggregate_sums(frame, CHURN_KEYS, CHURN_SUMS)?
             .lazy()
             .with_columns([
                 safe_ratio("arrivals", "active_editors", "arrival_rate"),
                 safe_ratio("departures", "active_editors", "departure_rate"),
             ])
             .collect()?,
-        "labor_cohorts" => aggregate_sums(frame, COHORT_KEYS, COHORT_SUMS)?,
-        "labor_monthly" => aggregate_sums(frame, GDP_KEYS, LABOR_SUMS)?,
-        "inequality" => aggregate_global_inequality(frame)?,
-        "patrol" => aggregate_global_patrol(frame)?,
-        _ => anyhow::bail!("unsupported global browser metric {metric}"),
+        MetricId::LaborCohorts => aggregate_sums(frame, COHORT_KEYS, COHORT_SUMS)?,
+        MetricId::LaborMonthly => aggregate_sums(frame, GDP_KEYS, LABOR_SUMS)?,
+        MetricId::Inequality => aggregate_global_inequality(frame)?,
+        MetricId::Patrol => aggregate_global_patrol(frame)?,
+        MetricId::PageWeeklyEdits => {
+            anyhow::bail!("page-week data is not globally browser-composable")
+        }
     };
     let sort_columns = result
         .get_column_names()
@@ -724,8 +734,15 @@ mod tests {
     }
 
     fn write_complete_wiki(root: &Path, wiki: &str) -> Result<()> {
-        for (metric, date_column) in BROWSER_METRICS {
-            write_metric(root, wiki, metric, date_column)?;
+        for definition in browser_metrics() {
+            write_metric(
+                root,
+                wiki,
+                definition.name,
+                definition
+                    .date_column
+                    .expect("browser metric should have a date column"),
+            )?;
         }
         Ok(())
     }
@@ -838,9 +855,9 @@ mod tests {
     }
 
     fn write_global_sources(root: &Path) -> Result<()> {
-        for (metric, _) in BROWSER_METRICS {
-            let mut frame = global_source(metric)?;
-            ParquetWriter::new(File::create(root.join(format!("{metric}.parquet")))?)
+        for definition in browser_metrics() {
+            let mut frame = global_source(definition.name)?;
+            ParquetWriter::new(File::create(root.join(definition.id.parquet_name()))?)
                 .set_parallel(false)
                 .finish(&mut frame)?;
         }
@@ -862,7 +879,7 @@ mod tests {
             fs::read(second.path().join(INDEX_FILENAME))?
         );
         let index = read_index(&first.path().join(INDEX_FILENAME))?;
-        assert_eq!(index.entries.len(), BROWSER_METRICS.len() * 2);
+        assert_eq!(index.entries.len(), browser_metrics().count() * 2);
         assert!(
             index
                 .entries
@@ -893,7 +910,7 @@ mod tests {
         let previous = read_index(&output.path().join(INDEX_FILENAME))?;
         let (_, reused, rebuilt) =
             build_index_with_previous(output.path(), Some(&allowlist), Some(&previous))?;
-        assert_eq!((reused, rebuilt), (BROWSER_METRICS.len(), 0));
+        assert_eq!((reused, rebuilt), (browser_metrics().count(), 0));
 
         let changed = output.path().join("nlwiki/gdp.parquet");
         fs::remove_file(artifact_receipt::sidecar_path(&changed)?)?;
@@ -908,7 +925,7 @@ mod tests {
             .finish(&mut changed_frame)?;
         let (_, reused, rebuilt) =
             build_index_with_previous(output.path(), Some(&allowlist), Some(&previous))?;
-        assert_eq!((reused, rebuilt), (BROWSER_METRICS.len() - 1, 1));
+        assert_eq!((reused, rebuilt), (browser_metrics().count() - 1, 1));
 
         fs::write(
             output.path().join(INDEX_FILENAME),
@@ -918,7 +935,7 @@ mod tests {
         materialize(output.path(), Some(&allowlist))?;
         let rebuilt = read_index(&output.path().join(INDEX_FILENAME))?;
         assert_eq!(rebuilt.schema_version, INDEX_SCHEMA_VERSION);
-        assert_eq!(rebuilt.entries.len(), BROWSER_METRICS.len());
+        assert_eq!(rebuilt.entries.len(), browser_metrics().count());
         Ok(())
     }
 
@@ -1102,7 +1119,7 @@ mod tests {
             .iter()
             .filter(|entry| entry.scope == "global")
             .collect::<Vec<_>>();
-        assert_eq!(global.len(), BROWSER_METRICS.len() * 2);
+        assert_eq!(global.len(), browser_metrics().count() * 2);
         assert!(global.iter().all(|entry| {
             entry.wiki == GLOBAL_WIKI
                 && entry.shard.is_some()
