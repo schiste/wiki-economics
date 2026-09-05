@@ -14,7 +14,7 @@ whose size and composition shift over time. This page tracks active editor ident
 </div>
 
 ```js
-import {makeRowsLoader, makeJsonLoader, toPeriod, fmtNum, createFilterBar, isDefaultView, parseDefaultsMeta, startLoading, doneLoading, aggregateChurn, aggregateCohorts, wikiMatches} from "./components/filters.js"
+import {makeRowsLoader, makeJsonLoader, toPeriod, fmtNum, createFilterBar, isDefaultView, parseDefaultsMeta, startLoading, doneLoading, aggregateActivityByPeriod, aggregateChurn, aggregateCohorts, wikiMatches} from "./components/filters.js"
 import {withExport, pageExportBar} from "./components/exports.js"
 import {identityTransition} from "./components/editor-identities.js"
 
@@ -53,15 +53,9 @@ if (useDefaults) {
   churnData = defaults.churn
 } else {
   const {tiers: tierRaw, churn: churnRaw} = await loadLaborRows(wiki, {startPeriod, endPeriod})
-  workforce = d3.rollups(
-    tierRaw.filter(d => wikiMatches(d, wiki) && userTypes.includes(d.user_type)
-      && d.period_type === granularity && d.period >= startP && d.period <= endP),
-    rows => ({
-      unique_editors: d3.sum(rows, d => d.editors),
-      total_edits: d3.sum(rows, d => d.total_edits),
-    }),
-    d => d.period,
-  ).map(([period, values]) => ({period, ...values})).sort((a, b) => d3.ascending(a.period, b.period))
+  workforce = aggregateActivityByPeriod(tierRaw.filter(d => wikiMatches(d, wiki)
+    && userTypes.includes(d.user_type) && d.period_type === granularity
+    && d.period >= startP && d.period <= endP))
   churnData = aggregateChurn(churnRaw.filter(d => wikiMatches(d, wiki) && d.period_type === granularity && d.period >= startP && d.period <= endP))
 }
 } finally {

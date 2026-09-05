@@ -142,6 +142,41 @@ export function aggregateFunnel(rows) {
   return [...grouped.values()].sort((left, right) => left.cohort_year.localeCompare(right.cohort_year));
 }
 
+/** Sum the additive GDP primitives for rows that already carry a period key. */
+export function aggregateGdpByPeriod(rows) {
+  const grouped = new Map();
+  const sums = [
+    "gross_bytes_added", "net_bytes", "total_edits", "productive_edits",
+    "reverted_edits", "minor_edits",
+  ];
+  for (const row of rows) {
+    const entry = grouped.get(row.period) ?? {period: row.period};
+    for (const column of sums) entry[column] = (entry[column] ?? 0) + (row[column] ?? 0);
+    grouped.set(row.period, entry);
+  }
+  return [...grouped.values()].sort((left, right) => left.period.localeCompare(right.period));
+}
+
+/** Compose exact activity-tier populations after Rust has made strata disjoint. */
+export function aggregateActivityByPeriod(rows) {
+  const grouped = new Map();
+  for (const row of rows) {
+    const entry = grouped.get(row.period) ?? {
+      period: row.period,
+      unique_editors: 0,
+      total_edits: 0,
+      net_bytes: 0,
+      gross_bytes: 0,
+    };
+    entry.unique_editors += row.editors ?? 0;
+    entry.total_edits += row.total_edits ?? 0;
+    entry.net_bytes += row.net_bytes ?? 0;
+    entry.gross_bytes += row.gross_bytes ?? 0;
+    grouped.set(row.period, entry);
+  }
+  return [...grouped.values()].sort((left, right) => left.period.localeCompare(right.period));
+}
+
 /** Compose counts and Theil across explicitly disjoint period populations.
  * Rust assigns each identity exactly one user type per period, so editor
  * counts and Theil remain exact across selected type strata. Gini, Palma, and

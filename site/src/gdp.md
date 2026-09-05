@@ -11,7 +11,7 @@ In national economics, **[GDP](https://en.wikipedia.org/wiki/Gross_domestic_prod
 </div>
 
 ```js
-import {queryGrouped, filterRows, makeRowsLoader, makeJsonLoader, toPeriod, activityTierLabels, nsLabel, fmtNum, fmtBytes, createFilterBar, isDefaultView, parseDefaultsMeta, startLoading, doneLoading, wikiMatches} from "./components/filters.js"
+import {aggregateGdpByPeriod, filterRows, makeRowsLoader, makeJsonLoader, toPeriod, activityTierLabels, nsLabel, fmtNum, fmtBytes, createFilterBar, isDefaultView, parseDefaultsMeta, startLoading, doneLoading, wikiMatches} from "./components/filters.js"
 import {withExport, pageExportBar} from "./components/exports.js"
 
 const meta = await FileAttachment("data/meta_gdp.json").json()
@@ -52,10 +52,9 @@ if (useDefaults) {
   byType = defaults.byType
 } else {
   const {gdp: gdpRaw} = await loadGdpRows(wiki, {startPeriod, endPeriod})
-  output = queryGrouped(gdpRaw, {
-    sumCols: ["gross_bytes_added", "net_bytes", "total_edits", "productive_edits", "reverted_edits"],
+  output = aggregateGdpByPeriod(filterRows(gdpRaw, {
     wiki, userTypes, namespaces, startPeriod, endPeriod, granularity
-  })
+  }))
   const byTypeRows = gdpRaw
     .filter(d => wikiMatches(d, wiki) && userTypes.includes(d.user_type) && namespaces.includes(d.page_namespace)
       && d.year_month >= startPeriod && d.year_month <= endPeriod)
