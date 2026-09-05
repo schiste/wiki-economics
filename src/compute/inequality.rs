@@ -1,15 +1,29 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use polars::prelude::*;
 use std::collections::BTreeMap;
 use std::path::Path;
 use tracing::debug;
 
 use super::{
-    editor_identity_available_expr, editor_identity_expr, ensure_editor_identity_inputs,
-    write_output,
+    ActivityPeriod, editor_identity_available_expr, editor_identity_expr,
+    ensure_editor_identity_inputs, user_type_from_rank_expr, user_type_rank_expr, write_output,
 };
 
-type InequalityRow = (String, String, f64, f64, f64, usize, usize, usize);
+type InequalityRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    u32,
+    String,
+    f64,
+    f64,
+    f64,
+    u32,
+    u32,
+    u32,
+);
 
 /// Compute Gini coefficient from a sorted array of values.
 fn gini_from_sorted(values: &[f64]) -> f64 {
@@ -86,38 +100,87 @@ fn min_editors_50pct(sorted_desc: &[f64]) -> usize {
     sorted_desc.len()
 }
 
-pub fn compute_frame(base: &DataFrame) -> Result<DataFrame> {
-    let editor_monthly = ensure_editor_identity_inputs(base)?
+pub(super) fn editor_month_frame(base: &DataFrame) -> Result<DataFrame> {
+    let month_key = if base.column("year_month_key").is_ok() {
+        col("year_month_key")
+    } else {
+        col("year_month")
+            .str()
+            .slice(lit(0), lit(4))
+            .cast(DataType::Int32)
+            * lit(100_i32)
+            + col("year_month")
+                .str()
+                .slice(lit(5), lit(2))
+                .cast(DataType::Int32)
+    };
+    ensure_editor_identity_inputs(base)?
         .lazy()
-        .filter(editor_identity_available_expr())
-        .group_by([col("year_month"), col("user_type"), editor_identity_expr()])
-        .agg([col("revision_id").count().alias("edits")])
+        .filter(
+            editor_identity_available_expr()
+                .and(col("year_month").is_not_null())
+                .and(col("user_type").is_not_null()),
+        )
+        .with_column(month_key.alias("year_month_key"))
+        .group_by([
+            col("year_month"),
+            col("year_month_key"),
+            editor_identity_expr().alias("editor_identity"),
+        ])
+        .agg([
+            user_type_rank_expr().max().alias("user_type_rank"),
+            col("revision_id").count().alias("edits"),
+        ])
+        .with_column(user_type_from_rank_expr())
+        .collect()
+        .map_err(Into::into)
+}
+
+fn compute_period_frame(editor_monthly: &DataFrame, period: ActivityPeriod) -> Result<DataFrame> {
+    let period_name = period.name();
+    let period_months = period.months();
+    let input_edits = editor_monthly
+        .column("edits")?
+        .cast(&DataType::UInt64)?
+        .u64()?
+        .sum()
+        .unwrap_or(0);
+    let editor_period = editor_monthly
+        .clone()
+        .lazy()
+        .with_column(period.key_expr().alias("period_key"))
+        .group_by([col("period_key"), col("editor_identity")])
+        .agg([
+            col("user_type_rank").max().alias("user_type_rank"),
+            col("edits").sum().alias("edits"),
+        ])
+        .with_column(user_type_from_rank_expr())
         .collect()?;
 
     let mut result_rows: Vec<InequalityRow> = Vec::new();
-    let year_months = editor_monthly.column("year_month")?.str()?;
-    let user_types = editor_monthly.column("user_type")?.str()?;
-    let edits = editor_monthly.column("edits")?.u32()?;
-    let mut grouped: BTreeMap<(String, String), Vec<f64>> = BTreeMap::new();
+    let period_keys = editor_period.column("period_key")?.i32()?;
+    let user_types = editor_period.column("user_type")?.str()?;
+    let edits = editor_period
+        .column("edits")?
+        .cast(&DataType::UInt64)?
+        .u64()?
+        .clone();
+    let mut grouped: BTreeMap<(i32, String), Vec<f64>> = BTreeMap::new();
 
-    for idx in 0..editor_monthly.height() {
-        let (Some(month), Some(user_type), Some(edit_count)) =
-            (year_months.get(idx), user_types.get(idx), edits.get(idx))
+    for idx in 0..editor_period.height() {
+        let (Some(period_key), Some(user_type), Some(edit_count)) =
+            (period_keys.get(idx), user_types.get(idx), edits.get(idx))
         else {
             continue;
         };
 
         grouped
-            .entry((month.to_string(), user_type.to_string()))
+            .entry((period_key, user_type.to_string()))
             .or_default()
             .push(edit_count as f64);
     }
 
-    for ((month, user_type), mut values) in grouped {
-        if values.len() < 2 {
-            continue;
-        }
-
+    for ((period_key, user_type), mut values) in grouped {
         values.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
         let gini = gini_from_sorted(&values);
@@ -128,18 +191,31 @@ pub fn compute_frame(base: &DataFrame) -> Result<DataFrame> {
         let fragility = min_editors_50pct(&values);
         let total_editors = values.len();
         let total_edits: f64 = values.iter().sum();
+        let (period_value, period_start, period_end) = period.fields(period_key)?;
 
         result_rows.push((
-            month,
+            period_start.clone(),
+            period_value,
+            period_start,
+            period_end,
+            period_name.to_string(),
+            period_months,
             user_type,
             gini,
             theil,
             palma,
-            fragility,
-            total_editors,
-            total_edits as usize,
+            u32::try_from(fragility)?,
+            u32::try_from(total_editors)?,
+            u32::try_from(total_edits as u64)
+                .with_context(|| format!("{period_name} inequality edit total exceeds u32"))?,
         ));
     }
+
+    let output_edits = result_rows.iter().map(|row| u64::from(row.12)).sum::<u64>();
+    anyhow::ensure!(
+        input_edits == output_edits,
+        "{period_name} inequality edit conservation failed: input={input_edits}, output={output_edits}"
+    );
 
     let columns = vec![
         Column::new(
@@ -150,47 +226,84 @@ pub fn compute_frame(base: &DataFrame) -> Result<DataFrame> {
                 .collect::<Vec<_>>(),
         ),
         Column::new(
-            "user_type".into(),
+            "period".into(),
             result_rows
                 .iter()
                 .map(|row| row.1.as_str())
                 .collect::<Vec<_>>(),
         ),
         Column::new(
+            "period_start".into(),
+            result_rows
+                .iter()
+                .map(|row| row.2.as_str())
+                .collect::<Vec<_>>(),
+        ),
+        Column::new(
+            "period_end".into(),
+            result_rows
+                .iter()
+                .map(|row| row.3.as_str())
+                .collect::<Vec<_>>(),
+        ),
+        Column::new(
+            "period_type".into(),
+            result_rows
+                .iter()
+                .map(|row| row.4.as_str())
+                .collect::<Vec<_>>(),
+        ),
+        Column::new(
+            "period_months".into(),
+            result_rows.iter().map(|row| row.5).collect::<Vec<_>>(),
+        ),
+        Column::new(
+            "user_type".into(),
+            result_rows
+                .iter()
+                .map(|row| row.6.as_str())
+                .collect::<Vec<_>>(),
+        ),
+        Column::new(
             "gini".into(),
-            result_rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+            result_rows.iter().map(|row| row.7).collect::<Vec<_>>(),
         ),
         Column::new(
             "theil".into(),
-            result_rows.iter().map(|row| row.3).collect::<Vec<_>>(),
+            result_rows.iter().map(|row| row.8).collect::<Vec<_>>(),
         ),
         Column::new(
             "palma".into(),
-            result_rows.iter().map(|row| row.4).collect::<Vec<_>>(),
+            result_rows.iter().map(|row| row.9).collect::<Vec<_>>(),
         ),
         Column::new(
             "min_editors_50pct".into(),
-            result_rows
-                .iter()
-                .map(|row| row.5 as u32)
-                .collect::<Vec<_>>(),
+            result_rows.iter().map(|row| row.10).collect::<Vec<_>>(),
         ),
         Column::new(
             "total_editors".into(),
-            result_rows
-                .iter()
-                .map(|row| row.6 as u32)
-                .collect::<Vec<_>>(),
+            result_rows.iter().map(|row| row.11).collect::<Vec<_>>(),
         ),
         Column::new(
             "total_edits".into(),
-            result_rows
-                .iter()
-                .map(|row| row.7 as u32)
-                .collect::<Vec<_>>(),
+            result_rows.iter().map(|row| row.12).collect::<Vec<_>>(),
         ),
     ];
     DataFrame::new_infer_height(columns).map_err(Into::into)
+}
+
+pub(super) fn compute_periods(editor_monthly: &DataFrame) -> Result<DataFrame> {
+    let mut result = super::concat_frames(vec![
+        compute_period_frame(editor_monthly, ActivityPeriod::Month)?,
+        compute_period_frame(editor_monthly, ActivityPeriod::Quarter)?,
+        compute_period_frame(editor_monthly, ActivityPeriod::Year)?,
+    ])?;
+    result = result.sort(["period", "period_type", "user_type"], Default::default())?;
+    Ok(result)
+}
+
+pub fn compute_frame(base: &DataFrame) -> Result<DataFrame> {
+    compute_periods(&editor_month_frame(base)?)
 }
 
 /// Compute all inequality metrics, grouped by year-month.
@@ -270,9 +383,59 @@ mod tests {
         let result =
             LazyFrame::scan_parquet(result_path.as_str().into(), Default::default())?.collect()?;
 
-        assert_eq!(result.height(), 1);
-        assert_eq!(result.column("year_month")?.str()?.get(0), Some("2024-01"));
-        assert_eq!(result.column("total_editors")?.u32()?.get(0), Some(2));
+        assert_eq!(result.height(), 3);
+        let monthly = result
+            .lazy()
+            .filter(col("period_type").eq(lit("month")))
+            .collect()?;
+        assert_eq!(monthly.column("year_month")?.str()?.get(0), Some("2024-01"));
+        assert_eq!(monthly.column("total_editors")?.u32()?.get(0), Some(2));
+        Ok(())
+    }
+
+    #[test]
+    fn quarter_and_year_count_repeated_editors_once() -> Result<()> {
+        let base = df!(
+            "year_month" => &["2024-01", "2024-01", "2024-02", "2024-02"],
+            "user_type" => &["registered", "registered", "registered", "registered"],
+            "event_user_id" => &[1_i64, 1, 1, 2],
+            "revision_id" => &[10_i64, 11, 12, 13],
+        )?;
+
+        let result = compute_frame(&base)?;
+        for period_type in ["quarter", "year"] {
+            let period = result
+                .clone()
+                .lazy()
+                .filter(col("period_type").eq(lit(period_type)))
+                .collect()?;
+            assert_eq!(period.height(), 1);
+            assert_eq!(period.column("total_editors")?.u32()?.get(0), Some(2));
+            assert_eq!(period.column("total_edits")?.u32()?.get(0), Some(4));
+            assert!((period.column("gini")?.f64()?.get(0).unwrap() - 0.25).abs() < 1e-12);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn period_user_types_are_disjoint_when_bot_status_changes() -> Result<()> {
+        let base = df!(
+            "year_month" => &["2024-01", "2024-01", "2024-01"],
+            "user_type" => &["registered", "bot", "registered"],
+            "event_user_id" => &[1_i64, 1, 2],
+            "revision_id" => &[10_i64, 11, 12],
+        )?;
+        let monthly = compute_frame(&base)?
+            .lazy()
+            .filter(col("period_type").eq(lit("month")))
+            .collect()?;
+        assert_eq!(monthly.column("total_editors")?.u32()?.sum(), Some(2));
+        let bot = monthly
+            .lazy()
+            .filter(col("user_type").eq(lit("bot")))
+            .collect()?;
+        assert_eq!(bot.column("total_editors")?.u32()?.get(0), Some(1));
+        assert_eq!(bot.column("total_edits")?.u32()?.get(0), Some(2));
         Ok(())
     }
 }

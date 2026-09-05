@@ -138,12 +138,7 @@ impl SemanticSpec {
                 false,
             ),
             "gdp_user_type_share" => (Some("year_month"), vec!["edits"], "wiki-major/v1", false),
-            "inequality" => (
-                Some("year_month"),
-                vec!["total_edits"],
-                "wiki-major/v1",
-                false,
-            ),
+            "inequality" => (Some("period_start"), vec![], "wiki-major/v1", false),
             "labor_churn" => (Some("period"), vec![], "wiki-major/v1", false),
             "labor_monthly" => (
                 Some("year_month"),

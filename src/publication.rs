@@ -102,6 +102,11 @@ const GDP_SHARE_SCHEMA: &[(&str, Kind)] = &[
 ];
 const INEQUALITY_SCHEMA: &[(&str, Kind)] = &[
     ("year_month", Kind::String),
+    ("period", Kind::String),
+    ("period_start", Kind::String),
+    ("period_end", Kind::String),
+    ("period_type", Kind::String),
+    ("period_months", Kind::U32),
     ("user_type", Kind::String),
     ("gini", Kind::F64),
     ("theil", Kind::F64),
@@ -198,8 +203,8 @@ const METRICS: [MetricSpec; 10] = [
     },
     MetricSpec {
         name: "inequality",
-        date_column: Some("year_month"),
-        conservation_column: Some("total_edits"),
+        date_column: Some("period_start"),
+        conservation_column: None,
         schema: INEQUALITY_SCHEMA,
     },
     MetricSpec {

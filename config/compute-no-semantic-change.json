@@ -72,6 +72,18 @@
       "paths": ["src/compute/mod.rs"],
       "reason": "Historical editor identity and suppression accounting affect editor-based families only; page-week aggregation semantics and bytes are unchanged.",
       "base_commit": "629ff53fd87e8396f5e4254fadf82f354578f7ab"
+    },
+    {
+      "family": "lifecycle",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Exact inequality periods and exclusive activity-tier classification do not alter stateful lifecycle metrics or their bytes.",
+      "base_commit": "c44b4546ee500d43b23935935705613ccb6377f5"
+    },
+    {
+      "family": "page_week",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Exact inequality periods and exclusive activity-tier classification do not alter page-week metrics or their bytes.",
+      "base_commit": "c44b4546ee500d43b23935935705613ccb6377f5"
     }
   ]
 }

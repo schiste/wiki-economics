@@ -1021,6 +1021,31 @@ pub fn user_type_col(event_user_is_anonymous: Expr, event_user_is_temporary: Exp
     .alias("user_type")
 }
 
+/// Assign one deterministic classification to an identity within a period.
+/// Bot status takes precedence because it is an account property that may be
+/// observed on only part of an account's history; the remaining identity
+/// classes are mutually exclusive in normal MediaWiki data.
+pub(super) fn user_type_rank_expr() -> Expr {
+    when(col("user_type").eq(lit("bot")))
+        .then(lit(3_i32))
+        .when(col("user_type").eq(lit("temporary")))
+        .then(lit(2_i32))
+        .when(col("user_type").eq(lit("anonymous")))
+        .then(lit(1_i32))
+        .otherwise(lit(0_i32))
+}
+
+pub(super) fn user_type_from_rank_expr() -> Expr {
+    when(col("user_type_rank").eq(lit(3_i32)))
+        .then(lit("bot"))
+        .when(col("user_type_rank").eq(lit(2_i32)))
+        .then(lit("temporary"))
+        .when(col("user_type_rank").eq(lit(1_i32)))
+        .then(lit("anonymous"))
+        .otherwise(lit("registered"))
+        .alias("user_type")
+}
+
 fn bool_flag_expr(column: &str, dtype: Option<&DataType>) -> Expr {
     match dtype {
         Some(DataType::Boolean) => col(column),
@@ -1258,10 +1283,10 @@ fn gdp_editor_month_frame(base: &DataFrame) -> Result<DataFrame> {
         .group_by([
             col("year_month"),
             col("year_month_key"),
-            col("user_type"),
             editor_identity_expr().alias("editor_identity"),
         ])
         .agg([
+            user_type_rank_expr().max().alias("user_type_rank"),
             col("revision_id").count().alias("edits"),
             col("revision_text_bytes_diff").sum().alias("net_bytes"),
             col("revision_text_bytes_diff")
@@ -1269,19 +1294,20 @@ fn gdp_editor_month_frame(base: &DataFrame) -> Result<DataFrame> {
                 .sum()
                 .alias("gross_bytes"),
         ])
+        .with_column(user_type_from_rank_expr())
         .collect()
         .map_err(Into::into)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ActivityPeriod {
+pub(super) enum ActivityPeriod {
     Month,
     Quarter,
     Year,
 }
 
 impl ActivityPeriod {
-    fn name(self) -> &'static str {
+    pub(super) fn name(self) -> &'static str {
         match self {
             Self::Month => "month",
             Self::Quarter => "quarter",
@@ -1289,7 +1315,7 @@ impl ActivityPeriod {
         }
     }
 
-    fn months(self) -> u32 {
+    pub(super) fn months(self) -> u32 {
         match self {
             Self::Month => 1,
             Self::Quarter => 3,
@@ -1297,7 +1323,7 @@ impl ActivityPeriod {
         }
     }
 
-    fn key_expr(self) -> Expr {
+    pub(super) fn key_expr(self) -> Expr {
         match self {
             Self::Month => col("year_month_key"),
             Self::Quarter => {
@@ -1309,7 +1335,7 @@ impl ActivityPeriod {
         }
     }
 
-    fn fields(self, key: i32) -> Result<(String, String, String)> {
+    pub(super) fn fields(self, key: i32) -> Result<(String, String, String)> {
         match self {
             Self::Month => {
                 let year = key / 100;
@@ -1397,13 +1423,15 @@ fn gdp_activity_tiers_for_period(
     let mut frame = editor_months
         .lazy()
         .with_column(period.key_expr().alias("period_key"))
-        .group_by([col("period_key"), col("user_type"), col("editor_identity")])
+        .group_by([col("period_key"), col("editor_identity")])
         .agg([
+            col("user_type_rank").max().alias("user_type_rank"),
             col("edits").sum().alias("edits"),
             col("net_bytes").sum().alias("net_bytes"),
             col("gross_bytes").sum().alias("gross_bytes"),
         ])
         .with_columns([
+            user_type_from_rank_expr(),
             when(col("edits").lt_eq(lit(months)))
                 .then(lit(labels[0].clone()))
                 .when(col("edits").lt(lit(5 * months)))
@@ -3362,6 +3390,9 @@ fn compute_all_incremental_cached(
     }
 
     let mut inequality_frames = Vec::new();
+    let mut inequality_editor_month_frames = Vec::new();
+    let mut inequality_month_digests = Vec::new();
+    let mut inequality_year = None;
     let mut gdp_frames = Vec::new();
     let mut gdp_type_frames = Vec::new();
     let mut identity_coverage_frames = Vec::new();
@@ -3406,6 +3437,25 @@ fn compute_all_incremental_cached(
 
     let partition_count = partitions.len();
     for partition in partitions {
+        if plan.monthly.must_compute()
+            && let Some(current_year) = inequality_year
+        {
+            anyhow::ensure!(
+                partition.year >= current_year,
+                "analytical partitions are not ordered chronologically"
+            );
+            if partition.year != current_year {
+                finish_inequality_year_cached(
+                    &mut inequality_editor_month_frames,
+                    &mut inequality_frames,
+                    &mut inequality_month_digests,
+                    cross_snapshot,
+                )?;
+            }
+        }
+        if plan.monthly.must_compute() {
+            inequality_year = Some(partition.year);
+        }
         if plan.activity_tiers.must_compute()
             && let Some(current_year) = gdp_activity_year
         {
@@ -3446,15 +3496,18 @@ fn compute_all_incremental_cached(
             let input_digest = cross_snapshot
                 .map(|cache| cache.month_digest(&partition.year_month))
                 .transpose()?;
-            let inequality = cached_or_compute(
+            let inequality_editor_month = cached_or_compute(
                 cross_snapshot,
-                "monthly",
+                "inequality_editor_month",
                 monthly::ALGORITHM_VERSION,
                 input_digest,
-                "inequality",
-                || inequality::compute_frame(&base),
+                "editor_month",
+                || inequality::editor_month_frame(&base),
             );
-            inequality_frames.push(inequality?);
+            inequality_editor_month_frames.push(inequality_editor_month?);
+            if let Some(input_digest) = input_digest {
+                inequality_month_digests.push(input_digest.to_string());
+            }
             let gdp = cached_or_compute(
                 cross_snapshot,
                 "monthly",
@@ -3530,6 +3583,12 @@ fn compute_all_incremental_cached(
         }
     }
     if plan.monthly.must_compute() {
+        finish_inequality_year_cached(
+            &mut inequality_editor_month_frames,
+            &mut inequality_frames,
+            &mut inequality_month_digests,
+            cross_snapshot,
+        )?;
         let result = write_monthly_outputs(
             wiki,
             snapshot,
@@ -3641,6 +3700,53 @@ fn finish_activity_year_cached(
     finish_activity_year(editor_month_frames, output_frames)
 }
 
+fn finish_inequality_year_cached(
+    editor_month_frames: &mut Vec<DataFrame>,
+    output_frames: &mut Vec<DataFrame>,
+    month_digests: &mut Vec<String>,
+    cache: Option<&crate::cross_snapshot::CrossSnapshotCache>,
+) -> Result<()> {
+    if editor_month_frames.is_empty() {
+        month_digests.clear();
+        return Ok(());
+    }
+    if let Some(cache) = cache {
+        anyhow::ensure!(
+            editor_month_frames.len() == month_digests.len(),
+            "inequality cache month inputs and identities disagree"
+        );
+        let digest_refs = month_digests.iter().map(String::as_str).collect::<Vec<_>>();
+        let input_digest =
+            cache.derived_digest("inequality_year", monthly::ALGORITHM_VERSION, &digest_refs);
+        if let Some(frame) = cache.load(
+            "inequality_year",
+            monthly::ALGORITHM_VERSION,
+            &input_digest,
+            "inequality",
+        )? {
+            editor_month_frames.clear();
+            month_digests.clear();
+            output_frames.push(frame);
+            return Ok(());
+        }
+        let editor_months = concat_frames(std::mem::take(editor_month_frames))?;
+        let mut frame = inequality::compute_periods(&editor_months)?;
+        cache.store(
+            "inequality_year",
+            monthly::ALGORITHM_VERSION,
+            &input_digest,
+            "inequality",
+            &mut frame,
+        )?;
+        month_digests.clear();
+        output_frames.push(frame);
+        return Ok(());
+    }
+    let editor_months = concat_frames(std::mem::take(editor_month_frames))?;
+    output_frames.push(inequality::compute_periods(&editor_months)?);
+    Ok(())
+}
+
 struct MonthlyFrames {
     inequality_frames: Vec<DataFrame>,
     gdp_frames: Vec<DataFrame>,
@@ -3656,8 +3762,10 @@ fn write_monthly_outputs(
     frames: MonthlyFrames,
 ) -> Result<()> {
     let mut inequality_out = concat_frames(frames.inequality_frames)?;
-    inequality_out =
-        inequality_out.sort(["year_month", "user_type"], SortMultipleOptions::default())?;
+    inequality_out = inequality_out.sort(
+        ["period", "period_type", "user_type"],
+        SortMultipleOptions::default(),
+    )?;
     add_wiki_column(&mut inequality_out, wiki)?;
     write_output(&mut inequality_out, wiki, "inequality", output_dir)?;
 
@@ -4373,6 +4481,7 @@ mod tests {
             ),
             Column::new("year_month_key".into(), month_keys.to_vec()),
             Column::new("user_type".into(), vec!["registered"; edits.len()]),
+            Column::new("user_type_rank".into(), vec![0_i32; edits.len()]),
             Column::new("event_user_id".into(), user_ids.to_vec()),
             Column::new("edits".into(), edits.to_vec()),
             Column::new(
@@ -4468,6 +4577,28 @@ mod tests {
         assert_eq!(activity_tier_labels(3)[0], "1-3 edits");
         assert!(ActivityPeriod::Month.fields(202400).is_err());
         assert!(ActivityPeriod::Quarter.fields(20240).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn activity_period_assigns_each_identity_one_user_type() -> Result<()> {
+        let base = df!(
+            "year_month" => &["2024-01", "2024-01", "2024-02"],
+            "year_month_key" => &[202401_i32, 202401, 202402],
+            "user_type" => &["registered", "bot", "registered"],
+            "event_user_id" => &[1_i64, 1, 2],
+            "revision_id" => &[10_i64, 11, 12],
+            "revision_text_bytes_diff" => &[1_i64, 1, 1],
+        )?;
+        let editor_months = gdp_editor_month_frame(&base)?;
+        let annual = gdp_activity_tiers_for_period(&editor_months, ActivityPeriod::Year)?;
+        assert_eq!(annual.column("editors")?.u32()?.sum(), Some(2));
+        let bot = annual
+            .lazy()
+            .filter(col("user_type").eq(lit("bot")))
+            .collect()?;
+        assert_eq!(bot.column("editors")?.u32()?.sum(), Some(1));
+        assert_eq!(bot.column("total_edits")?.u32()?.sum(), Some(2));
         Ok(())
     }
 

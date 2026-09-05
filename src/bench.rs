@@ -427,7 +427,7 @@ mod tests {
             result
                 .outputs
                 .iter()
-                .any(|summary| summary.metric == "inequality" && summary.columns == 9)
+                .any(|summary| summary.metric == "inequality" && summary.columns == 14)
         );
         Ok(())
     }
