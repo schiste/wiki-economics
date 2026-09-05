@@ -167,6 +167,17 @@ fn sha256_file(path: &Path) -> Result<String> {
 
 type ParquetSummary = (Vec<String>, u64, Option<String>, Option<String>);
 
+fn published_metric_for_identity(identity: &str) -> Option<MetricId> {
+    let parts = identity.split('/').collect::<Vec<_>>();
+    let artifact = match parts.as_slice() {
+        [artifact] => *artifact,
+        ["data" | "merged", artifact] => *artifact,
+        ["output" | "wiki-output", _, artifact] => *artifact,
+        _ => return None,
+    };
+    MetricId::from_artifact_identity(artifact)
+}
+
 fn parquet_summary(path: &Path, identity: &str) -> Result<ParquetSummary> {
     let mut reader =
         crate::storage::SequentialParquetReader::new(path, None, PARQUET_SUMMARY_BATCH_ROWS)?;
@@ -177,8 +188,8 @@ fn parquet_summary(path: &Path, identity: &str) -> Result<ParquetSummary> {
         .iter_fields()
         .map(|field| format!("{}:{:?}", field.name(), field.dtype()))
         .collect::<Vec<_>>();
-    let registered_date = MetricId::from_artifact_identity(identity)
-        .and_then(|metric| metric.definition().date_column);
+    let registered_date =
+        published_metric_for_identity(identity).and_then(|metric| metric.definition().date_column);
     if let Some(date_column) = registered_date {
         ensure!(
             schema_frame.schema().contains(date_column),
@@ -1458,6 +1469,13 @@ mod tests {
             parquet_summary(&missing_registered_date, "data/gdp.parquet").is_err(),
             "registered fingerprint definitions must fail closed on a missing date column"
         );
+
+        let raw_patrol_source = dir.path().join("patrol-source.parquet");
+        let mut patrol_events = df!("revision_id" => [1_i64])?;
+        ParquetWriter::new(File::create(&raw_patrol_source)?).finish(&mut patrol_events)?;
+        let (_, rows, minimum, maximum) =
+            parquet_summary(&raw_patrol_source, "patrol-source/testwiki/patrol.parquet")?;
+        assert_eq!((rows, minimum, maximum), (1, None, None));
         Ok(())
     }
 
