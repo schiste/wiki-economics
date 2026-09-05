@@ -928,21 +928,18 @@ pub(crate) fn catalog_markdown() -> String {
     output
 }
 
-fn generated_paths(workspace_dir: &Path) -> [(PathBuf, Vec<u8>); 2] {
-    [
-        (
-            workspace_dir.join(CATALOG_JSON_PATH),
-            catalog_json().expect("static metric registry should serialize"),
-        ),
+fn generated_paths(workspace_dir: &Path) -> Result<[(PathBuf, Vec<u8>); 2]> {
+    Ok([
+        (workspace_dir.join(CATALOG_JSON_PATH), catalog_json()?),
         (
             workspace_dir.join(CATALOG_MARKDOWN_PATH),
             catalog_markdown().into_bytes(),
         ),
-    ]
+    ])
 }
 
 pub(crate) fn sync_generated_catalog(workspace_dir: &Path, check: bool) -> Result<()> {
-    for (path, expected) in generated_paths(workspace_dir) {
+    for (path, expected) in generated_paths(workspace_dir)? {
         if check {
             let actual = fs::read(&path).with_context(|| {
                 format!("generated metric catalog is missing: {}", path.display())
@@ -1003,6 +1000,12 @@ mod tests {
                 Some(metric)
             );
             assert!(!definition.schema.is_empty());
+            let schema_names = definition
+                .schema
+                .iter()
+                .map(|field| field.0)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(schema_names.len(), definition.schema.len());
             assert!(!definition.algorithm_version.is_empty());
             assert!(!definition.aggregation.is_empty());
         }
