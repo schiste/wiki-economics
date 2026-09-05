@@ -1061,14 +1061,12 @@ pub(crate) fn mark_wiki_candidate_ready(
             summary.wiki_min == wiki && summary.wiki_max == wiki,
             "candidate metric contains rows for another wiki"
         );
-        if let (Some(column), Some(minimum), Some(maximum)) = (
-            spec.date_column,
+        let date_result = validate_metric_date_range(
+            spec,
             summary.minimum_date.as_deref(),
             summary.maximum_date.as_deref(),
-        ) {
-            validate_date(minimum, column)?;
-            validate_date(maximum, column)?;
-        }
+        );
+        date_result?;
         if spec.name == "gdp" {
             let cutoff = summary
                 .maximum_date
@@ -1187,14 +1185,12 @@ pub(crate) fn mark_wiki_qualification_ready(
             summary.wiki_min == wiki && summary.wiki_max == wiki,
             "qualification metric contains rows for another wiki"
         );
-        if let (Some(column), Some(minimum), Some(maximum)) = (
-            spec.date_column,
+        let date_result = validate_metric_date_range(
+            spec,
             summary.minimum_date.as_deref(),
             summary.maximum_date.as_deref(),
-        ) {
-            validate_date(minimum, column)?;
-            validate_date(maximum, column)?;
-        }
+        );
+        date_result?;
         if spec.name == "gdp" {
             let cutoff = summary
                 .maximum_date
@@ -3986,6 +3982,18 @@ fn validate_date(value: &str, column: &str) -> Result<()> {
     Ok(())
 }
 
+fn validate_metric_date_range(
+    spec: &MetricSpec,
+    minimum: Option<&str>,
+    maximum: Option<&str>,
+) -> Result<()> {
+    if let (Some(column), Some(minimum), Some(maximum)) = (spec.date_column, minimum, maximum) {
+        validate_date(minimum, column)?;
+        validate_date(maximum, column)?;
+    }
+    Ok(())
+}
+
 fn partition_only_metric(spec: &MetricSpec) -> bool {
     spec.name == "page_weekly_edits"
 }
@@ -4379,14 +4387,12 @@ pub fn validate(
                     spec.name,
                     reused.rows
                 );
-                if let (Some(column), Some(minimum), Some(maximum)) = (
-                    spec.date_column,
+                let date_result = validate_metric_date_range(
+                    spec,
                     reused.minimum_date.as_deref(),
                     reused.maximum_date.as_deref(),
-                ) {
-                    validate_date(minimum, column)?;
-                    validate_date(maximum, column)?;
-                }
+                );
+                date_result?;
                 if spec.name == "gdp" {
                     cutoffs.insert(
                         wiki.clone(),
@@ -4425,14 +4431,12 @@ pub fn validate(
                 summary.wiki_min == wiki && summary.wiki_max == wiki,
                 "{identity} contains rows for the wrong wiki"
             );
-            if let (Some(column), Some(minimum), Some(maximum)) = (
-                spec.date_column,
+            let date_result = validate_metric_date_range(
+                spec,
                 summary.minimum_date.as_deref(),
                 summary.maximum_date.as_deref(),
-            ) {
-                validate_date(minimum, column)?;
-                validate_date(maximum, column)?;
-            }
+            );
+            date_result?;
             if spec.name == "gdp" {
                 cutoffs.insert(
                     wiki.clone(),
@@ -8464,6 +8468,10 @@ mod tests {
         assert!(validate_date("2026-Q5", "period").is_err());
         assert!(validate_date("2026-03", "year_month").is_ok());
         assert!(validate_date("bad", "year_month").is_err());
+        let gdp = crate::metric_registry::MetricId::Gdp.definition();
+        assert!(validate_metric_date_range(gdp, Some("2026-02"), Some("2026-03")).is_ok());
+        assert!(validate_metric_date_range(gdp, Some("bad"), Some("2026-03")).is_err());
+        assert!(validate_metric_date_range(gdp, None, None).is_ok());
         assert_eq!(snapshot_month_index("2026-03")?, 2026 * 12 + 3);
         assert!(snapshot_month_index("2026-13").is_err());
         assert!(validate_snapshot_cutoff("nlwiki", "2026-07", "2026-08").is_ok());
