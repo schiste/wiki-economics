@@ -8,6 +8,7 @@ use std::process::Command;
 use tracing::info;
 
 use crate::fingerprint::{self, StageSpec, TrackedPath};
+use crate::metric_registry::{MetricId, PublicationScope};
 use crate::observability::MemorySnapshot;
 use crate::storage;
 use crate::wiki_lifecycle;
@@ -17,10 +18,10 @@ pub(crate) const MERGE_ALGORITHM_VERSION: &str = "merged-metrics-v9-incremental-
 const METRIC_MERGE_ALGORITHM_VERSION: &str = "merged-wiki-runs-v1";
 const GENERATOR_DEPENDENCIES: [&str; 1] = ["manifest.json.cjs"];
 const MANIFEST_GENERATOR: &str = "manifest.json.sh";
-const PARTITION_ONLY_METRICS: [&str; 1] = ["page_weekly_edits.parquet"];
-
 fn is_partition_only_metric(name: &str) -> bool {
-    PARTITION_ONLY_METRICS.contains(&name)
+    MetricId::from_artifact_identity(name).is_some_and(|metric| {
+        metric.definition().publication_scope == PublicationScope::PerWikiOnly
+    })
 }
 
 /// Merge per-wiki metric parquet files into combined files at the output root.
@@ -102,6 +103,13 @@ fn merge_outputs_from_dir(
     inputs.push(TrackedPath::new(
         "config/wiki-lifecycle.json",
         lifecycle_file,
+    ));
+    let repository_root = env::var_os("WIKI_ECON_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    inputs.push(TrackedPath::new(
+        crate::metric_registry::CATALOG_JSON_PATH,
+        repository_root.join(crate::metric_registry::CATALOG_JSON_PATH),
     ));
     // Root Parquets are owned by their per-metric merge receipts. Keeping
     // them out of this orchestration receipt prevents a broader stage from

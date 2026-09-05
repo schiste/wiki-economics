@@ -8,23 +8,14 @@ use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 use tracing::{info, warn};
 
+use crate::metric_registry::{self, MetricId, PublicationScope};
+
 const RECEIPT_SCHEMA_VERSION: u32 = 1;
 const SITE_ALGORITHM_VERSION: &str = "observable-static-site-v9-exact-period-semantics";
 const DASHBOARD_DEFAULTS_ALGORITHM_VERSION: &str =
     "rust-dashboard-defaults-v7-nonadditive-fail-closed";
-pub(crate) const DASHBOARD_DEFAULT_METRIC_INPUTS: [&str; 9] = [
-    "business_funnel.parquet",
-    "gdp.parquet",
-    "gdp_activity_tiers.parquet",
-    "gdp_user_type_share.parquet",
-    "inequality.parquet",
-    "labor_churn.parquet",
-    "labor_cohorts.parquet",
-    "labor_monthly.parquet",
-    "patrol.parquet",
-];
 const PARQUET_SUMMARY_BATCH_ROWS: usize = 250_000;
-const DATE_COLUMNS: [&str; 6] = [
+const FALLBACK_DATE_COLUMNS: [&str; 6] = [
     "week_start",
     "year_month",
     "cohort_month",
@@ -32,6 +23,12 @@ const DATE_COLUMNS: [&str; 6] = [
     "month",
     "date",
 ];
+
+pub(crate) fn dashboard_default_metric_inputs() -> impl Iterator<Item = String> {
+    metric_registry::definitions()
+        .filter(|definition| definition.publication_scope == PublicationScope::MergedAndPerWiki)
+        .map(|definition| definition.id.parquet_name())
+}
 
 pub fn data_stage_receipt_path(
     data_dir: &Path,
@@ -170,7 +167,7 @@ fn sha256_file(path: &Path) -> Result<String> {
 
 type ParquetSummary = (Vec<String>, u64, Option<String>, Option<String>);
 
-fn parquet_summary(path: &Path) -> Result<ParquetSummary> {
+fn parquet_summary(path: &Path, identity: &str) -> Result<ParquetSummary> {
     let mut reader =
         crate::storage::SequentialParquetReader::new(path, None, PARQUET_SUMMARY_BATCH_ROWS)?;
     let rows = u64::try_from(reader.rows())?;
@@ -180,9 +177,20 @@ fn parquet_summary(path: &Path) -> Result<ParquetSummary> {
         .iter_fields()
         .map(|field| format!("{}:{:?}", field.name(), field.dtype()))
         .collect::<Vec<_>>();
-    let date_column = DATE_COLUMNS
-        .iter()
-        .find(|candidate| schema_frame.schema().contains(candidate));
+    let registered_date = MetricId::from_artifact_identity(identity)
+        .and_then(|metric| metric.definition().date_column);
+    if let Some(date_column) = registered_date {
+        ensure!(
+            schema_frame.schema().contains(date_column),
+            "registered metric {identity} is missing its {date_column} date column"
+        );
+    }
+    let date_column = registered_date.or_else(|| {
+        FALLBACK_DATE_COLUMNS
+            .iter()
+            .find(|candidate| schema_frame.schema().contains(candidate))
+            .copied()
+    });
     let Some(date_column) = date_column else {
         return Ok((schema, rows, None, None));
     };
@@ -260,7 +268,7 @@ fn inspect(path: &TrackedPath) -> Result<ArtifactIdentity> {
         .extension()
         .is_some_and(|extension| extension == "parquet")
     {
-        let (schema, rows, minimum, maximum) = parquet_summary(&path.path)?;
+        let (schema, rows, minimum, maximum) = parquet_summary(&path.path, &path.identity)?;
         (schema, Some(rows), minimum, maximum)
     } else {
         (Vec::new(), None, None, None)
@@ -803,8 +811,7 @@ fn site_source_inputs(site_dir: &Path) -> Result<Vec<TrackedPath>> {
 }
 
 fn dashboard_defaults_inputs(output_dir: &Path, workspace_dir: &Path) -> Result<Vec<TrackedPath>> {
-    let mut inputs = DASHBOARD_DEFAULT_METRIC_INPUTS
-        .iter()
+    let mut inputs = dashboard_default_metric_inputs()
         .map(|name| TrackedPath::new(format!("data/{name}"), output_dir.join(name)))
         .collect::<Vec<_>>();
     let selected_wikis = site_selected_snapshot_versions(output_dir)?
@@ -1077,14 +1084,32 @@ mod tests {
 
     fn write_dashboard_metric_inputs(output: &Path, wiki: &str) -> Result<()> {
         fs::create_dir_all(output.join(wiki))?;
-        for path in DASHBOARD_DEFAULT_METRIC_INPUTS
-            .iter()
+        for path in dashboard_default_metric_inputs()
             .map(|name| output.join(name))
             .chain(std::iter::once(
                 output.join(wiki).join("page_weekly_edits.parquet"),
             ))
         {
-            let mut frame = df!("wiki" => [wiki], "value" => [1_i64])?;
+            let identity = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("dashboard metric fixture name should be UTF-8")?;
+            let metric = MetricId::from_artifact_identity(identity)
+                .context("dashboard metric fixture should be registered")?;
+            let date_column = metric
+                .definition()
+                .date_column
+                .context("dashboard metric fixture should have a date column")?;
+            let date = match date_column {
+                "week_start" => "2026-01-05",
+                "cohort_year" | "year" => "2026",
+                _ => "2026-01",
+            };
+            let mut frame = DataFrame::new_infer_height(vec![
+                Column::new("wiki".into(), [wiki]),
+                Column::new("value".into(), [1_i64]),
+                Column::new(date_column.into(), [date]),
+            ])?;
             ParquetWriter::new(File::create(path)?).finish(&mut frame)?;
         }
         let account_report = output.join(crate::dashboard::ACCOUNT_CREATION_STAGING_PATH);
@@ -1423,8 +1448,16 @@ mod tests {
         ])
         .expect("valid empty Parquet fixture");
         ParquetWriter::new(File::create(&empty_path)?).finish(&mut empty)?;
-        let (_, rows, minimum, maximum) = parquet_summary(&empty_path)?;
+        let (_, rows, minimum, maximum) = parquet_summary(&empty_path, "empty.parquet")?;
         assert_eq!((rows, minimum, maximum), (0, None, None));
+
+        let missing_registered_date = dir.path().join("gdp.parquet");
+        let mut invalid_gdp = df!("wiki" => ["testwiki"], "value" => [1_i64])?;
+        ParquetWriter::new(File::create(&missing_registered_date)?).finish(&mut invalid_gdp)?;
+        assert!(
+            parquet_summary(&missing_registered_date, "data/gdp.parquet").is_err(),
+            "registered fingerprint definitions must fail closed on a missing date column"
+        );
         Ok(())
     }
 

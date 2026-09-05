@@ -4786,14 +4786,32 @@ mod tests {
         )
         .expect("gate fixture should be written");
         fs::create_dir_all(output_dir.path().join("nlwiki"))?;
-        for path in fingerprint::DASHBOARD_DEFAULT_METRIC_INPUTS
-            .iter()
+        for path in fingerprint::dashboard_default_metric_inputs()
             .map(|name| output_dir.path().join(name))
             .chain(std::iter::once(
                 output_dir.path().join("nlwiki/page_weekly_edits.parquet"),
             ))
         {
-            let mut frame = df!("wiki" => ["nlwiki"], "value" => [1_i64])?;
+            let identity = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .context("dashboard fingerprint fixture should be UTF-8")?;
+            let metric = metric_registry::MetricId::from_artifact_identity(identity)
+                .context("dashboard fingerprint fixture should be registered")?;
+            let date_column = metric
+                .definition()
+                .date_column
+                .context("dashboard fingerprint fixture should be dated")?;
+            let date = match date_column {
+                "week_start" => "2026-01-05",
+                "cohort_year" | "year" => "2026",
+                _ => "2026-01",
+            };
+            let mut frame = DataFrame::new_infer_height(vec![
+                Column::new("wiki".into(), ["nlwiki"]),
+                Column::new("value".into(), [1_i64]),
+                Column::new(date_column.into(), [date]),
+            ])?;
             ParquetWriter::new(fs::File::create(path)?).finish(&mut frame)?;
         }
         fs::write(output_dir.path().join("manifest.json"), "{}")?;
