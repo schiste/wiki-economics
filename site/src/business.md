@@ -173,16 +173,17 @@ if (useDefaults) {
     bytesPerEditor: d.unique_editors > 0 ? d.net_bytes / d.unique_editors : 0
   }))
 } else {
-  const {cohorts} = await loadBizRows(wiki, {startPeriod, endPeriod})
+  const {cohorts, tiers: annualTiers} = await loadBizRows(wiki, {startPeriod, endPeriod})
   cohortData = aggregateCohorts(cohorts.filter(d => wikiMatches(d, wiki)))
   yearlyBytesPerEditor = d3.rollups(
-    gdpRaw.filter(d => userTypes.includes(d.user_type) && d.page_namespace === 0),
+    annualTiers.filter(d => wikiMatches(d, wiki) && userTypes.includes(d.user_type)
+      && d.period_type === "year"),
     v => {
-      const editors = d3.sum(v, d => d.unique_editors)
+      const editors = d3.sum(v, d => d.editors)
       const bytes = d3.sum(v, d => d.net_bytes)
       return editors > 0 ? bytes / editors : 0
     },
-    d => d.year_month.slice(0, 4)
+    d => d.period
   ).map(([year, bytesPerEditor]) => ({year, bytesPerEditor}))
 }
 } finally {
@@ -394,7 +395,7 @@ withExport(Plot.plot({
 
 `LTV(cohort) = Σ over years (Survival Rate × Avg Net Bytes per Editor)`
 
-For each cohort year, LTV = sum over all years of (cohort survival rate x average net bytes per editor in that year). Average bytes per editor is computed from article namespace (ns 0) data for the selected user types. Cohorts with fewer than 10 initial editors are excluded.
+For each cohort year, LTV = sum over all years of (cohort survival rate x average net bytes per active editor identity in that year). The denominator comes from the exact annual activity-tier populations, so an identity active in several months is counted once. Net bytes cover all namespaces for the selected user types. Cohorts with fewer than 10 initial editors are excluded.
 
 </details>
 </div>

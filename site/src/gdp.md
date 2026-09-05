@@ -53,7 +53,7 @@ if (useDefaults) {
 } else {
   const {gdp: gdpRaw} = await loadGdpRows(wiki, {startPeriod, endPeriod})
   output = queryGrouped(gdpRaw, {
-    sumCols: ["gross_bytes_added", "net_bytes", "total_edits", "productive_edits", "reverted_edits", "unique_editors"],
+    sumCols: ["gross_bytes_added", "net_bytes", "total_edits", "productive_edits", "reverted_edits"],
     wiki, userTypes, namespaces, startPeriod, endPeriod, granularity
   })
   const byTypeRows = gdpRaw
@@ -65,7 +65,6 @@ if (useDefaults) {
       net_bytes: d3.sum(v, d => d.net_bytes),
       total_edits: d3.sum(v, d => d.total_edits),
       reverted_edits: d3.sum(v, d => d.reverted_edits),
-      unique_editors: d3.sum(v, d => d.unique_editors),
     }), d => d.period, d => d.user_type)
     .flatMap(([period, types]) => types.map(([user_type, agg]) => ({period, user_type, ...agg})))
     .sort((a, b) => d3.ascending(a.period, b.period))

@@ -9,7 +9,7 @@ How evenly are edits distributed among Wikipedia editors? This page tracks four 
 </p>
 
 ```js
-import {filterRows, aggregateInequalityByPeriod, makeRowsLoader, makeJsonLoader, fmtNum, createFilterBar, isDefaultView, parseDefaultsMeta, startLoading, doneLoading} from "./components/filters.js"
+import {aggregateInequalityByPeriod, makeRowsLoader, makeJsonLoader, fmtNum, createFilterBar, isDefaultView, parseDefaultsMeta, startLoading, doneLoading, wikiMatches} from "./components/filters.js"
 import {withExport, pageExportBar} from "./components/exports.js"
 
 const meta = await FileAttachment("data/meta_inequality.json").json()
@@ -41,9 +41,11 @@ if (useDefaults) {
   ineqData = defaults.data
 } else {
   const {inequality} = await loadIneqRows(wiki, {startPeriod, endPeriod})
-  const selected = filterRows(inequality, {
-    wiki, userTypes, namespaces: null, startPeriod, endPeriod, granularity
-  })
+  const selected = inequality.filter(d => wikiMatches(d, wiki)
+    && userTypes.includes(d.user_type)
+    && d.period_type === granularity
+    && d.period_end >= startPeriod
+    && d.period_start <= endPeriod)
   ineqData = aggregateInequalityByPeriod(selected)
 }
 } finally {
@@ -111,7 +113,7 @@ withExport(Plot.plot({
 `Gini = (2 × Σ rank × edits_i) / (n × Total Edits) − (n + 1) / n`
 where n = number of editors, sorted by ascending edit count, rank = 1…n
 
-The standard Gini coefficient is applied to the distribution of edits across all active editors in each wiki and month. A value of 0 means perfect equality (every editor made the same number of edits), while 1 means maximum inequality (one editor made all edits). Gini cannot be reconstructed exactly from monthly or per-wiki summary statistics, so it is shown only when the selected period is represented by one source row. Combined periods and All wikis never report a weighted average as a global Gini.
+The standard Gini coefficient is applied directly to every editor's total edits in the selected calendar month, quarter, or year. An editor is counted once in that period, even if active in several constituent months, and receives one deterministic period classification with bot status taking precedence. A value of 0 means perfect equality and 1 approaches maximum inequality. Gini is unavailable when several precomputed populations are combined because their ranked distributions cannot be reconstructed.
 
 </details>
 </div>
@@ -142,7 +144,7 @@ withExport(Plot.plot({
 
 `Theil T = (1/n) × Σ (edits_i / mean_edits) × ln(edits_i / mean_edits)`
 
-The Theil T index is an entropy-based inequality measure. It is computed as the weighted sum of each editor's share of total edits multiplied by the logarithm of that share relative to equal distribution. Unlike Gini, Theil is perfectly decomposable: total inequality can be split into between-group and within-group components, which makes it especially useful when multiple user types are selected.
+The Theil T index is an entropy-based inequality measure computed directly from each editor's period total. It is decomposable across populations known to be disjoint. Each identity is assigned one user type per period, so selected type strata are disjoint; all-wiki composition uses disjoint local editor–wiki populations. Gini, Palma, and fragility remain unavailable after composition because Theil's sufficient statistics do not reconstruct a ranked distribution.
 
 </details>
 </div>
@@ -188,7 +190,9 @@ The Palma ratio is the share of total edits made by the top 10% of editors divid
 <div class="note">This is the <strong><a href="https://en.wikipedia.org/wiki/Bus_factor">bus factor</a></strong> of the wiki: the minimum number of editors whose combined edits account for at least 50% of all output. The ratio version (% of total editors) lets you compare fragility across periods with different editor populations. A lower number means the community is more fragile: if those few editors leave, half the output disappears.</div>
 
 ```js
-const fragility = ineqData.map(d => ({...d, fragility_pct: d.total_editors > 0 ? d.min_editors_50pct / d.total_editors * 100 : 0}))
+const fragility = ineqData
+  .filter(d => Number.isFinite(d.total_editors) && Number.isFinite(d.min_editors_50pct) && d.total_editors > 0)
+  .map(d => ({...d, fragility_pct: d.min_editors_50pct / d.total_editors * 100}))
 ```
 
 ```js

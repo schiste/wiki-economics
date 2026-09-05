@@ -76,7 +76,7 @@ test("all-wiki count reducers sum primitives and recompute rates", () => {
   ]), [{cohort_year: "2020", cohort_size: 14, reached_5: 8, reached_25: 3, reached_100: 1}]);
 });
 
-test("non-additive portfolio statistics fail closed while Theil and coverage remain exact", () => {
+test("non-additive population statistics fail closed while additive patrol coverage remains exact", () => {
   const inequality = aggregateInequalityByPeriod([
     {period: "2026", total_editors: 10, total_edits: 30, min_editors_50pct: 2, gini: 0.4, theil: 0.2, palma: 1},
     {period: "2026", total_editors: 30, total_edits: 70, min_editors_50pct: 4, gini: 0.8, theil: 0.6, palma: 3},
@@ -99,6 +99,7 @@ test("non-additive portfolio statistics fail closed while Theil and coverage rem
       min_patrollers_50pct: 2, median_latency_hours: 3, p90_latency_hours: 5, top1_pct: 20},
   ])[0];
   assert.equal(patrol.total_patrols, 40);
+  assert.equal(patrol.unique_patrollers, null);
   assert.equal(patrol.median_latency_hours, null);
   assert.equal(patrol.min_patrollers_50pct, null);
   assert.equal(patrol.patrol_coverage_pct, 40);

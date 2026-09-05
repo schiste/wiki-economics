@@ -52,36 +52,6 @@ struct CommonMeta {
     ranges: Vec<Value>,
 }
 
-#[derive(Default)]
-struct Average {
-    sum: f64,
-    weight: f64,
-}
-
-impl Average {
-    #[cfg(test)]
-    fn add(&mut self, value: Option<f64>) {
-        self.add_weighted(value, 1.0);
-    }
-
-    fn add_weighted(&mut self, value: Option<f64>, weight: f64) {
-        if let Some(value) = value
-            && weight > 0.0
-        {
-            self.sum += value * weight;
-            self.weight += weight;
-        }
-    }
-
-    fn value(&self) -> Value {
-        if self.weight == 0.0 {
-            Value::Null
-        } else {
-            number(self.sum / self.weight)
-        }
-    }
-}
-
 pub fn materialize(output_dir: &Path) -> Result<()> {
     materialize_into(output_dir, output_dir)
 }
@@ -627,8 +597,8 @@ fn gdp_artifacts(frames: &Frames) -> Result<(Value, Value)> {
 }
 
 fn gdp_artifacts_with_meta(frames: &Frames, meta: CommonMeta) -> Result<(Value, Value)> {
-    let mut output: BTreeMap<String, [f64; 6]> = BTreeMap::new();
-    let mut by_type: BTreeMap<(String, String), [f64; 5]> = BTreeMap::new();
+    let mut output: BTreeMap<String, [f64; 5]> = BTreeMap::new();
+    let mut by_type: BTreeMap<(String, String), [f64; 4]> = BTreeMap::new();
     let mut by_namespace: BTreeMap<(String, i64), [f64; 3]> = BTreeMap::new();
 
     for row in 0..frames.gdp.height() {
@@ -649,7 +619,6 @@ fn gdp_artifacts_with_meta(frames: &Frames, meta: CommonMeta) -> Result<(Value, 
                 "net_bytes",
                 "total_edits",
                 "reverted_edits",
-                "unique_editors",
             ]
             .iter()
             .enumerate()
@@ -665,7 +634,6 @@ fn gdp_artifacts_with_meta(frames: &Frames, meta: CommonMeta) -> Result<(Value, 
                 "total_edits",
                 "productive_edits",
                 "reverted_edits",
-                "unique_editors",
             ]
             .iter()
             .enumerate()
@@ -734,7 +702,6 @@ fn gdp_artifacts_with_meta(frames: &Frames, meta: CommonMeta) -> Result<(Value, 
             "total_edits": number(values[2]),
             "productive_edits": number(values[3]),
             "reverted_edits": number(values[4]),
-            "unique_editors": number(values[5]),
         })).collect::<Vec<_>>(),
         "byType": by_type.into_iter().map(|((period, user_type), values)| json!({
             "period": period,
@@ -743,7 +710,6 @@ fn gdp_artifacts_with_meta(frames: &Frames, meta: CommonMeta) -> Result<(Value, 
             "net_bytes": number(values[1]),
             "total_edits": number(values[2]),
             "reverted_edits": number(values[3]),
-            "unique_editors": number(values[4]),
         })).collect::<Vec<_>>(),
         "byNamespace": by_namespace.into_iter().map(|((period, page_namespace), values)| json!({
             "period": period,
@@ -927,6 +893,7 @@ fn business_artifacts(frames: &Frames) -> Result<(Value, Value)> {
     let churn = churn_rows(&frames.churn, &meta.default_wiki, "quarter", &max_quarter)?;
 
     let mut tiers: BTreeMap<(String, i64, String), [f64; 4]> = BTreeMap::new();
+    let mut yearly_bytes: BTreeMap<String, [f64; 2]> = BTreeMap::new();
     for row in 0..frames.tiers.height() {
         if !selected_activity_tier_row(
             &frames.tiers,
@@ -943,6 +910,7 @@ fn business_artifacts(frames: &Frames) -> Result<(Value, Value)> {
             integer(&frames.tiers, "tier_rank", row)?.context("tier rank is null")?,
             string(&frames.tiers, "activity_tier", row)?.context("activity tier is null")?,
         );
+        let period = key.0.clone();
         let entry = tiers.entry(key).or_default();
         for (index, column) in ["editors", "total_edits", "net_bytes", "gross_bytes"]
             .iter()
@@ -950,11 +918,13 @@ fn business_artifacts(frames: &Frames) -> Result<(Value, Value)> {
         {
             entry[index] += float(&frames.tiers, column, row)?.unwrap_or_default();
         }
+        let yearly_entry = yearly_bytes.entry(period).or_default();
+        yearly_entry[0] += float(&frames.tiers, "net_bytes", row)?.unwrap_or_default();
+        yearly_entry[1] += float(&frames.tiers, "editors", row)?.unwrap_or_default();
     }
 
     let mut survival: BTreeMap<String, [f64; 2]> = BTreeMap::new();
     let mut equilibrium: BTreeMap<(String, Option<i64>), [f64; 2]> = BTreeMap::new();
-    let mut yearly_bytes: BTreeMap<String, [f64; 2]> = BTreeMap::new();
     for row in 0..frames.gdp.height() {
         if !selected_month_row(&frames.gdp, row, &meta.default_wiki, &meta.max_month)?
             || string(&frames.gdp, "user_type", row)?.as_deref() != Some("registered")
@@ -973,9 +943,6 @@ fn business_artifacts(frames: &Frames) -> Result<(Value, Value)> {
             let survival_entry = survival.entry(quarterly).or_default();
             survival_entry[0] += float(&frames.gdp, "total_edits", row)?.unwrap_or_default();
             survival_entry[1] += float(&frames.gdp, "reverted_edits", row)?.unwrap_or_default();
-            let yearly_entry = yearly_bytes.entry(year(&month)?).or_default();
-            yearly_entry[0] += float(&frames.gdp, "net_bytes", row)?.unwrap_or_default();
-            yearly_entry[1] += float(&frames.gdp, "unique_editors", row)?.unwrap_or_default();
         }
     }
 
@@ -1085,7 +1052,8 @@ fn inequality_artifacts(frames: &Frames) -> Result<(Value, Value)> {
     let meta = common_meta(&frames.inequality, None)?;
     let mut default_start = None;
     for row in 0..frames.inequality.height() {
-        if let Some(month) = string(&frames.inequality, "year_month", row)?
+        if string(&frames.inequality, "period_type", row)?.as_deref() == Some("month")
+            && let Some(month) = string(&frames.inequality, "period_start", row)?
             && month <= meta.max_month
             && month.as_str() >= INEQUALITY_DEFAULT_START_MONTH
             && default_start
@@ -1095,21 +1063,39 @@ fn inequality_artifacts(frames: &Frames) -> Result<(Value, Value)> {
             default_start = Some(month);
         }
     }
+    if default_start.is_none() {
+        for row in 0..frames.inequality.height() {
+            if let Some(start) = string(&frames.inequality, "period_start", row)?
+                && start <= meta.max_month
+                && start.as_str() >= INEQUALITY_DEFAULT_START_MONTH
+                && default_start
+                    .as_ref()
+                    .is_none_or(|current| start < *current)
+            {
+                default_start = Some(start);
+            }
+        }
+    }
     let default_start =
         default_start.context("inequality input contains no row in the default date range")?;
     let mut yearly: BTreeMap<String, InequalityYear> = BTreeMap::new();
     for row in 0..frames.inequality.height() {
-        if !selected_month_row(&frames.inequality, row, &meta.default_wiki, &meta.max_month)?
+        if !selected_wiki_row(&frames.inequality, row, &meta.default_wiki)?
+            || string(&frames.inequality, "period_type", row)?.as_deref() != Some("year")
             || string(&frames.inequality, "user_type", row)?.as_deref() != Some("registered")
         {
             continue;
         }
-        let month =
-            string(&frames.inequality, "year_month", row)?.context("inequality month is null")?;
-        if month < default_start {
+        let period =
+            string(&frames.inequality, "period", row)?.context("inequality period is null")?;
+        let period_start = string(&frames.inequality, "period_start", row)?
+            .context("inequality period start is null")?;
+        let period_end = string(&frames.inequality, "period_end", row)?
+            .context("inequality period end is null")?;
+        if period_start > meta.max_month || period_end < default_start {
             continue;
         }
-        let entry = yearly.entry(year(&month)?).or_default();
+        let entry = yearly.entry(period).or_default();
         let editors = float(&frames.inequality, "total_editors", row)?.unwrap_or_default();
         let edits = float(&frames.inequality, "total_edits", row)?.unwrap_or_default();
         if entry.source_rows == 0 {
@@ -1169,16 +1155,17 @@ fn inequality_artifacts(frames: &Frames) -> Result<(Value, Value)> {
 #[derive(Default)]
 struct PatrolYear {
     total_patrols: f64,
-    unique_patrollers: f64,
     patrol_new_pages: f64,
     patrol_diffs: f64,
-    median_latency_hours: Average,
-    p90_latency_hours: Average,
     patrolled_revisions: f64,
     autopatrolled_revisions: f64,
     total_revisions: f64,
-    top1_pct: Average,
-    min_patrollers_50pct: f64,
+    source_rows: usize,
+    unique_patrollers: Option<f64>,
+    median_latency_hours: Option<f64>,
+    p90_latency_hours: Option<f64>,
+    top1_pct: Option<f64>,
+    min_patrollers_50pct: Option<f64>,
 }
 
 fn patrol_artifacts(frames: &Frames) -> Result<(Value, Value)> {
@@ -1195,31 +1182,27 @@ fn patrol_artifacts(frames: &Frames) -> Result<(Value, Value)> {
         let entry = yearly.entry(year(&month)?).or_default();
         let patrols = float(&frames.patrol, "total_patrols", row)?.unwrap_or_default();
         entry.total_patrols += patrols;
-        entry.unique_patrollers +=
-            float(&frames.patrol, "unique_patrollers", row)?.unwrap_or_default();
+        if entry.source_rows == 0 {
+            entry.unique_patrollers = float(&frames.patrol, "unique_patrollers", row)?;
+            entry.median_latency_hours = float(&frames.patrol, "median_latency_hours", row)?;
+            entry.p90_latency_hours = float(&frames.patrol, "p90_latency_hours", row)?;
+            entry.top1_pct = float(&frames.patrol, "top1_pct", row)?;
+            entry.min_patrollers_50pct = float(&frames.patrol, "min_patrollers_50pct", row)?;
+        }
+        entry.source_rows += 1;
         entry.patrol_new_pages +=
             float(&frames.patrol, "patrol_new_pages", row)?.unwrap_or_default();
         entry.patrol_diffs += float(&frames.patrol, "patrol_diffs", row)?.unwrap_or_default();
-        entry
-            .median_latency_hours
-            .add_weighted(float(&frames.patrol, "median_latency_hours", row)?, patrols);
-        entry
-            .p90_latency_hours
-            .add_weighted(float(&frames.patrol, "p90_latency_hours", row)?, patrols);
         entry.patrolled_revisions +=
             float(&frames.patrol, "patrolled_revisions", row)?.unwrap_or_default();
         entry.autopatrolled_revisions +=
             float(&frames.patrol, "autopatrolled_revisions", row)?.unwrap_or_default();
         entry.total_revisions += float(&frames.patrol, "total_revisions", row)?.unwrap_or_default();
-        entry
-            .top1_pct
-            .add_weighted(float(&frames.patrol, "top1_pct", row)?, patrols);
-        entry.min_patrollers_50pct +=
-            float(&frames.patrol, "min_patrollers_50pct", row)?.unwrap_or_default();
     }
     let patrol = yearly
         .into_iter()
         .map(|(period, entry)| {
+            let single = entry.source_rows == 1;
             let patrol_coverage_pct = if entry.total_revisions > 0.0 {
                 entry.patrolled_revisions / entry.total_revisions * 100.0
             } else {
@@ -1234,18 +1217,18 @@ fn patrol_artifacts(frames: &Frames) -> Result<(Value, Value)> {
             json!({
                 "period": period,
                 "total_patrols": number(entry.total_patrols),
-                "unique_patrollers": number(entry.unique_patrollers),
+                "unique_patrollers": single.then_some(entry.unique_patrollers).flatten(),
                 "patrol_new_pages": number(entry.patrol_new_pages),
                 "patrol_diffs": number(entry.patrol_diffs),
-                "median_latency_hours": entry.median_latency_hours.value(),
-                "p90_latency_hours": entry.p90_latency_hours.value(),
+                "median_latency_hours": single.then_some(entry.median_latency_hours).flatten(),
+                "p90_latency_hours": single.then_some(entry.p90_latency_hours).flatten(),
                 "patrolled_revisions": number(entry.patrolled_revisions),
                 "autopatrolled_revisions": number(entry.autopatrolled_revisions),
                 "total_revisions": number(entry.total_revisions),
                 "patrol_coverage_pct": number(patrol_coverage_pct),
                 "adjusted_coverage_pct": number(adjusted_coverage_pct),
-                "top1_pct": entry.top1_pct.value(),
-                "min_patrollers_50pct": number(entry.min_patrollers_50pct),
+                "top1_pct": single.then_some(entry.top1_pct).flatten(),
+                "min_patrollers_50pct": single.then_some(entry.min_patrollers_50pct).flatten(),
             })
         })
         .collect::<Vec<_>>();
@@ -1611,15 +1594,20 @@ pub fn write_site_fixture(output_dir: &Path) -> Result<()> {
         (
         "inequality",
         df!(
-            "year_month" => &["2026-01", "2026-01"],
-            "user_type" => &["registered", "registered"],
-            "gini" => &[0.4_f64, 0.5],
-            "theil" => &[0.3_f64, 0.4],
-            "palma" => &[1.2_f64, 1.3],
-            "min_editors_50pct" => &[2_u32, 2],
-            "total_editors" => &[6_u32, 4],
-            "total_edits" => &[12_u32, 8],
-            "wiki" => &["nlwiki", "ptwiki"],
+            "year_month" => &["2026-01", "2026-01", "2026-01", "2026-01"],
+            "period" => &["2026-01", "2026-01", "2026", "2026"],
+            "period_start" => &["2026-01", "2026-01", "2026-01", "2026-01"],
+            "period_end" => &["2026-01", "2026-01", "2026-12", "2026-12"],
+            "period_type" => &["month", "month", "year", "year"],
+            "period_months" => &[1_u32, 1, 12, 12],
+            "user_type" => &["registered", "registered", "registered", "registered"],
+            "gini" => &[0.4_f64, 0.5, 0.4, 0.5],
+            "theil" => &[0.3_f64, 0.4, 0.3, 0.4],
+            "palma" => &[1.2_f64, 1.3, 1.2, 1.3],
+            "min_editors_50pct" => &[2_u32, 2, 2, 2],
+            "total_editors" => &[6_u32, 4, 6, 4],
+            "total_edits" => &[12_u32, 8, 12, 8],
+            "wiki" => &["nlwiki", "ptwiki", "nlwiki", "ptwiki"],
         )
         .expect("static fixture columns have equal lengths")),
         (
@@ -1930,6 +1918,8 @@ mod tests {
         let business = read_json(&first.path().join("defaults_business.json"))?;
         assert_eq!(business["tiers"][0]["tier"], "1-12 edits");
         assert_eq!(business["tiers"][0]["period"], "2026");
+        assert_eq!(business["yearlyBytesPerEditor"][0]["net_bytes"], 240);
+        assert_eq!(business["yearlyBytesPerEditor"][0]["unique_editors"], 16);
 
         let variation = read_json(&first.path().join("defaults_edit_variation.json"))?;
         assert_eq!(variation["defaultWiki"], ALL_WIKIS_SCOPE);
@@ -1949,6 +1939,11 @@ mod tests {
             manifest["toolforge_open_licensing"]["open_data_license_spdx"],
             "MIT"
         );
+
+        let patrol = read_json(&first.path().join("defaults_patrol.json"))?;
+        assert!(patrol["patrol"][0]["unique_patrollers"].is_null());
+        assert!(patrol["patrol"][0]["median_latency_hours"].is_null());
+        assert!(patrol["patrol"][0]["min_patrollers_50pct"].is_null());
 
         let browser_index_path = first.path().join(crate::browser_data::INDEX_FILENAME);
         let browser_index = crate::browser_data::read_index(&browser_index_path)?;
@@ -2122,15 +2117,20 @@ mod tests {
         write_site_fixture(output.path())?;
         let mut frames = Frames::read(output.path())?;
         frames.inequality = df!(
-            "wiki" => &["nlwiki", "nlwiki"],
-            "year_month" => &["2001-05", "2001-06"],
-            "user_type" => &["registered", "registered"],
-            "total_editors" => &[10_i64, 20_i64],
-            "total_edits" => &[100_i64, 200_i64],
-            "min_editors_50pct" => &[2_i64, 3_i64],
-            "gini" => &[0.5_f64, 0.6_f64],
-            "theil" => &[0.2_f64, 0.3_f64],
-            "palma" => &[1.0_f64, 1.5_f64],
+            "wiki" => &["nlwiki", "nlwiki", "nlwiki"],
+            "year_month" => &["2001-05", "2001-06", "2001-01"],
+            "period" => &["2001-05", "2001-06", "2001"],
+            "period_start" => &["2001-05", "2001-06", "2001-01"],
+            "period_end" => &["2001-05", "2001-06", "2001-12"],
+            "period_type" => &["month", "month", "year"],
+            "period_months" => &[1_i64, 1, 12],
+            "user_type" => &["registered", "registered", "registered"],
+            "total_editors" => &[10_i64, 20_i64, 25_i64],
+            "total_edits" => &[100_i64, 200_i64, 300_i64],
+            "min_editors_50pct" => &[2_i64, 3_i64, 4_i64],
+            "gini" => &[0.5_f64, 0.6_f64, 0.7_f64],
+            "theil" => &[0.2_f64, 0.3_f64, 0.4_f64],
+            "palma" => &[1.0_f64, 1.5_f64, 2.0_f64],
         )
         .expect("inequality boundary fixture columns have equal lengths");
 
@@ -2141,8 +2141,8 @@ mod tests {
         );
         assert_eq!(metadata["defaultRange"], defaults["defaultRange"]);
         assert_eq!(defaults["data"].as_array().map(Vec::len), Some(1));
-        assert_eq!(defaults["data"][0]["total_editors"], 20);
-        assert_eq!(defaults["data"][0]["total_edits"], 200);
+        assert_eq!(defaults["data"][0]["total_editors"], 25);
+        assert_eq!(defaults["data"][0]["total_edits"], 300);
         Ok(())
     }
 
@@ -2257,11 +2257,6 @@ mod tests {
         assert_eq!(number(f64::NAN), Value::Null);
         assert_eq!(number(4.0), json!(4));
         assert_eq!(number(1.25), json!(1.25));
-        let mut average = Average::default();
-        assert_eq!(average.value(), Value::Null);
-        average.add(None);
-        average.add(Some(3.0));
-        assert_eq!(average.value(), json!(3));
         Ok(())
     }
 

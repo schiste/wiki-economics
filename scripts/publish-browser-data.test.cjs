@@ -52,7 +52,7 @@ test("publishes receipt-indexed global year shards from their isolated source", 
   fixtureData.index.entries = [{metric: "gdp", wiki: "all", minimum_date: "2026-01", maximum_date: "2026-07",
     file: "browser-data/gdp/all-2026.parquet", rows: 2, bytes, sha256,
     artifact_receipt_sha256: "c".repeat(64), scope: "global", shard: "2026",
-    aggregation_version: "global-browser-aggregate-v1"}];
+    aggregation_version: "global-browser-aggregate-v2-semantic-composition"}];
   fs.writeFileSync(path.join(fixtureData.dataDir, "browser-data-index.json"), JSON.stringify(fixtureData.index));
   const files = publishBrowserData(fixtureData);
   assert.deepEqual(files, ["browser-data/gdp/all-2026.parquet", "browser-data/index.json"]);

@@ -21,7 +21,7 @@ function safeSource(dataDir, entry) {
   if (entry.scope === "global"
       && entry.wiki === "all"
       && /^\d{4}$/.test(entry.shard || "")
-      && entry.aggregation_version === "global-browser-aggregate-v1"
+      && entry.aggregation_version === "global-browser-aggregate-v2-semantic-composition"
       && entry.file === `browser-data/${entry.metric}/all-${entry.shard}.parquet`) {
     return path.join(dataDir, "_browser-global", entry.metric, `${entry.shard}.parquet`);
   }

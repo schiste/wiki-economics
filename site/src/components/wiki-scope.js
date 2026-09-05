@@ -142,9 +142,10 @@ export function aggregateFunnel(rows) {
   return [...grouped.values()].sort((left, right) => left.cohort_year.localeCompare(right.cohort_year));
 }
 
-/** Aggregate counts and the exactly decomposable Theil statistic.
- * Gini, Palma, and fragility cannot be recovered from grouped summaries, so
- * they remain available only when a selected period contains one source row.
+/** Compose counts and Theil across explicitly disjoint period populations.
+ * Rust assigns each identity exactly one user type per period, so editor
+ * counts and Theil remain exact across selected type strata. Gini, Palma, and
+ * fragility still require the complete ranked distribution and fail closed.
  */
 export function aggregateInequalityByPeriod(rows) {
   const grouped = new Map();
@@ -176,69 +177,59 @@ export function aggregateInequalityByPeriod(rows) {
         ? (entry.within_theil + entry.edit_mean_log
           - entry.total_edits * Math.log(entry.total_edits / entry.total_editors)) / entry.total_edits
         : null;
+      const oneDistribution = entry.source_rows === 1;
       return {
         period: entry.period,
         total_editors: entry.total_editors,
         total_edits: entry.total_edits,
-        min_editors_50pct: entry.source_rows === 1 ? entry.single.min_editors_50pct : null,
-        gini: entry.source_rows === 1 ? entry.single.gini : null,
+        min_editors_50pct: oneDistribution ? entry.single.min_editors_50pct : null,
+        gini: oneDistribution ? entry.single.gini : null,
         theil: exactTheil,
-        palma: entry.source_rows === 1 ? entry.single.palma : null,
+        palma: oneDistribution ? entry.single.palma : null,
       };
     });
 }
 
 /**
- * Patrol counts are additive. Coverage is recomputed from its component
- * counts; distribution summaries use patrol-volume weighting.
+ * Patrol event and revision counts are additive, and coverage is recomputed
+ * from those counts. Distinct reviewers, quantiles, concentration, and
+ * fragility are non-additive and remain available only for one source row.
  */
 export function aggregatePatrolByPeriod(rows) {
   const grouped = new Map();
   const sumColumns = [
-    "total_patrols", "unique_patrollers", "patrol_new_pages", "patrol_diffs",
+    "total_patrols", "patrol_new_pages", "patrol_diffs",
     "patrolled_revisions", "autopatrolled_revisions", "total_revisions",
   ];
   for (const row of rows) {
     const entry = grouped.get(row.period) ?? {
       period: row.period,
-      median_latency_hours: 0,
-      p90_latency_hours: 0,
-      top1_pct: 0,
       source_rows: 0,
       single: row,
     };
     for (const column of sumColumns) entry[column] = (entry[column] ?? 0) + (row[column] ?? 0);
     entry.source_rows += 1;
-    const weight = row.total_patrols ?? 0;
-    if (weight > 0) {
-      for (const column of ["median_latency_hours", "p90_latency_hours", "top1_pct"]) {
-        if (row[column] != null) {
-          entry[column] += row[column] * weight;
-          entry[`${column}_weight`] = (entry[`${column}_weight`] ?? 0) + weight;
-        }
-      }
-    }
     grouped.set(row.period, entry);
   }
   return [...grouped.values()]
     .sort((left, right) => left.period.localeCompare(right.period))
     .map(entry => {
       const output = {...entry};
-      for (const column of ["median_latency_hours", "p90_latency_hours", "top1_pct"]) {
-        const weight = output[`${column}_weight`] ?? 0;
-        output[column] = weight > 0 ? output[column] / weight : null;
-        delete output[`${column}_weight`];
-      }
       output.patrol_coverage_pct = output.total_revisions > 0
         ? output.patrolled_revisions / output.total_revisions * 100 : 0;
       output.adjusted_coverage_pct = output.total_revisions > 0
         ? (output.patrolled_revisions + output.autopatrolled_revisions) / output.total_revisions * 100 : 0;
       if (output.source_rows > 1) {
+        output.unique_patrollers = null;
         output.median_latency_hours = null;
         output.p90_latency_hours = null;
         output.top1_pct = null;
         output.min_patrollers_50pct = null;
       } else {
+        output.unique_patrollers = output.single.unique_patrollers;
+        output.median_latency_hours = output.single.median_latency_hours;
+        output.p90_latency_hours = output.single.p90_latency_hours;
+        output.top1_pct = output.single.top1_pct;
         output.min_patrollers_50pct = output.single.min_patrollers_50pct;
       }
       delete output.source_rows;

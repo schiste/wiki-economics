@@ -9,9 +9,9 @@ use std::time::UNIX_EPOCH;
 use tracing::{info, warn};
 
 const RECEIPT_SCHEMA_VERSION: u32 = 1;
-const SITE_ALGORITHM_VERSION: &str = "observable-static-site-v8-plain-distribution-artifacts";
+const SITE_ALGORITHM_VERSION: &str = "observable-static-site-v9-exact-period-semantics";
 const DASHBOARD_DEFAULTS_ALGORITHM_VERSION: &str =
-    "rust-dashboard-defaults-v6-indefinite-local-account-blocks";
+    "rust-dashboard-defaults-v7-nonadditive-fail-closed";
 pub(crate) const DASHBOARD_DEFAULT_METRIC_INPUTS: [&str; 9] = [
     "business_funnel.parquet",
     "gdp.parquet",

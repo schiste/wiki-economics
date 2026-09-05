@@ -57,7 +57,8 @@ if (useDefaults) {
 
 ```js
 const totalPatrols = data.reduce((s, d) => s + d.total_patrols, 0)
-const maxPatrollers = Math.max(...data.map(d => d.unique_patrollers))
+const patrollerCounts = data.map(d => d.unique_patrollers).filter(Number.isFinite)
+const maxPatrollers = patrollerCounts.length > 0 ? Math.max(...patrollerCounts) : null
 const latestWithLatency = data.filter(d => d.median_latency_hours != null)
 const latestLatency = latestWithLatency.length > 0 ? latestWithLatency[latestWithLatency.length - 1].median_latency_hours : null
 const latestCoverage = data.length > 0 ? data[data.length - 1].patrol_coverage_pct : 0
@@ -94,11 +95,11 @@ pageExportBar([{name: "patrol", data: data}])
 
 <div class="chart-section">
 
-## Monthly Patrol Volume
+## Patrol Volume
 
 <div class="note">
 
-Number of edits reviewed (patrolled) each month. Declining patrol volume against stable edit counts signals a growing review backlog.
+Number of edits reviewed (patrolled) in each selected calendar period. Declining patrol volume against stable edit counts signals a growing review backlog.
 
 </div>
 
@@ -202,7 +203,7 @@ withExport(Plot.plot({
 
 `Latency = patrol_timestamp − revision_timestamp`
 
-For each patrol event, the corresponding revision's creation time is looked up and the difference computed. Median and 90th percentile are computed per wiki and month. Only events with a matched revision and latency under 1 year are included. When multiple wikis or months are combined, these summaries are weighted by patrol volume; they are portfolio summaries rather than a pooled event-level percentile.
+For each patrol event, the corresponding revision's creation time is looked up and the difference computed. Median and 90th percentile are exact only at their computed wiki × month × namespace × user-type grain. Only events with a matched revision and latency under 1 year are included. Quantiles cannot be reconstructed from monthly summaries, so they are unavailable when several months, namespaces, or user types are combined.
 
 </details>
 </div>
@@ -218,7 +219,9 @@ How many patrollers would need to leave before 50% of patrol work goes undone? L
 </div>
 
 ```js
-const fragData = data.map(d => ({...d, fragility_pct: d.unique_patrollers > 0 ? d.min_patrollers_50pct / d.unique_patrollers * 100 : 0}))
+const fragData = data
+  .filter(d => Number.isFinite(d.unique_patrollers) && Number.isFinite(d.min_patrollers_50pct) && d.unique_patrollers > 0)
+  .map(d => ({...d, fragility_pct: d.min_patrollers_50pct / d.unique_patrollers * 100}))
 ```
 
 ```js
@@ -242,7 +245,7 @@ withExport(Plot.plot({
 `Fragility = min k where top-k patrollers' patrols ≥ 50% × Total Patrols`
 `Fragility Ratio = Fragility / Unique Patrollers × 100%`
 
-Patrollers are ranked by patrol count descending. The fragility index is the minimum number whose cumulative patrols reach 50% of the total.
+Patrollers are ranked by patrol count descending. The fragility index is the minimum number whose cumulative patrols reach 50% of the total. Unique patrollers, concentration, and fragility are unavailable when several source populations are combined because distinct identities and rank distributions are not additive.
 
 </details>
 </div>

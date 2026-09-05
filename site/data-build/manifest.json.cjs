@@ -211,7 +211,7 @@ function browserDataSummary(outputDir) {
     const globalSource = entry?.scope === "global"
       && entry?.wiki === "all"
       && /^\d{4}$/.test(entry?.shard || "")
-      && entry?.aggregation_version === "global-browser-aggregate-v1"
+      && entry?.aggregation_version === "global-browser-aggregate-v2-semantic-composition"
       && entry.file === `browser-data/${entry.metric}/all-${entry.shard}.parquet`;
     if (!/^[a-z0-9_]+$/.test(entry?.metric || "")
         || (!wikiSource && !globalSource)

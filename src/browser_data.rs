@@ -14,14 +14,14 @@ pub const INDEX_SCHEMA_VERSION: u32 = 3;
 pub const CACHE_SCHEMA_VERSION: u32 = 3;
 const GLOBAL_WIKI: &str = "all";
 const GLOBAL_ROOT: &str = "_browser-global";
-const GLOBAL_AGGREGATION_VERSION: &str = "global-browser-aggregate-v1";
+const GLOBAL_AGGREGATION_VERSION: &str = "global-browser-aggregate-v2-semantic-composition";
 
 pub const BROWSER_METRICS: [(&str, &str); 9] = [
     ("business_funnel", "cohort_year"),
     ("gdp", "year_month"),
     ("gdp_activity_tiers", "period_start"),
     ("gdp_user_type_share", "year_month"),
-    ("inequality", "year_month"),
+    ("inequality", "period_start"),
     ("labor_churn", "period"),
     ("labor_cohorts", "year"),
     ("labor_monthly", "year_month"),
@@ -406,8 +406,8 @@ fn aggregate_global_metric(metric: &str, frame: DataFrame) -> Result<DataFrame> 
         "gdp" => aggregate_sums(frame, GDP_KEYS, GDP_SUMS)?
             .lazy()
             .with_columns([
-                safe_ratio("gross_bytes_added", "total_edits", "bytes_per_edit"),
-                safe_ratio("gross_bytes_added", "unique_editors", "bytes_per_editor"),
+                safe_ratio("net_bytes", "total_edits", "bytes_per_edit"),
+                safe_ratio("net_bytes", "unique_editors", "bytes_per_editor"),
                 safe_ratio("reverted_edits", "total_edits", "revert_rate"),
             ])
             .collect()?,
@@ -470,7 +470,15 @@ fn aggregate_global_inequality(frame: DataFrame) -> Result<DataFrame> {
             (edits.clone() * (edits.clone() / editors.clone()).log(lit(std::f64::consts::E)))
                 .alias("_mean_log"),
         ])
-        .group_by([col("year_month"), col("user_type")])
+        .group_by([
+            col("year_month"),
+            col("period"),
+            col("period_start"),
+            col("period_end"),
+            col("period_type"),
+            col("period_months"),
+            col("user_type"),
+        ])
         .agg([
             col("total_editors").cast(DataType::Int64).sum(),
             col("total_edits").cast(DataType::Int64).sum(),
@@ -492,6 +500,11 @@ fn aggregate_global_inequality(frame: DataFrame) -> Result<DataFrame> {
         ])
         .select([
             col("year_month"),
+            col("period"),
+            col("period_start"),
+            col("period_end"),
+            col("period_type"),
+            col("period_months"),
             col("user_type"),
             col("gini"),
             col("theil"),
@@ -509,7 +522,6 @@ fn aggregate_global_patrol(frame: DataFrame) -> Result<DataFrame> {
     const PATROL_KEYS: &[&str] = &["year_month", "page_namespace", "user_type"];
     const PATROL_SUMS: &[&str] = &[
         "total_patrols",
-        "unique_patrollers",
         "patrol_new_pages",
         "patrol_diffs",
         "patrolled_revisions",
@@ -521,6 +533,7 @@ fn aggregate_global_patrol(frame: DataFrame) -> Result<DataFrame> {
     aggregate
         .lazy()
         .with_columns([
+            lit(NULL).cast(DataType::Int64).alias("unique_patrollers"),
             lit(NULL)
                 .cast(DataType::Float64)
                 .alias("median_latency_hours"),
@@ -768,6 +781,11 @@ mod tests {
             "inequality" => df!(
                 "wiki" => wiki,
                 "year_month" => &["2025-12", "2026-01"],
+                "period" => &["2025", "2026"],
+                "period_start" => &["2025-01", "2026-01"],
+                "period_end" => &["2025-12", "2026-12"],
+                "period_type" => &["year", "year"],
+                "period_months" => &[12_i64, 12],
                 "user_type" => &["registered", "registered"],
                 "gini" => &[0.3_f64, 0.4],
                 "theil" => &[0.2_f64, 0.25],
@@ -1008,6 +1026,58 @@ mod tests {
     }
 
     #[test]
+    fn global_gdp_productivity_uses_net_bytes() -> Result<()> {
+        let source = df!(
+            "wiki" => &["nlwiki", "ptwiki"],
+            "year_month" => &["2026-01", "2026-01"],
+            "page_namespace" => &[0_i32, 0],
+            "user_type" => &["registered", "registered"],
+            "gross_bytes_added" => &[100_i64, 200],
+            "net_bytes" => &[40_i64, 20],
+            "total_edits" => &[2_i64, 1],
+            "productive_edits" => &[2_i64, 1],
+            "reverted_edits" => &[0_i64, 0],
+            "unique_editors" => &[1_i64, 1],
+            "minor_edits" => &[0_i64, 0],
+        )?;
+        let result = aggregate_global_metric("gdp", source)?;
+        assert_eq!(result.height(), 1);
+        assert_eq!(result.column("bytes_per_edit")?.f64()?.get(0), Some(20.0));
+        assert_eq!(result.column("bytes_per_editor")?.f64()?.get(0), Some(30.0));
+        Ok(())
+    }
+
+    #[test]
+    fn global_patrol_keeps_only_additive_statistics() -> Result<()> {
+        let source = df!(
+            "wiki" => &["nlwiki", "ptwiki"],
+            "year_month" => &["2026-01", "2026-01"],
+            "page_namespace" => &[0_i32, 0],
+            "user_type" => &["registered", "registered"],
+            "total_patrols" => &[10_i64, 20],
+            "unique_patrollers" => &[2_i64, 4],
+            "patrol_new_pages" => &[3_i64, 6],
+            "patrol_diffs" => &[7_i64, 14],
+            "patrolled_revisions" => &[8_i64, 4],
+            "autopatrolled_revisions" => &[1_i64, 2],
+            "total_revisions" => &[10_i64, 10],
+        )?;
+        let result = aggregate_global_metric("patrol", source)?;
+        assert_eq!(result.height(), 1);
+        assert_eq!(result.column("total_patrols")?.i64()?.get(0), Some(30));
+        assert_eq!(result.column("unique_patrollers")?.i64()?.get(0), None);
+        assert_eq!(
+            result.column("patrol_coverage_pct")?.f64()?.get(0),
+            Some(60.0)
+        );
+        assert_eq!(
+            result.column("adjusted_coverage_pct")?.f64()?.get(0),
+            Some(75.0)
+        );
+        Ok(())
+    }
+
+    #[test]
     fn global_aggregates_are_sharded_reused_and_fail_closed() -> Result<()> {
         let output = TestDir::new()?;
         write_complete_wiki(output.path(), "nlwiki")?;
@@ -1097,6 +1167,14 @@ mod tests {
         assert_eq!(
             global_gdp.column("gross_bytes_added")?.i64()?.get(0),
             Some(200)
+        );
+        assert_eq!(
+            global_gdp.column("bytes_per_edit")?.f64()?.get(0),
+            Some(0.0)
+        );
+        assert_eq!(
+            global_gdp.column("bytes_per_editor")?.f64()?.get(0),
+            Some(0.0)
         );
         assert_eq!(global_gdp.column("wiki")?.str()?.get(0), Some(GLOBAL_WIKI));
         Ok(())
