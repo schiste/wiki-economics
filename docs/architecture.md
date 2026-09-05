@@ -153,7 +153,21 @@ If a new metric needs more fields, the preferred path is:
 
 ## Compute
 
-Compute logic lives in [src/compute/mod.rs](../src/compute/mod.rs) and the per-family modules.
+The computation planner and scan-fusion façade live in
+[src/compute/mod.rs](../src/compute/mod.rs). Actual family implementations are
+owned by:
+
+- `src/compute/monthly/`: stateless monthly reducers, inequality cache units,
+  identity coverage, and family output assembly
+- `src/compute/activity/`: editor-month reduction, period-aware activity tiers,
+  annual cache units, and family output assembly
+- `src/compute/lifecycle/`: lifecycle state, checkpoints, funnel/cohort/churn
+  reducers, and family output assembly
+- `src/compute/weekly/`: page-week source projection, governed disk buckets,
+  reconciliation, output writing, and resource reports
+
+`compute/mod.rs` may coordinate these APIs and fuse their input scans, but it
+must not own metric formulas or family-specific checkpoint/output logic.
 
 Important decisions:
 

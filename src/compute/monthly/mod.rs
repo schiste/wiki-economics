@@ -1,3 +1,5 @@
+//! Stateless monthly metric computation, inequality cache units, and outputs.
+
 /// Semantic version for monthly stateless aggregates.
 ///
 /// Increment this when GDP, GDP user-type share, inequality, or monthly labor

@@ -1,3 +1,10 @@
+//! Computation planning and scan-fusion façade.
+//!
+//! This module selects invalidated metric families, opens each shared history
+//! partition once, and routes the bounded frame to the owning family module.
+//! Metric formulas, family checkpoints, and family-specific output assembly
+//! belong in `monthly`, `activity`, `lifecycle`, and `weekly`.
+
 pub mod activity;
 pub mod gdp;
 pub mod inequality;
