@@ -9,7 +9,7 @@ use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::storage;
+use crate::{metric_registry::MetricId, storage};
 
 pub const ARTIFACT_RECEIPT_SCHEMA_VERSION: u32 = 1;
 const RECEIPT_DOCUMENT_SCHEMA_VERSION: u32 = 1;
@@ -118,55 +118,23 @@ pub struct SemanticSpec {
 
 impl SemanticSpec {
     pub fn for_identity(identity: &str) -> Self {
-        let metric = Path::new(identity)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(identity)
-            .strip_suffix(".parquet")
-            .unwrap_or(identity);
-        let (date, totals, ordering, page_week) = match metric {
-            "gdp" => (
-                Some("year_month"),
-                vec!["total_edits"],
-                "wiki-major/v1",
-                false,
-            ),
-            "gdp_activity_tiers" => (
-                Some("period_start"),
-                vec!["total_edits"],
-                "wiki-major/v1",
-                false,
-            ),
-            "gdp_user_type_share" => (Some("year_month"), vec!["edits"], "wiki-major/v1", false),
-            "inequality" => (Some("period_start"), vec![], "wiki-major/v1", false),
-            "labor_churn" => (Some("period"), vec![], "wiki-major/v1", false),
-            "labor_monthly" => (
-                Some("year_month"),
-                vec!["total_edits"],
-                "wiki-major/v1",
-                false,
-            ),
-            "page_weekly_edits" => (
-                Some("week_start"),
-                vec!["edits"],
-                "stable-page-hash-bucket/page-key/week/v1",
-                true,
-            ),
-            "patrol" => (
-                Some("year_month"),
-                vec!["total_patrols"],
-                "wiki-major/v1",
-                false,
-            ),
-            "business_funnel" => (Some("cohort_year"), vec![], "wiki-major/v1", false),
-            "labor_cohorts" => (Some("year"), vec![], "wiki-major/v1", false),
-            _ => (None, vec![], "writer-order/v1", false),
-        };
+        if let Some(metric) = MetricId::from_artifact_identity(identity) {
+            let definition = metric.definition();
+            return Self {
+                date_column: definition.date_column.map(str::to_string),
+                conservation_columns: definition
+                    .conservation_column
+                    .map(|column| vec![column.to_string()])
+                    .unwrap_or_default(),
+                ordering_contract: definition.ordering.as_str().to_string(),
+                page_week_consistency: metric == MetricId::PageWeeklyEdits,
+            };
+        }
         Self {
-            date_column: date.map(str::to_string),
-            conservation_columns: totals.into_iter().map(str::to_string).collect(),
-            ordering_contract: ordering.to_string(),
-            page_week_consistency: page_week,
+            date_column: None,
+            conservation_columns: Vec::new(),
+            ordering_contract: "writer-order/v1".to_string(),
+            page_week_consistency: false,
         }
     }
 }

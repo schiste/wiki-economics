@@ -36,208 +36,9 @@ const JSON_ARTIFACTS: [&str; 14] = [
     "manifest.json",
 ];
 
-#[derive(Clone, Copy)]
-enum Kind {
-    String,
-    I32,
-    I64,
-    U32,
-    F64,
-}
-
-struct MetricSpec {
-    name: &'static str,
-    date_column: Option<&'static str>,
-    conservation_column: Option<&'static str>,
-    schema: &'static [(&'static str, Kind)],
-}
-
-const BUSINESS_SCHEMA: &[(&str, Kind)] = &[
-    ("cohort_year", Kind::String),
-    ("cohort_size", Kind::U32),
-    ("reached_5", Kind::U32),
-    ("reached_25", Kind::U32),
-    ("reached_100", Kind::U32),
-    ("wiki", Kind::String),
-];
-const GDP_SCHEMA: &[(&str, Kind)] = &[
-    ("year_month", Kind::String),
-    ("page_namespace", Kind::I32),
-    ("user_type", Kind::String),
-    ("gross_bytes_added", Kind::I64),
-    ("net_bytes", Kind::I64),
-    ("total_edits", Kind::U32),
-    ("productive_edits", Kind::U32),
-    ("reverted_edits", Kind::U32),
-    ("unique_editors", Kind::U32),
-    ("minor_edits", Kind::U32),
-    ("bytes_per_edit", Kind::F64),
-    ("bytes_per_editor", Kind::F64),
-    ("revert_rate", Kind::F64),
-    ("wiki", Kind::String),
-];
-const GDP_TIERS_SCHEMA: &[(&str, Kind)] = &[
-    ("year_month", Kind::String),
-    ("period", Kind::String),
-    ("period_start", Kind::String),
-    ("period_end", Kind::String),
-    ("period_type", Kind::String),
-    ("period_months", Kind::U32),
-    ("user_type", Kind::String),
-    ("activity_tier", Kind::String),
-    ("tier_rank", Kind::U32),
-    ("editors", Kind::U32),
-    ("total_edits", Kind::U32),
-    ("net_bytes", Kind::I64),
-    ("gross_bytes", Kind::I64),
-    ("wiki", Kind::String),
-];
-const GDP_SHARE_SCHEMA: &[(&str, Kind)] = &[
-    ("year_month", Kind::String),
-    ("user_type", Kind::String),
-    ("edits", Kind::U32),
-    ("net_bytes", Kind::I64),
-    ("editors", Kind::U32),
-    ("wiki", Kind::String),
-];
-const INEQUALITY_SCHEMA: &[(&str, Kind)] = &[
-    ("year_month", Kind::String),
-    ("period", Kind::String),
-    ("period_start", Kind::String),
-    ("period_end", Kind::String),
-    ("period_type", Kind::String),
-    ("period_months", Kind::U32),
-    ("user_type", Kind::String),
-    ("gini", Kind::F64),
-    ("theil", Kind::F64),
-    ("palma", Kind::F64),
-    ("min_editors_50pct", Kind::U32),
-    ("total_editors", Kind::U32),
-    ("total_edits", Kind::U32),
-    ("wiki", Kind::String),
-];
-const CHURN_SCHEMA: &[(&str, Kind)] = &[
-    ("period", Kind::String),
-    ("active_editors", Kind::U32),
-    ("arrivals", Kind::U32),
-    ("departures", Kind::U32),
-    ("period_type", Kind::String),
-    ("arrival_rate", Kind::F64),
-    ("departure_rate", Kind::F64),
-    ("wiki", Kind::String),
-];
-const COHORTS_SCHEMA: &[(&str, Kind)] = &[
-    ("cohort_year", Kind::String),
-    ("year", Kind::String),
-    ("survived_editors", Kind::U32),
-    ("initial_editors", Kind::U32),
-    ("wiki", Kind::String),
-];
-const LABOR_SCHEMA: &[(&str, Kind)] = &[
-    ("year_month", Kind::String),
-    ("page_namespace", Kind::I32),
-    ("user_type", Kind::String),
-    ("unique_editors", Kind::U32),
-    ("total_edits", Kind::U32),
-    ("net_bytes", Kind::I64),
-    ("reverted_edits", Kind::U32),
-    ("wiki", Kind::String),
-];
-const WEEKLY_SCHEMA: &[(&str, Kind)] = &[
-    ("week_start", Kind::String),
-    ("iso_year", Kind::I32),
-    ("iso_week", Kind::I32),
-    ("page_id", Kind::I64),
-    ("page_title", Kind::String),
-    ("page_namespace", Kind::I32),
-    ("edits", Kind::U32),
-    ("previous_week_edits", Kind::U32),
-    ("wow_change", Kind::I64),
-    ("wow_rate", Kind::F64),
-    ("wiki", Kind::String),
-];
-const PATROL_SCHEMA: &[(&str, Kind)] = &[
-    ("year_month", Kind::String),
-    ("wiki", Kind::String),
-    ("page_namespace", Kind::I32),
-    ("user_type", Kind::String),
-    ("total_patrols", Kind::I64),
-    ("unique_patrollers", Kind::I32),
-    ("patrol_new_pages", Kind::I64),
-    ("patrol_diffs", Kind::I64),
-    ("median_latency_hours", Kind::F64),
-    ("p90_latency_hours", Kind::F64),
-    ("patrolled_revisions", Kind::I64),
-    ("autopatrolled_revisions", Kind::I64),
-    ("total_revisions", Kind::I64),
-    ("patrol_coverage_pct", Kind::F64),
-    ("adjusted_coverage_pct", Kind::F64),
-    ("top1_pct", Kind::F64),
-    ("min_patrollers_50pct", Kind::I32),
-];
-
-const METRICS: [MetricSpec; 10] = [
-    MetricSpec {
-        name: "business_funnel",
-        date_column: None,
-        conservation_column: None,
-        schema: BUSINESS_SCHEMA,
-    },
-    MetricSpec {
-        name: "gdp",
-        date_column: Some("year_month"),
-        conservation_column: Some("total_edits"),
-        schema: GDP_SCHEMA,
-    },
-    MetricSpec {
-        name: "gdp_activity_tiers",
-        date_column: Some("period_start"),
-        conservation_column: Some("total_edits"),
-        schema: GDP_TIERS_SCHEMA,
-    },
-    MetricSpec {
-        name: "gdp_user_type_share",
-        date_column: Some("year_month"),
-        conservation_column: Some("edits"),
-        schema: GDP_SHARE_SCHEMA,
-    },
-    MetricSpec {
-        name: "inequality",
-        date_column: Some("period_start"),
-        conservation_column: None,
-        schema: INEQUALITY_SCHEMA,
-    },
-    MetricSpec {
-        name: "labor_churn",
-        date_column: Some("period"),
-        conservation_column: None,
-        schema: CHURN_SCHEMA,
-    },
-    MetricSpec {
-        name: "labor_cohorts",
-        date_column: None,
-        conservation_column: None,
-        schema: COHORTS_SCHEMA,
-    },
-    MetricSpec {
-        name: "labor_monthly",
-        date_column: Some("year_month"),
-        conservation_column: Some("total_edits"),
-        schema: LABOR_SCHEMA,
-    },
-    MetricSpec {
-        name: "page_weekly_edits",
-        date_column: Some("week_start"),
-        conservation_column: Some("edits"),
-        schema: WEEKLY_SCHEMA,
-    },
-    MetricSpec {
-        name: "patrol",
-        date_column: Some("year_month"),
-        conservation_column: Some("total_patrols"),
-        schema: PATROL_SCHEMA,
-    },
-];
+#[cfg(test)]
+use crate::metric_registry::FieldKind as Kind;
+use crate::metric_registry::{METRIC_DEFINITIONS as METRICS, MetricDefinition as MetricSpec};
 
 const SUBSTANTIAL_ANONYMOUS_EDITS: u64 = 100;
 
@@ -1142,13 +943,7 @@ fn receipted_summary_with_mode(
     for ((expected_name, expected_kind), observed) in
         spec.schema.iter().zip(&receipt.parquet_schema)
     {
-        let expected_type = match expected_kind {
-            Kind::String => "String",
-            Kind::I32 => "Int32",
-            Kind::I64 => "Int64",
-            Kind::U32 => "UInt32",
-            Kind::F64 => "Float64",
-        };
+        let expected_type = expected_kind.parquet_name();
         ensure!(
             observed.name == *expected_name && observed.data_type == expected_type,
             "{} receipt schema disagrees at {}",
@@ -1722,7 +1517,7 @@ pub(crate) fn plan_wiki_preparation(
         let patrol =
             crate::patrol::reusable_candidate_files(wiki, snapshot, data_dir, candidate_dir)?;
         if candidate_dir.join("ready.json").is_file()
-            && compute.len() == crate::compute::MetricFamily::ALL.len()
+            && compute.len() == crate::metric_registry::MetricFamily::ALL.len()
             && patrol.is_some()
         {
             let indexed = indexed_latest_ready_candidate(data_dir, output_dir, wiki)?
@@ -1779,7 +1574,7 @@ pub(crate) fn plan_wiki_preparation(
     reusable_patrol.as_ref().map_or(Ok(()), |(source, files)| {
         copy_candidate_files(source, &target_candidate, files)
     })?;
-    let compute_reused = reusable_compute.len() == crate::compute::MetricFamily::ALL.len();
+    let compute_reused = reusable_compute.len() == crate::metric_registry::MetricFamily::ALL.len();
     let patrol_reused = reusable_patrol.is_some();
     info!(
         wiki,
@@ -1855,7 +1650,7 @@ pub(crate) fn plan_wiki_qualification_preparation(
     reusable_patrol.as_ref().map_or(Ok(()), |(source, files)| {
         copy_candidate_files(source, &target, files)
     })?;
-    let compute_reused = reusable_compute.len() == crate::compute::MetricFamily::ALL.len();
+    let compute_reused = reusable_compute.len() == crate::metric_registry::MetricFamily::ALL.len();
     let patrol_reused = reusable_patrol.is_some();
     info!(
         wiki,
@@ -1947,8 +1742,8 @@ fn publication_family_for_metric(metric: &str) -> Result<&'static str> {
     if metric == "patrol" {
         return Ok("patrol");
     }
-    crate::compute::MetricFamily::for_metric(metric)
-        .map(crate::compute::MetricFamily::name)
+    crate::metric_registry::MetricFamily::for_metric(metric)
+        .map(crate::metric_registry::MetricFamily::name)
         .with_context(|| format!("metric {metric} has no publication family"))
 }
 
@@ -2051,7 +1846,7 @@ fn artifact_backed_ready_candidate_reference(
 ) -> Result<ReadyCandidateReference> {
     let ready = authoritative_ready_candidate(candidate_dir, ready)?;
     let proofs = artifact_backed_family_proofs(candidate_dir, &ready.artifacts)?;
-    let core_family_receipt_identities = crate::compute::MetricFamily::ALL
+    let core_family_receipt_identities = crate::metric_registry::MetricFamily::ALL
         .into_iter()
         .map(|family| {
             let name = family.name().to_string();
@@ -4172,6 +3967,8 @@ fn sum_conservation_column(frame: &DataFrame, name: &str, _path: &Path) -> Resul
 fn validate_date(value: &str, column: &str) -> Result<()> {
     let valid = if column == "week_start" {
         chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").is_ok()
+    } else if column == "cohort_year" || column == "year" {
+        value.len() == 4 && value.as_bytes().iter().all(u8::is_ascii_digit) && value != "0000"
     } else if column == "period" {
         let bytes = value.as_bytes();
         let valid_year =
@@ -4197,7 +3994,7 @@ fn expected_artifact_names(registry: &LifecycleRegistry) -> Result<BTreeSet<Stri
     let mut expected: BTreeSet<_> = METRICS
         .iter()
         .filter(|metric| !partition_only_metric(metric))
-        .map(|metric| format!("{}.parquet", metric.name))
+        .map(|metric| metric.id.parquet_name())
         .chain(JSON_ARTIFACTS.iter().map(|name| name.to_string()))
         .collect();
     let weekly = METRICS
@@ -4265,7 +4062,7 @@ fn validate_artifact_inventory(
     let expected_parquets: BTreeSet<_> = METRICS
         .iter()
         .filter(|metric| !partition_only_metric(metric))
-        .map(|metric| format!("{}.parquet", metric.name))
+        .map(|metric| metric.id.parquet_name())
         .collect();
     ensure!(
         actual_parquets == expected_parquets,
@@ -5440,10 +5237,17 @@ mod tests {
             DataFrame::new_infer_height(vec![Column::new("wiki".into(), ["nlwiki"])])?;
         ParquetWriter::new(File::create(&wiki_only_path)?).finish(&mut wiki_only)?;
         let wiki_only_spec = MetricSpec {
+            id: crate::metric_registry::MetricId::BusinessFunnel,
             name: "wiki_only",
+            family: crate::metric_registry::MetricFamily::Lifecycle,
+            algorithm_version: "test-only",
             date_column: None,
             conservation_column: None,
             schema: &[("wiki", Kind::String)],
+            ordering: crate::metric_registry::OrderingContract::WikiMajor,
+            publication_scope: crate::metric_registry::PublicationScope::MergedAndPerWiki,
+            browser_partitioning: crate::metric_registry::BrowserPartitioning::RustDefaultsOnly,
+            aggregation: &[],
         };
         let wiki_only_summary = summarize_batched(&wiki_only_path, &wiki_only_spec, 1)?;
         assert_eq!(wiki_only_summary.minimum_date, None);
@@ -5859,7 +5663,7 @@ mod tests {
             candidate_dir,
         )
         .expect("current family receipts should expose algorithm versions");
-        incomplete_algorithms.remove(crate::compute::MetricFamily::Monthly.name());
+        incomplete_algorithms.remove(crate::metric_registry::MetricFamily::Monthly.name());
         assert!(
             current_family_publication_proofs(current_reference, &incomplete_algorithms)
                 .unwrap_err()
@@ -5876,7 +5680,7 @@ mod tests {
             artifact.receipt_sha256.clear();
         }
         atomic_json(&ready_path, &legacy)?;
-        for family in crate::compute::MetricFamily::ALL {
+        for family in crate::metric_registry::MetricFamily::ALL {
             fs::remove_file(
                 candidate_dir
                     .join("_stages/compute")
