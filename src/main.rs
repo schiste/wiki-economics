@@ -1152,15 +1152,12 @@ fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
             queue_dir,
             snapshot,
         } => {
-            let report = handle_fleet_discovery(
-                context,
-                ops,
-                FleetDiscoveryRequest {
-                    lifecycle: &lifecycle,
-                    queue_dir: &queue_dir,
-                    snapshot: snapshot.as_deref(),
-                },
-            )?;
+            let request = FleetDiscoveryRequest {
+                lifecycle: &lifecycle,
+                queue_dir: &queue_dir,
+                snapshot: snapshot.as_deref(),
+            };
+            let report = handle_fleet_discovery(context, ops, request)?;
             println!("{}", serde_json::to_string(&report)?);
         }
 
@@ -1410,15 +1407,12 @@ fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
         }
 
         Commands::PatrolRefresh { wikis, rebuild } => {
-            handle_patrol_refresh(
-                context,
-                ops,
-                PatrolComputeRequest {
-                    wikis: &wikis,
-                    rebuild,
-                    limit_months: None,
-                },
-            )?;
+            let request = PatrolComputeRequest {
+                wikis: &wikis,
+                rebuild,
+                limit_months: None,
+            };
+            handle_patrol_refresh(context, ops, request)?;
         }
 
         Commands::PatrolCompute {
@@ -1426,15 +1420,12 @@ fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
             rebuild,
             limit_months,
         } => {
-            handle_patrol_compute(
-                context,
-                ops,
-                PatrolComputeRequest {
-                    wikis: &wikis,
-                    rebuild,
-                    limit_months,
-                },
-            )?;
+            let request = PatrolComputeRequest {
+                wikis: &wikis,
+                rebuild,
+                limit_months,
+            };
+            handle_patrol_compute(context, ops, request)?;
         }
 
         Commands::AccountCreations {
@@ -3965,6 +3956,49 @@ mod tests {
         rebuild_result?;
         let stale_gone = !parts_dir.join("stale.parquet").exists();
         assert!(stale_gone);
+        Ok(())
+    }
+
+    #[test]
+    fn real_candidate_publication_and_qualification_adapters_fail_closed() -> Result<()> {
+        let root = TestDir::new()?;
+        let data = root.path().join("data");
+        let output = root.path().join("output");
+        let lifecycle = root.path().join("missing-lifecycle.json");
+        let report = root.path().join("cpu-qualification.json");
+        fs::create_dir_all(&output)?;
+        let ops = RealOps;
+
+        assert!(
+            ops.mark_candidate_ready(&data, &output, &lifecycle, "nlwiki", "2026-07", "candidate",)
+                .is_err()
+        );
+        assert!(ops.ensure_qualification_wiki(&lifecycle, "itwiki").is_err());
+        assert!(
+            ops.mark_qualification_ready(
+                &data,
+                &output,
+                &lifecycle,
+                "itwiki",
+                "2026-07",
+                "qualification",
+            )
+            .is_err()
+        );
+        assert!(
+            ops.prepare_ready_publication(&data, &output, &lifecycle, "prepare")
+                .is_err()
+        );
+        assert!(
+            ops.commit_ready_publication(&data, &output, "commit")
+                .is_err()
+        );
+        assert!(
+            ops.rollback_ready_publication(&data, &output, &lifecycle, "rollback")
+                .is_err()
+        );
+        assert!(ops.cpu_qualification(&[], &report).is_err());
+        assert!(report.is_file());
         Ok(())
     }
 
