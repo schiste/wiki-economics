@@ -173,7 +173,6 @@ Important decisions:
 
 - `load_wiki()` still exists and still loads a whole base frame into memory. It is retained for:
   - compatibility with older flat parquet layouts
-  - benchmark split-stage measurements
   - tests and small-wiki workflows
 - Compatibility with older parquet files is deliberate. Both `load_wiki()` and partition loading can still derive missing analytical columns from legacy data, which makes migrations safer and keeps old test fixtures useful.
 - `compute_all()` prefers the partitioned incremental path whenever the selected generation is laid out under `year=/year_month=` directories.

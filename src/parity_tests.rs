@@ -7,7 +7,7 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
 use crate::test_support::{TestDir, init_test_tracing};
-use crate::{compute, merge, patrol};
+use crate::{compute, merge, metric_registry::MetricFamily, patrol};
 
 const FIXTURE_JSON: &str = include_str!("../tests/fixtures/adversarial-metric-parity.json");
 
@@ -665,7 +665,8 @@ fn adversarial_metric_semantics_match_every_publication_layer() -> Result<()> {
 
     let temp = TestDir::new()?;
     let output_dir = temp.path().join("output");
-    let base_dir = output_dir.join("_base");
+    let data_dir = temp.path().join("data");
+    let base_dir = data_dir.join("parquet");
     let events = patrol_event_frame(&fixture)?;
     let coverage = patrol_coverage_frame(&fixture)?;
     let wikis = fixture
@@ -674,13 +675,17 @@ fn adversarial_metric_semantics_match_every_publication_layer() -> Result<()> {
         .map(|row| row.wiki.clone())
         .collect::<BTreeSet<_>>();
     for wiki in &wikis {
-        let base_path = base_dir.join(format!("{wiki}.parquet"));
+        let base_path = base_dir.join(wiki).join("part-00000.parquet");
         write_parquet(&base_path, history_frame(&fixture, wiki)?)?;
         let base = read_parquet(&base_path)?;
         assert_base_parquet_identity_cases(&base, wiki)?;
-        compute::gdp::compute(wiki, &base, &output_dir)?;
-        compute::labor::compute(wiki, &base, &output_dir)?;
-        compute::inequality::compute(wiki, &base, &output_dir)?;
+        for family in [
+            MetricFamily::Monthly,
+            MetricFamily::ActivityTiers,
+            MetricFamily::Lifecycle,
+        ] {
+            compute::execute_family(wiki, &data_dir, &output_dir, family)?;
+        }
         let mut patrol = patrol::parity_fixture_metrics(wiki, &events, &coverage)?;
         compute::write_output(&mut patrol, wiki, "patrol", &output_dir)?;
         let mut weekly = df!(

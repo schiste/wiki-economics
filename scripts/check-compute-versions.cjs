@@ -12,22 +12,17 @@ const FAMILIES = {
     versionFile: "src/compute/monthly/mod.rs",
     paths: [
       "src/compute/monthly/",
-      "src/compute/inequality.rs",
-      "src/compute/gdp.rs",
-      "src/compute/labor.rs",
       "src/compute/mod.rs",
     ],
   },
   activity_tiers: {
     versionFile: "src/compute/activity/mod.rs",
-    paths: ["src/compute/activity/", "src/compute/gdp.rs", "src/compute/mod.rs"],
+    paths: ["src/compute/activity/", "src/compute/mod.rs"],
   },
   lifecycle: {
     versionFile: "src/compute/lifecycle/mod.rs",
     paths: [
       "src/compute/lifecycle/",
-      "src/compute/gdp.rs",
-      "src/compute/labor.rs",
       "src/compute/mod.rs",
     ],
   },

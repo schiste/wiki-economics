@@ -19,7 +19,8 @@ const base = "0123456789abcdef0123456789abcdef01234567";
 
 test("family paths map shared and isolated implementations", () => {
   assert.deepEqual(familiesForPath("src/compute/weekly/reconcile.rs"), ["page_week"]);
-  assert.deepEqual(familiesForPath("src/compute/inequality.rs"), ["monthly"]);
+  assert.deepEqual(familiesForPath("src/compute/monthly/inequality.rs"), ["monthly"]);
+  assert.deepEqual(familiesForPath("src/compute/gdp.rs"), []);
   assert.deepEqual(familiesForPath("src/compute/mod.rs"), [
     "monthly",
     "activity_tiers",

@@ -1,12 +1,10 @@
 use anyhow::{Context, Result};
 use polars::prelude::*;
 use std::collections::BTreeMap;
-use std::path::Path;
-use tracing::debug;
 
-use super::{
+use super::super::{
     activity::ActivityPeriod, editor_identity_available_expr, editor_identity_expr,
-    ensure_editor_identity_inputs, user_type_from_rank_expr, user_type_rank_expr, write_output,
+    ensure_editor_identity_inputs, user_type_from_rank_expr, user_type_rank_expr,
 };
 
 type InequalityRow = (
@@ -100,7 +98,7 @@ fn min_editors_50pct(sorted_desc: &[f64]) -> usize {
     sorted_desc.len()
 }
 
-pub(super) fn editor_month_frame(base: &DataFrame) -> Result<DataFrame> {
+pub(in crate::compute) fn editor_month_frame(base: &DataFrame) -> Result<DataFrame> {
     let month_key = if base.column("year_month_key").is_ok() {
         col("year_month_key")
     } else {
@@ -312,33 +310,18 @@ pub(super) fn compute_periods(editor_monthly: &DataFrame) -> Result<DataFrame> {
         compute_period_frame(editor_monthly, ActivityPeriod::Quarter)?,
         compute_period_frame(editor_monthly, ActivityPeriod::Year)?,
     ];
-    let mut result = super::concat_frames(frames)?;
+    let mut result = super::super::concat_frames(frames)?;
     result = result.sort(["period", "period_type", "user_type"], Default::default())?;
     Ok(result)
 }
 
-pub fn compute_frame(base: &DataFrame) -> Result<DataFrame> {
+pub(in crate::compute) fn compute_frame(base: &DataFrame) -> Result<DataFrame> {
     compute_periods(&editor_month_frame(base)?)
-}
-
-/// Compute exact editor distributions for calendar months, quarters, and years.
-/// All namespaces are combined before each period-level distribution is ranked.
-pub fn compute(wiki: &str, base: &DataFrame, output_dir: &Path) -> Result<()> {
-    debug!(wiki = wiki, "computing inequality metrics");
-
-    let mut result = compute_frame(base)?;
-
-    let wiki_col = Column::new("wiki".into(), vec![wiki; result.height()]);
-    result.with_column(wiki_col)?;
-
-    write_output(&mut result, wiki, "inequality", output_dir)?;
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::TestDir;
 
     #[test]
     fn gini_handles_simple_distribution() {
@@ -368,8 +351,7 @@ mod tests {
     }
 
     #[test]
-    fn compute_skips_null_groups_and_writes_output() -> Result<()> {
-        let output_dir = TestDir::new()?;
+    fn compute_skips_null_groups() -> Result<()> {
         let columns = vec![
             Column::new(
                 "year_month".into(),
@@ -387,16 +369,7 @@ mod tests {
         ];
         let base = DataFrame::new_infer_height(columns)?;
 
-        compute("testwiki", &base, output_dir.path())?;
-
-        let result_path = output_dir
-            .path()
-            .join("testwiki")
-            .join("inequality.parquet");
-        let result_path = result_path.to_string_lossy().to_string();
-        let result =
-            LazyFrame::scan_parquet(result_path.as_str().into(), Default::default())?.collect()?;
-
+        let result = compute_frame(&base)?;
         assert_eq!(result.height(), 3);
         let monthly = result
             .lazy()

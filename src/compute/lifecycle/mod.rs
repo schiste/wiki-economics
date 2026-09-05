@@ -4,7 +4,7 @@
 pub(crate) const ALGORITHM_VERSION: &str =
     "editor-lifecycle-v3-explicit-identified-registered-editors";
 
-use super::{add_wiki_column, concat_frames, labor, write_output};
+use super::{add_wiki_column, concat_frames, write_output};
 use crate::{metric_registry::MetricFamily, storage};
 use anyhow::Result;
 use polars::prelude::*;
@@ -12,6 +12,27 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::path::Path;
+
+fn normalize_period_key(year_month_key: i32, period_type: &str) -> Result<i32> {
+    let year = year_month_key / 100;
+    let month = year_month_key % 100;
+
+    match period_type {
+        "month" => Ok(year_month_key),
+        "quarter" => Ok(year * 10 + ((month - 1) / 3) + 1),
+        "year" => Ok(year),
+        _ => anyhow::bail!("unsupported period type: {period_type}"),
+    }
+}
+
+fn format_period_key(period_key: i32, period_type: &str) -> String {
+    match period_type {
+        "month" => format!("{}-{:02}", period_key / 100, period_key % 100),
+        "quarter" => format!("{}-Q{}", period_key / 10, period_key % 10),
+        "year" => period_key.to_string(),
+        _ => period_key.to_string(),
+    }
+}
 
 #[derive(Clone)]
 pub(super) struct ChurnAccumulator {
@@ -61,7 +82,7 @@ impl ChurnAccumulator {
         let period_keys: Vec<i32> = self.active.keys().copied().collect();
         let periods: Vec<String> = period_keys
             .iter()
-            .map(|period_key| labor::format_period_key(*period_key, self.period_type))
+            .map(|period_key| format_period_key(*period_key, self.period_type))
             .collect();
         let active_editors: Vec<u32> = period_keys
             .iter()
@@ -163,10 +184,8 @@ impl RegisteredState {
                 .or_insert((year, year));
 
             self.churn_month.observe(user_id, year_month_key);
-            self.churn_quarter.observe(
-                user_id,
-                labor::normalize_period_key(year_month_key, "quarter")?,
-            );
+            self.churn_quarter
+                .observe(user_id, normalize_period_key(year_month_key, "quarter")?);
             self.churn_year.observe(user_id, year);
         }
 
@@ -204,10 +223,8 @@ impl RegisteredState {
                 })
                 .or_insert((year, year));
             self.churn_month.observe(user_id, year_month_key);
-            self.churn_quarter.observe(
-                user_id,
-                labor::normalize_period_key(year_month_key, "quarter")?,
-            );
+            self.churn_quarter
+                .observe(user_id, normalize_period_key(year_month_key, "quarter")?);
             self.churn_year.observe(user_id, year);
         }
         Ok(())
@@ -395,6 +412,53 @@ fn registered_editor_totals(base: &DataFrame) -> Result<DataFrame> {
         .map_err(Into::into)
 }
 
+fn build_cohort_output(editor_spans: &DataFrame, all_years: &[i32]) -> Result<DataFrame> {
+    let cohort_years = editor_spans.column("cohort_year")?.i32()?;
+    let last_years = editor_spans.column("last_year")?.i32()?;
+
+    let mut initial_sizes: BTreeMap<i32, u32> = BTreeMap::new();
+    let mut ended_by: HashMap<(i32, i32), u32> = HashMap::new();
+    for index in 0..editor_spans.height() {
+        let (Some(cohort_year), Some(last_year)) = (cohort_years.get(index), last_years.get(index))
+        else {
+            continue;
+        };
+        *initial_sizes.entry(cohort_year).or_insert(0) += 1;
+        *ended_by.entry((cohort_year, last_year)).or_insert(0) += 1;
+    }
+
+    let mut cohort_years_out = Vec::new();
+    let mut years_out = Vec::new();
+    let mut survived_out = Vec::new();
+    let mut initial_out = Vec::new();
+    for (&cohort_year, &initial) in &initial_sizes {
+        let mut survivors = 0_u32;
+        let mut cohort_rows = Vec::new();
+        for &year in all_years.iter().rev() {
+            if year < cohort_year {
+                continue;
+            }
+            survivors += ended_by.get(&(cohort_year, year)).copied().unwrap_or(0);
+            cohort_rows.push((year, survivors));
+        }
+        cohort_rows.reverse();
+        for (year, survived) in cohort_rows {
+            cohort_years_out.push(cohort_year.to_string());
+            years_out.push(year.to_string());
+            survived_out.push(survived);
+            initial_out.push(initial);
+        }
+    }
+
+    DataFrame::new_infer_height(vec![
+        Column::new("cohort_year".into(), cohort_years_out),
+        Column::new("year".into(), years_out),
+        Column::new("survived_editors".into(), survived_out),
+        Column::new("initial_editors".into(), initial_out),
+    ])
+    .map_err(Into::into)
+}
+
 pub(super) fn finalize_funnel(
     stats: HashMap<i64, (i32, u32)>,
     wiki: &str,
@@ -471,7 +535,7 @@ pub(super) fn finalize_labor_cohorts(
         ),
     ];
     let editor_spans = DataFrame::new_infer_height(editor_span_columns)?;
-    let mut cohort_out = labor::build_cohort_output(&editor_spans, &all_years)?;
+    let mut cohort_out = build_cohort_output(&editor_spans, &all_years)?;
     add_wiki_column(&mut cohort_out, wiki)?;
     write_output(&mut cohort_out, wiki, "labor_cohorts", output_dir)
 }
@@ -491,4 +555,50 @@ pub(super) fn write_lifecycle_outputs(
     let mut churn = concat_frames(churn_frames)?;
     add_wiki_column(&mut churn, wiki)?;
     write_output(&mut churn, wiki, "labor_churn", output_dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cohort_output_skips_null_years() -> Result<()> {
+        let editor_spans = DataFrame::new_infer_height(vec![
+            Column::new(
+                "cohort_year".into(),
+                vec![Some(2024_i32), None, Some(2025), None, Some(2025)],
+            ),
+            Column::new(
+                "last_year".into(),
+                vec![Some(2025_i32), Some(2025), None, Some(2025), Some(2025)],
+            ),
+        ])
+        .expect("cohort fixture should be valid");
+
+        let cohort_out = build_cohort_output(&editor_spans, &[2024, 2025])?;
+        assert_eq!(cohort_out.height(), 3);
+        assert_eq!(
+            cohort_out.column("cohort_year")?.str()?.get(0),
+            Some("2024")
+        );
+        assert_eq!(
+            cohort_out.column("cohort_year")?.str()?.get(2),
+            Some("2025")
+        );
+        assert_eq!(cohort_out.column("year")?.str()?.get(2), Some("2025"));
+        Ok(())
+    }
+
+    #[test]
+    fn period_keys_cover_supported_and_invalid_granularities() -> Result<()> {
+        assert_eq!(normalize_period_key(202401, "month")?, 202401);
+        assert_eq!(normalize_period_key(202404, "quarter")?, 20242);
+        assert_eq!(normalize_period_key(202401, "year")?, 2024);
+        assert!(normalize_period_key(202401, "week").is_err());
+        assert_eq!(format_period_key(202401, "month"), "2024-01");
+        assert_eq!(format_period_key(20242, "quarter"), "2024-Q2");
+        assert_eq!(format_period_key(2024, "year"), "2024");
+        assert_eq!(format_period_key(202401, "week"), "202401");
+        Ok(())
+    }
 }

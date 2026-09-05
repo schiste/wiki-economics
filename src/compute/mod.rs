@@ -6,9 +6,6 @@
 //! belong in `monthly`, `activity`, `lifecycle`, and `weekly`.
 
 pub mod activity;
-pub mod gdp;
-pub mod inequality;
-pub mod labor;
 pub mod lifecycle;
 pub mod monthly;
 pub mod weekly;
@@ -735,7 +732,7 @@ fn compute_all_incremental_cached(
                 monthly::ALGORITHM_VERSION,
                 input_digest,
                 "editor_month",
-                || inequality::editor_month_frame(&base),
+                || monthly::inequality::editor_month_frame(&base),
             );
             inequality_editor_month_frames.push(inequality_editor_month?);
             if let Some(input_digest) = input_digest {
@@ -898,7 +895,7 @@ fn compute_nonweekly_flat(
             None,
             output_dir,
             MonthlyFrames {
-                inequality_frames: vec![inequality::compute_frame(base)?],
+                inequality_frames: vec![monthly::inequality::compute_frame(base)?],
                 gdp_frames: vec![gdp_monthly_frame(base)?],
                 gdp_type_frames: vec![gdp_type_share_frame(base)?],
                 identity_coverage_frames: vec![editor_identity_coverage_frame(base)?],
@@ -1378,25 +1375,18 @@ pub(crate) fn execute_family(
     let plan = ComputePlan::only(family)?;
     if family == MetricFamily::PageWeek {
         let config = WeeklyAggregationConfig::for_snapshot(data_dir, wiki, snapshot.as_deref())?;
-        compute_page_weekly_edits_for_snapshot_cached(
+        return compute_page_weekly_edits_for_snapshot_cached(
             wiki,
             data_dir,
             output_dir,
             &config,
             snapshot.as_deref(),
             None,
-        )?;
-    } else {
-        compute_all_incremental_cached(
-            wiki,
-            data_dir,
-            output_dir,
-            snapshot.as_deref(),
-            plan,
-            None,
-        )?;
+        )
+        .map(|_| ());
     }
-    Ok(())
+    compute_all_incremental_cached(wiki, data_dir, output_dir, snapshot.as_deref(), plan, None)
+        .map(|_| ())
 }
 
 pub(crate) fn compute_all_for_snapshot(
@@ -2351,7 +2341,7 @@ mod tests {
         assert_eq!(type_share.column("edits")?.u32()?.get(0), Some(3));
         assert_eq!(type_share.column("editors")?.u32()?.get(0), Some(2));
 
-        let inequality = inequality::compute_frame(&projected)?;
+        let inequality = monthly::inequality::compute_frame(&projected)?;
         assert_eq!(inequality.column("total_editors")?.u32()?.get(0), Some(2));
         assert_eq!(inequality.column("total_edits")?.u32()?.get(0), Some(3));
         Ok(())
@@ -2365,7 +2355,7 @@ mod tests {
         let type_share = gdp_type_share_frame(&projected)?;
         assert_eq!(type_share.column("edits")?.u32()?.get(0), Some(3));
         assert_eq!(type_share.column("editors")?.u32()?.get(0), Some(0));
-        assert_eq!(inequality::compute_frame(&projected)?.height(), 0);
+        assert_eq!(monthly::inequality::compute_frame(&projected)?.height(), 0);
 
         let output = TestDir::new()?;
         assert!(read_editor_identity_coverage(output.path(), "testwiki")?.is_none());
@@ -2615,14 +2605,7 @@ mod tests {
     }
 
     fn only_family(family: MetricFamily) -> ComputePlan {
-        let mut plan = ComputePlan {
-            monthly: Invalidation::Reuse,
-            activity_tiers: Invalidation::Reuse,
-            lifecycle: Invalidation::Reuse,
-            page_week: Invalidation::Reuse,
-        };
-        plan.set_invalidation(family, Invalidation::Recompute);
-        plan
+        ComputePlan::only(family).expect("fixture family should be a core compute family")
     }
 
     #[test]
@@ -2645,9 +2628,10 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "patrol is not a core compute family")]
     fn core_only_family_fixture_rejects_patrol() {
-        let _ = only_family(MetricFamily::Patrol);
+        let error = ComputePlan::only(MetricFamily::Patrol)
+            .expect_err("patrol must not enter the history compute plan");
+        assert!(error.to_string().contains("not a core compute family"));
     }
 
     #[test]
@@ -2751,7 +2735,7 @@ mod tests {
                 malformed_monthly_output.path(),
                 MonthlyFrames {
                     inequality_frames: vec![
-                        inequality::compute_frame(&base)
+                        monthly::inequality::compute_frame(&base)
                             .expect("inequality fixture should compute")
                     ],
                     gdp_frames: vec![gdp_monthly_frame(&base).expect("GDP fixture should compute")],

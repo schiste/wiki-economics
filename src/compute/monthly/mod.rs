@@ -1,5 +1,7 @@
 //! Stateless monthly metric computation, inequality cache units, and outputs.
 
+pub(super) mod inequality;
+
 /// Semantic version for monthly stateless aggregates.
 ///
 /// Increment this when GDP, GDP user-type share, inequality, or monthly labor
@@ -10,7 +12,6 @@ use super::{
     PendingOutput, add_wiki_column, concat_frames, editor_identity_available_expr,
     ensure_editor_identity_inputs, sort_frame, unique_identified_editors_expr, write_output,
 };
-use crate::compute::inequality;
 use anyhow::{Context, Result};
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
