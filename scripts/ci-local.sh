@@ -146,6 +146,9 @@ cargo fmt --all -- --check
 echo "==> cargo clippy --locked --all-targets --all-features -- -D warnings"
 cargo clippy --locked --all-targets --all-features -- -D warnings
 
+echo "==> cargo run --locked -- metric-catalog --check"
+cargo run --locked -- metric-catalog --check
+
 echo "==> cargo test --locked --all-targets --all-features"
 cargo test --locked --all-targets --all-features
 

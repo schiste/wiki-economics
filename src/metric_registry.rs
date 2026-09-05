@@ -1,5 +1,9 @@
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::fs::{self, File};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -155,7 +159,8 @@ impl MetricFamily {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum FieldKind {
     String,
     I32,
@@ -182,7 +187,8 @@ const fn field(name: &'static str, kind: FieldKind) -> FieldDefinition {
     (name, kind)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum OrderingContract {
     WikiMajor,
     StablePageHashBucketPageKeyWeek,
@@ -197,19 +203,22 @@ impl OrderingContract {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum PublicationScope {
     MergedAndPerWiki,
     PerWikiOnly,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum BrowserPartitioning {
     PerWikiAndGlobalYearShards,
     RustDefaultsOnly,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
 pub(crate) enum AggregationSemantics {
     Additive,
     Ratio {
@@ -699,9 +708,283 @@ pub(crate) fn definitions() -> impl ExactSizeIterator<Item = &'static MetricDefi
     METRIC_DEFINITIONS.iter()
 }
 
+pub(crate) const CATALOG_JSON_PATH: &str = "config/generated/metric-catalog.json";
+pub(crate) const CATALOG_MARKDOWN_PATH: &str = "docs/generated/metric-catalog.md";
+const CATALOG_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Serialize)]
+struct MetricCatalogDocument {
+    schema_version: u32,
+    metrics: Vec<MetricCatalogEntry>,
+}
+
+#[derive(Debug, Serialize)]
+struct MetricCatalogEntry {
+    id: MetricId,
+    family: MetricFamily,
+    algorithm_version: String,
+    schema: Vec<CatalogField>,
+    aggregation: Vec<CatalogAggregationRule>,
+    publication: CatalogPublication,
+    receipt: CatalogReceipt,
+    fingerprint: CatalogFingerprint,
+    browser: CatalogBrowser,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogField {
+    name: String,
+    data_type: FieldKind,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogAggregationRule {
+    columns: Vec<String>,
+    #[serde(flatten)]
+    semantics: AggregationSemantics,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogPublication {
+    scope: PublicationScope,
+    per_wiki_artifact: String,
+    merged_artifact: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogReceipt {
+    date_column: Option<String>,
+    ordering_contract: String,
+    conservation_columns: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogFingerprint {
+    artifact_identity: String,
+    family: MetricFamily,
+    algorithm_version: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogBrowser {
+    partitioning: BrowserPartitioning,
+    per_wiki_path: Option<String>,
+    global_path: Option<String>,
+}
+
+fn catalog_document() -> MetricCatalogDocument {
+    let metrics = definitions()
+        .map(|definition| {
+            let artifact = definition.id.parquet_name();
+            let browser_enabled =
+                definition.browser_partitioning == BrowserPartitioning::PerWikiAndGlobalYearShards;
+            MetricCatalogEntry {
+                id: definition.id,
+                family: definition.family,
+                algorithm_version: definition.algorithm_version.to_string(),
+                schema: definition
+                    .schema
+                    .iter()
+                    .map(|(name, kind)| CatalogField {
+                        name: (*name).to_string(),
+                        data_type: *kind,
+                    })
+                    .collect(),
+                aggregation: definition
+                    .aggregation
+                    .iter()
+                    .map(|rule| CatalogAggregationRule {
+                        columns: rule
+                            .columns
+                            .iter()
+                            .map(|column| (*column).to_string())
+                            .collect(),
+                        semantics: rule.semantics,
+                    })
+                    .collect(),
+                publication: CatalogPublication {
+                    scope: definition.publication_scope,
+                    per_wiki_artifact: format!("{{wiki}}/{artifact}"),
+                    merged_artifact: (definition.publication_scope
+                        == PublicationScope::MergedAndPerWiki)
+                        .then_some(artifact.clone()),
+                },
+                receipt: CatalogReceipt {
+                    date_column: definition.date_column.map(str::to_string),
+                    ordering_contract: definition.ordering.as_str().to_string(),
+                    conservation_columns: definition
+                        .conservation_column
+                        .map(|column| vec![column.to_string()])
+                        .unwrap_or_default(),
+                },
+                fingerprint: CatalogFingerprint {
+                    artifact_identity: artifact,
+                    family: definition.family,
+                    algorithm_version: definition.algorithm_version.to_string(),
+                },
+                browser: CatalogBrowser {
+                    partitioning: definition.browser_partitioning,
+                    per_wiki_path: browser_enabled
+                        .then(|| format!("browser-data/{}/{{wiki}}.parquet", definition.name)),
+                    global_path: browser_enabled
+                        .then(|| format!("browser-data/{}/all-{{year}}.parquet", definition.name)),
+                },
+            }
+        })
+        .collect();
+    MetricCatalogDocument {
+        schema_version: CATALOG_SCHEMA_VERSION,
+        metrics,
+    }
+}
+
+pub(crate) fn catalog_json() -> Result<Vec<u8>> {
+    let mut rendered = serde_json::to_vec_pretty(&catalog_document())?;
+    rendered.push(b'\n');
+    Ok(rendered)
+}
+
+fn aggregation_label(rule: &AggregationRule) -> String {
+    let columns = rule.columns.join(", ");
+    match rule.semantics {
+        AggregationSemantics::Additive => format!("additive: {columns}"),
+        AggregationSemantics::Ratio {
+            numerators,
+            denominator,
+        } => format!(
+            "ratio: {columns} ← ({}) / {denominator}",
+            numerators.join(" + ")
+        ),
+        AggregationSemantics::DistinctAtGrain { grain } => {
+            format!("distinct-at-grain: {columns} @ {}", grain.join(" + "))
+        }
+        AggregationSemantics::SufficientStatistic { components } => format!(
+            "sufficient-statistic: {columns} from {}",
+            components.join(" + ")
+        ),
+        AggregationSemantics::NonComposable => format!("non-composable: {columns}"),
+    }
+}
+
+fn markdown_cell(value: &str) -> String {
+    value.replace('|', "\\|").replace('\n', " ")
+}
+
+pub(crate) fn catalog_markdown() -> String {
+    let mut output = String::from(
+        "# Generated metric catalog\n\n<!-- Generated from src/metric_registry.rs by `wiki-econ metric-catalog`. Do not edit by hand. -->\n\nThe tables below are deterministic projections of the canonical Rust metric registry.\n\n## Publication, receipts, fingerprints, and browser layout\n\n| Metric | Family / algorithm | Publication | Receipt contract | Fingerprint identity | Browser partitioning |\n| --- | --- | --- | --- | --- | --- |\n",
+    );
+    for definition in definitions() {
+        let publication = match definition.publication_scope {
+            PublicationScope::MergedAndPerWiki => "merged + per-wiki",
+            PublicationScope::PerWikiOnly => "per-wiki only",
+        };
+        let browser = match definition.browser_partitioning {
+            BrowserPartitioning::PerWikiAndGlobalYearShards => {
+                "per-wiki files + global year shards"
+            }
+            BrowserPartitioning::RustDefaultsOnly => "Rust defaults only",
+        };
+        let receipt = format!(
+            "date: {}; order: {}; conserve: {}",
+            definition.date_column.unwrap_or("—"),
+            definition.ordering.as_str(),
+            definition.conservation_column.unwrap_or("—")
+        );
+        output.push_str(&format!(
+            "| `{}` | `{}` / `{}` | {} | {} | `{}` | {} |\n",
+            definition.name,
+            definition.family.as_str(),
+            definition.algorithm_version,
+            publication,
+            markdown_cell(&receipt),
+            definition.id.parquet_name(),
+            browser,
+        ));
+    }
+    output.push_str(
+        "\n## Schemas and aggregation semantics\n\n| Metric | Schema | Aggregation contracts |\n| --- | --- | --- |\n",
+    );
+    for definition in definitions() {
+        let schema = definition
+            .schema
+            .iter()
+            .map(|(name, kind)| format!("{name}:{}", kind.parquet_name()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let aggregation = definition
+            .aggregation
+            .iter()
+            .map(aggregation_label)
+            .collect::<Vec<_>>()
+            .join("; ");
+        output.push_str(&format!(
+            "| `{}` | {} | {} |\n",
+            definition.name,
+            markdown_cell(&schema),
+            markdown_cell(&aggregation),
+        ));
+    }
+    output
+}
+
+fn generated_paths(workspace_dir: &Path) -> [(PathBuf, Vec<u8>); 2] {
+    [
+        (
+            workspace_dir.join(CATALOG_JSON_PATH),
+            catalog_json().expect("static metric registry should serialize"),
+        ),
+        (
+            workspace_dir.join(CATALOG_MARKDOWN_PATH),
+            catalog_markdown().into_bytes(),
+        ),
+    ]
+}
+
+pub(crate) fn sync_generated_catalog(workspace_dir: &Path, check: bool) -> Result<()> {
+    for (path, expected) in generated_paths(workspace_dir) {
+        if check {
+            let actual = fs::read(&path).with_context(|| {
+                format!("generated metric catalog is missing: {}", path.display())
+            })?;
+            ensure!(
+                actual == expected,
+                "generated metric catalog is stale: {}; run `cargo run --locked -- metric-catalog`",
+                path.display()
+            );
+            continue;
+        }
+        let parent = path
+            .parent()
+            .context("generated metric catalog path has no parent")?;
+        fs::create_dir_all(parent)?;
+        let temporary = parent.join(format!(
+            ".{}.{}.tmp",
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .context("generated metric catalog path is not UTF-8")?,
+            std::process::id()
+        ));
+        let result = (|| -> Result<()> {
+            let mut file = File::create(&temporary)?;
+            file.write_all(&expected)?;
+            file.sync_all()?;
+            fs::rename(&temporary, &path)?;
+            File::open(parent)?.sync_all()?;
+            Ok(())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+        result.with_context(|| format!("failed to write {}", path.display()))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestDir;
     use std::collections::BTreeSet;
 
     #[test]
@@ -816,5 +1099,64 @@ mod tests {
             rule.columns.contains(&"median_latency_hours")
                 && rule.semantics == AggregationSemantics::NonComposable
         }));
+    }
+
+    #[test]
+    fn generated_catalog_projects_every_runtime_contract_deterministically() -> Result<()> {
+        let first = catalog_json()?;
+        assert_eq!(first, catalog_json()?);
+        let document: serde_json::Value = serde_json::from_slice(&first)?;
+        let metrics = document["metrics"]
+            .as_array()
+            .context("catalog metrics should be an array")?;
+        assert_eq!(metrics.len(), MetricId::ALL.len());
+        let weekly = metrics
+            .iter()
+            .find(|metric| metric["id"] == "page_weekly_edits")
+            .context("weekly metric should be catalogued")?;
+        assert_eq!(weekly["publication"]["scope"], "per_wiki_only");
+        assert_eq!(weekly["receipt"]["conservation_columns"][0], "edits");
+        assert_eq!(weekly["browser"]["partitioning"], "rust_defaults_only");
+        assert_eq!(
+            weekly["fingerprint"]["algorithm_version"],
+            crate::compute::weekly::ALGORITHM_VERSION
+        );
+        let markdown = catalog_markdown();
+        assert_eq!(markdown, catalog_markdown());
+        assert!(markdown.contains("## Publication, receipts, fingerprints, and browser layout"));
+        assert!(markdown.contains("sufficient-statistic: theil"));
+        assert!(markdown.contains("non-composable: median_latency_hours"));
+        Ok(())
+    }
+
+    #[test]
+    fn generated_catalog_write_and_check_are_fail_closed() -> Result<()> {
+        let workspace = TestDir::new()?;
+        assert!(sync_generated_catalog(workspace.path(), true).is_err());
+        sync_generated_catalog(workspace.path(), false)?;
+        sync_generated_catalog(workspace.path(), true)?;
+
+        let json = workspace.path().join(CATALOG_JSON_PATH);
+        fs::write(&json, b"{}")?;
+        assert!(sync_generated_catalog(workspace.path(), true).is_err());
+
+        fs::remove_file(&json)?;
+        fs::create_dir(&json)?;
+        assert!(sync_generated_catalog(workspace.path(), false).is_err());
+        let parent = json
+            .parent()
+            .context("catalog fixture should have a parent")?;
+        assert!(
+            !parent
+                .join(format!(
+                    ".{}.{}.tmp",
+                    json.file_name()
+                        .and_then(|name| name.to_str())
+                        .context("catalog fixture should be UTF-8")?,
+                    std::process::id()
+                ))
+                .exists()
+        );
+        Ok(())
     }
 }

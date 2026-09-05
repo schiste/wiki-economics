@@ -1,0 +1,987 @@
+{
+  "schema_version": 1,
+  "metrics": [
+    {
+      "id": "business_funnel",
+      "family": "lifecycle",
+      "algorithm_version": "editor-lifecycle-v3-explicit-identified-registered-editors",
+      "schema": [
+        {
+          "name": "cohort_year",
+          "data_type": "string"
+        },
+        {
+          "name": "cohort_size",
+          "data_type": "u32"
+        },
+        {
+          "name": "reached_5",
+          "data_type": "u32"
+        },
+        {
+          "name": "reached_25",
+          "data_type": "u32"
+        },
+        {
+          "name": "reached_100",
+          "data_type": "u32"
+        },
+        {
+          "name": "wiki",
+          "data_type": "string"
+        }
+      ],
+      "aggregation": [
+        {
+          "columns": [
+            "cohort_size",
+            "reached_5",
+            "reached_25",
+            "reached_100"
+          ],
+          "kind": "distinct_at_grain",
+          "grain": [
+            "wiki",
+            "cohort_year"
+          ]
+        }
+      ],
+      "publication": {
+        "scope": "merged_and_per_wiki",
+        "per_wiki_artifact": "{wiki}/business_funnel.parquet",
+        "merged_artifact": "business_funnel.parquet"
+      },
+      "receipt": {
+        "date_column": "cohort_year",
+        "ordering_contract": "wiki-major/v1",
+        "conservation_columns": []
+      },
+      "fingerprint": {
+        "artifact_identity": "business_funnel.parquet",
+        "family": "lifecycle",
+        "algorithm_version": "editor-lifecycle-v3-explicit-identified-registered-editors"
+      },
+      "browser": {
+        "partitioning": "per_wiki_and_global_year_shards",
+        "per_wiki_path": "browser-data/business_funnel/{wiki}.parquet",
+        "global_path": "browser-data/business_funnel/all-{year}.parquet"
+      }
+    },
+    {
+      "id": "gdp",
+      "family": "monthly",
+      "algorithm_version": "monthly-stateless-v5-exact-period-inequality",
+      "schema": [
+        {
+          "name": "year_month",
+          "data_type": "string"
+        },
+        {
+          "name": "page_namespace",
+          "data_type": "i32"
+        },
+        {
+          "name": "user_type",
+          "data_type": "string"
+        },
+        {
+          "name": "gross_bytes_added",
+          "data_type": "i64"
+        },
+        {
+          "name": "net_bytes",
+          "data_type": "i64"
+        },
+        {
+          "name": "total_edits",
+          "data_type": "u32"
+        },
+        {
+          "name": "productive_edits",
+          "data_type": "u32"
+        },
+        {
+          "name": "reverted_edits",
+          "data_type": "u32"
+        },
+        {
+          "name": "unique_editors",
+          "data_type": "u32"
+        },
+        {
+          "name": "minor_edits",
+          "data_type": "u32"
+        },
+        {
+          "name": "bytes_per_edit",
+          "data_type": "f64"
+        },
+        {
+          "name": "bytes_per_editor",
+          "data_type": "f64"
+        },
+        {
+          "name": "revert_rate",
+          "data_type": "f64"
+        },
+        {
+          "name": "wiki",
+          "data_type": "string"
+        }
+      ],
+      "aggregation": [
+        {
+          "columns": [
+            "gross_bytes_added",
+            "net_bytes",
+            "total_edits",
+            "productive_edits",
+            "reverted_edits",
+            "minor_edits"
+          ],
+          "kind": "additive"
+        },
+        {
+          "columns": [
+            "unique_editors"
+          ],
+          "kind": "distinct_at_grain",
+          "grain": [
+            "wiki",
+            "year_month",
+            "page_namespace",
+            "user_type"
+          ]
+        },
+        {
+          "columns": [
+            "bytes_per_edit"
+          ],
+          "kind": "ratio",
+          "numerators": [
+            "net_bytes"
+          ],
+          "denominator": "total_edits"
+        },
+        {
+          "columns": [
+            "bytes_per_editor"
+          ],
+          "kind": "ratio",
+          "numerators": [
+            "net_bytes"
+          ],
+          "denominator": "unique_editors"
+        },
+        {
+          "columns": [
+            "revert_rate"
+          ],
+          "kind": "ratio",
+          "numerators": [
+            "reverted_edits"
+          ],
+          "denominator": "total_edits"
+        }
+      ],
+      "publication": {
+        "scope": "merged_and_per_wiki",
+        "per_wiki_artifact": "{wiki}/gdp.parquet",
+        "merged_artifact": "gdp.parquet"
+      },
+      "receipt": {
+        "date_column": "year_month",
+        "ordering_contract": "wiki-major/v1",
+        "conservation_columns": [
+          "total_edits"
+        ]
+      },
+      "fingerprint": {
+        "artifact_identity": "gdp.parquet",
+        "family": "monthly",
+        "algorithm_version": "monthly-stateless-v5-exact-period-inequality"
+      },
+      "browser": {
+        "partitioning": "per_wiki_and_global_year_shards",
+        "per_wiki_path": "browser-data/gdp/{wiki}.parquet",
+        "global_path": "browser-data/gdp/all-{year}.parquet"
+      }
+    },
+    {
+      "id": "gdp_activity_tiers",
+      "family": "activity_tiers",
+      "algorithm_version": "activity-tiers-v5-exclusive-period-user-type",
+      "schema": [
+        {
+          "name": "year_month",
+          "data_type": "string"
+        },
+        {
+          "name": "period",
+          "data_type": "string"
+        },
+        {
+          "name": "period_start",
+          "data_type": "string"
+        },
+        {
+          "name": "period_end",
+          "data_type": "string"
+        },
+        {
+          "name": "period_type",
+          "data_type": "string"
+        },
+        {
+          "name": "period_months",
+          "data_type": "u32"
+        },
+        {
+          "name": "user_type",
+          "data_type": "string"
+        },
+        {
+          "name": "activity_tier",
+          "data_type": "string"
+        },
+        {
+          "name": "tier_rank",
+          "data_type": "u32"
+        },
+        {
+          "name": "editors",
+          "data_type": "u32"
+        },
+        {
+          "name": "total_edits",
+          "data_type": "u32"
+        },
+        {
+          "name": "net_bytes",
+          "data_type": "i64"
+        },
+        {
+          "name": "gross_bytes",
+          "data_type": "i64"
+        },
+        {
+          "name": "wiki",
+          "data_type": "string"
+        }
+      ],
+      "aggregation": [
+        {
+          "columns": [
+            "total_edits",
+            "net_bytes",
+            "gross_bytes"
+          ],
+          "kind": "additive"
+        },
+        {
+          "columns": [
+            "editors"
+          ],
+          "kind": "distinct_at_grain",
+          "grain": [
+            "wiki",
+            "period",
+            "period_type",
+            "user_type",
+            "activity_tier"
+          ]
+        }
+      ],
+      "publication": {
+        "scope": "merged_and_per_wiki",
+        "per_wiki_artifact": "{wiki}/gdp_activity_tiers.parquet",
+        "merged_artifact": "gdp_activity_tiers.parquet"
+      },
+      "receipt": {
+        "date_column": "period_start",
+        "ordering_contract": "wiki-major/v1",
+        "conservation_columns": [
+          "total_edits"
+        ]
+      },
+      "fingerprint": {
+        "artifact_identity": "gdp_activity_tiers.parquet",
+        "family": "activity_tiers",
+        "algorithm_version": "activity-tiers-v5-exclusive-period-user-type"
+      },
+      "browser": {
+        "partitioning": "per_wiki_and_global_year_shards",
+        "per_wiki_path": "browser-data/gdp_activity_tiers/{wiki}.parquet",
+        "global_path": "browser-data/gdp_activity_tiers/all-{year}.parquet"
+      }
+    },
+    {
+      "id": "gdp_user_type_share",
+      "family": "monthly",
+      "algorithm_version": "monthly-stateless-v5-exact-period-inequality",
+      "schema": [
+        {
+          "name": "year_month",
+          "data_type": "string"
+        },
+        {
+          "name": "user_type",
+          "data_type": "string"
+        },
+        {
+          "name": "edits",
+          "data_type": "u32"
+        },
+        {
+          "name": "net_bytes",
+          "data_type": "i64"
+        },
+        {
+          "name": "editors",
+          "data_type": "u32"
+        },
+        {
+          "name": "wiki",
+          "data_type": "string"
+        }
+      ],
+      "aggregation": [
+        {
+          "columns": [
+            "edits",
+            "net_bytes"
+          ],
+          "kind": "additive"
+        },
+        {
+          "columns": [
+            "editors"
+          ],
+          "kind": "distinct_at_grain",
+          "grain": [
+            "wiki",
+            "year_month",
+            "user_type"
+          ]
+        }
+      ],
+      "publication": {
+        "scope": "merged_and_per_wiki",
+        "per_wiki_artifact": "{wiki}/gdp_user_type_share.parquet",
+        "merged_artifact": "gdp_user_type_share.parquet"
+      },
+      "receipt": {
+        "date_column": "year_month",
+        "ordering_contract": "wiki-major/v1",
+        "conservation_columns": [
+          "edits"
+        ]
+      },
+      "fingerprint": {
+        "artifact_identity": "gdp_user_type_share.parquet",
+        "family": "monthly",
+        "algorithm_version": "monthly-stateless-v5-exact-period-inequality"
+      },
+      "browser": {
+        "partitioning": "per_wiki_and_global_year_shards",
+        "per_wiki_path": "browser-data/gdp_user_type_share/{wiki}.parquet",
+        "global_path": "browser-data/gdp_user_type_share/all-{year}.parquet"
+      }
+    },
+    {
+      "id": "inequality",
+      "family": "monthly",
+      "algorithm_version": "monthly-stateless-v5-exact-period-inequality",
+      "schema": [
+        {
+          "name": "year_month",
+          "data_type": "string"
+        },
+        {
+          "name": "period",
+          "data_type": "string"
+        },
+        {
+          "name": "period_start",
+          "data_type": "string"
+        },
+        {
+          "name": "period_end",
+          "data_type": "string"
+        },
+        {
+          "name": "period_type",
+          "data_type": "string"
+        },
+        {
+          "name": "period_months",
+          "data_type": "u32"
+        },
+        {
+          "name": "user_type",
+          "data_type": "string"
+        },
+        {
+          "name": "gini",
+          "data_type": "f64"
+        },
+        {
+          "name": "theil",
+          "data_type": "f64"
+        },
+        {
+          "name": "palma",
+          "data_type": "f64"
+        },
+        {
+          "name": "min_editors_50pct",
+          "data_type": "u32"
+        },
+        {
+          "name": "total_editors",
+          "data_type": "u32"
+        },
+        {
+          "name": "total_edits",
+          "data_type": "u32"
+        },
+        {
+          "name": "wiki",
+          "data_type": "string"
+        }
+      ],
+      "aggregation": [
+        {
+          "columns": [
+            "total_edits"
+          ],
+          "kind": "additive"
+        },
+        {
+          "columns": [
+            "total_editors"
+          ],
+          "kind": "distinct_at_grain",
+          "grain": [
+            "wiki",
+            "period",
+            "period_type",
+            "user_type"
+          ]
+        },
+        {
+          "columns": [
+            "theil"
+          ],
+          "kind": "sufficient_statistic",
+          "components": [
+            "theil",
+            "total_edits",
+            "total_editors"
+          ]
+        },
+        {
+          "columns": [
+            "gini",
+            "palma",
+            "min_editors_50pct"
+          ],
+          "kind": "non_composable"
+        }
+      ],
+      "publication": {
+        "scope": "merged_and_per_wiki",
+        "per_wiki_artifact": "{wiki}/inequality.parquet",
+        "merged_artifact": "inequality.parquet"
+      },
+      "receipt": {
+        "date_column": "period_start",
+        "ordering_contract": "wiki-major/v1",
+        "conservation_columns": []
+      },
+      "fingerprint": {
+        "artifact_identity": "inequality.parquet",
+        "family": "monthly",
+        "algorithm_version": "monthly-stateless-v5-exact-period-inequality"
+      },
+      "browser": {
+        "partitioning": "per_wiki_and_global_year_shards",
+        "per_wiki_path": "browser-data/inequality/{wiki}.parquet",
+        "global_path": "browser-data/inequality/all-{year}.parquet"
+      }
+    },
+    {
+      "id": "labor_churn",
+      "family": "lifecycle",
+      "algorithm_version": "editor-lifecycle-v3-explicit-identified-registered-editors",
+      "schema": [
+        {
+          "name": "period",
+          "data_type": "string"
+        },
+        {
+          "name": "active_editors",
+          "data_type": "u32"
+        },
+        {
+          "name": "arrivals",
+          "data_type": "u32"
+        },
+        {
+          "name": "departures",
+          "data_type": "u32"
+        },
+        {
+          "name": "period_type",
+          "data_type": "string"
+        },
+        {
+          "name": "arrival_rate",
+          "data_type": "f64"
+        },
+        {
+          "name": "departure_rate",
+          "data_type": "f64"
+        },
+        {
+          "name": "wiki",
+          "data_type": "string"
+        }
+      ],
+      "aggregation": [
+        {
+          "columns": [
+            "active_editors",
+            "arrivals",
+            "departures"
+          ],
+          "kind": "distinct_at_grain",
+          "grain": [
+            "wiki",
+            "period",
+            "period_type"
+          ]
+        },
+        {
+          "columns": [
+            "arrival_rate"
+          ],
+          "kind": "ratio",
+          "numerators": [
+            "arrivals"
+          ],
+          "denominator": "active_editors"
+        },
+        {
+          "columns": [
+            "departure_rate"
+          ],
+          "kind": "ratio",
+          "numerators": [
+            "departures"
+          ],
+          "denominator": "active_editors"
+        }
+      ],
+      "publication": {
+        "scope": "merged_and_per_wiki",
+        "per_wiki_artifact": "{wiki}/labor_churn.parquet",
+        "merged_artifact": "labor_churn.parquet"
+      },
+      "receipt": {
+        "date_column": "period",
+        "ordering_contract": "wiki-major/v1",
+        "conservation_columns": []
+      },
+      "fingerprint": {
+        "artifact_identity": "labor_churn.parquet",
+        "family": "lifecycle",
+        "algorithm_version": "editor-lifecycle-v3-explicit-identified-registered-editors"
+      },
+      "browser": {
+        "partitioning": "per_wiki_and_global_year_shards",
+        "per_wiki_path": "browser-data/labor_churn/{wiki}.parquet",
+        "global_path": "browser-data/labor_churn/all-{year}.parquet"
+      }
+    },
+    {
+      "id": "labor_cohorts",
+      "family": "lifecycle",
+      "algorithm_version": "editor-lifecycle-v3-explicit-identified-registered-editors",
+      "schema": [
+        {
+          "name": "cohort_year",
+          "data_type": "string"
+        },
+        {
+          "name": "year",
+          "data_type": "string"
+        },
+        {
+          "name": "survived_editors",
+          "data_type": "u32"
+        },
+        {
+          "name": "initial_editors",
+          "data_type": "u32"
+        },
+        {
+          "name": "wiki",
+          "data_type": "string"
+        }
+      ],
+      "aggregation": [
+        {
+          "columns": [
+            "survived_editors",
+            "initial_editors"
+          ],
+          "kind": "distinct_at_grain",
+          "grain": [
+            "wiki",
+            "cohort_year",
+            "year"
+          ]
+        }
+      ],
+      "publication": {
+        "scope": "merged_and_per_wiki",
+        "per_wiki_artifact": "{wiki}/labor_cohorts.parquet",
+        "merged_artifact": "labor_cohorts.parquet"
+      },
+      "receipt": {
+        "date_column": "year",
+        "ordering_contract": "wiki-major/v1",
+        "conservation_columns": []
+      },
+      "fingerprint": {
+        "artifact_identity": "labor_cohorts.parquet",
+        "family": "lifecycle",
+        "algorithm_version": "editor-lifecycle-v3-explicit-identified-registered-editors"
+      },
+      "browser": {
+        "partitioning": "per_wiki_and_global_year_shards",
+        "per_wiki_path": "browser-data/labor_cohorts/{wiki}.parquet",
+        "global_path": "browser-data/labor_cohorts/all-{year}.parquet"
+      }
+    },
+    {
+      "id": "labor_monthly",
+      "family": "monthly",
+      "algorithm_version": "monthly-stateless-v5-exact-period-inequality",
+      "schema": [
+        {
+          "name": "year_month",
+          "data_type": "string"
+        },
+        {
+          "name": "page_namespace",
+          "data_type": "i32"
+        },
+        {
+          "name": "user_type",
+          "data_type": "string"
+        },
+        {
+          "name": "unique_editors",
+          "data_type": "u32"
+        },
+        {
+          "name": "total_edits",
+          "data_type": "u32"
+        },
+        {
+          "name": "net_bytes",
+          "data_type": "i64"
+        },
+        {
+          "name": "reverted_edits",
+          "data_type": "u32"
+        },
+        {
+          "name": "wiki",
+          "data_type": "string"
+        }
+      ],
+      "aggregation": [
+        {
+          "columns": [
+            "total_edits",
+            "net_bytes",
+            "reverted_edits"
+          ],
+          "kind": "additive"
+        },
+        {
+          "columns": [
+            "unique_editors"
+          ],
+          "kind": "distinct_at_grain",
+          "grain": [
+            "wiki",
+            "year_month",
+            "page_namespace",
+            "user_type"
+          ]
+        }
+      ],
+      "publication": {
+        "scope": "merged_and_per_wiki",
+        "per_wiki_artifact": "{wiki}/labor_monthly.parquet",
+        "merged_artifact": "labor_monthly.parquet"
+      },
+      "receipt": {
+        "date_column": "year_month",
+        "ordering_contract": "wiki-major/v1",
+        "conservation_columns": [
+          "total_edits"
+        ]
+      },
+      "fingerprint": {
+        "artifact_identity": "labor_monthly.parquet",
+        "family": "monthly",
+        "algorithm_version": "monthly-stateless-v5-exact-period-inequality"
+      },
+      "browser": {
+        "partitioning": "per_wiki_and_global_year_shards",
+        "per_wiki_path": "browser-data/labor_monthly/{wiki}.parquet",
+        "global_path": "browser-data/labor_monthly/all-{year}.parquet"
+      }
+    },
+    {
+      "id": "page_weekly_edits",
+      "family": "page_week",
+      "algorithm_version": "page-week-v2-governed-parallel-buckets",
+      "schema": [
+        {
+          "name": "week_start",
+          "data_type": "string"
+        },
+        {
+          "name": "iso_year",
+          "data_type": "i32"
+        },
+        {
+          "name": "iso_week",
+          "data_type": "i32"
+        },
+        {
+          "name": "page_id",
+          "data_type": "i64"
+        },
+        {
+          "name": "page_title",
+          "data_type": "string"
+        },
+        {
+          "name": "page_namespace",
+          "data_type": "i32"
+        },
+        {
+          "name": "edits",
+          "data_type": "u32"
+        },
+        {
+          "name": "previous_week_edits",
+          "data_type": "u32"
+        },
+        {
+          "name": "wow_change",
+          "data_type": "i64"
+        },
+        {
+          "name": "wow_rate",
+          "data_type": "f64"
+        },
+        {
+          "name": "wiki",
+          "data_type": "string"
+        }
+      ],
+      "aggregation": [
+        {
+          "columns": [
+            "edits"
+          ],
+          "kind": "additive"
+        },
+        {
+          "columns": [
+            "previous_week_edits",
+            "wow_change",
+            "wow_rate"
+          ],
+          "kind": "non_composable"
+        }
+      ],
+      "publication": {
+        "scope": "per_wiki_only",
+        "per_wiki_artifact": "{wiki}/page_weekly_edits.parquet",
+        "merged_artifact": null
+      },
+      "receipt": {
+        "date_column": "week_start",
+        "ordering_contract": "stable-page-hash-bucket/page-key/week/v1",
+        "conservation_columns": [
+          "edits"
+        ]
+      },
+      "fingerprint": {
+        "artifact_identity": "page_weekly_edits.parquet",
+        "family": "page_week",
+        "algorithm_version": "page-week-v2-governed-parallel-buckets"
+      },
+      "browser": {
+        "partitioning": "rust_defaults_only",
+        "per_wiki_path": null,
+        "global_path": null
+      }
+    },
+    {
+      "id": "patrol",
+      "family": "patrol",
+      "algorithm_version": "patrol-metrics-v5-complete-snapshot-months",
+      "schema": [
+        {
+          "name": "year_month",
+          "data_type": "string"
+        },
+        {
+          "name": "wiki",
+          "data_type": "string"
+        },
+        {
+          "name": "page_namespace",
+          "data_type": "i32"
+        },
+        {
+          "name": "user_type",
+          "data_type": "string"
+        },
+        {
+          "name": "total_patrols",
+          "data_type": "i64"
+        },
+        {
+          "name": "unique_patrollers",
+          "data_type": "i32"
+        },
+        {
+          "name": "patrol_new_pages",
+          "data_type": "i64"
+        },
+        {
+          "name": "patrol_diffs",
+          "data_type": "i64"
+        },
+        {
+          "name": "median_latency_hours",
+          "data_type": "f64"
+        },
+        {
+          "name": "p90_latency_hours",
+          "data_type": "f64"
+        },
+        {
+          "name": "patrolled_revisions",
+          "data_type": "i64"
+        },
+        {
+          "name": "autopatrolled_revisions",
+          "data_type": "i64"
+        },
+        {
+          "name": "total_revisions",
+          "data_type": "i64"
+        },
+        {
+          "name": "patrol_coverage_pct",
+          "data_type": "f64"
+        },
+        {
+          "name": "adjusted_coverage_pct",
+          "data_type": "f64"
+        },
+        {
+          "name": "top1_pct",
+          "data_type": "f64"
+        },
+        {
+          "name": "min_patrollers_50pct",
+          "data_type": "i32"
+        }
+      ],
+      "aggregation": [
+        {
+          "columns": [
+            "total_patrols",
+            "patrol_new_pages",
+            "patrol_diffs",
+            "patrolled_revisions",
+            "autopatrolled_revisions",
+            "total_revisions"
+          ],
+          "kind": "additive"
+        },
+        {
+          "columns": [
+            "unique_patrollers"
+          ],
+          "kind": "non_composable"
+        },
+        {
+          "columns": [
+            "patrol_coverage_pct"
+          ],
+          "kind": "ratio",
+          "numerators": [
+            "patrolled_revisions"
+          ],
+          "denominator": "total_revisions"
+        },
+        {
+          "columns": [
+            "adjusted_coverage_pct"
+          ],
+          "kind": "ratio",
+          "numerators": [
+            "patrolled_revisions",
+            "autopatrolled_revisions"
+          ],
+          "denominator": "total_revisions"
+        },
+        {
+          "columns": [
+            "median_latency_hours",
+            "p90_latency_hours",
+            "top1_pct",
+            "min_patrollers_50pct"
+          ],
+          "kind": "non_composable"
+        }
+      ],
+      "publication": {
+        "scope": "merged_and_per_wiki",
+        "per_wiki_artifact": "{wiki}/patrol.parquet",
+        "merged_artifact": "patrol.parquet"
+      },
+      "receipt": {
+        "date_column": "year_month",
+        "ordering_contract": "wiki-major/v1",
+        "conservation_columns": [
+          "total_patrols"
+        ]
+      },
+      "fingerprint": {
+        "artifact_identity": "patrol.parquet",
+        "family": "patrol",
+        "algorithm_version": "patrol-metrics-v5-complete-snapshot-months"
+      },
+      "browser": {
+        "partitioning": "per_wiki_and_global_year_shards",
+        "per_wiki_path": "browser-data/patrol/{wiki}.parquet",
+        "global_path": "browser-data/patrol/all-{year}.parquet"
+      }
+    }
+  ]
+}

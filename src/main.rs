@@ -112,6 +112,18 @@ enum Commands {
     #[command(hide = true)]
     SiteFixture,
 
+    /// Generate or verify the deterministic metric catalog projections
+    #[command(hide = true)]
+    MetricCatalog {
+        /// Repository root receiving the generated JSON and Markdown files
+        #[arg(long, default_value = ".")]
+        workspace_dir: PathBuf,
+
+        /// Verify checked-in files without modifying them
+        #[arg(long)]
+        check: bool,
+    },
+
     /// Write deterministic nlwiki/ptwiki/frwiki browser scalability fixtures
     #[command(hide = true)]
     BrowserPerformanceFixture,
@@ -1287,6 +1299,10 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             fingerprint::record_dashboard_defaults(&output_dir, &workspace_dir, &defaults_dir)?;
         }
         Commands::SiteFixture => dashboard::write_site_fixture(&output_dir)?,
+        Commands::MetricCatalog {
+            workspace_dir,
+            check,
+        } => metric_registry::sync_generated_catalog(&workspace_dir, check)?,
         Commands::BrowserPerformanceFixture => {
             dashboard::write_browser_performance_fixture(&output_dir)?
         }
@@ -4960,6 +4976,21 @@ mod tests {
                 .iter()
                 .any(|entry| entry.wiki == "frwiki" && entry.rows == 21_000)
         );
+        let catalog_workspace = TestDir::new()?;
+        run_with_ops(
+            command(Commands::MetricCatalog {
+                workspace_dir: catalog_workspace.path().to_path_buf(),
+                check: false,
+            }),
+            &RecordingOps::default(),
+        )?;
+        run_with_ops(
+            command(Commands::MetricCatalog {
+                workspace_dir: catalog_workspace.path().to_path_buf(),
+                check: true,
+            }),
+            &RecordingOps::default(),
+        )?;
         Ok(())
     }
 

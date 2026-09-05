@@ -175,6 +175,7 @@ python3 -m unittest discover -s scripts -p 'test_*.py'
 - [Architecture](docs/architecture.md)
 - [Production Topology](docs/production-topology.md)
 - [Generated Stack Reference](docs/generated/stack-reference.md)
+- [Generated Metric Catalog](docs/generated/metric-catalog.md)
 - [Admin Server](docs/admin-server.md)
 - [Cloud VPS Deployment](docs/cloud-vps-deploy.md)
 - [Toolforge Deployment](deploy/toolforge/README.md)

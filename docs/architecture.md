@@ -3,6 +3,9 @@
 This document records the decisions that currently matter to the codebase.
 Exact dependency versions and lifecycle states are generated in the
 [stack reference](generated/stack-reference.md).
+Metric schemas, ownership, publication and receipt contracts, fingerprint
+identities, browser layouts, and aggregation semantics are generated from the
+canonical Rust registry in the [metric catalog](generated/metric-catalog.md).
 
 ## Pipeline Overview
 

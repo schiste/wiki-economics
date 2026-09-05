@@ -233,6 +233,9 @@ jobs:
       - name: Lint
         run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
+      - name: Verify generated metric catalog
+        run: cargo run --locked -- metric-catalog --check
+
       # Note: the test suite runs in the `coverage` job under cargo-llvm-cov,
       # which subsumes a plain `cargo test`. Running `cargo test` here too
       # would double the wall time without adding signal.
