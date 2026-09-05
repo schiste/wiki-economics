@@ -410,3 +410,14 @@ pub(super) fn extract_php_array_body(value: &str) -> Option<&str> {
         })?;
     Some(&value[open_brace + 1..open_brace + end_offset])
 }
+
+#[cfg(test)]
+mod tests {
+    use super::apply_decoded_text;
+
+    #[test]
+    fn text_outside_a_log_field_is_ignored() {
+        apply_decoded_text(None, Some("type"), false, "patrol".to_string());
+        apply_decoded_text(None, None, false, "whitespace".to_string());
+    }
+}

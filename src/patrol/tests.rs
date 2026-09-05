@@ -1322,6 +1322,51 @@ sysop</params></logitem>
 }
 
 #[test]
+fn typed_logging_consumers_propagate_invalid_event_dates() -> Result<()> {
+    let temp_dir = TestDir::new()?;
+    let invalid_block = temp_dir.path().join("invalid-block.xml.gz");
+    write_gz(
+        &invalid_block,
+        r#"<mediawiki><logitem><id>1</id><timestamp>bad</timestamp><type>block</type><action>block</action><logtitle>User:Editor</logtitle><params>infinity</params></logitem></mediawiki>"#,
+    )?;
+    let mut patrol_writer =
+        PatrolWriter::new_with_batch_rows(&temp_dir.path().join("patrol.parquet"), 10)?;
+    let mut rights_writer =
+        RightsWriter::new_with_batch_rows(&temp_dir.path().join("rights.parquet"), 10)?;
+    let mut block_writer = AccountBlockWriter::new_with_batch_rows(
+        &temp_dir.path().join("account-blocks.parquet"),
+        10,
+    )?;
+    let error = parse_logging_events_with_blocks(
+        &invalid_block,
+        Some("2026-08"),
+        &mut patrol_writer,
+        &mut rights_writer,
+        Some(&mut block_writer),
+    )
+    .expect_err("an invalid block date must propagate from the typed consumer");
+    assert!(error.to_string().contains("block timestamp"));
+
+    let invalid_creation = temp_dir.path().join("invalid-creation.xml.gz");
+    write_gz(
+        &invalid_creation,
+        r#"<mediawiki><logitem><id>2</id><timestamp>bad</timestamp><type>newusers</type><action>create</action><logtitle>User:Editor</logtitle><params>42</params></logitem></mediawiki>"#,
+    )?;
+    let error = parse_account_creation_events(
+        &invalid_creation,
+        "2026-08",
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        &mut HashMap::new(),
+        &mut BTreeMap::new(),
+    )
+    .expect_err("an invalid account-creation date must propagate from the typed consumer");
+    assert!(error.to_string().contains("newusers timestamp"));
+    Ok(())
+}
+
+#[test]
 fn generation_fetch_is_snapshot_aware_monthly_and_provenanced() -> Result<()> {
     let data_dir = TestDir::new()?;
     let xml = r#"<mediawiki xmlns="http://www.mediawiki.org/xml/export-0.11/">
