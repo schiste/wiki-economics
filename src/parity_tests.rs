@@ -618,6 +618,37 @@ fn assert_adversarial_coverage(fixture: &Fixture) {
     );
 }
 
+fn assert_base_parquet_identity_cases(frame: &DataFrame, wiki: &str) -> Result<()> {
+    let types = frame
+        .column("user_type")?
+        .str()?
+        .iter()
+        .flatten()
+        .collect::<BTreeSet<_>>();
+    if wiki == "alphawiki" {
+        assert_eq!(
+            types,
+            BTreeSet::from(["anonymous", "bot", "registered", "temporary"]),
+            "base Parquet lost an adversarial user type"
+        );
+        assert!(
+            frame
+                .column("is_indefinitely_blocked")?
+                .bool()?
+                .iter()
+                .flatten()
+                .any(|blocked| blocked),
+            "base Parquet lost block-state evidence"
+        );
+        let renamed = selected(frame, col("event_user_id").eq(lit(10_i64)))?;
+        let distinct = |column: &str| -> Result<usize> { Ok(renamed.column(column)?.n_unique()?) };
+        assert!(distinct("event_user_text_historical")? > 1);
+        assert!(distinct("year_month")? > 1);
+        assert!(distinct("page_namespace")? > 1);
+    }
+    Ok(())
+}
+
 #[test]
 fn adversarial_metric_semantics_match_every_publication_layer() -> Result<()> {
     init_test_tracing();
@@ -646,6 +677,7 @@ fn adversarial_metric_semantics_match_every_publication_layer() -> Result<()> {
         let base_path = base_dir.join(format!("{wiki}.parquet"));
         write_parquet(&base_path, history_frame(&fixture, wiki)?)?;
         let base = read_parquet(&base_path)?;
+        assert_base_parquet_identity_cases(&base, wiki)?;
         compute::gdp::compute(wiki, &base, &output_dir)?;
         compute::labor::compute(wiki, &base, &output_dir)?;
         compute::inequality::compute(wiki, &base, &output_dir)?;
