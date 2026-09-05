@@ -2146,6 +2146,7 @@ fn record_fetch_stage(
 /// is safe to call immediately once ingest succeeds — no downstream stage
 /// (compute, patrol) reads from it. Missing directories are a no-op, matching
 /// the idempotent `find ... -delete` this replaces in `run-refresh.sh`.
+#[cfg(any(test, coverage))]
 pub fn cleanup_raw_dump(wiki: &str, data_dir: &Path) -> Result<()> {
     let raw_dir = data_dir.join("raw").join(wiki);
     if !raw_dir.exists() {

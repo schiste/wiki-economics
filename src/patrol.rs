@@ -1661,25 +1661,6 @@ pub(crate) const fn algorithm_version() -> &'static str {
     PATROL_COMPUTE_ALGORITHM_VERSION
 }
 
-pub(crate) fn cached_sources_available(data_dir: &Path, wiki: &str) -> bool {
-    let patrol_dir = data_dir.join("patrol").join(wiki);
-    let metadata_valid = fs::read(patrol_dir.join("autopatrol_groups.json"))
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .and_then(|value| value.get("autopatrol_groups").cloned())
-        .is_some_and(|groups| groups.is_array());
-    metadata_valid
-        && ["patrol.parquet", "rights.parquet"]
-            .iter()
-            .map(|name| patrol_dir.join(name))
-            .all(|path| {
-                File::open(path)
-                    .ok()
-                    .and_then(|file| ParquetReader::new(file).num_rows().ok())
-                    .is_some_and(|rows| rows > 0)
-            })
-}
-
 pub(crate) fn cached_sources_available_for_snapshot(
     data_dir: &Path,
     wiki: &str,

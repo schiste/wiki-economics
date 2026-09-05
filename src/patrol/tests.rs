@@ -3579,35 +3579,6 @@ fn clear_patrol_parts_dir_is_idempotent_and_removes_existing_dir() -> Result<()>
 }
 
 #[test]
-fn cached_patrol_sources_require_three_nonempty_files() -> Result<()> {
-    let data_dir = TestDir::new()?;
-    let patrol_dir = data_dir.path().join("patrol/testwiki");
-    fs::create_dir_all(&patrol_dir)?;
-    assert!(!cached_sources_available(data_dir.path(), "testwiki"));
-    fs::write(
-        patrol_dir.join("autopatrol_groups.json"),
-        b"{\"autopatrol_groups\":[]}",
-    )?;
-    write_patrol_events(
-        &patrol_dir.join("patrol.parquet"),
-        &[(Some("2026-01-01 00:00:00"), 1, 0, Some("Patroller"))],
-    )?;
-    write_rights_events(
-        &patrol_dir.join("rights.parquet"),
-        &[(
-            Some("2026-01-01 00:00:00"),
-            Some("Editor"),
-            Some(""),
-            Some("sysop"),
-        )],
-    )?;
-    assert!(cached_sources_available(data_dir.path(), "testwiki"));
-    fs::write(patrol_dir.join("rights.parquet"), b"")?;
-    assert!(!cached_sources_available(data_dir.path(), "testwiki"));
-    Ok(())
-}
-
-#[test]
 fn bootstrap_patrol_parts_writes_atomically_and_ignores_stray_tmp_files() -> Result<()> {
     init_test_tracing();
     let temp_dir = TestDir::new()?;

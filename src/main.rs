@@ -24,6 +24,7 @@ mod logging;
 mod merge;
 mod metric_registry;
 mod observability;
+mod orchestration;
 #[cfg(test)]
 mod parity_tests;
 mod patrol;
@@ -41,13 +42,12 @@ mod wiki_lifecycle;
 mod workload_profile;
 
 use anyhow::{Context, Result, ensure};
-use chrono::{DateTime, Datelike, Utc};
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand, ValueEnum};
 use std::env;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-use std::time::Instant;
 use tracing::{Event, Subscriber, info};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::FmtContext;
@@ -55,6 +55,17 @@ use tracing_subscriber::fmt::format::{
     Compact, DefaultFields, Format, FormatEvent, FormatFields, Writer,
 };
 use tracing_subscriber::registry::LookupSpan;
+
+use orchestration::{
+    AppPaths, ApplicationOps, BenchmarkRequest, CandidateOps, CapacityBenchmarkRequest,
+    HistoryInputOps, MetricComputeOps, PatrolOps, PipelineRunRequest, PreparationMode,
+    PrepareWikiRequest, PublicationOps, QualificationOps, RunContext, SchemaBenchmarkRequest,
+    SnapshotOps, handle_compute, handle_fetch, handle_ingest, handle_pipeline_run,
+    handle_prepare_wiki, handle_snapshot_resolve, timed_stage as run_timed_stage,
+};
+
+#[cfg(test)]
+use orchestration::previous_month_snapshot as snapshot_version_for;
 
 #[derive(Parser)]
 #[command(name = "wiki-econ", about = "Wikipedia economic analysis toolkit")]
@@ -669,263 +680,9 @@ impl RunStage {
     }
 }
 
-trait Ops {
-    fn resolve_snapshot(
-        &self,
-        _wikis: &[String],
-        now: DateTime<Utc>,
-        _data_dir: &Path,
-    ) -> Result<String> {
-        Ok(snapshot_version_for(now))
-    }
-    fn persist_snapshot_plans(
-        &self,
-        _wikis: &[String],
-        _version: &str,
-        _data_dir: &Path,
-    ) -> Result<()> {
-        Ok(())
-    }
-    fn validate_completed_snapshot(
-        &self,
-        _wiki: &str,
-        _version: &str,
-        _data_dir: &Path,
-    ) -> Result<()> {
-        Ok(())
-    }
-    fn fetch_wiki(&self, wiki: &str, version: &str, data_dir: &std::path::Path) -> Result<()>;
-    fn fetch_patrol(&self, wiki: &str, data_dir: &std::path::Path) -> Result<()>;
-    fn fetch_patrol_for_snapshot(
-        &self,
-        wiki: &str,
-        _version: &str,
-        data_dir: &std::path::Path,
-    ) -> Result<()> {
-        self.fetch_patrol(wiki, data_dir)
-    }
-    fn preflight_patrol_for_snapshot(
-        &self,
-        _wiki: &str,
-        _version: &str,
-        _data_dir: &Path,
-    ) -> Result<()> {
-        Ok(())
-    }
-    fn ingest_wiki(
-        &self,
-        wiki: &str,
-        version: Option<&str>,
-        data_dir: &std::path::Path,
-    ) -> Result<()>;
-    fn prepare_wiki_snapshot(
-        &self,
-        wiki: &str,
-        version: &str,
-        data_dir: &Path,
-        _run_id: &str,
-        _window_size: usize,
-    ) -> Result<()> {
-        self.fetch_wiki(wiki, version, data_dir)?;
-        self.ingest_wiki(wiki, Some(version), data_dir)?;
-        self.cleanup_raw_dump(wiki, data_dir)
-    }
-    fn cleanup_raw_dump(&self, wiki: &str, data_dir: &std::path::Path) -> Result<()>;
-    fn compute_all(
-        &self,
-        wiki: &str,
-        data_dir: &std::path::Path,
-        output_dir: &std::path::Path,
-    ) -> Result<()>;
-    fn compute_patrol(
-        &self,
-        wiki: &str,
-        data_dir: &std::path::Path,
-        output_dir: &std::path::Path,
-        rebuild: bool,
-        limit_months: Option<usize>,
-    ) -> Result<()>;
-    fn build_account_creation_staging_report(
-        &self,
-        wiki: &str,
-        version: &str,
-        data_dir: &Path,
-        destination: &Path,
-    ) -> Result<()>;
-    fn benchmark(
-        &self,
-        wikis: &[String],
-        data_dir: &std::path::Path,
-        output_dir: &std::path::Path,
-        warmup: usize,
-        iterations: usize,
-        keep_outputs: bool,
-    ) -> Result<()>;
-    #[allow(clippy::too_many_arguments)]
-    fn capacity_benchmark(
-        &self,
-        wiki: &str,
-        data_dir: &std::path::Path,
-        output_dir: &std::path::Path,
-        scratch_dir: &std::path::Path,
-        report_path: &std::path::Path,
-        weekly_buckets: usize,
-        weekly_secondary_buckets: usize,
-        raw_transient_bytes: u64,
-        nfs_quota_bytes: Option<u64>,
-        storage_reserve_bytes: u64,
-        quota_root: &std::path::Path,
-        minimum_memory_headroom_percent: u8,
-        requested_cpu: usize,
-    ) -> Result<()>;
-    fn cpu_qualification(&self, capacity_reports: &[PathBuf], report: &Path) -> Result<()> {
-        cpu_qualification::run(capacity_reports, report).map(drop)
-    }
-    fn schema_benchmark(
-        &self,
-        data_dir: &Path,
-        scratch_dir: &Path,
-        report_path: &Path,
-        wikis: &[String],
-        run_id: Option<&str>,
-    ) -> Result<()>;
-    fn merge_outputs(&self, output_dir: &std::path::Path, run_id: Option<&str>) -> Result<()>;
-    fn finalize_snapshot(&self, wiki: &str, data_dir: &std::path::Path) -> Result<()>;
-    fn prepare_candidate_snapshot(
-        &self,
-        wiki: &str,
-        version: &str,
-        data_dir: &Path,
-        run_id: &str,
-        window_size: usize,
-    ) -> Result<()> {
-        self.prepare_wiki_snapshot(wiki, version, data_dir, run_id, window_size)
-    }
-    fn plan_candidate_preparation(
-        &self,
-        _wiki: &str,
-        _version: &str,
-        _data_dir: &Path,
-        _output_dir: &Path,
-        _run_id: &str,
-    ) -> Result<publication::WikiPreparationPlan> {
-        Ok(publication::WikiPreparationPlan::Build {
-            same_snapshot_candidate: false,
-            compute_reused: false,
-            patrol_reused: false,
-        })
-    }
-    fn plan_qualification_preparation(
-        &self,
-        _wiki: &str,
-        _version: &str,
-        _data_dir: &Path,
-        _output_dir: &Path,
-        _run_id: &str,
-    ) -> Result<publication::WikiPreparationPlan> {
-        Ok(publication::WikiPreparationPlan::Build {
-            same_snapshot_candidate: false,
-            compute_reused: false,
-            patrol_reused: false,
-        })
-    }
-    fn cached_patrol_sources_available(&self, _wiki: &str, _data_dir: &Path) -> bool {
-        false
-    }
-    fn cached_patrol_generation_available(
-        &self,
-        wiki: &str,
-        _version: &str,
-        data_dir: &Path,
-    ) -> bool {
-        self.cached_patrol_sources_available(wiki, data_dir)
-    }
-    fn compute_candidate(
-        &self,
-        wiki: &str,
-        _version: &str,
-        data_dir: &Path,
-        candidate_dir: &Path,
-    ) -> Result<()> {
-        self.compute_all(wiki, data_dir, candidate_dir)?;
-        Ok(())
-    }
-    fn compute_candidate_patrol(
-        &self,
-        wiki: &str,
-        _version: &str,
-        data_dir: &Path,
-        candidate_dir: &Path,
-    ) -> Result<()> {
-        self.compute_patrol(wiki, data_dir, candidate_dir, false, None)?;
-        Ok(())
-    }
-    fn mark_candidate_ready(
-        &self,
-        data_dir: &Path,
-        output_dir: &Path,
-        lifecycle: &Path,
-        wiki: &str,
-        version: &str,
-        run_id: &str,
-    ) -> Result<PathBuf> {
-        publication::mark_wiki_candidate_ready(
-            data_dir, output_dir, lifecycle, wiki, version, run_id,
-        )
-    }
-    fn ensure_qualification_wiki(&self, lifecycle: &Path, wiki: &str) -> Result<()> {
-        publication::ensure_qualification_wiki(lifecycle, wiki)
-    }
-    fn reset_obsolete_qualification_generation(
-        &self,
-        wiki: &str,
-        version: &str,
-        data_dir: &Path,
-    ) -> Result<bool>;
-    fn mark_qualification_ready(
-        &self,
-        data_dir: &Path,
-        output_dir: &Path,
-        lifecycle: &Path,
-        wiki: &str,
-        version: &str,
-        run_id: &str,
-    ) -> Result<PathBuf> {
-        publication::mark_wiki_qualification_ready(
-            data_dir, output_dir, lifecycle, wiki, version, run_id,
-        )
-    }
-    fn prepare_ready_publication(
-        &self,
-        data_dir: &Path,
-        output_dir: &Path,
-        lifecycle: &Path,
-        run_id: &str,
-    ) -> Result<()> {
-        publication::prepare_ready_publication(data_dir, output_dir, lifecycle, run_id)
-    }
-    fn commit_ready_publication(
-        &self,
-        data_dir: &Path,
-        output_dir: &Path,
-        run_id: &str,
-    ) -> Result<()> {
-        publication::commit_ready_publication(data_dir, output_dir, run_id)
-    }
-    fn rollback_ready_publication(
-        &self,
-        data_dir: &Path,
-        output_dir: &Path,
-        lifecycle: &Path,
-        run_id: &str,
-    ) -> Result<()> {
-        publication::rollback_ready_publication(data_dir, output_dir, lifecycle, run_id)
-    }
-}
-
 struct RealOps;
 
-impl Ops for RealOps {
+impl SnapshotOps for RealOps {
     fn resolve_snapshot(
         &self,
         wikis: &[String],
@@ -956,6 +713,15 @@ impl Ops for RealOps {
         fetch::validate_completed_snapshot(data_dir, wiki, version)
     }
 
+    fn finalize_snapshot(&self, wiki: &str, data_dir: &Path) -> Result<()> {
+        let removed = storage::retire_inactive_snapshots(data_dir, wiki)?;
+        info!(
+            wiki = wiki,
+            removed, "retired inactive snapshot generations"
+        );
+        Ok(())
+    }
+
     fn reset_obsolete_qualification_generation(
         &self,
         wiki: &str,
@@ -964,47 +730,18 @@ impl Ops for RealOps {
     ) -> Result<bool> {
         ingest::reset_obsolete_qualification_generation(data_dir, wiki, version)
     }
+}
 
-    fn fetch_wiki(&self, wiki: &str, version: &str, data_dir: &std::path::Path) -> Result<()> {
+impl HistoryInputOps for RealOps {
+    fn fetch_wiki(&self, wiki: &str, version: &str, data_dir: &Path) -> Result<()> {
         fetch::fetch_wiki(wiki, version, data_dir).map(|_| ())
     }
 
-    fn fetch_patrol(&self, wiki: &str, data_dir: &std::path::Path) -> Result<()> {
-        patrol::fetch_patrol(wiki, data_dir)
-    }
-
-    fn fetch_patrol_for_snapshot(
-        &self,
-        wiki: &str,
-        version: &str,
-        data_dir: &std::path::Path,
-    ) -> Result<()> {
-        patrol::fetch_patrol_for_snapshot(wiki, version, data_dir)
-    }
-
-    fn preflight_patrol_for_snapshot(
-        &self,
-        wiki: &str,
-        version: &str,
-        data_dir: &Path,
-    ) -> Result<()> {
-        patrol::preflight_patrol_for_snapshot(wiki, version, data_dir)
-    }
-
-    fn ingest_wiki(
-        &self,
-        wiki: &str,
-        version: Option<&str>,
-        data_dir: &std::path::Path,
-    ) -> Result<()> {
+    fn ingest_wiki(&self, wiki: &str, version: Option<&str>, data_dir: &Path) -> Result<()> {
         match version {
             Some(version) => ingest::ingest_wiki_snapshot(wiki, version, data_dir).map(|_| ()),
             None => ingest::ingest_wiki(wiki, data_dir).map(|_| ()),
         }
-    }
-
-    fn cleanup_raw_dump(&self, wiki: &str, data_dir: &std::path::Path) -> Result<()> {
-        fetch::cleanup_raw_dump(wiki, data_dir)
     }
 
     fn prepare_wiki_snapshot(
@@ -1018,123 +755,6 @@ impl Ops for RealOps {
         source_window::prepare_snapshot(wiki, version, data_dir, run_id, window_size).map(|_| ())
     }
 
-    fn compute_all(
-        &self,
-        wiki: &str,
-        data_dir: &std::path::Path,
-        output_dir: &std::path::Path,
-    ) -> Result<()> {
-        compute::compute_all(wiki, data_dir, output_dir)
-    }
-
-    fn compute_patrol(
-        &self,
-        wiki: &str,
-        data_dir: &std::path::Path,
-        output_dir: &std::path::Path,
-        rebuild: bool,
-        limit_months: Option<usize>,
-    ) -> Result<()> {
-        patrol::compute_patrol(wiki, data_dir, output_dir, rebuild, limit_months)
-    }
-
-    fn build_account_creation_staging_report(
-        &self,
-        wiki: &str,
-        version: &str,
-        data_dir: &Path,
-        destination: &Path,
-    ) -> Result<()> {
-        patrol::build_account_creation_staging_report(wiki, version, data_dir, destination)
-    }
-
-    fn benchmark(
-        &self,
-        wikis: &[String],
-        data_dir: &std::path::Path,
-        output_dir: &std::path::Path,
-        warmup: usize,
-        iterations: usize,
-        keep_outputs: bool,
-    ) -> Result<()> {
-        bench::run(
-            wikis,
-            data_dir,
-            output_dir,
-            warmup,
-            iterations,
-            keep_outputs,
-        )
-    }
-
-    fn capacity_benchmark(
-        &self,
-        wiki: &str,
-        data_dir: &std::path::Path,
-        output_dir: &std::path::Path,
-        scratch_dir: &std::path::Path,
-        report_path: &std::path::Path,
-        weekly_buckets: usize,
-        weekly_secondary_buckets: usize,
-        raw_transient_bytes: u64,
-        nfs_quota_bytes: Option<u64>,
-        storage_reserve_bytes: u64,
-        quota_root: &std::path::Path,
-        minimum_memory_headroom_percent: u8,
-        requested_cpu: usize,
-    ) -> Result<()> {
-        execute_capacity_benchmark(capacity::CapacityBenchmarkOptions {
-            wiki,
-            data_dir,
-            output_dir,
-            scratch_root: scratch_dir,
-            quota_root,
-            report_path,
-            bucket_count: weekly_buckets,
-            secondary_bucket_count: weekly_secondary_buckets,
-            raw_transient_requirement_bytes: raw_transient_bytes,
-            nfs_quota_bytes,
-            storage_reserve_bytes,
-            minimum_memory_headroom_percent,
-            requested_cpu,
-            telemetry_override: None,
-        })
-    }
-
-    fn schema_benchmark(
-        &self,
-        data_dir: &Path,
-        scratch_dir: &Path,
-        report_path: &Path,
-        wikis: &[String],
-        run_id: Option<&str>,
-    ) -> Result<()> {
-        let benchmark = schema_benchmark::run(
-            data_dir,
-            scratch_dir,
-            report_path,
-            wikis,
-            std::env::var("WIKI_ECON_SOURCE_COMMIT").ok().as_deref(),
-            run_id,
-        );
-        let result = benchmark?;
-        println!("{}", serde_json::to_string(&result)?);
-        Ok(())
-    }
-
-    fn merge_outputs(&self, output_dir: &std::path::Path, run_id: Option<&str>) -> Result<()> {
-        merge::merge_outputs(output_dir, run_id)
-    }
-
-    fn finalize_snapshot(&self, wiki: &str, data_dir: &std::path::Path) -> Result<()> {
-        let removed = storage::retire_inactive_snapshots(data_dir, wiki)?;
-        info!(
-            wiki = wiki,
-            removed, "retired inactive snapshot generations"
-        );
-        Ok(())
-    }
-
     fn prepare_candidate_snapshot(
         &self,
         wiki: &str,
@@ -1146,7 +766,84 @@ impl Ops for RealOps {
         source_window::prepare_candidate_snapshot(wiki, version, data_dir, run_id, window_size)
             .map(|_| ())
     }
+}
 
+impl PatrolOps for RealOps {
+    fn fetch_patrol(&self, wiki: &str, data_dir: &Path) -> Result<()> {
+        patrol::fetch_patrol(wiki, data_dir)
+    }
+
+    fn fetch_patrol_for_snapshot(&self, wiki: &str, version: &str, data_dir: &Path) -> Result<()> {
+        patrol::fetch_patrol_for_snapshot(wiki, version, data_dir)
+    }
+
+    fn preflight_patrol_for_snapshot(
+        &self,
+        wiki: &str,
+        version: &str,
+        data_dir: &Path,
+    ) -> Result<()> {
+        patrol::preflight_patrol_for_snapshot(wiki, version, data_dir)
+    }
+
+    fn cached_patrol_generation_available(
+        &self,
+        wiki: &str,
+        version: &str,
+        data_dir: &Path,
+    ) -> bool {
+        patrol::cached_sources_available_for_snapshot(data_dir, wiki, version)
+    }
+
+    fn compute_patrol(
+        &self,
+        wiki: &str,
+        data_dir: &Path,
+        output_dir: &Path,
+        rebuild: bool,
+        limit_months: Option<usize>,
+    ) -> Result<()> {
+        patrol::compute_patrol(wiki, data_dir, output_dir, rebuild, limit_months)
+    }
+
+    fn compute_candidate_patrol(
+        &self,
+        wiki: &str,
+        version: &str,
+        data_dir: &Path,
+        candidate_dir: &Path,
+    ) -> Result<()> {
+        patrol::compute_patrol_for_snapshot(wiki, version, data_dir, candidate_dir, false, None)
+    }
+
+    fn build_account_creation_staging_report(
+        &self,
+        wiki: &str,
+        version: &str,
+        data_dir: &Path,
+        destination: &Path,
+    ) -> Result<()> {
+        patrol::build_account_creation_staging_report(wiki, version, data_dir, destination)
+    }
+}
+
+impl MetricComputeOps for RealOps {
+    fn compute_all(&self, wiki: &str, data_dir: &Path, output_dir: &Path) -> Result<()> {
+        compute::compute_all(wiki, data_dir, output_dir)
+    }
+
+    fn compute_candidate(
+        &self,
+        wiki: &str,
+        version: &str,
+        data_dir: &Path,
+        candidate_dir: &Path,
+    ) -> Result<()> {
+        compute::compute_all_for_snapshot(wiki, version, data_dir, candidate_dir)
+    }
+}
+
+impl CandidateOps for RealOps {
     fn plan_candidate_preparation(
         &self,
         wiki: &str,
@@ -1171,37 +868,121 @@ impl Ops for RealOps {
         )
     }
 
-    fn cached_patrol_sources_available(&self, wiki: &str, data_dir: &Path) -> bool {
-        patrol::cached_sources_available(data_dir, wiki)
-    }
-
-    fn cached_patrol_generation_available(
+    fn mark_candidate_ready(
         &self,
+        data_dir: &Path,
+        output_dir: &Path,
+        lifecycle: &Path,
         wiki: &str,
         version: &str,
-        data_dir: &Path,
-    ) -> bool {
-        patrol::cached_sources_available_for_snapshot(data_dir, wiki, version)
+        run_id: &str,
+    ) -> Result<PathBuf> {
+        publication::mark_wiki_candidate_ready(
+            data_dir, output_dir, lifecycle, wiki, version, run_id,
+        )
     }
 
-    fn compute_candidate(
+    fn ensure_qualification_wiki(&self, lifecycle: &Path, wiki: &str) -> Result<()> {
+        publication::ensure_qualification_wiki(lifecycle, wiki)
+    }
+
+    fn mark_qualification_ready(
         &self,
+        data_dir: &Path,
+        output_dir: &Path,
+        lifecycle: &Path,
         wiki: &str,
         version: &str,
+        run_id: &str,
+    ) -> Result<PathBuf> {
+        publication::mark_wiki_qualification_ready(
+            data_dir, output_dir, lifecycle, wiki, version, run_id,
+        )
+    }
+}
+
+impl PublicationOps for RealOps {
+    fn merge_outputs(&self, output_dir: &Path, run_id: Option<&str>) -> Result<()> {
+        merge::merge_outputs(output_dir, run_id)
+    }
+
+    fn prepare_ready_publication(
+        &self,
         data_dir: &Path,
-        candidate_dir: &Path,
+        output_dir: &Path,
+        lifecycle: &Path,
+        run_id: &str,
     ) -> Result<()> {
-        compute::compute_all_for_snapshot(wiki, version, data_dir, candidate_dir)
+        publication::prepare_ready_publication(data_dir, output_dir, lifecycle, run_id)
     }
 
-    fn compute_candidate_patrol(
+    fn commit_ready_publication(
         &self,
-        wiki: &str,
-        version: &str,
         data_dir: &Path,
-        candidate_dir: &Path,
+        output_dir: &Path,
+        run_id: &str,
     ) -> Result<()> {
-        patrol::compute_patrol_for_snapshot(wiki, version, data_dir, candidate_dir, false, None)
+        publication::commit_ready_publication(data_dir, output_dir, run_id)
+    }
+
+    fn rollback_ready_publication(
+        &self,
+        data_dir: &Path,
+        output_dir: &Path,
+        lifecycle: &Path,
+        run_id: &str,
+    ) -> Result<()> {
+        publication::rollback_ready_publication(data_dir, output_dir, lifecycle, run_id)
+    }
+}
+
+impl QualificationOps for RealOps {
+    fn benchmark(&self, request: BenchmarkRequest<'_>) -> Result<()> {
+        bench::run(
+            request.wikis,
+            request.paths.data,
+            request.paths.output,
+            request.warmup,
+            request.iterations,
+            request.keep_outputs,
+        )
+    }
+
+    fn capacity_benchmark(&self, request: CapacityBenchmarkRequest<'_>) -> Result<()> {
+        execute_capacity_benchmark(capacity::CapacityBenchmarkOptions {
+            wiki: request.wiki,
+            data_dir: request.data_dir,
+            output_dir: request.output_dir,
+            scratch_root: request.scratch_dir,
+            quota_root: request.quota_root,
+            report_path: request.report_path,
+            bucket_count: request.weekly_buckets,
+            secondary_bucket_count: request.weekly_secondary_buckets,
+            raw_transient_requirement_bytes: request.raw_transient_bytes,
+            nfs_quota_bytes: request.nfs_quota_bytes,
+            storage_reserve_bytes: request.storage_reserve_bytes,
+            minimum_memory_headroom_percent: request.minimum_memory_headroom_percent,
+            requested_cpu: request.requested_cpu,
+            telemetry_override: None,
+        })
+    }
+
+    fn cpu_qualification(&self, capacity_reports: &[PathBuf], report: &Path) -> Result<()> {
+        cpu_qualification::run(capacity_reports, report).map(drop)
+    }
+
+    fn schema_benchmark(&self, request: SchemaBenchmarkRequest<'_>) -> Result<()> {
+        let benchmark = schema_benchmark::run(
+            request.data_dir,
+            request.scratch_dir,
+            request.report_path,
+            request.wikis,
+            std::env::var("WIKI_ECON_SOURCE_COMMIT").ok().as_deref(),
+            request.run_id,
+        );
+        let result = benchmark?;
+        println!("{}", serde_json::to_string(&result)?);
+        Ok(())
     }
 }
 
@@ -1211,66 +992,23 @@ fn execute_capacity_benchmark(options: capacity::CapacityBenchmarkOptions<'_>) -
     Ok(())
 }
 
-fn run_timed_stage<T>(
-    stage: &str,
-    wiki: Option<&str>,
-    action: impl FnOnce() -> Result<T>,
-) -> Result<T> {
-    let started = Instant::now();
-    observability::record_stage_started(stage, wiki);
-    info!(stage = stage, wiki = wiki.unwrap_or("-"), "starting stage");
-    let result = action();
-    let duration = started.elapsed();
-    let duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
-    match &result {
-        Ok(_) => {
-            observability::record_stage_completed(stage, wiki, duration_ms);
-            info!(
-                stage = stage,
-                wiki = wiki.unwrap_or("-"),
-                elapsed_ms = duration.as_secs_f64() * 1_000.0,
-                "completed stage"
-            );
-        }
-        Err(error) => observability::record_stage_failed(stage, wiki, duration_ms, error),
-    }
-    result
-}
-
-fn record_reused_stage(stage: &str, wiki: Option<&str>) {
-    observability::record_stage_started(stage, wiki);
-    observability::record_stage_reused(stage, wiki);
-    observability::record_stage_completed(stage, wiki, 0);
-    info!(
-        stage,
-        wiki = wiki.unwrap_or("-"),
-        "reused stage without execution"
-    );
-}
-
-fn record_skipped_stage(stage: &str, wiki: Option<&str>) {
-    observability::record_stage_started(stage, wiki);
-    observability::record_stage_skipped(stage, wiki);
-    observability::record_stage_completed(stage, wiki, 0);
-    info!(stage, wiki = wiki.unwrap_or("-"), "skipped unneeded stage");
-}
-
-fn snapshot_version_for(now: DateTime<Utc>) -> String {
-    let current_month = now.month();
-    let (year, month) = if current_month == 1 {
-        (now.year() - 1, 12)
-    } else {
-        (now.year(), current_month - 1)
+fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
+    let Cli {
+        data_dir,
+        output_dir,
+        run_id,
+        command,
+    } = cli;
+    let context = RunContext {
+        paths: AppPaths {
+            data: &data_dir,
+            output: &output_dir,
+        },
+        run_id: run_id.as_deref(),
+        now: Utc::now(),
     };
-    format!("{year:04}-{month:02}")
-}
 
-fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
-    let data_dir = cli.data_dir;
-    let output_dir = cli.output_dir;
-    let run_id = cli.run_id;
-
-    match cli.command {
+    match command {
         Commands::DashboardMaterialize { destination_dir } => {
             if let Some(destination_dir) = destination_dir {
                 dashboard::materialize_into(&output_dir, &destination_dir)?;
@@ -1368,61 +1106,20 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
         }
 
         Commands::SnapshotResolve { wikis } => {
-            let version = run_timed_stage("snapshot_resolve", None, || {
-                ops.resolve_snapshot(&wikis, Utc::now(), &data_dir)
-            })?;
-            ops.persist_snapshot_plans(&wikis, &version, &data_dir)?;
+            let version = handle_snapshot_resolve(context, ops, &wikis)?;
             println!("{version}");
         }
 
         Commands::Fetch { wikis, version } => {
-            let version = match version {
-                Some(version) => {
-                    for wiki in &wikis {
-                        run_timed_stage("snapshot_validate", Some(wiki), || {
-                            ops.validate_completed_snapshot(wiki, &version, &data_dir)
-                        })?;
-                    }
-                    version
-                }
-                None => run_timed_stage("snapshot_resolve", None, || {
-                    ops.resolve_snapshot(&wikis, Utc::now(), &data_dir)
-                })?,
-            };
-            ops.persist_snapshot_plans(&wikis, &version, &data_dir)?;
-            for wiki in &wikis {
-                run_timed_stage("patrol_preflight", Some(wiki), || {
-                    ops.preflight_patrol_for_snapshot(wiki, &version, &data_dir)
-                })?;
-                run_timed_stage("fetch", Some(wiki), || {
-                    ops.fetch_wiki(wiki, &version, &data_dir)
-                })?;
-                run_timed_stage("patrol_fetch", Some(wiki), || {
-                    ops.fetch_patrol_for_snapshot(wiki, &version, &data_dir)
-                })?;
-            }
+            handle_fetch(context, ops, &wikis, version.as_deref())?;
         }
 
         Commands::Ingest { wikis, version } => {
-            for wiki in &wikis {
-                run_timed_stage("ingest", Some(wiki), || {
-                    ops.ingest_wiki(wiki, version.as_deref(), &data_dir)
-                })?;
-            }
+            handle_ingest(context, ops, &wikis, version.as_deref())?;
         }
 
         Commands::Compute { wikis } => {
-            for wiki in &wikis {
-                run_timed_stage("compute", Some(wiki), || {
-                    ops.compute_all(wiki, &data_dir, &output_dir)
-                })?;
-                run_timed_stage("patrol_compute", Some(wiki), || {
-                    ops.compute_patrol(wiki, &data_dir, &output_dir, false, None)
-                })?;
-            }
-            run_timed_stage("merge", None, || {
-                ops.merge_outputs(&output_dir, run_id.as_deref())
-            })?;
+            handle_compute(context, ops, &wikis)?;
         }
 
         Commands::PrepareWiki {
@@ -1431,105 +1128,18 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             source_window_size,
             lifecycle,
         } => {
-            let run_id = run_id
-                .as_deref()
-                .context("candidate preparation requires --run-id")?;
-            let version = match version {
-                Some(version) => {
-                    run_timed_stage("snapshot_validate", Some(&wiki), || {
-                        ops.validate_completed_snapshot(&wiki, &version, &data_dir)
-                    })?;
-                    version
-                }
-                None => run_timed_stage("snapshot_resolve", Some(&wiki), || {
-                    ops.resolve_snapshot(std::slice::from_ref(&wiki), Utc::now(), &data_dir)
-                })?,
-            };
-            let source_window_size = source_window::configured_window_size(source_window_size)?;
-            ops.persist_snapshot_plans(std::slice::from_ref(&wiki), &version, &data_dir)?;
-            let candidate_dir =
-                publication::wiki_candidate_dir(&output_dir, &wiki, &version, run_id)?;
-            let preparation = run_timed_stage("candidate_discovery", Some(&wiki), || {
-                let plan = ops.plan_candidate_preparation(
-                    &wiki,
-                    &version,
-                    &data_dir,
-                    &output_dir,
-                    run_id,
-                )?;
-                if matches!(plan, publication::WikiPreparationPlan::NoOp { .. }) {
-                    observability::record_stage_reused("candidate_discovery", Some(&wiki));
-                }
-                Ok(plan)
-            })?;
-
-            match preparation {
-                publication::WikiPreparationPlan::NoOp { ready_path } => {
-                    info!(wiki, version, path = %ready_path.display(), "candidate preparation is a recorded no-op");
-                    println!("{}", ready_path.display());
-                }
-                publication::WikiPreparationPlan::Build {
-                    same_snapshot_candidate,
-                    compute_reused,
-                    patrol_reused,
-                } => {
-                    run_timed_stage("source_window", Some(&wiki), || {
-                        ops.prepare_candidate_snapshot(
-                            &wiki,
-                            &version,
-                            &data_dir,
-                            run_id,
-                            source_window_size,
-                        )
-                    })?;
-                    if compute_reused {
-                        record_reused_stage("compute", Some(&wiki));
-                    } else {
-                        run_timed_stage("compute", Some(&wiki), || {
-                            ops.compute_candidate(&wiki, &version, &data_dir, &candidate_dir)
-                        })?;
-                    }
-                    if patrol_reused {
-                        record_reused_stage("patrol_preflight", Some(&wiki));
-                        record_reused_stage("patrol_fetch", Some(&wiki));
-                        record_reused_stage("patrol_compute", Some(&wiki));
-                    } else {
-                        let patrol_cached =
-                            ops.cached_patrol_generation_available(&wiki, &version, &data_dir);
-                        if !patrol_cached {
-                            // Patrol is an independent upstream publication.
-                            // Run this after durable core computation so a late
-                            // logging dump defers only patrol work.
-                            run_timed_stage("patrol_preflight", Some(&wiki), || {
-                                ops.preflight_patrol_for_snapshot(&wiki, &version, &data_dir)
-                            })?;
-                        } else {
-                            record_reused_stage("patrol_preflight", Some(&wiki));
-                        }
-                        if same_snapshot_candidate && patrol_cached {
-                            record_skipped_stage("patrol_fetch", Some(&wiki));
-                        } else {
-                            run_timed_stage("patrol_fetch", Some(&wiki), || {
-                                ops.fetch_patrol_for_snapshot(&wiki, &version, &data_dir)
-                            })?;
-                        }
-                        run_timed_stage("patrol_compute", Some(&wiki), || {
-                            ops.compute_candidate_patrol(&wiki, &version, &data_dir, &candidate_dir)
-                        })?;
-                    }
-                    let ready = run_timed_stage("candidate_validate", Some(&wiki), || {
-                        ops.mark_candidate_ready(
-                            &data_dir,
-                            &output_dir,
-                            &lifecycle,
-                            &wiki,
-                            &version,
-                            run_id,
-                        )
-                    })?;
-                    println!("{}", ready.display());
-                }
-            }
+            let ready = handle_prepare_wiki(
+                context,
+                ops,
+                PrepareWikiRequest {
+                    wiki: &wiki,
+                    version: version.as_deref(),
+                    source_window_size,
+                    lifecycle: &lifecycle,
+                    mode: PreparationMode::Candidate,
+                },
+            )?;
+            println!("{}", ready.display());
         }
 
         Commands::FleetDiscover {
@@ -1626,92 +1236,17 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             source_window_size,
             lifecycle,
         } => {
-            let run_id = run_id
-                .as_deref()
-                .context("wiki qualification requires --run-id")?;
-            ops.ensure_qualification_wiki(&lifecycle, &wiki)?;
-            let version = match version {
-                Some(version) => {
-                    run_timed_stage("snapshot_validate", Some(&wiki), || {
-                        ops.validate_completed_snapshot(&wiki, &version, &data_dir)
-                    })?;
-                    version
-                }
-                None => run_timed_stage("snapshot_resolve", Some(&wiki), || {
-                    ops.resolve_snapshot(std::slice::from_ref(&wiki), Utc::now(), &data_dir)
-                })?,
-            };
-            let source_window_size = source_window::configured_window_size(source_window_size)?;
-            ops.persist_snapshot_plans(std::slice::from_ref(&wiki), &version, &data_dir)?;
-            if ops.reset_obsolete_qualification_generation(&wiki, &version, &data_dir)? {
-                record_skipped_stage("obsolete_input_retired", Some(&wiki));
-            }
-            let qualification_dir =
-                publication::wiki_qualification_dir(&output_dir, &wiki, &version, run_id)?;
-            run_timed_stage("source_window", Some(&wiki), || {
-                ops.prepare_candidate_snapshot(
-                    &wiki,
-                    &version,
-                    &data_dir,
-                    run_id,
+            let receipt = handle_prepare_wiki(
+                context,
+                ops,
+                PrepareWikiRequest {
+                    wiki: &wiki,
+                    version: version.as_deref(),
                     source_window_size,
-                )
-            })?;
-            let preparation = run_timed_stage("qualification_discovery", Some(&wiki), || {
-                ops.plan_qualification_preparation(&wiki, &version, &data_dir, &output_dir, run_id)
-            })?;
-            let publication::WikiPreparationPlan::Build {
-                same_snapshot_candidate,
-                compute_reused,
-                patrol_reused,
-            } = preparation
-            else {
-                anyhow::bail!(
-                    "qualification preparation unexpectedly resolved as a publication no-op"
-                )
-            };
-            if compute_reused {
-                record_reused_stage("compute", Some(&wiki));
-            } else {
-                run_timed_stage("compute", Some(&wiki), || {
-                    ops.compute_candidate(&wiki, &version, &data_dir, &qualification_dir)
-                })?;
-            }
-            if patrol_reused {
-                record_reused_stage("patrol_preflight", Some(&wiki));
-                record_reused_stage("patrol_fetch", Some(&wiki));
-                record_reused_stage("patrol_compute", Some(&wiki));
-            } else {
-                let patrol_cached =
-                    ops.cached_patrol_generation_available(&wiki, &version, &data_dir);
-                if !patrol_cached {
-                    run_timed_stage("patrol_preflight", Some(&wiki), || {
-                        ops.preflight_patrol_for_snapshot(&wiki, &version, &data_dir)
-                    })?;
-                } else {
-                    record_reused_stage("patrol_preflight", Some(&wiki));
-                }
-                if same_snapshot_candidate && patrol_cached {
-                    record_skipped_stage("patrol_fetch", Some(&wiki));
-                } else {
-                    run_timed_stage("patrol_fetch", Some(&wiki), || {
-                        ops.fetch_patrol_for_snapshot(&wiki, &version, &data_dir)
-                    })?;
-                }
-                run_timed_stage("patrol_compute", Some(&wiki), || {
-                    ops.compute_candidate_patrol(&wiki, &version, &data_dir, &qualification_dir)
-                })?;
-            }
-            let receipt = run_timed_stage("qualification_validate", Some(&wiki), || {
-                ops.mark_qualification_ready(
-                    &data_dir,
-                    &output_dir,
-                    &lifecycle,
-                    &wiki,
-                    &version,
-                    run_id,
-                )
-            })?;
+                    lifecycle: &lifecycle,
+                    mode: PreparationMode::Qualification,
+                },
+            )?;
             println!("{}", receipt.display());
         }
 
@@ -1962,14 +1497,16 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             keep_outputs,
         } => {
             run_timed_stage("bench", None, || {
-                ops.benchmark(
-                    &wikis,
-                    &data_dir,
-                    &output_dir,
+                ops.benchmark(BenchmarkRequest {
+                    wikis: &wikis,
+                    paths: orchestration::AppPaths {
+                        data: &data_dir,
+                        output: &output_dir,
+                    },
                     warmup,
                     iterations,
                     keep_outputs,
-                )
+                })
             })?;
         }
 
@@ -2005,21 +1542,21 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
                     .unwrap_or_else(|| data_dir.clone())
             });
             run_timed_stage("capacity_benchmark", Some(&wiki), || {
-                ops.capacity_benchmark(
-                    &wiki,
-                    &data_dir,
-                    &benchmark_output,
-                    &scratch_dir,
-                    &report_path,
+                ops.capacity_benchmark(CapacityBenchmarkRequest {
+                    wiki: &wiki,
+                    data_dir: &data_dir,
+                    output_dir: &benchmark_output,
+                    scratch_dir: &scratch_dir,
+                    report_path: &report_path,
                     weekly_buckets,
                     weekly_secondary_buckets,
                     raw_transient_bytes,
                     nfs_quota_bytes,
                     storage_reserve_bytes,
-                    &quota_root,
+                    quota_root: &quota_root,
                     minimum_memory_headroom_percent,
                     requested_cpu,
-                )
+                })
             })?;
         }
 
@@ -2038,7 +1575,13 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             report,
         } => {
             run_timed_stage("schema_benchmark", None, || {
-                ops.schema_benchmark(&data_dir, &scratch_dir, &report, &wikis, run_id.as_deref())
+                ops.schema_benchmark(SchemaBenchmarkRequest {
+                    data_dir: &data_dir,
+                    scratch_dir: &scratch_dir,
+                    report_path: &report,
+                    wikis: &wikis,
+                    run_id: run_id.as_deref(),
+                })
             })?;
         }
 
@@ -2048,55 +1591,16 @@ fn run_with_ops(cli: Cli, ops: &impl Ops) -> Result<()> {
             source_window_size,
             stage,
         } => {
-            let version = match version {
-                Some(version) => version,
-                None => run_timed_stage("snapshot_resolve", None, || {
-                    ops.resolve_snapshot(&wikis, Utc::now(), &data_dir)
-                })?,
-            };
-            let source_window_size = source_window::configured_window_size(source_window_size)?;
-            let source_window_run_id = run_id
-                .clone()
-                .unwrap_or_else(|| format!("manual-{}", std::process::id()));
-            ops.persist_snapshot_plans(&wikis, &version, &data_dir)?;
-            publication::begin_run(&output_dir, run_id.as_deref(), &wikis, Some(&version))?;
-            for wiki in &wikis {
-                info!(wiki = wiki, stage = ?stage, "running pipeline stage");
-                if stage.runs_ingest() {
-                    if !ops.cached_patrol_generation_available(wiki, &version, &data_dir) {
-                        run_timed_stage("patrol_preflight", Some(wiki), || {
-                            ops.preflight_patrol_for_snapshot(wiki, &version, &data_dir)
-                        })?;
-                    } else {
-                        record_reused_stage("patrol_preflight", Some(wiki));
-                    }
-                    run_timed_stage("source_window", Some(wiki), || {
-                        ops.prepare_wiki_snapshot(
-                            wiki,
-                            &version,
-                            &data_dir,
-                            &source_window_run_id,
-                            source_window_size,
-                        )
-                    })?;
-                    run_timed_stage("patrol_fetch", Some(wiki), || {
-                        ops.fetch_patrol_for_snapshot(wiki, &version, &data_dir)
-                    })?;
-                }
-                if stage.runs_compute() {
-                    run_timed_stage("compute", Some(wiki), || {
-                        ops.compute_all(wiki, &data_dir, &output_dir)
-                    })?;
-                    run_timed_stage("patrol_compute", Some(wiki), || {
-                        ops.compute_patrol(wiki, &data_dir, &output_dir, false, None)
-                    })?;
-                }
-            }
-            if stage.runs_compute() {
-                run_timed_stage("merge", None, || {
-                    ops.merge_outputs(&output_dir, run_id.as_deref())
-                })?;
-            }
+            handle_pipeline_run(
+                context,
+                ops,
+                PipelineRunRequest {
+                    wikis: &wikis,
+                    version: version.as_deref(),
+                    source_window_size,
+                    stage,
+                },
+            )?;
         }
     }
 
@@ -2422,7 +1926,7 @@ mod tests {
         Ok(())
     }
 
-    impl Ops for RecordingOps {
+    impl SnapshotOps for RecordingOps {
         fn resolve_snapshot(
             &self,
             wikis: &[String],
@@ -2433,22 +1937,26 @@ mod tests {
             Ok("2026-07".to_string())
         }
 
-        fn fetch_wiki(&self, wiki: &str, version: &str, data_dir: &Path) -> Result<()> {
-            self.record(format!("fetch:{wiki}:{version}:{}", data_dir.display()));
+        fn persist_snapshot_plans(
+            &self,
+            _wikis: &[String],
+            _version: &str,
+            _data_dir: &Path,
+        ) -> Result<()> {
             Ok(())
         }
 
-        fn fetch_patrol(&self, wiki: &str, data_dir: &Path) -> Result<()> {
-            self.record(format!("fetch_patrol:{wiki}:{}", data_dir.display()));
+        fn validate_completed_snapshot(
+            &self,
+            _wiki: &str,
+            _version: &str,
+            _data_dir: &Path,
+        ) -> Result<()> {
             Ok(())
         }
 
-        fn ingest_wiki(&self, wiki: &str, version: Option<&str>, data_dir: &Path) -> Result<()> {
-            self.record(format!(
-                "ingest:{wiki}:{}:{}",
-                version.unwrap_or("_"),
-                data_dir.display()
-            ));
+        fn finalize_snapshot(&self, wiki: &str, data_dir: &Path) -> Result<()> {
+            self.record(format!("snapshot_finalize:{wiki}:{}", data_dir.display()));
             Ok(())
         }
 
@@ -2462,6 +1970,22 @@ mod tests {
                 self.record(format!("reset_obsolete_input:{wiki}:{version}"));
             }
             Ok(self.reset_obsolete_input)
+        }
+    }
+
+    impl HistoryInputOps for RecordingOps {
+        fn fetch_wiki(&self, wiki: &str, version: &str, data_dir: &Path) -> Result<()> {
+            self.record(format!("fetch:{wiki}:{version}:{}", data_dir.display()));
+            Ok(())
+        }
+
+        fn ingest_wiki(&self, wiki: &str, version: Option<&str>, data_dir: &Path) -> Result<()> {
+            self.record(format!(
+                "ingest:{wiki}:{}:{}",
+                version.unwrap_or("_"),
+                data_dir.display()
+            ));
+            Ok(())
         }
 
         fn prepare_wiki_snapshot(
@@ -2479,6 +2003,118 @@ mod tests {
             Ok(())
         }
 
+        fn prepare_candidate_snapshot(
+            &self,
+            wiki: &str,
+            version: &str,
+            data_dir: &Path,
+            run_id: &str,
+            window_size: usize,
+        ) -> Result<()> {
+            self.prepare_wiki_snapshot(wiki, version, data_dir, run_id, window_size)
+        }
+    }
+
+    impl PatrolOps for RecordingOps {
+        fn fetch_patrol(&self, wiki: &str, data_dir: &Path) -> Result<()> {
+            self.record(format!("fetch_patrol:{wiki}:{}", data_dir.display()));
+            Ok(())
+        }
+
+        fn fetch_patrol_for_snapshot(
+            &self,
+            wiki: &str,
+            _version: &str,
+            data_dir: &Path,
+        ) -> Result<()> {
+            self.fetch_patrol(wiki, data_dir)
+        }
+
+        fn preflight_patrol_for_snapshot(
+            &self,
+            _wiki: &str,
+            _version: &str,
+            _data_dir: &Path,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn cached_patrol_generation_available(
+            &self,
+            _wiki: &str,
+            _version: &str,
+            _data_dir: &Path,
+        ) -> bool {
+            self.cached_patrol_sources
+        }
+
+        fn compute_patrol(
+            &self,
+            wiki: &str,
+            data_dir: &Path,
+            output_dir: &Path,
+            rebuild: bool,
+            limit_months: Option<usize>,
+        ) -> Result<()> {
+            let limit_str = limit_months
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| "_".to_string());
+            self.record(format!(
+                "compute_patrol:{wiki}:{}:{}:{rebuild}:{limit_str}",
+                data_dir.display(),
+                output_dir.display()
+            ));
+            Ok(())
+        }
+
+        fn compute_candidate_patrol(
+            &self,
+            wiki: &str,
+            _version: &str,
+            data_dir: &Path,
+            candidate_dir: &Path,
+        ) -> Result<()> {
+            self.compute_patrol(wiki, data_dir, candidate_dir, false, None)
+        }
+
+        fn build_account_creation_staging_report(
+            &self,
+            wiki: &str,
+            version: &str,
+            data_dir: &Path,
+            destination: &Path,
+        ) -> Result<()> {
+            self.record(format!(
+                "account_creations:{wiki}:{version}:{}:{}",
+                data_dir.display(),
+                destination.display()
+            ));
+            Ok(())
+        }
+    }
+
+    impl MetricComputeOps for RecordingOps {
+        fn compute_all(&self, wiki: &str, data_dir: &Path, output_dir: &Path) -> Result<()> {
+            self.record(format!(
+                "compute:{wiki}:{}:{}",
+                data_dir.display(),
+                output_dir.display()
+            ));
+            Ok(())
+        }
+
+        fn compute_candidate(
+            &self,
+            wiki: &str,
+            _version: &str,
+            data_dir: &Path,
+            candidate_dir: &Path,
+        ) -> Result<()> {
+            self.compute_all(wiki, data_dir, candidate_dir)
+        }
+    }
+
+    impl CandidateOps for RecordingOps {
         fn plan_candidate_preparation(
             &self,
             _wiki: &str,
@@ -2518,150 +2154,6 @@ mod tests {
                 }))
         }
 
-        fn cached_patrol_sources_available(&self, _wiki: &str, _data_dir: &Path) -> bool {
-            self.cached_patrol_sources
-        }
-
-        fn cleanup_raw_dump(&self, wiki: &str, data_dir: &Path) -> Result<()> {
-            self.record(format!("cleanup_raw:{wiki}:{}", data_dir.display()));
-            Ok(())
-        }
-
-        fn compute_all(&self, wiki: &str, data_dir: &Path, output_dir: &Path) -> Result<()> {
-            self.record(format!(
-                "compute:{wiki}:{}:{}",
-                data_dir.display(),
-                output_dir.display()
-            ));
-            Ok(())
-        }
-
-        fn compute_patrol(
-            &self,
-            wiki: &str,
-            data_dir: &Path,
-            output_dir: &Path,
-            rebuild: bool,
-            limit_months: Option<usize>,
-        ) -> Result<()> {
-            let limit_str = limit_months
-                .map(|n| n.to_string())
-                .unwrap_or_else(|| "_".to_string());
-            self.record(format!(
-                "compute_patrol:{wiki}:{}:{}:{rebuild}:{limit_str}",
-                data_dir.display(),
-                output_dir.display()
-            ));
-            Ok(())
-        }
-
-        fn build_account_creation_staging_report(
-            &self,
-            wiki: &str,
-            version: &str,
-            data_dir: &Path,
-            destination: &Path,
-        ) -> Result<()> {
-            self.record(format!(
-                "account_creations:{wiki}:{version}:{}:{}",
-                data_dir.display(),
-                destination.display()
-            ));
-            Ok(())
-        }
-
-        fn benchmark(
-            &self,
-            wikis: &[String],
-            data_dir: &Path,
-            output_dir: &Path,
-            warmup: usize,
-            iterations: usize,
-            keep_outputs: bool,
-        ) -> Result<()> {
-            self.record(format!(
-                "bench:{}:{}:{}:{warmup}:{iterations}:{keep_outputs}",
-                wikis.join(","),
-                data_dir.display(),
-                output_dir.display(),
-            ));
-            Ok(())
-        }
-
-        fn capacity_benchmark(
-            &self,
-            wiki: &str,
-            data_dir: &Path,
-            output_dir: &Path,
-            scratch_dir: &Path,
-            report_path: &Path,
-            weekly_buckets: usize,
-            weekly_secondary_buckets: usize,
-            raw_transient_bytes: u64,
-            nfs_quota_bytes: Option<u64>,
-            storage_reserve_bytes: u64,
-            quota_root: &Path,
-            minimum_memory_headroom_percent: u8,
-            requested_cpu: usize,
-        ) -> Result<()> {
-            self.record(format!(
-                "capacity:{wiki}:{}:{}:{}:{}:{weekly_buckets}x{weekly_secondary_buckets}:{raw_transient_bytes}:{}:{storage_reserve_bytes}:{}:{minimum_memory_headroom_percent}:{requested_cpu}",
-                data_dir.display(),
-                output_dir.display(),
-                scratch_dir.display(),
-                report_path.display(),
-                nfs_quota_bytes
-                    .map(|quota| quota.to_string())
-                    .unwrap_or_else(|| "shared".to_string()),
-                quota_root.display(),
-            ));
-            Ok(())
-        }
-
-        fn cpu_qualification(&self, capacity_reports: &[PathBuf], report: &Path) -> Result<()> {
-            self.record(format!(
-                "cpu-qualification:{}:{}",
-                capacity_reports
-                    .iter()
-                    .map(|path| path.display().to_string())
-                    .collect::<Vec<_>>()
-                    .join(","),
-                report.display()
-            ));
-            Ok(())
-        }
-
-        fn schema_benchmark(
-            &self,
-            data_dir: &Path,
-            scratch_dir: &Path,
-            report_path: &Path,
-            wikis: &[String],
-            _run_id: Option<&str>,
-        ) -> Result<()> {
-            self.record(format!(
-                "schema_benchmark:{}:{}:{}",
-                wikis.join(","),
-                data_dir.display(),
-                scratch_dir.display()
-            ));
-            anyhow::ensure!(
-                report_path == Path::new("reports/schema.json"),
-                "unexpected schema report path"
-            );
-            Ok(())
-        }
-
-        fn merge_outputs(&self, output_dir: &Path, _run_id: Option<&str>) -> Result<()> {
-            self.record(format!("merge:{}", output_dir.display()));
-            Ok(())
-        }
-
-        fn finalize_snapshot(&self, wiki: &str, data_dir: &Path) -> Result<()> {
-            self.record(format!("snapshot_finalize:{wiki}:{}", data_dir.display()));
-            Ok(())
-        }
-
         fn mark_candidate_ready(
             &self,
             _data_dir: &Path,
@@ -2691,6 +2183,13 @@ mod tests {
         ) -> Result<PathBuf> {
             self.record(format!("qualification_ready:{wiki}:{version}:{run_id}"));
             Ok(output_dir.join("qualification.json"))
+        }
+    }
+
+    impl PublicationOps for RecordingOps {
+        fn merge_outputs(&self, output_dir: &Path, _run_id: Option<&str>) -> Result<()> {
+            self.record(format!("merge:{}", output_dir.display()));
+            Ok(())
         }
 
         fn prepare_ready_publication(
@@ -2726,7 +2225,112 @@ mod tests {
         }
     }
 
-    impl Ops for FailingOps {
+    impl QualificationOps for RecordingOps {
+        fn benchmark(&self, request: BenchmarkRequest<'_>) -> Result<()> {
+            self.record(format!(
+                "bench:{}:{}:{}:{}:{}:{}",
+                request.wikis.join(","),
+                request.paths.data.display(),
+                request.paths.output.display(),
+                request.warmup,
+                request.iterations,
+                request.keep_outputs,
+            ));
+            Ok(())
+        }
+
+        fn capacity_benchmark(&self, request: CapacityBenchmarkRequest<'_>) -> Result<()> {
+            self.record(format!(
+                "capacity:{}:{}:{}:{}:{}:{}x{}:{}:{}:{}:{}:{}:{}",
+                request.wiki,
+                request.data_dir.display(),
+                request.output_dir.display(),
+                request.scratch_dir.display(),
+                request.report_path.display(),
+                request.weekly_buckets,
+                request.weekly_secondary_buckets,
+                request.raw_transient_bytes,
+                request
+                    .nfs_quota_bytes
+                    .map(|quota| quota.to_string())
+                    .unwrap_or_else(|| "shared".to_string()),
+                request.storage_reserve_bytes,
+                request.quota_root.display(),
+                request.minimum_memory_headroom_percent,
+                request.requested_cpu,
+            ));
+            Ok(())
+        }
+
+        fn cpu_qualification(&self, capacity_reports: &[PathBuf], report: &Path) -> Result<()> {
+            self.record(format!(
+                "cpu-qualification:{}:{}",
+                capacity_reports
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                report.display()
+            ));
+            Ok(())
+        }
+
+        fn schema_benchmark(&self, request: SchemaBenchmarkRequest<'_>) -> Result<()> {
+            self.record(format!(
+                "schema_benchmark:{}:{}:{}",
+                request.wikis.join(","),
+                request.data_dir.display(),
+                request.scratch_dir.display()
+            ));
+            anyhow::ensure!(
+                request.report_path == Path::new("reports/schema.json"),
+                "unexpected schema report path"
+            );
+            Ok(())
+        }
+    }
+
+    impl FailingOps {
+        fn fail_if(&self, stage: &str, message: &str) -> Result<()> {
+            if self.fail_stage == stage {
+                anyhow::bail!("{message}");
+            }
+            Ok(())
+        }
+    }
+
+    impl SnapshotOps for FailingOps {
+        fn resolve_snapshot(
+            &self,
+            _wikis: &[String],
+            now: DateTime<Utc>,
+            _data_dir: &Path,
+        ) -> Result<String> {
+            Ok(snapshot_version_for(now))
+        }
+
+        fn persist_snapshot_plans(
+            &self,
+            _wikis: &[String],
+            _version: &str,
+            _data_dir: &Path,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn validate_completed_snapshot(
+            &self,
+            _wiki: &str,
+            _version: &str,
+            _data_dir: &Path,
+        ) -> Result<()> {
+            Ok(())
+        }
+
+        fn finalize_snapshot(&self, _wiki: &str, _data_dir: &Path) -> Result<()> {
+            self.fail_if("snapshot_finalize", "snapshot finalize failed")
+        }
+
         fn reset_obsolete_qualification_generation(
             &self,
             _wiki: &str,
@@ -2735,40 +2339,72 @@ mod tests {
         ) -> Result<bool> {
             Ok(false)
         }
+    }
 
+    impl HistoryInputOps for FailingOps {
         fn fetch_wiki(&self, _wiki: &str, _version: &str, _data_dir: &Path) -> Result<()> {
-            if self.fail_stage == "fetch" {
-                anyhow::bail!("fetch failed");
-            }
-            Ok(())
-        }
-
-        fn fetch_patrol(&self, _wiki: &str, _data_dir: &Path) -> Result<()> {
-            if self.fail_stage == "fetch_patrol" {
-                anyhow::bail!("fetch patrol failed");
-            }
-            Ok(())
+            self.fail_if("fetch", "fetch failed")
         }
 
         fn ingest_wiki(&self, _wiki: &str, _version: Option<&str>, _data_dir: &Path) -> Result<()> {
-            if self.fail_stage == "ingest" {
-                anyhow::bail!("ingest failed");
-            }
+            self.fail_if("ingest", "ingest failed")
+        }
+
+        fn prepare_wiki_snapshot(
+            &self,
+            wiki: &str,
+            version: &str,
+            data_dir: &Path,
+            _run_id: &str,
+            _window_size: usize,
+        ) -> Result<()> {
+            self.fetch_wiki(wiki, version, data_dir)?;
+            self.ingest_wiki(wiki, Some(version), data_dir)?;
+            self.fail_if("cleanup_raw", "cleanup raw failed")
+        }
+
+        fn prepare_candidate_snapshot(
+            &self,
+            wiki: &str,
+            version: &str,
+            data_dir: &Path,
+            run_id: &str,
+            window_size: usize,
+        ) -> Result<()> {
+            self.prepare_wiki_snapshot(wiki, version, data_dir, run_id, window_size)
+        }
+    }
+
+    impl PatrolOps for FailingOps {
+        fn fetch_patrol(&self, _wiki: &str, _data_dir: &Path) -> Result<()> {
+            self.fail_if("fetch_patrol", "fetch patrol failed")
+        }
+
+        fn fetch_patrol_for_snapshot(
+            &self,
+            wiki: &str,
+            _version: &str,
+            data_dir: &Path,
+        ) -> Result<()> {
+            self.fetch_patrol(wiki, data_dir)
+        }
+
+        fn preflight_patrol_for_snapshot(
+            &self,
+            _wiki: &str,
+            _version: &str,
+            _data_dir: &Path,
+        ) -> Result<()> {
             Ok(())
         }
 
-        fn cleanup_raw_dump(&self, _wiki: &str, _data_dir: &Path) -> Result<()> {
-            if self.fail_stage == "cleanup_raw" {
-                anyhow::bail!("cleanup raw failed");
-            }
-            Ok(())
-        }
-
-        fn compute_all(&self, _wiki: &str, _data_dir: &Path, _output_dir: &Path) -> Result<()> {
-            if self.fail_stage == "compute" {
-                anyhow::bail!("compute failed");
-            }
-            Ok(())
+        fn cached_patrol_generation_available(
+            &self,
+            _wiki: &str,
+            _version: &str,
+            _data_dir: &Path,
+        ) -> bool {
+            false
         }
 
         fn compute_patrol(
@@ -2779,10 +2415,17 @@ mod tests {
             _rebuild: bool,
             _limit_months: Option<usize>,
         ) -> Result<()> {
-            if self.fail_stage == "compute_patrol" {
-                anyhow::bail!("compute patrol failed");
-            }
-            Ok(())
+            self.fail_if("compute_patrol", "compute patrol failed")
+        }
+
+        fn compute_candidate_patrol(
+            &self,
+            wiki: &str,
+            _version: &str,
+            data_dir: &Path,
+            candidate_dir: &Path,
+        ) -> Result<()> {
+            self.compute_patrol(wiki, data_dir, candidate_dir, false, None)
         }
 
         fn build_account_creation_staging_report(
@@ -2792,75 +2435,132 @@ mod tests {
             _data_dir: &Path,
             _destination: &Path,
         ) -> Result<()> {
-            if self.fail_stage == "account_creations" {
-                anyhow::bail!("account creation failed");
-            }
-            Ok(())
+            self.fail_if("account_creations", "account creation failed")
+        }
+    }
+
+    impl MetricComputeOps for FailingOps {
+        fn compute_all(&self, _wiki: &str, _data_dir: &Path, _output_dir: &Path) -> Result<()> {
+            self.fail_if("compute", "compute failed")
         }
 
-        fn benchmark(
+        fn compute_candidate(
             &self,
-            _wikis: &[String],
-            _data_dir: &Path,
-            _output_dir: &Path,
-            _warmup: usize,
-            _iterations: usize,
-            _keep_outputs: bool,
+            wiki: &str,
+            _version: &str,
+            data_dir: &Path,
+            candidate_dir: &Path,
         ) -> Result<()> {
-            if self.fail_stage == "bench" {
-                anyhow::bail!("bench failed");
-            }
-            Ok(())
+            self.compute_all(wiki, data_dir, candidate_dir)
         }
+    }
 
-        fn capacity_benchmark(
+    impl CandidateOps for FailingOps {
+        fn plan_candidate_preparation(
             &self,
             _wiki: &str,
+            _version: &str,
             _data_dir: &Path,
             _output_dir: &Path,
-            _scratch_dir: &Path,
-            _report_path: &Path,
-            _weekly_buckets: usize,
-            _weekly_secondary_buckets: usize,
-            _raw_transient_bytes: u64,
-            _nfs_quota_bytes: Option<u64>,
-            _storage_reserve_bytes: u64,
-            _quota_root: &Path,
-            _minimum_memory_headroom_percent: u8,
-            _requested_cpu: usize,
-        ) -> Result<()> {
-            if self.fail_stage == "capacity" {
-                anyhow::bail!("capacity benchmark failed");
-            }
-            Ok(())
+            _run_id: &str,
+        ) -> Result<publication::WikiPreparationPlan> {
+            Ok(publication::WikiPreparationPlan::Build {
+                same_snapshot_candidate: false,
+                compute_reused: false,
+                patrol_reused: false,
+            })
         }
 
-        fn schema_benchmark(
+        fn plan_qualification_preparation(
+            &self,
+            wiki: &str,
+            version: &str,
+            data_dir: &Path,
+            output_dir: &Path,
+            run_id: &str,
+        ) -> Result<publication::WikiPreparationPlan> {
+            self.plan_candidate_preparation(wiki, version, data_dir, output_dir, run_id)
+        }
+
+        fn mark_candidate_ready(
             &self,
             _data_dir: &Path,
-            _scratch_dir: &Path,
-            _report_path: &Path,
-            _wikis: &[String],
-            _run_id: Option<&str>,
-        ) -> Result<()> {
-            if self.fail_stage == "schema_benchmark" {
-                anyhow::bail!("schema benchmark failed");
-            }
+            output_dir: &Path,
+            _lifecycle: &Path,
+            _wiki: &str,
+            _version: &str,
+            _run_id: &str,
+        ) -> Result<PathBuf> {
+            Ok(output_dir.join("ready.json"))
+        }
+
+        fn ensure_qualification_wiki(&self, _lifecycle: &Path, _wiki: &str) -> Result<()> {
             Ok(())
         }
 
+        fn mark_qualification_ready(
+            &self,
+            _data_dir: &Path,
+            output_dir: &Path,
+            _lifecycle: &Path,
+            _wiki: &str,
+            _version: &str,
+            _run_id: &str,
+        ) -> Result<PathBuf> {
+            Ok(output_dir.join("qualification.json"))
+        }
+    }
+
+    impl PublicationOps for FailingOps {
         fn merge_outputs(&self, _output_dir: &Path, _run_id: Option<&str>) -> Result<()> {
-            if self.fail_stage == "merge" {
-                anyhow::bail!("merge failed");
-            }
+            self.fail_if("merge", "merge failed")
+        }
+
+        fn prepare_ready_publication(
+            &self,
+            _data_dir: &Path,
+            _output_dir: &Path,
+            _lifecycle: &Path,
+            _run_id: &str,
+        ) -> Result<()> {
             Ok(())
         }
 
-        fn finalize_snapshot(&self, _wiki: &str, _data_dir: &Path) -> Result<()> {
-            if self.fail_stage == "snapshot_finalize" {
-                anyhow::bail!("snapshot finalize failed");
-            }
+        fn commit_ready_publication(
+            &self,
+            _data_dir: &Path,
+            _output_dir: &Path,
+            _run_id: &str,
+        ) -> Result<()> {
             Ok(())
+        }
+
+        fn rollback_ready_publication(
+            &self,
+            _data_dir: &Path,
+            _output_dir: &Path,
+            _lifecycle: &Path,
+            _run_id: &str,
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    impl QualificationOps for FailingOps {
+        fn benchmark(&self, _request: BenchmarkRequest<'_>) -> Result<()> {
+            self.fail_if("bench", "bench failed")
+        }
+
+        fn capacity_benchmark(&self, _request: CapacityBenchmarkRequest<'_>) -> Result<()> {
+            self.fail_if("capacity", "capacity benchmark failed")
+        }
+
+        fn cpu_qualification(&self, capacity_reports: &[PathBuf], report: &Path) -> Result<()> {
+            cpu_qualification::run(capacity_reports, report).map(drop)
+        }
+
+        fn schema_benchmark(&self, _request: SchemaBenchmarkRequest<'_>) -> Result<()> {
+            self.fail_if("schema_benchmark", "schema benchmark failed")
         }
     }
 
@@ -3358,7 +3058,7 @@ mod tests {
                 patrol_reused: false,
             }
         );
-        assert!(!ops.cached_patrol_sources_available("nlwiki", &data));
+        assert!(!ops.cached_patrol_generation_available("nlwiki", "2026-07", &data));
         Ok(())
     }
 
@@ -4137,21 +3837,21 @@ mod tests {
 
         let native_output = output.path().join("native");
         let native_report = reports.path().join("native.json");
-        let _ = RealOps.capacity_benchmark(
-            "frwiki",
-            data.path(),
-            &native_output,
-            scratch.path(),
-            &native_report,
-            256,
-            1,
-            0,
-            Some(1_000_000_000),
-            0,
-            data.path(),
-            25,
-            1,
-        );
+        let _ = RealOps.capacity_benchmark(CapacityBenchmarkRequest {
+            wiki: "frwiki",
+            data_dir: data.path(),
+            output_dir: &native_output,
+            scratch_dir: scratch.path(),
+            report_path: &native_report,
+            weekly_buckets: 256,
+            weekly_secondary_buckets: 1,
+            raw_transient_bytes: 0,
+            nfs_quota_bytes: Some(1_000_000_000),
+            storage_reserve_bytes: 0,
+            quota_root: data.path(),
+            minimum_memory_headroom_percent: 25,
+            requested_cpu: 1,
+        });
         Ok(())
     }
 
@@ -4395,13 +4095,13 @@ mod tests {
         let schema_scratch = output_dir.path().join("schema-scratch");
         let schema_report = output_dir.path().join("schema-benchmark.json");
         let benchmark_wikis = ["ingestwiki".to_string()];
-        let benchmark_result = ops.schema_benchmark(
-            data_dir.path(),
-            &schema_scratch,
-            &schema_report,
-            &benchmark_wikis,
-            Some("schema-e2e"),
-        );
+        let benchmark_result = ops.schema_benchmark(SchemaBenchmarkRequest {
+            data_dir: data_dir.path(),
+            scratch_dir: &schema_scratch,
+            report_path: &schema_report,
+            wikis: &benchmark_wikis,
+            run_id: Some("schema-e2e"),
+        });
         benchmark_result?;
         assert!(schema_report.is_file());
 
@@ -4410,7 +4110,7 @@ mod tests {
         write_bz2_dump(&raw_legacy_dir.join("legacy.tsv.bz2"))?;
         ops.ingest_wiki("legacywiki", None, data_dir.path())?;
 
-        ops.cleanup_raw_dump("ingestwiki", data_dir.path())?;
+        fetch::cleanup_raw_dump("ingestwiki", data_dir.path())?;
         assert!(
             !raw_ingest_dir
                 .join("2026-02.ingestwiki.all-time.tsv.bz2")
@@ -4445,7 +4145,7 @@ mod tests {
             )
             .is_err()
         );
-        assert!(!ops.cached_patrol_sources_available("missingwiki", data_dir.path()));
+        assert!(!ops.cached_patrol_generation_available("missingwiki", "2026-02", data_dir.path()));
         assert!(
             ops.compute_candidate("computewiki", "invalid", data_dir.path(), output_dir.path(),)
                 .is_err()
@@ -4609,14 +4309,6 @@ mod tests {
             error_exit_code(&crate::patrol::upstream_waiting_error_for_test()),
             75
         );
-    }
-
-    #[test]
-    fn recording_ops_covers_compatibility_raw_cleanup() -> Result<()> {
-        let ops = RecordingOps::default();
-        ops.cleanup_raw_dump("testwiki", Path::new("dataset"))?;
-        assert_eq!(ops.calls.into_inner(), vec!["cleanup_raw:testwiki:dataset"]);
-        Ok(())
     }
 
     #[test]
@@ -5279,25 +4971,33 @@ mod tests {
         ops.fetch_patrol("frwiki", data_dir)?;
         ops.ingest_wiki("frwiki", None, data_dir)?;
         assert!(!ops.reset_obsolete_qualification_generation("frwiki", "2026-02", data_dir,)?);
-        ops.cleanup_raw_dump("frwiki", data_dir)?;
         ops.compute_all("frwiki", data_dir, output_dir)?;
         ops.compute_patrol("frwiki", data_dir, output_dir, false, None)?;
-        ops.benchmark(&wikis, data_dir, output_dir, 0, 1, false)?;
-        ops.capacity_benchmark(
-            "frwiki",
+        ops.benchmark(BenchmarkRequest {
+            wikis: &wikis,
+            paths: orchestration::AppPaths {
+                data: data_dir,
+                output: output_dir,
+            },
+            warmup: 0,
+            iterations: 1,
+            keep_outputs: false,
+        })?;
+        ops.capacity_benchmark(CapacityBenchmarkRequest {
+            wiki: "frwiki",
             data_dir,
             output_dir,
-            Path::new("scratch"),
-            Path::new("report.json"),
-            256,
-            1,
-            0,
-            Some(1),
-            0,
-            data_dir,
-            25,
-            1,
-        )
+            scratch_dir: Path::new("scratch"),
+            report_path: Path::new("report.json"),
+            weekly_buckets: 256,
+            weekly_secondary_buckets: 1,
+            raw_transient_bytes: 0,
+            nfs_quota_bytes: Some(1),
+            storage_reserve_bytes: 0,
+            quota_root: data_dir,
+            minimum_memory_headroom_percent: 25,
+            requested_cpu: 1,
+        })
         .expect("non-matching failing ops stage");
         let qualification_report = qualification.path().join("cpu.json");
         assert!(
@@ -5305,13 +5005,13 @@ mod tests {
             "an incomplete qualification matrix must fail closed"
         );
         assert!(qualification_report.is_file());
-        let schema_result = ops.schema_benchmark(
+        let schema_result = ops.schema_benchmark(SchemaBenchmarkRequest {
             data_dir,
-            Path::new("scratch"),
-            Path::new("schema.json"),
-            &wikis,
-            Some("schema-test"),
-        );
+            scratch_dir: Path::new("scratch"),
+            report_path: Path::new("schema.json"),
+            wikis: &wikis,
+            run_id: Some("schema-test"),
+        });
         schema_result?;
         ops.merge_outputs(output_dir, None)?;
         ops.finalize_snapshot("frwiki", data_dir)?;
