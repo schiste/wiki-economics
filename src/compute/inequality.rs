@@ -306,9 +306,8 @@ pub fn compute_frame(base: &DataFrame) -> Result<DataFrame> {
     compute_periods(&editor_month_frame(base)?)
 }
 
-/// Compute all inequality metrics, grouped by year-month.
-/// We aggregate across all namespaces per month to keep the output manageable,
-/// with a separate per-namespace breakdown.
+/// Compute exact editor distributions for calendar months, quarters, and years.
+/// All namespaces are combined before each period-level distribution is ranked.
 pub fn compute(wiki: &str, base: &DataFrame, output_dir: &Path) -> Result<()> {
     debug!(wiki = wiki, "computing inequality metrics");
 

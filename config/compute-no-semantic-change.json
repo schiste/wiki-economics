@@ -84,6 +84,12 @@
       "paths": ["src/compute/mod.rs"],
       "reason": "Exact inequality periods and exclusive activity-tier classification do not alter page-week metrics or their bytes.",
       "base_commit": "c44b4546ee500d43b23935935705613ccb6377f5"
+    },
+    {
+      "family": "monthly",
+      "paths": ["src/compute/inequality.rs"],
+      "reason": "Correct the public documentation comment for the already-versioned exact-period inequality implementation; executable semantics and bytes are unchanged.",
+      "base_commit": "3f87247692a3bdd8ba045ab327e3b9fd701e8ffb"
     }
   ]
 }
