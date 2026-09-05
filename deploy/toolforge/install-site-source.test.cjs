@@ -13,9 +13,10 @@ const script = path.join(__dirname, "install-site-source.sh");
 const commit = "d".repeat(40);
 
 function sourceFixture(root) {
-  for (const directory of ["site/src", "site/data-build"]) fs.mkdirSync(path.join(root, directory), {recursive: true});
+  for (const directory of ["config/generated", "site/src", "site/data-build"]) fs.mkdirSync(path.join(root, directory), {recursive: true});
   const files = {
     "LICENSE": "MIT\n",
+    "config/generated/metric-catalog.json": "{\"schema_version\":1,\"metrics\":[]}\n",
     "package.json": "{}\n", "package-lock.json": "{}\n", "site/package.json": "{}\n",
     "site/observablehq.config.js": "export default {};\n", "site/site-footer.js": "export const siteFooter = '';\n",
     "site/src/index.md": "# Home\n", "site/data-build/manifest.json.sh": "#!/bin/sh\n",
