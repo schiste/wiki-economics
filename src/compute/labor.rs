@@ -5,8 +5,8 @@ use std::path::Path;
 use tracing::debug;
 
 use super::{
-    ChurnAccumulator, editor_identity_available_expr, editor_identity_expr,
-    ensure_editor_identity_inputs, write_output,
+    editor_identity_available_expr, editor_identity_expr, ensure_editor_identity_inputs,
+    lifecycle::ChurnAccumulator, write_output,
 };
 
 pub(crate) fn normalize_period_key(year_month_key: i32, period_type: &str) -> Result<i32> {
