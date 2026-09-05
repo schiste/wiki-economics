@@ -138,7 +138,6 @@ pub(super) fn editor_month_frame(base: &DataFrame) -> Result<DataFrame> {
 
 fn compute_period_frame(editor_monthly: &DataFrame, period: ActivityPeriod) -> Result<DataFrame> {
     let period_name = period.name();
-    let period_months = period.months();
     let input_edits = editor_monthly
         .column("edits")?
         .cast(&DataType::UInt64)?
@@ -157,7 +156,23 @@ fn compute_period_frame(editor_monthly: &DataFrame, period: ActivityPeriod) -> R
         .with_column(user_type_from_rank_expr())
         .collect()?;
 
-    let mut result_rows: Vec<InequalityRow> = Vec::new();
+    let result_rows = rows_from_editor_period(&editor_period, period)?;
+
+    let output_edits = result_rows.iter().map(|row| u64::from(row.12)).sum::<u64>();
+    anyhow::ensure!(
+        input_edits == output_edits,
+        "{period_name} inequality edit conservation failed: input={input_edits}, output={output_edits}"
+    );
+
+    rows_to_frame(&result_rows)
+}
+
+fn rows_from_editor_period(
+    editor_period: &DataFrame,
+    period: ActivityPeriod,
+) -> Result<Vec<InequalityRow>> {
+    let period_name = period.name();
+    let period_months = period.months();
     let period_keys = editor_period.column("period_key")?.i32()?;
     let user_types = editor_period.column("user_type")?.str()?;
     let edits = editor_period
@@ -180,6 +195,7 @@ fn compute_period_frame(editor_monthly: &DataFrame, period: ActivityPeriod) -> R
             .push(edit_count as f64);
     }
 
+    let mut result_rows = Vec::new();
     for ((period_key, user_type), mut values) in grouped {
         values.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
@@ -211,12 +227,10 @@ fn compute_period_frame(editor_monthly: &DataFrame, period: ActivityPeriod) -> R
         ));
     }
 
-    let output_edits = result_rows.iter().map(|row| u64::from(row.12)).sum::<u64>();
-    anyhow::ensure!(
-        input_edits == output_edits,
-        "{period_name} inequality edit conservation failed: input={input_edits}, output={output_edits}"
-    );
+    Ok(result_rows)
+}
 
+fn rows_to_frame(result_rows: &[InequalityRow]) -> Result<DataFrame> {
     let columns = vec![
         Column::new(
             "year_month".into(),
@@ -293,11 +307,12 @@ fn compute_period_frame(editor_monthly: &DataFrame, period: ActivityPeriod) -> R
 }
 
 pub(super) fn compute_periods(editor_monthly: &DataFrame) -> Result<DataFrame> {
-    let mut result = super::concat_frames(vec![
+    let frames = vec![
         compute_period_frame(editor_monthly, ActivityPeriod::Month)?,
         compute_period_frame(editor_monthly, ActivityPeriod::Quarter)?,
         compute_period_frame(editor_monthly, ActivityPeriod::Year)?,
-    ])?;
+    ];
+    let mut result = super::concat_frames(frames)?;
     result = result.sort(["period", "period_type", "user_type"], Default::default())?;
     Ok(result)
 }
@@ -393,13 +408,32 @@ mod tests {
     }
 
     #[test]
+    fn period_reduction_skips_null_group_keys_and_counts() -> Result<()> {
+        let editor_period = DataFrame::new_infer_height(vec![
+            Column::new("period_key".into(), [Some(202401_i32), None, Some(202401)]),
+            Column::new(
+                "user_type".into(),
+                [Some("registered"), Some("registered"), None],
+            ),
+            Column::new("edits".into(), [Some(2_u32), Some(3), Some(4)]),
+        ])
+        .expect("null-key inequality fixture should be valid");
+        let result = rows_from_editor_period(&editor_period, ActivityPeriod::Month)?;
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].11, 1);
+        assert_eq!(result[0].12, 2);
+        Ok(())
+    }
+
+    #[test]
     fn quarter_and_year_count_repeated_editors_once() -> Result<()> {
         let base = df!(
             "year_month" => &["2024-01", "2024-01", "2024-02", "2024-02"],
             "user_type" => &["registered", "registered", "registered", "registered"],
             "event_user_id" => &[1_i64, 1, 1, 2],
             "revision_id" => &[10_i64, 11, 12, 13],
-        )?;
+        )
+        .expect("repeated-editor inequality fixture should be valid");
 
         let result = compute_frame(&base)?;
         for period_type in ["quarter", "year"] {
@@ -423,7 +457,8 @@ mod tests {
             "user_type" => &["registered", "bot", "registered"],
             "event_user_id" => &[1_i64, 1, 2],
             "revision_id" => &[10_i64, 11, 12],
-        )?;
+        )
+        .expect("user-type inequality fixture should be valid");
         let monthly = compute_frame(&base)?
             .lazy()
             .filter(col("period_type").eq(lit("month")))

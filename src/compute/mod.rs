@@ -122,6 +122,16 @@ impl ComputePlan {
         }
     }
 
+    fn set_invalidation(&mut self, family: MetricFamily, invalidation: Invalidation) {
+        match family {
+            MetricFamily::Monthly => self.monthly = invalidation,
+            MetricFamily::ActivityTiers => self.activity_tiers = invalidation,
+            MetricFamily::Lifecycle => self.lifecycle = invalidation,
+            MetricFamily::PageWeek => self.page_week = invalidation,
+            MetricFamily::Patrol => unreachable!("patrol is not a core compute family"),
+        }
+    }
+
     fn all_reused(self) -> bool {
         MetricFamily::CORE
             .into_iter()
@@ -3406,12 +3416,13 @@ fn compute_all_incremental_cached(
                 "analytical partitions are not ordered chronologically"
             );
             if partition.year != current_year {
-                finish_inequality_year_cached(
+                let finish_result = finish_inequality_year_cached(
                     &mut inequality_editor_month_frames,
                     &mut inequality_frames,
                     &mut inequality_month_digests,
                     cross_snapshot,
-                )?;
+                );
+                finish_result?;
             }
         }
         if plan.monthly.must_compute() {
@@ -3544,12 +3555,13 @@ fn compute_all_incremental_cached(
         }
     }
     if plan.monthly.must_compute() {
-        finish_inequality_year_cached(
+        let finish_result = finish_inequality_year_cached(
             &mut inequality_editor_month_frames,
             &mut inequality_frames,
             &mut inequality_month_digests,
             cross_snapshot,
-        )?;
+        );
+        finish_result?;
         let result = write_monthly_outputs(
             wiki,
             snapshot,
@@ -3679,12 +3691,13 @@ fn finish_inequality_year_cached(
         let digest_refs = month_digests.iter().map(String::as_str).collect::<Vec<_>>();
         let input_digest =
             cache.derived_digest("inequality_year", monthly::ALGORITHM_VERSION, &digest_refs);
-        if let Some(frame) = cache.load(
+        let cached = cache.load(
             "inequality_year",
             monthly::ALGORITHM_VERSION,
             &input_digest,
             "inequality",
-        )? {
+        );
+        if let Some(frame) = cached? {
             editor_month_frames.clear();
             month_digests.clear();
             output_frames.push(frame);
@@ -3692,13 +3705,14 @@ fn finish_inequality_year_cached(
         }
         let editor_months = concat_frames(std::mem::take(editor_month_frames))?;
         let mut frame = inequality::compute_periods(&editor_months)?;
-        cache.store(
+        let store_result = cache.store(
             "inequality_year",
             monthly::ALGORITHM_VERSION,
             &input_digest,
             "inequality",
             &mut frame,
-        )?;
+        );
+        store_result?;
         month_digests.clear();
         output_frames.push(frame);
         return Ok(());
@@ -3723,10 +3737,11 @@ fn write_monthly_outputs(
     frames: MonthlyFrames,
 ) -> Result<()> {
     let mut inequality_out = concat_frames(frames.inequality_frames)?;
-    inequality_out = inequality_out.sort(
+    let inequality_sort = inequality_out.sort(
         ["period", "period_type", "user_type"],
         SortMultipleOptions::default(),
-    )?;
+    );
+    inequality_out = inequality_sort?;
     add_wiki_column(&mut inequality_out, wiki)?;
     write_output(&mut inequality_out, wiki, "inequality", output_dir)?;
 
@@ -4151,13 +4166,7 @@ fn compute_plan(
             } else {
                 Invalidation::Recompute
             };
-        match family {
-            MetricFamily::Monthly => plan.monthly = invalidation,
-            MetricFamily::ActivityTiers => plan.activity_tiers = invalidation,
-            MetricFamily::Lifecycle => plan.lifecycle = invalidation,
-            MetricFamily::PageWeek => plan.page_week = invalidation,
-            MetricFamily::Patrol => unreachable!("patrol is not a core compute family"),
-        }
+        plan.set_invalidation(family, invalidation);
     }
     Ok(plan)
 }
@@ -4552,7 +4561,8 @@ mod tests {
             "event_user_id" => &[1_i64, 1, 2],
             "revision_id" => &[10_i64, 11, 12],
             "revision_text_bytes_diff" => &[1_i64, 1, 1],
-        )?;
+        )
+        .expect("activity identity fixture should be valid");
         let editor_months = gdp_editor_month_frame(&base)?;
         let annual = gdp_activity_tiers_for_period(&editor_months, ActivityPeriod::Year)?;
         assert_eq!(annual.column("editors")?.u32()?.sum(), Some(2));
@@ -5431,6 +5441,57 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn partitioned_monthly_scan_flushes_at_a_year_boundary() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let output_dir = TestDir::new()?;
+        let wiki = "multi-year-scan-wiki";
+        write_partitioned_base_parquet(&data_dir, wiki)?;
+        let next_year = storage::month_partition_dir(
+            &storage::analytical_wiki_dir(data_dir.path(), wiki),
+            2025,
+            "2025-01",
+        );
+        fs::create_dir_all(&next_year)?;
+        let mut january = analytical_partition_df(AnalyticalPartitionRows {
+            year_month: ["2025-01", "2025-01"],
+            year_month_key: [202501, 202501],
+            user_type: ["registered", "registered"],
+            event_user_id: [1, 4],
+            page_namespace: [0, 0],
+            revision_id: [14, 15],
+            revision_text_bytes_diff: [3, 9],
+            is_reverted: [false, false],
+            is_minor: [false, false],
+        })?;
+        ParquetWriter::new(&mut fs::File::create(next_year.join("part-000.parquet"))?)
+            .finish(&mut january)?;
+
+        compute_all_incremental(
+            wiki,
+            data_dir.path(),
+            output_dir.path(),
+            None,
+            only_family(MetricFamily::Monthly),
+        )
+        .expect("multi-year monthly compute should succeed");
+        let inequality_path = output_dir.path().join(wiki).join("inequality.parquet");
+        let inequality_file =
+            fs::File::open(inequality_path).expect("multi-year inequality output should exist");
+        let inequality = ParquetReader::new(inequality_file)
+            .finish()
+            .expect("multi-year inequality output should be readable");
+        assert!(
+            inequality
+                .column("period")?
+                .str()?
+                .iter()
+                .flatten()
+                .any(|value| value == "2025")
+        );
+        Ok(())
+    }
+
     fn only_family(family: MetricFamily) -> ComputePlan {
         let mut plan = ComputePlan {
             monthly: Invalidation::Reuse,
@@ -5438,14 +5499,33 @@ mod tests {
             lifecycle: Invalidation::Reuse,
             page_week: Invalidation::Reuse,
         };
-        match family {
-            MetricFamily::Monthly => plan.monthly = Invalidation::Recompute,
-            MetricFamily::ActivityTiers => plan.activity_tiers = Invalidation::Recompute,
-            MetricFamily::Lifecycle => plan.lifecycle = Invalidation::Recompute,
-            MetricFamily::PageWeek => plan.page_week = Invalidation::Recompute,
-            MetricFamily::Patrol => unreachable!("patrol is not a core compute family"),
-        }
+        plan.set_invalidation(family, Invalidation::Recompute);
         plan
+    }
+
+    #[test]
+    #[should_panic(expected = "patrol is not a core compute family")]
+    fn core_plan_rejects_patrol_lookup() {
+        ComputePlan::all_recompute().invalidation(MetricFamily::Patrol);
+    }
+
+    #[test]
+    #[should_panic(expected = "patrol is not a core compute family")]
+    fn core_plan_rejects_patrol_assignment() {
+        let mut plan = ComputePlan::all_recompute();
+        plan.set_invalidation(MetricFamily::Patrol, Invalidation::Reuse);
+    }
+
+    #[test]
+    #[should_panic(expected = "patrol has its own compute stage")]
+    fn core_stage_spec_rejects_patrol() {
+        let _ = family_stage_spec(MetricFamily::Patrol, "testwiki", None, "v1");
+    }
+
+    #[test]
+    #[should_panic(expected = "patrol is not a core compute family")]
+    fn core_only_family_fixture_rejects_patrol() {
+        let _ = only_family(MetricFamily::Patrol);
     }
 
     #[test]
@@ -6591,7 +6671,7 @@ mod tests {
         let cache = crate::cross_snapshot::CrossSnapshotCache::for_test(
             root.path(),
             "testwiki",
-            vec![identity],
+            vec![identity.clone()],
         );
 
         let mut editor_month_frames = Vec::new();
@@ -6606,6 +6686,60 @@ mod tests {
         empty_finish?;
         assert!(month_digests.is_empty());
         assert!(output_frames.is_empty());
+
+        let mut inequality_inputs = Vec::new();
+        let mut inequality_outputs = Vec::new();
+        let mut inequality_digests = vec!["stale".to_string()];
+        finish_inequality_year_cached(
+            &mut inequality_inputs,
+            &mut inequality_outputs,
+            &mut inequality_digests,
+            Some(&cache),
+        )
+        .expect("empty inequality period should be accepted");
+        assert!(inequality_digests.is_empty());
+        assert!(inequality_outputs.is_empty());
+
+        let inequality_month = || {
+            DataFrame::new_infer_height(vec![
+                Column::new("year_month".into(), ["2024-02"]),
+                Column::new("year_month_key".into(), [202402_i32]),
+                Column::new("editor_identity".into(), ["id:1"]),
+                Column::new("user_type_rank".into(), [0_i32]),
+                Column::new("edits".into(), [1_u32]),
+            ])
+            .map_err(anyhow::Error::from)
+        };
+        inequality_inputs.push(inequality_month().expect("inequality fixture should be valid"));
+        assert!(
+            finish_inequality_year_cached(
+                &mut inequality_inputs,
+                &mut inequality_outputs,
+                &mut inequality_digests,
+                Some(&cache),
+            )
+            .is_err()
+        );
+        inequality_digests.push(identity.digest.clone());
+        finish_inequality_year_cached(
+            &mut inequality_inputs,
+            &mut inequality_outputs,
+            &mut inequality_digests,
+            Some(&cache),
+        )
+        .expect("first inequality cache write should succeed");
+        assert_eq!(inequality_outputs.len(), 1);
+
+        inequality_inputs.push(inequality_month().expect("inequality fixture should be valid"));
+        inequality_digests.push(identity.digest.clone());
+        finish_inequality_year_cached(
+            &mut inequality_inputs,
+            &mut inequality_outputs,
+            &mut inequality_digests,
+            Some(&cache),
+        )
+        .expect("inequality cache reuse should succeed");
+        assert_eq!(inequality_outputs.len(), 2);
 
         editor_month_frames.push(editor_months(&[1], &[202402], &[1])?);
         assert!(

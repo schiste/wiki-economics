@@ -138,6 +138,18 @@
       "paths": ["src/compute/mod.rs"],
       "reason": "Name the core-only family collection explicitly while keeping page-week computation semantics and artifact bytes unchanged.",
       "base_commit": "42e1ee5643d30707541bd8436a87623aad3cfa3c"
+    },
+    {
+      "family": "lifecycle",
+      "paths": ["src/compute/mod.rs", "src/compute/lifecycle/mod.rs"],
+      "reason": "Canonical registry adoption and coverage-oriented control-flow extraction leave lifecycle computation semantics and artifact bytes unchanged.",
+      "base_commit": "da16b4e15850a00b76a8a6b61da6d85638398786"
+    },
+    {
+      "family": "page_week",
+      "paths": ["src/compute/mod.rs", "src/compute/weekly/mod.rs"],
+      "reason": "Canonical registry adoption and coverage-oriented control-flow extraction leave page-week computation semantics and artifact bytes unchanged.",
+      "base_commit": "da16b4e15850a00b76a8a6b61da6d85638398786"
     }
   ]
 }
