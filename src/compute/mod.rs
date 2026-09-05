@@ -123,7 +123,7 @@ impl ComputePlan {
     }
 
     fn all_reused(self) -> bool {
-        MetricFamily::ALL
+        MetricFamily::CORE
             .into_iter()
             .all(|family| self.invalidation(family) == Invalidation::Reuse)
     }
@@ -3936,7 +3936,7 @@ fn family_outputs(
 }
 
 fn compute_stage_outputs(wiki: &str, output_dir: &Path) -> Vec<fingerprint::TrackedPath> {
-    MetricFamily::ALL
+    MetricFamily::CORE
         .into_iter()
         .flat_map(|family| family_outputs(family, wiki, output_dir))
         .filter(|output| output.path.is_file())
@@ -4074,7 +4074,7 @@ pub(crate) fn reusable_candidate_families(
         migrate_legacy_compute_receipt(wiki, snapshot, data_dir, candidate_dir, &weekly_config)?;
     }
     let mut reusable = Vec::new();
-    for family in MetricFamily::ALL {
+    for family in MetricFamily::CORE {
         if family == MetricFamily::PageWeek && !profile_exists {
             continue;
         }
@@ -4121,7 +4121,7 @@ pub(crate) fn candidate_receipts_current_without_inputs(
     };
     profile.validate(wiki, snapshot)?;
     let weekly_config = WeeklyAggregationConfig::from_workload_profile(profile)?;
-    for family in MetricFamily::ALL {
+    for family in MetricFamily::CORE {
         let algorithm = family.algorithm_version(&weekly_config);
         let outputs = family_outputs(family, wiki, candidate_dir);
         let outputs_reusable = fingerprint::outputs_reusable(
@@ -4144,7 +4144,7 @@ fn compute_plan(
     weekly_config: &WeeklyAggregationConfig,
 ) -> Result<ComputePlan> {
     let mut plan = ComputePlan::all_recompute();
-    for family in MetricFamily::ALL {
+    for family in MetricFamily::CORE {
         let invalidation =
             if family_is_reusable(family, wiki, snapshot, data_dir, output_dir, weekly_config)? {
                 Invalidation::Reuse
@@ -4173,17 +4173,17 @@ pub(crate) fn family_receipt_identities(
         .iter()
         .map(|(family, _)| family.name())
         .collect::<Vec<_>>();
-    let missing_names = MetricFamily::ALL
+    let missing_names = MetricFamily::CORE
         .into_iter()
         .filter(|family| !reusable_names.contains(&family.name()))
         .map(MetricFamily::name)
         .collect::<Vec<_>>();
     anyhow::ensure!(
-        reusable.len() == MetricFamily::ALL.len(),
+        reusable.len() == MetricFamily::CORE.len(),
         "candidate does not have a complete reusable compute-family receipt set; missing {}",
         missing_names.join(", ")
     );
-    MetricFamily::ALL
+    MetricFamily::CORE
         .into_iter()
         .map(|family| {
             let receipt =
@@ -4200,7 +4200,7 @@ pub(crate) fn family_receipt_algorithms(
     candidate_dir: &Path,
 ) -> Result<BTreeMap<String, String>> {
     family_receipt_identities(wiki, snapshot, data_dir, candidate_dir)?;
-    MetricFamily::ALL
+    MetricFamily::CORE
         .into_iter()
         .map(|family| {
             let receipt =
@@ -4237,7 +4237,7 @@ pub(crate) fn record_candidate_fingerprint_for_test(
         write_editor_identity_coverage(wiki, Some(snapshot), candidate_dir, vec![coverage])?;
     }
     let weekly_config = WeeklyAggregationConfig::for_snapshot(data_dir, wiki, Some(snapshot))?;
-    for family in MetricFamily::ALL {
+    for family in MetricFamily::CORE {
         let algorithm = family.algorithm_version(&weekly_config);
         let inputs = family_inputs(family, wiki, data_dir, Some(snapshot))?;
         let outputs = family_outputs(family, wiki, candidate_dir);
@@ -4326,7 +4326,7 @@ fn compute_all_selected(
         info!(
             wiki,
             snapshot = snapshot.unwrap_or("legacy"),
-            families = MetricFamily::ALL.len(),
+            families = MetricFamily::CORE.len(),
             "reusing deterministic compute stage"
         );
         return Ok(());
@@ -4365,7 +4365,7 @@ fn compute_all_selected(
             cross_snapshot.as_ref(),
         )?;
     }
-    for family in MetricFamily::ALL {
+    for family in MetricFamily::CORE {
         if !plan.invalidation(family).must_compute() {
             crate::observability::record_stage_reused(
                 &format!("compute_{}", family.name()),
@@ -5388,7 +5388,7 @@ mod tests {
         );
         assert_eq!(fs::read(&gdp)?, gdp_bytes);
 
-        let family_receipts_before = MetricFamily::ALL
+        let family_receipts_before = MetricFamily::CORE
             .into_iter()
             .map(|family| fs::read(family_stage_receipt(output_dir.path(), wiki, family)))
             .collect::<std::io::Result<Vec<_>>>()?;
@@ -5396,7 +5396,7 @@ mod tests {
         fs::create_dir_all(&patrol_dir)?;
         fs::write(patrol_dir.join("parser-input.changed"), "patrol-only")?;
         compute_all(wiki, data_dir.path(), output_dir.path())?;
-        let family_receipts_after = MetricFamily::ALL
+        let family_receipts_after = MetricFamily::CORE
             .into_iter()
             .map(|family| fs::read(family_stage_receipt(output_dir.path(), wiki, family)))
             .collect::<std::io::Result<Vec<_>>>()?;
@@ -5862,11 +5862,11 @@ mod tests {
             .collect::<std::io::Result<Vec<_>>>()?,
             nonmonthly_before
         );
-        let receipts_before = MetricFamily::ALL
+        let receipts_before = MetricFamily::CORE
             .into_iter()
             .map(|family| fs::read(family_stage_receipt(output_dir.path(), wiki, family)))
             .collect::<std::io::Result<Vec<_>>>()?;
-        for family in MetricFamily::ALL {
+        for family in MetricFamily::CORE {
             assert!(
                 family_is_reusable(
                     family,
@@ -5889,14 +5889,14 @@ mod tests {
         )
         .expect("repeated legacy migration should be idempotent");
         assert_eq!(
-            MetricFamily::ALL
+            MetricFamily::CORE
                 .into_iter()
                 .map(|family| fs::read(family_stage_receipt(output_dir.path(), wiki, family)))
                 .collect::<std::io::Result<Vec<_>>>()?,
             receipts_before
         );
 
-        for family in MetricFamily::ALL {
+        for family in MetricFamily::CORE {
             let receipt = family_stage_receipt(output_dir.path(), wiki, family);
             let parent = receipt
                 .parent()

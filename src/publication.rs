@@ -1517,7 +1517,7 @@ pub(crate) fn plan_wiki_preparation(
         let patrol =
             crate::patrol::reusable_candidate_files(wiki, snapshot, data_dir, candidate_dir)?;
         if candidate_dir.join("ready.json").is_file()
-            && compute.len() == crate::metric_registry::MetricFamily::ALL.len()
+            && compute.len() == crate::metric_registry::MetricFamily::CORE.len()
             && patrol.is_some()
         {
             let indexed = indexed_latest_ready_candidate(data_dir, output_dir, wiki)?
@@ -1574,7 +1574,7 @@ pub(crate) fn plan_wiki_preparation(
     reusable_patrol.as_ref().map_or(Ok(()), |(source, files)| {
         copy_candidate_files(source, &target_candidate, files)
     })?;
-    let compute_reused = reusable_compute.len() == crate::metric_registry::MetricFamily::ALL.len();
+    let compute_reused = reusable_compute.len() == crate::metric_registry::MetricFamily::CORE.len();
     let patrol_reused = reusable_patrol.is_some();
     info!(
         wiki,
@@ -1650,7 +1650,7 @@ pub(crate) fn plan_wiki_qualification_preparation(
     reusable_patrol.as_ref().map_or(Ok(()), |(source, files)| {
         copy_candidate_files(source, &target, files)
     })?;
-    let compute_reused = reusable_compute.len() == crate::metric_registry::MetricFamily::ALL.len();
+    let compute_reused = reusable_compute.len() == crate::metric_registry::MetricFamily::CORE.len();
     let patrol_reused = reusable_patrol.is_some();
     info!(
         wiki,
@@ -1846,7 +1846,7 @@ fn artifact_backed_ready_candidate_reference(
 ) -> Result<ReadyCandidateReference> {
     let ready = authoritative_ready_candidate(candidate_dir, ready)?;
     let proofs = artifact_backed_family_proofs(candidate_dir, &ready.artifacts)?;
-    let core_family_receipt_identities = crate::metric_registry::MetricFamily::ALL
+    let core_family_receipt_identities = crate::metric_registry::MetricFamily::CORE
         .into_iter()
         .map(|family| {
             let name = family.name().to_string();
@@ -5680,7 +5680,7 @@ mod tests {
             artifact.receipt_sha256.clear();
         }
         atomic_json(&ready_path, &legacy)?;
-        for family in crate::metric_registry::MetricFamily::ALL {
+        for family in crate::metric_registry::MetricFamily::CORE {
             fs::remove_file(
                 candidate_dir
                     .join("_stages/compute")

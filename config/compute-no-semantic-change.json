@@ -114,6 +114,30 @@
       "paths": ["src/compute/mod.rs", "src/compute/weekly/mod.rs"],
       "reason": "Move the existing page-week metric inventory into the typed canonical registry without changing computation semantics or artifact bytes.",
       "base_commit": "8da5e681b6014891178a902bb8415ff91a382f7c"
+    },
+    {
+      "family": "monthly",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Name the core-only family collection explicitly while keeping monthly computation semantics and artifact bytes unchanged.",
+      "base_commit": "42e1ee5643d30707541bd8436a87623aad3cfa3c"
+    },
+    {
+      "family": "activity_tiers",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Name the core-only family collection explicitly while keeping activity-tier computation semantics and artifact bytes unchanged.",
+      "base_commit": "42e1ee5643d30707541bd8436a87623aad3cfa3c"
+    },
+    {
+      "family": "lifecycle",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Name the core-only family collection explicitly while keeping lifecycle computation semantics and artifact bytes unchanged.",
+      "base_commit": "42e1ee5643d30707541bd8436a87623aad3cfa3c"
+    },
+    {
+      "family": "page_week",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Name the core-only family collection explicitly while keeping page-week computation semantics and artifact bytes unchanged.",
+      "base_commit": "42e1ee5643d30707541bd8436a87623aad3cfa3c"
     }
   ]
 }

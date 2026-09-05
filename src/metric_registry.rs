@@ -100,13 +100,13 @@ pub(crate) enum MetricFamily {
 }
 
 impl MetricFamily {
-    pub(crate) const ALL: [Self; 4] = [
+    pub(crate) const CORE: [Self; 4] = [
         Self::Monthly,
         Self::ActivityTiers,
         Self::Lifecycle,
         Self::PageWeek,
     ];
-    pub(crate) const PUBLISHED: [Self; 5] = [
+    pub(crate) const ALL: [Self; 5] = [
         Self::Monthly,
         Self::ActivityTiers,
         Self::Lifecycle,
@@ -139,7 +139,7 @@ impl MetricFamily {
     }
 
     pub(crate) fn for_metric(metric: &str) -> Option<Self> {
-        Self::PUBLISHED
+        Self::ALL
             .into_iter()
             .find(|family| family.metrics().contains(&metric))
     }
