@@ -133,18 +133,28 @@ impl PatrolSourcePlan {
             Some((
                 PatrolSourceLayout::Recombined,
                 parse_job_sources(recombined, wiki, &logging_dump_date)?,
+                job_updated(recombined),
             ))
         } else if split_status == "done" {
             let mut sources = parse_job_sources(split, wiki, &logging_dump_date)?;
-            sources.sort_by_key(|source| {
-                split_source_index(&source.source_id, wiki, &logging_dump_date)
-                    .unwrap_or(usize::MAX)
-            });
-            Some((PatrolSourceLayout::Split, sources))
+            let canonical_source = format!("{wiki}-{logging_dump_date}-pages-logging.xml.gz");
+            let layout = if sources.len() == 1 && sources[0].source_id == canonical_source {
+                // Small wikis can publish the canonical single logging object directly
+                // from xmlpagelogsdump without an xmlpagelogsdumprecombine job.  The
+                // physical source layout is still the same one-object layout.
+                PatrolSourceLayout::Recombined
+            } else {
+                sources.sort_by_key(|source| {
+                    split_source_index(&source.source_id, wiki, &logging_dump_date)
+                        .unwrap_or(usize::MAX)
+                });
+                PatrolSourceLayout::Split
+            };
+            Some((layout, sources, job_updated(split)))
         } else {
             None
         };
-        let Some((layout, sources)) = selected else {
+        let Some((layout, sources, inventory_updated)) = selected else {
             let waiting = UpstreamWaiting {
                 wiki: wiki.to_string(),
                 history_snapshot: snapshot.to_string(),
@@ -172,10 +182,6 @@ impl PatrolSourcePlan {
             !sources.is_empty(),
             "completed patrol job has no source files"
         );
-        let inventory_updated = match layout {
-            PatrolSourceLayout::Recombined => job_updated(recombined),
-            PatrolSourceLayout::Split => job_updated(split),
-        };
         let mut plan = Self {
             schema_version: PLAN_SCHEMA_VERSION,
             wiki: wiki.to_string(),

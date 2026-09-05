@@ -1008,6 +1008,45 @@ fn patrol_plan_uses_complete_split_inventory_and_rejects_incomplete_metadata() -
 }
 
 #[test]
+fn patrol_plan_accepts_canonical_single_file_from_split_job() -> Result<()> {
+    let data_dir = TestDir::new()?;
+    let status = json!({
+        "jobs": {
+            "xmlpagelogsdump": {
+                "status": "done",
+                "updated": "2026-09-04 00:00:00",
+                "files": {
+                    "smallwiki-20260901-pages-logging.xml.gz": {
+                        "size": 42,
+                        "url": "/smallwiki/20260901/smallwiki-20260901-pages-logging.xml.gz",
+                        "md5": "0".repeat(32),
+                        "sha1": "1".repeat(40)
+                    }
+                }
+            }
+        }
+    });
+    let transport =
+        FakePatrolTransport::new(Vec::new(), Vec::new()).with_dump_statuses(vec![status]);
+
+    let plan = plan::PatrolSourcePlan::load_or_resolve(
+        &transport,
+        "smallwiki",
+        "2026-08",
+        data_dir.path(),
+    )?;
+
+    assert_eq!(plan.layout, plan::PatrolSourceLayout::Recombined);
+    assert_eq!(plan.sources.len(), 1);
+    assert_eq!(
+        plan.sources[0].source_id,
+        "smallwiki-20260901-pages-logging.xml.gz"
+    );
+    assert_eq!(plan.inventory_updated, "2026-09-04 00:00:00");
+    Ok(())
+}
+
+#[test]
 fn patrol_plan_orders_double_digit_split_parts_numerically() -> Result<()> {
     let data_dir = TestDir::new()?;
     let mut files = serde_json::Map::new();
