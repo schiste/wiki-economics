@@ -3,5 +3,3 @@
 pub(crate) const ALGORITHM_VERSION: &str = "page-week-v2-governed-parallel-buckets";
 pub(crate) const CONTRIBUTION_ALGORITHM_VERSION: &str =
     "page-week-month-contribution-v1-monday-boundary";
-
-pub(crate) const METRICS: [&str; 1] = ["page_weekly_edits"];

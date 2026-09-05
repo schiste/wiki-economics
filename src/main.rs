@@ -21,6 +21,7 @@ mod generation_lifecycle;
 mod ingest;
 mod licensing;
 mod merge;
+mod metric_registry;
 mod observability;
 #[cfg(test)]
 mod parity_tests;

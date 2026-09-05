@@ -90,6 +90,30 @@
       "paths": ["src/compute/inequality.rs"],
       "reason": "Correct the public documentation comment for the already-versioned exact-period inequality implementation; executable semantics and bytes are unchanged.",
       "base_commit": "3f87247692a3bdd8ba045ab327e3b9fd701e8ffb"
+    },
+    {
+      "family": "monthly",
+      "paths": ["src/compute/mod.rs", "src/compute/monthly/mod.rs"],
+      "reason": "Move the existing monthly metric inventory into the typed canonical registry without changing computation semantics or artifact bytes.",
+      "base_commit": "8da5e681b6014891178a902bb8415ff91a382f7c"
+    },
+    {
+      "family": "activity_tiers",
+      "paths": ["src/compute/mod.rs", "src/compute/activity/mod.rs"],
+      "reason": "Move the existing activity-tier metric inventory into the typed canonical registry without changing computation semantics or artifact bytes.",
+      "base_commit": "8da5e681b6014891178a902bb8415ff91a382f7c"
+    },
+    {
+      "family": "lifecycle",
+      "paths": ["src/compute/mod.rs", "src/compute/lifecycle/mod.rs"],
+      "reason": "Move the existing lifecycle metric inventory into the typed canonical registry without changing computation semantics or artifact bytes.",
+      "base_commit": "8da5e681b6014891178a902bb8415ff91a382f7c"
+    },
+    {
+      "family": "page_week",
+      "paths": ["src/compute/mod.rs", "src/compute/weekly/mod.rs"],
+      "reason": "Move the existing page-week metric inventory into the typed canonical registry without changing computation semantics or artifact bytes.",
+      "base_commit": "8da5e681b6014891178a902bb8415ff91a382f7c"
     }
   ]
 }

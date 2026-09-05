@@ -21,6 +21,7 @@ use tracing::info;
 
 use crate::{
     determinism, fingerprint,
+    metric_registry::MetricFamily,
     observability::MemorySnapshot,
     resource_governor::{GovernorPaths, ResourceGovernor, ResourceObservation},
     storage, workload_profile,
@@ -69,54 +70,13 @@ pub(crate) fn snapshot_contains_complete_month(snapshot: &str, event_month: &str
     event_month <= snapshot
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub(crate) enum MetricFamily {
-    Monthly,
-    ActivityTiers,
-    Lifecycle,
-    PageWeek,
-}
-
 impl MetricFamily {
-    pub(crate) const ALL: [Self; 4] = [
-        Self::Monthly,
-        Self::ActivityTiers,
-        Self::Lifecycle,
-        Self::PageWeek,
-    ];
-
     const NONWEEKLY: [Self; 3] = [Self::Monthly, Self::ActivityTiers, Self::Lifecycle];
-
-    pub(crate) fn name(self) -> &'static str {
-        match self {
-            Self::Monthly => "monthly",
-            Self::ActivityTiers => "activity_tiers",
-            Self::Lifecycle => "lifecycle",
-            Self::PageWeek => "page_week",
-        }
-    }
-
-    pub(crate) fn metrics(self) -> &'static [&'static str] {
-        match self {
-            Self::Monthly => &monthly::METRICS,
-            Self::ActivityTiers => &activity::METRICS,
-            Self::Lifecycle => &lifecycle::METRICS,
-            Self::PageWeek => &weekly::METRICS,
-        }
-    }
-
-    pub(crate) fn for_metric(metric: &str) -> Option<Self> {
-        Self::ALL
-            .into_iter()
-            .find(|family| family.metrics().contains(&metric))
-    }
 
     fn algorithm_version(self, weekly_config: &WeeklyAggregationConfig) -> String {
         match self {
-            Self::Monthly => monthly::ALGORITHM_VERSION.to_string(),
-            Self::ActivityTiers => activity::ALGORITHM_VERSION.to_string(),
-            Self::Lifecycle => lifecycle::ALGORITHM_VERSION.to_string(),
             Self::PageWeek => weekly_config.algorithm_version(),
+            _ => self.base_algorithm_version().to_string(),
         }
     }
 }
@@ -158,6 +118,7 @@ impl ComputePlan {
             MetricFamily::ActivityTiers => self.activity_tiers,
             MetricFamily::Lifecycle => self.lifecycle,
             MetricFamily::PageWeek => self.page_week,
+            MetricFamily::Patrol => unreachable!("patrol is not a core compute family"),
         }
     }
 
@@ -710,7 +671,7 @@ fn load_cached_lifecycle_outputs(
     input_digest: &str,
 ) -> Result<Option<Vec<(&'static str, DataFrame)>>> {
     let mut outputs = Vec::new();
-    for metric in lifecycle::METRICS {
+    for &metric in MetricFamily::Lifecycle.metrics() {
         let cached = cache.load(
             "lifecycle_final",
             lifecycle::ALGORITHM_VERSION,
@@ -731,7 +692,7 @@ fn store_lifecycle_outputs(
     wiki: &str,
     output_dir: &Path,
 ) -> Result<()> {
-    for metric in lifecycle::METRICS {
+    for &metric in MetricFamily::Lifecycle.metrics() {
         let path = output_dir.join(wiki).join(format!("{metric}.parquet"));
         let mut frame = ParquetReader::new(File::open(path)?)
             .set_low_memory(true)
@@ -4009,6 +3970,7 @@ fn family_stage_spec<'a>(
             MetricFamily::ActivityTiers => "compute_activity_tiers",
             MetricFamily::Lifecycle => "compute_lifecycle",
             MetricFamily::PageWeek => "compute_page_week",
+            MetricFamily::Patrol => unreachable!("patrol has its own compute stage"),
         },
         scope: wiki,
         selected_snapshot: snapshot,
@@ -4194,6 +4156,7 @@ fn compute_plan(
             MetricFamily::ActivityTiers => plan.activity_tiers = invalidation,
             MetricFamily::Lifecycle => plan.lifecycle = invalidation,
             MetricFamily::PageWeek => plan.page_week = invalidation,
+            MetricFamily::Patrol => unreachable!("patrol is not a core compute family"),
         }
     }
     Ok(plan)
@@ -5480,6 +5443,7 @@ mod tests {
             MetricFamily::ActivityTiers => plan.activity_tiers = Invalidation::Recompute,
             MetricFamily::Lifecycle => plan.lifecycle = Invalidation::Recompute,
             MetricFamily::PageWeek => plan.page_week = Invalidation::Recompute,
+            MetricFamily::Patrol => unreachable!("patrol is not a core compute family"),
         }
         plan
     }
