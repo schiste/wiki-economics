@@ -5,14 +5,14 @@
 //! requirements explicit at compile time.
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Utc};
 #[cfg(any(test, coverage))]
 use chrono::Datelike;
+use chrono::{DateTime, Utc};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use tracing::info;
 
-use crate::{observability, publication, source_window};
+use crate::{fleet, observability, publication, snapshot_plan, source_window};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct AppPaths<'a> {
@@ -83,6 +83,27 @@ pub(crate) struct SchemaBenchmarkRequest<'a> {
     pub(crate) report_path: &'a Path,
     pub(crate) wikis: &'a [String],
     pub(crate) run_id: Option<&'a str>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PatrolComputeRequest<'a> {
+    pub(crate) wikis: &'a [String],
+    pub(crate) rebuild: bool,
+    pub(crate) limit_months: Option<usize>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct AccountCreationRequest<'a> {
+    pub(crate) wiki: &'a str,
+    pub(crate) version: Option<&'a str>,
+    pub(crate) destination: &'a Path,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FleetDiscoveryRequest<'a> {
+    pub(crate) lifecycle: &'a Path,
+    pub(crate) queue_dir: &'a Path,
+    pub(crate) snapshot: Option<&'a str>,
 }
 
 pub(crate) trait SnapshotOps {
@@ -362,6 +383,45 @@ pub(crate) fn handle_snapshot_resolve(
     Ok(version)
 }
 
+pub(crate) fn handle_fleet_discovery(
+    context: RunContext<'_>,
+    ops: &impl SnapshotOps,
+    request: FleetDiscoveryRequest<'_>,
+) -> Result<fleet::DiscoveryReport> {
+    let controller_run_id = context
+        .run_id
+        .context("fleet discovery requires --run-id")?;
+    let wikis = fleet::scheduled_wikis(request.lifecycle)?;
+    let overrides = fleet::lifecycle_resource_overrides(request.lifecycle)?;
+    let mut report = fleet::DiscoveryReport::default();
+    for wiki in wikis {
+        let version = match request.snapshot {
+            Some(version) => version.to_string(),
+            None => timed_stage("fleet_snapshot_resolve", Some(&wiki), || {
+                ops.resolve_snapshot(std::slice::from_ref(&wiki), context.now, context.paths.data)
+            })?,
+        };
+        ops.persist_snapshot_plans(std::slice::from_ref(&wiki), &version, context.paths.data)?;
+        let (plan, _) =
+            snapshot_plan::SnapshotPlan::load_or_resolve(context.paths.data, &wiki, &version)?;
+        let (resource_class, signals) = fleet::classify(
+            context.paths.data,
+            context.paths.output,
+            &plan,
+            overrides.get(&wiki).copied(),
+        )?;
+        report.merge(fleet::enqueue(
+            request.queue_dir,
+            &wiki,
+            &version,
+            resource_class,
+            signals,
+            controller_run_id,
+        )?);
+    }
+    Ok(report)
+}
+
 pub(crate) fn handle_fetch(
     context: RunContext<'_>,
     ops: &(impl SnapshotOps + HistoryInputOps + PatrolOps),
@@ -428,18 +488,20 @@ pub(crate) fn handle_prepare_wiki(
     if request.mode == PreparationMode::Qualification {
         ops.ensure_qualification_wiki(request.lifecycle, request.wiki)?;
     }
-    let version = resolve_requested_snapshot(
-        context,
-        ops,
-        std::slice::from_ref(&request.wiki.to_string()),
-        request.version,
-    )?;
+    let wikis = [request.wiki.to_string()];
+    let version = match request.version {
+        Some(version) => {
+            timed_stage("snapshot_validate", Some(request.wiki), || {
+                ops.validate_completed_snapshot(request.wiki, version, context.paths.data)
+            })?;
+            version.to_string()
+        }
+        None => timed_stage("snapshot_resolve", Some(request.wiki), || {
+            ops.resolve_snapshot(&wikis, context.now, context.paths.data)
+        })?,
+    };
     let source_window_size = source_window::configured_window_size(request.source_window_size)?;
-    ops.persist_snapshot_plans(
-        std::slice::from_ref(&request.wiki.to_string()),
-        &version,
-        context.paths.data,
-    )?;
+    ops.persist_snapshot_plans(&wikis, &version, context.paths.data)?;
 
     if request.mode == PreparationMode::Qualification
         && ops.reset_obsolete_qualification_generation(
@@ -705,4 +767,176 @@ pub(crate) fn handle_pipeline_run(
         })?;
     }
     Ok(())
+}
+
+pub(crate) fn handle_publication_prepare(
+    context: RunContext<'_>,
+    ops: &impl PublicationOps,
+    lifecycle: &Path,
+) -> Result<()> {
+    let run_id = context
+        .run_id
+        .context("ready publication preparation requires --run-id")?;
+    timed_stage("publication_prepare", None, || {
+        ops.prepare_ready_publication(context.paths.data, context.paths.output, lifecycle, run_id)
+    })
+}
+
+pub(crate) fn handle_publication_commit(
+    context: RunContext<'_>,
+    ops: &impl PublicationOps,
+) -> Result<()> {
+    let run_id = context
+        .run_id
+        .context("ready publication commit requires --run-id")?;
+    timed_stage("publication_commit", None, || {
+        ops.commit_ready_publication(context.paths.data, context.paths.output, run_id)
+    })
+}
+
+pub(crate) fn handle_publication_rollback(
+    context: RunContext<'_>,
+    ops: &impl PublicationOps,
+    lifecycle: &Path,
+) -> Result<()> {
+    let run_id = context
+        .run_id
+        .context("ready publication rollback requires --run-id")?;
+    timed_stage("publication_rollback", None, || {
+        ops.rollback_ready_publication(context.paths.data, context.paths.output, lifecycle, run_id)
+    })
+}
+
+pub(crate) fn handle_merge(context: RunContext<'_>, ops: &impl PublicationOps) -> Result<()> {
+    publication::begin_run(context.paths.output, context.run_id, &[], None)?;
+    timed_stage("merge", None, || {
+        ops.merge_outputs(context.paths.output, context.run_id)
+    })
+}
+
+pub(crate) fn handle_snapshot_finalize(
+    context: RunContext<'_>,
+    ops: &impl SnapshotOps,
+    wikis: &[String],
+) -> Result<()> {
+    for wiki in wikis {
+        timed_stage("snapshot_finalize", Some(wiki), || {
+            ops.finalize_snapshot(wiki, context.paths.data)
+        })?;
+    }
+    Ok(())
+}
+
+pub(crate) fn handle_patrol_fetch(
+    context: RunContext<'_>,
+    ops: &impl PatrolOps,
+    wikis: &[String],
+) -> Result<()> {
+    for wiki in wikis {
+        timed_stage("patrol_fetch", Some(wiki), || {
+            ops.fetch_patrol(wiki, context.paths.data)
+        })?;
+    }
+    Ok(())
+}
+
+pub(crate) fn handle_patrol_refresh(
+    context: RunContext<'_>,
+    ops: &impl PatrolOps,
+    request: PatrolComputeRequest<'_>,
+) -> Result<()> {
+    for wiki in request.wikis {
+        timed_stage("patrol_fetch", Some(wiki), || {
+            ops.fetch_patrol(wiki, context.paths.data)
+        })?;
+        compute_patrol(context, ops, wiki, request.rebuild, request.limit_months)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn handle_patrol_compute(
+    context: RunContext<'_>,
+    ops: &impl PatrolOps,
+    request: PatrolComputeRequest<'_>,
+) -> Result<()> {
+    for wiki in request.wikis {
+        compute_patrol(context, ops, wiki, request.rebuild, request.limit_months)?;
+    }
+    Ok(())
+}
+
+fn compute_patrol(
+    context: RunContext<'_>,
+    ops: &impl PatrolOps,
+    wiki: &str,
+    rebuild: bool,
+    limit_months: Option<usize>,
+) -> Result<()> {
+    timed_stage("patrol_compute", Some(wiki), || {
+        ops.compute_patrol(
+            wiki,
+            context.paths.data,
+            context.paths.output,
+            rebuild,
+            limit_months,
+        )
+    })
+}
+
+pub(crate) fn handle_account_creation(
+    context: RunContext<'_>,
+    ops: &impl PatrolOps,
+    request: AccountCreationRequest<'_>,
+) -> Result<()> {
+    let snapshot = match request.version {
+        Some(version) => version.to_string(),
+        None => crate::storage::current_snapshot_version(context.paths.data, request.wiki)?
+            .with_context(|| {
+                format!(
+                    "account creation requires a selected snapshot for {}",
+                    request.wiki
+                )
+            })?,
+    };
+    timed_stage("account_creation_extract", Some(request.wiki), || {
+        ops.build_account_creation_staging_report(
+            request.wiki,
+            &snapshot,
+            context.paths.data,
+            request.destination,
+        )
+    })
+}
+
+pub(crate) fn handle_benchmark(
+    ops: &impl QualificationOps,
+    request: BenchmarkRequest<'_>,
+) -> Result<()> {
+    timed_stage("bench", None, || ops.benchmark(request))
+}
+
+pub(crate) fn handle_capacity_benchmark(
+    ops: &impl QualificationOps,
+    request: CapacityBenchmarkRequest<'_>,
+) -> Result<()> {
+    timed_stage("capacity_benchmark", Some(request.wiki), || {
+        ops.capacity_benchmark(request)
+    })
+}
+
+pub(crate) fn handle_cpu_qualification(
+    ops: &impl QualificationOps,
+    capacity_reports: &[PathBuf],
+    report: &Path,
+) -> Result<()> {
+    timed_stage("cpu_qualification", None, || {
+        ops.cpu_qualification(capacity_reports, report)
+    })
+}
+
+pub(crate) fn handle_schema_benchmark(
+    ops: &impl QualificationOps,
+    request: SchemaBenchmarkRequest<'_>,
+) -> Result<()> {
+    timed_stage("schema_benchmark", None, || ops.schema_benchmark(request))
 }

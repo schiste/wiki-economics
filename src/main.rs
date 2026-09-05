@@ -57,11 +57,16 @@ use tracing_subscriber::fmt::format::{
 use tracing_subscriber::registry::LookupSpan;
 
 use orchestration::{
-    AppPaths, ApplicationOps, BenchmarkRequest, CandidateOps, CapacityBenchmarkRequest,
-    HistoryInputOps, MetricComputeOps, PatrolOps, PipelineRunRequest, PreparationMode,
-    PrepareWikiRequest, PublicationOps, QualificationOps, RunContext, SchemaBenchmarkRequest,
-    SnapshotOps, handle_compute, handle_fetch, handle_ingest, handle_pipeline_run,
-    handle_prepare_wiki, handle_snapshot_resolve, timed_stage as run_timed_stage,
+    AccountCreationRequest, AppPaths, ApplicationOps, BenchmarkRequest, CandidateOps,
+    CapacityBenchmarkRequest, FleetDiscoveryRequest, HistoryInputOps, MetricComputeOps,
+    PatrolComputeRequest, PatrolOps, PipelineRunRequest, PreparationMode, PrepareWikiRequest,
+    PublicationOps, QualificationOps, RunContext, SchemaBenchmarkRequest, SnapshotOps,
+    handle_account_creation, handle_benchmark, handle_capacity_benchmark, handle_compute,
+    handle_cpu_qualification, handle_fetch, handle_fleet_discovery, handle_ingest, handle_merge,
+    handle_patrol_compute, handle_patrol_fetch, handle_patrol_refresh, handle_pipeline_run,
+    handle_prepare_wiki, handle_publication_commit, handle_publication_prepare,
+    handle_publication_rollback, handle_schema_benchmark, handle_snapshot_finalize,
+    handle_snapshot_resolve, timed_stage as run_timed_stage,
 };
 
 #[cfg(test)]
@@ -1147,34 +1152,15 @@ fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
             queue_dir,
             snapshot,
         } => {
-            let controller_run_id = run_id
-                .as_deref()
-                .context("fleet discovery requires --run-id")?;
-            let wikis = fleet::scheduled_wikis(&lifecycle)?;
-            let overrides = fleet::lifecycle_resource_overrides(&lifecycle)?;
-            let mut report = fleet::DiscoveryReport::default();
-            for wiki in wikis {
-                let version = match snapshot.as_deref() {
-                    Some(version) => version.to_string(),
-                    None => run_timed_stage("fleet_snapshot_resolve", Some(&wiki), || {
-                        ops.resolve_snapshot(std::slice::from_ref(&wiki), Utc::now(), &data_dir)
-                    })?,
-                };
-                ops.persist_snapshot_plans(std::slice::from_ref(&wiki), &version, &data_dir)?;
-                let (plan, _) =
-                    snapshot_plan::SnapshotPlan::load_or_resolve(&data_dir, &wiki, &version)?;
-                let (resource_class, signals) =
-                    fleet::classify(&data_dir, &output_dir, &plan, overrides.get(&wiki).copied())?;
-                let discovery = fleet::enqueue(
-                    &queue_dir,
-                    &wiki,
-                    &version,
-                    resource_class,
-                    signals,
-                    controller_run_id,
-                );
-                report.merge(discovery?);
-            }
+            let report = handle_fleet_discovery(
+                context,
+                ops,
+                FleetDiscoveryRequest {
+                    lifecycle: &lifecycle,
+                    queue_dir: &queue_dir,
+                    snapshot: snapshot.as_deref(),
+                },
+            )?;
             println!("{}", serde_json::to_string(&report)?);
         }
 
@@ -1251,21 +1237,11 @@ fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
         }
 
         Commands::PublicationPrepareReady { lifecycle } => {
-            let run_id = run_id
-                .as_deref()
-                .context("ready publication preparation requires --run-id")?;
-            run_timed_stage("publication_prepare", None, || {
-                ops.prepare_ready_publication(&data_dir, &output_dir, &lifecycle, run_id)
-            })?;
+            handle_publication_prepare(context, ops, &lifecycle)?;
         }
 
         Commands::PublicationCommitReady => {
-            let run_id = run_id
-                .as_deref()
-                .context("ready publication commit requires --run-id")?;
-            run_timed_stage("publication_commit", None, || {
-                ops.commit_ready_publication(&data_dir, &output_dir, run_id)
-            })?;
+            handle_publication_commit(context, ops)?;
         }
 
         Commands::RetentionAudit { lifecycle, wikis } => {
@@ -1301,12 +1277,7 @@ fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
         }
 
         Commands::PublicationRollbackReady { lifecycle } => {
-            let run_id = run_id
-                .as_deref()
-                .context("ready publication rollback requires --run-id")?;
-            run_timed_stage("publication_rollback", None, || {
-                ops.rollback_ready_publication(&data_dir, &output_dir, &lifecycle, run_id)
-            })?;
+            handle_publication_rollback(context, ops, &lifecycle)?;
         }
 
         Commands::PublicationRecoveryAudit {
@@ -1354,10 +1325,7 @@ fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
         }
 
         Commands::Merge => {
-            publication::begin_run(&output_dir, run_id.as_deref(), &[], None)?;
-            run_timed_stage("merge", None, || {
-                ops.merge_outputs(&output_dir, run_id.as_deref())
-            })?;
+            handle_merge(context, ops)?;
         }
 
         Commands::ManifestMaterialize { generator_dir } => {
@@ -1413,11 +1381,7 @@ fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
         }
 
         Commands::SnapshotFinalize { wikis } => {
-            for wiki in &wikis {
-                run_timed_stage("snapshot_finalize", Some(wiki), || {
-                    ops.finalize_snapshot(wiki, &data_dir)
-                })?;
-            }
+            handle_snapshot_finalize(context, ops, &wikis)?;
         }
 
         Commands::SnapshotRepair { wiki, version } => {
@@ -1442,22 +1406,19 @@ fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
         }
 
         Commands::PatrolFetch { wikis } => {
-            for wiki in &wikis {
-                run_timed_stage("patrol_fetch", Some(wiki), || {
-                    ops.fetch_patrol(wiki, &data_dir)
-                })?;
-            }
+            handle_patrol_fetch(context, ops, &wikis)?;
         }
 
         Commands::PatrolRefresh { wikis, rebuild } => {
-            for wiki in &wikis {
-                run_timed_stage("patrol_fetch", Some(wiki), || {
-                    ops.fetch_patrol(wiki, &data_dir)
-                })?;
-                run_timed_stage("patrol_compute", Some(wiki), || {
-                    ops.compute_patrol(wiki, &data_dir, &output_dir, rebuild, None)
-                })?;
-            }
+            handle_patrol_refresh(
+                context,
+                ops,
+                PatrolComputeRequest {
+                    wikis: &wikis,
+                    rebuild,
+                    limit_months: None,
+                },
+            )?;
         }
 
         Commands::PatrolCompute {
@@ -1465,11 +1426,15 @@ fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
             rebuild,
             limit_months,
         } => {
-            for wiki in &wikis {
-                run_timed_stage("patrol_compute", Some(wiki), || {
-                    ops.compute_patrol(wiki, &data_dir, &output_dir, rebuild, limit_months)
-                })?;
-            }
+            handle_patrol_compute(
+                context,
+                ops,
+                PatrolComputeRequest {
+                    wikis: &wikis,
+                    rebuild,
+                    limit_months,
+                },
+            )?;
         }
 
         Commands::AccountCreations {
@@ -1477,17 +1442,15 @@ fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
             version,
             destination,
         } => {
-            let snapshot = match version {
-                Some(version) => version,
-                None => {
-                    storage::current_snapshot_version(&data_dir, &wiki)?.with_context(|| {
-                        format!("account creation requires a selected snapshot for {wiki}")
-                    })?
-                }
-            };
-            run_timed_stage("account_creation_extract", Some(&wiki), || {
-                ops.build_account_creation_staging_report(&wiki, &snapshot, &data_dir, &destination)
-            })?;
+            handle_account_creation(
+                context,
+                ops,
+                AccountCreationRequest {
+                    wiki: &wiki,
+                    version: version.as_deref(),
+                    destination: &destination,
+                },
+            )?;
         }
 
         Commands::Bench {
@@ -1496,18 +1459,16 @@ fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
             iterations,
             keep_outputs,
         } => {
-            run_timed_stage("bench", None, || {
-                ops.benchmark(BenchmarkRequest {
+            handle_benchmark(
+                ops,
+                BenchmarkRequest {
                     wikis: &wikis,
-                    paths: orchestration::AppPaths {
-                        data: &data_dir,
-                        output: &output_dir,
-                    },
+                    paths: context.paths,
                     warmup,
                     iterations,
                     keep_outputs,
-                })
-            })?;
+                },
+            )?;
         }
 
         Commands::CapacityBench {
@@ -1541,8 +1502,9 @@ fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
                     .map(Path::to_path_buf)
                     .unwrap_or_else(|| data_dir.clone())
             });
-            run_timed_stage("capacity_benchmark", Some(&wiki), || {
-                ops.capacity_benchmark(CapacityBenchmarkRequest {
+            handle_capacity_benchmark(
+                ops,
+                CapacityBenchmarkRequest {
                     wiki: &wiki,
                     data_dir: &data_dir,
                     output_dir: &benchmark_output,
@@ -1556,17 +1518,15 @@ fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
                     quota_root: &quota_root,
                     minimum_memory_headroom_percent,
                     requested_cpu,
-                })
-            })?;
+                },
+            )?;
         }
 
         Commands::CpuQualify {
             capacity_reports,
             report,
         } => {
-            run_timed_stage("cpu_qualification", None, || {
-                ops.cpu_qualification(&capacity_reports, &report)
-            })?;
+            handle_cpu_qualification(ops, &capacity_reports, &report)?;
         }
 
         Commands::SchemaBenchmark {
@@ -1574,15 +1534,16 @@ fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
             scratch_dir,
             report,
         } => {
-            run_timed_stage("schema_benchmark", None, || {
-                ops.schema_benchmark(SchemaBenchmarkRequest {
+            handle_schema_benchmark(
+                ops,
+                SchemaBenchmarkRequest {
                     data_dir: &data_dir,
                     scratch_dir: &scratch_dir,
                     report_path: &report,
                     wikis: &wikis,
                     run_id: run_id.as_deref(),
-                })
-            })?;
+                },
+            )?;
         }
 
         Commands::Run {
@@ -1721,23 +1682,79 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[derive(Default)]
-    struct RecordingOps {
-        calls: RefCell<Vec<String>>,
-        preparation_plans: RefCell<VecDeque<publication::WikiPreparationPlan>>,
-        qualification_preparation_plans: RefCell<VecDeque<publication::WikiPreparationPlan>>,
-        preparation_error: bool,
-        cached_patrol_sources: bool,
+    struct SnapshotSpy {
         reset_obsolete_input: bool,
     }
 
-    impl RecordingOps {
+    #[derive(Default)]
+    struct PatrolSpy {
+        cached_generation: bool,
+    }
+
+    #[derive(Default)]
+    struct CandidateSpy {
+        plans: RefCell<VecDeque<publication::WikiPreparationPlan>>,
+        qualification_plans: RefCell<VecDeque<publication::WikiPreparationPlan>>,
+        fail_planning: bool,
+    }
+
+    #[derive(Default)]
+    struct FailureInjector {
+        stage: Option<&'static str>,
+    }
+
+    #[derive(Default)]
+    struct TestApplication {
+        calls: RefCell<Vec<String>>,
+        snapshots: SnapshotSpy,
+        patrol: PatrolSpy,
+        candidates: CandidateSpy,
+        failures: FailureInjector,
+    }
+
+    impl TestApplication {
+        fn failing(stage: &'static str) -> Self {
+            Self {
+                failures: FailureInjector { stage: Some(stage) },
+                ..Self::default()
+            }
+        }
+
+        fn with_candidate_plans(self, plans: Vec<publication::WikiPreparationPlan>) -> Self {
+            *self.candidates.plans.borrow_mut() = plans.into();
+            self
+        }
+
+        fn with_qualification_plans(self, plans: Vec<publication::WikiPreparationPlan>) -> Self {
+            *self.candidates.qualification_plans.borrow_mut() = plans.into();
+            self
+        }
+
+        fn with_cached_patrol(mut self) -> Self {
+            self.patrol.cached_generation = true;
+            self
+        }
+
+        fn with_obsolete_input_reset(mut self) -> Self {
+            self.snapshots.reset_obsolete_input = true;
+            self
+        }
+
+        fn with_planning_failure(mut self) -> Self {
+            self.candidates.fail_planning = true;
+            self
+        }
+
         fn record(&self, entry: String) {
             self.calls.borrow_mut().push(entry);
         }
-    }
 
-    struct FailingOps {
-        fail_stage: &'static str,
+        fn fail_if(&self, stage: &str, message: &str) -> Result<()> {
+            if self.failures.stage == Some(stage) {
+                anyhow::bail!("{message}");
+            }
+            Ok(())
+        }
     }
 
     struct FakePatrolTransport {
@@ -1926,7 +1943,7 @@ mod tests {
         Ok(())
     }
 
-    impl SnapshotOps for RecordingOps {
+    impl SnapshotOps for TestApplication {
         fn resolve_snapshot(
             &self,
             wikis: &[String],
@@ -1956,6 +1973,7 @@ mod tests {
         }
 
         fn finalize_snapshot(&self, wiki: &str, data_dir: &Path) -> Result<()> {
+            self.fail_if("snapshot_finalize", "snapshot finalize failed")?;
             self.record(format!("snapshot_finalize:{wiki}:{}", data_dir.display()));
             Ok(())
         }
@@ -1966,20 +1984,22 @@ mod tests {
             version: &str,
             _data_dir: &Path,
         ) -> Result<bool> {
-            if self.reset_obsolete_input {
+            if self.snapshots.reset_obsolete_input {
                 self.record(format!("reset_obsolete_input:{wiki}:{version}"));
             }
-            Ok(self.reset_obsolete_input)
+            Ok(self.snapshots.reset_obsolete_input)
         }
     }
 
-    impl HistoryInputOps for RecordingOps {
+    impl HistoryInputOps for TestApplication {
         fn fetch_wiki(&self, wiki: &str, version: &str, data_dir: &Path) -> Result<()> {
+            self.fail_if("fetch", "fetch failed")?;
             self.record(format!("fetch:{wiki}:{version}:{}", data_dir.display()));
             Ok(())
         }
 
         fn ingest_wiki(&self, wiki: &str, version: Option<&str>, data_dir: &Path) -> Result<()> {
+            self.fail_if("ingest", "ingest failed")?;
             self.record(format!(
                 "ingest:{wiki}:{}:{}",
                 version.unwrap_or("_"),
@@ -1996,6 +2016,9 @@ mod tests {
             _run_id: &str,
             window_size: usize,
         ) -> Result<()> {
+            self.fail_if("fetch", "fetch failed")?;
+            self.fail_if("ingest", "ingest failed")?;
+            self.fail_if("cleanup_raw", "cleanup raw failed")?;
             self.record(format!(
                 "source_window:{wiki}:{version}:{}:{window_size}",
                 data_dir.display()
@@ -2015,8 +2038,9 @@ mod tests {
         }
     }
 
-    impl PatrolOps for RecordingOps {
+    impl PatrolOps for TestApplication {
         fn fetch_patrol(&self, wiki: &str, data_dir: &Path) -> Result<()> {
+            self.fail_if("fetch_patrol", "fetch patrol failed")?;
             self.record(format!("fetch_patrol:{wiki}:{}", data_dir.display()));
             Ok(())
         }
@@ -2045,7 +2069,7 @@ mod tests {
             _version: &str,
             _data_dir: &Path,
         ) -> bool {
-            self.cached_patrol_sources
+            self.patrol.cached_generation
         }
 
         fn compute_patrol(
@@ -2056,6 +2080,7 @@ mod tests {
             rebuild: bool,
             limit_months: Option<usize>,
         ) -> Result<()> {
+            self.fail_if("compute_patrol", "compute patrol failed")?;
             let limit_str = limit_months
                 .map(|n| n.to_string())
                 .unwrap_or_else(|| "_".to_string());
@@ -2084,6 +2109,7 @@ mod tests {
             data_dir: &Path,
             destination: &Path,
         ) -> Result<()> {
+            self.fail_if("account_creations", "account creation failed")?;
             self.record(format!(
                 "account_creations:{wiki}:{version}:{}:{}",
                 data_dir.display(),
@@ -2093,8 +2119,9 @@ mod tests {
         }
     }
 
-    impl MetricComputeOps for RecordingOps {
+    impl MetricComputeOps for TestApplication {
         fn compute_all(&self, wiki: &str, data_dir: &Path, output_dir: &Path) -> Result<()> {
+            self.fail_if("compute", "compute failed")?;
             self.record(format!(
                 "compute:{wiki}:{}:{}",
                 data_dir.display(),
@@ -2114,7 +2141,7 @@ mod tests {
         }
     }
 
-    impl CandidateOps for RecordingOps {
+    impl CandidateOps for TestApplication {
         fn plan_candidate_preparation(
             &self,
             _wiki: &str,
@@ -2123,10 +2150,10 @@ mod tests {
             _output_dir: &Path,
             _run_id: &str,
         ) -> Result<publication::WikiPreparationPlan> {
-            if self.preparation_error {
+            if self.candidates.fail_planning {
                 anyhow::bail!("candidate plan failed");
             }
-            Ok(self.preparation_plans.borrow_mut().pop_front().unwrap_or(
+            Ok(self.candidates.plans.borrow_mut().pop_front().unwrap_or(
                 publication::WikiPreparationPlan::Build {
                     same_snapshot_candidate: false,
                     compute_reused: false,
@@ -2144,7 +2171,8 @@ mod tests {
             _run_id: &str,
         ) -> Result<publication::WikiPreparationPlan> {
             Ok(self
-                .qualification_preparation_plans
+                .candidates
+                .qualification_plans
                 .borrow_mut()
                 .pop_front()
                 .unwrap_or(publication::WikiPreparationPlan::Build {
@@ -2186,8 +2214,9 @@ mod tests {
         }
     }
 
-    impl PublicationOps for RecordingOps {
+    impl PublicationOps for TestApplication {
         fn merge_outputs(&self, output_dir: &Path, _run_id: Option<&str>) -> Result<()> {
+            self.fail_if("merge", "merge failed")?;
             self.record(format!("merge:{}", output_dir.display()));
             Ok(())
         }
@@ -2225,8 +2254,9 @@ mod tests {
         }
     }
 
-    impl QualificationOps for RecordingOps {
+    impl QualificationOps for TestApplication {
         fn benchmark(&self, request: BenchmarkRequest<'_>) -> Result<()> {
+            self.fail_if("bench", "bench failed")?;
             self.record(format!(
                 "bench:{}:{}:{}:{}:{}:{}",
                 request.wikis.join(","),
@@ -2240,6 +2270,7 @@ mod tests {
         }
 
         fn capacity_benchmark(&self, request: CapacityBenchmarkRequest<'_>) -> Result<()> {
+            self.fail_if("capacity", "capacity benchmark failed")?;
             self.record(format!(
                 "capacity:{}:{}:{}:{}:{}:{}x{}:{}:{}:{}:{}:{}:{}",
                 request.wiki,
@@ -2276,6 +2307,7 @@ mod tests {
         }
 
         fn schema_benchmark(&self, request: SchemaBenchmarkRequest<'_>) -> Result<()> {
+            self.fail_if("schema_benchmark", "schema benchmark failed")?;
             self.record(format!(
                 "schema_benchmark:{}:{}:{}",
                 request.wikis.join(","),
@@ -2287,280 +2319,6 @@ mod tests {
                 "unexpected schema report path"
             );
             Ok(())
-        }
-    }
-
-    impl FailingOps {
-        fn fail_if(&self, stage: &str, message: &str) -> Result<()> {
-            if self.fail_stage == stage {
-                anyhow::bail!("{message}");
-            }
-            Ok(())
-        }
-    }
-
-    impl SnapshotOps for FailingOps {
-        fn resolve_snapshot(
-            &self,
-            _wikis: &[String],
-            now: DateTime<Utc>,
-            _data_dir: &Path,
-        ) -> Result<String> {
-            Ok(snapshot_version_for(now))
-        }
-
-        fn persist_snapshot_plans(
-            &self,
-            _wikis: &[String],
-            _version: &str,
-            _data_dir: &Path,
-        ) -> Result<()> {
-            Ok(())
-        }
-
-        fn validate_completed_snapshot(
-            &self,
-            _wiki: &str,
-            _version: &str,
-            _data_dir: &Path,
-        ) -> Result<()> {
-            Ok(())
-        }
-
-        fn finalize_snapshot(&self, _wiki: &str, _data_dir: &Path) -> Result<()> {
-            self.fail_if("snapshot_finalize", "snapshot finalize failed")
-        }
-
-        fn reset_obsolete_qualification_generation(
-            &self,
-            _wiki: &str,
-            _version: &str,
-            _data_dir: &Path,
-        ) -> Result<bool> {
-            Ok(false)
-        }
-    }
-
-    impl HistoryInputOps for FailingOps {
-        fn fetch_wiki(&self, _wiki: &str, _version: &str, _data_dir: &Path) -> Result<()> {
-            self.fail_if("fetch", "fetch failed")
-        }
-
-        fn ingest_wiki(&self, _wiki: &str, _version: Option<&str>, _data_dir: &Path) -> Result<()> {
-            self.fail_if("ingest", "ingest failed")
-        }
-
-        fn prepare_wiki_snapshot(
-            &self,
-            wiki: &str,
-            version: &str,
-            data_dir: &Path,
-            _run_id: &str,
-            _window_size: usize,
-        ) -> Result<()> {
-            self.fetch_wiki(wiki, version, data_dir)?;
-            self.ingest_wiki(wiki, Some(version), data_dir)?;
-            self.fail_if("cleanup_raw", "cleanup raw failed")
-        }
-
-        fn prepare_candidate_snapshot(
-            &self,
-            wiki: &str,
-            version: &str,
-            data_dir: &Path,
-            run_id: &str,
-            window_size: usize,
-        ) -> Result<()> {
-            self.prepare_wiki_snapshot(wiki, version, data_dir, run_id, window_size)
-        }
-    }
-
-    impl PatrolOps for FailingOps {
-        fn fetch_patrol(&self, _wiki: &str, _data_dir: &Path) -> Result<()> {
-            self.fail_if("fetch_patrol", "fetch patrol failed")
-        }
-
-        fn fetch_patrol_for_snapshot(
-            &self,
-            wiki: &str,
-            _version: &str,
-            data_dir: &Path,
-        ) -> Result<()> {
-            self.fetch_patrol(wiki, data_dir)
-        }
-
-        fn preflight_patrol_for_snapshot(
-            &self,
-            _wiki: &str,
-            _version: &str,
-            _data_dir: &Path,
-        ) -> Result<()> {
-            Ok(())
-        }
-
-        fn cached_patrol_generation_available(
-            &self,
-            _wiki: &str,
-            _version: &str,
-            _data_dir: &Path,
-        ) -> bool {
-            false
-        }
-
-        fn compute_patrol(
-            &self,
-            _wiki: &str,
-            _data_dir: &Path,
-            _output_dir: &Path,
-            _rebuild: bool,
-            _limit_months: Option<usize>,
-        ) -> Result<()> {
-            self.fail_if("compute_patrol", "compute patrol failed")
-        }
-
-        fn compute_candidate_patrol(
-            &self,
-            wiki: &str,
-            _version: &str,
-            data_dir: &Path,
-            candidate_dir: &Path,
-        ) -> Result<()> {
-            self.compute_patrol(wiki, data_dir, candidate_dir, false, None)
-        }
-
-        fn build_account_creation_staging_report(
-            &self,
-            _wiki: &str,
-            _version: &str,
-            _data_dir: &Path,
-            _destination: &Path,
-        ) -> Result<()> {
-            self.fail_if("account_creations", "account creation failed")
-        }
-    }
-
-    impl MetricComputeOps for FailingOps {
-        fn compute_all(&self, _wiki: &str, _data_dir: &Path, _output_dir: &Path) -> Result<()> {
-            self.fail_if("compute", "compute failed")
-        }
-
-        fn compute_candidate(
-            &self,
-            wiki: &str,
-            _version: &str,
-            data_dir: &Path,
-            candidate_dir: &Path,
-        ) -> Result<()> {
-            self.compute_all(wiki, data_dir, candidate_dir)
-        }
-    }
-
-    impl CandidateOps for FailingOps {
-        fn plan_candidate_preparation(
-            &self,
-            _wiki: &str,
-            _version: &str,
-            _data_dir: &Path,
-            _output_dir: &Path,
-            _run_id: &str,
-        ) -> Result<publication::WikiPreparationPlan> {
-            Ok(publication::WikiPreparationPlan::Build {
-                same_snapshot_candidate: false,
-                compute_reused: false,
-                patrol_reused: false,
-            })
-        }
-
-        fn plan_qualification_preparation(
-            &self,
-            wiki: &str,
-            version: &str,
-            data_dir: &Path,
-            output_dir: &Path,
-            run_id: &str,
-        ) -> Result<publication::WikiPreparationPlan> {
-            self.plan_candidate_preparation(wiki, version, data_dir, output_dir, run_id)
-        }
-
-        fn mark_candidate_ready(
-            &self,
-            _data_dir: &Path,
-            output_dir: &Path,
-            _lifecycle: &Path,
-            _wiki: &str,
-            _version: &str,
-            _run_id: &str,
-        ) -> Result<PathBuf> {
-            Ok(output_dir.join("ready.json"))
-        }
-
-        fn ensure_qualification_wiki(&self, _lifecycle: &Path, _wiki: &str) -> Result<()> {
-            Ok(())
-        }
-
-        fn mark_qualification_ready(
-            &self,
-            _data_dir: &Path,
-            output_dir: &Path,
-            _lifecycle: &Path,
-            _wiki: &str,
-            _version: &str,
-            _run_id: &str,
-        ) -> Result<PathBuf> {
-            Ok(output_dir.join("qualification.json"))
-        }
-    }
-
-    impl PublicationOps for FailingOps {
-        fn merge_outputs(&self, _output_dir: &Path, _run_id: Option<&str>) -> Result<()> {
-            self.fail_if("merge", "merge failed")
-        }
-
-        fn prepare_ready_publication(
-            &self,
-            _data_dir: &Path,
-            _output_dir: &Path,
-            _lifecycle: &Path,
-            _run_id: &str,
-        ) -> Result<()> {
-            Ok(())
-        }
-
-        fn commit_ready_publication(
-            &self,
-            _data_dir: &Path,
-            _output_dir: &Path,
-            _run_id: &str,
-        ) -> Result<()> {
-            Ok(())
-        }
-
-        fn rollback_ready_publication(
-            &self,
-            _data_dir: &Path,
-            _output_dir: &Path,
-            _lifecycle: &Path,
-            _run_id: &str,
-        ) -> Result<()> {
-            Ok(())
-        }
-    }
-
-    impl QualificationOps for FailingOps {
-        fn benchmark(&self, _request: BenchmarkRequest<'_>) -> Result<()> {
-            self.fail_if("bench", "bench failed")
-        }
-
-        fn capacity_benchmark(&self, _request: CapacityBenchmarkRequest<'_>) -> Result<()> {
-            self.fail_if("capacity", "capacity benchmark failed")
-        }
-
-        fn cpu_qualification(&self, capacity_reports: &[PathBuf], report: &Path) -> Result<()> {
-            cpu_qualification::run(capacity_reports, report).map(drop)
-        }
-
-        fn schema_benchmark(&self, _request: SchemaBenchmarkRequest<'_>) -> Result<()> {
-            self.fail_if("schema_benchmark", "schema benchmark failed")
         }
     }
 
@@ -2577,7 +2335,7 @@ mod tests {
             "--version",
             "2026-02",
         ])?;
-        let ops = RecordingOps::default();
+        let ops = TestApplication::default();
 
         run_with_ops(cli, &ops)?;
 
@@ -2597,7 +2355,7 @@ mod tests {
     fn run_with_ops_dispatches_snapshot_resolution() -> Result<()> {
         init_test_tracing();
         let cli = Cli::try_parse_from(["wiki-econ", "snapshot-resolve", "frwiki", "dewiki"])?;
-        let ops = RecordingOps::default();
+        let ops = TestApplication::default();
 
         run_with_ops(cli, &ops)?;
 
@@ -2612,7 +2370,7 @@ mod tests {
     fn run_with_ops_dispatches_ingest() -> Result<()> {
         init_test_tracing();
         let cli = Cli::try_parse_from(["wiki-econ", "ingest", "frwiki"])?;
-        let ops = RecordingOps::default();
+        let ops = TestApplication::default();
 
         run_with_ops(cli, &ops)?;
 
@@ -2639,7 +2397,7 @@ mod tests {
             "snapshot-finalize",
             "nlwiki",
         ])?;
-        let ops = RecordingOps::default();
+        let ops = TestApplication::default();
 
         run_with_ops(ingest_cli, &ops)?;
         run_with_ops(finalize_cli, &ops)?;
@@ -2667,7 +2425,7 @@ mod tests {
             "frwiki",
             "dewiki",
         ])?;
-        let ops = RecordingOps::default();
+        let ops = TestApplication::default();
 
         run_with_ops(cli, &ops)?;
 
@@ -2702,7 +2460,7 @@ mod tests {
             "--source-window-size",
             "2",
         ])?;
-        let ops = RecordingOps::default();
+        let ops = TestApplication::default();
 
         run_with_ops(cli, &ops)?;
 
@@ -2737,11 +2495,9 @@ mod tests {
             "--source-window-size",
             "1",
         ])?;
-        let ops = RecordingOps {
-            cached_patrol_sources: true,
-            reset_obsolete_input: true,
-            ..RecordingOps::default()
-        };
+        let ops = TestApplication::default()
+            .with_cached_patrol()
+            .with_obsolete_input_reset();
 
         run_with_ops(cli, &ops)?;
 
@@ -2769,7 +2525,7 @@ mod tests {
             "qualify-wiki",
             "itwiki",
         ])?;
-        let ops = RecordingOps::default();
+        let ops = TestApplication::default();
 
         run_with_ops(cli, &ops)?;
 
@@ -2789,7 +2545,7 @@ mod tests {
             "prepare-wiki",
             "nlwiki",
         ])?;
-        let ops = RecordingOps::default();
+        let ops = TestApplication::default();
 
         run_with_ops(cli, &ops)?;
 
@@ -2814,14 +2570,11 @@ mod tests {
             "--version",
             "2026-07",
         ])?;
-        let ops = RecordingOps {
-            preparation_plans: RefCell::new(VecDeque::from([
-                publication::WikiPreparationPlan::NoOp {
-                    ready_path: PathBuf::from("existing/ready.json"),
-                },
-            ])),
-            ..RecordingOps::default()
-        };
+        let ops = TestApplication::default().with_candidate_plans(vec![
+            publication::WikiPreparationPlan::NoOp {
+                ready_path: PathBuf::from("existing/ready.json"),
+            },
+        ]);
 
         run_with_ops(cli, &ops)?;
 
@@ -2844,17 +2597,13 @@ mod tests {
             "--version",
             "2026-07",
         ])?;
-        let ops = RecordingOps {
-            preparation_plans: RefCell::new(VecDeque::from([
-                publication::WikiPreparationPlan::Build {
-                    same_snapshot_candidate: true,
-                    compute_reused: true,
-                    patrol_reused: true,
-                },
-            ])),
-            cached_patrol_sources: true,
-            ..RecordingOps::default()
-        };
+        let ops = TestApplication::default()
+            .with_candidate_plans(vec![publication::WikiPreparationPlan::Build {
+                same_snapshot_candidate: true,
+                compute_reused: true,
+                patrol_reused: true,
+            }])
+            .with_cached_patrol();
 
         run_with_ops(cli, &ops)?;
 
@@ -2883,17 +2632,13 @@ mod tests {
             "--version",
             "2026-07",
         ])?;
-        let ops = RecordingOps {
-            preparation_plans: RefCell::new(VecDeque::from([
-                publication::WikiPreparationPlan::Build {
-                    same_snapshot_candidate: true,
-                    compute_reused: true,
-                    patrol_reused: false,
-                },
-            ])),
-            cached_patrol_sources: true,
-            ..RecordingOps::default()
-        };
+        let ops = TestApplication::default()
+            .with_candidate_plans(vec![publication::WikiPreparationPlan::Build {
+                same_snapshot_candidate: true,
+                compute_reused: true,
+                patrol_reused: false,
+            }])
+            .with_cached_patrol();
 
         run_with_ops(cli, &ops)?;
 
@@ -2925,16 +2670,13 @@ mod tests {
                 "2026-07",
             ])
         };
-        let reused = RecordingOps {
-            qualification_preparation_plans: RefCell::new(VecDeque::from([
-                publication::WikiPreparationPlan::Build {
-                    same_snapshot_candidate: true,
-                    compute_reused: true,
-                    patrol_reused: true,
-                },
-            ])),
-            ..RecordingOps::default()
-        };
+        let reused = TestApplication::default().with_qualification_plans(vec![
+            publication::WikiPreparationPlan::Build {
+                same_snapshot_candidate: true,
+                compute_reused: true,
+                patrol_reused: true,
+            },
+        ]);
         run_with_ops(command()?, &reused)?;
         assert_eq!(
             reused.calls.into_inner(),
@@ -2945,14 +2687,11 @@ mod tests {
             ]
         );
 
-        let impossible = RecordingOps {
-            qualification_preparation_plans: RefCell::new(VecDeque::from([
-                publication::WikiPreparationPlan::NoOp {
-                    ready_path: PathBuf::from("not-publication-eligible"),
-                },
-            ])),
-            ..RecordingOps::default()
-        };
+        let impossible = TestApplication::default().with_qualification_plans(vec![
+            publication::WikiPreparationPlan::NoOp {
+                ready_path: PathBuf::from("not-publication-eligible"),
+            },
+        ]);
         let error = run_with_ops(command()?, &impossible)
             .expect_err("a qualification planner must never return a publication no-op");
         assert!(error.to_string().contains("unexpectedly resolved"));
@@ -2974,17 +2713,13 @@ mod tests {
             "--version",
             "2026-07",
         ])?;
-        let ops = RecordingOps {
-            qualification_preparation_plans: RefCell::new(VecDeque::from([
-                publication::WikiPreparationPlan::Build {
-                    same_snapshot_candidate: true,
-                    compute_reused: true,
-                    patrol_reused: false,
-                },
-            ])),
-            cached_patrol_sources: true,
-            ..RecordingOps::default()
-        };
+        let ops = TestApplication::default()
+            .with_qualification_plans(vec![publication::WikiPreparationPlan::Build {
+                same_snapshot_candidate: true,
+                compute_reused: true,
+                patrol_reused: false,
+            }])
+            .with_cached_patrol();
         run_with_ops(cli, &ops)?;
         assert_eq!(
             ops.calls.into_inner(),
@@ -2999,73 +2734,9 @@ mod tests {
     }
 
     #[test]
-    fn ops_default_publication_methods_delegate_and_fail_closed() -> Result<()> {
-        let root = TestDir::new()?;
-        let data = root.path().join("data");
-        let output = root.path().join("output");
-        let lifecycle = root.path().join("missing-lifecycle.json");
-        fs::create_dir_all(&output)?;
-        let ops = FailingOps { fail_stage: "none" };
-
-        assert!(
-            ops.mark_candidate_ready(&data, &output, &lifecycle, "nlwiki", "2026-07", "candidate",)
-                .is_err()
-        );
-        assert!(ops.ensure_qualification_wiki(&lifecycle, "itwiki").is_err());
-        assert!(
-            ops.mark_qualification_ready(
-                &data,
-                &output,
-                &lifecycle,
-                "itwiki",
-                "2026-07",
-                "qualification",
-            )
-            .is_err()
-        );
-        assert!(
-            ops.prepare_ready_publication(&data, &output, &lifecycle, "prepare")
-                .is_err()
-        );
-        assert!(
-            ops.commit_ready_publication(&data, &output, "commit")
-                .is_err()
-        );
-        assert!(
-            ops.rollback_ready_publication(&data, &output, &lifecycle, "rollback")
-                .is_err()
-        );
-        assert_eq!(
-            ops.plan_candidate_preparation("nlwiki", "2026-07", &data, &output, "candidate",)?,
-            publication::WikiPreparationPlan::Build {
-                same_snapshot_candidate: false,
-                compute_reused: false,
-                patrol_reused: false,
-            }
-        );
-        assert_eq!(
-            ops.plan_qualification_preparation(
-                "itwiki",
-                "2026-07",
-                &data,
-                &output,
-                "qualification",
-            )
-            .expect("default qualification planner should succeed"),
-            publication::WikiPreparationPlan::Build {
-                same_snapshot_candidate: false,
-                compute_reused: false,
-                patrol_reused: false,
-            }
-        );
-        assert!(!ops.cached_patrol_generation_available("nlwiki", "2026-07", &data));
-        Ok(())
-    }
-
-    #[test]
     fn run_with_ops_dispatches_short_publication_transaction_commands() -> Result<()> {
         init_test_tracing();
-        let ops = RecordingOps::default();
+        let ops = TestApplication::default();
         for command in [
             "publication-prepare-ready",
             "publication-commit-ready",
@@ -3105,7 +2776,7 @@ mod tests {
                     run_id: None,
                     command,
                 },
-                &RecordingOps::default(),
+                &TestApplication::default(),
             );
             assert!(result.is_err());
         }
@@ -3133,7 +2804,7 @@ mod tests {
             site.to_str().context("site path")?,
         ])
         .expect("recovery audit CLI should parse");
-        run_with_ops(audit, &RecordingOps::default())?;
+        run_with_ops(audit, &TestApplication::default())?;
 
         let recover = Cli::try_parse_from([
             "wiki-econ",
@@ -3149,7 +2820,7 @@ mod tests {
             report.to_str().context("report path")?,
         ])
         .expect("recovery repair CLI should parse");
-        run_with_ops(recover, &RecordingOps::default())?;
+        run_with_ops(recover, &TestApplication::default())?;
         assert!(report.is_file());
 
         let missing_selector = Cli::try_parse_from([
@@ -3163,7 +2834,7 @@ mod tests {
             site.to_str().context("site path")?,
         ])
         .expect("recovery CLI without a selector should parse before validation");
-        assert!(run_with_ops(missing_selector, &RecordingOps::default()).is_err());
+        assert!(run_with_ops(missing_selector, &TestApplication::default()).is_err());
 
         let broken_transaction = output.join("_publication_transactions/broken");
         fs::create_dir_all(&broken_transaction)?;
@@ -3181,7 +2852,7 @@ mod tests {
             site.to_str().context("site path")?,
         ])
         .expect("ambiguous recovery CLI should parse");
-        assert!(run_with_ops(ambiguous, &RecordingOps::default()).is_err());
+        assert!(run_with_ops(ambiguous, &TestApplication::default()).is_err());
 
         fs::remove_dir_all(output.join("_publication_transactions"))?;
         let blocked_report = root.path().join("blocked-report");
@@ -3200,7 +2871,7 @@ mod tests {
             blocked_report.to_str().context("blocked report path")?,
         ])
         .expect("blocked report recovery CLI should parse");
-        assert!(run_with_ops(report_failure, &RecordingOps::default()).is_err());
+        assert!(run_with_ops(report_failure, &TestApplication::default()).is_err());
 
         let no_report = Cli::try_parse_from([
             "wiki-econ",
@@ -3214,7 +2885,7 @@ mod tests {
             site.to_str().context("site path")?,
         ])
         .expect("no-report recovery CLI should parse");
-        run_with_ops(no_report, &RecordingOps::default())
+        run_with_ops(no_report, &TestApplication::default())
             .expect("no-report recovery should succeed");
         Ok(())
     }
@@ -3228,7 +2899,7 @@ mod tests {
             vec!["wiki-econ", "publication-commit-ready"],
             vec!["wiki-econ", "publication-rollback-ready"],
         ] {
-            let error = run_with_ops(Cli::try_parse_from(args)?, &RecordingOps::default())
+            let error = run_with_ops(Cli::try_parse_from(args)?, &TestApplication::default())
                 .expect_err("transactional commands require a stable run ID");
             assert!(error.to_string().contains("requires --run-id"));
         }
@@ -3239,7 +2910,7 @@ mod tests {
     fn run_with_ops_dispatches_merge() -> Result<()> {
         init_test_tracing();
         let cli = Cli::try_parse_from(["wiki-econ", "--output-dir", "combined", "merge"])?;
-        let ops = RecordingOps::default();
+        let ops = TestApplication::default();
 
         run_with_ops(cli, &ops)?;
 
@@ -3263,7 +2934,7 @@ mod tests {
         ];
         let cli = Cli::try_parse_from(arguments)?;
 
-        run_with_ops(cli, &RecordingOps::default())?;
+        run_with_ops(cli, &TestApplication::default())?;
 
         assert_eq!(
             fs::read_to_string(output.path().join("manifest.json"))?,
@@ -3274,7 +2945,7 @@ mod tests {
 
     #[test]
     fn publication_commands_require_run_ids_and_reach_their_validators() -> Result<()> {
-        let ops = RecordingOps::default();
+        let ops = TestApplication::default();
         for command in ["publication-validate", "publication-verify"] {
             let cli = Cli::try_parse_from(["wiki-econ", command])?;
             let error = run_with_ops(cli, &ops).expect_err("run ID is mandatory");
@@ -3304,7 +2975,7 @@ mod tests {
 
     #[test]
     fn run_id_initializes_context_for_merge_and_full_run() -> Result<()> {
-        let ops = RecordingOps::default();
+        let ops = TestApplication::default();
         for command in [vec!["merge"], vec!["run", "nlwiki", "--version", "2026-03"]] {
             let output = TestDir::new()?;
             let mut args = vec![
@@ -3327,7 +2998,7 @@ mod tests {
     fn run_with_ops_dispatches_patrol_fetch() -> Result<()> {
         init_test_tracing();
         let cli = Cli::try_parse_from(["wiki-econ", "--data-dir", "d", "patrol-fetch", "frwiki"])?;
-        let ops = RecordingOps::default();
+        let ops = TestApplication::default();
 
         run_with_ops(cli, &ops)?;
 
@@ -3347,7 +3018,7 @@ mod tests {
             "patrol-compute",
             "frwiki",
         ])?;
-        let ops = RecordingOps::default();
+        let ops = TestApplication::default();
 
         run_with_ops(cli, &ops)?;
 
@@ -3371,7 +3042,7 @@ mod tests {
             "frwiki",
             "--rebuild",
         ])?;
-        let ops = RecordingOps::default();
+        let ops = TestApplication::default();
 
         run_with_ops(cli, &ops)?;
 
@@ -3395,7 +3066,7 @@ mod tests {
             "--destination",
             "staging/svwiki.json",
         ])?;
-        let ops = RecordingOps::default();
+        let ops = TestApplication::default();
         run_with_ops(cli, &ops)?;
         assert_eq!(
             ops.calls.into_inner(),
@@ -3411,7 +3082,7 @@ mod tests {
             "--destination",
             "staging/svwiki.json",
         ])?;
-        assert!(run_with_ops(missing_snapshot, &RecordingOps::default()).is_err());
+        assert!(run_with_ops(missing_snapshot, &TestApplication::default()).is_err());
         Ok(())
     }
 
@@ -3431,7 +3102,7 @@ mod tests {
 
     #[test]
     fn failing_ops_exercises_account_creation_failure_contract() -> Result<()> {
-        FailingOps { fail_stage: "none" }
+        TestApplication::failing("none")
             .build_account_creation_staging_report(
                 "svwiki",
                 "2026-08",
@@ -3440,16 +3111,14 @@ mod tests {
             )
             .expect("non-failing account creation operation should succeed");
         assert!(
-            FailingOps {
-                fail_stage: "account_creations"
-            }
-            .build_account_creation_staging_report(
-                "svwiki",
-                "2026-08",
-                Path::new("data"),
-                Path::new("report.json"),
-            )
-            .is_err()
+            TestApplication::failing("account_creations")
+                .build_account_creation_staging_report(
+                    "svwiki",
+                    "2026-08",
+                    Path::new("data"),
+                    Path::new("report.json"),
+                )
+                .is_err()
         );
         Ok(())
     }
@@ -3475,7 +3144,7 @@ mod tests {
             "--limit-months",
             "3",
         ])?;
-        let ops = RecordingOps::default();
+        let ops = TestApplication::default();
 
         run_with_ops(cli, &ops)?;
 
@@ -3506,7 +3175,7 @@ mod tests {
             "4",
             "--keep-outputs",
         ])?;
-        let ops = RecordingOps::default();
+        let ops = TestApplication::default();
 
         run_with_ops(cli, &ops)?;
 
@@ -3525,7 +3194,7 @@ mod tests {
         let lifecycle = output.path().join("lifecycle.json");
         const LIFECYCLE: &[u8] = br#"{"schema_version":1,"wikis":{"testwiki":{"publication":"published","refresh":"scheduled"}}}"#;
         fs::write(&lifecycle, LIFECYCLE)?;
-        let ops = RecordingOps::default();
+        let ops = TestApplication::default();
         let discovery = run_with_ops(
             Cli {
                 data_dir: data.path().to_path_buf(),
@@ -3583,7 +3252,7 @@ mod tests {
                 retry_after_secs: 21_600,
             },
         };
-        run_with_ops(cli, &RecordingOps::default())?;
+        run_with_ops(cli, &TestApplication::default())?;
         let pending: fleet::FleetTask =
             serde_json::from_slice(&fs::read(queue.path().join("pending/dewiki.json"))?)?;
         assert_eq!(pending.attempt, 0);
@@ -3616,7 +3285,7 @@ mod tests {
                     report: report.clone(),
                 },
             },
-            &RecordingOps::default(),
+            &TestApplication::default(),
         )
         .expect("identical artifacts from distinct worker counts must qualify");
         let value: Value = serde_json::from_slice(&fs::read(report)?)?;
@@ -3637,7 +3306,7 @@ mod tests {
                     report: root.path().join("rejected.json"),
                 },
             },
-            &RecordingOps::default(),
+            &TestApplication::default(),
         );
         assert!(rejected.is_err());
         Ok(())
@@ -3775,7 +3444,7 @@ mod tests {
                     version: version.to_string(),
                 },
             },
-            &RecordingOps::default(),
+            &TestApplication::default(),
         )
         .expect("snapshot repair command should succeed");
         assert_eq!(
@@ -3883,7 +3552,7 @@ mod tests {
             "--minimum-memory-headroom-percent",
             "30",
         ])?;
-        let ops = RecordingOps::default();
+        let ops = TestApplication::default();
 
         run_with_ops(cli, &ops)?;
 
@@ -3908,7 +3577,7 @@ mod tests {
             "--report",
             "reports/cpu-qualification.json",
         ])?;
-        let ops = RecordingOps::default();
+        let ops = TestApplication::default();
 
         run_with_ops(cli, &ops)?;
 
@@ -3936,7 +3605,7 @@ mod tests {
             "--report",
             "reports/schema.json",
         ])?;
-        let ops = RecordingOps::default();
+        let ops = TestApplication::default();
 
         run_with_ops(cli, &ops)?;
 
@@ -3963,10 +3632,7 @@ mod tests {
             "--source-window-size",
             "3",
         ])?;
-        let ops = RecordingOps {
-            cached_patrol_sources: true,
-            ..RecordingOps::default()
-        };
+        let ops = TestApplication::default().with_cached_patrol();
 
         run_with_ops(cli, &ops)?;
 
@@ -4001,7 +3667,7 @@ mod tests {
             "--stage",
             "ingest",
         ])?;
-        let ops = RecordingOps::default();
+        let ops = TestApplication::default();
 
         run_with_ops(cli, &ops)?;
 
@@ -4031,7 +3697,7 @@ mod tests {
             "--stage",
             "compute",
         ])?;
-        let ops = RecordingOps::default();
+        let ops = TestApplication::default();
 
         run_with_ops(cli, &ops)?;
 
@@ -4434,7 +4100,7 @@ mod tests {
                 site_dir: site_dir.clone(),
                 dist_dir: dist_dir.path().to_path_buf(),
             }),
-            &RecordingOps::default(),
+            &TestApplication::default(),
         )
         .expect("site fingerprint should record");
         run_with_ops(
@@ -4442,7 +4108,7 @@ mod tests {
                 site_dir: site_dir.clone(),
                 dist_dir: dist_dir.path().to_path_buf(),
             }),
-            &RecordingOps::default(),
+            &TestApplication::default(),
         )
         .expect("unchanged site should be reusable");
 
@@ -4453,7 +4119,7 @@ mod tests {
                     site_dir,
                     dist_dir: dist_dir.path().to_path_buf(),
                 }),
-                &RecordingOps::default(),
+                &TestApplication::default(),
             )
             .is_err()
         );
@@ -4536,7 +4202,7 @@ mod tests {
                 workspace_dir: workspace_dir.path().to_path_buf(),
                 defaults_dir: defaults_dir.path().to_path_buf(),
             }),
-            &RecordingOps::default(),
+            &TestApplication::default(),
         )
         .expect("dashboard defaults receipt should record");
         run_with_ops(
@@ -4544,7 +4210,7 @@ mod tests {
                 workspace_dir: workspace_dir.path().to_path_buf(),
                 defaults_dir: defaults_dir.path().to_path_buf(),
             }),
-            &RecordingOps::default(),
+            &TestApplication::default(),
         )
         .expect("dashboard defaults receipt should be reusable");
 
@@ -4555,7 +4221,7 @@ mod tests {
                     workspace_dir: workspace_dir.path().to_path_buf(),
                     defaults_dir: defaults_dir.path().to_path_buf(),
                 }),
-                &RecordingOps::default(),
+                &TestApplication::default(),
             )
             .is_err()
         );
@@ -4567,7 +4233,7 @@ mod tests {
                     workspace_dir: workspace_dir.path().to_path_buf(),
                     defaults_dir: defaults_dir.path().to_path_buf(),
                 }),
-                &RecordingOps::default(),
+                &TestApplication::default(),
             )
             .is_err(),
             "source inventory errors must propagate through the CLI"
@@ -4597,7 +4263,7 @@ mod tests {
             report.to_str().context("UTF-8 report fixture")?,
         ])
         .expect("valid artifact-scrub CLI");
-        run_with_ops(cli, &RecordingOps::default())?;
+        run_with_ops(cli, &TestApplication::default())?;
         let value: Value = serde_json::from_slice(&fs::read(report)?)?;
         assert_eq!(value["artifacts"].as_array().map(Vec::len), Some(1));
 
@@ -4608,7 +4274,7 @@ mod tests {
             "artifact-scrub",
         ])
         .expect("valid stdout-only artifact-scrub CLI");
-        run_with_ops(stdout_only_cli, &RecordingOps::default())?;
+        run_with_ops(stdout_only_cli, &TestApplication::default())?;
 
         let invalid_report_cli = Cli::try_parse_from([
             "wiki-econ",
@@ -4619,7 +4285,7 @@ mod tests {
             output.path().to_str().context("UTF-8 report fixture")?,
         ])
         .expect("valid artifact-scrub failure CLI");
-        assert!(run_with_ops(invalid_report_cli, &RecordingOps::default()).is_err());
+        assert!(run_with_ops(invalid_report_cli, &TestApplication::default()).is_err());
 
         let empty = TestDir::new().expect("empty scrub fixture");
         let empty_cli = Cli::try_parse_from([
@@ -4631,7 +4297,7 @@ mod tests {
             "artifact-scrub",
         ])
         .expect("valid failing artifact-scrub CLI");
-        assert!(run_with_ops(empty_cli, &RecordingOps::default()).is_err());
+        assert!(run_with_ops(empty_cli, &TestApplication::default()).is_err());
         let status: Value = serde_json::from_slice(
             &fs::read(empty.path().join("_scrubs/status.json"))
                 .expect("failed scrub status should exist"),
@@ -4652,13 +4318,13 @@ mod tests {
             command,
         };
 
-        run_with_ops(command(Commands::SiteFixture), &RecordingOps::default())?;
+        run_with_ops(command(Commands::SiteFixture), &TestApplication::default())?;
         let first = fs::read(output_dir.path().join("defaults_gdp.json"))?;
         run_with_ops(
             command(Commands::DashboardMaterialize {
                 destination_dir: None,
             }),
-            &RecordingOps::default(),
+            &TestApplication::default(),
         )
         .expect("dashboard fixture should rematerialize");
         assert_eq!(
@@ -4670,14 +4336,14 @@ mod tests {
             command(Commands::DashboardMaterialize {
                 destination_dir: Some(overlay.path().to_path_buf()),
             }),
-            &RecordingOps::default(),
+            &TestApplication::default(),
         )
         .expect("dashboard fixture should materialize into a site overlay");
         assert_eq!(fs::read(overlay.path().join("defaults_gdp.json"))?, first);
         assert!(overlay.path().join("meta_inequality.json").is_file());
         run_with_ops(
             command(Commands::BrowserPerformanceFixture),
-            &RecordingOps::default(),
+            &TestApplication::default(),
         )
         .expect("browser performance fixture should materialize");
         let browser_index =
@@ -4694,7 +4360,7 @@ mod tests {
                 workspace_dir: catalog_workspace.path().to_path_buf(),
                 check: false,
             }),
-            &RecordingOps::default(),
+            &TestApplication::default(),
         )
         .expect("metric catalog generation should succeed");
         run_with_ops(
@@ -4702,7 +4368,7 @@ mod tests {
                 workspace_dir: catalog_workspace.path().to_path_buf(),
                 check: true,
             }),
-            &RecordingOps::default(),
+            &TestApplication::default(),
         )
         .expect("metric catalog verification should succeed");
         Ok(())
@@ -4731,7 +4397,7 @@ mod tests {
                     wikis: Vec::new(),
                 },
             },
-            &RecordingOps::default(),
+            &TestApplication::default(),
         )
         .expect("safe stale cleanup command should succeed");
 
@@ -4763,7 +4429,7 @@ mod tests {
                     wikis: vec!["nlwiki".to_string()],
                 },
             },
-            &RecordingOps::default(),
+            &TestApplication::default(),
         );
 
         assert!(result.is_err());
@@ -4774,13 +4440,8 @@ mod tests {
     fn run_with_ops_propagates_fetch_errors() -> Result<()> {
         init_test_tracing();
         let cli = Cli::try_parse_from(["wiki-econ", "fetch", "frwiki"])?;
-        let err = run_with_ops(
-            cli,
-            &FailingOps {
-                fail_stage: "fetch",
-            },
-        )
-        .expect_err("fetch failure should propagate");
+        let err = run_with_ops(cli, &TestApplication::failing("fetch"))
+            .expect_err("fetch failure should propagate");
         assert!(err.to_string().contains("fetch failed"));
         Ok(())
     }
@@ -4796,10 +4457,7 @@ mod tests {
             "--version",
             "2026-07",
         ])?;
-        let ops = RecordingOps {
-            preparation_error: true,
-            ..RecordingOps::default()
-        };
+        let ops = TestApplication::default().with_planning_failure();
         let error =
             run_with_ops(cli, &ops).expect_err("candidate discovery failure should propagate");
         assert!(error.to_string().contains("candidate plan failed"));
@@ -4810,13 +4468,8 @@ mod tests {
     fn run_with_ops_propagates_patrol_fetch_errors() -> Result<()> {
         init_test_tracing();
         let cli = Cli::try_parse_from(["wiki-econ", "fetch", "frwiki"])?;
-        let err = run_with_ops(
-            cli,
-            &FailingOps {
-                fail_stage: "fetch_patrol",
-            },
-        )
-        .expect_err("patrol fetch failure should propagate");
+        let err = run_with_ops(cli, &TestApplication::failing("fetch_patrol"))
+            .expect_err("patrol fetch failure should propagate");
         assert!(err.to_string().contains("fetch patrol failed"));
         Ok(())
     }
@@ -4825,13 +4478,8 @@ mod tests {
     fn run_with_ops_propagates_ingest_errors() -> Result<()> {
         init_test_tracing();
         let cli = Cli::try_parse_from(["wiki-econ", "ingest", "frwiki"])?;
-        let err = run_with_ops(
-            cli,
-            &FailingOps {
-                fail_stage: "ingest",
-            },
-        )
-        .expect_err("ingest failure should propagate");
+        let err = run_with_ops(cli, &TestApplication::failing("ingest"))
+            .expect_err("ingest failure should propagate");
         assert!(err.to_string().contains("ingest failed"));
         Ok(())
     }
@@ -4840,13 +4488,8 @@ mod tests {
     fn run_with_ops_propagates_compute_errors() -> Result<()> {
         init_test_tracing();
         let cli = Cli::try_parse_from(["wiki-econ", "compute", "frwiki"])?;
-        let err = run_with_ops(
-            cli,
-            &FailingOps {
-                fail_stage: "compute",
-            },
-        )
-        .expect_err("compute failure should propagate");
+        let err = run_with_ops(cli, &TestApplication::failing("compute"))
+            .expect_err("compute failure should propagate");
         assert!(err.to_string().contains("compute failed"));
         Ok(())
     }
@@ -4865,13 +4508,8 @@ mod tests {
             "--nfs-quota-bytes",
             "100000000000",
         ])?;
-        let error = run_with_ops(
-            cli,
-            &FailingOps {
-                fail_stage: "capacity",
-            },
-        )
-        .expect_err("capacity failure should propagate");
+        let error = run_with_ops(cli, &TestApplication::failing("capacity"))
+            .expect_err("capacity failure should propagate");
         assert!(error.to_string().contains("capacity benchmark failed"));
         Ok(())
     }
@@ -4888,13 +4526,8 @@ mod tests {
             "--report",
             "schema.json",
         ])?;
-        let error = run_with_ops(
-            cli,
-            &FailingOps {
-                fail_stage: "schema_benchmark",
-            },
-        )
-        .expect_err("schema benchmark failure should propagate");
+        let error = run_with_ops(cli, &TestApplication::failing("schema_benchmark"))
+            .expect_err("schema benchmark failure should propagate");
         assert!(error.to_string().contains("schema benchmark failed"));
         Ok(())
     }
@@ -4903,13 +4536,8 @@ mod tests {
     fn run_with_ops_propagates_patrol_compute_errors() -> Result<()> {
         init_test_tracing();
         let cli = Cli::try_parse_from(["wiki-econ", "compute", "frwiki"])?;
-        let err = run_with_ops(
-            cli,
-            &FailingOps {
-                fail_stage: "compute_patrol",
-            },
-        )
-        .expect_err("patrol compute failure should propagate");
+        let err = run_with_ops(cli, &TestApplication::failing("compute_patrol"))
+            .expect_err("patrol compute failure should propagate");
         assert!(err.to_string().contains("compute patrol failed"));
         Ok(())
     }
@@ -4918,13 +4546,8 @@ mod tests {
     fn run_with_ops_compute_propagates_merge_errors() -> Result<()> {
         init_test_tracing();
         let cli = Cli::try_parse_from(["wiki-econ", "compute", "frwiki"])?;
-        let err = run_with_ops(
-            cli,
-            &FailingOps {
-                fail_stage: "merge",
-            },
-        )
-        .expect_err("compute merge failure should propagate");
+        let err = run_with_ops(cli, &TestApplication::failing("merge"))
+            .expect_err("compute merge failure should propagate");
         assert!(err.to_string().contains("merge failed"));
         Ok(())
     }
@@ -4933,13 +4556,8 @@ mod tests {
     fn run_with_ops_propagates_merge_errors() -> Result<()> {
         init_test_tracing();
         let cli = Cli::try_parse_from(["wiki-econ", "merge"])?;
-        let err = run_with_ops(
-            cli,
-            &FailingOps {
-                fail_stage: "merge",
-            },
-        )
-        .expect_err("merge failure should propagate");
+        let err = run_with_ops(cli, &TestApplication::failing("merge"))
+            .expect_err("merge failure should propagate");
         assert!(err.to_string().contains("merge failed"));
         Ok(())
     }
@@ -4948,73 +4566,9 @@ mod tests {
     fn run_with_ops_propagates_bench_errors() -> Result<()> {
         init_test_tracing();
         let cli = Cli::try_parse_from(["wiki-econ", "bench", "frwiki", "--warmup", "0"])?;
-        let err = run_with_ops(
-            cli,
-            &FailingOps {
-                fail_stage: "bench",
-            },
-        )
-        .expect_err("bench failure should propagate");
+        let err = run_with_ops(cli, &TestApplication::failing("bench"))
+            .expect_err("bench failure should propagate");
         assert!(err.to_string().contains("bench failed"));
-        Ok(())
-    }
-
-    #[test]
-    fn failing_ops_succeeds_for_non_matching_stages() -> Result<()> {
-        let ops = FailingOps { fail_stage: "none" };
-        let qualification = TestDir::new()?;
-        let data_dir = Path::new("data");
-        let output_dir = Path::new("output");
-        let wikis = vec!["frwiki".to_string()];
-
-        ops.fetch_wiki("frwiki", "2026-02", data_dir)?;
-        ops.fetch_patrol("frwiki", data_dir)?;
-        ops.ingest_wiki("frwiki", None, data_dir)?;
-        assert!(!ops.reset_obsolete_qualification_generation("frwiki", "2026-02", data_dir,)?);
-        ops.compute_all("frwiki", data_dir, output_dir)?;
-        ops.compute_patrol("frwiki", data_dir, output_dir, false, None)?;
-        ops.benchmark(BenchmarkRequest {
-            wikis: &wikis,
-            paths: orchestration::AppPaths {
-                data: data_dir,
-                output: output_dir,
-            },
-            warmup: 0,
-            iterations: 1,
-            keep_outputs: false,
-        })?;
-        ops.capacity_benchmark(CapacityBenchmarkRequest {
-            wiki: "frwiki",
-            data_dir,
-            output_dir,
-            scratch_dir: Path::new("scratch"),
-            report_path: Path::new("report.json"),
-            weekly_buckets: 256,
-            weekly_secondary_buckets: 1,
-            raw_transient_bytes: 0,
-            nfs_quota_bytes: Some(1),
-            storage_reserve_bytes: 0,
-            quota_root: data_dir,
-            minimum_memory_headroom_percent: 25,
-            requested_cpu: 1,
-        })
-        .expect("non-matching failing ops stage");
-        let qualification_report = qualification.path().join("cpu.json");
-        assert!(
-            ops.cpu_qualification(&[], &qualification_report).is_err(),
-            "an incomplete qualification matrix must fail closed"
-        );
-        assert!(qualification_report.is_file());
-        let schema_result = ops.schema_benchmark(SchemaBenchmarkRequest {
-            data_dir,
-            scratch_dir: Path::new("scratch"),
-            report_path: Path::new("schema.json"),
-            wikis: &wikis,
-            run_id: Some("schema-test"),
-        });
-        schema_result?;
-        ops.merge_outputs(output_dir, None)?;
-        ops.finalize_snapshot("frwiki", data_dir)?;
         Ok(())
     }
 
@@ -5022,13 +4576,8 @@ mod tests {
     fn run_with_ops_propagates_snapshot_finalize_errors() -> Result<()> {
         init_test_tracing();
         let cli = Cli::try_parse_from(["wiki-econ", "snapshot-finalize", "frwiki"])?;
-        let err = run_with_ops(
-            cli,
-            &FailingOps {
-                fail_stage: "snapshot_finalize",
-            },
-        )
-        .expect_err("snapshot finalization failure should propagate");
+        let err = run_with_ops(cli, &TestApplication::failing("snapshot_finalize"))
+            .expect_err("snapshot finalization failure should propagate");
         assert!(err.to_string().contains("snapshot finalize failed"));
         Ok(())
     }
@@ -5037,13 +4586,8 @@ mod tests {
     fn run_command_propagates_fetch_errors() -> Result<()> {
         init_test_tracing();
         let cli = Cli::try_parse_from(["wiki-econ", "run", "frwiki"])?;
-        let err = run_with_ops(
-            cli,
-            &FailingOps {
-                fail_stage: "fetch",
-            },
-        )
-        .expect_err("run fetch failure should propagate");
+        let err = run_with_ops(cli, &TestApplication::failing("fetch"))
+            .expect_err("run fetch failure should propagate");
         assert!(err.to_string().contains("fetch failed"));
         Ok(())
     }
@@ -5052,13 +4596,8 @@ mod tests {
     fn run_command_propagates_patrol_fetch_errors() -> Result<()> {
         init_test_tracing();
         let cli = Cli::try_parse_from(["wiki-econ", "run", "frwiki"])?;
-        let err = run_with_ops(
-            cli,
-            &FailingOps {
-                fail_stage: "fetch_patrol",
-            },
-        )
-        .expect_err("run patrol fetch failure should propagate");
+        let err = run_with_ops(cli, &TestApplication::failing("fetch_patrol"))
+            .expect_err("run patrol fetch failure should propagate");
         assert!(err.to_string().contains("fetch patrol failed"));
         Ok(())
     }
@@ -5067,13 +4606,8 @@ mod tests {
     fn run_command_propagates_ingest_errors() -> Result<()> {
         init_test_tracing();
         let cli = Cli::try_parse_from(["wiki-econ", "run", "frwiki"])?;
-        let err = run_with_ops(
-            cli,
-            &FailingOps {
-                fail_stage: "ingest",
-            },
-        )
-        .expect_err("run ingest failure should propagate");
+        let err = run_with_ops(cli, &TestApplication::failing("ingest"))
+            .expect_err("run ingest failure should propagate");
         assert!(err.to_string().contains("ingest failed"));
         Ok(())
     }
@@ -5082,13 +4616,8 @@ mod tests {
     fn run_command_propagates_cleanup_raw_errors() -> Result<()> {
         init_test_tracing();
         let cli = Cli::try_parse_from(["wiki-econ", "run", "frwiki"])?;
-        let err = run_with_ops(
-            cli,
-            &FailingOps {
-                fail_stage: "cleanup_raw",
-            },
-        )
-        .expect_err("run cleanup_raw failure should propagate");
+        let err = run_with_ops(cli, &TestApplication::failing("cleanup_raw"))
+            .expect_err("run cleanup_raw failure should propagate");
         assert!(err.to_string().contains("cleanup raw failed"));
         Ok(())
     }
@@ -5097,13 +4626,8 @@ mod tests {
     fn run_command_propagates_compute_errors() -> Result<()> {
         init_test_tracing();
         let cli = Cli::try_parse_from(["wiki-econ", "run", "frwiki"])?;
-        let err = run_with_ops(
-            cli,
-            &FailingOps {
-                fail_stage: "compute",
-            },
-        )
-        .expect_err("run compute failure should propagate");
+        let err = run_with_ops(cli, &TestApplication::failing("compute"))
+            .expect_err("run compute failure should propagate");
         assert!(err.to_string().contains("compute failed"));
         Ok(())
     }
@@ -5112,13 +4636,8 @@ mod tests {
     fn run_command_propagates_patrol_compute_errors() -> Result<()> {
         init_test_tracing();
         let cli = Cli::try_parse_from(["wiki-econ", "run", "frwiki"])?;
-        let err = run_with_ops(
-            cli,
-            &FailingOps {
-                fail_stage: "compute_patrol",
-            },
-        )
-        .expect_err("run patrol compute failure should propagate");
+        let err = run_with_ops(cli, &TestApplication::failing("compute_patrol"))
+            .expect_err("run patrol compute failure should propagate");
         assert!(err.to_string().contains("compute patrol failed"));
         Ok(())
     }
@@ -5127,13 +4646,8 @@ mod tests {
     fn run_command_propagates_merge_errors() -> Result<()> {
         init_test_tracing();
         let cli = Cli::try_parse_from(["wiki-econ", "run", "frwiki"])?;
-        let err = run_with_ops(
-            cli,
-            &FailingOps {
-                fail_stage: "merge",
-            },
-        )
-        .expect_err("run merge failure should propagate");
+        let err = run_with_ops(cli, &TestApplication::failing("merge"))
+            .expect_err("run merge failure should propagate");
         assert!(err.to_string().contains("merge failed"));
         Ok(())
     }
