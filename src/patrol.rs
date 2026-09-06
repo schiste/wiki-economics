@@ -189,6 +189,12 @@ struct LoggingParseStats {
     total_log_items: usize,
     patrol_events: usize,
     rights_events: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account_creation_events: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    permanent_account_creation_events: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    temporary_account_creation_events: Option<usize>,
     local_account_block_events: usize,
     indefinite_block_events: usize,
     finite_block_events: usize,
@@ -227,6 +233,9 @@ pub(crate) struct PatrolSourceSummary {
     pub(crate) total_log_items: u64,
     pub(crate) patrol_events: u64,
     pub(crate) rights_events: u64,
+    pub(crate) account_creation_events: Option<u64>,
+    pub(crate) permanent_account_creation_events: Option<u64>,
+    pub(crate) temporary_account_creation_events: Option<u64>,
     pub(crate) local_account_block_events: u64,
     pub(crate) indefinitely_blocked_accounts: u64,
     pub(crate) unclassified_block_duration_events: u64,
@@ -271,6 +280,21 @@ pub(crate) fn source_generation_summary(
         total_log_items: u64::try_from(source.stats.total_log_items)?,
         patrol_events: u64::try_from(source.stats.patrol_events)?,
         rights_events: u64::try_from(source.stats.rights_events)?,
+        account_creation_events: source
+            .stats
+            .account_creation_events
+            .map(u64::try_from)
+            .transpose()?,
+        permanent_account_creation_events: source
+            .stats
+            .permanent_account_creation_events
+            .map(u64::try_from)
+            .transpose()?,
+        temporary_account_creation_events: source
+            .stats
+            .temporary_account_creation_events
+            .map(u64::try_from)
+            .transpose()?,
         local_account_block_events: u64::try_from(source.stats.local_account_block_events)?,
         indefinitely_blocked_accounts: source.blocked_accounts.rows,
         unclassified_block_duration_events,
@@ -1929,7 +1953,12 @@ fn parse_logging_events_with_blocks<P: PatrolSink + ?Sized, R: RightsSink + ?Siz
     rights_writer: &mut R,
     mut block_writer: Option<&mut dyn AccountBlockSink>,
 ) -> Result<LoggingParseStats> {
-    let mut stats = LoggingParseStats::default();
+    let mut stats = LoggingParseStats {
+        account_creation_events: Some(0),
+        permanent_account_creation_events: Some(0),
+        temporary_account_creation_events: Some(0),
+        ..Default::default()
+    };
     let summary = crate::logging::stream_file(xml_path, |event| {
         match event {
             LoggingEvent::Patrol(row) => {
@@ -1964,9 +1993,31 @@ fn parse_logging_events_with_blocks<P: PatrolSink + ?Sized, R: RightsSink + ?Siz
                         .context("skipped event count overflow")?;
                 }
             }
-            LoggingEvent::Block(_)
-            | LoggingEvent::AccountCreation(_)
-            | LoggingEvent::Other { .. } => {
+            LoggingEvent::AccountCreation(row) => {
+                let account_total = stats
+                    .account_creation_events
+                    .as_mut()
+                    .expect("new logging generations initialize account counters");
+                *account_total = account_total
+                    .checked_add(1)
+                    .context("account creation event count overflow")?;
+                let classified = if row.is_temporary {
+                    &mut stats.temporary_account_creation_events
+                } else {
+                    &mut stats.permanent_account_creation_events
+                };
+                let classified = classified
+                    .as_mut()
+                    .expect("new logging generations initialize classified account counters");
+                *classified = classified
+                    .checked_add(1)
+                    .context("classified account creation event count overflow")?;
+                stats.skipped_events = stats
+                    .skipped_events
+                    .checked_add(1)
+                    .context("skipped event count overflow")?;
+            }
+            LoggingEvent::Block(_) | LoggingEvent::Other { .. } => {
                 stats.skipped_events = stats
                     .skipped_events
                     .checked_add(1)

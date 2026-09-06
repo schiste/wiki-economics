@@ -91,6 +91,8 @@ struct ReadyWikiCandidate {
     workload_profile: Option<crate::workload_profile::WorkloadProfile>,
     #[serde(default)]
     editor_identity_coverage: Option<crate::compute::EditorIdentityCoverageReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quality_signals: Option<CandidateQualitySignals>,
     artifacts: Vec<PreparedArtifact>,
 }
 
@@ -129,7 +131,32 @@ struct QualificationReceipt {
     workload_profile: crate::workload_profile::WorkloadProfile,
     #[serde(default)]
     editor_identity_coverage: Option<crate::compute::EditorIdentityCoverageReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quality_signals: Option<CandidateQualitySignals>,
     artifacts: Vec<PreparedArtifact>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+struct CandidateQualitySignals {
+    editor_period_observations: u64,
+    identified_editor_edits: u64,
+    excluded_editor_edits: u64,
+    patrol_events: u64,
+    rights_events: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account_creation_events: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    permanent_account_creation_events: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    temporary_account_creation_events: Option<u64>,
+    local_account_block_events: u64,
+    indefinitely_blocked_accounts: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EditorQualitySummary {
+    period_observations: u64,
+    edits: u64,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -357,6 +384,12 @@ struct MetricReport {
 struct PatrolSourceReport {
     patrol_events: u64,
     rights_events: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account_creation_events: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    permanent_account_creation_events: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    temporary_account_creation_events: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     generation: Option<PatrolGenerationReport>,
 }
@@ -380,6 +413,12 @@ struct PatrolGenerationReport {
     downloaded_sha256: String,
     parser_version: String,
     total_log_items: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    account_creation_events: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    permanent_account_creation_events: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    temporary_account_creation_events: Option<u64>,
     #[serde(default)]
     local_account_block_events: u64,
     #[serde(default)]
@@ -416,6 +455,9 @@ fn patrol_source_report_with_generation(
         return Ok(PatrolSourceReport {
             patrol_events: source.patrol_events,
             rights_events: source.rights_events,
+            account_creation_events: source.account_creation_events,
+            permanent_account_creation_events: source.permanent_account_creation_events,
+            temporary_account_creation_events: source.temporary_account_creation_events,
             generation: Some(PatrolGenerationReport {
                 history_snapshot: Some(source.history_snapshot),
                 logging_dump_date: Some(source.logging_dump_date),
@@ -429,6 +471,9 @@ fn patrol_source_report_with_generation(
                 downloaded_sha256: source.downloaded_sha256,
                 parser_version: source.parser_version,
                 total_log_items: source.total_log_items,
+                account_creation_events: source.account_creation_events,
+                permanent_account_creation_events: source.permanent_account_creation_events,
+                temporary_account_creation_events: source.temporary_account_creation_events,
                 local_account_block_events: source.local_account_block_events,
                 indefinitely_blocked_accounts: source.indefinitely_blocked_accounts,
                 unclassified_block_duration_events: source.unclassified_block_duration_events,
@@ -454,8 +499,37 @@ fn patrol_source_report_with_generation(
     Ok(PatrolSourceReport {
         patrol_events: patrol_rows,
         rights_events: rights_rows,
+        account_creation_events: None,
+        permanent_account_creation_events: None,
+        temporary_account_creation_events: None,
         generation: None,
     })
+}
+
+fn candidate_quality_signals(
+    editor: EditorQualitySummary,
+    coverage: Option<&crate::compute::EditorIdentityCoverageReport>,
+    patrol: &PatrolSourceReport,
+) -> CandidateQualitySignals {
+    let generation = patrol.generation.as_ref();
+    CandidateQualitySignals {
+        editor_period_observations: editor.period_observations,
+        identified_editor_edits: coverage
+            .map(|report| report.identified_edits)
+            .unwrap_or(editor.edits),
+        excluded_editor_edits: coverage.map(|report| report.excluded_edits).unwrap_or(0),
+        patrol_events: patrol.patrol_events,
+        rights_events: patrol.rights_events,
+        account_creation_events: patrol.account_creation_events,
+        permanent_account_creation_events: patrol.permanent_account_creation_events,
+        temporary_account_creation_events: patrol.temporary_account_creation_events,
+        local_account_block_events: generation
+            .map(|report| report.local_account_block_events)
+            .unwrap_or(0),
+        indefinitely_blocked_accounts: generation
+            .map(|report| report.indefinitely_blocked_accounts)
+            .unwrap_or(0),
+    }
 }
 
 fn publication_patrol_source_report(
@@ -535,6 +609,8 @@ struct WikiPublicationProof {
     ready_receipt_sha256: String,
     families: BTreeMap<String, FamilyPublicationProof>,
     artifacts: BTreeMap<String, PreparedArtifact>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    quality_signals: Option<CandidateQualitySignals>,
 }
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -1054,6 +1130,7 @@ pub(crate) fn mark_wiki_candidate_ready(
     );
     let mut artifacts = Vec::new();
     let mut cutoff_date = None;
+    let mut editor_summary = None;
     let editor_identity_coverage =
         crate::compute::read_editor_identity_coverage(&candidate_dir, wiki)?;
     ensure!(
@@ -1077,7 +1154,10 @@ pub(crate) fn mark_wiki_candidate_ready(
         let identity = format!("{wiki}/{}.parquet", spec.name);
         let (rows, summary) = receipted_summary(&path, &identity, spec)?;
         if spec.name == "gdp_user_type_share" {
-            validate_editor_identity_semantics(&path, editor_identity_coverage.as_ref())?;
+            editor_summary = Some(validate_editor_identity_semantics(
+                &path,
+                editor_identity_coverage.as_ref(),
+            )?);
         }
         let minimum_rows = contract.minimum_rows(wiki);
         ensure!(
@@ -1105,12 +1185,17 @@ pub(crate) fn mark_wiki_candidate_ready(
         }
         artifacts.push(prepared_artifact(&candidate_dir, &path)?);
     }
-    patrol_source_report(data_dir, wiki, snapshot)?;
+    let patrol_source = patrol_source_report(data_dir, wiki, snapshot)?;
     artifacts.sort_by(|left, right| left.path.cmp(&right.path));
     let workload_profile = crate::workload_profile::load(data_dir, wiki, snapshot)?;
     ensure!(
         workload_profile.is_some() || !crate::workload_profile::require_qualified()?,
         "qualified production candidate has no persisted workload profile"
+    );
+    let quality_signals = candidate_quality_signals(
+        editor_summary.context("candidate editor observations are missing")?,
+        editor_identity_coverage.as_ref(),
+        &patrol_source,
     );
     let ready = ReadyWikiCandidate {
         schema_version: 2,
@@ -1122,6 +1207,7 @@ pub(crate) fn mark_wiki_candidate_ready(
         cutoff_date: cutoff_date.context("candidate GDP cutoff is missing")?,
         workload_profile,
         editor_identity_coverage,
+        quality_signals: Some(quality_signals),
         artifacts,
     };
     let generation_state =
@@ -1187,6 +1273,7 @@ pub(crate) fn mark_wiki_qualification_ready(
     let generation_state = generation.adopt(GState::Building, "recovered qualification run")?;
     let mut artifacts = Vec::new();
     let mut cutoff_date = None;
+    let mut editor_summary = None;
     let editor_identity_coverage =
         crate::compute::read_editor_identity_coverage(&qualification_dir, wiki)?;
     ensure!(
@@ -1202,7 +1289,10 @@ pub(crate) fn mark_wiki_qualification_ready(
         let identity = format!("{wiki}/{}.parquet", spec.name);
         let (rows, summary) = receipted_summary(&path, &identity, spec)?;
         if spec.name == "gdp_user_type_share" {
-            validate_editor_identity_semantics(&path, editor_identity_coverage.as_ref())?;
+            editor_summary = Some(validate_editor_identity_semantics(
+                &path,
+                editor_identity_coverage.as_ref(),
+            )?);
         }
         ensure!(
             rows > 0,
@@ -1229,10 +1319,15 @@ pub(crate) fn mark_wiki_qualification_ready(
         }
         artifacts.push(prepared_artifact(&qualification_dir, &path)?);
     }
-    patrol_source_report(data_dir, wiki, snapshot)?;
+    let patrol_source = patrol_source_report(data_dir, wiki, snapshot)?;
     artifacts.sort_by(|left, right| left.path.cmp(&right.path));
     let workload_profile = crate::workload_profile::load(data_dir, wiki, snapshot)?
         .context("qualification has no persisted workload profile")?;
+    let quality_signals = candidate_quality_signals(
+        editor_summary.context("qualification editor observations are missing")?,
+        editor_identity_coverage.as_ref(),
+        &patrol_source,
+    );
     let receipt = QualificationReceipt {
         schema_version: 2,
         publication_eligible: false,
@@ -1244,6 +1339,7 @@ pub(crate) fn mark_wiki_qualification_ready(
         cutoff_date: cutoff_date.context("qualification GDP cutoff is missing")?,
         workload_profile,
         editor_identity_coverage,
+        quality_signals: Some(quality_signals),
         artifacts,
     };
     let generation_state = if generation_state.state == GState::Building {
@@ -1964,6 +2060,7 @@ fn legacy_wiki_publication_proof(
         ready_receipt_sha256,
         families,
         artifacts,
+        quality_signals: None,
     })
 }
 
@@ -2037,6 +2134,7 @@ fn current_wiki_publication_proof(
             (families, ready_receipt_sha256)
         }
     };
+    let quality_signals = ready.quality_signals.clone();
     let mut artifacts = BTreeMap::new();
     for artifact in ready.artifacts {
         let metric = prepared_metric_name(&artifact)?;
@@ -2057,6 +2155,7 @@ fn current_wiki_publication_proof(
         ready_receipt_sha256,
         families,
         artifacts,
+        quality_signals,
     })
 }
 
@@ -4327,7 +4426,7 @@ fn validate_snapshot_cutoff(wiki: &str, snapshot: &str, cutoff: &str) -> Result<
 fn validate_editor_identity_semantics(
     path: &Path,
     coverage: Option<&crate::compute::EditorIdentityCoverageReport>,
-) -> Result<()> {
+) -> Result<EditorQualitySummary> {
     let coverage_by_period = coverage
         .map(|report| {
             report
@@ -4349,6 +4448,8 @@ fn validate_editor_identity_semantics(
         "editors".to_string(),
     ];
     let mut reader = storage::SequentialParquetReader::new(path, Some(columns), 100_000)?;
+    let mut period_observations = 0_u64;
+    let mut total_edits = 0_u64;
     while let Some(batch) = reader.next_batch()? {
         let months = batch.column("year_month")?.str()?;
         let user_types = batch.column("user_type")?.str()?;
@@ -4362,6 +4463,12 @@ fn validate_editor_identity_semantics(
             let edit_count = u64::from(edits.get(row).context("editor identity edits is null")?);
             let editor_count =
                 u64::from(editors.get(row).context("editor identity count is null")?);
+            period_observations = period_observations
+                .checked_add(editor_count)
+                .context("editor period-observation total overflow")?;
+            total_edits = total_edits
+                .checked_add(edit_count)
+                .context("editor edit total overflow")?;
             let (identified_edits, excluded_edits) = coverage_by_period
                 .get(&(month, user_type))
                 .copied()
@@ -4382,7 +4489,10 @@ fn validate_editor_identity_semantics(
             );
         }
     }
-    Ok(())
+    Ok(EditorQualitySummary {
+        period_observations,
+        edits: total_edits,
+    })
 }
 
 fn validate_snapshots(
@@ -4921,6 +5031,9 @@ mod tests {
             total_log_items: 15,
             patrol_events: 10,
             rights_events: 2,
+            account_creation_events: Some(4),
+            permanent_account_creation_events: Some(3),
+            temporary_account_creation_events: Some(1),
             local_account_block_events: 0,
             indefinitely_blocked_accounts: 0,
             unclassified_block_duration_events: 0,
@@ -4933,6 +5046,9 @@ mod tests {
             patrol_source_report_with_generation(data.path(), "nlwiki", Some(source.clone()))?;
         assert_eq!(report.patrol_events, 10);
         assert_eq!(report.rights_events, 2);
+        assert_eq!(report.account_creation_events, Some(4));
+        assert_eq!(report.permanent_account_creation_events, Some(3));
+        assert_eq!(report.temporary_account_creation_events, Some(1));
         let generation = report.generation.context("generation report is missing")?;
         assert_eq!(generation.downloaded_sha256, "a".repeat(64));
         assert_eq!(generation.manifest_sha256, "b".repeat(64));
@@ -5790,6 +5906,15 @@ mod tests {
             1
         );
         assert_eq!(receipt["patrol_sources"]["nlwiki"]["rights_events"], 1);
+        assert!(
+            receipt["wiki_proofs"]["nlwiki"]["quality_signals"]["editor_period_observations"]
+                .as_u64()
+                .is_some_and(|value| value > 0)
+        );
+        assert_eq!(
+            receipt["wiki_proofs"]["nlwiki"]["quality_signals"]["patrol_events"],
+            1
+        );
 
         let receipt_path = fixture.output.path().join(RECEIPT_FILE);
         let mut tampered_receipt = receipt.clone();
@@ -6006,6 +6131,7 @@ mod tests {
                         ready_receipt_sha256: format!("ready-{wiki}"),
                         families,
                         artifacts: BTreeMap::new(),
+                        quality_signals: None,
                     },
                 )
             })
