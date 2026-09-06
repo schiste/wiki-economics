@@ -15,6 +15,8 @@ use crate::{artifact_receipt, licensing, storage};
 const RUN_CONTEXT_FILE: &str = ".publication-run.json";
 const CANDIDATE_FILE: &str = ".publication-candidate.json";
 const READY_INDEX_DIR: &str = "_ready-index";
+const PUBLICATION_BACKUP_DIR: &str = "publication-backup";
+const PUBLICATION_BACKUP_MANIFEST: &str = "backup.json";
 pub(crate) const READY_INDEX_SCHEMA_VERSION: u8 = 2;
 const PUBLICATION_CONTRACT_VERSION: &str =
     "ready-candidate-publication-v3-incremental-receipt-composition";
@@ -38,7 +40,9 @@ const JSON_ARTIFACTS: [&str; 14] = [
 
 #[cfg(test)]
 use crate::metric_registry::FieldKind as Kind;
-use crate::metric_registry::{METRIC_DEFINITIONS as METRICS, MetricDefinition as MetricSpec};
+use crate::metric_registry::{
+    METRIC_DEFINITIONS as METRICS, MetricDefinition as MetricSpec, MetricId, PublicationScope,
+};
 
 const SUBSTANTIAL_ANONYMOUS_EDITS: u64 = 100;
 
@@ -201,6 +205,12 @@ struct PublicationSelection {
     entries: Vec<SelectionEntry>,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+struct PublicationArtifactBackup {
+    schema_version: u8,
+    artifacts: Vec<String>,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PublicationRecoveryClassification {
@@ -276,6 +286,12 @@ pub(crate) struct PublicationPreflightReport {
     changed: Vec<PublicationChange>,
     reused: Vec<PublicationChange>,
     wikis: Vec<PublicationPreflightWiki>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CandidateMergeContract {
+    parquet_schema: Vec<artifact_receipt::FieldIdentity>,
+    algorithm_version: String,
 }
 
 #[derive(Clone, Copy)]
@@ -3567,6 +3583,8 @@ pub(crate) fn publication_preflight(
     let mut changed = Vec::new();
     let mut reused = Vec::new();
     let mut wikis = Vec::new();
+    let mut merge_contracts = BTreeMap::<MetricId, (String, CandidateMergeContract)>::new();
+    let mut incompatible_merge_metrics = BTreeSet::new();
     for (wiki, lifecycle) in &registry.wikis {
         if lifecycle.publication != "published" {
             continue;
@@ -3611,11 +3629,34 @@ pub(crate) fn publication_preflight(
             }
         };
         let reference = &index.newest_valid_ready;
-        if let Err(error) = ready_from_reference(data_dir, output_dir, wiki, reference) {
-            blockers.push(format!(
-                "{wiki} newest ready candidate failed authentication: {error:#}"
-            ));
+        let (ready, candidate_dir) =
+            match ready_from_reference(data_dir, output_dir, wiki, reference) {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    blockers.push(format!(
+                        "{wiki} newest ready candidate failed authentication: {error:#}"
+                    ));
+                    continue;
+                }
+            };
+        let mut contracts = BTreeMap::new();
+        if !collect_ready_candidate_merge_contracts(
+            wiki,
+            ready_candidate_merge_contracts(&candidate_dir, &ready),
+            &mut blockers,
+            &mut contracts,
+        ) {
             continue;
+        }
+        for (metric, contract) in contracts {
+            record_candidate_merge_contract(
+                &mut merge_contracts,
+                &mut incompatible_merge_metrics,
+                &mut blockers,
+                wiki,
+                metric,
+                contract,
+            );
         }
         if previous.is_some_and(|proof| reference.snapshot < proof.snapshot) {
             blockers.push(format!(
@@ -3683,6 +3724,98 @@ pub(crate) fn publication_preflight(
         reused,
         wikis,
     })
+}
+
+fn collect_ready_candidate_merge_contracts(
+    wiki: &str,
+    result: Result<BTreeMap<MetricId, CandidateMergeContract>>,
+    blockers: &mut Vec<String>,
+    contracts: &mut BTreeMap<MetricId, CandidateMergeContract>,
+) -> bool {
+    match result {
+        Ok(candidate_contracts) => {
+            *contracts = candidate_contracts;
+            true
+        }
+        Err(error) => {
+            blockers.push(format!(
+                "{wiki} candidate merge contract is invalid: {error:#}"
+            ));
+            false
+        }
+    }
+}
+
+fn record_candidate_merge_contract(
+    contracts: &mut BTreeMap<MetricId, (String, CandidateMergeContract)>,
+    incompatible: &mut BTreeSet<MetricId>,
+    blockers: &mut Vec<String>,
+    wiki: &str,
+    metric: MetricId,
+    contract: CandidateMergeContract,
+) {
+    if let Some((other_wiki, expected)) = contracts.get(&metric) {
+        if expected != &contract && incompatible.insert(metric) {
+            blockers.push(format!(
+                "{} candidates have incompatible merge schemas or algorithm versions between {other_wiki} and {wiki}",
+                metric.as_str()
+            ));
+        }
+    } else {
+        contracts.insert(metric, (wiki.to_string(), contract));
+    }
+}
+
+fn ready_candidate_merge_contracts(
+    candidate_dir: &Path,
+    ready: &ReadyWikiCandidate,
+) -> Result<BTreeMap<MetricId, CandidateMergeContract>> {
+    let mut contracts = BTreeMap::new();
+    for artifact in &ready.artifacts {
+        let Some(metric) = MetricId::from_artifact_identity(&artifact.path) else {
+            continue;
+        };
+        if metric.definition().publication_scope != PublicationScope::MergedAndPerWiki {
+            continue;
+        }
+        let path = candidate_dir.join(&artifact.path);
+        let document = artifact_receipt::read(&path)?;
+        let document = artifact_receipt::verify(
+            &path,
+            &document.receipt.identity,
+            Some(&document.receipt_sha256),
+            artifact_receipt::VerificationMode::Fast,
+        )?;
+        ensure!(
+            document.receipt.artifact_sha256 == artifact.sha256
+                && document.receipt.bytes == artifact.bytes
+                && document.receipt.rows == artifact.rows,
+            "{} artifact receipt disagrees with ready.json",
+            metric.as_str()
+        );
+        let replaced = contracts.insert(
+            metric,
+            CandidateMergeContract {
+                parquet_schema: document.receipt.parquet_schema,
+                algorithm_version: document.receipt.algorithm_version,
+            },
+        );
+        ensure!(
+            replaced.is_none(),
+            "ready candidate contains duplicate {} artifacts",
+            metric.as_str()
+        );
+    }
+    for definition in METRICS {
+        if definition.publication_scope == PublicationScope::MergedAndPerWiki {
+            ensure!(
+                contracts.contains_key(&definition.id),
+                "ready candidate is missing {}",
+                definition.id.as_str()
+            );
+        }
+    }
+    Ok(contracts)
 }
 
 pub(crate) fn write_publication_preflight_report(
@@ -3791,6 +3924,119 @@ fn remove_committed_backup(output_dir: &Path, backup: Option<&str>) -> Result<()
         fs::remove_dir_all(backup)?;
     } else if backup.is_symlink() {
         fs::remove_file(backup)?;
+    }
+    Ok(())
+}
+
+fn publication_backup_dir(output_dir: &Path, run_id: &str) -> Result<PathBuf> {
+    Ok(selection_path(output_dir, run_id)?
+        .parent()
+        .context("publication selection has no transaction directory")?
+        .join(PUBLICATION_BACKUP_DIR))
+}
+
+fn snapshot_publication_artifacts(output_dir: &Path, run_id: &str) -> Result<bool> {
+    snapshot_publication_artifacts_with(output_dir, run_id, |_| Ok(()))
+}
+
+fn snapshot_publication_artifacts_with<F>(
+    output_dir: &Path,
+    run_id: &str,
+    before_manifest: F,
+) -> Result<bool>
+where
+    F: FnOnce(&Path) -> Result<()>,
+{
+    let gate_path = output_dir.join(RECEIPT_FILE);
+    if !gate_path.is_file() {
+        return Ok(false);
+    }
+    if let Err(error) = verify(output_dir, "publication-backup") {
+        warn!(
+            error = %format!("{error:#}"),
+            "current publication is not authenticatable; continuing without a rollback artifact backup"
+        );
+        return Ok(false);
+    }
+    let gate: GateReceipt = read_json(&gate_path)?;
+    let backup_dir = publication_backup_dir(output_dir, run_id)?;
+    ensure!(
+        !backup_dir.exists(),
+        "publication artifact backup already exists"
+    );
+    fs::create_dir_all(&backup_dir)?;
+    let mut artifacts = BTreeSet::new();
+    for artifact in &gate.artifacts {
+        let relative = Path::new(&artifact.name);
+        if relative.components().count() != 1 {
+            continue;
+        }
+        artifacts.insert(artifact.name.clone());
+        let sidecar = artifact_receipt::sidecar_path(&output_dir.join(relative))?;
+        if sidecar.is_file() {
+            artifacts.insert(
+                sidecar
+                    .file_name()
+                    .context("publication sidecar has no filename")?
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+    for name in [RECEIPT_FILE, CANDIDATE_FILE, RUN_CONTEXT_FILE] {
+        if output_dir.join(name).is_file() {
+            artifacts.insert(name.to_string());
+        }
+    }
+    for name in &artifacts {
+        ensure!(valid_component(name), "unsafe publication backup path");
+        fs::hard_link(output_dir.join(name), backup_dir.join(name))
+            .with_context(|| format!("failed to hard-link publication backup artifact {name}"))?;
+    }
+    let manifest_path = backup_dir.join(PUBLICATION_BACKUP_MANIFEST);
+    before_manifest(&manifest_path)?;
+    atomic_json(
+        &manifest_path,
+        &PublicationArtifactBackup {
+            schema_version: 1,
+            artifacts: artifacts.into_iter().collect(),
+        },
+    )?;
+    File::open(&backup_dir)?.sync_all()?;
+    Ok(true)
+}
+
+fn restore_publication_artifacts(output_dir: &Path, run_id: &str) -> Result<bool> {
+    let backup_dir = publication_backup_dir(output_dir, run_id)?;
+    let manifest_path = backup_dir.join(PUBLICATION_BACKUP_MANIFEST);
+    if !manifest_path.is_file() {
+        return Ok(false);
+    }
+    let backup: PublicationArtifactBackup = read_json(&manifest_path)?;
+    ensure!(
+        backup.schema_version == 1 && !backup.artifacts.is_empty(),
+        "invalid publication artifact backup"
+    );
+    for (index, name) in backup.artifacts.iter().enumerate() {
+        ensure!(valid_component(name), "unsafe publication restore path");
+        let source = backup_dir.join(name);
+        ensure!(source.is_file(), "publication backup artifact is missing");
+        let temporary = output_dir.join(format!(".publication.restore.{run_id}.{index}.tmp"));
+        if temporary.is_file() {
+            fs::remove_file(&temporary)?;
+        }
+        fs::hard_link(&source, &temporary)
+            .with_context(|| format!("failed to link restored publication artifact {name}"))?;
+        fs::rename(&temporary, output_dir.join(name))?;
+    }
+    File::open(output_dir)?.sync_all()?;
+    Ok(true)
+}
+
+fn remove_publication_artifact_backup(output_dir: &Path, run_id: &str) -> Result<()> {
+    let backup_dir = publication_backup_dir(output_dir, run_id)?;
+    if backup_dir.is_dir() {
+        fs::remove_dir_all(backup_dir)?;
     }
     Ok(())
 }
@@ -3949,6 +4195,25 @@ fn activate_ready_candidates(
     lifecycle_path: &Path,
     run_id: &str,
 ) -> Result<PublicationSelection> {
+    activate_ready_candidates_with(
+        data_dir,
+        output_dir,
+        lifecycle_path,
+        run_id,
+        snapshot_publication_artifacts,
+    )
+}
+
+fn activate_ready_candidates_with<F>(
+    data_dir: &Path,
+    output_dir: &Path,
+    lifecycle_path: &Path,
+    run_id: &str,
+    snapshot_artifacts: F,
+) -> Result<PublicationSelection>
+where
+    F: FnOnce(&Path, &str) -> Result<bool>,
+{
     let candidates = latest_ready_candidates(data_dir, output_dir, lifecycle_path)?;
     let transaction_dir = selection_path(output_dir, run_id)?
         .parent()
@@ -3958,7 +4223,6 @@ fn activate_ready_candidates(
         !transaction_dir.exists(),
         "publication transaction already exists"
     );
-    fs::create_dir_all(transaction_dir.join("backups"))?;
     let mut entries = Vec::new();
     for (ready, candidate_dir) in candidates {
         let candidate_relative = candidate_dir
@@ -3995,6 +4259,16 @@ fn activate_ready_candidates(
             workload_profile: ready.workload_profile,
         });
     }
+    fs::create_dir_all(transaction_dir.join("backups"))?;
+    if let Err(error) = snapshot_artifacts(output_dir, run_id) {
+        fs::remove_dir_all(&transaction_dir).with_context(|| {
+            format!(
+                "failed to remove incomplete publication transaction {}",
+                transaction_dir.display()
+            )
+        })?;
+        return Err(error).context("failed to snapshot the current publication");
+    }
     let mut selection = PublicationSelection {
         schema_version: 1,
         run_id: run_id.to_string(),
@@ -4029,6 +4303,7 @@ fn activate_ready_candidates(
         selection.state = "rolled_back".to_string();
         let journal_result = atomic_json(&path, &selection);
         journal_result?;
+        remove_publication_artifact_backup(output_dir, run_id)?;
         return Err(error).context("failed to activate ready candidates");
     }
     selection.state = "selected".to_string();
@@ -4063,6 +4338,25 @@ pub(crate) fn prepare_ready_publication(
     lifecycle_path: &Path,
     run_id: &str,
 ) -> Result<()> {
+    prepare_ready_publication_with_merge(
+        data_dir,
+        output_dir,
+        lifecycle_path,
+        run_id,
+        crate::merge::merge_outputs,
+    )
+}
+
+fn prepare_ready_publication_with_merge<F>(
+    data_dir: &Path,
+    output_dir: &Path,
+    lifecycle_path: &Path,
+    run_id: &str,
+    merge_outputs: F,
+) -> Result<()>
+where
+    F: FnOnce(&Path, Option<&str>) -> Result<()>,
+{
     let started = Instant::now();
     artifact_receipt::ensure_publication_allowed(output_dir)?;
     if publication_is_immediate_noop(data_dir, output_dir, lifecycle_path)? {
@@ -4094,14 +4388,19 @@ pub(crate) fn prepare_ready_publication(
         .collect::<BTreeMap<_, _>>();
     let result = (|| -> Result<()> {
         begin_selected_run(output_dir, run_id, &snapshots)?;
-        crate::merge::merge_outputs(output_dir, Some(run_id))?;
+        merge_outputs(output_dir, Some(run_id))?;
         validate(data_dir, output_dir, lifecycle_path, run_id)
     })();
     if let Err(error) = result {
         rollback_selection_files(data_dir, output_dir, &selection)?;
+        let restored_publication = restore_publication_artifacts(output_dir, run_id)?;
+        if restored_publication {
+            verify(output_dir, "publication-rollback")?;
+        }
         let mut rolled_back = selection;
         rolled_back.state = "rolled_back".to_string();
         atomic_json(&selection_path(output_dir, run_id)?, &rolled_back)?;
+        remove_publication_artifact_backup(output_dir, run_id)?;
         return Err(error).context("ready-candidate publication preparation failed");
     }
     Ok(())
@@ -4122,6 +4421,13 @@ pub(crate) fn rollback_ready_publication(
         "publication selection is not active"
     );
     rollback_selection_files(data_dir, output_dir, &selection)?;
+    if restore_publication_artifacts(output_dir, run_id)? {
+        verify(output_dir, "publication-rollback")?;
+        selection.state = "rolled_back".to_string();
+        atomic_json(&path, &selection)?;
+        remove_publication_artifact_backup(output_dir, run_id)?;
+        return Ok(());
+    }
     selection.state = "rolled_back".to_string();
     atomic_json(&path, &selection)?;
     begin_selected_run(output_dir, run_id, &BTreeMap::new())?;
@@ -4194,7 +4500,8 @@ pub(crate) fn commit_ready_publication(
         );
     }
     selection.state = "committed".to_string();
-    atomic_json(&path, &selection)
+    atomic_json(&path, &selection)?;
+    remove_publication_artifact_backup(output_dir, run_id)
 }
 
 fn reconcile_generation_as_published(
@@ -4338,6 +4645,7 @@ fn rollback_unpublished_selection(
     // previous publication byte-for-byte. Regenerating it with the current
     // binary is not safe across algorithm or schema upgrades.
     rollback_selection_files(data_dir, output_dir, &selection)?;
+    restore_publication_artifacts(output_dir, run_id)?;
     let previous_publication_is_intact = verify(output_dir, "publication-recovery")
         .and_then(|()| {
             ensure!(
@@ -4364,6 +4672,7 @@ fn rollback_unpublished_selection(
         );
         selection.state = "rolled_back".to_string();
         atomic_json(&path, &selection)?;
+        remove_publication_artifact_backup(output_dir, run_id)?;
         info!(
             transaction_run_id = run_id,
             "restored the authenticated previous publication without regenerating artifacts"
@@ -4375,6 +4684,7 @@ fn rollback_unpublished_selection(
     validate(data_dir, output_dir, lifecycle_path, recovery_run_id)?;
     selection.state = "rolled_back".to_string();
     atomic_json(&path, &selection)?;
+    remove_publication_artifact_backup(output_dir, run_id)?;
     Ok(true)
 }
 
@@ -5879,6 +6189,331 @@ mod tests {
     }
 
     #[test]
+    fn publication_artifact_backup_restores_the_verified_gate_bytes() {
+        let fixture = Fixture::new().expect("backup fixture should initialize");
+        fixture
+            .prepare("backup-baseline")
+            .expect("baseline publication should prepare");
+        validate(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "backup-baseline",
+        )
+        .expect("baseline publication should validate");
+        let run_id = "backup-restore";
+        fs::create_dir_all(
+            selection_path(fixture.output.path(), run_id)
+                .expect("backup selection path should resolve")
+                .parent()
+                .expect("backup test transaction has a parent"),
+        )
+        .expect("backup transaction directory should be created");
+        assert!(
+            snapshot_publication_artifacts(fixture.output.path(), run_id)
+                .expect("verified publication should be backed up")
+        );
+        let gdp = fixture.output.path().join("gdp.parquet");
+        let expected = fs::read(&gdp).expect("baseline GDP should be readable");
+        let replacement = fixture.output.path().join(".gdp.replacement.tmp");
+        fs::write(&replacement, b"corrupt replacement")
+            .expect("corrupt replacement should be written");
+        fs::rename(&replacement, &gdp).expect("GDP should be atomically replaced");
+        assert!(verify(fixture.output.path(), "corrupt-backup-test").is_err());
+        fs::write(
+            fixture
+                .output
+                .path()
+                .join(format!(".publication.restore.{run_id}.0.tmp")),
+            b"abandoned restore",
+        )
+        .expect("abandoned restore temporary should be written");
+        assert!(
+            restore_publication_artifacts(fixture.output.path(), run_id)
+                .expect("publication backup should restore")
+        );
+        assert_eq!(
+            fs::read(&gdp).expect("restored GDP should be readable"),
+            expected
+        );
+        verify(fixture.output.path(), "restored-backup-test")
+            .expect("restored publication should authenticate");
+        remove_publication_artifact_backup(fixture.output.path(), run_id)
+            .expect("publication backup should be removable");
+        assert!(
+            !publication_backup_dir(fixture.output.path(), run_id)
+                .expect("publication backup path should resolve")
+                .exists()
+        );
+
+        let failed_run = "backup-manifest-failure";
+        fs::create_dir_all(
+            selection_path(fixture.output.path(), failed_run)
+                .expect("failed-backup selection path should resolve")
+                .parent()
+                .expect("failed-backup transaction has a parent"),
+        )
+        .expect("failed-backup transaction directory should be created");
+        let failure = snapshot_publication_artifacts_with(
+            fixture.output.path(),
+            failed_run,
+            |manifest_path| {
+                fs::create_dir(manifest_path)?;
+                Ok(())
+            },
+        );
+        assert!(failure.is_err());
+        fs::remove_dir_all(
+            selection_path(fixture.output.path(), failed_run)
+                .expect("failed-backup selection path should resolve")
+                .parent()
+                .expect("failed-backup transaction has a parent"),
+        )
+        .expect("failed-backup transaction should be removable");
+    }
+
+    #[test]
+    fn candidate_merge_contract_validation_is_fail_closed_and_actionable() {
+        let fixture = Fixture::new().expect("merge-contract fixture should initialize");
+        let ready_path = fixture
+            .ready_candidate("contract-errors")
+            .expect("merge-contract candidate should become ready");
+        let candidate_dir = ready_path
+            .parent()
+            .expect("ready receipt should have a candidate directory");
+        let ready: ReadyWikiCandidate =
+            read_json(&ready_path).expect("ready receipt should be readable");
+
+        let mut with_unknown = ready.clone();
+        with_unknown.artifacts.push(PreparedArtifact {
+            path: "unregistered.bin".to_string(),
+            bytes: 0,
+            rows: 0,
+            sha256: String::new(),
+            receipt_identity: String::new(),
+            receipt_sha256: String::new(),
+        });
+        ready_candidate_merge_contracts(candidate_dir, &with_unknown)
+            .expect("unregistered and per-wiki-only artifacts should be ignored");
+
+        let merged_position = ready
+            .artifacts
+            .iter()
+            .position(|artifact| {
+                MetricId::from_artifact_identity(&artifact.path).is_some_and(|metric| {
+                    metric.definition().publication_scope == PublicationScope::MergedAndPerWiki
+                })
+            })
+            .expect("fixture should contain a merged artifact");
+
+        let mut mismatched = ready.clone();
+        mismatched.artifacts[merged_position].sha256 = "0".repeat(64);
+        assert!(ready_candidate_merge_contracts(candidate_dir, &mismatched).is_err());
+
+        let mut duplicated = ready.clone();
+        duplicated
+            .artifacts
+            .push(duplicated.artifacts[merged_position].clone());
+        assert!(ready_candidate_merge_contracts(candidate_dir, &duplicated).is_err());
+
+        atomic_json(&ready_path, &duplicated).expect("duplicate ready receipt should be writable");
+        let reference = ready_candidate_reference(
+            fixture.data.path(),
+            fixture.output.path(),
+            candidate_dir,
+            &duplicated,
+        )
+        .expect("duplicate candidate should still have a structural ready reference");
+        atomic_json(
+            &ready_index_path(fixture.output.path(), "nlwiki"),
+            &ReadyCandidateIndex {
+                schema_version: READY_INDEX_SCHEMA_VERSION,
+                wiki: "nlwiki".to_string(),
+                newest_valid_ready: reference,
+                active_published: None,
+                updated_at_unix: now_unix().expect("test timestamp should resolve"),
+            },
+        )
+        .expect("duplicate candidate index should be writable");
+        let (_site_root, site_dist) =
+            preflight_site_fixture().expect("preflight site fixture should initialize");
+        let report = publication_preflight(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            &site_dist,
+        )
+        .expect("invalid merge contract should produce a preflight report");
+        assert!(!report.eligible);
+        assert!(
+            report
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("candidate merge contract is invalid"))
+        );
+
+        let omitted_metric =
+            MetricId::from_artifact_identity(&ready.artifacts[merged_position].path)
+                .expect("merged artifact should have a metric identity");
+        let mut missing = ready.clone();
+        missing.artifacts.retain(|artifact| {
+            MetricId::from_artifact_identity(&artifact.path) != Some(omitted_metric)
+        });
+        assert!(ready_candidate_merge_contracts(candidate_dir, &missing).is_err());
+
+        let artifact_path = candidate_dir.join(&ready.artifacts[merged_position].path);
+        fs::write(&artifact_path, b"corrupt artifact")
+            .expect("candidate artifact should be corruptible");
+        assert!(ready_candidate_merge_contracts(candidate_dir, &ready).is_err());
+
+        let mut blockers = Vec::new();
+        let mut contracts = BTreeMap::new();
+        assert!(!collect_ready_candidate_merge_contracts(
+            "nlwiki",
+            Err(anyhow::anyhow!("fixture contract failure")),
+            &mut blockers,
+            &mut contracts,
+        ));
+        assert!(contracts.is_empty());
+        assert!(blockers[0].contains("candidate merge contract is invalid"));
+    }
+
+    #[test]
+    fn explicit_publication_rollback_restores_the_artifact_backup() {
+        let fixture = Fixture::new().expect("explicit rollback fixture should initialize");
+        fixture
+            .prepare("rollback-baseline")
+            .expect("baseline publication should prepare");
+        validate(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "rollback-baseline",
+        )
+        .expect("baseline publication should validate");
+        let expected_gate = fs::read(fixture.output.path().join(RECEIPT_FILE))
+            .expect("baseline gate should be readable");
+        fixture
+            .ready_candidate("rollback-candidate")
+            .expect("replacement candidate should become ready");
+        activate_ready_candidates(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "explicit-rollback",
+        )
+        .expect("candidate should activate");
+        let replacement = fixture.output.path().join(".gdp.rollback.tmp");
+        fs::write(&replacement, b"replacement").expect("replacement artifact should be written");
+        fs::rename(&replacement, fixture.output.path().join("gdp.parquet"))
+            .expect("published GDP should be atomically replaced");
+        rollback_ready_publication(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "explicit-rollback",
+        )
+        .expect("explicit rollback should restore the old publication");
+        assert_eq!(
+            fs::read(fixture.output.path().join(RECEIPT_FILE))
+                .expect("restored gate should be readable"),
+            expected_gate
+        );
+
+        let failed = Fixture::new().expect("backup failure fixture should initialize");
+        failed
+            .prepare("failure-baseline")
+            .expect("failure baseline should prepare");
+        validate(
+            failed.data.path(),
+            failed.output.path(),
+            &failed.lifecycle_path,
+            "failure-baseline",
+        )
+        .expect("failure baseline should validate");
+        failed
+            .ready_candidate("failure-candidate")
+            .expect("failure candidate should become ready");
+        let error = activate_ready_candidates_with(
+            failed.data.path(),
+            failed.output.path(),
+            &failed.lifecycle_path,
+            "snapshot-failure",
+            |_, _| anyhow::bail!("injected publication backup failure"),
+        )
+        .expect_err("backup failure must abort activation");
+        assert!(error.to_string().contains("failed to snapshot"));
+        assert!(
+            !selection_path(failed.output.path(), "snapshot-failure")
+                .expect("failed selection path should resolve")
+                .parent()
+                .expect("failed selection has a parent")
+                .exists()
+        );
+
+        let cleanup_failure = Fixture::new().expect("cleanup failure fixture should initialize");
+        cleanup_failure
+            .ready_candidate("cleanup-failure-candidate")
+            .expect("cleanup failure candidate should become ready");
+        let transaction_dir = selection_path(cleanup_failure.output.path(), "cleanup-failure")
+            .expect("cleanup-failure selection should resolve")
+            .parent()
+            .expect("cleanup-failure selection has a parent")
+            .to_path_buf();
+        let error = activate_ready_candidates_with(
+            cleanup_failure.data.path(),
+            cleanup_failure.output.path(),
+            &cleanup_failure.lifecycle_path,
+            "cleanup-failure",
+            |_, _| {
+                fs::remove_dir_all(&transaction_dir)?;
+                fs::write(&transaction_dir, b"cleanup blocker")?;
+                anyhow::bail!("injected publication backup failure")
+            },
+        )
+        .expect_err("transaction cleanup failure must propagate");
+        assert!(error.to_string().contains("failed to remove incomplete"));
+        fs::remove_file(transaction_dir).expect("cleanup blocker should be removable");
+
+        let prepare_failure = Fixture::new().expect("prepare failure fixture should initialize");
+        prepare_failure
+            .prepare("prepare-failure-baseline")
+            .expect("prepare failure baseline should prepare");
+        validate(
+            prepare_failure.data.path(),
+            prepare_failure.output.path(),
+            &prepare_failure.lifecycle_path,
+            "prepare-failure-baseline",
+        )
+        .expect("prepare failure baseline should validate");
+        let baseline_gate = fs::read(prepare_failure.output.path().join(RECEIPT_FILE))
+            .expect("prepare failure baseline gate should be readable");
+        prepare_failure
+            .ready_candidate("prepare-failure-candidate")
+            .expect("prepare failure candidate should become ready");
+        let output_path = prepare_failure.output.path().to_path_buf();
+        let error = prepare_ready_publication_with_merge(
+            prepare_failure.data.path(),
+            prepare_failure.output.path(),
+            &prepare_failure.lifecycle_path,
+            "prepare-failure",
+            move |_, _| {
+                let replacement = output_path.join(".gdp.prepare-failure.tmp");
+                fs::write(&replacement, b"partial merge")?;
+                fs::rename(&replacement, output_path.join("gdp.parquet"))?;
+                anyhow::bail!("injected merge failure")
+            },
+        )
+        .expect_err("merge failure must roll back the publication");
+        assert!(error.to_string().contains("publication preparation failed"));
+        assert_eq!(
+            fs::read(prepare_failure.output.path().join(RECEIPT_FILE))
+                .expect("prepare failure gate should be restored"),
+            baseline_gate
+        );
+    }
+
+    #[test]
     fn publication_preflight_reports_changed_families_without_selecting_candidates() -> Result<()> {
         let fixture = Fixture::new()?;
         fixture.prepare("baseline")?;
@@ -5924,6 +6559,61 @@ mod tests {
         .expect("eligible preflight should write its report");
         assert!(report_path.is_file());
         Ok(())
+    }
+
+    #[test]
+    fn publication_preflight_deduplicates_cross_wiki_merge_contract_blockers() {
+        let contract = CandidateMergeContract {
+            parquet_schema: vec![artifact_receipt::FieldIdentity {
+                name: "wiki".to_string(),
+                data_type: "String".to_string(),
+            }],
+            algorithm_version: "monthly-v1".to_string(),
+        };
+        let incompatible_contract = CandidateMergeContract {
+            algorithm_version: "monthly-v2".to_string(),
+            ..contract.clone()
+        };
+        let mut contracts = BTreeMap::new();
+        let mut incompatible = BTreeSet::new();
+        let mut blockers = Vec::new();
+        record_candidate_merge_contract(
+            &mut contracts,
+            &mut incompatible,
+            &mut blockers,
+            "afwiki",
+            MetricId::Gdp,
+            contract.clone(),
+        );
+        record_candidate_merge_contract(
+            &mut contracts,
+            &mut incompatible,
+            &mut blockers,
+            "arwiki",
+            MetricId::Gdp,
+            contract,
+        );
+        assert!(blockers.is_empty());
+        record_candidate_merge_contract(
+            &mut contracts,
+            &mut incompatible,
+            &mut blockers,
+            "frwiki",
+            MetricId::Gdp,
+            incompatible_contract.clone(),
+        );
+        record_candidate_merge_contract(
+            &mut contracts,
+            &mut incompatible,
+            &mut blockers,
+            "nlwiki",
+            MetricId::Gdp,
+            incompatible_contract,
+        );
+        assert_eq!(blockers.len(), 1);
+        assert!(blockers[0].contains("incompatible merge schemas or algorithm versions"));
+        assert!(blockers[0].contains("afwiki"));
+        assert!(blockers[0].contains("frwiki"));
     }
 
     #[test]
@@ -9104,6 +9794,7 @@ mod tests {
         ] {
             let fixture = Fixture::new()?;
             let (_site_root, dist) = fixture.published_site("baseline")?;
+            let gate_before_fault = fs::read(fixture.output.path().join(RECEIPT_FILE))?;
             fixture.ready_candidate("candidate")?;
             let run_id = format!("fault-{fault}");
             if fault == "after_active_symlink_switch" {
@@ -9135,11 +9826,11 @@ mod tests {
                     &run_id,
                 )
                 .expect("merge fault fixture should activate");
-                fs::write(
-                    fixture.output.path().join("gdp.parquet"),
-                    "partial merge output",
-                )
-                .expect("partial merge fixture should write");
+                let partial = fixture.output.path().join(".gdp.partial-merge.tmp");
+                fs::write(&partial, "partial merge output")
+                    .expect("partial merge fixture should write");
+                fs::rename(&partial, fixture.output.path().join("gdp.parquet"))
+                    .expect("partial merge fixture should replace the artifact atomically");
             } else {
                 prepare_ready_publication(
                     fixture.data.path(),
@@ -9160,11 +9851,6 @@ mod tests {
                 audit.transactions[0].classification,
                 PublicationRecoveryClassification::NeedsRollback
             );
-            let intact_previous_publication = matches!(
-                fault,
-                "after_active_symlink_switch" | "after_snapshot_pointer_switch"
-            );
-            let gate_before_recovery = fs::read(fixture.output.path().join(RECEIPT_FILE))?;
             let recovered = recover_publication_transactions(
                 fixture.data.path(),
                 fixture.output.path(),
@@ -9175,17 +9861,15 @@ mod tests {
             )
             .expect("pre-site transaction should recover");
             assert!(recovered.repaired);
-            assert_eq!(
-                recovered.site_rebuild_required, !intact_previous_publication,
-                "an intact previous publication must not be regenerated for {fault}"
+            assert!(
+                !recovered.site_rebuild_required,
+                "a transaction backup must restore the previous publication for {fault}"
             );
-            if intact_previous_publication {
-                assert_eq!(
-                    fs::read(fixture.output.path().join(RECEIPT_FILE))?,
-                    gate_before_recovery,
-                    "an intact previous gate must remain byte-identical for {fault}"
-                );
-            }
+            assert_eq!(
+                fs::read(fixture.output.path().join(RECEIPT_FILE))?,
+                gate_before_fault,
+                "the previous gate must remain byte-identical for {fault}"
+            );
             assert_eq!(
                 recovered.transactions[0].classification,
                 PublicationRecoveryClassification::RolledBack
