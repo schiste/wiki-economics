@@ -10,6 +10,7 @@ const {
   applyLifecycleMutation,
   immutableAuditEvent,
   mutateRegistry,
+  qualificationCandidates,
   readAuditTrail,
   registryRevision,
 } = require("./admin-lifecycle.cjs");
@@ -107,9 +108,10 @@ test("lifecycle writes use optimistic revisions and immutable authenticated audi
   });
   assert.equal(applied.current.refresh, "paused");
   assert.notEqual(applied.afterRevision, expectedRevision);
-  assert.equal(fs.readdirSync(auditDir).length, 1);
+  assert.equal(fs.readdirSync(auditDir).length, 2);
   const trail = readAuditTrail(auditDir);
   assert.equal(trail.invalid.length, 0);
+  assert.deepEqual(new Set(trail.events.map((event) => event.phase)), new Set(["prepared", "applied"]));
   assert.equal(trail.events[0].operator, "Alice");
   assert.equal(trail.events[0].beforeRevision, expectedRevision);
   assert.equal(trail.events[0].afterRevision, applied.afterRevision);
@@ -122,15 +124,43 @@ test("lifecycle writes use optimistic revisions and immutable authenticated audi
     requestId: "lifecycle-resume-stale",
     expectedRevision,
   }), /changed since/);
-  assert.equal(fs.readdirSync(auditDir).length, 1, "rejected mutations must not claim they were applied");
+  assert.equal(fs.readdirSync(auditDir).length, 2, "rejected mutations must not add audit evidence");
 
-  const file = path.join(auditDir, fs.readdirSync(auditDir)[0]);
+  const file = path.join(auditDir, fs.readdirSync(auditDir).find((name) => name.includes("-applied-")));
   const tampered = JSON.parse(fs.readFileSync(file, "utf8"));
   tampered.operator = "Mallory";
   fs.writeFileSync(file, JSON.stringify(tampered));
   const invalid = readAuditTrail(auditDir);
-  assert.equal(invalid.events.length, 0);
+  assert.equal(invalid.events.length, 1);
   assert.equal(invalid.invalid.length, 1);
+});
+
+test("qualification discovery validates identities and keeps malformed receipts visible", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-qualifications-"));
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const validDir = path.join(root, "_qualifications", "dewiki", "2026-08", "qualified-1");
+  const invalidDir = path.join(root, "_qualifications", "dewiki", "2026-07", "broken-1");
+  fs.mkdirSync(validDir, {recursive: true});
+  fs.mkdirSync(invalidDir, {recursive: true});
+  fs.writeFileSync(path.join(validDir, "qualification.json"), JSON.stringify({
+    schema_version: 2,
+    publication_eligible: false,
+    wiki: "dewiki",
+    snapshot: "2026-08",
+    run_id: "qualified-1",
+    qualified_at_unix: 1_788_000_000,
+    cutoff_date: "2026-08-31",
+    artifacts: [{path: "gdp.parquet"}],
+    workload_profile: {resource_class: "medium_large"},
+  }));
+  fs.writeFileSync(path.join(invalidDir, "qualification.json"), "{truncated");
+
+  const candidates = qualificationCandidates(root);
+  assert.equal(candidates.dewiki.length, 2);
+  assert.equal(candidates.dewiki[0].runId, "qualified-1");
+  assert.equal(candidates.dewiki[0].structurallyValid, true);
+  assert.match(candidates.dewiki[0].receiptSha256, /^[a-f0-9]{64}$/);
+  assert.equal(candidates.dewiki[1].structurallyValid, false);
 });
 
 test("immutable audit writes are idempotent and never overwrite another payload", (t) => {
@@ -150,4 +180,23 @@ test("immutable audit writes are idempotent and never overwrite another payload"
   assert.equal(fs.readdirSync(root).length, 1);
   immutableAuditEvent(root, {...event, operator: "Bob"});
   assert.equal(fs.readdirSync(root).length, 2);
+});
+
+test("a lifecycle registry is never changed when immutable audit intent cannot commit", (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-audit-failure-"));
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const lifecyclePath = path.join(root, "wiki-lifecycle.json");
+  const auditBlocker = path.join(root, "audit-blocker");
+  const initial = registry();
+  fs.writeFileSync(lifecyclePath, JSON.stringify(initial));
+  fs.writeFileSync(auditBlocker, "not a directory");
+  assert.throws(() => applyLifecycleMutation({
+    lifecyclePath,
+    auditDir: auditBlocker,
+    mutation: {action: "pause", wiki: "nlwiki"},
+    operator: "Alice",
+    requestId: "lifecycle-pause-audit-failure",
+    expectedRevision: registryRevision(initial),
+  }));
+  assert.deepEqual(JSON.parse(fs.readFileSync(lifecyclePath, "utf8")), initial);
 });

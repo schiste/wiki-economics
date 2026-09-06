@@ -5,6 +5,12 @@ const fs = require("node:fs");
 const path = require("node:path");
 const {spawn} = require("node:child_process");
 const {summarizeOperationLog} = require("../../site/admin-operation-status.cjs");
+const {
+  applyLifecycleMutation,
+  immutableAuditEvent,
+  registryRevision,
+  readLifecycle,
+} = require("../../site/admin-lifecycle.cjs");
 
 const ROOT = path.resolve(__dirname, "../..");
 const DATA_DIR = path.resolve(process.env.WIKI_ECON_DATA_DIR || path.join(ROOT, "data"));
@@ -17,6 +23,7 @@ const OPERATION_DIR = path.resolve(
   process.env.WIKI_ECON_ADMIN_OPERATION_DIR || path.join(OUTPUT_DIR, "_admin", "operations"),
 );
 const BIN = process.env.WIKI_ECON_BIN || path.join(ROOT, "target", "release", "wiki-econ");
+const LIFECYCLE_AUDIT_DIR = path.join(OUTPUT_DIR, "_admin", "lifecycle-audit");
 const LOG_TAIL_BYTES = 128 * 1024;
 const STALE_OPERATION_MS = Number.parseInt(process.env.WIKI_ECON_ADMIN_OPERATION_STALE_SECS || "600", 10) * 1_000;
 const configuredUpstreamRetrySecs = Number.parseInt(
@@ -72,6 +79,31 @@ function commandFor(request) {
       return {program: BIN, args: [...common, "prepare-wiki", wiki, ...version, "--lifecycle", LIFECYCLE_PATH]};
     case "qualify":
       return {program: BIN, args: [...common, "qualify-wiki", wiki, ...version, "--lifecycle", LIFECYCLE_PATH]};
+    case "promote-qualification":
+      return {program: BIN, args: [
+        ...common,
+        "promote-qualification", wiki,
+        ...version,
+        "--qualification-run-id", request.qualificationRunId,
+        "--lifecycle", LIFECYCLE_PATH,
+      ]};
+    case "retire-candidate":
+      return {program: BIN, args: [
+        "--data-dir", DATA_DIR,
+        "--output-dir", OUTPUT_DIR,
+        "retire-candidate", wiki,
+        ...version,
+        "--candidate-run-id", request.candidateRunId,
+        "--operator", request.requestedBy,
+      ]};
+    case "rebuild-candidate":
+      return {program: BIN, args: [
+        ...common,
+        "prepare-wiki", wiki,
+        ...version,
+        "--rebuild",
+        "--lifecycle", LIFECYCLE_PATH,
+      ]};
     case "fetch":
       return {program: BIN, args: [...common, "fetch", wiki, ...version]};
     case "ingest":
@@ -128,6 +160,24 @@ function validateRequest(request) {
   }
   if (request.action === "quarantine-retry" && !/^[a-f0-9]{64}$/.test(request.taskId || "")) {
     throw new Error("Quarantine retry requires an exact fleet task identity");
+  }
+  if (request.action === "promote-qualification") {
+    if (!request.version || !/^[a-zA-Z0-9_.-]+$/.test(request.qualificationRunId || "")) {
+      throw new Error("Qualification promotion requires an exact snapshot and qualification run ID");
+    }
+    if (request.lifecycleMutation?.action !== "promote"
+      || request.lifecycleMutation?.wiki !== request.wiki
+      || !/^[a-f0-9]{64}$/.test(request.lifecycleRevision || "")) {
+      throw new Error("Qualification promotion has no authenticated lifecycle transition");
+    }
+  }
+  if (request.action === "retire-candidate"
+    && (!request.version || !/^[a-zA-Z0-9_.-]+$/.test(request.candidateRunId || "")
+      || typeof request.requestedBy !== "string" || !request.requestedBy)) {
+    throw new Error("Candidate retirement requires exact candidate and operator identities");
+  }
+  if (request.action === "rebuild-candidate" && !request.version) {
+    throw new Error("Candidate rebuild requires an exact snapshot");
   }
   commandFor(request);
   return request;
@@ -302,16 +352,55 @@ async function executeClaim(claim) {
   clearInterval(heartbeat);
   const finishedAt = new Date().toISOString();
   const cancelled = state.cancelRequested && result.signal === "SIGTERM";
+  let effectiveCode = cancelled ? 130 : result.code;
+  let effectiveError = result.error?.message || null;
+  let lifecycleResult = null;
+  if (effectiveCode === 0 && request.lifecycleMutation) {
+    try {
+      lifecycleResult = applyLifecycleMutation({
+        lifecyclePath: LIFECYCLE_PATH,
+        auditDir: LIFECYCLE_AUDIT_DIR,
+        mutation: request.lifecycleMutation,
+        operator: request.requestedBy,
+        requestId: request.requestId,
+        expectedRevision: request.lifecycleRevision,
+      });
+      fs.appendFileSync(logPath, "\n[lifecycle transition committed]\n", "utf8");
+    } catch (error) {
+      effectiveCode = 1;
+      effectiveError = `Candidate operation succeeded but lifecycle transition failed: ${error.message}`;
+      fs.appendFileSync(logPath, `\n[lifecycle transition failed: ${error.message}]\n`, "utf8");
+    }
+  }
+  if (new Set(["promote-qualification", "retire-candidate", "rebuild-candidate"]).has(request.action)) {
+    try {
+      immutableAuditEvent(LIFECYCLE_AUDIT_DIR, {
+        requestId: request.requestId,
+        phase: effectiveCode === 0 ? "completed" : "failed",
+        action: request.action,
+        wiki: request.wiki,
+        operator: request.requestedBy,
+        recordedAt: finishedAt,
+        outcome: effectiveCode === 0 ? "succeeded" : "failed",
+        exitCode: effectiveCode,
+        lifecycleRevision: lifecycleResult?.afterRevision || registryRevision(readLifecycle(LIFECYCLE_PATH)),
+      });
+    } catch (error) {
+      effectiveCode = 1;
+      effectiveError = `Immutable operator audit failed: ${error.message}`;
+      fs.appendFileSync(logPath, `\n[immutable operator audit failed: ${error.message}]\n`, "utf8");
+    }
+  }
   const operationSummary = summarizeOperationLog(state, logTail(logPath));
-  const waitingUpstream = result.code === 75
+  const waitingUpstream = effectiveCode === 75
     || operationSummary.remediationCode === "upstream_logging_waiting";
   const completed = {
     ...state,
     ...operationSummary,
-    state: cancelled ? "cancelled" : result.code === 0 ? "succeeded" : waitingUpstream ? "waiting_upstream" : "failed",
-    exitCode: cancelled ? 130 : result.code,
+    state: cancelled ? "cancelled" : effectiveCode === 0 ? "succeeded" : waitingUpstream ? "waiting_upstream" : "failed",
+    exitCode: effectiveCode,
     signal: result.signal,
-    error: result.error?.message || (result.code === 0 ? null : operationSummary.errorSummary),
+    error: effectiveError || (effectiveCode === 0 ? null : operationSummary.errorSummary),
     cancelRequested: Boolean(state.cancelRequested),
     finishedAt,
     heartbeatAt: finishedAt,

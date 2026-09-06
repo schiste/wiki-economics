@@ -29,6 +29,13 @@ const {
 const {evaluateFreshness} = require("./freshness.cjs");
 const {stripAnsi, summarizeOperationLog} = require("./admin-operation-status.cjs");
 const {buildOperationalTruth} = require("./admin-operational-truth.cjs");
+const {
+  applyLifecycleMutation,
+  immutableAuditEvent,
+  qualificationCandidates,
+  readAuditTrail,
+  registryRevision,
+} = require("./admin-lifecycle.cjs");
 
 const ROOT = path.resolve(__dirname, "..");
 const RUNTIME_ENV = process.env.WIKI_ECON_ENV || "local";
@@ -47,7 +54,7 @@ const FLEET_QUEUE_DIR = process.env.WIKI_ECON_FLEET_QUEUE_DIR
 const ADMIN_STATE_DIR = path.join(OUTPUT_DIR, "_admin");
 const ADMIN_CURRENT_JOB_PATH = path.join(ADMIN_STATE_DIR, "current-job.json");
 const ADMIN_JOB_HISTORY_PATH = path.join(ADMIN_STATE_DIR, "job-history.json");
-const ADMIN_LIFECYCLE_HISTORY_PATH = path.join(ADMIN_STATE_DIR, "lifecycle-history.json");
+const ADMIN_LIFECYCLE_AUDIT_DIR = path.join(ADMIN_STATE_DIR, "lifecycle-audit");
 const ADMIN_OPERATION_DIR = process.env.WIKI_ECON_ADMIN_OPERATION_DIR
   ? resolveConfiguredPath("WIKI_ECON_ADMIN_OPERATION_DIR", path.join("output", "_admin", "operations"))
   : path.join(ADMIN_STATE_DIR, "operations");
@@ -765,99 +772,28 @@ function reloadWikiLifecycle() {
   return WIKI_LIFECYCLE;
 }
 
-function defaultRetentionPolicy() {
-  return {
-    source_recoverability: "redownloadable",
-    history_input: "purge_after_ready",
-    patrol_source: "purge_after_ready",
-    computed_rollback_generations: 1,
-  };
-}
-
-function registrationLifecycle(mode, resourceClass, operator) {
-  const provenance = `toolforge-admin:${operator || "local-operator"}`;
-  const base = {
-    provenance,
-    retention: defaultRetentionPolicy(),
-  };
-  if (mode === "qualification") {
-    return {
-      ...base,
-      publication: "hidden",
-      refresh: "qualification",
-      fleet_resource_class: resourceClass || "medium_large",
-    };
-  }
-  if (mode === "manual") {
-    return {
-      ...base,
-      publication: "published",
-      refresh: "manual",
-      fleet_resource_class: resourceClass || "medium_large",
-    };
-  }
-  if (mode === "scheduled") {
-    return {
-      ...base,
-      publication: "published",
-      refresh: "scheduled",
-      freshness_sla_days: 10,
-      fleet_resource_class: resourceClass || "medium_large",
-    };
-  }
-  throw new Error(`Unsupported lifecycle mode ${mode}`);
-}
-
-function updateExplicitDatasetCoverage(registry, wiki, published) {
-  for (const contract of Object.values(registry.publication_contract?.datasets || {})) {
-    if (!Array.isArray(contract.wikis)) continue;
-    const covered = new Set(contract.wikis);
-    if (published) covered.add(wiki);
-    else covered.delete(wiki);
-    contract.wikis = [...covered].sort();
-  }
-}
-
-function recordLifecycleChange(change) {
-  const current = readJsonFile(ADMIN_LIFECYCLE_HISTORY_PATH);
-  const changes = current?.schemaVersion === 1 && Array.isArray(current.changes)
-    ? current.changes
-    : [];
-  atomicWriteJson(ADMIN_LIFECYCLE_HISTORY_PATH, {
-    schemaVersion: 1,
-    generatedAt: new Date().toISOString(),
-    changes: [change, ...changes].slice(0, ADMIN_JOB_HISTORY_LIMIT),
-  });
-}
-
-function registerWikiLifecycle({ wiki, mode, resourceClass, operator }) {
+function registerWikiLifecycle({ wiki, mode, resourceClass, operator, expectedRevision = null, requestId = null }) {
   const supported = new Set(loadSupportedWikipedias());
   if (!supported.has(wiki)) throw new Error(`${wiki} is not a supported Wikimedia history project`);
-  if (!new Set(["qualification", "manual", "scheduled"]).has(mode)) {
-    throw new Error("Lifecycle mode must be qualification, manual, or scheduled");
-  }
-  if (!new Set(["small", "medium_large", "isolated"]).has(resourceClass)) {
-    throw new Error("Resource class must be small, medium_large, or isolated");
-  }
-
-  const registry = structuredClone(reloadWikiLifecycle());
-  const previous = registry.wikis[wiki] ? structuredClone(registry.wikis[wiki]) : null;
-  registry.wikis[wiki] = registrationLifecycle(mode, resourceClass, operator);
-  updateExplicitDatasetCoverage(registry, wiki, mode !== "qualification");
-  validateWikiLifecycle(registry, WIKI_LIFECYCLE_PATH);
-  atomicWriteJson(WIKI_LIFECYCLE_PATH, registry);
-  reloadWikiLifecycle();
   const updatedAt = new Date().toISOString();
-  recordLifecycleChange({
-    wiki,
-    mode,
-    resourceClass,
-    operator: operator || "local-operator",
-    updatedAt,
-    previous,
-    current: registry.wikis[wiki],
+  const result = applyLifecycleMutation({
+    lifecyclePath: WIKI_LIFECYCLE_PATH,
+    auditDir: ADMIN_LIFECYCLE_AUDIT_DIR,
+    mutation: {action: "register", wiki, mode, resourceClass},
+    operator,
+    requestId: requestId || adminRunId("register", wiki),
+    expectedRevision,
+    recordedAt: updatedAt,
   });
-  return { wiki, lifecycle: registry.wikis[wiki], previous, updatedAt };
+  reloadWikiLifecycle();
+  return {
+    wiki,
+    lifecycle: result.current,
+    previous: result.previous,
+    lifecycleRevision: result.afterRevision,
+    auditEvent: result.audit,
+    updatedAt,
+  };
 }
 
 function operationDirectories() {
@@ -987,7 +923,18 @@ function readAdminOperations() {
   };
 }
 
-function queueAdminOperation({ action, wiki, version, taskId = null, requestedBy, acknowledgeBlockedRetry = false }) {
+function queueAdminOperation({
+  action,
+  wiki,
+  version,
+  taskId = null,
+  qualificationRunId = null,
+  candidateRunId = null,
+  lifecycleMutation = null,
+  lifecycleRevision = null,
+  requestedBy,
+  acknowledgeBlockedRetry = false,
+}) {
   const directories = operationDirectories();
   const active = [
     ...operationEntries(directories.running, Number.MAX_SAFE_INTEGER),
@@ -1034,6 +981,10 @@ function queueAdminOperation({ action, wiki, version, taskId = null, requestedBy
     wiki: wiki || null,
     version: version || null,
     taskId: taskId || null,
+    qualificationRunId: qualificationRunId || null,
+    candidateRunId: candidateRunId || null,
+    lifecycleMutation,
+    lifecycleRevision,
     lifecyclePath: WIKI_LIFECYCLE_PATH,
     requestedBy: requestedBy || "local-operator",
     requestedAt,
@@ -1733,6 +1684,8 @@ function wikiLifecycleStatus(now = Date.now()) {
 
 function buildStatusPayload(req, session) {
   reloadWikiLifecycle();
+  const lifecycleRevision = registryRevision(WIKI_LIFECYCLE);
+  const lifecycleAudit = readAuditTrail(ADMIN_LIFECYCLE_AUDIT_DIR, ADMIN_JOB_HISTORY_LIMIT);
   const progress = getProgress();
   const scheduledRefresh = readRefreshStatus();
   const adminOperations = readAdminOperations();
@@ -1796,6 +1749,9 @@ function buildStatusPayload(req, session) {
     refreshWikis: REFRESH_WIKIS,
     publishedWikis: PUBLISHED_WIKIS,
     wikiLifecycle: WIKI_LIFECYCLE,
+    lifecycleRevision,
+    lifecycleAudit,
+    qualifications: qualificationCandidates(OUTPUT_DIR),
     wikiStates: wikiLifecycleStatus(),
     runner: runnerInfo(),
     scheduledRefresh,
@@ -1928,6 +1884,50 @@ async function handleRequest(req, res) {
       }
       const operator = session?.username || "local-operator";
 
+      if (action === "update-lifecycle") {
+        const operations = readAdminOperations();
+        if (currentJob || operations.running.length > 0 || operations.queued.length > 0) {
+          writeJson(res, 409, {error: "Lifecycle changes are blocked while operator work is active or queued"});
+          return;
+        }
+        if (!wiki || !WIKI_LIFECYCLE.wikis[wiki]) {
+          writeJson(res, 400, {error: "update-lifecycle requires a registered wiki"});
+          return;
+        }
+        const lifecycleAction = String(params.operation || "");
+        if (!new Set(["pause", "resume", "configure"]).has(lifecycleAction)) {
+          writeJson(res, 400, {error: "Lifecycle operation must be pause, resume, or configure"});
+          return;
+        }
+        try {
+          const result = applyLifecycleMutation({
+            lifecyclePath: WIKI_LIFECYCLE_PATH,
+            auditDir: ADMIN_LIFECYCLE_AUDIT_DIR,
+            mutation: {
+              action: lifecycleAction,
+              wiki,
+              ...(params.refresh ? {refresh: String(params.refresh)} : {}),
+              ...(params.resourceClass ? {resourceClass: String(params.resourceClass)} : {}),
+              ...(params.freshnessSlaDays != null ? {freshnessSlaDays: params.freshnessSlaDays} : {}),
+            },
+            operator,
+            requestId: adminRunId(`lifecycle-${lifecycleAction}`, wiki),
+            expectedRevision: String(params.lifecycleRevision || "") || null,
+          });
+          reloadWikiLifecycle();
+          writeJson(res, 200, {
+            updated: true,
+            wiki,
+            lifecycle: result.current,
+            lifecycleRevision: result.afterRevision,
+            auditEvent: result.audit,
+          });
+        } catch (error) {
+          writeJson(res, 409, {error: error.message});
+        }
+        return;
+      }
+
       if (action === "register-wiki") {
         const operations = readAdminOperations();
         if (currentJob || operations.running.length > 0) {
@@ -1944,6 +1944,7 @@ async function handleRequest(req, res) {
             mode: String(params.mode || "qualification"),
             resourceClass: String(params.resourceClass || "medium_large"),
             operator,
+            expectedRevision: String(params.lifecycleRevision || "") || null,
           });
           writeJson(res, 201, {registered: true, ...registration});
         } catch (error) {
@@ -1969,6 +1970,7 @@ async function handleRequest(req, res) {
             mode,
             resourceClass: String(params.resourceClass || "medium_large"),
             operator,
+            expectedRevision: String(params.lifecycleRevision || "") || null,
           });
           const nextAction = mode === "qualification" ? "qualify" : "run";
           if (ADMIN_EXECUTION_MODE === "queue") {
@@ -2037,6 +2039,7 @@ async function handleRequest(req, res) {
       const wikiActions = new Set([
         "fetch", "ingest", "compute", "run", "qualify",
         "patrol-fetch", "patrol-compute", "patrol-rebuild", "quarantine-retry",
+        "promote-qualification", "retire-candidate", "rebuild-candidate",
       ]);
       if (wikiActions.has(action) && wiki && !WIKI_LIFECYCLE.wikis[wiki]) {
         writeJson(res, 409, {
@@ -2074,6 +2077,87 @@ async function handleRequest(req, res) {
         return;
       }
 
+      let requestedLifecycleMutation = null;
+      if (action === "promote-qualification") {
+        const qualificationRunId = String(params.qualificationRunId || "");
+        const qualification = (qualificationCandidates(OUTPUT_DIR)[wiki] || []).find((entry) => (
+          entry.snapshot === version && entry.runId === qualificationRunId
+        ));
+        if (!qualification || !qualification.structurallyValid) {
+          writeJson(res, 409, {error: "Promotion requires one exact structurally valid qualification receipt"});
+          return;
+        }
+        const lifecycle = WIKI_LIFECYCLE.wikis[wiki];
+        if (lifecycle?.publication !== "hidden" || lifecycle?.refresh !== "qualification") {
+          writeJson(res, 409, {error: `${wiki} must still be hidden/qualification before promotion`});
+          return;
+        }
+        const expectedRevision = String(params.lifecycleRevision || "");
+        if (!/^[a-f0-9]{64}$/.test(expectedRevision)
+          || expectedRevision !== registryRevision(WIKI_LIFECYCLE)) {
+          writeJson(res, 409, {error: "Lifecycle registry changed since this page was loaded; refresh before promoting"});
+          return;
+        }
+        requestedLifecycleMutation = {
+          action: "promote",
+          wiki,
+          refresh: String(params.refresh || "manual"),
+          resourceClass: String(params.resourceClass || lifecycle.fleet_resource_class || "medium_large"),
+          ...(params.freshnessSlaDays != null ? {freshnessSlaDays: params.freshnessSlaDays} : {}),
+        };
+        immutableAuditEvent(ADMIN_LIFECYCLE_AUDIT_DIR, {
+          requestId: runId,
+          phase: "requested",
+          action,
+          wiki,
+          operator,
+          recordedAt: new Date().toISOString(),
+          lifecycleRevision: expectedRevision,
+          qualification: {
+            snapshot: qualification.snapshot,
+            runId: qualification.runId,
+            receiptSha256: qualification.receiptSha256,
+          },
+          requestedLifecycle: requestedLifecycleMutation,
+        });
+      }
+
+      if (action === "retire-candidate") {
+        const candidateRunId = String(params.candidateRunId || "");
+        if (!version || !/^[a-zA-Z0-9_.-]+$/.test(candidateRunId)) {
+          writeJson(res, 400, {error: "Candidate retirement requires an exact snapshot and candidate run ID"});
+          return;
+        }
+        immutableAuditEvent(ADMIN_LIFECYCLE_AUDIT_DIR, {
+          requestId: runId,
+          phase: "requested",
+          action,
+          wiki,
+          operator,
+          recordedAt: new Date().toISOString(),
+          candidate: {snapshot: version, runId: candidateRunId},
+        });
+      }
+
+      if (action === "rebuild-candidate") {
+        const lifecycle = WIKI_LIFECYCLE.wikis[wiki];
+        if (!version || lifecycle?.publication !== "published"
+          || !new Set(["manual", "scheduled"]).has(lifecycle?.refresh)) {
+          writeJson(res, 409, {error: "Candidate rebuild requires an exact snapshot for a managed published wiki"});
+          return;
+        }
+        immutableAuditEvent(ADMIN_LIFECYCLE_AUDIT_DIR, {
+          requestId: runId,
+          phase: "requested",
+          action,
+          wiki,
+          operator,
+          recordedAt: new Date().toISOString(),
+          candidate: {snapshot: version, previousRunId: params.candidateRunId || null},
+          policy: "new immutable generation; existing candidate remains unchanged",
+        });
+      }
+
       if (ADMIN_EXECUTION_MODE === "queue" && (wikiActions.has(action) || globalActions.has(action))) {
         try {
           const request = queueAdminOperation({
@@ -2081,6 +2165,10 @@ async function handleRequest(req, res) {
             wiki,
             version,
             taskId: params.taskId || null,
+            qualificationRunId: params.qualificationRunId || null,
+            candidateRunId: params.candidateRunId || null,
+            lifecycleMutation: requestedLifecycleMutation,
+            lifecycleRevision: params.lifecycleRevision || null,
             requestedBy: operator,
             acknowledgeBlockedRetry: params.acknowledgeBlockedRetry === true,
           });
@@ -2174,6 +2262,59 @@ async function handleRequest(req, res) {
                   "--lifecycle", WIKI_LIFECYCLE_PATH,
                 ],
                 label: `${resolveRunner().label} --data-dir ${DATA_DIR} --output-dir ${OUTPUT_DIR} --run-id ${runId} qualify-wiki ${wiki}${version ? ` --version ${version}` : ""} --lifecycle ${WIKI_LIFECYCLE_PATH}`,
+              }
+            : null;
+          break;
+        case "promote-qualification":
+          commandSpec = wiki
+            ? {
+                program: resolveRunner().program,
+                args: [
+                  ...resolveRunner().args,
+                  "--data-dir", DATA_DIR,
+                  "--output-dir", OUTPUT_DIR,
+                  "--run-id", runId,
+                  "promote-qualification", wiki,
+                  "--version", version,
+                  "--qualification-run-id", params.qualificationRunId,
+                  "--lifecycle", WIKI_LIFECYCLE_PATH,
+                ],
+                label: `${resolveRunner().label} promote-qualification ${wiki} --version ${version} --qualification-run-id ${params.qualificationRunId}`,
+              }
+            : null;
+          break;
+        case "retire-candidate":
+          commandSpec = wiki
+            ? {
+                program: resolveRunner().program,
+                args: [
+                  ...resolveRunner().args,
+                  "--data-dir", DATA_DIR,
+                  "--output-dir", OUTPUT_DIR,
+                  "retire-candidate", wiki,
+                  "--version", version,
+                  "--candidate-run-id", params.candidateRunId,
+                  "--operator", operator,
+                ],
+                label: `${resolveRunner().label} retire-candidate ${wiki} --version ${version} --candidate-run-id ${params.candidateRunId}`,
+              }
+            : null;
+          break;
+        case "rebuild-candidate":
+          commandSpec = wiki
+            ? {
+                program: resolveRunner().program,
+                args: [
+                  ...resolveRunner().args,
+                  "--data-dir", DATA_DIR,
+                  "--output-dir", OUTPUT_DIR,
+                  "--run-id", runId,
+                  "prepare-wiki", wiki,
+                  "--version", version,
+                  "--rebuild",
+                  "--lifecycle", WIKI_LIFECYCLE_PATH,
+                ],
+                label: `${resolveRunner().label} prepare-wiki ${wiki} --version ${version} --rebuild`,
               }
             : null;
           break;
@@ -2331,9 +2472,46 @@ async function handleRequest(req, res) {
         if (processFinalized) return;
         processFinalized = true;
         const cancelled = !error && currentJob?.cancelRequested && signal === "SIGTERM";
-        const exitCode = cancelled ? 130 : error ? 1 : code;
+        let exitCode = cancelled ? 130 : error ? 1 : code;
         if (error) jobLog.push(`\n[failed to start: ${error.message}]`);
         else jobLog.push(`\n[exited with code ${cancelled ? "cancelled" : code}]`);
+        let lifecycleResult = null;
+        if (exitCode === 0 && requestedLifecycleMutation) {
+          try {
+            lifecycleResult = applyLifecycleMutation({
+              lifecyclePath: WIKI_LIFECYCLE_PATH,
+              auditDir: ADMIN_LIFECYCLE_AUDIT_DIR,
+              mutation: requestedLifecycleMutation,
+              operator,
+              requestId: runId,
+              expectedRevision: String(params.lifecycleRevision || "") || null,
+            });
+            reloadWikiLifecycle();
+            jobLog.push("\n[lifecycle transition committed]");
+          } catch (lifecycleError) {
+            exitCode = 1;
+            try { reloadWikiLifecycle(); } catch {}
+            jobLog.push(`\n[lifecycle transition failed: ${lifecycleError.message}]`);
+          }
+        }
+        if (new Set(["promote-qualification", "retire-candidate", "rebuild-candidate"]).has(action)) {
+          try {
+            immutableAuditEvent(ADMIN_LIFECYCLE_AUDIT_DIR, {
+              requestId: runId,
+              phase: exitCode === 0 ? "completed" : "failed",
+              action,
+              wiki,
+              operator,
+              recordedAt: new Date().toISOString(),
+              outcome: exitCode === 0 ? "succeeded" : "failed",
+              exitCode,
+              lifecycleRevision: lifecycleResult?.afterRevision || registryRevision(WIKI_LIFECYCLE),
+            });
+          } catch (auditError) {
+            exitCode = 1;
+            jobLog.push(`\n[immutable operator audit failed: ${auditError.message}]`);
+          }
+        }
         jobExitCode = exitCode;
         const completedJob = {
           runId,

@@ -661,6 +661,173 @@ test("one generic onboarding transaction registers and queues any supported proj
   assert.equal(fs.readdirSync(path.join(outputDir, "_admin", "operations", "queued")).length, 3);
 });
 
+test("operators can pause, resume, and configure lifecycle with revision protection", async (t) => {
+  const lifecycle = {
+    schema_version: 1,
+    publication_contract: {datasets: {}},
+    wikis: {
+      nlwiki: {
+        refresh: "scheduled",
+        publication: "published",
+        provenance: "toolforge",
+        freshness_sla_days: 10,
+        fleet_resource_class: "small",
+      },
+    },
+  };
+  const {module, host, outputDir} = await startServer(t, LOCAL_ENV, lifecycle);
+  const initial = JSON.parse((await invoke(module, {url: "/api/status", headers: {host}})).text());
+  assert.match(initial.lifecycleRevision, /^[a-f0-9]{64}$/);
+
+  const paused = await invoke(module, {
+    method: "POST",
+    url: "/api/update-lifecycle",
+    headers: {host, "content-type": "application/json"},
+    body: JSON.stringify({
+      wiki: "nlwiki",
+      operation: "pause",
+      lifecycleRevision: initial.lifecycleRevision,
+    }),
+  });
+  assert.equal(paused.statusCode, 200, paused.text());
+  const pausedBody = JSON.parse(paused.text());
+  assert.equal(pausedBody.lifecycle.refresh, "paused");
+
+  const stale = await invoke(module, {
+    method: "POST",
+    url: "/api/update-lifecycle",
+    headers: {host, "content-type": "application/json"},
+    body: JSON.stringify({wiki: "nlwiki", operation: "resume", lifecycleRevision: initial.lifecycleRevision}),
+  });
+  assert.equal(stale.statusCode, 409);
+  assert.match(JSON.parse(stale.text()).error, /changed since/);
+
+  const configured = await invoke(module, {
+    method: "POST",
+    url: "/api/update-lifecycle",
+    headers: {host, "content-type": "application/json"},
+    body: JSON.stringify({
+      wiki: "nlwiki",
+      operation: "configure",
+      resourceClass: "medium_large",
+      freshnessSlaDays: 21,
+      lifecycleRevision: pausedBody.lifecycleRevision,
+    }),
+  });
+  assert.equal(configured.statusCode, 200, configured.text());
+  const configuredBody = JSON.parse(configured.text());
+  assert.equal(configuredBody.lifecycle.fleet_resource_class, "medium_large");
+  assert.equal(configuredBody.lifecycle.freshness_sla_days, 21);
+
+  const resumed = await invoke(module, {
+    method: "POST",
+    url: "/api/update-lifecycle",
+    headers: {host, "content-type": "application/json"},
+    body: JSON.stringify({
+      wiki: "nlwiki",
+      operation: "resume",
+      refresh: "scheduled",
+      lifecycleRevision: configuredBody.lifecycleRevision,
+    }),
+  });
+  assert.equal(resumed.statusCode, 200, resumed.text());
+  assert.equal(JSON.parse(resumed.text()).lifecycle.refresh, "scheduled");
+  const auditDir = path.join(outputDir, "_admin", "lifecycle-audit");
+  assert.equal(fs.readdirSync(auditDir).length, 6);
+});
+
+test("qualification promotion is queued with exact candidate and lifecycle identities", async (t) => {
+  const lifecycle = {
+    schema_version: 1,
+    publication_contract: {datasets: {}},
+    wikis: {
+      dewiki: {
+        refresh: "qualification",
+        publication: "hidden",
+        provenance: "toolforge-admin:Alice",
+        fleet_resource_class: "medium_large",
+      },
+    },
+  };
+  const {module, host, outputDir} = await startServer(t, {
+    ...LOCAL_ENV,
+    WIKI_ECON_ADMIN_EXECUTION_MODE: "queue",
+  }, lifecycle, ({outputDir: fixtureOutput}) => {
+    const candidate = path.join(fixtureOutput, "_qualifications", "dewiki", "2026-08", "qualification-1");
+    fs.mkdirSync(candidate, {recursive: true});
+    fs.writeFileSync(path.join(candidate, "qualification.json"), JSON.stringify({
+      schema_version: 2,
+      publication_eligible: false,
+      wiki: "dewiki",
+      snapshot: "2026-08",
+      run_id: "qualification-1",
+      qualified_at_unix: 1_788_000_000,
+      cutoff_date: "2026-08",
+      workload_profile: {resource_class: "medium_large"},
+      artifacts: [{path: "dewiki/gdp.parquet"}],
+    }));
+  });
+  const status = JSON.parse((await invoke(module, {url: "/api/status", headers: {host}})).text());
+  assert.equal(status.qualifications.dewiki[0].structurallyValid, true);
+  const response = await invoke(module, {
+    method: "POST",
+    url: "/api/promote-qualification",
+    headers: {host, "content-type": "application/json"},
+    body: JSON.stringify({
+      wiki: "dewiki",
+      version: "2026-08",
+      qualificationRunId: "qualification-1",
+      refresh: "scheduled",
+      freshnessSlaDays: 14,
+      resourceClass: "medium_large",
+      lifecycleRevision: status.lifecycleRevision,
+    }),
+  });
+  assert.equal(response.statusCode, 202, response.text());
+  const body = JSON.parse(response.text());
+  assert.equal(body.operation.qualificationRunId, "qualification-1");
+  assert.equal(body.operation.lifecycleMutation.action, "promote");
+  assert.equal(body.operation.lifecycleRevision, status.lifecycleRevision);
+  assert.equal(fs.readdirSync(path.join(outputDir, "_admin", "lifecycle-audit")).length, 1);
+});
+
+test("candidate retirement and isolated rebuild require exact identities", async (t) => {
+  const lifecycle = {
+    schema_version: 1,
+    publication_contract: {datasets: {}},
+    wikis: {
+      nlwiki: {
+        refresh: "manual",
+        publication: "published",
+        provenance: "toolforge",
+        fleet_resource_class: "small",
+      },
+    },
+  };
+  const {module, host} = await startServer(t, {
+    ...LOCAL_ENV,
+    WIKI_ECON_ADMIN_EXECUTION_MODE: "queue",
+  }, lifecycle);
+  const invalid = await invoke(module, {
+    method: "POST",
+    url: "/api/retire-candidate",
+    headers: {host, "content-type": "application/json"},
+    body: JSON.stringify({wiki: "nlwiki"}),
+  });
+  assert.equal(invalid.statusCode, 400);
+
+  const rebuild = await invoke(module, {
+    method: "POST",
+    url: "/api/rebuild-candidate",
+    headers: {host, "content-type": "application/json"},
+    body: JSON.stringify({wiki: "nlwiki", version: "2026-08", candidateRunId: "ready-1"}),
+  });
+  assert.equal(rebuild.statusCode, 202, rebuild.text());
+  const operation = JSON.parse(rebuild.text()).operation;
+  assert.equal(operation.action, "rebuild-candidate");
+  assert.equal(operation.version, "2026-08");
+});
+
 test("production execution mode queues heavy work and supports cancellation", async (t) => {
   const lifecycle = {
     schema_version: 1,
@@ -945,6 +1112,105 @@ test("admin dispatcher maps fail-closed operational controls to typed commands",
   assert.deepEqual(retry.args.slice(-4), ["--wiki", "nlwiki", "--task-id", taskId]);
   const scrub = dispatcher.commandFor({action: "artifact-scrub", runId: "scrub-1"});
   assert.match(scrub.args[0], /run-artifact-scrub\.sh$/);
+  const promote = dispatcher.commandFor({
+    action: "promote-qualification",
+    wiki: "dewiki",
+    version: "2026-08",
+    qualificationRunId: "qualification-1",
+    runId: "promote-1",
+  });
+  assert.deepEqual(
+    promote.args.slice(-7),
+    ["dewiki", "--version", "2026-08", "--qualification-run-id", "qualification-1", "--lifecycle", promote.args.at(-1)],
+  );
+  const retire = dispatcher.commandFor({
+    action: "retire-candidate",
+    wiki: "dewiki",
+    version: "2026-08",
+    candidateRunId: "candidate-1",
+    requestedBy: "Alice",
+    runId: "retire-1",
+  });
+  assert.ok(retire.args.includes("retire-candidate"));
+  assert.ok(retire.args.includes("candidate-1"));
+  const rebuild = dispatcher.commandFor({
+    action: "rebuild-candidate",
+    wiki: "dewiki",
+    version: "2026-08",
+    runId: "rebuild-1",
+  });
+  assert.ok(rebuild.args.includes("--rebuild"));
+});
+
+test("admin dispatcher commits lifecycle only after qualification promotion succeeds", async (t) => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-admin-promotion-test-"));
+  t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const operationRoot = path.join(root, "operations");
+  const outputDir = path.join(root, "output");
+  const lifecyclePath = path.join(root, "wiki-lifecycle.json");
+  const queuedDir = path.join(operationRoot, "queued");
+  fs.mkdirSync(queuedDir, {recursive: true});
+  fs.mkdirSync(outputDir, {recursive: true});
+  const lifecycle = {
+    schema_version: 1,
+    publication_contract: {datasets: {patrol: {wikis: ["nlwiki"], minimum_rows_per_wiki: 1}}},
+    wikis: {
+      dewiki: {publication: "hidden", refresh: "qualification", provenance: "qualification", fleet_resource_class: "medium_large"},
+      nlwiki: {publication: "published", refresh: "manual", provenance: "toolforge"},
+    },
+  };
+  fs.writeFileSync(lifecyclePath, JSON.stringify(lifecycle));
+  const {registryRevision} = require("./admin-lifecycle.cjs");
+  const request = {
+    schemaVersion: 1,
+    requestId: "admin-promote-dewiki",
+    runId: "admin-promote-dewiki",
+    action: "promote-qualification",
+    wiki: "dewiki",
+    version: "2026-08",
+    qualificationRunId: "qualification-1",
+    lifecycleMutation: {
+      action: "promote",
+      wiki: "dewiki",
+      refresh: "scheduled",
+      resourceClass: "medium_large",
+      freshnessSlaDays: 14,
+    },
+    lifecycleRevision: registryRevision(lifecycle),
+    requestedBy: "Alice",
+    requestedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    state: "queued",
+  };
+  fs.writeFileSync(path.join(queuedDir, `${request.requestId}.json`), JSON.stringify(request));
+
+  const dispatcherPath = require.resolve("../deploy/toolforge/admin-dispatcher.cjs");
+  const previous = Object.fromEntries([
+    "WIKI_ECON_ADMIN_OPERATION_DIR",
+    "WIKI_ECON_OUTPUT_DIR",
+    "WIKI_ECON_WIKI_LIFECYCLE_FILE",
+    "WIKI_ECON_BIN",
+  ].map((key) => [key, process.env[key]]));
+  process.env.WIKI_ECON_ADMIN_OPERATION_DIR = operationRoot;
+  process.env.WIKI_ECON_OUTPUT_DIR = outputDir;
+  process.env.WIKI_ECON_WIKI_LIFECYCLE_FILE = lifecyclePath;
+  process.env.WIKI_ECON_BIN = "/usr/bin/true";
+  delete require.cache[dispatcherPath];
+  const dispatcher = require(dispatcherPath);
+  const completed = await dispatcher.run();
+  for (const [key, value] of Object.entries(previous)) {
+    if (value == null) delete process.env[key];
+    else process.env[key] = value;
+  }
+  delete require.cache[dispatcherPath];
+
+  assert.equal(completed.state, "succeeded");
+  const updated = JSON.parse(fs.readFileSync(lifecyclePath, "utf8"));
+  assert.equal(updated.wikis.dewiki.publication, "published");
+  assert.equal(updated.wikis.dewiki.refresh, "scheduled");
+  assert.equal(updated.wikis.dewiki.freshness_sla_days, 14);
+  assert.deepEqual(updated.publication_contract.datasets.patrol.wikis, ["dewiki", "nlwiki"]);
+  assert.equal(fs.readdirSync(path.join(outputDir, "_admin", "lifecycle-audit")).length, 3);
 });
 
 test("admin dispatcher records upstream dump waits without reporting a pipeline defect", async (t) => {

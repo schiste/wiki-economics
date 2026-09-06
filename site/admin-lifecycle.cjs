@@ -131,6 +131,70 @@ function readAuditTrail(auditDir, limit = 104) {
   return {events: events.slice(0, limit), invalid};
 }
 
+function qualificationCandidates(outputDir, limitPerWiki = 10) {
+  const root = path.join(outputDir, "_qualifications");
+  const byWiki = {};
+  let wikis = [];
+  try {
+    wikis = fs.readdirSync(root).sort();
+  } catch (error) {
+    if (error.code === "ENOENT") return byWiki;
+    throw error;
+  }
+  for (const wiki of wikis) {
+    if (!/^[a-z0-9_]+wiki$/.test(wiki)) continue;
+    const wikiRoot = path.join(root, wiki);
+    let snapshots = [];
+    try { snapshots = fs.readdirSync(wikiRoot).sort().reverse(); } catch { continue; }
+    const entries = [];
+    for (const snapshot of snapshots) {
+      if (!YEAR_MONTH.test(snapshot)) continue;
+      const snapshotRoot = path.join(wikiRoot, snapshot);
+      let runs = [];
+      try { runs = fs.readdirSync(snapshotRoot).sort().reverse(); } catch { continue; }
+      for (const runId of runs) {
+        const receiptPath = path.join(snapshotRoot, runId, "qualification.json");
+        try {
+          const bytes = fs.readFileSync(receiptPath);
+          const receipt = JSON.parse(bytes.toString("utf8"));
+          const valid = receipt.schema_version === 2
+            && receipt.publication_eligible === false
+            && receipt.wiki === wiki
+            && receipt.snapshot === snapshot
+            && receipt.run_id === runId
+            && Array.isArray(receipt.artifacts)
+            && receipt.artifacts.length > 0;
+          entries.push({
+            wiki,
+            snapshot,
+            runId,
+            qualifiedAtUnix: receipt.qualified_at_unix ?? null,
+            cutoffDate: receipt.cutoff_date ?? null,
+            artifactCount: receipt.artifacts?.length ?? 0,
+            resourceClass: receipt.workload_profile?.resource_class ?? null,
+            receiptSha256: sha256(bytes),
+            structurallyValid: valid,
+            error: valid ? null : "qualification receipt identity or schema mismatch",
+          });
+        } catch (error) {
+          if (error.code !== "ENOENT") entries.push({
+            wiki,
+            snapshot,
+            runId,
+            structurallyValid: false,
+            error: error.message,
+          });
+        }
+      }
+    }
+    entries.sort((left, right) => (right.snapshot || "").localeCompare(left.snapshot || "")
+      || Number(right.qualifiedAtUnix || 0) - Number(left.qualifiedAtUnix || 0)
+      || (right.runId || "").localeCompare(left.runId || ""));
+    if (entries.length > 0) byWiki[wiki] = entries.slice(0, limitPerWiki);
+  }
+  return byWiki;
+}
+
 function defaultRetentionPolicy() {
   return {
     source_recoverability: "redownloadable",
@@ -285,10 +349,8 @@ function applyLifecycleMutation({
   const after = mutateRegistry(before, mutation, operator);
   const afterRevision = registryRevision(after);
   if (afterRevision === beforeRevision) throw new Error("Lifecycle mutation did not change the registry");
-  atomicWriteJson(lifecyclePath, after);
-  const audit = immutableAuditEvent(auditDir, {
+  const auditPayload = {
     requestId,
-    phase: "applied",
     action: mutation.action,
     wiki: mutation.wiki,
     operator,
@@ -298,7 +360,13 @@ function applyLifecycleMutation({
     before: before.wikis[mutation.wiki] || null,
     after: after.wikis[mutation.wiki] || null,
     parameters: Object.fromEntries(Object.entries(mutation).filter(([key]) => key !== "wiki" && key !== "action")),
-  });
+  };
+  // Commit intent first. If either the registry replacement or final audit
+  // write is interrupted, the immutable prepared event contains both exact
+  // revisions and is sufficient for deterministic operator reconciliation.
+  immutableAuditEvent(auditDir, {...auditPayload, phase: "prepared"});
+  atomicWriteJson(lifecyclePath, after);
+  const audit = immutableAuditEvent(auditDir, {...auditPayload, phase: "applied"});
   return {registry: after, previous: before.wikis[mutation.wiki] || null, current: after.wikis[mutation.wiki], beforeRevision, afterRevision, audit: audit.document};
 }
 
@@ -308,6 +376,7 @@ module.exports = {
   canonicalJson,
   immutableAuditEvent,
   mutateRegistry,
+  qualificationCandidates,
   readAuditTrail,
   readLifecycle,
   registryRevision,
