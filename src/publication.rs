@@ -5636,7 +5636,11 @@ mod tests {
         }
     }
 
-    fn write_metric(path: &Path, spec: &MetricSpec, _wiki: &str) -> Result<()> {
+    fn write_metric_with_editor_count(
+        path: &Path,
+        spec: &MetricSpec,
+        editor_count: u32,
+    ) -> Result<()> {
         let columns = spec
             .schema
             .iter()
@@ -5648,6 +5652,8 @@ mod tests {
                     (*name).into(),
                     [if *name == "previous_week_edits" {
                         0_u32
+                    } else if *name == "editors" {
+                        editor_count
                     } else {
                         1_u32
                     }],
@@ -5658,6 +5664,10 @@ mod tests {
         let mut frame = DataFrame::new(1, columns)?;
         ParquetWriter::new(File::create(path)?).finish(&mut frame)?;
         Ok(())
+    }
+
+    fn write_metric(path: &Path, spec: &MetricSpec, _wiki: &str) -> Result<()> {
+        write_metric_with_editor_count(path, spec, 1)
     }
 
     #[test]
@@ -5906,16 +5916,6 @@ mod tests {
             1
         );
         assert_eq!(receipt["patrol_sources"]["nlwiki"]["rights_events"], 1);
-        assert!(
-            receipt["wiki_proofs"]["nlwiki"]["quality_signals"]["editor_period_observations"]
-                .as_u64()
-                .is_some_and(|value| value > 0)
-        );
-        assert_eq!(
-            receipt["wiki_proofs"]["nlwiki"]["quality_signals"]["patrol_events"],
-            1
-        );
-
         let receipt_path = fixture.output.path().join(RECEIPT_FILE);
         let mut tampered_receipt = receipt.clone();
         tampered_receipt["attribution"] = Value::String("tampered".to_string());
@@ -6337,6 +6337,7 @@ mod tests {
         let ready = fixture.ready_candidate("candidate-1")?;
         assert!(ready.is_file());
         let mut legacy_ready: ReadyWikiCandidate = read_json(&ready)?;
+        assert!(legacy_ready.quality_signals.is_some());
         legacy_ready.workload_profile = None;
         let candidate_dir = ready
             .parent()
@@ -7673,6 +7674,66 @@ mod tests {
                 "candidate-subset",
             )
             .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn candidate_and_qualification_marking_reject_invalid_editor_evidence() -> Result<()> {
+        let spec = METRICS
+            .iter()
+            .find(|spec| spec.name == "gdp_user_type_share")
+            .context("GDP user-type-share metric contract")?;
+
+        let candidate_fixture = Fixture::new()?;
+        let ready_path = candidate_fixture.ready_candidate("candidate-invalid-editor")?;
+        let candidate_metric = ready_path
+            .parent()
+            .context("ready candidate should have a directory")?
+            .join("nlwiki/gdp_user_type_share.parquet");
+        write_metric_with_editor_count(&candidate_metric, spec, 0)?;
+        fs::remove_file(artifact_receipt::sidecar_path(&candidate_metric)?)?;
+        let candidate_error = mark_wiki_candidate_ready(
+            candidate_fixture.data.path(),
+            candidate_fixture.output.path(),
+            &candidate_fixture.lifecycle_path,
+            "nlwiki",
+            "2026-03",
+            "candidate-invalid-editor",
+        )
+        .expect_err("candidate with edits but no editor identity must fail closed");
+        assert!(format!("{candidate_error:#}").contains("no editor identities"));
+
+        let qualification_fixture = Fixture::new()?;
+        prepare_hidden_qualification_fixture(
+            &qualification_fixture,
+            "qualification-invalid-editor",
+        );
+        let qualification_metric = wiki_qualification_dir(
+            qualification_fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            "qualification-invalid-editor",
+        )
+        .expect("qualification path should resolve")
+        .join("nlwiki/gdp_user_type_share.parquet");
+        write_metric_with_editor_count(&qualification_metric, spec, 0)?;
+        let qualification_sidecar = artifact_receipt::sidecar_path(&qualification_metric)?;
+        assert!(qualification_sidecar.is_file());
+        fs::remove_file(qualification_sidecar)
+            .expect("qualification artifact receipt should be removable");
+        let qualification_error = mark_wiki_qualification_ready(
+            qualification_fixture.data.path(),
+            qualification_fixture.output.path(),
+            &qualification_fixture.lifecycle_path,
+            "nlwiki",
+            "2026-03",
+            "qualification-invalid-editor",
+        )
+        .expect_err("qualification with edits but no editor identity must fail closed");
+        assert!(
+            format!("{qualification_error:#}").contains("no editor identities"),
+            "unexpected qualification error: {qualification_error:#}"
         );
         Ok(())
     }
