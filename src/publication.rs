@@ -3245,16 +3245,20 @@ fn previous_candidate_recoverable(
         return false;
     };
     let candidate = output_dir.join(previous);
-    storage::read_generation_manifest(data_dir, &entry.wiki, previous_snapshot).is_ok()
-        && read_json::<ReadyWikiCandidate>(&candidate.join("ready.json"))
-            .and_then(|ready| {
-                ensure!(
-                    ready.wiki == entry.wiki && ready.snapshot == previous_snapshot,
-                    "previous ready candidate identity does not match its journal"
-                );
-                validate_ready_candidate(data_dir, &candidate, &ready)
-            })
-            .is_ok()
+    read_json::<ReadyWikiCandidate>(&candidate.join("ready.json"))
+        .and_then(|ready| {
+            ensure!(
+                ready.wiki == entry.wiki && ready.snapshot == previous_snapshot,
+                "previous ready candidate identity does not match its journal"
+            );
+            // Candidate validation already requires either the complete input
+            // generation or a receipt that explicitly authorizes this exact
+            // ready.json after redownloadable inputs were purged. Requiring a
+            // physical manifest here as well made retention-compliant rollback
+            // generations impossible to restore.
+            validate_ready_candidate(data_dir, &candidate, &ready)
+        })
+        .is_ok()
 }
 
 fn audit_publication_transaction(
@@ -9387,6 +9391,57 @@ mod tests {
             active_candidate_relative(fixture.output.path(), "nlwiki")?.as_deref(),
             Some("_candidates/nlwiki/2026-03/previous")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn previous_candidate_recovery_honors_authenticated_input_retention() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let ready_path = fixture.ready_candidate("retained-previous")?;
+        let (_, ready_sha256) = storage::sha256_file(&ready_path)?;
+        let plan_path = crate::snapshot_plan::plan_path(fixture.data.path(), "nlwiki", "2026-03")?;
+        let (_, source_plan_sha256) = storage::sha256_file(&plan_path)?;
+        let retention_path =
+            crate::retention::receipt_path(fixture.data.path(), "nlwiki", "2026-03")?;
+        atomic_json(
+            &retention_path,
+            &crate::retention::RetentionReceipt {
+                schema_version: crate::retention::RETENTION_RECEIPT_SCHEMA_VERSION,
+                wiki: "nlwiki".to_string(),
+                snapshot: "2026-03".to_string(),
+                state: crate::retention::RetentionState::Applied,
+                authorized_ready_sha256: ready_sha256,
+                source_plan_sha256,
+                history_input: crate::retention::InputRetention::PurgeAfterReady,
+                patrol_source: crate::retention::InputRetention::PurgeAfterReady,
+                authorized_at_unix: 1,
+                applied_at_unix: Some(1),
+                removed_bytes: 1,
+                removed_paths: vec!["fixture-generation".to_string()],
+            },
+        )
+        .expect("retention receipt should be written");
+        let generation_manifest =
+            storage::generation_manifest_path(fixture.data.path(), "nlwiki", "2026-03")
+                .expect("generation manifest path should be valid");
+        fs::remove_file(generation_manifest).expect("generation manifest should be removed");
+
+        let entry = SelectionEntry {
+            wiki: "nlwiki".to_string(),
+            snapshot: "2026-04".to_string(),
+            candidate_relative: "_candidates/nlwiki/2026-04/selected".to_string(),
+            previous_candidate_relative: Some(
+                "_candidates/nlwiki/2026-03/retained-previous".to_string(),
+            ),
+            previous_snapshot: Some("2026-03".to_string()),
+            backup_relative: None,
+            workload_profile: None,
+        };
+        assert!(previous_candidate_recoverable(
+            fixture.data.path(),
+            fixture.output.path(),
+            &entry,
+        ));
         Ok(())
     }
 
