@@ -1682,9 +1682,14 @@ fn validate_ready_candidate_metadata(
     } else {
         let retained =
             crate::retention::validate_purged_snapshot(data_dir, &ready.wiki, &ready.snapshot);
-        retained.context(
+        let retained = retained.context(
             "ready candidate input generation is absent without valid retention authorization",
         )?;
+        let (_, ready_sha256) = storage::sha256_file(&candidate_dir.join("ready.json"))?;
+        ensure!(
+            ready_sha256 == retained.authorized_ready_sha256,
+            "retention receipt does not authorize this ready candidate"
+        );
     }
     if let Some(profile) = &ready.workload_profile {
         profile.validate(&ready.wiki, &ready.snapshot)?;
@@ -3197,11 +3202,6 @@ fn backups_recoverable(
         let Some(backup) = entry.backup_relative.as_deref() else {
             continue;
         };
-        if let Some(previous_snapshot) = entry.previous_snapshot.as_deref()
-            && storage::read_generation_manifest(data_dir, &entry.wiki, previous_snapshot).is_err()
-        {
-            return Ok(false);
-        }
         let backup = output_dir.join(backup);
         if !(backup.exists()
             || backup.is_symlink()
@@ -9259,22 +9259,14 @@ mod tests {
         .expect("candidate activation should succeed");
 
         let entry = &mut selection.entries[0];
-        let active = fixture.output.path().join("nlwiki");
-        remove_selection_link(&active)?;
-        restore_backup(
-            fixture.output.path(),
-            &active,
-            entry.backup_relative.as_deref(),
-        )
-        .expect("previous output should be restorable");
-        let previous_candidate = fixture
-            .output
-            .path()
-            .join("_candidates/nlwiki/2026-02/previous");
-        fs::create_dir_all(&previous_candidate)?;
-        fs::rename(&active, previous_candidate.join("nlwiki"))?;
-        std::os::unix::fs::symlink("_candidates/nlwiki/2026-02/previous/nlwiki", &active)?;
-        entry.previous_candidate_relative = Some("_candidates/nlwiki/2026-02/previous".to_string());
+        let backup = fixture.output.path().join(
+            entry
+                .backup_relative
+                .as_deref()
+                .context("activated selection should record a backup")?,
+        );
+        fs::remove_dir_all(backup)?;
+        entry.previous_candidate_relative = Some("_candidates/nlwiki/2026-02/retired".to_string());
         entry.previous_snapshot = Some("2026-02".to_string());
         atomic_json(&selection_path(fixture.output.path(), run_id)?, &selection)?;
 
@@ -9310,6 +9302,9 @@ mod tests {
             active_candidate_relative(fixture.output.path(), "nlwiki")?.as_deref(),
             Some("_candidates/nlwiki/2026-03/candidate")
         );
+        let active = fixture.output.path().join("nlwiki");
+        remove_selection_link(&active)?;
+        std::os::unix::fs::symlink("_candidates/nlwiki/2026-02/retired/nlwiki", &active)?;
         resume_unpublished_selection(
             fixture.data.path(),
             fixture.output.path(),
@@ -9434,7 +9429,9 @@ mod tests {
                 "_candidates/nlwiki/2026-03/retained-previous".to_string(),
             ),
             previous_snapshot: Some("2026-03".to_string()),
-            backup_relative: None,
+            backup_relative: Some(
+                "_publication_transactions/retained-recovery/backups/nlwiki".to_string(),
+            ),
             workload_profile: None,
         };
         assert!(previous_candidate_recoverable(
@@ -9442,6 +9439,19 @@ mod tests {
             fixture.output.path(),
             &entry,
         ));
+        let active = fixture.output.path().join("nlwiki");
+        fs::remove_dir_all(&active)?;
+        std::os::unix::fs::symlink("_candidates/nlwiki/2026-04/selected/nlwiki", &active)?;
+        let selection = PublicationSelection {
+            schema_version: 1,
+            run_id: "retained-recovery".to_string(),
+            state: "selected".to_string(),
+            entries: vec![entry],
+        };
+        assert!(
+            backups_recoverable(fixture.data.path(), fixture.output.path(), &selection)
+                .expect("retained rollback evidence should be readable")
+        );
         Ok(())
     }
 
