@@ -83,6 +83,62 @@ function classifyError(message) {
       remediation: "Select an available snapshot or leave the snapshot blank before retrying.",
     };
   }
+  if (/workload profile .* has not completed production qualification/i.test(message)) {
+    return {
+      errorSummary: "The selected workload profile has not passed production qualification for this workload.",
+      retryable: false,
+      remediationCode: "workload_profile_unqualified",
+      remediation: "Run the profile qualification with measured memory, scratch, duration, and deterministic-output evidence before retrying this project.",
+    };
+  }
+  if (/out of memory|oom|memory(?:\.max)?|cannot allocate memory|exceeded.*memory/i.test(message)) {
+    return {
+      errorSummary: "The run exceeded its safe memory budget.",
+      retryable: false,
+      remediationCode: "memory_budget_exceeded",
+      remediation: "Review the run resource evidence, select a qualified lower-memory profile or increase capacity, then explicitly retry.",
+    };
+  }
+  if (/disk|storage|no space left|reserve.*(?:below|exhausted)|quota exceeded/i.test(message)) {
+    return {
+      errorSummary: "The run could not preserve the required storage reserve.",
+      retryable: false,
+      remediationCode: "storage_reserve_exhausted",
+      remediation: "Run the retention audit or safe cleanup, verify the configured reserve is available, then explicitly retry.",
+    };
+  }
+  if (/publication.*(?:receipt|gate|candidate|site).*(?:mismatch|disagree|invalid)|(?:receipt|hash).*(?:mismatch|changed|invalid)/i.test(message)) {
+    return {
+      errorSummary: "Publication evidence no longer agrees with the artifact or site generation it authenticates.",
+      retryable: false,
+      remediationCode: "publication_evidence_mismatch",
+      remediation: "Run publication recovery audit and artifact scrub. Publish again only after both reports are clean.",
+    };
+  }
+  if (/lease heartbeat expired|stale lease|worker.*stopped reporting/i.test(message)) {
+    return {
+      errorSummary: "A fleet worker stopped reporting before it released its lease.",
+      retryable: true,
+      remediationCode: "fleet_lease_stale",
+      remediation: "Run fleet recovery to authenticate the stale lease and requeue only recoverable work.",
+    };
+  }
+  if (/retry_limit_exhausted|retry limit exhausted|automatic retries.*exhausted/i.test(message)) {
+    return {
+      errorSummary: "Automatic retries were exhausted and the fleet task is quarantined.",
+      retryable: false,
+      remediationCode: "fleet_task_quarantined",
+      remediation: "Review the final failure and its inputs. After correcting the cause, explicitly retry this exact quarantined task.",
+    };
+  }
+  if (/multi-member|zero relevant events|patrol.*zero|rights.*zero/i.test(message)) {
+    return {
+      errorSummary: "Patrol data failed its semantic event-count checks.",
+      retryable: false,
+      remediationCode: "patrol_semantic_failure",
+      remediation: "Inspect the selected logging source and parser counts, then run a patrol-only rebuild after correcting the cause.",
+    };
+  }
   return {
     errorSummary: message.replace(/^Error:\s*/i, "").trim(),
     retryable: true,

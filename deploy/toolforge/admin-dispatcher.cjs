@@ -88,6 +88,25 @@ function commandFor(request) {
       return {program: BIN, args: [...common, "merge"]};
     case "fleet-recover":
       return {program: BIN, args: ["fleet-recover", "--queue-dir", QUEUE_DIR]};
+    case "quarantine-retry":
+      return {program: BIN, args: ["fleet-retry-quarantine", "--queue-dir", QUEUE_DIR, "--wiki", wiki, "--task-id", request.taskId]};
+    case "publication-recovery-audit":
+      return {program: BIN, args: [
+        ...common,
+        "publication-recovery-audit",
+        "--site-dist-dir", path.join(ROOT, "site", "dist"),
+        "--report", path.join(OUTPUT_DIR, "_admin", "publication-recovery-audit.json"),
+      ]};
+    case "publication-preflight":
+      return {program: BIN, args: [
+        ...common,
+        "publication-preflight",
+        "--lifecycle", LIFECYCLE_PATH,
+        "--site-dist-dir", path.join(ROOT, "site", "dist"),
+        "--report", path.join(OUTPUT_DIR, "_admin", "publication-preflight.json"),
+      ]};
+    case "artifact-scrub":
+      return {program: "bash", args: [path.join(ROOT, "deploy", "toolforge", "run-artifact-scrub.sh")]};
     case "publish":
       return {program: "bash", args: [path.join(ROOT, "deploy", "toolforge", "run-publish-ready.sh")]};
     case "site":
@@ -106,6 +125,9 @@ function validateRequest(request) {
   }
   if (request.version != null && !/^\d{4}-\d{2}$/.test(request.version)) {
     throw new Error(`Admin operation has an invalid snapshot ${request.version}`);
+  }
+  if (request.action === "quarantine-retry" && !/^[a-f0-9]{64}$/.test(request.taskId || "")) {
+    throw new Error("Quarantine retry requires an exact fleet task identity");
   }
   commandFor(request);
   return request;

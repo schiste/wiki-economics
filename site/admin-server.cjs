@@ -987,7 +987,7 @@ function readAdminOperations() {
   };
 }
 
-function queueAdminOperation({ action, wiki, version, requestedBy, acknowledgeBlockedRetry = false }) {
+function queueAdminOperation({ action, wiki, version, taskId = null, requestedBy, acknowledgeBlockedRetry = false }) {
   const directories = operationDirectories();
   const active = [
     ...operationEntries(directories.running, Number.MAX_SAFE_INTEGER),
@@ -1033,6 +1033,7 @@ function queueAdminOperation({ action, wiki, version, requestedBy, acknowledgeBl
     action,
     wiki: wiki || null,
     version: version || null,
+    taskId: taskId || null,
     lifecyclePath: WIKI_LIFECYCLE_PATH,
     requestedBy: requestedBy || "local-operator",
     requestedAt,
@@ -1259,7 +1260,7 @@ function directoryJsonEntries(directory, { directories = false, limit = 100 } = 
 }
 
 function fleetTaskFrom(value) {
-  return value?.task || value || {};
+  return value?.claim?.task || value?.task || value || {};
 }
 
 function fleetWikiFrom(value, filename = "") {
@@ -1362,6 +1363,7 @@ function readFleetStatus(now = Date.now()) {
       wiki: fleetWikiFrom(entry.value, entry.file),
       updatedAt: entry.modifiedAt,
       error: entry.value.error ?? entry.value.reason ?? null,
+      taskId: fleetTaskFrom(entry.value).task_id ?? null,
       task: fleetTaskFrom(entry.value),
     })),
     recentFailures: failureEntries.map((entry) => ({
@@ -1766,6 +1768,10 @@ function buildStatusPayload(req, session) {
     fleet,
     adminOperations,
     scheduledRefresh,
+    sourceIdentity: {
+      sourceCommit: process.env.WIKI_ECON_SOURCE_COMMIT || null,
+      siteSourceCommit: process.env.WIKI_ECON_SITE_SOURCE_COMMIT || null,
+    },
   });
   return {
     running: currentJob !== null,
@@ -2030,7 +2036,7 @@ async function handleRequest(req, res) {
       reloadWikiLifecycle();
       const wikiActions = new Set([
         "fetch", "ingest", "compute", "run", "qualify",
-        "patrol-fetch", "patrol-compute", "patrol-rebuild",
+        "patrol-fetch", "patrol-compute", "patrol-rebuild", "quarantine-retry",
       ]);
       if (wikiActions.has(action) && wiki && !WIKI_LIFECYCLE.wikis[wiki]) {
         writeJson(res, 409, {
@@ -2041,7 +2047,10 @@ async function handleRequest(req, res) {
         return;
       }
 
-      const globalActions = new Set(["merge", "publish", "site", "fleet-recover"]);
+      const globalActions = new Set([
+        "merge", "publish", "site", "fleet-recover", "publication-recovery-audit",
+        "publication-preflight", "artifact-scrub",
+      ]);
       if (wikiActions.has(action) && !wiki) {
         writeJson(res, 400, {error: `${action} requires a wiki parameter`});
         return;
@@ -2060,6 +2069,10 @@ async function handleRequest(req, res) {
           return;
         }
       }
+      if (action === "quarantine-retry" && !/^[a-f0-9]{64}$/.test(String(params.taskId || ""))) {
+        writeJson(res, 400, {error: "quarantine-retry requires the exact 64-character task identity"});
+        return;
+      }
 
       if (ADMIN_EXECUTION_MODE === "queue" && (wikiActions.has(action) || globalActions.has(action))) {
         try {
@@ -2067,6 +2080,7 @@ async function handleRequest(req, res) {
             action,
             wiki,
             version,
+            taskId: params.taskId || null,
             requestedBy: operator,
             acknowledgeBlockedRetry: params.acknowledgeBlockedRetry === true,
           });
@@ -2189,6 +2203,49 @@ async function handleRequest(req, res) {
             program: resolveRunner().program,
             args: [...resolveRunner().args, "fleet-recover", "--queue-dir", FLEET_QUEUE_DIR],
             label: `${resolveRunner().label} fleet-recover --queue-dir ${FLEET_QUEUE_DIR}`,
+          };
+          break;
+        case "quarantine-retry":
+          commandSpec = {
+            program: resolveRunner().program,
+            args: [
+              ...resolveRunner().args,
+              "fleet-retry-quarantine", "--queue-dir", FLEET_QUEUE_DIR,
+              "--wiki", wiki, "--task-id", params.taskId,
+            ],
+            label: `${resolveRunner().label} fleet-retry-quarantine --queue-dir ${FLEET_QUEUE_DIR} --wiki ${wiki} --task-id ${params.taskId}`,
+          };
+          break;
+        case "publication-recovery-audit":
+          commandSpec = {
+            program: resolveRunner().program,
+            args: [
+              ...resolveRunner().args,
+              "--data-dir", DATA_DIR, "--output-dir", OUTPUT_DIR, "--run-id", runId,
+              "publication-recovery-audit", "--site-dist-dir", path.join(ROOT, "site", "dist"),
+              "--report", path.join(OUTPUT_DIR, "_admin", "publication-recovery-audit.json"),
+            ],
+            label: `${resolveRunner().label} publication-recovery-audit`,
+          };
+          break;
+        case "publication-preflight":
+          commandSpec = {
+            program: resolveRunner().program,
+            args: [
+              ...resolveRunner().args,
+              "--data-dir", DATA_DIR, "--output-dir", OUTPUT_DIR, "--run-id", runId,
+              "publication-preflight", "--lifecycle", WIKI_LIFECYCLE_PATH,
+              "--site-dist-dir", path.join(ROOT, "site", "dist"),
+              "--report", path.join(OUTPUT_DIR, "_admin", "publication-preflight.json"),
+            ],
+            label: `${resolveRunner().label} publication-preflight`,
+          };
+          break;
+        case "artifact-scrub":
+          commandSpec = {
+            program: "bash",
+            args: [path.join(ROOT, "deploy", "toolforge", "run-artifact-scrub.sh")],
+            label: "deploy/toolforge/run-artifact-scrub.sh",
           };
           break;
         case "patrol-fetch":

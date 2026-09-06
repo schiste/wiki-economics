@@ -105,6 +105,9 @@ test("operational truth separates a healthy publication from a failed newer cand
     failingStage: "source_window",
     error: "workload profile Large has not completed production qualification",
     exitCode: 1,
+    stages: [{stage: "snapshot_validate", state: "succeeded", durationMs: 93}],
+    memoryPeakBytes: 1024,
+    cpu: {usageUsec: 5000, throttledUsec: 0},
   });
   writeJson(path.join(outputDir, "publication-gate.json"), {
     schema_version: 8,
@@ -147,6 +150,9 @@ test("operational truth separates a healthy publication from a failed newer cand
   });
   assert.equal(result.wikis.nlwiki.metrics.published.complete, true);
   assert.equal(result.wikis.nlwiki.metrics.candidate.complete, true);
+  assert.equal(result.wikis.nlwiki.candidate.stages[0].durationMs, 93);
+  assert.equal(result.wikis.nlwiki.candidate.remediationCode, "workload_profile_unqualified");
+  assert.deepEqual(result.wikis.nlwiki.allowedActions, []);
 });
 
 test("metric completeness is exact and names every missing registered metric", (t) => {
@@ -191,3 +197,53 @@ test("latest completed snapshot requires both the plan and remote inventory", (t
   });
   assert.deepEqual(completedSnapshots(dataDir, "nlwiki"), ["2026-07"]);
 });
+
+test("publication preflight is current only while it names the indexed candidate", (t) => {
+  const {root, dataDir, outputDir} = fixture(t);
+  const policy = lifecycle();
+  completedSnapshot(dataDir, "nlwiki", "2026-08");
+  readyIndex(outputDir, "nlwiki", "2026-08");
+  writeJson(path.join(outputDir, "publication-gate.json"), {
+    schema_version: 8,
+    run_id: "publish-july",
+    selected_snapshot_versions: {nlwiki: "2026-07"},
+    cutoff_dates: {nlwiki: "2026-08"},
+    metrics: {
+      gdp: {wikis: {nlwiki: {rows: 12, minimum_date: "2001-01", maximum_date: "2026-08"}}},
+      patrol: {wikis: {nlwiki: {rows: 5, minimum_date: "2001-01", maximum_date: "2026-08"}}},
+    },
+  });
+  writeJson(path.join(outputDir, "_admin", "publication-preflight.json"), {
+    schema_version: 1,
+    generated_at_unix: 1,
+    eligible: true,
+    wikis: [{wiki: "nlwiki", candidate_run_id: "ready-run"}],
+    changed: [{wiki: "nlwiki", family: "monthly"}],
+    reused: [],
+  });
+  const current = buildOperationalTruth({
+    root, dataDir, outputDir, lifecycle: policy,
+    freshness: {status: "healthy", alerts: [], summary: {}},
+    fleet: {work: []}, adminOperations: {counts: {}}, scheduledRefresh: {last: null},
+  });
+  assert.equal(current.public.publication.preflight.current, true);
+  current.wikis.nlwiki.ready.run_id = "different";
+
+  writeJson(path.join(outputDir, "_ready-index", "nlwiki.json"), {
+    ...readJsonFixture(path.join(outputDir, "_ready-index", "nlwiki.json")),
+    newest_valid_ready: {
+      ...readJsonFixture(path.join(outputDir, "_ready-index", "nlwiki.json")).newest_valid_ready,
+      run_id: "different",
+    },
+  });
+  const stale = buildOperationalTruth({
+    root, dataDir, outputDir, lifecycle: policy,
+    freshness: {status: "healthy", alerts: [], summary: {}},
+    fleet: {work: []}, adminOperations: {counts: {}}, scheduledRefresh: {last: null},
+  });
+  assert.equal(stale.public.publication.preflight.current, false);
+});
+
+function readJsonFixture(file) {
+  return JSON.parse(fs.readFileSync(file, "utf8"));
+}

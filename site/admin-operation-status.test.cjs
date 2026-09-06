@@ -2,7 +2,7 @@
 
 const assert = require("node:assert/strict");
 const test = require("node:test");
-const {stripAnsi, summarizeOperationLog} = require("./admin-operation-status.cjs");
+const {classifyError, stripAnsi, summarizeOperationLog} = require("./admin-operation-status.cjs");
 
 test("operation summaries expose bounded source-window progress in human terms", () => {
   const log = [
@@ -107,4 +107,17 @@ test("operation summaries stop retry loops for compute without patrol sources", 
   assert.equal(summary.retryable, false);
   assert.equal(summary.remediationCode, "patrol_source_missing");
   assert.match(summary.remediation, /Patrol refresh/);
+});
+
+test("failure diagnoses prescribe only evidence-backed recovery paths", () => {
+  assert.deepEqual(classifyError("workload profile Large has not completed production qualification"), {
+    errorSummary: "The selected workload profile has not passed production qualification for this workload.",
+    retryable: false,
+    remediationCode: "workload_profile_unqualified",
+    remediation: "Run the profile qualification with measured memory, scratch, duration, and deterministic-output evidence before retrying this project.",
+  });
+  assert.equal(classifyError("publication receipt and site generation disagree").remediationCode, "publication_evidence_mismatch");
+  assert.equal(classifyError("worker lease heartbeat expired").remediationCode, "fleet_lease_stale");
+  assert.equal(classifyError("automatic retries exhausted").remediationCode, "fleet_task_quarantined");
+  assert.equal(classifyError("No space left on device").remediationCode, "storage_reserve_exhausted");
 });

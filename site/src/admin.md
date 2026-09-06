@@ -34,9 +34,20 @@ const jobStatus = Mutable(null)
 const authState = Mutable({enabled: false, authenticated: true, loginUrl: null, logoutUrl: null, user: null})
 const liveManifest = Mutable(initialManifest)
 const selectedWikiState = Mutable(null)
+const initialRunId = typeof location !== "undefined" ? new URL(location.href).searchParams.get("run") : null
+const selectedRunState = Mutable(initialRunId)
 function setSelectedWiki(value, userInitiated = true) {
   if (userInitiated) adminUiState.selectedWikiUser = true
   selectedWikiState.value = value
+}
+function setSelectedRun(value) {
+  selectedRunState.value = value || null
+  if (typeof history !== "undefined" && typeof location !== "undefined") {
+    const url = new URL(location.href)
+    if (value) url.searchParams.set("run", value)
+    else url.searchParams.delete("run")
+    history.replaceState(null, "", url)
+  }
 }
 const adminUiState = globalThis.__wikiEconAdminState ??= {
   showRunningLog: false,
@@ -245,6 +256,7 @@ async function runCommand(action, wikiOrOptions = null) {
       ...(options.wiki ? {wiki: options.wiki} : {}),
       ...(requestedVersion ? {version: requestedVersion} : {}),
       ...(options.requestId ? {requestId: options.requestId} : {}),
+      ...(options.taskId ? {taskId: options.taskId} : {}),
       ...(options.mode ? {mode: options.mode} : {}),
       ...(options.resourceClass ? {resourceClass: options.resourceClass} : {}),
       ...(options.acknowledgeBlockedRetry ? {acknowledgeBlockedRetry: true} : {})
@@ -306,6 +318,10 @@ function actionLabel(action) {
     case "publish": return "publish candidates"
     case "site": return "rebuild site"
     case "fleet-recover": return "recover fleet"
+    case "quarantine-retry": return "retry quarantined task"
+    case "publication-recovery-audit": return "audit publication recovery"
+    case "publication-preflight": return "run publication preflight"
+    case "artifact-scrub": return "scrub published artifacts"
     case "recover-admin": return "recover operator queue"
     case "qualify": return "qualify project"
     case "register-wiki": return "add project"
@@ -339,6 +355,14 @@ function actionTooltip(action) {
       return "Rebuild and validate only the website against the currently published data."
     case "fleet-recover":
       return "Reclaim stale fleet leases and requeue recoverable work without touching healthy tasks."
+    case "quarantine-retry":
+      return "Requeue one exact authenticated fleet task after its failure cause has been corrected."
+    case "publication-recovery-audit":
+      return "Audit interrupted publication transactions without changing production state."
+    case "publication-preflight":
+      return "Authenticate ready candidates and show the exact wiki-by-family change plan without publishing."
+    case "artifact-scrub":
+      return "Sequentially rehash and semantically verify every published artifact."
     case "recover-admin":
       return "Requeue an operator operation only after its dedicated worker heartbeat has been stale for ten minutes."
     case "qualify":
@@ -657,8 +681,17 @@ const activityRows = [
     source: "fleet",
     stage: entry.state === "queued" ? "waiting for worker" : "candidate preparation"
   })),
-  ...(adminRuns.recent || []).map((entry) => ({...entry, source: "operator"}))
+  ...(adminRuns.recent || []).map((entry) => ({...entry, source: "operator"})),
+  ...Object.values(operationalWikiTruth)
+    .filter((entry) => entry?.candidate)
+    .map((entry) => ({...entry.candidate, wiki: entry.wiki, source: "candidate receipt"}))
 ]
+  .map((entry) => {
+    const durable = entry.runId
+      ? Object.values(operationalWikiTruth).find((truth) => truth?.candidate?.runId === entry.runId)?.candidate
+      : null
+    return durable ? {...entry, ...durable, log: entry.log || durable.log || []} : entry
+  })
   .filter((entry, index, rows) => {
     const identity = entry.runId
       ? `run:${entry.runId}`
@@ -687,8 +720,10 @@ display(activityRows.length
   ? html`<div class="admin-activity-ledger">
       ${activityRows.map((operation) => html`<button
         class="admin-activity-row ${operationTone(operation.state)}"
-        onclick=${() => { if (operation.wiki) setSelectedWiki(operation.wiki) }}
-        ?disabled=${!operation.wiki}
+        onclick=${() => {
+          if (operation.wiki) setSelectedWiki(operation.wiki)
+          setSelectedRun(operation.runId || operation.taskId || null)
+        }}
       >
         <span class="admin-activity-state">${operationLabel(operation.state)}</span>
         <span class="admin-activity-main">
@@ -700,6 +735,85 @@ display(activityRows.length
       </button>`)}
     </div>`
   : html`<div class="admin-empty-state"><strong>No recent operator activity.</strong><span>Scheduled and manual runs will appear here as soon as they are queued.</span></div>`)
+```
+
+```js
+const selectedRunId = selectedRunState
+const selectedRun = activityRows.find((entry) => (entry.runId || entry.taskId) === selectedRunId) || null
+const selectedRunTruth = selectedRun?.wiki ? operationalWikiTruth[selectedRun.wiki] || null : null
+
+function bytesLabel(value) {
+  if (!Number.isFinite(Number(value))) return "—"
+  const bytes = Number(value)
+  if (bytes >= 1024 ** 3) return `${(bytes / 1024 ** 3).toFixed(2)} GiB`
+  if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(1)} MiB`
+  return `${bytes.toLocaleString()} B`
+}
+
+function durationLabel(value) {
+  if (!Number.isFinite(Number(value))) return "—"
+  const seconds = Number(value) / 1000
+  if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)}s`
+  const minutes = Math.floor(seconds / 60)
+  return `${minutes}m ${Math.round(seconds % 60)}s`
+}
+
+function runStages(run) {
+  if (Array.isArray(run?.stages) && run.stages.length) return run.stages
+  return Object.entries(run?.stageDurationsMs || {}).map(([stage, durationMs]) => ({
+    stage, durationMs, state: stage === run?.failingStage ? "failed" : "succeeded"
+  }))
+}
+
+async function executeAllowedAction(action) {
+  if (action.confirmation && !confirm(action.confirmation)) return
+  await runCommand(action.id, {
+    wiki: action.wiki || selectedRun?.wiki || null,
+    taskId: action.taskId || selectedRun?.taskId || null,
+    acknowledgeBlockedRetry: Boolean(action.acknowledgeBlockedRetry)
+  })
+}
+```
+
+```js
+selectedRun ? display(html`<section class="admin-run-sheet" aria-label="Run details">
+  <header class="admin-run-sheet-header">
+    <div>
+      <span class="admin-run-sheet-state ${operationTone(selectedRun.state)}">${operationLabel(selectedRun.state)}</span>
+      <h3>${selectedRun.wiki ? wikipediaProjectLabel(selectedRun.wiki) : "Global operation"}</h3>
+      <code>${selectedRun.runId || selectedRun.taskId}</code>
+    </div>
+    <button class="admin-btn small" onclick=${() => setSelectedRun(null)}>Close details</button>
+  </header>
+  <div class="admin-run-facts">
+    <div><span>Snapshot</span><strong>${selectedRun.selectedSnapshot || selectedRun.snapshot || "—"}</strong></div>
+    <div><span>Elapsed</span><strong>${selectedRun.durationSecs != null ? durationLabel(selectedRun.durationSecs * 1000) : "—"}</strong></div>
+    <div><span>Memory peak</span><strong>${bytesLabel(selectedRun.memoryPeakBytes)}</strong><small>${selectedRun.memoryLimitBytes ? ` of ${bytesLabel(selectedRun.memoryLimitBytes)}` : ""}</small></div>
+    <div><span>Disk free</span><strong>${bytesLabel(selectedRun.disk?.freeBytes)}</strong></div>
+    <div><span>CPU time</span><strong>${selectedRun.cpu?.usageUsec ? durationLabel(selectedRun.cpu.usageUsec / 1000) : "—"}</strong><small>${selectedRun.cpu?.throttledUsec ? ` throttled ${durationLabel(selectedRun.cpu.throttledUsec / 1000)}` : ""}</small></div>
+    <div><span>Heartbeat</span><strong>${relativeTime(selectedRun.heartbeatAt || selectedRun.updatedAt)}</strong></div>
+  </div>
+  <div class="admin-run-timeline">
+    ${runStages(selectedRun).length ? runStages(selectedRun).map((stage) => html`<div class="admin-run-stage ${stage.state || "unknown"}">
+      <i aria-hidden="true"></i>
+      <div><strong>${stage.stage?.replaceAll("_", " ") || "stage"}</strong><span>${stage.reused ? "Reused" : stage.skipped ? "Skipped" : operationLabel(stage.state)}</span></div>
+      <time>${durationLabel(stage.durationMs)}</time>
+      ${stage.error ? html`<p>${stage.error}</p>` : ""}
+    </div>`) : html`<div class="admin-empty-state"><strong>No stage receipt was recorded.</strong><span>The operation log remains available below.</span></div>`}
+  </div>
+  ${selectedRun.errorSummary || selectedRun.error ? html`<div class="admin-run-diagnosis">
+    <span>Diagnosis</span>
+    <strong>${selectedRun.errorSummary || selectedRun.error}</strong>
+    <p>${selectedRun.remediation || "Review the recorded evidence before retrying."}</p>
+    <div class="admin-dossier-actions">
+      ${(selectedRunTruth?.allowedActions || []).length
+        ? selectedRunTruth.allowedActions.map((action) => html`<button class="admin-btn ${action.id === "quarantine-retry" ? "danger" : ""}" ?disabled=${!apiStatus} onclick=${() => executeAllowedAction(action)}>${action.label}</button>`)
+        : html`<span class="admin-action-blocked">No automated action is safe for this diagnosis.</span>`}
+    </div>
+  </div>` : ""}
+  ${selectedRun.provenance ? html`<details class="admin-run-provenance"><summary>Build provenance</summary><pre>${JSON.stringify(selectedRun.provenance, null, 2)}</pre></details>` : ""}
+  ${(selectedRun.log || []).length ? html`<details class="admin-run-provenance"><summary>Operation log</summary><pre>${(selectedRun.log || []).join("")}</pre></details>` : ""}
+</section>`) : display(html`<span></span>`)
 ```
 
 </div>
@@ -779,6 +893,14 @@ const operationalAlerts = [
   ...(operationalTruth.pipeline?.issues || []).map((alert) => ({...alert, domain: "Pipeline"})),
   ...(operationalTruth.infrastructure?.issues || []).map((alert) => ({...alert, domain: "Infrastructure"}))
 ].sort((left, right) => (left.severity === "critical" ? 0 : 1) - (right.severity === "critical" ? 0 : 1))
+const publicationOps = operationalTruth.public?.publication || {}
+const publicationPreflight = publicationOps.preflight || null
+const preflightCanPublish = Boolean(publicationPreflight?.eligible && publicationPreflight?.current)
+const displayedChangePlan = publicationPreflight?.current
+  ? {changed: publicationPreflight.changed || [], reused: publicationPreflight.reused || [], source: "Current preflight"}
+  : publicationOps.currentChangePlan
+    ? {...publicationOps.currentChangePlan, source: "Last publication"}
+    : null
 ```
 
 ```js
@@ -815,14 +937,30 @@ display(html`<div class="admin-refresh-panel">
     ${operationalAlerts.length > 10 ? html`<span>${operationalAlerts.length - 10} more operational alerts. Filter the project list to inspect each one.</span>` : ""}
   </div>` : html`<div class="admin-health-clear">Published data, update pipeline, and configured infrastructure checks pass.</div>`}
   <div class="admin-publication-actions">
-    <button class="admin-btn primary" ?disabled=${!apiStatus} title=${actionTooltipWithApi("publish", apiStatus)} onclick=${() => {
+    <button class="admin-btn" ?disabled=${!apiStatus} title=${actionTooltipWithApi("publication-preflight", apiStatus)} onclick=${() => runCommand("publication-preflight")}>Run publication preflight</button>
+    <button class="admin-btn primary" ?disabled=${!apiStatus || !preflightCanPublish} title=${preflightCanPublish ? actionTooltipWithApi("publish", apiStatus) : "Run a current, passing publication preflight first."} onclick=${() => {
       if (confirm("Publish every validated ready candidate and atomically switch the live site?")) runCommand("publish")
     }}>Publish ready candidates</button>
     <button class="admin-btn" ?disabled=${!apiStatus} title=${actionTooltipWithApi("site", apiStatus)} onclick=${() => {
       if (confirm("Rebuild and validate only the website against the current publication?")) runCommand("site")
     }}>Rebuild site only</button>
-    <details class="admin-inline-advanced"><summary>Advanced</summary><button class="admin-btn" ?disabled=${!apiStatus} title=${actionTooltipWithApi("merge", apiStatus)} onclick=${() => runCommand("merge")}>Regenerate merged artifacts only</button></details>
+    <details class="admin-inline-advanced"><summary>Recovery and verification</summary><div class="admin-recovery-actions">
+      <button class="admin-btn" ?disabled=${!apiStatus} title=${actionTooltipWithApi("publication-recovery-audit", apiStatus)} onclick=${() => runCommand("publication-recovery-audit")}>Audit publication recovery</button>
+      <button class="admin-btn" ?disabled=${!apiStatus} title=${actionTooltipWithApi("fleet-recover", apiStatus)} onclick=${() => { if (confirm("Authenticate stale fleet leases and requeue recoverable work?")) runCommand("fleet-recover") }}>Recover stale fleet leases</button>
+      <button class="admin-btn" ?disabled=${!apiStatus} title=${actionTooltipWithApi("artifact-scrub", apiStatus)} onclick=${() => { if (confirm("Sequentially rehash and semantically verify every published artifact?")) runCommand("artifact-scrub") }}>Scrub published artifacts</button>
+      <button class="admin-btn" ?disabled=${!apiStatus} title=${actionTooltipWithApi("merge", apiStatus)} onclick=${() => runCommand("merge")}>Regenerate merged artifacts only</button>
+    </div></details>
   </div>
+  <section class="admin-preflight ${publicationPreflight?.eligible ? "eligible" : publicationPreflight ? "blocked" : "missing"}">
+    <header><div><span>Publication preflight</span><strong>${publicationPreflight ? publicationPreflight.current ? publicationPreflight.eligible ? "Ready to publish" : "Blocked" : "Out of date" : "Not run"}</strong></div>${publicationPreflight ? html`<time>${relativeTime(new Date(publicationPreflight.generated_at_unix * 1000).toISOString())}</time>` : ""}</header>
+    ${publicationPreflight?.blockers?.length ? html`<ul>${publicationPreflight.blockers.map((blocker) => html`<li>${blocker}</li>`)}</ul>` : publicationPreflight?.eligible ? html`<p>Ready candidates, recovery state, scrub state, and current publication evidence passed.</p>` : html`<p>Run preflight to authenticate the candidate set and unlock publication.</p>`}
+    ${displayedChangePlan ? html`<details open><summary>${displayedChangePlan.source} change plan · ${displayedChangePlan.changed?.length || 0} changed · ${displayedChangePlan.reused?.length || 0} reused</summary>
+      <div class="admin-change-plan">
+        <div><strong>Will rebuild</strong>${displayedChangePlan.changed?.length ? html`<ul>${displayedChangePlan.changed.map((item) => html`<li><code>${item.wiki}</code><span>${item.family}</span></li>`)}</ul>` : html`<p>No metric family changes.</p>`}</div>
+        <div><strong>Will reuse</strong>${displayedChangePlan.reused?.length ? html`<ul>${displayedChangePlan.reused.map((item) => html`<li><code>${item.wiki}</code><span>${item.family}</span></li>`)}</ul>` : html`<p>No reusable families reported.</p>`}</div>
+      </div>
+    </details>` : ""}
+  </section>
   ${refreshHistoryNewestFirst.length ? html`<details class="admin-history-details"><summary>Publication history (${refreshHistoryNewestFirst.length})</summary><table class="admin-refresh-history">
     <thead><tr><th>Started</th><th>Finished</th><th>Result</th><th>Duration</th><th>Peak memory</th><th>Wikis</th></tr></thead>
     <tbody>
@@ -1048,6 +1186,8 @@ function pipelineDossier(name, wiki, state, lifecycle, direct, fleetWork, plan) 
   const progress = direct?.progress || null
   const progressPercent = Number.isFinite(progress?.percent) ? progress.percent : null
   const stoppedWithExplanation = direct?.errorSummary && ["failed", "interrupted", "quarantined", "waiting_upstream"].includes(state)
+  const failureState = ["failed", "interrupted", "quarantined", "stalled"].includes(state)
+  const allowedActions = operationalWikiTruth[name]?.allowedActions || []
   return html`<section class="admin-pipeline-dossier" aria-label=${`${name} pipeline details`}>
     <div class="admin-dossier-lead ${operationTone(state)}">
       <span class="admin-command-kicker">${statusLabels[state] || operationLabel(state)}</span>
@@ -1076,7 +1216,10 @@ function pipelineDossier(name, wiki, state, lifecycle, direct, fleetWork, plan) 
     <div class="admin-dossier-actions">
       ${!lifecycle ? html`<button class="admin-btn primary" ?disabled=${!apiStatus} onclick=${() => {
         if (confirm(`Add ${name} as a publication-invisible qualification project?`)) registerWiki(name, "qualification", "medium_large")
-      }}>Add as qualification</button>` : html`
+      }}>Add as qualification</button>` : failureState ? html`
+        ${allowedActions.length ? allowedActions.map((action) => html`<button class="admin-btn ${action.id === "quarantine-retry" ? "danger" : ""}" ?disabled=${!apiStatus} onclick=${() => executeAllowedAction({...action, wiki: action.wiki || name, taskId: action.taskId || fleetWork?.taskId})}>${action.label}</button>`) : html`<span class="admin-action-blocked">No automated retry is safe. Complete the stated remediation first.</span>`}
+        ${direct?.requestId && state === "stalled" ? html`<button class="admin-btn" ?disabled=${!apiStatus} onclick=${() => runCommand("recover-admin")}>Recover operator queue</button>` : ""}
+      ` : html`
         <button class="admin-btn primary" ?disabled=${!apiStatus || operationActive}
           onclick=${() => {
             const blocked = direct?.state === "failed" && direct?.retryable === false
@@ -1093,7 +1236,6 @@ function pipelineDossier(name, wiki, state, lifecycle, direct, fleetWork, plan) 
           ? html`<button class="admin-btn" ?disabled=${!apiStatus || operationActive} onclick=${() => runCommand("qualify", {wiki: name, version: preferredSnapshotVersion()})}>Resume when patrol is ready</button>`
           : html`<button class="admin-btn" ?disabled=${!apiStatus || operationActive} onclick=${() => runCommand("patrol-rebuild", name)}>Refetch and rebuild patrol</button>`}
         <button class="admin-btn" ?disabled=${!apiStatus} onclick=${() => runCommand("cleanup", name)}>Clean stale staging</button>`}
-      ${["stalled", "quarantined"].includes(state) ? html`<button class="admin-btn" ?disabled=${!apiStatus} onclick=${() => runCommand(direct?.requestId ? "recover-admin" : "fleet-recover")}>${direct?.requestId ? "Recover operator queue" : "Recover fleet lease"}</button>` : ""}
       ${operationActive ? html`<button class="admin-btn danger" ?disabled=${!apiStatus} onclick=${() => runCommand("cancel", {requestId: direct?.requestId, wiki: name})}>Cancel operation</button>` : ""}
     </div>
     ${lifecycle ? html`<details class="admin-advanced-actions"><summary>Advanced stage controls</summary><div>
@@ -2464,6 +2606,59 @@ currentManifest.merged.length > 0
 .admin-health-clear { padding: 0.65rem 0.8rem; border-left: 3px solid #2e7d32; color: #2e7d32; font-size: 0.76rem; font-weight: 700; }
 .admin-history-details { margin-top: 0.25rem; }
 .admin-history-details summary { cursor: pointer; color: var(--theme-foreground-muted); font-size: 0.74rem; font-weight: 700; }
+.admin-run-sheet { margin-top: 1rem; border-block: 1px solid var(--theme-foreground-faintest); background: color-mix(in srgb, var(--theme-background) 96%, #dfe9f3 4%); }
+.admin-run-sheet-header { display: flex; justify-content: space-between; gap: 1rem; padding: 1rem; border-bottom: 1px solid var(--theme-foreground-faintest); }
+.admin-run-sheet-header > div { display: grid; gap: 0.2rem; min-width: 0; }
+.admin-run-sheet-header h3 { margin: 0; font-size: 1.05rem; }
+.admin-run-sheet-header code { overflow: hidden; color: var(--theme-foreground-muted); font-size: 0.68rem; text-overflow: ellipsis; }
+.admin-run-sheet-state { width: fit-content; color: #607d8b; font-size: 0.68rem; font-weight: 800; }
+.admin-run-sheet-state.danger { color: #c13c32; }
+.admin-run-sheet-state.active { color: #315b8a; }
+.admin-run-sheet-state.success { color: #2e7d32; }
+.admin-run-facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); border-bottom: 1px solid var(--theme-foreground-faintest); }
+.admin-run-facts > div { display: grid; gap: 0.12rem; padding: 0.72rem 0.85rem; border-left: 1px solid var(--theme-foreground-faintest); }
+.admin-run-facts > div:nth-child(3n + 1) { border-left: 0; }
+.admin-run-facts span { color: var(--theme-foreground-muted); font-size: 0.62rem; font-weight: 700; }
+.admin-run-facts strong { font-size: 0.78rem; }
+.admin-run-facts small { color: var(--theme-foreground-muted); font-size: 0.65rem; }
+.admin-run-timeline { position: relative; padding: 0.6rem 1rem; }
+.admin-run-stage { display: grid; grid-template-columns: 0.85rem minmax(10rem, 1fr) 5rem; gap: 0.6rem; align-items: start; min-height: 2.8rem; }
+.admin-run-stage > i { position: relative; width: 0.62rem; height: 0.62rem; margin-top: 0.28rem; border: 2px solid #738091; border-radius: 50%; background: var(--theme-background); }
+.admin-run-stage:not(:last-child) > i::after { position: absolute; top: 0.72rem; left: 0.18rem; width: 1px; height: 2rem; background: var(--theme-foreground-faintest); content: ""; }
+.admin-run-stage.succeeded > i { border-color: #2e7d32; background: #2e7d32; }
+.admin-run-stage.failed > i { border-color: #c13c32; background: #c13c32; }
+.admin-run-stage.running > i { border-color: #315b8a; background: #315b8a; }
+.admin-run-stage > div { display: grid; }
+.admin-run-stage strong { font-size: 0.76rem; }
+.admin-run-stage span, .admin-run-stage time { color: var(--theme-foreground-muted); font-size: 0.66rem; }
+.admin-run-stage p { grid-column: 2 / -1; margin: 0 0 0.75rem; color: #c13c32; font-size: 0.7rem; }
+.admin-run-diagnosis { display: grid; gap: 0.3rem; padding: 0.9rem 1rem; border-top: 1px solid var(--theme-foreground-faintest); border-left: 4px solid #c13c32; }
+.admin-run-diagnosis > span { color: #c13c32; font-size: 0.65rem; font-weight: 800; }
+.admin-run-diagnosis > strong { max-width: 72ch; font-size: 0.85rem; }
+.admin-run-diagnosis > p { max-width: 72ch; margin: 0; color: var(--theme-foreground-muted); font-size: 0.74rem; }
+.admin-action-blocked { align-self: center; color: var(--theme-foreground-muted); font-size: 0.72rem; }
+.admin-run-provenance { padding: 0.7rem 1rem; border-top: 1px solid var(--theme-foreground-faintest); }
+.admin-run-provenance summary { cursor: pointer; font-size: 0.72rem; font-weight: 700; }
+.admin-run-provenance pre { max-height: 24rem; overflow: auto; font-size: 0.68rem; white-space: pre-wrap; }
+.admin-inline-advanced > div, .admin-recovery-actions { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.5rem; }
+.admin-preflight { border-top: 1px solid var(--theme-foreground-faintest); border-left: 4px solid #738091; }
+.admin-preflight.eligible { border-left-color: #2e7d32; }
+.admin-preflight.blocked { border-left-color: #c13c32; }
+.admin-preflight > header { display: flex; justify-content: space-between; gap: 1rem; padding: 0.75rem 0.9rem; }
+.admin-preflight > header > div { display: grid; }
+.admin-preflight > header span, .admin-preflight > header time { color: var(--theme-foreground-muted); font-size: 0.65rem; }
+.admin-preflight > header strong { font-size: 0.82rem; }
+.admin-preflight > p, .admin-preflight > ul { margin: 0; padding: 0 0.9rem 0.75rem; font-size: 0.72rem; }
+.admin-preflight > ul { padding-left: 2rem; color: #c13c32; }
+.admin-preflight details { border-top: 1px solid var(--theme-foreground-faintest); }
+.admin-preflight summary { padding: 0.65rem 0.9rem; cursor: pointer; font-size: 0.7rem; font-weight: 700; }
+.admin-change-plan { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-top: 1px solid var(--theme-foreground-faintest); }
+.admin-change-plan > div { padding: 0.75rem 0.9rem; border-left: 1px solid var(--theme-foreground-faintest); }
+.admin-change-plan > div:first-child { border-left: 0; }
+.admin-change-plan > div > strong { font-size: 0.72rem; }
+.admin-change-plan ul { display: grid; grid-template-columns: repeat(auto-fill, minmax(10rem, 1fr)); gap: 0.25rem 0.8rem; padding: 0; list-style: none; }
+.admin-change-plan li { display: flex; justify-content: space-between; gap: 0.5rem; font-size: 0.68rem; }
+.admin-change-plan li span, .admin-change-plan p { color: var(--theme-foreground-muted); }
 [data-theme="dark"] .admin-command-header { --admin-ink: #d7e2ee; background: color-mix(in srgb, var(--theme-background) 96%, #26384c 4%); }
 @media (prefers-reduced-motion: reduce) {
   .admin-stage-rail > i.active,
@@ -2504,6 +2699,14 @@ currentManifest.merged.length > 0
   .admin-wiki-focus > div:nth-child(3) { border-left: 0; }
   .admin-wiki-focus > div:nth-child(n+3) { border-top: 1px solid var(--theme-foreground-faintest); }
   .admin-run-evidence > div:first-child { display: grid; }
+  .admin-run-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .admin-run-facts > div:nth-child(3n + 1) { border-left: 1px solid var(--theme-foreground-faintest); }
+  .admin-run-facts > div:nth-child(odd) { border-left: 0; }
+  .admin-run-sheet-header { align-items: start; }
+  .admin-run-stage { grid-template-columns: 0.85rem minmax(0, 1fr) 4rem; }
+  .admin-change-plan { grid-template-columns: 1fr; }
+  .admin-change-plan > div { border-left: 0; border-top: 1px solid var(--theme-foreground-faintest); }
+  .admin-change-plan > div:first-child { border-top: 0; }
   .pipeline-stage-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }

@@ -2,6 +2,7 @@
 
 const fs = require("node:fs");
 const path = require("node:path");
+const {classifyError} = require("./admin-operation-status.cjs");
 
 function readJson(file) {
   try {
@@ -144,7 +145,7 @@ function completeness(expected, present) {
 function normalizeCandidate(value) {
   if (!value) return null;
   const stage = value.currentStage || value.failingStage || null;
-  const unqualifiedProfile = /workload profile .* has not completed production qualification/i.test(value.error || "");
+  const failure = classifyError(value.error || null);
   return {
     state: value.state,
     action: "prepare",
@@ -159,19 +160,65 @@ function normalizeCandidate(value) {
     stageLabel: stage ? stage.replaceAll("_", " ") : null,
     failingStage: value.failingStage || null,
     error: value.error || null,
-    errorSummary: value.error || null,
-    retryable: unqualifiedProfile ? false : null,
-    remediation: unqualifiedProfile
-      ? "Qualify the selected workload profile in production or adjust the adaptive profile thresholds using measured capacity evidence before retrying."
-      : null,
+    errorSummary: failure.errorSummary,
+    retryable: failure.retryable,
+    remediationCode: failure.remediationCode,
+    remediation: failure.remediation,
     exitCode: value.exitCode ?? null,
     durationSecs: value.durationSecs ?? null,
     stageDurationsMs: value.stageDurationsMs || {},
+    stages: Array.isArray(value.stages) ? value.stages.map((stageEntry) => ({
+      stage: stageEntry.stage || null,
+      wiki: stageEntry.wiki || null,
+      state: stageEntry.state || "unknown",
+      startedAt: stageEntry.startedAt || null,
+      finishedAt: stageEntry.finishedAt || null,
+      durationMs: stageEntry.durationMs ?? null,
+      reused: Boolean(stageEntry.reused),
+      skipped: Boolean(stageEntry.skipped),
+      error: stageEntry.error || null,
+    })) : [],
+    reusedStages: Array.isArray(value.reusedStages) ? value.reusedStages : [],
+    skippedStages: Array.isArray(value.skippedStages) ? value.skippedStages : [],
+    memoryCurrentBytes: value.memoryCurrentBytes ?? null,
     memoryPeakBytes: value.memoryPeakBytes ?? null,
     memoryLimitBytes: value.memoryLimitBytes ?? null,
+    cpu: value.cpu || null,
     disk: value.disk || null,
+    provenance: value.provenance || null,
+    publication: value.publication || null,
+    publishedSiteGeneration: value.publishedSiteGeneration || null,
     logFile: value.logFile || null,
   };
+}
+
+function allowedFailureActions(candidate, fleetWork = null) {
+  const code = candidate?.remediationCode || null;
+  if (fleetWork?.state === "stalled" || code === "fleet_lease_stale") {
+    return [{id: "fleet-recover", label: "Recover stale lease", confirmation: "Authenticate stale leases and requeue recoverable work?"}];
+  }
+  if (fleetWork?.state === "quarantined" || code === "fleet_task_quarantined") {
+    return [{
+      id: "quarantine-retry",
+      label: "Retry quarantined task",
+      wiki: fleetWork?.wiki || null,
+      taskId: fleetWork?.taskId || null,
+      confirmation: "Retry this exact quarantined task after confirming its failure cause has been corrected?",
+    }];
+  }
+  if (code === "publication_evidence_mismatch") {
+    return [
+      {id: "publication-recovery-audit", label: "Audit publication recovery"},
+      {id: "artifact-scrub", label: "Scrub published artifacts", confirmation: "Run a complete sequential integrity scrub?"},
+    ];
+  }
+  if (code === "patrol_source_missing" || code === "patrol_semantic_failure") {
+    return [{id: "patrol-rebuild", label: "Rebuild patrol only", wiki: candidate?.wiki || null}];
+  }
+  if (candidate?.retryable === true) {
+    return [{id: "run", label: "Retry preparation", wiki: candidate?.wiki || null, acknowledgeBlockedRetry: false}];
+  }
+  return [];
 }
 
 function latestTimestamp(...values) {
@@ -190,6 +237,7 @@ function wikiOperationalTruth({wiki, definitions, lifecycle, dataDir, outputDir,
   const publishedCutoff = gate?.cutoff_dates?.[wiki] || null;
   const readySnapshot = index?.newest_valid_ready?.snapshot || null;
   const candidate = normalizeCandidate(status);
+  if (candidate) candidate.wiki = wiki;
   const latestAvailable = completed.at(-1) || readySnapshot || publishedSnapshot;
   const candidateTargetSnapshot = status?.selectedSnapshot || readySnapshot;
   const candidateReadyIds = readySnapshot && readySnapshot === candidateTargetSnapshot
@@ -268,6 +316,25 @@ function wikiOperationalTruth({wiki, definitions, lifecycle, dataDir, outputDir,
   };
 }
 
+function publicationOperations(outputDir, wikis, sourceIdentity = {}) {
+  const preflight = readJson(path.join(outputDir, "_admin", "publication-preflight.json"));
+  const recoveryAudit = readJson(path.join(outputDir, "_admin", "publication-recovery-audit.json"));
+  const changePlan = readJson(path.join(outputDir, "publication-change-plan.json"));
+  const validPreflight = preflight?.schema_version === 1 ? preflight : null;
+  const preflightCurrent = Boolean(validPreflight)
+    && (validPreflight.wikis || []).every((entry) => entry.candidate_run_id == null
+      || wikis?.[entry.wiki]?.ready?.run_id === entry.candidate_run_id)
+    && (!validPreflight.generating_commit || !sourceIdentity.sourceCommit
+      || validPreflight.generating_commit === sourceIdentity.sourceCommit)
+    && (!validPreflight.site_source_commit || !sourceIdentity.siteSourceCommit
+      || validPreflight.site_source_commit === sourceIdentity.siteSourceCommit);
+  return {
+    preflight: validPreflight ? {...validPreflight, current: preflightCurrent} : null,
+    recoveryAudit: recoveryAudit?.schema_version === 1 ? recoveryAudit : null,
+    currentChangePlan: changePlan?.schema_version === 1 ? changePlan : null,
+  };
+}
+
 function requestedMemoryForWork(work, capacity) {
   return capacity.resource_requests?.[work.resourceClass] || 0;
 }
@@ -313,7 +380,7 @@ function infrastructureTruth({capacity, fleet, adminOperations, scheduledRefresh
   };
 }
 
-function buildOperationalTruth({root, dataDir, outputDir, lifecycle, freshness, fleet, adminOperations, scheduledRefresh}) {
+function buildOperationalTruth({root, dataDir, outputDir, lifecycle, freshness, fleet, adminOperations, scheduledRefresh, sourceIdentity}) {
   const catalog = readJson(path.join(root, "config", "generated", "metric-catalog.json"));
   const definitions = metricDefinitions(catalog);
   const gate = publicationGate(outputDir);
@@ -331,6 +398,15 @@ function buildOperationalTruth({root, dataDir, outputDir, lifecycle, freshness, 
     || (fleet?.work || []).some((work) => ["running", "queued", "waiting_upstream"].includes(work.state));
   const capacity = readJson(path.join(root, "config", "toolforge-capacity.json"));
   const infrastructure = infrastructureTruth({capacity, fleet, adminOperations, scheduledRefresh});
+  const publication = publicationOperations(outputDir, wikis, sourceIdentity);
+  for (const wiki of Object.values(wikis)) {
+    const fleetWork = (fleet?.work || []).find((entry) => entry.wiki === wiki.wiki) || null;
+    if (wiki.candidate?.state === "failed" || ["stalled", "quarantined"].includes(fleetWork?.state)) {
+      wiki.allowedActions = allowedFailureActions(wiki.candidate, fleetWork);
+    } else {
+      wiki.allowedActions = [];
+    }
+  }
   const publicStatus = freshness?.status || (gate ? "healthy" : "unknown");
   const pipelineStatus = pipelineIssues.some((issue) => issue.severity === "critical")
     ? "degraded"
@@ -350,6 +426,7 @@ function buildOperationalTruth({root, dataDir, outputDir, lifecycle, freshness, 
       cutoffDates: gate?.cutoff_dates || {},
       scrub,
       alerts: freshness?.alerts || [],
+      publication,
     },
     pipeline: {status: pipelineStatus, issues: pipelineIssues},
     infrastructure,
@@ -362,5 +439,6 @@ module.exports = {
   completedSnapshots,
   expectedMetricsForWiki,
   infrastructureTruth,
+  allowedFailureActions,
   metricDefinitions,
 };

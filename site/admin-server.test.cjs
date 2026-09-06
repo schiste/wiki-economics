@@ -930,6 +930,23 @@ test("admin dispatcher patrol actions always fetch before compute", () => {
   assert.deepEqual(rebuild.args.slice(-3), ["patrol-refresh", "nlwiki", "--rebuild"]);
 });
 
+test("admin dispatcher maps fail-closed operational controls to typed commands", () => {
+  const dispatcherPath = require.resolve("../deploy/toolforge/admin-dispatcher.cjs");
+  delete require.cache[dispatcherPath];
+  const dispatcher = require(dispatcherPath);
+  const taskId = "a".repeat(64);
+
+  const preflight = dispatcher.commandFor({action: "publication-preflight", runId: "preflight-1"});
+  assert.ok(preflight.args.includes("publication-preflight"));
+  assert.ok(preflight.args.includes("--report"));
+  const audit = dispatcher.commandFor({action: "publication-recovery-audit", runId: "audit-1"});
+  assert.ok(audit.args.includes("publication-recovery-audit"));
+  const retry = dispatcher.commandFor({action: "quarantine-retry", wiki: "nlwiki", taskId, runId: "retry-1"});
+  assert.deepEqual(retry.args.slice(-4), ["--wiki", "nlwiki", "--task-id", taskId]);
+  const scrub = dispatcher.commandFor({action: "artifact-scrub", runId: "scrub-1"});
+  assert.match(scrub.args[0], /run-artifact-scrub\.sh$/);
+});
+
 test("admin dispatcher records upstream dump waits without reporting a pipeline defect", async (t) => {
   const operationRoot = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-admin-waiting-test-"));
   t.after(() => fs.rmSync(operationRoot, {recursive: true, force: true}));

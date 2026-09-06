@@ -35,3 +35,29 @@ test("project status shows available, candidate, and published snapshots togethe
   assert.match(source, /Published \/ cutoff/);
   assert.match(source, /Published \$\{snapshots\.published/);
 });
+
+test("admin run details expose timelines, resource evidence, and specific next actions", () => {
+  assert.match(source, /class="admin-run-sheet"/);
+  assert.match(source, /class="admin-run-timeline"/);
+  assert.match(source, />Memory peak</);
+  assert.match(source, />CPU time</);
+  assert.match(source, />Diagnosis</);
+  assert.match(source, /selectedRunTruth\.allowedActions/);
+  assert.match(source, /searchParams\.set\("run"/);
+});
+
+test("publication controls require a current preflight and expose the change plan", () => {
+  assert.match(source, />Run publication preflight</);
+  assert.match(source, /preflightCanPublish/);
+  assert.match(source, /Run a current, passing publication preflight first/);
+  assert.match(source, /class="admin-change-plan"/);
+  assert.match(source, />Will rebuild</);
+  assert.match(source, />Will reuse</);
+});
+
+test("recovery workbench exposes audit, fleet recovery, quarantine retry, and scrub", () => {
+  assert.match(source, />Audit publication recovery</);
+  assert.match(source, />Recover stale fleet leases</);
+  assert.match(source, />Scrub published artifacts</);
+  assert.match(source, /quarantine-retry/);
+});
