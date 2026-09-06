@@ -259,6 +259,12 @@ async function runCommand(action, wikiOrOptions = null) {
       ...(options.taskId ? {taskId: options.taskId} : {}),
       ...(options.mode ? {mode: options.mode} : {}),
       ...(options.resourceClass ? {resourceClass: options.resourceClass} : {}),
+      ...(options.operation ? {operation: options.operation} : {}),
+      ...(options.refresh ? {refresh: options.refresh} : {}),
+      ...(options.freshnessSlaDays != null ? {freshnessSlaDays: options.freshnessSlaDays} : {}),
+      ...(options.lifecycleRevision ? {lifecycleRevision: options.lifecycleRevision} : {}),
+      ...(options.qualificationRunId ? {qualificationRunId: options.qualificationRunId} : {}),
+      ...(options.candidateRunId ? {candidateRunId: options.candidateRunId} : {}),
       ...(options.acknowledgeBlockedRetry ? {acknowledgeBlockedRetry: true} : {})
     })
     const r = await fetch(`${API}/${action}`, {
@@ -298,7 +304,9 @@ async function runCommand(action, wikiOrOptions = null) {
 }
 
 async function registerWiki(wiki, mode, resourceClass, {start = false, version = null} = {}) {
-  const result = await runCommand(start ? "onboard-wiki" : "register-wiki", {wiki, mode, resourceClass, version})
+  const result = await runCommand(start ? "onboard-wiki" : "register-wiki", {
+    wiki, mode, resourceClass, version, lifecycleRevision
+  })
   if (!result?.registered) return
   setSelectedWiki(wiki)
   if (start && !result.queued && result.nextAction) {
@@ -326,6 +334,10 @@ function actionLabel(action) {
     case "qualify": return "qualify project"
     case "register-wiki": return "add project"
     case "onboard-wiki": return "add and start project"
+    case "update-lifecycle": return "update lifecycle policy"
+    case "promote-qualification": return "promote qualification"
+    case "retire-candidate": return "retire candidate"
+    case "rebuild-candidate": return "rebuild candidate"
     case "cleanup": return "cleanup"
     case "cancel": return "cancel"
     case "run": return "prepare update"
@@ -369,6 +381,14 @@ function actionTooltip(action) {
       return "Run fetch, ingest, compute, patrol, and validation as a publication-invisible qualification."
     case "register-wiki":
       return "Persist this project in the lifecycle registry before any data is downloaded."
+    case "update-lifecycle":
+      return "Atomically change scheduling, resource class, or freshness SLA and record the operator action."
+    case "promote-qualification":
+      return "Copy one exact validated qualification into a managed candidate, then update lifecycle policy only after that succeeds."
+    case "retire-candidate":
+      return "Retire one exact unpublished ready candidate. The active publication and rollback generation are protected."
+    case "rebuild-candidate":
+      return "Build a new immutable candidate for the exact snapshot without modifying the existing candidate or live publication."
     case "cleanup":
       return "Remove temporary files and invalid ingest markers for this wiki."
     case "cancel":
@@ -402,6 +422,9 @@ const auth = authState
 const currentManifest = liveManifest || initialManifest || {generated_at: "unknown", wikis: {}, merged: []}
 const currentWikis = currentManifest.wikis || {}
 const lifecycleStates = job?.wikiStates || currentManifest.lifecycle?.wikis || {}
+const lifecycleRevision = job?.lifecycleRevision || null
+const lifecycleAudit = job?.lifecycleAudit || {events: [], invalid: []}
+const qualifications = job?.qualifications || {}
 const refreshWikis = job?.refreshWikis || Object.entries(lifecycleStates).filter(([, state]) => state.refresh === "scheduled").map(([wiki]) => wiki)
 const publishedWikis = job?.publishedWikis || Object.entries(lifecycleStates).filter(([, state]) => state.publication === "published").map(([wiki]) => wiki)
 const wikiJobMap = job?.wikiJobs || {}
@@ -1286,6 +1309,103 @@ function evidenceItems(name, wiki, lifecycle, direct, fleetWork, plan) {
   ]
 }
 
+function typedOperatorConfirmation(summary, token) {
+  const entered = prompt(`${summary}\n\nType ${token} to continue.`)
+  return entered === token
+}
+
+function lifecycleControls(name, lifecycle, direct) {
+  if (!lifecycle) return ""
+  const truth = operationalWikiTruth[name] || {}
+  const operationActive = ["queued", "waiting_upstream", "running", "cancelling"].includes(direct?.state) || direct?.running
+  const registryBusy = Boolean(job?.running || adminOperations.counts?.running || adminOperations.counts?.queued)
+  const controlsDisabled = !apiStatus || operationActive || registryBusy || !lifecycleRevision
+  const resourceSelect = html`<select class="admin-lifecycle-select" aria-label=${`${name} resource class`}>
+    ${[
+      ["Small", "small"],
+      ["Medium / large", "medium_large"],
+      ["Isolated qualification", "isolated"]
+    ].map(([label, value]) => html`<option value=${value} selected=${(lifecycle.fleet_resource_class || "medium_large") === value}>${label}</option>`)}
+  </select>`
+  const slaInput = html`<input class="admin-lifecycle-number" type="number" min="1" max="365" step="1" value=${lifecycle.freshness_sla_days || 10} aria-label=${`${name} freshness SLA in days`}>`
+
+  if (lifecycle.publication === "hidden" && lifecycle.refresh === "qualification") {
+    const qualification = (qualifications[name] || []).find((entry) => entry.structurallyValid)
+    const refreshSelect = html`<select class="admin-lifecycle-select" aria-label=${`${name} schedule after promotion`}>
+      <option value="manual" selected>Manual updates</option>
+      <option value="scheduled">Scheduled updates</option>
+    </select>`
+    return html`<section class="admin-lifecycle-console qualification">
+      <header><div><span>Lifecycle decision</span><strong>Qualification remains invisible</strong></div><code>${lifecycleRevision?.slice(0, 12) || "no revision"}</code></header>
+      ${qualification ? html`
+        <div class="admin-lifecycle-evidence">
+          <div><span>Qualified snapshot</span><strong>${qualification.snapshot}</strong></div>
+          <div><span>Candidate identity</span><code>${qualification.runId}</code></div>
+          <div><span>Artifacts</span><strong>${qualification.artifactCount}</strong></div>
+          <div><span>Cutoff</span><strong>${qualification.cutoffDate || "not reported"}</strong></div>
+        </div>
+        <div class="admin-lifecycle-policy">${refreshSelect}${resourceSelect}${slaInput}</div>
+        <div class="admin-lifecycle-actions">
+          <button class="admin-btn primary" title=${actionTooltipWithApi("promote-qualification", apiStatus)} ?disabled=${controlsDisabled} onclick=${() => {
+            const token = `promote ${name}`
+            if (!typedOperatorConfirmation(`Promote qualification ${qualification.runId} at ${qualification.snapshot}. Lifecycle changes only after the immutable candidate is validated.`, token)) return
+            runCommand("promote-qualification", {
+              wiki: name,
+              version: qualification.snapshot,
+              qualificationRunId: qualification.runId,
+              lifecycleRevision,
+              refresh: refreshSelect.value,
+              resourceClass: resourceSelect.value,
+              freshnessSlaDays: Number(slaInput.value)
+            })
+          }}>Promote exact qualification</button>
+        </div>` : html`<p class="admin-lifecycle-empty">No structurally valid qualification receipt is available. Complete or resume qualification before promotion.</p>`}
+    </section>`
+  }
+
+  const ready = truth.ready || null
+  const active = truth.activePublished || null
+  const readyIsUnpublished = Boolean(ready?.run_id && ready.run_id !== active?.run_id)
+  const exactSnapshot = ready?.snapshot || truth.snapshots?.candidate || truth.snapshots?.published || null
+  const resumeSelect = html`<select class="admin-lifecycle-select" aria-label=${`${name} resume schedule`}>
+    <option value="scheduled" selected>Scheduled updates</option>
+    <option value="manual">Manual updates</option>
+  </select>`
+  return html`<section class="admin-lifecycle-console">
+    <header><div><span>Lifecycle policy</span><strong>${lifecycle.refresh === "paused" ? "Paused safely" : lifecycle.refresh === "scheduled" ? "Scheduled and managed" : "Operator-triggered"}</strong></div><code>${lifecycleRevision?.slice(0, 12) || "no revision"}</code></header>
+    <div class="admin-lifecycle-policy">
+      ${lifecycle.refresh === "paused" ? resumeSelect : html`<div class="admin-lifecycle-readonly"><span>Refresh</span><strong>${lifecycle.refresh}</strong></div>`}
+      ${resourceSelect}
+      ${slaInput}
+    </div>
+    <div class="admin-lifecycle-actions">
+      ${lifecycle.refresh === "paused" ? html`<button class="admin-btn primary" ?disabled=${controlsDisabled} onclick=${() => runCommand("update-lifecycle", {
+        wiki: name, operation: "resume", refresh: resumeSelect.value,
+        freshnessSlaDays: Number(slaInput.value), lifecycleRevision
+      })}>Resume scheduling</button>` : html`<button class="admin-btn" ?disabled=${controlsDisabled} onclick=${() => {
+        if (confirm(`Pause ${name} scheduling? Published data remains live and operator-triggered rebuilds remain available.`)) {
+          runCommand("update-lifecycle", {wiki: name, operation: "pause", lifecycleRevision})
+        }
+      }}>Pause scheduling</button>`}
+      <button class="admin-btn" ?disabled=${controlsDisabled} onclick=${() => runCommand("update-lifecycle", {
+        wiki: name, operation: "configure", resourceClass: resourceSelect.value,
+        freshnessSlaDays: Number(slaInput.value), lifecycleRevision
+      })}>Save resource &amp; SLA policy</button>
+      <button class="admin-btn" title=${actionTooltipWithApi("rebuild-candidate", apiStatus)} ?disabled=${!apiStatus || operationActive || !exactSnapshot} onclick=${() => {
+        const token = `rebuild ${name}`
+        if (!typedOperatorConfirmation(`Start a clean immutable rebuild of ${name} snapshot ${exactSnapshot}. The live and existing ready candidates will not be changed.`, token)) return
+        runCommand("rebuild-candidate", {wiki: name, version: exactSnapshot, candidateRunId: ready?.run_id || null})
+      }}>Rebuild exact snapshot</button>
+      ${readyIsUnpublished ? html`<button class="admin-btn danger" title=${actionTooltipWithApi("retire-candidate", apiStatus)} ?disabled=${!apiStatus || operationActive} onclick=${() => {
+        const token = `retire ${name}/${ready.run_id}`
+        if (!typedOperatorConfirmation(`Retire unpublished candidate ${ready.run_id} at ${ready.snapshot}. This cannot target the live or rollback generation.`, token)) return
+        runCommand("retire-candidate", {wiki: name, version: ready.snapshot, candidateRunId: ready.run_id})
+      }}>Retire unpublished candidate</button>` : ""}
+    </div>
+    <p class="admin-lifecycle-footnote">Policy writes use revision locking. Candidate actions use exact snapshot and run identities. Every request and result is retained in the operator audit ledger.</p>
+  </section>`
+}
+
 function pipelineDossier(name, wiki, state, lifecycle, direct, fleetWork, plan) {
   const canRun = Boolean(apiStatus && lifecycle)
   const isQualification = lifecycle?.publication === "hidden" && lifecycle?.refresh === "qualification"
@@ -1346,6 +1466,7 @@ function pipelineDossier(name, wiki, state, lifecycle, direct, fleetWork, plan) 
         <button class="admin-btn" ?disabled=${!apiStatus} onclick=${() => runCommand("cleanup", name)}>Clean stale staging</button>`}
       ${operationActive ? html`<button class="admin-btn danger" ?disabled=${!apiStatus} onclick=${() => runCommand("cancel", {requestId: direct?.requestId, wiki: name})}>Cancel operation</button>` : ""}
     </div>
+    ${lifecycleControls(name, lifecycle, direct)}
     ${lifecycle ? html`<details class="admin-advanced-actions"><summary>Advanced stage controls</summary><div>
       <button class="admin-btn" ?disabled=${!canRun || operationActive} onclick=${() => runCommand("fetch", {wiki: name, version: preferredSnapshotVersion()})}>Fetch history</button>
       <button class="admin-btn" ?disabled=${!canRun || operationActive} onclick=${() => runCommand("ingest", name)}>Ingest</button>
@@ -1653,6 +1774,43 @@ html`<div class="admin-onboarding-console">
       <pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && WIKI_ECON_ADMIN_ENABLED=1 node site/admin-server.cjs</pre>
       <pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && ${runnerCommand()} ${cliFlags(currentManifest)} run ${onboardingWiki || "frwiki"}${normalizeSnapshotVersion(snapshotVersion) ? ` --version ${normalizeSnapshotVersion(snapshotVersion)}` : ""}</pre>`
     : ""}
+</div>`
+```
+
+</div>
+
+<!-- ── Immutable lifecycle audit ──────────────────────────── -->
+
+<div class="chart-section">
+
+## Operator audit
+
+<div class="note">Append-only, content-addressed evidence for lifecycle decisions and destructive candidate operations. Invalid or modified records are reported separately and never treated as valid history.</div>
+
+```js
+const lifecycleAuditEvents = lifecycleAudit.events || []
+const lifecycleAuditInvalid = lifecycleAudit.invalid || []
+```
+
+```js
+html`<div class="admin-audit-ledger">
+  <header>
+    <div><span>Authenticated events</span><strong>${lifecycleAuditEvents.length}</strong></div>
+    <div><span>Invalid records</span><strong class=${lifecycleAuditInvalid.length ? "danger" : "success"}>${lifecycleAuditInvalid.length}</strong></div>
+    <div><span>Registry revision</span><code>${lifecycleRevision || "unavailable"}</code></div>
+  </header>
+  ${lifecycleAuditInvalid.length ? html`<div class="admin-audit-warning"><strong>Audit integrity needs attention</strong><span>${lifecycleAuditInvalid.map((entry) => `${entry.file}: ${entry.error}`).join(" · ")}</span></div>` : ""}
+  ${lifecycleAuditEvents.length ? html`<div class="admin-audit-table-wrap"><table class="admin-audit-table">
+    <thead><tr><th>Recorded</th><th>Operator</th><th>Project</th><th>Action</th><th>Phase</th><th>Evidence</th></tr></thead>
+    <tbody>${lifecycleAuditEvents.map((event) => html`<tr>
+      <td data-label="Recorded"><time datetime=${event.recordedAt || ""}>${event.recordedAt ? new Date(event.recordedAt).toLocaleString() : "unknown"}</time></td>
+      <td data-label="Operator">${event.operator || "system"}</td>
+      <td data-label="Project"><code>${event.wiki || "global"}</code></td>
+      <td data-label="Action">${actionLabel(event.action || "recorded")}</td>
+      <td data-label="Phase"><span class=${`admin-audit-phase ${event.phase || "recorded"}`}>${event.phase || "recorded"}</span></td>
+      <td data-label="Evidence"><code title=${event.eventSha256}>${event.eventSha256?.slice(0, 12) || "—"}</code>${event.afterRevision ? html`<small title=${event.afterRevision}>registry ${event.afterRevision.slice(0, 12)}</small>` : ""}</td>
+    </tr>`)}</tbody>
+  </table></div>` : html`<div class="admin-audit-empty">No lifecycle decisions have been recorded through this admin deployment yet.</div>`}
 </div>`
 ```
 
@@ -2878,6 +3036,48 @@ currentManifest.merged.length > 0
 .admin-change-plan ul { display: grid; grid-template-columns: repeat(auto-fill, minmax(10rem, 1fr)); gap: 0.25rem 0.8rem; padding: 0; list-style: none; }
 .admin-change-plan li { display: flex; justify-content: space-between; gap: 0.5rem; font-size: 0.68rem; }
 .admin-change-plan li span, .admin-change-plan p { color: var(--theme-foreground-muted); }
+.admin-lifecycle-console { border-top: 1px solid var(--theme-foreground-faintest); background: color-mix(in srgb, #315b8a 3%, transparent); }
+.admin-lifecycle-console.qualification { background: color-mix(in srgb, #d98c2f 4%, transparent); }
+.admin-lifecycle-console > header { display: flex; justify-content: space-between; align-items: start; gap: 1rem; padding: 0.8rem 1rem; border-bottom: 1px solid var(--theme-foreground-faintest); }
+.admin-lifecycle-console > header > div { display: grid; gap: 0.15rem; }
+.admin-lifecycle-console > header span { color: var(--theme-foreground-muted); font-size: 0.61rem; font-weight: 800; letter-spacing: 0.07em; text-transform: uppercase; }
+.admin-lifecycle-console > header strong { font-size: 0.82rem; }
+.admin-lifecycle-console > header code { max-width: 12rem; overflow: hidden; color: var(--theme-foreground-muted); font-size: 0.64rem; text-overflow: ellipsis; }
+.admin-lifecycle-evidence { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-bottom: 1px solid var(--theme-foreground-faintest); }
+.admin-lifecycle-evidence > div { display: grid; gap: 0.18rem; min-width: 0; padding: 0.65rem 0.8rem; border-left: 1px solid var(--theme-foreground-faintest); }
+.admin-lifecycle-evidence > div:first-child { border-left: 0; }
+.admin-lifecycle-evidence span, .admin-lifecycle-readonly span { color: var(--theme-foreground-muted); font-size: 0.6rem; font-weight: 750; letter-spacing: 0.05em; text-transform: uppercase; }
+.admin-lifecycle-evidence strong, .admin-lifecycle-evidence code { overflow: hidden; font-size: 0.7rem; text-overflow: ellipsis; white-space: nowrap; }
+.admin-lifecycle-policy { display: grid; grid-template-columns: repeat(3, minmax(10rem, 1fr)); gap: 0.55rem; padding: 0.7rem 1rem; }
+.admin-lifecycle-select, .admin-lifecycle-number { width: 100%; min-height: 2.25rem; padding: 0.38rem 0.5rem; border: 1px solid var(--theme-foreground-faintest); border-radius: 0.25rem; background: var(--theme-background); color: var(--theme-foreground); font: inherit; font-size: 0.72rem; }
+.admin-lifecycle-select:focus-visible, .admin-lifecycle-number:focus-visible { outline: 2px solid #315b8a; outline-offset: 2px; }
+.admin-lifecycle-readonly { display: grid; align-content: center; gap: 0.1rem; min-height: 2.25rem; padding-inline: 0.55rem; border-left: 2px solid #315b8a; }
+.admin-lifecycle-readonly strong { font-size: 0.72rem; text-transform: capitalize; }
+.admin-lifecycle-actions { display: flex; flex-wrap: wrap; gap: 0.4rem; padding: 0 1rem 0.75rem; }
+.admin-lifecycle-footnote, .admin-lifecycle-empty { margin: 0; padding: 0 1rem 0.75rem; color: var(--theme-foreground-muted); font-size: 0.67rem; line-height: 1.45; }
+.admin-audit-ledger { border-block: 1px solid var(--theme-foreground-faintest); }
+.admin-audit-ledger > header { display: grid; grid-template-columns: 10rem 10rem minmax(14rem, 1fr); }
+.admin-audit-ledger > header > div { display: grid; gap: 0.15rem; min-width: 0; padding: 0.7rem 0.8rem; border-left: 1px solid var(--theme-foreground-faintest); }
+.admin-audit-ledger > header > div:first-child { border-left: 0; }
+.admin-audit-ledger > header span { color: var(--theme-foreground-muted); font-size: 0.61rem; font-weight: 750; letter-spacing: 0.05em; text-transform: uppercase; }
+.admin-audit-ledger > header strong { font-size: 0.9rem; }
+.admin-audit-ledger > header strong.success { color: #2e7d32; }
+.admin-audit-ledger > header strong.danger { color: #c13c32; }
+.admin-audit-ledger > header code { overflow: hidden; font-size: 0.68rem; text-overflow: ellipsis; white-space: nowrap; }
+.admin-audit-warning { display: grid; gap: 0.15rem; padding: 0.7rem 0.8rem; border-top: 1px solid var(--theme-foreground-faintest); border-left: 4px solid #c13c32; background: color-mix(in srgb, #c13c32 6%, transparent); }
+.admin-audit-warning strong { color: #c13c32; font-size: 0.72rem; }
+.admin-audit-warning span { font-size: 0.68rem; overflow-wrap: anywhere; }
+.admin-audit-table-wrap { max-height: 26rem; overflow: auto; border-top: 1px solid var(--theme-foreground-faintest); }
+.admin-audit-table { width: 100%; border-collapse: collapse; font-size: 0.7rem; }
+.admin-audit-table th { position: sticky; top: 0; z-index: 1; padding: 0.55rem 0.65rem; background: var(--theme-background); color: var(--theme-foreground-muted); font-size: 0.6rem; letter-spacing: 0.06em; text-align: left; text-transform: uppercase; }
+.admin-audit-table td { padding: 0.55rem 0.65rem; border-top: 1px solid var(--theme-foreground-faintest); vertical-align: top; }
+.admin-audit-table td:last-child { display: grid; gap: 0.12rem; }
+.admin-audit-table small { color: var(--theme-foreground-muted); font-size: 0.58rem; }
+.admin-audit-phase { font-weight: 750; }
+.admin-audit-phase.applied, .admin-audit-phase.completed { color: #2e7d32; }
+.admin-audit-phase.failed { color: #c13c32; }
+.admin-audit-phase.requested { color: #315b8a; }
+.admin-audit-empty { padding: 0.8rem; border-top: 1px solid var(--theme-foreground-faintest); color: var(--theme-foreground-muted); font-size: 0.72rem; }
 [data-theme="dark"] .admin-command-header { --admin-ink: #d7e2ee; background: color-mix(in srgb, var(--theme-background) 96%, #26384c 4%); }
 @media (prefers-reduced-motion: reduce) {
   .admin-stage-rail > i.active,
@@ -2947,6 +3147,18 @@ currentManifest.merged.length > 0
   .admin-change-plan { grid-template-columns: 1fr; }
   .admin-change-plan > div { border-left: 0; border-top: 1px solid var(--theme-foreground-faintest); }
   .admin-change-plan > div:first-child { border-top: 0; }
+  .admin-lifecycle-evidence { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .admin-lifecycle-evidence > div:nth-child(3) { border-left: 0; border-top: 1px solid var(--theme-foreground-faintest); }
+  .admin-lifecycle-evidence > div:nth-child(4) { border-top: 1px solid var(--theme-foreground-faintest); }
+  .admin-lifecycle-policy { grid-template-columns: 1fr; }
+  .admin-audit-ledger > header { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .admin-audit-ledger > header > div:last-child { grid-column: 1 / -1; border-top: 1px solid var(--theme-foreground-faintest); border-left: 0; }
+  .admin-audit-table thead { display: none; }
+  .admin-audit-table, .admin-audit-table tbody, .admin-audit-table tr, .admin-audit-table td { display: block; width: 100%; }
+  .admin-audit-table tr { padding: 0.5rem 0; border-top: 1px solid var(--theme-foreground-faintest); }
+  .admin-audit-table td { display: block; padding: 0.25rem 0.6rem; border-top: 0; }
+  .admin-audit-table td:last-child { display: grid; }
+  .admin-audit-table td::before { display: block; margin-bottom: 0.08rem; color: var(--theme-foreground-muted); content: attr(data-label); font-size: 0.56rem; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase; }
   .pipeline-stage-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }

@@ -73,3 +73,24 @@ test("quality ledger exposes receipt evidence, candidate deltas, and anomaly sig
   assert.match(source, /quality\.signals/);
   assert.match(source, /quality\.anomalies/);
 });
+
+test("lifecycle console exposes safe policy, promotion, rebuild, and retirement controls", () => {
+  assert.match(source, /Promote exact qualification/);
+  assert.match(source, /Pause scheduling/);
+  assert.match(source, /Resume scheduling/);
+  assert.match(source, /Save resource &amp; SLA policy/);
+  assert.match(source, /Rebuild exact snapshot/);
+  assert.match(source, /Retire unpublished candidate/);
+  assert.match(source, /typedOperatorConfirmation/);
+  assert.match(source, /lifecycleRevision/);
+  assert.match(source, /qualificationRunId/);
+  assert.match(source, /candidateRunId/);
+});
+
+test("operator audit ledger exposes authenticated immutable lifecycle evidence", () => {
+  assert.match(source, /## Operator audit/);
+  assert.match(source, /Append-only, content-addressed evidence/);
+  assert.match(source, /lifecycleAudit\.invalid/);
+  assert.match(source, /event\.eventSha256/);
+  assert.match(source, /Registry revision/);
+});
