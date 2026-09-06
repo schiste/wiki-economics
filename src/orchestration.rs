@@ -43,6 +43,25 @@ pub(crate) struct PrepareWikiRequest<'a> {
     pub(crate) rebuild: bool,
 }
 
+pub(crate) struct PromoteQualificationRequest<'a> {
+    pub(crate) data_dir: &'a Path,
+    pub(crate) output_dir: &'a Path,
+    pub(crate) lifecycle: &'a Path,
+    pub(crate) wiki: &'a str,
+    pub(crate) version: &'a str,
+    pub(crate) qualification_run_id: &'a str,
+    pub(crate) promotion_run_id: &'a str,
+}
+
+pub(crate) struct RetireCandidateRequest<'a> {
+    pub(crate) data_dir: &'a Path,
+    pub(crate) output_dir: &'a Path,
+    pub(crate) wiki: &'a str,
+    pub(crate) version: &'a str,
+    pub(crate) candidate_run_id: &'a str,
+    pub(crate) operator: &'a str,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PipelineRunRequest<'a> {
     pub(crate) wikis: &'a [String],
@@ -242,6 +261,10 @@ pub(crate) trait CandidateOps {
         version: &str,
         run_id: &str,
     ) -> Result<()>;
+
+    fn promote_qualification(&self, request: PromoteQualificationRequest<'_>) -> Result<PathBuf>;
+
+    fn retire_candidate(&self, request: RetireCandidateRequest<'_>) -> Result<PathBuf>;
 
     fn plan_candidate_preparation(
         &self,

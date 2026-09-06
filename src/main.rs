@@ -60,13 +60,14 @@ use orchestration::{
     AccountCreationRequest, AppPaths, ApplicationOps, BenchmarkRequest, CandidateOps,
     CapacityBenchmarkRequest, FleetDiscoveryRequest, HistoryInputOps, MetricComputeOps,
     PatrolComputeRequest, PatrolOps, PipelineRunRequest, PreparationMode, PrepareWikiRequest,
-    PublicationOps, QualificationOps, RunContext, SchemaBenchmarkRequest, SnapshotOps,
-    handle_account_creation, handle_benchmark, handle_capacity_benchmark, handle_compute,
-    handle_cpu_qualification, handle_fetch, handle_fleet_discovery, handle_ingest, handle_merge,
-    handle_patrol_compute, handle_patrol_fetch, handle_patrol_refresh, handle_pipeline_run,
-    handle_prepare_wiki, handle_publication_commit, handle_publication_prepare,
-    handle_publication_rollback, handle_schema_benchmark, handle_snapshot_finalize,
-    handle_snapshot_resolve, timed_stage as run_timed_stage,
+    PromoteQualificationRequest, PublicationOps, QualificationOps, RetireCandidateRequest,
+    RunContext, SchemaBenchmarkRequest, SnapshotOps, handle_account_creation, handle_benchmark,
+    handle_capacity_benchmark, handle_compute, handle_cpu_qualification, handle_fetch,
+    handle_fleet_discovery, handle_ingest, handle_merge, handle_patrol_compute,
+    handle_patrol_fetch, handle_patrol_refresh, handle_pipeline_run, handle_prepare_wiki,
+    handle_publication_commit, handle_publication_prepare, handle_publication_rollback,
+    handle_schema_benchmark, handle_snapshot_finalize, handle_snapshot_resolve,
+    timed_stage as run_timed_stage,
 };
 
 #[cfg(test)]
@@ -930,6 +931,29 @@ impl CandidateOps for RealOps {
         publication::begin_wiki_candidate_rebuild(output_dir, wiki, version, run_id)
     }
 
+    fn promote_qualification(&self, request: PromoteQualificationRequest<'_>) -> Result<PathBuf> {
+        publication::promote_wiki_qualification(
+            request.data_dir,
+            request.output_dir,
+            request.lifecycle,
+            request.wiki,
+            request.version,
+            request.qualification_run_id,
+            request.promotion_run_id,
+        )
+    }
+
+    fn retire_candidate(&self, request: RetireCandidateRequest<'_>) -> Result<PathBuf> {
+        publication::retire_wiki_candidate(
+            request.data_dir,
+            request.output_dir,
+            request.wiki,
+            request.version,
+            request.candidate_run_id,
+            request.operator,
+        )
+    }
+
     fn plan_candidate_preparation(
         &self,
         wiki: &str,
@@ -1335,15 +1359,15 @@ fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
             let promotion_run_id = context
                 .run_id
                 .context("qualification promotion requires --run-id")?;
-            let ready = publication::promote_wiki_qualification(
-                &data_dir,
-                &output_dir,
-                &lifecycle,
-                &wiki,
-                &version,
-                &qualification_run_id,
+            let ready = ops.promote_qualification(PromoteQualificationRequest {
+                data_dir: &data_dir,
+                output_dir: &output_dir,
+                lifecycle: &lifecycle,
+                wiki: &wiki,
+                version: &version,
+                qualification_run_id: &qualification_run_id,
                 promotion_run_id,
-            )?;
+            })?;
             println!("{}", ready.display());
         }
 
@@ -1353,14 +1377,14 @@ fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
             candidate_run_id,
             operator,
         } => {
-            let retired = publication::retire_wiki_candidate(
-                &data_dir,
-                &output_dir,
-                &wiki,
-                &version,
-                &candidate_run_id,
-                &operator,
-            )?;
+            let retired = ops.retire_candidate(RetireCandidateRequest {
+                data_dir: &data_dir,
+                output_dir: &output_dir,
+                wiki: &wiki,
+                version: &version,
+                candidate_run_id: &candidate_run_id,
+                operator: &operator,
+            })?;
             println!("{}", retired.display());
         }
 
@@ -2291,6 +2315,30 @@ mod tests {
             Ok(())
         }
 
+        fn promote_qualification(
+            &self,
+            request: PromoteQualificationRequest<'_>,
+        ) -> Result<PathBuf> {
+            self.fail_if("promote_qualification", "qualification promotion failed")?;
+            self.record(format!(
+                "promote_qualification:{}:{}:{}:{}",
+                request.wiki,
+                request.version,
+                request.qualification_run_id,
+                request.promotion_run_id,
+            ));
+            Ok(PathBuf::from("ready.json"))
+        }
+
+        fn retire_candidate(&self, request: RetireCandidateRequest<'_>) -> Result<PathBuf> {
+            self.fail_if("retire_candidate", "candidate retirement failed")?;
+            self.record(format!(
+                "retire_candidate:{}:{}:{}:{}",
+                request.wiki, request.version, request.candidate_run_id, request.operator,
+            ));
+            Ok(PathBuf::from("retired.json"))
+        }
+
         fn plan_candidate_preparation(
             &self,
             _wiki: &str,
@@ -2942,6 +2990,95 @@ mod tests {
             ]
         );
         Ok(())
+    }
+
+    #[test]
+    fn run_with_ops_dispatches_exact_candidate_lifecycle_commands() {
+        let promotion = || {
+            Cli::try_parse_from([
+                "wiki-econ",
+                "--run-id",
+                "promote-9",
+                "promote-qualification",
+                "dewiki",
+                "--version",
+                "2026-08",
+                "--qualification-run-id",
+                "qualified-7",
+            ])
+            .expect("promotion CLI should parse")
+        };
+        let retirement = || {
+            Cli::try_parse_from([
+                "wiki-econ",
+                "retire-candidate",
+                "dewiki",
+                "--version",
+                "2026-08",
+                "--candidate-run-id",
+                "candidate-7",
+                "--operator",
+                "Alice",
+            ])
+            .expect("retirement CLI should parse")
+        };
+        let ops = TestApplication::default();
+        run_with_ops(promotion(), &ops).expect("qualification promotion should dispatch");
+        run_with_ops(retirement(), &ops).expect("candidate retirement should dispatch");
+        assert_eq!(
+            ops.calls.into_inner(),
+            vec![
+                "promote_qualification:dewiki:2026-08:qualified-7:promote-9",
+                "retire_candidate:dewiki:2026-08:candidate-7:Alice",
+            ]
+        );
+        assert!(
+            run_with_ops(
+                promotion(),
+                &TestApplication::failing("promote_qualification")
+            )
+            .is_err()
+        );
+        assert!(run_with_ops(retirement(), &TestApplication::failing("retire_candidate")).is_err());
+    }
+
+    #[test]
+    fn real_candidate_lifecycle_adapters_delegate_to_fail_closed_storage() {
+        let data = TestDir::new().expect("adapter data directory should initialize");
+        let output = TestDir::new().expect("adapter output directory should initialize");
+        RealOps
+            .begin_candidate_rebuild(output.path(), "nlwiki", "2026-08", "adapter-rebuild")
+            .expect("real rebuild adapter should create generation state");
+        assert!(
+            RealOps
+                .begin_candidate_rebuild(output.path(), "nlwiki", "2026-08", "adapter-rebuild")
+                .is_err()
+        );
+        assert!(
+            RealOps
+                .promote_qualification(PromoteQualificationRequest {
+                    data_dir: data.path(),
+                    output_dir: output.path(),
+                    lifecycle: &data.path().join("missing-lifecycle.json"),
+                    wiki: "nlwiki",
+                    version: "2026-08",
+                    qualification_run_id: "qualified-1",
+                    promotion_run_id: "promoted-1",
+                })
+                .is_err()
+        );
+        assert!(
+            RealOps
+                .retire_candidate(RetireCandidateRequest {
+                    data_dir: data.path(),
+                    output_dir: output.path(),
+                    wiki: "nlwiki",
+                    version: "2026-08",
+                    candidate_run_id: "candidate-1",
+                    operator: "Alice",
+                })
+                .is_err()
+        );
     }
 
     #[test]
