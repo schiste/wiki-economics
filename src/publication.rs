@@ -212,6 +212,34 @@ pub(crate) struct PublicationRecoveryReport {
     transactions: Vec<PublicationRecoveryTransaction>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct PublicationPreflightWiki {
+    wiki: String,
+    published_snapshot: Option<String>,
+    candidate_snapshot: Option<String>,
+    candidate_run_id: Option<String>,
+    changed_families: Vec<String>,
+    reused_families: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct PublicationPreflightReport {
+    schema_version: u8,
+    generated_at_unix: u64,
+    pub(crate) eligible: bool,
+    would_change: bool,
+    current_publication_run_id: Option<String>,
+    generating_commit: Option<String>,
+    site_source_commit: Option<String>,
+    site_source_fingerprint: String,
+    recovery_clean: bool,
+    scrub_state: String,
+    blockers: Vec<String>,
+    changed: Vec<PublicationChange>,
+    reused: Vec<PublicationChange>,
+    wikis: Vec<PublicationPreflightWiki>,
+}
+
 #[derive(Clone, Copy)]
 struct CandidateGeneration<'a> {
     output_dir: &'a Path,
@@ -3006,6 +3034,183 @@ pub(crate) fn write_publication_recovery_report(
     atomic_json(path, report)
 }
 
+pub(crate) fn publication_preflight(
+    data_dir: &Path,
+    output_dir: &Path,
+    lifecycle_path: &Path,
+    site_dist_dir: &Path,
+) -> Result<PublicationPreflightReport> {
+    let registry = load_lifecycle(lifecycle_path)?;
+    let gate = read_json::<GateReceipt>(&output_dir.join(RECEIPT_FILE)).ok();
+    let recovery = audit_publication_recovery(data_dir, output_dir, site_dist_dir, None);
+    let recovery_clean = recovery.transactions.iter().all(|transaction| {
+        matches!(
+            transaction.classification,
+            PublicationRecoveryClassification::Committed
+                | PublicationRecoveryClassification::RolledBack
+                | PublicationRecoveryClassification::NoOp
+                | PublicationRecoveryClassification::Reconciled
+        )
+    });
+    let scrub_state =
+        read_json::<crate::artifact_receipt::ScrubStatus>(&output_dir.join("_scrubs/status.json"))
+            .map(|status| status.state)
+            .unwrap_or_else(|_| "missing".to_string());
+    let mut blockers = Vec::new();
+    if !recovery_clean {
+        blockers.push("publication recovery audit contains a non-terminal transaction".to_string());
+    }
+    if scrub_state == "failed" {
+        blockers.push("the latest published-artifact scrub failed".to_string());
+    }
+    if gate.is_none() {
+        blockers.push("the current publication gate is missing or invalid".to_string());
+    }
+
+    let mut changed = Vec::new();
+    let mut reused = Vec::new();
+    let mut wikis = Vec::new();
+    for (wiki, lifecycle) in &registry.wikis {
+        if lifecycle.publication != "published" {
+            continue;
+        }
+        let previous = gate
+            .as_ref()
+            .and_then(|receipt| receipt.wiki_proofs.get(wiki));
+        if !matches!(lifecycle.refresh.as_str(), "scheduled" | "manual") {
+            let mut reused_families = previous
+                .map(|proof| proof.families.keys().cloned().collect::<Vec<_>>())
+                .unwrap_or_default();
+            reused_families.sort();
+            reused.extend(reused_families.iter().map(|family| PublicationChange {
+                wiki: wiki.clone(),
+                family: family.clone(),
+            }));
+            wikis.push(PublicationPreflightWiki {
+                wiki: wiki.clone(),
+                published_snapshot: previous.map(|proof| proof.snapshot.clone()),
+                candidate_snapshot: None,
+                candidate_run_id: None,
+                changed_families: Vec::new(),
+                reused_families,
+            });
+            continue;
+        }
+
+        let index_path = ready_index_path(output_dir, wiki);
+        let index = match read_json::<ReadyCandidateIndex>(&index_path) {
+            Ok(index)
+                if index.schema_version == READY_INDEX_SCHEMA_VERSION && index.wiki == *wiki =>
+            {
+                index
+            }
+            Ok(_) => {
+                blockers.push(format!("{wiki} ready index has an invalid identity"));
+                continue;
+            }
+            Err(error) => {
+                blockers.push(format!("{wiki} has no readable ready index: {error:#}"));
+                continue;
+            }
+        };
+        let reference = &index.newest_valid_ready;
+        if let Err(error) = ready_from_reference(data_dir, output_dir, wiki, reference) {
+            blockers.push(format!(
+                "{wiki} newest ready candidate failed authentication: {error:#}"
+            ));
+            continue;
+        }
+        if previous.is_some_and(|proof| reference.snapshot < proof.snapshot) {
+            blockers.push(format!(
+                "{wiki} candidate {} would downgrade the published snapshot",
+                reference.snapshot
+            ));
+        }
+        let mut candidate_families = reference.core_family_receipt_identities.clone();
+        if !reference.patrol_receipt_identity.is_empty() {
+            candidate_families.insert(
+                "patrol".to_string(),
+                reference.patrol_receipt_identity.clone(),
+            );
+        }
+        let mut changed_families = Vec::new();
+        let mut reused_families = Vec::new();
+        for (family, identity) in candidate_families {
+            let item = PublicationChange {
+                wiki: wiki.clone(),
+                family: family.clone(),
+            };
+            if previous
+                .and_then(|proof| proof.families.get(&family))
+                .is_some_and(|proof| proof.receipt_identity == identity)
+            {
+                reused.push(item);
+                reused_families.push(family);
+            } else {
+                changed.push(item);
+                changed_families.push(family);
+            }
+        }
+        changed_families.sort();
+        reused_families.sort();
+        wikis.push(PublicationPreflightWiki {
+            wiki: wiki.clone(),
+            published_snapshot: previous.map(|proof| proof.snapshot.clone()),
+            candidate_snapshot: Some(reference.snapshot.clone()),
+            candidate_run_id: Some(reference.run_id.clone()),
+            changed_families,
+            reused_families,
+        });
+    }
+    changed.sort();
+    reused.sort();
+    wikis.sort_by(|left, right| left.wiki.cmp(&right.wiki));
+    Ok(PublicationPreflightReport {
+        schema_version: 1,
+        generated_at_unix: now_unix()?,
+        eligible: blockers.is_empty(),
+        would_change: !changed.is_empty(),
+        current_publication_run_id: gate.as_ref().map(|receipt| receipt.run_id.clone()),
+        generating_commit: licensing::generating_commit(),
+        site_source_commit: std::env::var("WIKI_ECON_SITE_SOURCE_COMMIT").ok(),
+        site_source_fingerprint: crate::fingerprint::site_source_fingerprint(
+            &site_dist_dir
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(configured_site_dir),
+        )?,
+        recovery_clean,
+        scrub_state,
+        blockers,
+        changed,
+        reused,
+        wikis,
+    })
+}
+
+pub(crate) fn write_publication_preflight_report(
+    path: &Path,
+    report: &PublicationPreflightReport,
+) -> Result<()> {
+    atomic_json(path, report)
+}
+
+pub(crate) fn run_publication_preflight_command(
+    data_dir: &Path,
+    output_dir: &Path,
+    lifecycle_path: &Path,
+    site_dist_dir: &Path,
+    report_path: Option<&Path>,
+) -> Result<()> {
+    let report = publication_preflight(data_dir, output_dir, lifecycle_path, site_dist_dir)?;
+    if let Some(path) = report_path {
+        write_publication_preflight_report(path, &report)?;
+    }
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    ensure!(report.eligible, "publication preflight is blocked");
+    Ok(())
+}
+
 fn active_candidate_target(output_dir: &Path, wiki: &str) -> Result<Option<PathBuf>> {
     let path = output_dir.join(wiki);
     match fs::read_link(&path) {
@@ -4960,6 +5165,22 @@ mod tests {
         }
     }
 
+    fn preflight_site_fixture() -> Result<(TestDir, PathBuf)> {
+        let site_root = TestDir::new()?;
+        let site = site_root.path().join("site");
+        fs::create_dir_all(site.join("src"))?;
+        fs::create_dir_all(site.join("data-build"))?;
+        fs::write(site.join("src/index.md"), "# Preflight")?;
+        fs::write(site.join("data-build/manifest.sh"), "true")?;
+        fs::write(site.join("observablehq.config.js"), "export default {}")?;
+        fs::write(site.join("package.json"), "{}")?;
+        fs::write(site.join("site-footer.js"), "export const siteFooter = ''")?;
+        fs::write(site_root.path().join("package.json"), "{}")?;
+        fs::write(site_root.path().join("package-lock.json"), "{}")?;
+        let dist = site.join("dist");
+        Ok((site_root, dist))
+    }
+
     fn write_single_i64(path: &Path) -> Result<()> {
         let mut frame = DataFrame::new_infer_height(vec![Column::new("value".into(), [1_i64])])?;
         ParquetWriter::new(File::create(path)?).finish(&mut frame)?;
@@ -4997,6 +5218,236 @@ mod tests {
                 | CandidateReuseMethod::Copy
         ));
         assert_eq!(fs::read(target)?, fs::read(source)?);
+        Ok(())
+    }
+
+    #[test]
+    fn publication_preflight_reports_changed_families_without_selecting_candidates() -> Result<()> {
+        let fixture = Fixture::new()?;
+        fixture.prepare("baseline")?;
+        validate(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "baseline",
+        )
+        .expect("baseline publication fixture should validate");
+        fixture.ready_candidate("candidate")?;
+        let (_site_root, site_dist) = preflight_site_fixture()?;
+
+        let report = publication_preflight(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            &site_dist,
+        )
+        .expect("publication preflight should succeed");
+        assert!(report.eligible);
+        assert!(report.would_change);
+        assert_eq!(
+            report.current_publication_run_id.as_deref(),
+            Some("baseline")
+        );
+        assert!(report.changed.iter().any(|change| change.wiki == "nlwiki"));
+        assert!(
+            !fixture
+                .output
+                .path()
+                .join("_publication_transactions")
+                .exists()
+        );
+        let report_path = fixture.output.path().join("preflight.json");
+        run_publication_preflight_command(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            &site_dist,
+            Some(&report_path),
+        )
+        .expect("eligible preflight should write its report");
+        assert!(report_path.is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn publication_preflight_names_recovery_scrub_index_and_downgrade_blockers() -> Result<()> {
+        let (_site_root, site_dist) = preflight_site_fixture()?;
+
+        let blocked = Fixture::new()?;
+        blocked.prepare("baseline")?;
+        validate(
+            blocked.data.path(),
+            blocked.output.path(),
+            &blocked.lifecycle_path,
+            "baseline",
+        )
+        .expect("baseline publication must validate");
+        blocked.ready_candidate("candidate")?;
+        atomic_json(
+            &blocked
+                .output
+                .path()
+                .join("_publication_transactions/broken/selection.json"),
+            &json!({"not": "a valid transaction"}),
+        )
+        .expect("invalid transaction fixture must be written");
+        atomic_json(
+            &blocked.output.path().join("_scrubs/status.json"),
+            &crate::artifact_receipt::ScrubStatus {
+                schema_version: 1,
+                state: "failed".to_string(),
+                run_id: "scrub-failed".to_string(),
+                updated_at_unix: 1,
+                report_sha256: None,
+                error: Some("corrupt artifact".to_string()),
+            },
+        )
+        .expect("failed scrub fixture must be written");
+        fs::remove_file(blocked.output.path().join(RECEIPT_FILE))?;
+        let blocked_report = publication_preflight(
+            blocked.data.path(),
+            blocked.output.path(),
+            &blocked.lifecycle_path,
+            &site_dist,
+        )
+        .expect("blocked preflight must still produce a report");
+        assert!(!blocked_report.eligible);
+        assert_eq!(blocked_report.blockers.len(), 3);
+        assert!(
+            run_publication_preflight_command(
+                blocked.data.path(),
+                blocked.output.path(),
+                &blocked.lifecycle_path,
+                &site_dist,
+                None,
+            )
+            .is_err()
+        );
+
+        let lifecycle_states = Fixture::new()?;
+        lifecycle_states.prepare("baseline")?;
+        validate(
+            lifecycle_states.data.path(),
+            lifecycle_states.output.path(),
+            &lifecycle_states.lifecycle_path,
+            "baseline",
+        )
+        .expect("lifecycle baseline must validate");
+        let mut registry: Value = read_json(&lifecycle_states.lifecycle_path)?;
+        registry["wikis"]["nlwiki"]["refresh"] = json!("paused");
+        registry["wikis"]["nlwiki"]["imported_cutoff"] = json!("2026-03");
+        registry["wikis"]["hiddenwiki"] = json!({
+            "publication": "hidden",
+            "refresh": "qualification"
+        });
+        atomic_json(&lifecycle_states.lifecycle_path, &registry)?;
+        let states_report = publication_preflight(
+            lifecycle_states.data.path(),
+            lifecycle_states.output.path(),
+            &lifecycle_states.lifecycle_path,
+            &site_dist,
+        )
+        .expect("paused and hidden lifecycle entries should be handled");
+        assert!(states_report.eligible);
+        assert_eq!(states_report.wikis.len(), 1);
+        assert!(!states_report.reused.is_empty());
+
+        enum IndexFailure {
+            InvalidIndex,
+            MissingIndex,
+            InvalidCandidate,
+        }
+        for failure in [
+            IndexFailure::InvalidIndex,
+            IndexFailure::MissingIndex,
+            IndexFailure::InvalidCandidate,
+        ] {
+            let fixture = Fixture::new()?;
+            fixture.prepare("baseline")?;
+            validate(
+                fixture.data.path(),
+                fixture.output.path(),
+                &fixture.lifecycle_path,
+                "baseline",
+            )
+            .expect("index failure baseline must validate");
+            fixture.ready_candidate("candidate")?;
+            let index_path = ready_index_path(fixture.output.path(), "nlwiki");
+            match failure {
+                IndexFailure::InvalidIndex => {
+                    let mut index: Value = read_json(&index_path)?;
+                    index["wiki"] = json!("ptwiki");
+                    atomic_json(&index_path, &index)?;
+                }
+                IndexFailure::MissingIndex => fs::remove_file(&index_path)?,
+                IndexFailure::InvalidCandidate => {
+                    let mut index: Value = read_json(&index_path)?;
+                    index["newest_valid_ready"]["ready_receipt_sha256"] = json!("0".repeat(64));
+                    atomic_json(&index_path, &index)?;
+                }
+            }
+            let report = publication_preflight(
+                fixture.data.path(),
+                fixture.output.path(),
+                &fixture.lifecycle_path,
+                &site_dist,
+            )
+            .expect("index failures should become preflight blockers");
+            assert!(!report.eligible);
+            assert!(
+                report
+                    .blockers
+                    .iter()
+                    .any(|blocker| blocker.contains("nlwiki"))
+            );
+        }
+
+        let downgrade = Fixture::new()?;
+        downgrade.prepare("baseline")?;
+        validate(
+            downgrade.data.path(),
+            downgrade.output.path(),
+            &downgrade.lifecycle_path,
+            "baseline",
+        )
+        .expect("downgrade baseline must validate");
+        downgrade.ready_candidate("candidate")?;
+        let index: ReadyCandidateIndex =
+            read_json(&ready_index_path(downgrade.output.path(), "nlwiki"))?;
+        let mut gate: Value = read_json(&downgrade.output.path().join(RECEIPT_FILE))?;
+        gate["wiki_proofs"]["nlwiki"]["snapshot"] = json!("2027-01");
+        for (family, identity) in &index.newest_valid_ready.core_family_receipt_identities {
+            gate["wiki_proofs"]["nlwiki"]["families"][family]["receipt_identity"] = json!(identity);
+        }
+        gate["wiki_proofs"]["nlwiki"]["families"]["patrol"]["receipt_identity"] =
+            json!(index.newest_valid_ready.patrol_receipt_identity);
+        atomic_json(&downgrade.output.path().join(RECEIPT_FILE), &gate)?;
+        let downgrade_report = publication_preflight(
+            downgrade.data.path(),
+            downgrade.output.path(),
+            &downgrade.lifecycle_path,
+            &site_dist,
+        )
+        .expect("downgrade should become a preflight blocker");
+        assert!(!downgrade_report.eligible);
+        assert!(!downgrade_report.reused.is_empty());
+        assert!(
+            downgrade_report
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("downgrade"))
+        );
+
+        let missing_site_dist = lifecycle_states.output.path().join("missing-site/dist");
+        assert!(
+            publication_preflight(
+                lifecycle_states.data.path(),
+                lifecycle_states.output.path(),
+                &lifecycle_states.lifecycle_path,
+                &missing_site_dist,
+            )
+            .is_err()
+        );
         Ok(())
     }
 

@@ -362,6 +362,18 @@ enum Commands {
         max_attempts: u32,
     },
 
+    /// Retry one exact fleet task after an operator has corrected its quarantine cause
+    FleetRetryQuarantine {
+        #[arg(long)]
+        queue_dir: PathBuf,
+
+        #[arg(long)]
+        wiki: String,
+
+        #[arg(long)]
+        task_id: String,
+    },
+
     /// Prepare and validate an isolated, permanently publication-ineligible wiki
     QualifyWiki {
         /// Hidden wiki registered with refresh=qualification
@@ -426,6 +438,25 @@ enum Commands {
         /// Restrict the audit to one transaction
         #[arg(long = "run-id")]
         transaction_run_id: Option<String>,
+
+        /// Optional atomic JSON report retained by operations
+        #[arg(long = "report")]
+        report_path: Option<PathBuf>,
+    },
+
+    /// Validate publication prerequisites and derive a changed-family plan without publishing
+    PublicationPreflight {
+        /// Wiki lifecycle and publication contract
+        #[arg(long, default_value = "config/wiki-lifecycle.json")]
+        lifecycle: PathBuf,
+
+        /// Published site distribution whose receipt must match the data gate
+        #[arg(long, default_value = "site/dist")]
+        site_dist_dir: PathBuf,
+
+        /// Optional atomic JSON report retained by operations
+        #[arg(long = "report")]
+        report_path: Option<PathBuf>,
     },
 
     /// Repair one or all interrupted publication transactions
@@ -1213,6 +1244,15 @@ fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
             println!("{{\"recovered\":{recovered}}}");
         }
 
+        Commands::FleetRetryQuarantine {
+            queue_dir,
+            wiki,
+            task_id,
+        } => {
+            let archived = fleet::retry_quarantined(&queue_dir, &wiki, &task_id)?;
+            println!("{}", archived.display());
+        }
+
         Commands::QualifyWiki {
             wiki,
             version,
@@ -1280,6 +1320,7 @@ fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
         Commands::PublicationRecoveryAudit {
             site_dist_dir,
             transaction_run_id,
+            report_path,
         } => {
             let report = publication::audit_publication_recovery(
                 &data_dir,
@@ -1287,8 +1328,23 @@ fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
                 &site_dist_dir,
                 transaction_run_id.as_deref(),
             );
+            if let Some(path) = report_path.as_ref() {
+                publication::write_publication_recovery_report(path, &report)?;
+            }
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
+
+        Commands::PublicationPreflight {
+            lifecycle,
+            site_dist_dir,
+            report_path,
+        } => publication::run_publication_preflight_command(
+            &data_dir,
+            &output_dir,
+            &lifecycle,
+            &site_dist_dir,
+            report_path.as_deref(),
+        )?,
 
         Commands::PublicationRecover {
             lifecycle,
@@ -2780,6 +2836,7 @@ mod tests {
         let output = root.path().join("output");
         let site = root.path().join("site-dist");
         let report = root.path().join("recovery.json");
+        let audit_report = root.path().join("recovery-audit.json");
         fs::create_dir_all(&data)?;
         fs::create_dir_all(&output)?;
         fs::create_dir_all(&site)?;
@@ -2793,9 +2850,40 @@ mod tests {
             "publication-recovery-audit",
             "--site-dist-dir",
             site.to_str().context("site path")?,
+            "--report",
+            audit_report.to_str().context("audit report path")?,
         ])
         .expect("recovery audit CLI should parse");
         run_with_ops(audit, &TestApplication::default())?;
+        assert!(audit_report.is_file());
+
+        let invalid_report_parent = root.path().join("not-a-report-directory");
+        fs::write(&invalid_report_parent, b"fixture")?;
+        let failed_audit = Cli {
+            data_dir: data.clone(),
+            output_dir: output.clone(),
+            run_id: None,
+            command: Commands::PublicationRecoveryAudit {
+                site_dist_dir: site.clone(),
+                transaction_run_id: None,
+                report_path: Some(invalid_report_parent.join("audit.json")),
+            },
+        };
+        assert!(run_with_ops(failed_audit, &TestApplication::default()).is_err());
+        run_with_ops(
+            Cli {
+                data_dir: data.clone(),
+                output_dir: output.clone(),
+                run_id: None,
+                command: Commands::PublicationRecoveryAudit {
+                    site_dist_dir: site.clone(),
+                    transaction_run_id: None,
+                    report_path: None,
+                },
+            },
+            &TestApplication::default(),
+        )
+        .expect("recovery audit should also support stdout-only output");
 
         let recover = Cli::try_parse_from([
             "wiki-econ",
@@ -2813,6 +2901,24 @@ mod tests {
         .expect("recovery repair CLI should parse");
         run_with_ops(recover, &TestApplication::default())?;
         assert!(report.is_file());
+
+        let blocked_preflight = Cli::try_parse_from([
+            "wiki-econ",
+            "--data-dir",
+            data.to_str().context("data path")?,
+            "--output-dir",
+            output.to_str().context("output path")?,
+            "publication-preflight",
+            "--lifecycle",
+            root.path()
+                .join("missing-lifecycle.json")
+                .to_str()
+                .context("missing lifecycle path")?,
+            "--site-dist-dir",
+            site.to_str().context("site path")?,
+        ])
+        .expect("publication preflight CLI should parse");
+        assert!(run_with_ops(blocked_preflight, &TestApplication::default()).is_err());
 
         let missing_selector = Cli::try_parse_from([
             "wiki-econ",
@@ -3248,6 +3354,34 @@ mod tests {
             serde_json::from_slice(&fs::read(queue.path().join("pending/dewiki.json"))?)?;
         assert_eq!(pending.attempt, 0);
         assert!(!queue.path().join("leases/dewiki").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn fleet_quarantine_retry_cli_requeues_the_exact_task() -> Result<()> {
+        let queue = TestDir::new()?;
+        let (wiki, task_id) = fleet::quarantined_task_fixture(queue.path())?;
+        run_with_ops(
+            Cli {
+                data_dir: queue.path().join("data"),
+                output_dir: queue.path().join("output"),
+                run_id: None,
+                command: Commands::FleetRetryQuarantine {
+                    queue_dir: queue.path().to_path_buf(),
+                    wiki: wiki.clone(),
+                    task_id,
+                },
+            },
+            &TestApplication::default(),
+        )
+        .expect("exact quarantined task should be requeued");
+        assert!(
+            queue
+                .path()
+                .join("pending")
+                .join(format!("{wiki}.json"))
+                .is_file()
+        );
         Ok(())
     }
 

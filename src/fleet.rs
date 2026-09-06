@@ -95,6 +95,16 @@ struct ReadyNotification {
     completed_at_unix: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct QuarantinedTask {
+    schema_version: u32,
+    reason: String,
+    error: String,
+    failed_at_unix: u64,
+    claim: FleetClaim,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct DiscoveryReport {
@@ -625,6 +635,95 @@ pub(crate) fn recover_stale(queue_root: &Path, max_attempts: u32) -> Result<usiz
     recover_stale_at(queue_root, now_unix()?, max_attempts)
 }
 
+/// Explicitly retry one authenticated retry-limit quarantine. This is an
+/// operator action, so it resets the automatic attempt budget while retaining
+/// the original quarantine receipt in the append-only retried archive.
+pub(crate) fn retry_quarantined(queue_root: &Path, wiki: &str, task_id: &str) -> Result<PathBuf> {
+    initialize(queue_root)?;
+    validate_component(wiki, "wiki")?;
+    validate_component(task_id, "task ID")?;
+    ensure!(
+        !pending_path(queue_root, wiki).exists(),
+        "fleet task for {wiki} is already pending"
+    );
+    ensure!(
+        !lease_dir(queue_root, wiki).exists(),
+        "fleet task for {wiki} already has a live lease"
+    );
+    let mut matches = Vec::new();
+    for entry in fs::read_dir(queue_root.join("quarantine"))? {
+        let entry = entry?;
+        if !entry.path().is_file()
+            || entry.path().extension().and_then(|value| value.to_str()) != Some("json")
+        {
+            continue;
+        }
+        let quarantine = match read_json::<QuarantinedTask>(&entry.path()) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        if quarantine.claim.task.wiki == wiki && quarantine.claim.task.task_id == task_id {
+            matches.push((entry.path(), quarantine));
+        }
+    }
+    ensure!(
+        matches.len() == 1,
+        "expected exactly one authenticated quarantine for {wiki}/{task_id}, found {}",
+        matches.len()
+    );
+    let (source, quarantine) = matches.pop().context("quarantine disappeared")?;
+    ensure!(
+        quarantine.schema_version == 1 && quarantine.reason == "retry_limit_exhausted",
+        "fleet quarantine is not an operator-retryable task"
+    );
+    quarantine.claim.validate()?;
+    let now = now_unix()?;
+    let mut task = quarantine.claim.task;
+    task.attempt = 0;
+    task.not_before_unix = now;
+    let pending = pending_path(queue_root, wiki);
+    atomic_write_json(&pending, &task)?;
+    let archive = queue_root
+        .join("retried")
+        .join(format!("{}-{}-{}.json", wiki, task_id, now));
+    if let Err(error) = fs::rename(&source, &archive) {
+        let _ = fs::remove_file(&pending);
+        return Err(error).context("failed to archive retried fleet quarantine");
+    }
+    sync_dir(queue_root)?;
+    Ok(archive)
+}
+
+#[cfg(any(test, coverage))]
+pub(crate) fn quarantined_task_fixture(queue_root: &Path) -> Result<(String, String)> {
+    let wiki = "nlwiki";
+    enqueue_at(
+        queue_root,
+        wiki,
+        "2026-08",
+        ResourceClass::Small,
+        SchedulingSignals {
+            source_layout: SourceLayout::Yearly,
+            source_count: 1,
+            compressed_source_bytes: Some(1),
+            prior_rows: None,
+            fragment_count: None,
+            historical_memory_peak_bytes: None,
+            historical_scratch_peak_bytes: None,
+            observed_throughput_rows_per_second: None,
+        },
+        "admin-fixture",
+        1_000,
+    )
+    .expect("fixture task must be enqueued");
+    let claim = claim_at(queue_root, ResourceClass::Small, "admin-worker", 60, 1_001)
+        .expect("fixture claim lookup must succeed")
+        .expect("fixture fleet task was not claimable");
+    fail_claim_at(queue_root, &claim, "operator-correctable", 1, 1_002)
+        .expect("fixture task must enter quarantine");
+    Ok((wiki.to_string(), claim.task.task_id))
+}
+
 fn recover_stale_at(queue_root: &Path, now: u64, max_attempts: u32) -> Result<usize> {
     initialize(queue_root)?;
     let leases = queue_root.join("leases");
@@ -737,6 +836,7 @@ fn initialize(root: &Path) -> Result<()> {
         "deferred",
         "superseded",
         "quarantine",
+        "retried",
         "notifications/ready",
     ] {
         fs::create_dir_all(root.join(directory))?;
@@ -1092,6 +1192,48 @@ mod tests {
                 .next()
                 .is_some()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_quarantine_retry_is_exact_and_resets_the_attempt_budget() -> Result<()> {
+        let root = TestDir::new()?;
+        enqueue_fixture(root.path(), "nlwiki", "2026-08", "controller-1", 1_000)?;
+        let claim = claim_at(root.path(), ResourceClass::Small, "worker-1", 60, 1_001)?
+            .context("task should be claimable")?;
+        assert!(fail_claim_at(root.path(), &claim, "correctable", 1, 1_002)?);
+        fs::create_dir(root.path().join("quarantine/not-a-file.json"))?;
+        fs::write(root.path().join("quarantine/invalid.json"), b"not json")?;
+
+        assert!(retry_quarantined(root.path(), "nlwiki", "wrong-task").is_err());
+        let archived = retry_quarantined(root.path(), "nlwiki", &claim.task.task_id)?;
+        assert!(archived.is_file());
+        let pending: FleetTask = read_json(&pending_path(root.path(), "nlwiki"))?;
+        assert_eq!(pending.task_id, claim.task.task_id);
+        assert_eq!(pending.attempt, 0);
+        assert!(archived.starts_with(root.path().join("retried")));
+        assert!(retry_quarantined(root.path(), "nlwiki", &claim.task.task_id).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn quarantine_retry_rolls_back_pending_when_archive_commit_fails() -> Result<()> {
+        let root = TestDir::new()?;
+        enqueue_fixture(root.path(), "nlwiki", "2026-08", "controller-1", 1_000)?;
+        let claim = claim_at(root.path(), ResourceClass::Small, "worker-1", 60, 1_001)?
+            .context("task should be claimable")?;
+        assert!(fail_claim_at(root.path(), &claim, "correctable", 1, 1_002)?);
+        let now = now_unix()?;
+        for timestamp in now..=now + 2 {
+            fs::create_dir(
+                root.path()
+                    .join("retried")
+                    .join(format!("nlwiki-{}-{timestamp}.json", claim.task.task_id)),
+            )
+            .expect("fixture archive collision directory must be created");
+        }
+        assert!(retry_quarantined(root.path(), "nlwiki", &claim.task.task_id).is_err());
+        assert!(!pending_path(root.path(), "nlwiki").exists());
         Ok(())
     }
 
