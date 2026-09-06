@@ -3740,11 +3740,14 @@ fn rollback_selection_files(
             let backup = output_dir.join(backup);
             backup.exists() || backup.is_symlink()
         });
+        let snapshot_is_restored = storage::current_snapshot_version(data_dir, &entry.wiki)?
+            .as_deref()
+            == entry.previous_snapshot.as_deref();
 
         // A prior rollback attempt may have restored the tail of this
         // transaction before a derived-index refresh failed. Do not revisit
         // an entry whose selected link and backup are both already gone.
-        if !selected_is_live && !backup_exists && previous_is_live {
+        if !selected_is_live && !backup_exists && previous_is_live && snapshot_is_restored {
             continue;
         }
         ensure!(
@@ -7922,7 +7925,7 @@ mod tests {
                 snapshot: "2026-03".to_string(),
                 candidate_relative: "_candidates/nlwiki/2026-03/not-active".to_string(),
                 previous_candidate_relative: None,
-                previous_snapshot: Some("2026-03".to_string()),
+                previous_snapshot: Some("2026-02".to_string()),
                 backup_relative: None,
                 workload_profile: None,
             }],
