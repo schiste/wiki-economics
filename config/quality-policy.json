@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "scrub_max_age_days": 14,
+  "default": {
+    "minimum_baseline": 100,
+    "decrease_warning_fraction": 0.01,
+    "decrease_critical_fraction": 0.10,
+    "increase_warning_fraction_per_month": 0.25,
+    "increase_critical_fraction_per_month": 1.00
+  },
+  "signals": {
+    "editor_period_observations": {
+      "label": "Editor observations",
+      "increase_warning_fraction_per_month": 0.15,
+      "increase_critical_fraction_per_month": 0.50
+    },
+    "patrol_events": { "label": "Patrol events" },
+    "rights_events": { "label": "Rights events" },
+    "account_creation_events": { "label": "Account creations" },
+    "local_account_block_events": { "label": "Account block events" },
+    "indefinitely_blocked_accounts": {
+      "label": "Indefinitely blocked accounts",
+      "increase_warning_fraction_per_month": 0.30,
+      "increase_critical_fraction_per_month": 1.20
+    }
+  }
+}

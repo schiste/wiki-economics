@@ -44,6 +44,18 @@ function fixture(t) {
     source: "test",
     verified_at: "2026-09-06",
   });
+  writeJson(path.join(root, "config", "quality-policy.json"), {
+    schema_version: 1,
+    scrub_max_age_days: 14,
+    default: {
+      minimum_baseline: 100,
+      decrease_warning_fraction: 0.01,
+      decrease_critical_fraction: 0.1,
+      increase_warning_fraction_per_month: 0.25,
+      increase_critical_fraction_per_month: 1,
+    },
+    signals: {},
+  });
   return {root, dataDir, outputDir};
 }
 

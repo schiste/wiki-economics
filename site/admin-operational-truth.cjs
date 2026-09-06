@@ -3,6 +3,7 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const {classifyError} = require("./admin-operation-status.cjs");
+const {buildWikiQuality} = require("./admin-quality.cjs");
 
 function readJson(file) {
   try {
@@ -225,7 +226,7 @@ function latestTimestamp(...values) {
   return values.filter(Boolean).sort().at(-1) || null;
 }
 
-function wikiOperationalTruth({wiki, definitions, lifecycle, dataDir, outputDir, gate}) {
+function wikiOperationalTruth({wiki, definitions, lifecycle, dataDir, outputDir, gate, scrub, qualityPolicy, nowUnix}) {
   const entry = lifecycle?.wikis?.[wiki] || null;
   const expected = expectedMetricsForWiki(definitions, lifecycle, wiki);
   const status = candidateStatus(outputDir, wiki);
@@ -262,6 +263,21 @@ function wikiOperationalTruth({wiki, definitions, lifecycle, dataDir, outputDir,
     };
   });
   const issues = [];
+  const quality = buildWikiQuality({
+    wiki,
+    definitions: definitions.filter((definition) => expected.includes(definition.id)),
+    dataDir,
+    outputDir,
+    gate,
+    index,
+    scrubStatus: scrub,
+    policy: qualityPolicy,
+    nowUnix,
+  });
+  issues.push(...quality.anomalies.map((anomaly) => ({
+    ...anomaly,
+    message: `${wiki}: ${anomaly.message}`,
+  })));
   const candidateIsNewer = candidate?.snapshot && (!publishedSnapshot || candidate.snapshot > publishedSnapshot);
   if (candidateIsNewer && candidate.state === "failed") {
     issues.push({
@@ -311,6 +327,7 @@ function wikiOperationalTruth({wiki, definitions, lifecycle, dataDir, outputDir,
       published: publishedCompleteness,
       details: metricDetails,
     },
+    quality,
     issues,
     updatedAt: latestTimestamp(candidate?.finishedAt, candidate?.heartbeatAt),
   };
@@ -385,15 +402,22 @@ function buildOperationalTruth({root, dataDir, outputDir, lifecycle, freshness, 
   const definitions = metricDefinitions(catalog);
   const gate = publicationGate(outputDir);
   const scrub = scrubStatus(outputDir);
+  const qualityPolicy = readJson(path.join(root, "config", "quality-policy.json"));
+  const nowUnix = Math.floor(Date.now() / 1000);
   const wikiNames = new Set([
     ...Object.keys(lifecycle?.wikis || {}),
     ...jsonFileStems(path.join(outputDir, "_candidate-status")),
     ...jsonFileStems(path.join(outputDir, "_ready-index")),
   ]);
   const wikis = Object.fromEntries([...wikiNames].sort().map((wiki) => [wiki, wikiOperationalTruth({
-    wiki, definitions, lifecycle, dataDir, outputDir, gate,
+    wiki, definitions, lifecycle, dataDir, outputDir, gate, scrub, qualityPolicy, nowUnix,
   })]));
   const pipelineIssues = Object.values(wikis).flatMap((wiki) => wiki.issues);
+  if (qualityPolicy?.schema_version !== 1) pipelineIssues.unshift({
+    code: "quality_policy_invalid",
+    severity: "critical",
+    message: "The quality anomaly policy is missing or invalid; candidate comparisons are not trustworthy.",
+  });
   const pipelineActive = Object.values(wikis).some((wiki) => ["starting", "running"].includes(wiki.candidate?.state))
     || (fleet?.work || []).some((work) => ["running", "queued", "waiting_upstream"].includes(work.state));
   const capacity = readJson(path.join(root, "config", "toolforge-capacity.json"));
@@ -418,6 +442,7 @@ function buildOperationalTruth({root, dataDir, outputDir, lifecycle, freshness, 
       schemaVersion: catalog?.schema_version ?? null,
       expectedMetricIds: definitions.map((definition) => definition.id).sort(),
     },
+    qualityPolicy: qualityPolicy?.schema_version === 1 ? qualityPolicy : null,
     public: {
       status: publicStatus,
       publicationRunId: gate?.run_id || freshness?.summary?.lastPublicationRunId || null,

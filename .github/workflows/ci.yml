@@ -146,6 +146,7 @@ jobs:
       - name: Run Node unit tests
         run: |
           node --test site/admin-auth.test.cjs
+          node --test site/admin-quality.test.cjs
           node --test site/admin-operational-truth.test.cjs
           node --test site/admin-page.test.cjs
           node --test site/admin-server.test.cjs
