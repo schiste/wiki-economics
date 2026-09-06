@@ -1993,6 +1993,26 @@ pub(crate) fn plan_wiki_preparation(
     })
 }
 
+pub(crate) fn begin_wiki_candidate_rebuild(
+    output_dir: &Path,
+    wiki: &str,
+    snapshot: &str,
+    run_id: &str,
+) -> Result<()> {
+    let target = wiki_candidate_dir(output_dir, wiki, snapshot, run_id)?;
+    ensure!(
+        !target.exists()
+            && crate::generation_lifecycle::load(output_dir, wiki, snapshot, run_id)?.is_none(),
+        "forced candidate rebuild requires a new run ID"
+    );
+    crate::generation_lifecycle::begin(output_dir, wiki, snapshot, run_id)?;
+    info!(
+        wiki,
+        snapshot, run_id, "started isolated full candidate rebuild"
+    );
+    Ok(())
+}
+
 /// Reuse independently receipted work from an interrupted qualification run.
 ///
 /// A logging dump is published independently from MediaWiki History. When it
@@ -6959,6 +6979,8 @@ mod tests {
             &waiting,
         )
         .expect("core family receipts should record");
+        fs::remove_file(waiting.join("_stages/patrol_compute/nlwiki.json"))
+            .expect("late-patrol fixture must not retain its patrol stage receipt");
 
         let plan = plan_wiki_qualification_preparation(
             fixture.data.path(),
@@ -7006,6 +7028,46 @@ mod tests {
                 compute_reused: true,
                 patrol_reused: true,
             }
+        );
+    }
+
+    #[test]
+    fn forced_candidate_rebuild_starts_one_new_immutable_generation() {
+        let fixture = Fixture::new().expect("candidate rebuild fixture should initialize");
+        begin_wiki_candidate_rebuild(
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            "forced-rebuild-1",
+        )
+        .expect("a fresh rebuild generation should start");
+        assert!(
+            crate::generation_lifecycle::load(
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                "forced-rebuild-1",
+            )
+            .expect("generation state should load")
+            .is_some()
+        );
+        assert!(
+            begin_wiki_candidate_rebuild(
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                "forced-rebuild-1",
+            )
+            .is_err()
+        );
+        assert!(
+            begin_wiki_candidate_rebuild(
+                fixture.output.path(),
+                "../unsafe",
+                "2026-03",
+                "forced-rebuild-2",
+            )
+            .is_err()
         );
     }
 

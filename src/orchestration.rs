@@ -40,6 +40,7 @@ pub(crate) struct PrepareWikiRequest<'a> {
     pub(crate) source_window_size: Option<usize>,
     pub(crate) lifecycle: &'a Path,
     pub(crate) mode: PreparationMode,
+    pub(crate) rebuild: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -234,6 +235,14 @@ pub(crate) trait MetricComputeOps {
 }
 
 pub(crate) trait CandidateOps {
+    fn begin_candidate_rebuild(
+        &self,
+        output_dir: &Path,
+        wiki: &str,
+        version: &str,
+        run_id: &str,
+    ) -> Result<()>;
+
     fn plan_candidate_preparation(
         &self,
         wiki: &str,
@@ -564,22 +573,35 @@ pub(crate) fn handle_prepare_wiki(
         PreparationMode::Qualification => "qualification_discovery",
     };
     let preparation = timed_stage(discovery_stage, Some(request.wiki), || {
-        let plan = match request.mode {
-            PreparationMode::Candidate => ops.plan_candidate_preparation(
-                request.wiki,
-                &version,
-                context.paths.data,
-                context.paths.output,
-                run_id,
-            ),
-            PreparationMode::Qualification => ops.plan_qualification_preparation(
-                request.wiki,
-                &version,
-                context.paths.data,
-                context.paths.output,
-                run_id,
-            ),
-        }?;
+        let plan = if request.rebuild {
+            anyhow::ensure!(
+                request.mode == PreparationMode::Candidate,
+                "forced rebuild is available only for publication candidates"
+            );
+            ops.begin_candidate_rebuild(context.paths.output, request.wiki, &version, run_id)?;
+            publication::WikiPreparationPlan::Build {
+                same_snapshot_candidate: false,
+                compute_reused: false,
+                patrol_reused: false,
+            }
+        } else {
+            match request.mode {
+                PreparationMode::Candidate => ops.plan_candidate_preparation(
+                    request.wiki,
+                    &version,
+                    context.paths.data,
+                    context.paths.output,
+                    run_id,
+                ),
+                PreparationMode::Qualification => ops.plan_qualification_preparation(
+                    request.wiki,
+                    &version,
+                    context.paths.data,
+                    context.paths.output,
+                    run_id,
+                ),
+            }?
+        };
         if matches!(plan, publication::WikiPreparationPlan::NoOp { .. }) {
             observability::record_stage_reused(discovery_stage, Some(request.wiki));
         }

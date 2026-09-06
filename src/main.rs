@@ -266,6 +266,10 @@ enum Commands {
         #[arg(long)]
         source_window_size: Option<usize>,
 
+        /// Recompute every metric into a new candidate without reusing prior outputs
+        #[arg(long)]
+        rebuild: bool,
+
         /// Wiki lifecycle and publication contract
         #[arg(long, default_value = "config/wiki-lifecycle.json")]
         lifecycle: PathBuf,
@@ -916,6 +920,16 @@ impl MetricComputeOps for RealOps {
 }
 
 impl CandidateOps for RealOps {
+    fn begin_candidate_rebuild(
+        &self,
+        output_dir: &Path,
+        wiki: &str,
+        version: &str,
+        run_id: &str,
+    ) -> Result<()> {
+        publication::begin_wiki_candidate_rebuild(output_dir, wiki, version, run_id)
+    }
+
     fn plan_candidate_preparation(
         &self,
         wiki: &str,
@@ -1198,6 +1212,7 @@ fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
             wiki,
             version,
             source_window_size,
+            rebuild,
             lifecycle,
         } => {
             let ready = handle_prepare_wiki(
@@ -1209,6 +1224,7 @@ fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
                     source_window_size,
                     lifecycle: &lifecycle,
                     mode: PreparationMode::Candidate,
+                    rebuild,
                 },
             )?;
             println!("{}", ready.display());
@@ -1304,6 +1320,7 @@ fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
                     source_window_size,
                     lifecycle: &lifecycle,
                     mode: PreparationMode::Qualification,
+                    rebuild: false,
                 },
             )?;
             println!("{}", receipt.display());
@@ -2263,6 +2280,17 @@ mod tests {
     }
 
     impl CandidateOps for TestApplication {
+        fn begin_candidate_rebuild(
+            &self,
+            _output_dir: &Path,
+            wiki: &str,
+            version: &str,
+            run_id: &str,
+        ) -> Result<()> {
+            self.record(format!("candidate_rebuild:{wiki}:{version}:{run_id}"));
+            Ok(())
+        }
+
         fn plan_candidate_preparation(
             &self,
             _wiki: &str,
@@ -2593,6 +2621,44 @@ mod tests {
                 "fetch_patrol:nlwiki:fixtures/data",
                 "compute_patrol:nlwiki:fixtures/data:fixtures/output/_candidates/nlwiki/2026-07/run-7:false:_",
                 "candidate_ready:nlwiki:2026-07:run-7",
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn forced_candidate_rebuild_never_reuses_existing_metric_families() -> Result<()> {
+        let cli = Cli::try_parse_from([
+            "wiki-econ",
+            "--data-dir",
+            "fixtures/data",
+            "--output-dir",
+            "fixtures/output",
+            "--run-id",
+            "rebuild-7",
+            "prepare-wiki",
+            "nlwiki",
+            "--version",
+            "2026-07",
+            "--rebuild",
+        ])?;
+        let ops = TestApplication::default()
+            .with_candidate_plans(vec![publication::WikiPreparationPlan::NoOp {
+                ready_path: PathBuf::from("existing/ready.json"),
+            }])
+            .with_cached_patrol();
+
+        run_with_ops(cli, &ops)?;
+
+        assert_eq!(
+            ops.calls.into_inner(),
+            vec![
+                "candidate_rebuild:nlwiki:2026-07:rebuild-7",
+                "source_window:nlwiki:2026-07:fixtures/data:1",
+                "compute:nlwiki:fixtures/data:fixtures/output/_candidates/nlwiki/2026-07/rebuild-7",
+                "fetch_patrol:nlwiki:fixtures/data",
+                "compute_patrol:nlwiki:fixtures/data:fixtures/output/_candidates/nlwiki/2026-07/rebuild-7:false:_",
+                "candidate_ready:nlwiki:2026-07:rebuild-7",
             ]
         );
         Ok(())
