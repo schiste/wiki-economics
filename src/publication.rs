@@ -3759,11 +3759,8 @@ fn rollback_selection_files(
             remove_selection_link(&active)?;
         }
         restore_backup(output_dir, &active, entry.backup_relative.as_deref())?;
-        storage::restore_current_snapshot(
-            data_dir,
-            &entry.wiki,
-            entry.previous_snapshot.as_deref(),
-        )?;
+        let previous_snapshot = entry.previous_snapshot.as_deref();
+        storage::restore_current_snapshot(data_dir, &entry.wiki, previous_snapshot)?;
         discover_latest_ready_candidate(data_dir, output_dir, &entry.wiki)?
             .map(|newest| write_ready_index(data_dir, output_dir, &entry.wiki, &newest))
             .transpose()?;
@@ -9000,35 +8997,41 @@ mod tests {
     }
 
     #[test]
-    fn recovery_finishes_a_partially_completed_rollback_with_unprovable_selected_lineage()
-    -> Result<()> {
-        let fixture = Fixture::new()?;
-        let (_site_root, dist) = fixture.published_site("baseline")?;
-        fixture.ready_candidate("candidate")?;
+    fn recovery_finishes_a_partially_completed_rollback_with_unprovable_selected_lineage() {
+        let fixture = Fixture::new().expect("partial rollback fixture should initialize");
+        let (_site_root, dist) = fixture
+            .published_site("baseline")
+            .expect("baseline site should publish");
+        fixture
+            .ready_candidate("candidate")
+            .expect("replacement candidate should become ready");
         let run_id = "partial-rollback";
         let selection = activate_ready_candidates(
             fixture.data.path(),
             fixture.output.path(),
             &fixture.lifecycle_path,
             run_id,
-        )?;
+        )
+        .expect("replacement candidate should activate");
 
         // Model the production failure: a rollback restored this entry and
         // consumed its backup, but its transaction journal never became
         // terminal. The selected candidate no longer has live lineage.
         let entry = &selection.entries[0];
         let active = fixture.output.path().join(&entry.wiki);
-        remove_selection_link(&active)?;
+        remove_selection_link(&active).expect("selected link should be removable");
         restore_backup(
             fixture.output.path(),
             &active,
             entry.backup_relative.as_deref(),
-        )?;
+        )
+        .expect("previous output should be restorable");
         storage::restore_current_snapshot(
             fixture.data.path(),
             &entry.wiki,
             entry.previous_snapshot.as_deref(),
-        )?;
+        )
+        .expect("previous snapshot pointer should be restorable");
 
         let audit = audit_publication_recovery(
             fixture.data.path(),
@@ -9049,7 +9052,8 @@ mod tests {
             &dist,
             Some(run_id),
             "recover-partial-rollback",
-        )?;
+        )
+        .expect("partially completed rollback should recover");
         assert!(recovered.repaired);
         assert!(recovered.site_rebuild_required);
         assert_eq!(
@@ -9064,9 +9068,42 @@ mod tests {
             &dist,
             Some(run_id),
             "recover-partial-rollback-again",
-        )?;
+        )
+        .expect("second recovery should be idempotent");
         assert!(!second.repaired);
-        Ok(())
+
+        // Also cover the candidate-backed predecessor form used by modern
+        // publications; it is already restored and therefore a safe no-op.
+        fs::remove_dir_all(fixture.output.path().join("nlwiki"))
+            .expect("legacy active output should be removable");
+        std::os::unix::fs::symlink(
+            "_candidates/nlwiki/2026-03/candidate/nlwiki",
+            fixture.output.path().join("nlwiki"),
+        )
+        .expect("candidate-backed predecessor should be selectable");
+        rollback_selection_files(
+            fixture.data.path(),
+            fixture.output.path(),
+            &PublicationSelection {
+                schema_version: 1,
+                run_id: "already-restored-candidate".to_string(),
+                state: "selected".to_string(),
+                entries: vec![SelectionEntry {
+                    wiki: "nlwiki".to_string(),
+                    snapshot: "2026-03".to_string(),
+                    candidate_relative: "_candidates/nlwiki/2026-03/not-active".to_string(),
+                    previous_candidate_relative: Some(
+                        "_candidates/nlwiki/2026-03/candidate".to_string(),
+                    ),
+                    previous_snapshot: Some("2026-03".to_string()),
+                    backup_relative: Some(
+                        "_publication_transactions/already-restored/backups/nlwiki".to_string(),
+                    ),
+                    workload_profile: None,
+                }],
+            },
+        )
+        .expect("candidate-backed restored entry should be a no-op");
     }
 
     #[test]
