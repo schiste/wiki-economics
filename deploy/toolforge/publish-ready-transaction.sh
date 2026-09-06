@@ -70,6 +70,12 @@ if node -e '
   "$ROOT/scripts/build-site.sh" \
     --output-dir "$WIKI_ECON_OUTPUT_DIR" \
     --dist-dir "$WIKI_ECON_SITE_DIST_DIR"
+  echo "==> Finalizing recovered publication transaction after matching site switch"
+  wiki_econ_run_cli publication-recover \
+    --all \
+    --lifecycle "$WIKI_ECON_WIKI_LIFECYCLE_FILE" \
+    --site-dist-dir "$WIKI_ECON_SITE_DIST_DIR" \
+    --report "$recovery_report"
 fi
 
 wiki_econ_run_cli publication-prepare-ready \
