@@ -791,10 +791,10 @@ impl SnapshotOps for RealOps {
     }
 
     fn finalize_snapshot(&self, wiki: &str, data_dir: &Path) -> Result<()> {
-        let removed = storage::retire_inactive_snapshots(data_dir, wiki)?;
         info!(
             wiki = wiki,
-            removed, "retired inactive snapshot generations"
+            data_dir = %data_dir.display(),
+            "deferred snapshot retirement until publication commit"
         );
         Ok(())
     }
