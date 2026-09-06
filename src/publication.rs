@@ -3181,16 +3181,17 @@ fn backups_recoverable(output_dir: &Path, selection: &PublicationSelection) -> R
     for entry in &selection.entries {
         let active = output_dir.join(&entry.wiki);
         let selected_target = PathBuf::from(&entry.candidate_relative).join(&entry.wiki);
-        let selected_is_live =
-            active_candidate_target(output_dir, &entry.wiki)?.as_ref() == Some(&selected_target);
+        let active_target = active_candidate_target(output_dir, &entry.wiki)?;
+        let selected_is_live = active_target.as_ref() == Some(&selected_target);
+        let previous_is_live = entry.previous_candidate_relative.as_deref().map_or_else(
+            || !active.is_symlink() && active.is_dir(),
+            |previous| active_target.as_ref() == Some(&PathBuf::from(previous).join(&entry.wiki)),
+        );
         let Some(backup) = entry.backup_relative.as_deref() else {
             continue;
         };
         let backup = output_dir.join(backup);
-        if !(backup.exists()
-            || backup.is_symlink()
-            || (!selected_is_live && (active.exists() || active.is_symlink())))
-        {
+        if !(backup.exists() || backup.is_symlink() || (!selected_is_live && previous_is_live)) {
             return Ok(false);
         }
     }
@@ -3392,7 +3393,6 @@ fn audit_publication_transaction(
                         ))
             });
         if matches!(selection.state.as_str(), "activating" | "selected")
-            && candidate_artifacts_valid
             && previous_site_is_valid
             && report.evidence.backups_recoverable
         {
@@ -3730,7 +3730,29 @@ fn rollback_selection_files(
     for entry in selection.entries.iter().rev() {
         let active = output_dir.join(&entry.wiki);
         let expected_target = PathBuf::from(&entry.candidate_relative).join(&entry.wiki);
-        if active_candidate_target(output_dir, &entry.wiki)?.as_ref() == Some(&expected_target) {
+        let active_target = active_candidate_target(output_dir, &entry.wiki)?;
+        let selected_is_live = active_target.as_ref() == Some(&expected_target);
+        let previous_is_live = entry.previous_candidate_relative.as_deref().map_or_else(
+            || !active.is_symlink() && active.is_dir(),
+            |previous| active_target.as_ref() == Some(&PathBuf::from(previous).join(&entry.wiki)),
+        );
+        let backup_exists = entry.backup_relative.as_deref().is_some_and(|backup| {
+            let backup = output_dir.join(backup);
+            backup.exists() || backup.is_symlink()
+        });
+
+        // A prior rollback attempt may have restored the tail of this
+        // transaction before a derived-index refresh failed. Do not revisit
+        // an entry whose selected link and backup are both already gone.
+        if !selected_is_live && !backup_exists && previous_is_live {
+            continue;
+        }
+        ensure!(
+            selected_is_live || backup_exists,
+            "publication rollback cannot prove a selected, backup, or previously restored target for {}",
+            entry.wiki
+        );
+        if selected_is_live {
             remove_selection_link(&active)?;
         }
         restore_backup(output_dir, &active, entry.backup_relative.as_deref())?;
@@ -8971,6 +8993,76 @@ mod tests {
             .expect("second pre-site recovery should be a no-op");
             assert!(!second.repaired, "recovery must be idempotent for {fault}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_finishes_a_partially_completed_rollback_with_unprovable_selected_lineage()
+    -> Result<()> {
+        let fixture = Fixture::new()?;
+        let (_site_root, dist) = fixture.published_site("baseline")?;
+        fixture.ready_candidate("candidate")?;
+        let run_id = "partial-rollback";
+        let selection = activate_ready_candidates(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            run_id,
+        )?;
+
+        // Model the production failure: a rollback restored this entry and
+        // consumed its backup, but its transaction journal never became
+        // terminal. The selected candidate no longer has live lineage.
+        let entry = &selection.entries[0];
+        let active = fixture.output.path().join(&entry.wiki);
+        remove_selection_link(&active)?;
+        restore_backup(
+            fixture.output.path(),
+            &active,
+            entry.backup_relative.as_deref(),
+        )?;
+        storage::restore_current_snapshot(
+            fixture.data.path(),
+            &entry.wiki,
+            entry.previous_snapshot.as_deref(),
+        )?;
+
+        let audit = audit_publication_recovery(
+            fixture.data.path(),
+            fixture.output.path(),
+            &dist,
+            Some(run_id),
+        );
+        assert!(!audit.transactions[0].evidence.candidate_artifacts_valid);
+        assert_eq!(
+            audit.transactions[0].classification,
+            PublicationRecoveryClassification::NeedsRollback
+        );
+
+        let recovered = recover_publication_transactions(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            &dist,
+            Some(run_id),
+            "recover-partial-rollback",
+        )?;
+        assert!(recovered.repaired);
+        assert!(recovered.site_rebuild_required);
+        assert_eq!(
+            recovered.transactions[0].classification,
+            PublicationRecoveryClassification::RolledBack
+        );
+
+        let second = recover_publication_transactions(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            &dist,
+            Some(run_id),
+            "recover-partial-rollback-again",
+        )?;
+        assert!(!second.repaired);
         Ok(())
     }
 
