@@ -61,3 +61,15 @@ test("recovery workbench exposes audit, fleet recovery, quarantine retry, and sc
   assert.match(source, />Scrub published artifacts</);
   assert.match(source, /quarantine-retry/);
 });
+
+test("quality ledger exposes receipt evidence, candidate deltas, and anomaly signals", () => {
+  assert.match(source, /## Data quality/);
+  assert.match(source, /admin-quality-table/);
+  assert.match(source, /Published evidence/);
+  assert.match(source, /Candidate evidence/);
+  assert.match(source, /Schema \$\{evidence\.schema/);
+  assert.match(source, /Algorithm \$\{evidence\.algorithmMatches/);
+  assert.match(source, /receipt \$\{qualityHash/);
+  assert.match(source, /quality\.signals/);
+  assert.match(source, /quality\.anomalies/);
+});

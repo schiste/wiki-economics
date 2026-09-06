@@ -979,6 +979,114 @@ display(html`<div class="admin-refresh-panel">
 
 </div>
 
+<!-- ── Data quality ledger ───────────────────────────────── -->
+
+<div class="chart-section">
+
+## Data quality
+
+<div class="note">Candidate receipts are compared with the currently published receipts without reopening large Parquet files. Warnings account for the number of elapsed snapshot months; algorithm changes are shown but are not treated as comparable trends.</div>
+
+```js
+function qualityInteger(value) {
+  return Number.isFinite(Number(value)) ? Number(value).toLocaleString() : "—"
+}
+
+function qualityPercent(value) {
+  return Number.isFinite(Number(value)) ? `${Number(value) >= 0 ? "+" : ""}${(Number(value) * 100).toFixed(1)}%` : "—"
+}
+
+function qualityHash(value) {
+  return typeof value === "string" && value.length >= 12 ? `${value.slice(0, 12)}…` : "—"
+}
+
+function qualityAge(seconds) {
+  if (!Number.isFinite(Number(seconds))) return "Not scrubbed"
+  const days = Number(seconds) / 86400
+  return days < 1 ? `${Math.max(0, Math.floor(Number(seconds) / 3600))}h ago` : `${Math.floor(days)}d ago`
+}
+
+function qualityTotals(evidence) {
+  const totals = Object.entries(evidence?.totals || {})
+  return totals.length ? totals.map(([name, value]) => `${name.replaceAll("_", " ")} ${qualityInteger(value)}`).join(" · ") : "No conservation total"
+}
+
+function qualityEvidence(scope, evidence) {
+  if (!evidence) return html`<div class="admin-quality-empty">No ${scope} artifact</div>`
+  if (!evidence.valid) return html`<div class="admin-quality-invalid">Receipt invalid</div>`
+  return html`<div class="admin-quality-evidence">
+    <div><strong>${qualityInteger(evidence.rows)}</strong><span>rows · ${bytesLabel(evidence.bytes)}</span></div>
+    <span>${evidence.minimumDate || "—"} → ${evidence.maximumDate || "—"}</span>
+    <span>${qualityTotals(evidence)}</span>
+    <span class=${evidence.schemaMatches ? "pass" : "fail"}>Schema ${evidence.schema?.length || 0} fields · ${evidence.schemaMatches ? "matches" : "mismatch"}</span>
+    <span class=${evidence.algorithmMatches ? "pass" : "fail"} title=${evidence.algorithmVersion || ""}>Algorithm ${evidence.algorithmMatches ? "current" : "mismatch"}</span>
+    <code title=${evidence.artifactSha256 || ""}>data ${qualityHash(evidence.artifactSha256)}</code>
+    <code title=${evidence.receiptSha256 || ""}>receipt ${qualityHash(evidence.receiptSha256)}</code>
+    ${scope === "published" ? html`<span class=${evidence.scrubAgeSeconds == null ? "muted" : "pass"}>${qualityAge(evidence.scrubAgeSeconds)}</span>` : ""}
+  </div>`
+}
+
+const qualityEntries = Object.values(operationalWikiTruth)
+  .filter((wiki) => wiki?.quality?.metrics?.length)
+  .sort((left, right) => {
+    const severity = (entry) => entry.quality.anomalies.some((item) => item.severity === "critical") ? 0
+      : entry.quality.anomalies.length ? 1 : 2
+    return severity(left) - severity(right) || left.wiki.localeCompare(right.wiki)
+  })
+const qualityMetricCount = qualityEntries.reduce((sum, wiki) => sum + wiki.quality.metrics.length, 0)
+const qualityAnomalies = qualityEntries.flatMap((wiki) => wiki.quality.anomalies.map((anomaly) => ({...anomaly, wiki: wiki.wiki})))
+```
+
+```js
+display(qualityEntries.length ? html`<div class="admin-quality-ledger">
+  <div class="admin-quality-summary">
+    <div><strong>${qualityEntries.length}</strong><span>wikis evidenced</span></div>
+    <div><strong>${qualityMetricCount}</strong><span>metric contracts</span></div>
+    <div class=${qualityAnomalies.length ? "warning" : "healthy"}><strong>${qualityAnomalies.length}</strong><span>anomalies</span></div>
+    <div><strong>${qualityEntries.filter((wiki) => wiki.quality.scrub?.stale).length}</strong><span>stale scrubs</span></div>
+  </div>
+  ${qualityEntries.map((wiki) => {
+    const quality = wiki.quality
+    const critical = quality.anomalies.filter((item) => item.severity === "critical").length
+    const warning = quality.anomalies.length - critical
+    return html`<details class="admin-quality-wiki" ?open=${critical > 0 || selectedWiki === wiki.wiki}>
+      <summary onclick=${() => setSelectedWiki(wiki.wiki)}>
+        <span class="admin-quality-wiki-name"><strong>${wiki.wiki}</strong><small>${quality.publishedSnapshot || "—"} published → ${quality.candidateSnapshot || "—"} candidate</small></span>
+        <span class="admin-quality-counts">
+          ${critical ? html`<b class="critical">${critical} critical</b>` : ""}
+          ${warning ? html`<b class="warning">${warning} warning</b>` : ""}
+          ${!quality.anomalies.length ? html`<b class="healthy">Checks pass</b>` : ""}
+          <small>scrub ${qualityAge(quality.scrub?.ageSeconds)}</small>
+        </span>
+      </summary>
+      ${quality.anomalies.length ? html`<div class="admin-quality-alerts">${quality.anomalies.map((anomaly) => html`<div class=${anomaly.severity}><strong>${anomaly.metric || anomaly.signal?.replaceAll("_", " ") || "Quality"}</strong><span>${anomaly.message}</span></div>`)}</div>` : ""}
+      <div class="admin-quality-signal-strip">
+        ${quality.signals.map((signal) => html`<div class=${signal.anomaly?.severity || "neutral"}>
+          <span>${signal.label}</span>
+          <strong>${qualityInteger(signal.published)} → ${qualityInteger(signal.candidate)}</strong>
+          <small>${signal.anomaly ? qualityPercent(signal.anomaly.fraction) : signal.published == null || signal.candidate == null ? "Not yet recorded" : "Within policy"}</small>
+        </div>`)}
+      </div>
+      <div class="admin-quality-table-wrap"><table class="admin-quality-table">
+        <thead><tr><th>Metric contract</th><th>Published evidence</th><th>Candidate evidence</th><th>Change</th></tr></thead>
+        <tbody>${quality.metrics.map((metric) => html`<tr class=${metric.status}>
+          <th><strong>${metric.id}</strong><span>${metric.family}</span><small title=${metric.expectedAlgorithmVersion}>${metric.expectedSchema.length} expected fields</small></th>
+          <td data-label="Published">${qualityEvidence("published", metric.published)}</td>
+          <td data-label="Candidate">${qualityEvidence("candidate", metric.candidate)}</td>
+          <td data-label="Change"><div class="admin-quality-change">
+            <strong>${metric.comparison?.rows?.delta == null ? "Not comparable" : `${metric.comparison.rows.delta >= 0 ? "+" : ""}${qualityInteger(metric.comparison.rows.delta)} rows`}</strong>
+            <span>${metric.comparison?.changed == null ? "Evidence incomplete" : metric.comparison.changed ? "Content changed" : "Identical bytes"}</span>
+            ${metric.comparison?.algorithmComparable === false ? html`<small>Algorithm changed; trend alarms suppressed</small>` : ""}
+          </div></td>
+        </tr>`)}</tbody>
+      </table></div>
+    </details>`
+  })}
+</div>` : html`<div class="admin-empty-state"><strong>No authenticated metric receipts are available.</strong><span>Quality evidence appears after the admin API reads a ready candidate or publication gate.</span></div>`)
+```
+
+</div>
+
 <!-- ── Pipeline status matrix ─────────────────────────────── -->
 
 <div class="chart-section">
@@ -1715,6 +1823,117 @@ currentManifest.merged.length > 0
 </div>
 
 <style>
+.admin-quality-ledger { border-block: 1px solid var(--theme-foreground-faintest); }
+.admin-quality-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  border-bottom: 1px solid var(--theme-foreground-faintest);
+}
+.admin-quality-summary > div {
+  display: flex;
+  align-items: baseline;
+  gap: 0.45rem;
+  padding: 0.75rem 0.85rem;
+  border-right: 1px solid var(--theme-foreground-faintest);
+}
+.admin-quality-summary > div:last-child { border-right: 0; }
+.admin-quality-summary strong { font-size: 1.15rem; }
+.admin-quality-summary span { color: var(--theme-foreground-muted); font-size: 0.72rem; }
+.admin-quality-summary .warning strong { color: #b26a00; }
+.admin-quality-summary .healthy strong { color: #2e7d32; }
+.admin-quality-wiki { border-bottom: 1px solid var(--theme-foreground-faintest); }
+.admin-quality-wiki:last-child { border-bottom: 0; }
+.admin-quality-wiki > summary {
+  display: grid;
+  grid-template-columns: minmax(12rem, 1fr) auto;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.8rem 0.25rem;
+  cursor: pointer;
+  list-style: none;
+}
+.admin-quality-wiki > summary::-webkit-details-marker { display: none; }
+.admin-quality-wiki > summary::before {
+  content: "+";
+  grid-column: 1;
+  grid-row: 1;
+  width: 1.25rem;
+  color: var(--theme-foreground-muted);
+  font-size: 1.05rem;
+}
+.admin-quality-wiki[open] > summary::before { content: "−"; }
+.admin-quality-wiki-name {
+  grid-column: 1;
+  grid-row: 1;
+  display: flex;
+  align-items: baseline;
+  gap: 0.7rem;
+  padding-left: 1.65rem;
+}
+.admin-quality-wiki-name strong { font-size: 0.92rem; }
+.admin-quality-wiki-name small,
+.admin-quality-counts small { color: var(--theme-foreground-muted); }
+.admin-quality-counts { display: flex; align-items: center; gap: 0.45rem; }
+.admin-quality-counts b { border-radius: 999px; padding: 0.14rem 0.45rem; font-size: 0.66rem; }
+.admin-quality-counts .critical { color: #b71c1c; background: color-mix(in srgb, #c62828 11%, transparent); }
+.admin-quality-counts .warning { color: #9b5c00; background: color-mix(in srgb, #f57f17 12%, transparent); }
+.admin-quality-counts .healthy { color: #246b2a; background: color-mix(in srgb, #2e7d32 10%, transparent); }
+.admin-quality-alerts {
+  display: grid;
+  gap: 1px;
+  margin: 0 0 0.8rem 1.65rem;
+  background: var(--theme-foreground-faintest);
+  border-left: 3px solid #f57f17;
+}
+.admin-quality-alerts > div {
+  display: grid;
+  grid-template-columns: minmax(8rem, 0.25fr) 1fr;
+  gap: 0.7rem;
+  padding: 0.5rem 0.65rem;
+  background: var(--theme-background);
+  font-size: 0.74rem;
+}
+.admin-quality-alerts > div.critical { border-left: 3px solid #c62828; }
+.admin-quality-signal-strip {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin: 0 0 0.85rem 1.65rem;
+  border: 1px solid var(--theme-foreground-faintest);
+}
+.admin-quality-signal-strip > div {
+  display: grid;
+  gap: 0.08rem;
+  padding: 0.55rem 0.65rem;
+  border-right: 1px solid var(--theme-foreground-faintest);
+  border-bottom: 1px solid var(--theme-foreground-faintest);
+}
+.admin-quality-signal-strip > div:nth-child(3n) { border-right: 0; }
+.admin-quality-signal-strip span,
+.admin-quality-signal-strip small { color: var(--theme-foreground-muted); font-size: 0.67rem; }
+.admin-quality-signal-strip strong { font-size: 0.76rem; }
+.admin-quality-signal-strip .warning strong { color: #9b5c00; }
+.admin-quality-signal-strip .critical strong { color: #b71c1c; }
+.admin-quality-table-wrap { overflow-x: auto; margin-left: 1.65rem; padding-bottom: 0.9rem; }
+.admin-quality-table { width: 100%; border-collapse: collapse; font-size: 0.72rem; }
+.admin-quality-table th,
+.admin-quality-table td { border-top: 1px solid var(--theme-foreground-faintest); padding: 0.62rem; vertical-align: top; text-align: left; }
+.admin-quality-table thead th { color: var(--theme-foreground-muted); font-weight: 600; }
+.admin-quality-table tbody th { width: 15%; border-left: 3px solid #2e7d32; }
+.admin-quality-table tr.warning > th { border-left-color: #f57f17; }
+.admin-quality-table tr.critical > th { border-left-color: #c62828; }
+.admin-quality-table tbody th span,
+.admin-quality-table tbody th small { display: block; color: var(--theme-foreground-muted); font-weight: 400; margin-top: 0.12rem; }
+.admin-quality-evidence { display: grid; gap: 0.16rem; min-width: 13rem; }
+.admin-quality-evidence > div { display: flex; gap: 0.35rem; align-items: baseline; }
+.admin-quality-evidence span,
+.admin-quality-evidence code { color: var(--theme-foreground-muted); font-size: 0.66rem; }
+.admin-quality-evidence .pass { color: #2e7d32; }
+.admin-quality-evidence .fail,
+.admin-quality-invalid { color: #c62828; font-weight: 700; }
+.admin-quality-empty { color: var(--theme-foreground-muted); }
+.admin-quality-change { display: grid; gap: 0.18rem; min-width: 8rem; }
+.admin-quality-change span,
+.admin-quality-change small { color: var(--theme-foreground-muted); }
 .admin-pipeline-board {
   display: grid;
   gap: 1.15rem;
@@ -2674,6 +2893,27 @@ currentManifest.merged.length > 0
   }
 }
 @media (max-width: 760px) {
+  .admin-quality-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .admin-quality-summary > div:nth-child(2) { border-right: 0; }
+  .admin-quality-wiki > summary { grid-template-columns: 1fr; gap: 0.35rem; }
+  .admin-quality-counts { padding-left: 1.65rem; flex-wrap: wrap; }
+  .admin-quality-alerts,
+  .admin-quality-signal-strip,
+  .admin-quality-table-wrap { margin-left: 0; }
+  .admin-quality-alerts > div { grid-template-columns: 1fr; gap: 0.15rem; }
+  .admin-quality-signal-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .admin-quality-signal-strip > div:nth-child(3n) { border-right: 1px solid var(--theme-foreground-faintest); }
+  .admin-quality-signal-strip > div:nth-child(2n) { border-right: 0; }
+  .admin-quality-table thead { display: none; }
+  .admin-quality-table,
+  .admin-quality-table tbody,
+  .admin-quality-table tr,
+  .admin-quality-table th,
+  .admin-quality-table td { display: block; width: 100%; }
+  .admin-quality-table tr { border-top: 1px solid var(--theme-foreground-faintest); padding: 0.7rem 0; }
+  .admin-quality-table th,
+  .admin-quality-table td { border-top: 0; padding: 0.35rem 0.5rem; }
+  .admin-quality-table td::before { content: attr(data-label); display: block; color: var(--theme-foreground-muted); font-size: 0.65rem; margin-bottom: 0.25rem; }
   .admin-command-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .admin-command-facts > div:nth-child(3) { border-left: 0; }
   .admin-command-facts > div:nth-child(n+3) { border-top: 1px solid var(--admin-line); }
