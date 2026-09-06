@@ -189,6 +189,8 @@ test("local mode exposes the legacy /api/status endpoint without auth", async (t
   assert.equal(body.auth.enabled, false);
   assert.equal(body.auth.authenticated, true);
   assert.equal(body.adminEnabled, true);
+  assert.equal(body.operationalTruth.schemaVersion, 1);
+  assert.ok(["healthy", "attention", "working", "degraded"].includes(body.operationalTruth.pipeline.status));
   assert.equal("suggestedVersion" in body, false, "calendar months must not masquerade as completed snapshots");
 });
 

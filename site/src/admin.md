@@ -398,7 +398,18 @@ for (const operation of operatorOperations) {
 const adminRuns = job?.adminRuns || {active: null, recent: []}
 const freshness = job?.freshness || {status: "unknown", alerts: [], summary: {}}
 const snapshotPlans = job?.snapshotPlans || []
-const latestPlanByWiki = new Map(snapshotPlans.map((plan) => [plan.wiki, plan]))
+const latestPlanByWiki = new Map()
+for (const plan of snapshotPlans) {
+  const current = latestPlanByWiki.get(plan.wiki)
+  if (!current || plan.snapshot > current.snapshot) latestPlanByWiki.set(plan.wiki, plan)
+}
+const operationalTruth = job?.operationalTruth || {
+  public: {status: freshness.status || "unknown", alerts: freshness.alerts || [], scrub: {state: "missing"}},
+  pipeline: {status: "unknown", issues: []},
+  infrastructure: {status: "unknown", issues: [], activeRequests: []},
+  wikis: {}
+}
+const operationalWikiTruth = operationalTruth.wikis || {}
 const supportedWikis = Array.from(new Set(job?.supportedWikis || [])).sort((a, b) => a.localeCompare(b))
 ```
 
@@ -449,7 +460,8 @@ function latestWikiJob(name) {
   const candidates = [
     operatorOperationByWiki.get(name),
     wikiJobMap[name],
-    wikiJobHistory[name]?.[0]
+    wikiJobHistory[name]?.[0],
+    operationalWikiTruth[name]?.candidate
   ].filter(Boolean)
   return candidates.sort((left, right) => Date.parse(operationTimestamp(right) || 0) - Date.parse(operationTimestamp(left) || 0))[0] || null
 }
@@ -511,8 +523,10 @@ const hasSelectedWiki = selectedWiki !== "—"
 ```js
 const attentionStates = new Set(["stalled", "quarantined", "interrupted", "failed"])
 const attentionCount = wikiEntries.filter(([name, wiki]) => attentionStates.has(operationalState(name, wiki))).length
-const freshnessNeedsAttention = ["critical", "warning"].includes(freshness.status)
-const operatorIssueCount = attentionCount + Number(freshnessNeedsAttention)
+const publicIssueCount = (operationalTruth.public?.alerts || []).length
+const pipelineIssueCount = (operationalTruth.pipeline?.issues || []).length
+const infrastructureIssueCount = (operationalTruth.infrastructure?.issues || []).length
+const operatorIssueCount = publicIssueCount + Math.max(attentionCount, pipelineIssueCount) + infrastructureIssueCount
 const activeCount = Number(Boolean(inlineRunningJob))
   + Number(fleet.counts?.running || 0)
   + Number(adminOperations.counts?.running || 0)
@@ -524,10 +538,10 @@ display(html`<div class="admin-command-header">
     <span>${activeCount > 0 ? `${activeCount} active ${activeCount === 1 ? "run" : "runs"}` : "Pipeline idle"}</span>
   </div>
   <dl class="admin-command-facts">
-    <div><dt>API</dt><dd class=${apiStatus ? "ok" : "bad"}>${apiStatus ? "Connected" : "Offline"}</dd></div>
-    <div><dt>Operator worker</dt><dd>${adminOperations.executionMode === "queue" ? "Scheduled 6 GiB" : "Local direct"} · ${adminOperations.counts?.queued || 0} queued</dd></div>
+    <div><dt>Public data</dt><dd class=${operationalTruth.public?.status === "healthy" ? "ok" : operationalTruth.public?.status === "critical" ? "bad" : ""}>${operationalTruth.public?.status || "unknown"}</dd></div>
+    <div><dt>Update pipeline</dt><dd class=${operationalTruth.pipeline?.status === "healthy" ? "ok" : operationalTruth.pipeline?.status === "degraded" ? "bad" : ""}>${operationalTruth.pipeline?.status || "unknown"}</dd></div>
+    <div><dt>Infrastructure</dt><dd class=${operationalTruth.infrastructure?.status === "available" ? "ok" : ""}>${operationalTruth.infrastructure?.status || "unknown"}</dd></div>
     <div><dt>Coverage</dt><dd>${publishedWikis.length} published · ${refreshWikis.length} scheduled</dd></div>
-    <div><dt>Inventory scan</dt><dd>${formatRefreshTimestamp(currentManifest.generated_at)}</dd></div>
   </dl>
   <div class="admin-command-session">
     <span>${auth?.user?.email || (auth?.enabled ? "Sign-in required" : "Local operator")}</span>
@@ -760,36 +774,55 @@ function formatRefreshBytes(bytes) {
 const scheduledRefresh = job?.scheduledRefresh || {schedule: null, last: null, history: []}
 const refreshHealth = classifyRefreshHealth(scheduledRefresh.last, scheduledRefresh.schedule)
 const refreshHistoryNewestFirst = [...(scheduledRefresh.history || [])].reverse()
+const operationalAlerts = [
+  ...(operationalTruth.public?.alerts || []).map((alert) => ({...alert, domain: "Public data"})),
+  ...(operationalTruth.pipeline?.issues || []).map((alert) => ({...alert, domain: "Pipeline"})),
+  ...(operationalTruth.infrastructure?.issues || []).map((alert) => ({...alert, domain: "Infrastructure"}))
+].sort((left, right) => (left.severity === "critical" ? 0 : 1) - (right.severity === "critical" ? 0 : 1))
 ```
 
 ```js
 display(html`<div class="admin-refresh-panel">
   <div class="admin-control-strip">
     <div class="admin-control-chip">
-      <span class="admin-control-label">Health</span>
-      <strong style=${"color:" + (freshness.status === "healthy" ? "#2e7d32" : freshness.status === "warning" ? "#b26a00" : "#c62828")}>${freshness.status}</strong>
+      <span class="admin-control-label">Public data</span>
+      <strong style=${"color:" + (operationalTruth.public?.status === "healthy" ? "#2e7d32" : "#c62828")}>${operationalTruth.public?.status || "unknown"}</strong>
     </div>
     <div class="admin-control-chip">
-      <span class="admin-control-label">Publisher</span>
-      <strong style=${"color:" + refreshHealthColors[refreshHealth.status]}>${refreshHealth.message}</strong>
+      <span class="admin-control-label">Update pipeline</span>
+      <strong style=${"color:" + (operationalTruth.pipeline?.status === "healthy" ? "#2e7d32" : operationalTruth.pipeline?.status === "working" ? "#1565c0" : operationalTruth.pipeline?.status === "attention" ? "#b26a00" : "#c62828")}>${operationalTruth.pipeline?.status || "unknown"}</strong>
+    </div>
+    <div class="admin-control-chip">
+      <span class="admin-control-label">Infrastructure</span>
+      <strong style=${"color:" + (operationalTruth.infrastructure?.status === "available" ? "#2e7d32" : operationalTruth.infrastructure?.status === "constrained" ? "#b26a00" : "#c62828")}>${operationalTruth.infrastructure?.status || "unknown"}</strong>
+      <small>${operationalTruth.infrastructure?.namespaceMemoryLimitBytes ? `${formatRefreshBytes(operationalTruth.infrastructure.activeJobRequestedBytes + operationalTruth.infrastructure.residentServiceMemoryBytes)} / ${formatRefreshBytes(operationalTruth.infrastructure.namespaceMemoryLimitBytes)} requested` : "No capacity evidence"}</small>
     </div>
     <div class="admin-control-chip">
       <span class="admin-control-label">Last publication</span>
       <strong>${formatRefreshTimestamp(freshness.summary?.lastPublicationAt)}</strong>
     </div>
     <div class="admin-control-chip">
-      <span class="admin-control-label">Snapshot</span>
-      <strong>${freshness.summary?.selectedSnapshot || "—"}</strong>
+      <span class="admin-control-label">Artifact scrub</span>
+      <strong>${operationalTruth.public?.scrub?.state || "missing"}</strong>
     </div>
     <div class="admin-control-chip">
       <span class="admin-control-label">Peak memory</span>
       <strong>${formatRefreshBytes(scheduledRefresh.last?.memoryPeakBytes)} / ${formatRefreshBytes(scheduledRefresh.last?.memoryLimitBytes)}</strong>
     </div>
   </div>
-  ${(freshness.alerts || []).length ? html`<div class="admin-health-alerts">
-    ${(freshness.alerts || []).slice(0, 8).map((alert) => html`<div class=${alert.severity || "warning"}><strong>${alert.code.replaceAll("_", " ")}</strong><span>${alert.message}</span></div>`)}
-    ${(freshness.alerts || []).length > 8 ? html`<span>${freshness.alerts.length - 8} more alerts in the public freshness record.</span>` : ""}
-  </div>` : html`<div class="admin-health-clear">All publication checks pass.</div>`}
+  ${operationalAlerts.length ? html`<div class="admin-health-alerts">
+    ${operationalAlerts.slice(0, 10).map((alert) => html`<div class=${alert.severity || "warning"}><strong>${alert.domain} · ${alert.code.replaceAll("_", " ")}</strong><span>${alert.message}</span></div>`)}
+    ${operationalAlerts.length > 10 ? html`<span>${operationalAlerts.length - 10} more operational alerts. Filter the project list to inspect each one.</span>` : ""}
+  </div>` : html`<div class="admin-health-clear">Published data, update pipeline, and configured infrastructure checks pass.</div>`}
+  <div class="admin-publication-actions">
+    <button class="admin-btn primary" ?disabled=${!apiStatus} title=${actionTooltipWithApi("publish", apiStatus)} onclick=${() => {
+      if (confirm("Publish every validated ready candidate and atomically switch the live site?")) runCommand("publish")
+    }}>Publish ready candidates</button>
+    <button class="admin-btn" ?disabled=${!apiStatus} title=${actionTooltipWithApi("site", apiStatus)} onclick=${() => {
+      if (confirm("Rebuild and validate only the website against the current publication?")) runCommand("site")
+    }}>Rebuild site only</button>
+    <details class="admin-inline-advanced"><summary>Advanced</summary><button class="admin-btn" ?disabled=${!apiStatus} title=${actionTooltipWithApi("merge", apiStatus)} onclick=${() => runCommand("merge")}>Regenerate merged artifacts only</button></details>
+  </div>
   ${refreshHistoryNewestFirst.length ? html`<details class="admin-history-details"><summary>Publication history (${refreshHistoryNewestFirst.length})</summary><table class="admin-refresh-history">
     <thead><tr><th>Started</th><th>Finished</th><th>Result</th><th>Duration</th><th>Peak memory</th><th>Wikis</th></tr></thead>
     <tbody>
@@ -887,11 +920,21 @@ function summarizeStatuses(entries) {
   }, {})
 }
 
-function milestoneState(wiki, milestoneKey, lifecycle, direct, state) {
-  const hasLivePublication = lifecycle?.publication === "published" && wiki.status === "complete"
+function metricCompletenessForMilestone(name, lifecycle) {
+  const truth = operationalWikiTruth[name]
+  if (!truth) return null
+  const candidateIsNewer = truth.snapshots?.candidate && (!truth.snapshots?.published || truth.snapshots.candidate > truth.snapshots.published)
+  return lifecycle?.publication === "hidden" || candidateIsNewer ? truth.metrics?.candidate : truth.metrics?.published
+}
+
+function milestoneState(name, wiki, milestoneKey, lifecycle, direct, state) {
+  const truth = operationalWikiTruth[name]
+  const publishedComplete = truth?.metrics?.published?.complete === true
+  const candidateIsNewer = truth?.snapshots?.candidate && (!truth.snapshots?.published || truth.snapshots.candidate > truth.snapshots.published)
+  const hasLivePublication = lifecycle?.publication === "published" && publishedComplete
   const hiddenQualification = lifecycle?.publication === "hidden" && lifecycle?.refresh === "qualification"
-  if (milestoneKey === "publication" && hasLivePublication) return "done"
-  if (hasLivePublication && state === "complete") return "done"
+  if (milestoneKey === "publication" && hasLivePublication && !candidateIsNewer) return "done"
+  if (hasLivePublication && state === "complete" && !candidateIsNewer) return "done"
   if (milestoneKey === "publication" && hiddenQualification) return "not-applicable"
 
   const stage = direct?.progress?.stage || direct?.stage || null
@@ -907,14 +950,16 @@ function milestoneState(wiki, milestoneKey, lifecycle, direct, state) {
     if ((direct?.progress?.completedSources || 0) >= (direct?.progress?.totalSources || Number.MAX_SAFE_INTEGER)) return "done"
     if (wiki.snapshot?.ready || wiki.ingest?.ready || wiki.raw?.files > 0) return "done"
   }
-  if (milestoneKey === "metrics" && (wiki.metrics || []).length >= 9) return "done"
-  if (milestoneKey === "validation" && ["ready", "needs_merge"].includes(state)) return "done"
+  if (milestoneKey === "metrics" && metricCompletenessForMilestone(name, lifecycle)?.complete) return "done"
+  if (milestoneKey === "validation" && truth?.ready?.snapshot === truth?.snapshots?.candidate
+      && metricCompletenessForMilestone(name, lifecycle)?.complete) return "done"
   return "future"
 }
 
-function milestoneCaption(wiki, milestoneKey, lifecycle, direct, state) {
-  const selectedSnapshot = direct?.selectedSnapshot || wiki.snapshot?.version || null
-  const milestoneStateValue = milestoneState(wiki, milestoneKey, lifecycle, direct, state)
+function milestoneCaption(name, wiki, milestoneKey, lifecycle, direct, state) {
+  const truth = operationalWikiTruth[name]
+  const selectedSnapshot = direct?.selectedSnapshot || truth?.snapshots?.candidate || wiki.snapshot?.version || null
+  const milestoneStateValue = milestoneState(name, wiki, milestoneKey, lifecycle, direct, state)
   if (milestoneStateValue === "active") return direct?.progress?.detail || direct?.stageLabel || "In progress"
   if (milestoneStateValue === "issue") return `Stopped at ${direct?.stageLabel || "this step"}`
   if (milestoneStateValue === "not-applicable") return "Hidden qualification"
@@ -922,9 +967,14 @@ function milestoneCaption(wiki, milestoneKey, lifecycle, direct, state) {
     if (wiki.snapshot?.mode === "retained-publication" && wiki.status === "complete") return "Validated; inputs retired"
     return selectedSnapshot ? `Snapshot ${selectedSnapshot}` : milestoneStateValue === "done" ? "Ready" : "Not started"
   }
-  if (milestoneKey === "metrics") return milestoneStateValue === "done" ? `${(wiki.metrics || []).length} artifacts` : "Waiting for data"
+  if (milestoneKey === "metrics") {
+    const completeness = metricCompletenessForMilestone(name, lifecycle)
+    return completeness ? `${completeness.present.length}/${completeness.expected.length} required` : "No receipt evidence"
+  }
   if (milestoneKey === "validation") return milestoneStateValue === "done" ? "Candidate accepted" : "Not run"
-  if (milestoneKey === "publication") return milestoneStateValue === "done" ? `Live${selectedSnapshot ? ` · ${selectedSnapshot}` : ""}` : "Not public"
+  if (milestoneKey === "publication") return milestoneStateValue === "done"
+    ? `Live · ${truth?.snapshots?.published || selectedSnapshot || "unknown"}`
+    : truth?.snapshots?.published ? `Current live · ${truth.snapshots.published}` : "Not public"
   return ""
 }
 
@@ -968,6 +1018,8 @@ function stateExplanation(name, wiki, state, lifecycle, direct, fleetWork) {
 }
 
 function evidenceItems(name, wiki, lifecycle, direct, fleetWork, plan) {
+  const truth = operationalWikiTruth[name]
+  const metricTruth = metricCompletenessForMilestone(name, lifecycle)
   const sourceProgress = direct?.progress
   const sourceEvidence = sourceProgress?.totalSources
     ? `${sourceProgress.completedSources || 0}/${sourceProgress.totalSources} source files · ${formatRefreshBytes(sourceProgress.downloadedBytes)}`
@@ -978,9 +1030,11 @@ function evidenceItems(name, wiki, lifecycle, direct, fleetWork, plan) {
         : `${wiki.raw?.files || 0} raw files · ${wiki.parquet?.done || 0}/${wiki.parquet?.total || 0} ingested`
   return [
     ["Lifecycle", lifecycle ? `${lifecycle.publication} / ${lifecycle.refresh}` : "not registered"],
-    ["Snapshot", direct?.selectedSnapshot || plan?.snapshot || wiki.snapshot?.version || wiki.raw?.version || "not selected"],
+    ["Latest available", truth?.snapshots?.latestAvailable || plan?.snapshot || "not discovered"],
+    ["Candidate", truth?.snapshots?.candidate || "none"],
+    ["Published", truth?.snapshots?.published ? `${truth.snapshots.published} · cutoff ${truth.snapshots.cutoff || "unknown"}` : "not published"],
     ["Source data", sourceEvidence],
-    ["Metrics", `${(wiki.metrics || []).length} core/patrol artifacts · ${wiki.dashboard?.length || 0} published files`],
+    ["Metrics", metricTruth ? `${metricTruth.present.length}/${metricTruth.expected.length} required${metricTruth.missing.length ? ` · missing ${metricTruth.missing.join(", ")}` : ""}` : "no receipt evidence"],
     ["Last activity", direct ? `${operationLabel(direct.state || (direct.exitCode === 0 ? "succeeded" : "failed"))} · ${relativeTime(operationTimestamp(direct))}` : "no operator run recorded"],
     ["Worker", fleetWork ? `${fleetWork.workerId || fleetWork.resourceClass || "unclaimed"} · ${fleetWork.heartbeatAt ? `heartbeat ${relativeTime(fleetWork.heartbeatAt)}` : "no heartbeat"}` : "no fleet lease"]
   ]
@@ -1012,9 +1066,9 @@ function pipelineDossier(name, wiki, state, lifecycle, direct, fleetWork, plan) 
     </div>
     <div class="admin-milestone-line" aria-label="Project lifecycle">
       ${pipelineSteps.map((step) => {
-        const stepState = milestoneState(wiki, step.key, lifecycle, direct, state)
+        const stepState = milestoneState(name, wiki, step.key, lifecycle, direct, state)
         return html`<div class="admin-milestone ${stepState}">
-          <i aria-hidden="true"></i><span>${step.label}</span><strong>${milestoneCaption(wiki, step.key, lifecycle, direct, state)}</strong>
+          <i aria-hidden="true"></i><span>${step.label}</span><strong>${milestoneCaption(name, wiki, step.key, lifecycle, direct, state)}</strong>
         </div>`
       })}
     </div>
@@ -1067,6 +1121,12 @@ function projectRowDetail(name, wiki, state, lifecycle, direct, fleetWork) {
   return stateExplanation(name, wiki, state, lifecycle, direct, fleetWork)
 }
 
+function snapshotProgressLabel(name) {
+  const snapshots = operationalWikiTruth[name]?.snapshots
+  if (!snapshots) return "Snapshot evidence unavailable"
+  return `Published ${snapshots.published || "—"} · candidate ${snapshots.candidate || "—"} · latest ${snapshots.latestAvailable || "—"}`
+}
+
 ```
 
 ```js
@@ -1107,11 +1167,7 @@ display(html`<div class="admin-pipeline-board">
           const isRunning = ["running", "cancelling"].includes(state)
           const stageDetail = isRunning
             ? `${direct?.stageLabel || direct?.stage || "Starting"}${direct?.progress?.percent != null ? ` · ${direct.progress.percent}%` : ""}`
-            : direct
-              ? `${relativeTime(operationTimestamp(direct))}`
-              : fleetWork
-                ? `${fleetWork.workerId || fleetWork.resourceClass || "fleet"}${fleetWork.snapshot ? ` · ${fleetWork.snapshot}` : ""}`
-                : lifecycle?.refresh || "inventory"
+            : snapshotProgressLabel(name)
           const expanded = selectedWiki === name
           return html`<div class="admin-pipeline-entry" role="listitem">
           <button
@@ -1129,8 +1185,8 @@ display(html`<div class="admin-pipeline-board">
             <span class="admin-pipeline-message">${projectRowDetail(name, wiki, state, lifecycle, direct, fleetWork)}</span>
             <span class="admin-stage-rail" aria-label="Project lifecycle">
               ${pipelineSteps.map((step) => {
-                const stepState = milestoneState(wiki, step.key, lifecycle, direct, state)
-                return html`<i class=${stepState} title=${`${step.label}: ${milestoneCaption(wiki, step.key, lifecycle, direct, state)}`}><span>${step.label}</span></i>`
+                const stepState = milestoneState(name, wiki, step.key, lifecycle, direct, state)
+                return html`<i class=${stepState} title=${`${step.label}: ${milestoneCaption(name, wiki, step.key, lifecycle, direct, state)}`}><span>${step.label}</span></i>`
               })}
             </span>
             <span class="admin-row-chevron" aria-hidden="true">${expanded ? "⌄" : "›"}</span>
@@ -1365,6 +1421,7 @@ const w = hasSelectedWiki ? wikiMap.get(selectedWiki) || emptyWikiStatus(selecte
 const selectedLifecycle = lifecycleStates[selectedWiki] || null
 const selectedFleetWork = fleetByWiki.get(selectedWiki) || null
 const selectedPlan = latestPlanByWiki.get(selectedWiki) || null
+const selectedTruth = operationalWikiTruth[selectedWiki] || null
 ```
 
 ```js
@@ -1374,7 +1431,9 @@ const selectedPlan = latestPlanByWiki.get(selectedWiki) || null
       <div><span>Project</span><strong>${wikipediaProjectLabel(selectedWiki)}</strong></div>
       <div><span>Operational state</span><strong>${statusLabels[operationalState(selectedWiki, w)] || operationLabel(operationalState(selectedWiki, w))}</strong></div>
       <div><span>Lifecycle</span><strong>${selectedLifecycle?.refresh || "Not registered"}</strong></div>
-      <div><span>Snapshot</span><strong>${selectedPlan?.snapshot || w.snapshot?.version || w.raw?.version || "—"}</strong></div>
+      <div><span>Latest available</span><strong>${selectedTruth?.snapshots?.latestAvailable || selectedPlan?.snapshot || "—"}</strong></div>
+      <div><span>Candidate</span><strong>${selectedTruth?.snapshots?.candidate || "—"}</strong></div>
+      <div><span>Published / cutoff</span><strong>${selectedTruth?.snapshots?.published || "—"} / ${selectedTruth?.snapshots?.cutoff || "—"}</strong></div>
     </div>
     ${!selectedLifecycle ? html`<div class="warning"><strong>Processing is blocked.</strong> ${selectedWiki} has a source plan but is not registered in the lifecycle. Add it as a publication-invisible qualification project before continuing.</div>` : ""}
     ${selectedFleetWork ? html`<div class="admin-run-evidence">
@@ -1455,9 +1514,18 @@ const selectedPlan = latestPlanByWiki.get(selectedWiki) || null
 ```js
 !hasSelectedWiki
   ? html`<span></span>`
-  : w.metrics.length > 0
-  ? html`${Inputs.table(w.metrics.map(m => ({metric: m.name, size: m.size_kb + " KB"})), {
-      header: {metric: "Metric", size: "Size"}, sort: "metric"
+  : selectedTruth?.metrics?.details?.length
+  ? html`${Inputs.table(selectedTruth.metrics.details.map(metric => ({
+      metric: metric.id,
+      family: metric.family,
+      candidate: metric.candidateReady ? "Ready" : "Missing",
+      published: metric.publishedReady ? "Verified" : "Missing",
+      rows: metric.publishedRows == null ? "—" : metric.publishedRows.toLocaleString(),
+      range: metric.minimumDate && metric.maximumDate ? `${metric.minimumDate} – ${metric.maximumDate}` : "—",
+      algorithm: metric.algorithmVersion
+    })), {
+      header: {metric: "Metric", family: "Family", candidate: "Candidate", published: "Published", rows: "Rows", range: "Date range", algorithm: "Algorithm"},
+      sort: "metric"
     })}
     ${apiStatus && selectedLifecycle ? html`<button class="admin-btn small" title=${actionTooltipWithApi("compute", apiStatus)} onclick=${() => runCommand("compute", selectedWiki)}>recompute</button>` : ""}`
   : html`<div class="warning">No metrics computed for <strong>${selectedWiki}</strong>.</div>
@@ -1476,10 +1544,10 @@ const selectedPlan = latestPlanByWiki.get(selectedWiki) || null
   ? html`${Inputs.table(w.dashboard.map(m => ({metric: m.name, size: m.size_kb + " KB"})), {
       header: {metric: "Metric file", size: "Size"}, sort: "metric"
     })}
-    ${apiStatus ? html`<button class="admin-btn small" title=${actionTooltipWithApi("merge", apiStatus)} onclick=${() => runCommand("merge")}>re-merge all</button>` : ""}`
+    ${apiStatus ? html`<button class="admin-btn small" title=${actionTooltipWithApi("merge", apiStatus)} onclick=${() => runCommand("merge")}>regenerate merged artifacts</button>` : ""}`
   : html`<div class="warning">No site data found for <strong>${selectedWiki}</strong>.</div>
     ${apiStatus
-      ? html`<button class="admin-btn" title=${actionTooltipWithApi("merge", apiStatus)} onclick=${() => runCommand("merge")}>Publish site data</button>`
+      ? html`<button class="admin-btn" title=${actionTooltipWithApi("merge", apiStatus)} onclick=${() => runCommand("merge")}>Regenerate merged artifacts</button>`
       : html`<pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && ${runnerCommand()} ${cliFlags(currentManifest)} merge</pre>`
     }`
 ```
@@ -1527,6 +1595,28 @@ currentManifest.merged.length > 0
 }
 .admin-control-chip strong {
   font-size: 0.82rem;
+}
+.admin-control-chip small {
+  color: var(--theme-foreground-muted);
+  font-size: 0.68rem;
+}
+.admin-publication-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.8rem 0;
+}
+.admin-inline-advanced summary {
+  cursor: pointer;
+  color: var(--theme-foreground-muted);
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+.admin-inline-advanced[open] {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
 }
 .admin-control-chip.online {
   border-color: color-mix(in srgb, #2e7d32 30%, transparent);
@@ -2355,7 +2445,7 @@ currentManifest.merged.length > 0
 .admin-registration-policy { display: grid; grid-template-columns: minmax(16rem, 1.5fr) minmax(13rem, 1fr); gap: 0.8rem; max-width: 48rem; }
 .admin-registration-policy form { margin: 0; }
 .admin-empty-state { display: grid; gap: 0.2rem; border-block: 1px solid var(--theme-foreground-faintest); }
-.admin-wiki-focus { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); margin-bottom: 0.75rem; border-block: 1px solid var(--theme-foreground-faintest); }
+.admin-wiki-focus { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); margin-bottom: 0.75rem; border-block: 1px solid var(--theme-foreground-faintest); }
 .admin-wiki-focus > div { display: grid; gap: 0.25rem; padding: 0.75rem 0.85rem; border-left: 1px solid var(--theme-foreground-faintest); }
 .admin-wiki-focus > div:first-child { border-left: 0; }
 .admin-wiki-focus strong { font-size: 0.78rem; }

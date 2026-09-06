@@ -52,6 +52,8 @@ for f in site/data-build/*.cjs; do node --check "$f"; done
 
 echo "==> node --test site/admin-auth.test.cjs"
 node --test site/admin-auth.test.cjs
+node --test site/admin-operational-truth.test.cjs
+node --test site/admin-page.test.cjs
 
 echo "==> node --test site/admin-server.test.cjs"
 node --test site/admin-server.test.cjs

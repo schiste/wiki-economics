@@ -91,18 +91,54 @@ Supported endpoints:
 
 | Method | Path suffix | Purpose |
 | --- | --- | --- |
-| `GET` | `/status` | Returns current job state, logs, manifest age, freshness evaluation, auth state, and supported wiki list. |
+| `GET` | `/status` | Returns current job state plus the authoritative operational snapshot described below. |
+| `POST` | `/register-wiki` | Add a supported project to the lifecycle without starting work. |
+| `POST` | `/onboard-wiki` | Atomically register a project and queue its first preparation or qualification. |
 | `POST` | `/fetch` | Run `wiki-econ fetch <wiki>`. |
 | `POST` | `/ingest` | Run `wiki-econ ingest <wiki>`. |
 | `POST` | `/compute` | Run `wiki-econ compute <wiki>`. |
 | `POST` | `/merge` | Run `wiki-econ merge`. |
-| `POST` | `/run` | Run the full `fetch → ingest → compute → merge` pipeline for a wiki. |
+| `POST` | `/run` | Prepare and validate an immutable candidate for a managed wiki; it does not publish. |
+| `POST` | `/qualify` | Prepare and validate a hidden qualification candidate. |
 | `POST` | `/patrol-fetch` | Run `wiki-econ patrol-fetch <wiki>`. |
 | `POST` | `/patrol-compute` | Run the guarded `wiki-econ patrol-refresh <wiki>` fetch→compute flow. |
 | `POST` | `/cleanup` | Remove `.tmp`, invalid marker files, and partial outputs for a wiki. |
 | `POST` | `/cancel` | Cancel the current job. |
+| `POST` | `/publish` | Run the fail-closed ready-candidate publisher and atomically switch the site. |
+| `POST` | `/site` | Rebuild and validate only the site against the current publication. |
+| `POST` | `/fleet-recover` | Recover stale fleet leases. |
+| `POST` | `/recover-admin` | Recover a stale durable operator request. |
 
-A new POST while a job is running returns `409 Conflict`; jobs are not queued.
+Production writes heavy operations to the durable Toolforge dispatcher queue.
+Local direct mode permits one active operation and returns `409 Conflict` for
+another start while it is running.
+
+## Authoritative operational status
+
+`GET /status` includes a versioned `operationalTruth` object. It composes
+existing durable pipeline evidence without reopening Parquet data:
+
+- `_candidate-status/<wiki>.json` for the latest preparation outcome and
+  resource measurements;
+- `_ready-index/<wiki>.json` for authenticated ready and active candidate
+  identities;
+- `publication-gate.json` for the published metric proofs, cutoff dates, and
+  selected snapshots;
+- `_scrubs/status.json` for independent artifact verification;
+- completed `source-plan.json` plus `remote-inventory.json` pairs for the
+  latest known completed snapshots;
+- the generated metric registry for the exact expected metric set.
+
+It deliberately reports three independent domains: public-data health, update
+pipeline health, and infrastructure capacity. A valid public release can
+therefore remain green while a newer candidate is red. Metric readiness is an
+exact `MetricId` comparison; file counts never establish completeness.
+
+The admin pod cannot query the Toolforge Jobs API. Configured namespace and
+job-request limits live in `config/toolforge-capacity.json`; the operational
+snapshot combines those limits with durable active fleet/admin/publisher work
+to explain known scheduling contention. This is configured capacity evidence,
+not a claim to replace `toolforge jobs list` during break-glass diagnosis.
 
 ## Hosted auth model
 

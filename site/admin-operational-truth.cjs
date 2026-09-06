@@ -143,16 +143,27 @@ function completeness(expected, present) {
 
 function normalizeCandidate(value) {
   if (!value) return null;
+  const stage = value.currentStage || value.failingStage || null;
+  const unqualifiedProfile = /workload profile .* has not completed production qualification/i.test(value.error || "");
   return {
     state: value.state,
+    action: "prepare",
     runId: value.runId,
     snapshot: value.selectedSnapshot || null,
+    selectedSnapshot: value.selectedSnapshot || null,
     startedAt: value.startedAt || null,
     finishedAt: value.finishedAt || null,
     heartbeatAt: value.heartbeatAt || null,
-    currentStage: value.currentStage || value.failingStage || null,
+    currentStage: stage,
+    stage,
+    stageLabel: stage ? stage.replaceAll("_", " ") : null,
     failingStage: value.failingStage || null,
     error: value.error || null,
+    errorSummary: value.error || null,
+    retryable: unqualifiedProfile ? false : null,
+    remediation: unqualifiedProfile
+      ? "Qualify the selected workload profile in production or adjust the adaptive profile thresholds using measured capacity evidence before retrying."
+      : null,
     exitCode: value.exitCode ?? null,
     durationSecs: value.durationSecs ?? null,
     stageDurationsMs: value.stageDurationsMs || {},
@@ -180,8 +191,28 @@ function wikiOperationalTruth({wiki, definitions, lifecycle, dataDir, outputDir,
   const readySnapshot = index?.newest_valid_ready?.snapshot || null;
   const candidate = normalizeCandidate(status);
   const latestAvailable = completed.at(-1) || readySnapshot || publishedSnapshot;
-  const candidateCompleteness = completeness(expected, readyMetricIds(index, definitions, "newest_valid_ready"));
+  const candidateTargetSnapshot = status?.selectedSnapshot || readySnapshot;
+  const candidateReadyIds = readySnapshot && readySnapshot === candidateTargetSnapshot
+    ? readyMetricIds(index, definitions, "newest_valid_ready")
+    : [];
+  const candidateCompleteness = completeness(expected, candidateReadyIds);
   const publishedCompleteness = completeness(expected, publishedMetricIds(gate, wiki, expected));
+  const candidateMetricSet = new Set(candidateCompleteness.present);
+  const publishedMetricSet = new Set(publishedCompleteness.present);
+  const metricDetails = definitions.filter((definition) => expected.includes(definition.id)).map((definition) => {
+    const proof = gate?.metrics?.[definition.id]?.wikis?.[wiki] || null;
+    return {
+      id: definition.id,
+      family: definition.family,
+      algorithmVersion: definition.algorithm_version,
+      candidateReady: candidateMetricSet.has(definition.id),
+      publishedReady: publishedMetricSet.has(definition.id),
+      publishedRows: proof?.rows ?? null,
+      minimumDate: proof?.minimum_date ?? null,
+      maximumDate: proof?.maximum_date ?? null,
+      conservationTotal: proof?.conservation_total ?? null,
+    };
+  });
   const issues = [];
   const candidateIsNewer = candidate?.snapshot && (!publishedSnapshot || candidate.snapshot > publishedSnapshot);
   if (candidateIsNewer && candidate.state === "failed") {
@@ -200,11 +231,19 @@ function wikiOperationalTruth({wiki, definitions, lifecycle, dataDir, outputDir,
     });
   }
   if (latestAvailable && publishedSnapshot && latestAvailable > publishedSnapshot) {
-    issues.push({
-      code: "snapshot_pending",
-      severity: candidate?.state === "failed" ? "critical" : "warning",
-      message: `${wiki} has completed snapshot ${latestAvailable}, while ${publishedSnapshot} is public.`,
-    });
+    if (candidate?.state !== "failed" && readySnapshot && readySnapshot > publishedSnapshot) {
+      issues.push({
+        code: "candidate_ready_not_published",
+        severity: "warning",
+        message: `${wiki} candidate ${readySnapshot} is ready, while ${publishedSnapshot} remains public.`,
+      });
+    } else if (!candidate || !["starting", "running"].includes(candidate.state)) {
+      issues.push({
+        code: "snapshot_pending",
+        severity: "warning",
+        message: `${wiki} has completed snapshot ${latestAvailable}, while ${publishedSnapshot} is public.`,
+      });
+    }
   }
   return {
     wiki,
@@ -222,6 +261,7 @@ function wikiOperationalTruth({wiki, definitions, lifecycle, dataDir, outputDir,
     metrics: {
       candidate: candidateCompleteness,
       published: publishedCompleteness,
+      details: metricDetails,
     },
     issues,
     updatedAt: latestTimestamp(candidate?.finishedAt, candidate?.heartbeatAt),
@@ -253,10 +293,11 @@ function infrastructureTruth({capacity, fleet, adminOperations, scheduledRefresh
   const availableBytes = Math.max(0, limitBytes - usedBytes);
   const minimumJobBytes = Number(capacity.minimum_schedulable_job_bytes || 0);
   const constrained = activeRequests.length > 0 && availableBytes < minimumJobBytes;
+  const gib = (bytes) => `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
   const issues = constrained ? [{
     code: "toolforge_memory_quota_contention",
     severity: "warning",
-    message: `Active requested memory leaves ${availableBytes} bytes, below the ${minimumJobBytes}-byte minimum data-job request; other workers or publication must wait.`,
+    message: `Active workloads leave ${gib(availableBytes)} of the ${gib(limitBytes)} namespace memory quota, below the ${gib(minimumJobBytes)} minimum data-job request; other workers or publication must wait.`,
   }] : [];
   return {
     status: constrained ? "constrained" : "available",
@@ -286,12 +327,14 @@ function buildOperationalTruth({root, dataDir, outputDir, lifecycle, freshness, 
     wiki, definitions, lifecycle, dataDir, outputDir, gate,
   })]));
   const pipelineIssues = Object.values(wikis).flatMap((wiki) => wiki.issues);
+  const pipelineActive = Object.values(wikis).some((wiki) => ["starting", "running"].includes(wiki.candidate?.state))
+    || (fleet?.work || []).some((work) => ["running", "queued", "waiting_upstream"].includes(work.state));
   const capacity = readJson(path.join(root, "config", "toolforge-capacity.json"));
   const infrastructure = infrastructureTruth({capacity, fleet, adminOperations, scheduledRefresh});
   const publicStatus = freshness?.status || (gate ? "healthy" : "unknown");
   const pipelineStatus = pipelineIssues.some((issue) => issue.severity === "critical")
     ? "degraded"
-    : pipelineIssues.length > 0 ? "attention" : "healthy";
+    : pipelineIssues.length > 0 ? "attention" : pipelineActive ? "working" : "healthy";
   return {
     schemaVersion: 1,
     generatedAt: new Date().toISOString(),
