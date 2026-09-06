@@ -589,6 +589,8 @@ display(visibleOperationReceipts.length ? html`<section class="admin-operation-r
 
 <!-- ── Job output panel ───────────────────────────────────── -->
 
+<div data-admin-view="runs">
+
 ```js
 const trackedWikiEntries = Object.entries(currentWikis)
 const trackedWikiNames = trackedWikiEntries.map(([name]) => name)
@@ -724,7 +726,7 @@ display(html`<div class="admin-command-header">
 
 ```js
 topLevelJob
-  ? html`<div data-admin-view="runs" class="admin-job-panel ${topLevelJob.running ? "running" : topLevelJob.cancelled ? "failed" : topLevelJob.exitCode === 0 ? "success" : "failed"}">
+  ? html`<div class="admin-job-panel ${topLevelJob.running ? "running" : topLevelJob.cancelled ? "failed" : topLevelJob.exitCode === 0 ? "success" : "failed"}">
       <div class="admin-job-header">
         <strong>${topLevelJob.running ? "Running..." : topLevelJob.cancelled ? "Cancelled" : topLevelJob.exitCode === 0 ? "Completed" : "Failed"}</strong>
         <code>${topLevelJob.command || ""}</code>
@@ -777,6 +779,8 @@ topLevelJob
     </div>`
   : html`<span></span>`
 ```
+
+</div>
 
 <div id="admin-view-runs" class="chart-section admin-activity-section" data-admin-view="runs">
 

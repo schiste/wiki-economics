@@ -73,11 +73,18 @@ export function createAdminViewNavigation({root = document, location = globalThi
     navigation.append(button);
   }
 
+  const viewTargetsReady = () => ADMIN_VIEWS.every((view) => root.getElementById?.(`admin-view-${view.id}`));
   const observer = typeof MutationObserver === "function"
-    ? new MutationObserver(() => applyAdminView(root, current))
+    ? new MutationObserver(() => {
+        applyAdminView(root, current);
+        if (viewTargetsReady()) observer.disconnect();
+      })
     : null;
   observer?.observe(root.body || root, {childList: true, subtree: true});
-  queueMicrotask(() => applyAdminView(root, current));
+  queueMicrotask(() => {
+    applyAdminView(root, current);
+    if (viewTargetsReady()) observer?.disconnect();
+  });
 
   return {element: navigation, select, current: () => current, dispose: () => observer?.disconnect()};
 }
