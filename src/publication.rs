@@ -4321,9 +4321,10 @@ fn rollback_unpublished_selection(
     data_dir: &Path,
     output_dir: &Path,
     lifecycle_path: &Path,
+    site_dist_dir: &Path,
     run_id: &str,
     recovery_run_id: &str,
-) -> Result<()> {
+) -> Result<bool> {
     let path = selection_path(output_dir, run_id)?;
     let mut selection: PublicationSelection = read_json(&path)?;
     validate_publication_selection(output_dir, run_id, &selection)?;
@@ -4331,12 +4332,50 @@ fn rollback_unpublished_selection(
         matches!(selection.state.as_str(), "activating" | "selected"),
         "publication selection is not recoverable by rollback"
     );
+    // A selection switches wiki links before it starts replacing derived
+    // publication artifacts. If the old gate still authenticates every
+    // artifact and the live site still authenticates that gate, preserve the
+    // previous publication byte-for-byte. Regenerating it with the current
+    // binary is not safe across algorithm or schema upgrades.
     rollback_selection_files(data_dir, output_dir, &selection)?;
+    let previous_publication_is_intact = verify(output_dir, "publication-recovery")
+        .and_then(|()| {
+            ensure!(
+                crate::fingerprint::current_site_matches_publication(output_dir, site_dist_dir,)?,
+                "current site does not match the previous publication gate"
+            );
+            let gate: GateReceipt = read_json(&output_dir.join(RECEIPT_FILE))?;
+            ensure!(
+                selection.entries.iter().all(|entry| {
+                    entry.previous_snapshot.as_ref().is_some_and(|snapshot| {
+                        gate.selected_snapshot_versions.get(&entry.wiki) == Some(snapshot)
+                    })
+                }),
+                "previous publication gate does not cover every rollback snapshot"
+            );
+            Ok(())
+        })
+        .is_ok();
+    if previous_publication_is_intact {
+        verify(output_dir, "publication-recovery")?;
+        ensure!(
+            crate::fingerprint::current_site_matches_publication(output_dir, site_dist_dir)?,
+            "previous publication changed while restoring wiki candidates"
+        );
+        selection.state = "rolled_back".to_string();
+        atomic_json(&path, &selection)?;
+        info!(
+            transaction_run_id = run_id,
+            "restored the authenticated previous publication without regenerating artifacts"
+        );
+        return Ok(false);
+    }
     begin_selected_run(output_dir, recovery_run_id, &BTreeMap::new())?;
     crate::merge::merge_outputs(output_dir, Some(recovery_run_id))?;
     validate(data_dir, output_dir, lifecycle_path, recovery_run_id)?;
     selection.state = "rolled_back".to_string();
-    atomic_json(&path, &selection)
+    atomic_json(&path, &selection)?;
+    Ok(true)
 }
 
 fn resume_unpublished_selection(
@@ -4462,15 +4501,15 @@ pub(crate) fn recover_publication_transactions(
                 site_rebuild_required = true;
             }
             PublicationRecoveryClassification::NeedsRollback => {
-                rollback_unpublished_selection(
+                site_rebuild_required |= rollback_unpublished_selection(
                     data_dir,
                     output_dir,
                     lifecycle_path,
+                    site_dist_dir,
                     &transaction.run_id,
                     recovery_run_id,
                 )?;
                 repaired = true;
-                site_rebuild_required = true;
             }
             PublicationRecoveryClassification::Ambiguous => {
                 quarantine_ambiguous_publication(output_dir, transaction)?;
@@ -9121,6 +9160,11 @@ mod tests {
                 audit.transactions[0].classification,
                 PublicationRecoveryClassification::NeedsRollback
             );
+            let intact_previous_publication = matches!(
+                fault,
+                "after_active_symlink_switch" | "after_snapshot_pointer_switch"
+            );
+            let gate_before_recovery = fs::read(fixture.output.path().join(RECEIPT_FILE))?;
             let recovered = recover_publication_transactions(
                 fixture.data.path(),
                 fixture.output.path(),
@@ -9131,7 +9175,17 @@ mod tests {
             )
             .expect("pre-site transaction should recover");
             assert!(recovered.repaired);
-            assert!(recovered.site_rebuild_required);
+            assert_eq!(
+                recovered.site_rebuild_required, !intact_previous_publication,
+                "an intact previous publication must not be regenerated for {fault}"
+            );
+            if intact_previous_publication {
+                assert_eq!(
+                    fs::read(fixture.output.path().join(RECEIPT_FILE))?,
+                    gate_before_recovery,
+                    "an intact previous gate must remain byte-identical for {fault}"
+                );
+            }
             assert_eq!(
                 recovered.transactions[0].classification,
                 PublicationRecoveryClassification::RolledBack
@@ -9210,7 +9264,7 @@ mod tests {
         )
         .expect("partially completed rollback should recover");
         assert!(recovered.repaired);
-        assert!(recovered.site_rebuild_required);
+        assert!(!recovered.site_rebuild_required);
         assert_eq!(
             recovered.transactions[0].classification,
             PublicationRecoveryClassification::RolledBack
@@ -10304,6 +10358,10 @@ mod tests {
             "interrupted",
         )
         .expect("rollback failure fixture should activate");
+        fs::write(
+            rollback_fixture.output.path().join("gdp.parquet"),
+            "partial merge output",
+        )?;
         fs::write(&rollback_fixture.lifecycle_path, "invalid")?;
         assert!(
             recover_publication_transactions(
