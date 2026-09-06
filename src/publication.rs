@@ -3203,7 +3203,11 @@ fn backups_recoverable(
             return Ok(false);
         }
         let backup = output_dir.join(backup);
-        if !(backup.exists() || backup.is_symlink() || (!selected_is_live && previous_is_live)) {
+        if !(backup.exists()
+            || backup.is_symlink()
+            || (!selected_is_live && previous_is_live)
+            || (selected_is_live && previous_candidate_recoverable(data_dir, output_dir, entry)))
+        {
             return Ok(false);
         }
     }
@@ -3227,6 +3231,30 @@ fn selected_candidates_recoverable(
             })
             .is_ok()
     })
+}
+
+fn previous_candidate_recoverable(
+    data_dir: &Path,
+    output_dir: &Path,
+    entry: &SelectionEntry,
+) -> bool {
+    let (Some(previous), Some(previous_snapshot)) = (
+        entry.previous_candidate_relative.as_deref(),
+        entry.previous_snapshot.as_deref(),
+    ) else {
+        return false;
+    };
+    let candidate = output_dir.join(previous);
+    storage::read_generation_manifest(data_dir, &entry.wiki, previous_snapshot).is_ok()
+        && read_json::<ReadyWikiCandidate>(&candidate.join("ready.json"))
+            .and_then(|ready| {
+                ensure!(
+                    ready.wiki == entry.wiki && ready.snapshot == previous_snapshot,
+                    "previous ready candidate identity does not match its journal"
+                );
+                validate_ready_candidate(data_dir, &candidate, &ready)
+            })
+            .is_ok()
 }
 
 fn audit_publication_transaction(
@@ -3782,6 +3810,8 @@ fn rollback_selection_files(
             let backup = output_dir.join(backup);
             backup.exists() || backup.is_symlink()
         });
+        let previous_candidate_available =
+            previous_candidate_recoverable(data_dir, output_dir, entry);
         let snapshot_is_restored = storage::current_snapshot_version(data_dir, &entry.wiki)?
             .as_deref()
             == entry.previous_snapshot.as_deref();
@@ -3793,7 +3823,7 @@ fn rollback_selection_files(
             continue;
         }
         ensure!(
-            selected_is_live || backup_exists,
+            selected_is_live || backup_exists || previous_is_live,
             "publication rollback cannot prove a selected, backup, or previously restored target for {}",
             entry.wiki
         );
@@ -3801,6 +3831,13 @@ fn rollback_selection_files(
             remove_selection_link(&active)?;
         }
         restore_backup(output_dir, &active, entry.backup_relative.as_deref())?;
+        if !active.exists()
+            && !active.is_symlink()
+            && previous_candidate_available
+            && let Some(previous) = entry.previous_candidate_relative.as_deref()
+        {
+            std::os::unix::fs::symlink(PathBuf::from(previous).join(&entry.wiki), &active)?;
+        }
         let previous_snapshot = entry.previous_snapshot.as_deref();
         storage::restore_current_snapshot(data_dir, &entry.wiki, previous_snapshot)?;
         discover_latest_ready_candidate(data_dir, output_dir, &entry.wiki)?
@@ -9296,6 +9333,59 @@ mod tests {
         assert_eq!(
             committed.transactions[0].classification,
             PublicationRecoveryClassification::Committed
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_reconstructs_a_missing_backup_from_the_previous_candidate() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let (_site_root, dist) = fixture.published_site("baseline")?;
+        fixture.ready_candidate("previous")?;
+        fixture.ready_candidate("candidate")?;
+        let run_id = "reconstruct-missing-backup";
+        let mut selection = activate_ready_candidates(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            run_id,
+        )
+        .expect("candidate activation should succeed");
+        let entry = &mut selection.entries[0];
+        entry.previous_candidate_relative = Some("_candidates/nlwiki/2026-03/previous".to_string());
+        let backup_relative = entry.backup_relative.clone().context("backup path")?;
+        atomic_json(&selection_path(fixture.output.path(), run_id)?, &selection)?;
+        let backup = fixture.output.path().join(backup_relative);
+        fs::remove_dir_all(backup)?;
+
+        let audit = audit_publication_recovery(
+            fixture.data.path(),
+            fixture.output.path(),
+            &dist,
+            Some(run_id),
+        );
+        assert!(audit.transactions[0].evidence.backups_recoverable);
+        assert_eq!(
+            audit.transactions[0].classification,
+            PublicationRecoveryClassification::NeedsRollback
+        );
+        let recovered = recover_publication_transactions(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            &dist,
+            Some(run_id),
+            "recover-missing-backup",
+        )
+        .expect("receipt-backed rollback recovery should succeed");
+        assert!(recovered.repaired);
+        assert_eq!(
+            recovered.transactions[0].classification,
+            PublicationRecoveryClassification::RolledBack
+        );
+        assert_eq!(
+            active_candidate_relative(fixture.output.path(), "nlwiki")?.as_deref(),
+            Some("_candidates/nlwiki/2026-03/previous")
         );
         Ok(())
     }
