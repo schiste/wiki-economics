@@ -75,8 +75,9 @@ function contentType(file) {
   return "application/octet-stream";
 }
 
-async function startServer(distDir) {
+async function startServer(distDir, {handleRequest = null} = {}) {
   const server = http.createServer((request, response) => {
+    if (handleRequest?.(request, response) === true) return;
     let pathname = decodeURIComponent(new URL(request.url, "http://localhost").pathname);
     if (pathname === "/") pathname = "/index.html";
     if (!path.extname(pathname)) pathname += ".html";
@@ -343,4 +344,5 @@ async function main() {
 
 if (require.main === module) main().catch(error => { console.error(error.stack || error.message); process.exitCode = 1; });
 
-module.exports = {launchChrome, listFiles, parseArguments, runBrowserPerformance, terminateChild, validateProfile, validateStaticBudgets};
+module.exports = {Cdp, evaluate, launchChrome, listFiles, navigate, parseArguments, runBrowserPerformance,
+  startServer, terminateChild, validateProfile, validateStaticBudgets, waitFor};

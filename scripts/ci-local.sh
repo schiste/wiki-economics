@@ -23,6 +23,7 @@ node --check site/admin-auth.cjs
 
 echo "==> node --check site/admin-server.cjs"
 node --check site/admin-server.cjs
+node --check site/src/components/admin-console.js
 
 echo "==> node --check site/freshness.cjs scripts/check-freshness.cjs"
 node --check site/freshness.cjs
@@ -42,6 +43,7 @@ node --check scripts/verify-site-reproducibility.cjs
 node --check scripts/publish-browser-data.cjs
 node --check scripts/publish-static-root.cjs
 node --check scripts/browser-performance.cjs
+node --check scripts/admin-browser-workflow.cjs
 node --check scripts/site-source-bundle.cjs
 
 echo "==> node --check site/observablehq.config.js"
@@ -56,6 +58,7 @@ node --test site/admin-lifecycle.test.cjs
 node --test site/admin-quality.test.cjs
 node --test site/admin-operational-truth.test.cjs
 node --test site/admin-page.test.cjs
+node --test site/admin-console.test.mjs
 
 echo "==> node --test site/admin-server.test.cjs"
 node --test site/admin-server.test.cjs
@@ -170,6 +173,8 @@ node scripts/build-site-fixture.cjs \
 node scripts/browser-performance.cjs \
   --dist-dir "$SITE_FIXTURE_ROOT/performance-dist" \
   --report "$SITE_FIXTURE_ROOT/browser-performance.json"
+node scripts/admin-browser-workflow.cjs \
+  --dist-dir "$SITE_FIXTURE_ROOT/performance-dist"
 
 echo "==> cargo doc --locked --no-deps"
 cargo doc --locked --no-deps
