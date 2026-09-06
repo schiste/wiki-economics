@@ -2772,6 +2772,15 @@ fn configured_site_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("site"))
 }
 
+fn preflight_site_source_dir(site_dist_dir: &Path, configured: Option<PathBuf>) -> PathBuf {
+    configured.unwrap_or_else(|| {
+        site_dist_dir
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("site"))
+    })
+}
+
 fn publication_noop_digest(
     data_dir: &Path,
     output_dir: &Path,
@@ -3712,10 +3721,10 @@ pub(crate) fn publication_preflight(
         generating_commit: licensing::generating_commit(),
         site_source_commit: std::env::var("WIKI_ECON_SITE_SOURCE_COMMIT").ok(),
         site_source_fingerprint: crate::fingerprint::site_source_fingerprint(
-            &site_dist_dir
-                .parent()
-                .map(Path::to_path_buf)
-                .unwrap_or_else(configured_site_dir),
+            &preflight_site_source_dir(
+                site_dist_dir,
+                std::env::var_os("WIKI_ECON_SITE_DIR").map(PathBuf::from),
+            ),
         )?,
         recovery_clean,
         scrub_state,
@@ -6146,6 +6155,20 @@ mod tests {
         fs::write(site_root.path().join("package-lock.json"), "{}")?;
         let dist = site.join("dist");
         Ok((site_root, dist))
+    }
+
+    #[test]
+    fn publication_preflight_prefers_the_configured_site_source() {
+        let site_dist = Path::new("/data/project/wiki-economics/site-dist");
+        let attested_site = PathBuf::from("/data/project/wiki-economics/site-sources/current/site");
+        assert_eq!(
+            preflight_site_source_dir(site_dist, Some(attested_site.clone())),
+            attested_site
+        );
+        assert_eq!(
+            preflight_site_source_dir(site_dist, None),
+            PathBuf::from("/data/project/wiki-economics")
+        );
     }
 
     fn write_single_i64(path: &Path) -> Result<()> {
