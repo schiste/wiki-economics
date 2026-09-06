@@ -10361,7 +10361,8 @@ mod tests {
         fs::write(
             rollback_fixture.output.path().join("gdp.parquet"),
             "partial merge output",
-        )?;
+        )
+        .expect("rollback failure fixture should invalidate the prior gate");
         fs::write(&rollback_fixture.lifecycle_path, "invalid")?;
         assert!(
             recover_publication_transactions(
