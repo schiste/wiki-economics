@@ -93,7 +93,16 @@ struct ReadyWikiCandidate {
     editor_identity_coverage: Option<crate::compute::EditorIdentityCoverageReport>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     quality_signals: Option<CandidateQualitySignals>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    promoted_from_qualification: Option<QualificationPromotion>,
     artifacts: Vec<PreparedArtifact>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+struct QualificationPromotion {
+    snapshot: String,
+    run_id: String,
+    receipt_sha256: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
@@ -1208,6 +1217,7 @@ pub(crate) fn mark_wiki_candidate_ready(
         workload_profile,
         editor_identity_coverage,
         quality_signals: Some(quality_signals),
+        promoted_from_qualification: None,
         artifacts,
     };
     let generation_state =
@@ -1367,6 +1377,278 @@ pub(crate) fn mark_wiki_qualification_ready(
     }
     info!(wiki, snapshot, run_id, path = %receipt_path.display(), "wiki qualification is ready");
     Ok(receipt_path)
+}
+
+fn collect_promotion_files(root: &Path, directory: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        ensure!(!file_type.is_symlink(), "qualification contains a symlink");
+        if file_type.is_dir() {
+            collect_promotion_files(root, &path, files)?;
+            continue;
+        }
+        ensure!(
+            file_type.is_file(),
+            "qualification contains a non-file artifact"
+        );
+        let relative = path
+            .strip_prefix(root)
+            .context("qualification artifact escaped its root")?;
+        if relative == Path::new("qualification.json") {
+            continue;
+        }
+        ensure!(
+            relative
+                .components()
+                .all(|component| matches!(component, Component::Normal(_))),
+            "qualification contains an unsafe artifact path"
+        );
+        files.push(path);
+    }
+    Ok(())
+}
+
+fn validate_qualification_receipt(
+    data_dir: &Path,
+    qualification_dir: &Path,
+    receipt: &QualificationReceipt,
+    wiki: &str,
+    snapshot: &str,
+    run_id: &str,
+) -> Result<()> {
+    ensure!(
+        receipt.schema_version == 2,
+        "unsupported qualification receipt schema"
+    );
+    ensure!(
+        !receipt.publication_eligible,
+        "qualification receipt is already publication eligible"
+    );
+    ensure!(
+        receipt.wiki == wiki && receipt.snapshot == snapshot && receipt.run_id == run_id,
+        "qualification receipt identity mismatch"
+    );
+    receipt.workload_profile.validate(wiki, snapshot)?;
+    receipt.workload_profile.ensure_compute_qualified()?;
+    validate_snapshot_cutoff(wiki, snapshot, &receipt.cutoff_date)?;
+    let expected: BTreeSet<_> = METRICS
+        .iter()
+        .map(|metric| format!("{wiki}/{}.parquet", metric.name))
+        .collect();
+    let observed: BTreeSet<_> = receipt
+        .artifacts
+        .iter()
+        .map(|artifact| artifact.path.clone())
+        .collect();
+    ensure!(
+        observed == expected,
+        "qualification receipt does not contain the complete metric registry"
+    );
+    for artifact in &receipt.artifacts {
+        validate_prepared_artifact(qualification_dir, artifact)?;
+    }
+    if storage::generation_manifest_path(data_dir, wiki, snapshot)?.is_file() {
+        storage::ensure_generation_manifest(data_dir, wiki, snapshot)?;
+    } else {
+        crate::retention::validate_purged_snapshot(data_dir, wiki, snapshot).context(
+            "qualification input generation is absent without valid retention authorization",
+        )?;
+    }
+    Ok(())
+}
+
+/// Convert one exact, authenticated qualification into an immutable ready
+/// candidate without recomputing or mutating the qualification evidence.
+///
+/// The lifecycle remains hidden until the operator control plane separately
+/// commits its optimistic registry transition. A crash between these steps
+/// therefore leaves a harmless ready candidate that can be promoted
+/// idempotently, never a partially published wiki.
+pub(crate) fn promote_wiki_qualification(
+    data_dir: &Path,
+    output_dir: &Path,
+    lifecycle_path: &Path,
+    wiki: &str,
+    snapshot: &str,
+    qualification_run_id: &str,
+    promotion_run_id: &str,
+) -> Result<PathBuf> {
+    ensure!(valid_component(wiki), "unsafe promotion wiki");
+    storage::validate_snapshot_version(snapshot)?;
+    ensure!(
+        valid_component(qualification_run_id),
+        "unsafe qualification run ID"
+    );
+    ensure!(valid_component(promotion_run_id), "unsafe promotion run ID");
+    let registry = load_lifecycle(lifecycle_path)?;
+    let lifecycle = registry
+        .wikis
+        .get(wiki)
+        .with_context(|| format!("qualification wiki {wiki} is not registered"))?;
+    ensure!(
+        lifecycle.publication == "hidden" && lifecycle.refresh == "qualification",
+        "qualification promotion requires a hidden/qualification lifecycle"
+    );
+
+    let qualification_dir =
+        wiki_qualification_dir(output_dir, wiki, snapshot, qualification_run_id)?;
+    let qualification_path = qualification_dir.join("qualification.json");
+    let qualification: QualificationReceipt = read_json(&qualification_path)?;
+    validate_qualification_receipt(
+        data_dir,
+        &qualification_dir,
+        &qualification,
+        wiki,
+        snapshot,
+        qualification_run_id,
+    )?;
+    let (_, qualification_sha256) = storage::sha256_file(&qualification_path)?;
+    let promotion = QualificationPromotion {
+        snapshot: snapshot.to_string(),
+        run_id: qualification_run_id.to_string(),
+        receipt_sha256: qualification_sha256,
+    };
+    let target = wiki_candidate_dir(output_dir, wiki, snapshot, promotion_run_id)?;
+    let ready_path = target.join("ready.json");
+    if ready_path.is_file() {
+        let ready: ReadyWikiCandidate = read_json(&ready_path)?;
+        ensure!(
+            ready.wiki == wiki
+                && ready.snapshot == snapshot
+                && ready.run_id == promotion_run_id
+                && ready.promoted_from_qualification.as_ref() == Some(&promotion),
+            "existing promoted candidate has a different identity"
+        );
+        validate_ready_candidate(data_dir, &target, &ready)?;
+        reconcile_ready_generation_state(output_dir, &ready)?;
+        write_ready_index(data_dir, output_dir, wiki, &(ready, target.clone()))?;
+        return Ok(ready_path);
+    }
+    ensure!(
+        !target.exists(),
+        "promotion target already exists without a ready receipt"
+    );
+
+    let parent = target.parent().context("promotion target has no parent")?;
+    fs::create_dir_all(parent)?;
+    let staging = parent.join(format!(
+        ".{}.{}.promotion.tmp",
+        promotion_run_id,
+        std::process::id()
+    ));
+    ensure!(
+        !staging.exists(),
+        "promotion staging directory already exists"
+    );
+    fs::create_dir(&staging)?;
+    let promoted = (|| -> Result<ReadyWikiCandidate> {
+        let mut files = Vec::new();
+        collect_promotion_files(&qualification_dir, &qualification_dir, &mut files)?;
+        files.sort();
+        copy_candidate_files(&qualification_dir, &staging, &files)?;
+        for artifact in &qualification.artifacts {
+            validate_prepared_artifact(&staging, artifact)?;
+        }
+        let ready = ReadyWikiCandidate {
+            schema_version: 2,
+            wiki: wiki.to_string(),
+            snapshot: snapshot.to_string(),
+            run_id: promotion_run_id.to_string(),
+            ready_at_unix: now_unix()?,
+            generating_commit: qualification.generating_commit.clone(),
+            cutoff_date: qualification.cutoff_date.clone(),
+            workload_profile: Some(qualification.workload_profile.clone()),
+            editor_identity_coverage: qualification.editor_identity_coverage.clone(),
+            quality_signals: qualification.quality_signals.clone(),
+            promoted_from_qualification: Some(promotion.clone()),
+            artifacts: qualification.artifacts.clone(),
+        };
+        atomic_json(&staging.join("ready.json"), &ready)?;
+        File::open(&staging)?.sync_all()?;
+        fs::rename(&staging, &target)?;
+        File::open(parent)?.sync_all()?;
+        Ok(ready)
+    })();
+    let ready = match promoted {
+        Ok(ready) => ready,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&staging);
+            return Err(error);
+        }
+    };
+    CandidateGeneration::new(output_dir, wiki, snapshot, promotion_run_id).adopt(
+        GState::Ready,
+        "authenticated qualification promoted to ready candidate",
+    )?;
+    write_ready_index(data_dir, output_dir, wiki, &(ready, target))?;
+    info!(
+        wiki,
+        snapshot,
+        qualification_run_id,
+        promotion_run_id,
+        "qualification promoted to ready candidate"
+    );
+    Ok(ready_path)
+}
+
+/// Retire one exact unpublished ready candidate. Published and rollback
+/// generations are deliberately ineligible for this operation.
+pub(crate) fn retire_wiki_candidate(
+    data_dir: &Path,
+    output_dir: &Path,
+    wiki: &str,
+    snapshot: &str,
+    run_id: &str,
+    operator: &str,
+) -> Result<PathBuf> {
+    let candidate_dir = wiki_candidate_dir(output_dir, wiki, snapshot, run_id)?;
+    let ready_path = candidate_dir.join("ready.json");
+    let retired_path = candidate_dir.join("retired.json");
+    if retired_path.is_file() && !ready_path.exists() {
+        return Ok(retired_path);
+    }
+    let ready: ReadyWikiCandidate = read_json(&ready_path)?;
+    validate_ready_candidate(data_dir, &candidate_dir, &ready)?;
+    let state = crate::generation_lifecycle::load(output_dir, wiki, snapshot, run_id)?
+        .context("ready candidate generation state is missing")?;
+    ensure!(
+        state.state == GState::Ready,
+        "only an unpublished ready candidate can be retired"
+    );
+    if let Some(active) = active_ready_reference(data_dir, output_dir, wiki)? {
+        ensure!(
+            !(active.snapshot == snapshot && active.run_id == run_id),
+            "the active published candidate cannot be retired"
+        );
+    }
+    let reason = format!("retired by operator {operator}");
+    CandidateGeneration::new(output_dir, wiki, snapshot, run_id).transition(
+        GState::Superseded,
+        &reason,
+        None,
+    )?;
+    CandidateGeneration::new(output_dir, wiki, snapshot, run_id).transition(
+        GState::Retired,
+        &reason,
+        None,
+    )?;
+    fs::rename(&ready_path, &retired_path)?;
+    File::open(&candidate_dir)?.sync_all()?;
+
+    let index_path = ready_index_path(output_dir, wiki);
+    if index_path.is_file() {
+        fs::remove_file(&index_path)?;
+    }
+    if let Some(latest) = discover_latest_ready_candidate(data_dir, output_dir, wiki)? {
+        write_ready_index(data_dir, output_dir, wiki, &latest)?;
+    }
+    info!(
+        wiki,
+        snapshot, run_id, operator, "unpublished ready candidate retired"
+    );
+    Ok(retired_path)
 }
 
 fn validate_ready_candidate_metadata(
@@ -2317,7 +2599,20 @@ fn discover_latest_ready_candidate(
                 Ok((ready, candidate_dir.clone()))
             })();
             match candidate {
-                Ok(candidate) => candidates.push(candidate),
+                Ok(candidate) => {
+                    let state = crate::generation_lifecycle::load(
+                        output_dir,
+                        &candidate.0.wiki,
+                        &candidate.0.snapshot,
+                        &candidate.0.run_id,
+                    )?;
+                    if state.is_some_and(|record| {
+                        matches!(record.state, GState::Superseded | GState::Retired)
+                    }) {
+                        continue;
+                    }
+                    candidates.push(candidate);
+                }
                 Err(error) => {
                     invalid_candidates += 1;
                     last_error = Some(format!("{error:#}"));
@@ -2359,6 +2654,18 @@ fn indexed_latest_ready_candidate(
             "unsupported ready index identity"
         );
         let newest = ready_from_reference(data_dir, output_dir, wiki, &index.newest_valid_ready)?;
+        let newest_state = crate::generation_lifecycle::load(
+            output_dir,
+            &newest.0.wiki,
+            &newest.0.snapshot,
+            &newest.0.run_id,
+        )?;
+        ensure!(
+            newest_state.is_none_or(|record| {
+                !matches!(record.state, GState::Superseded | GState::Retired)
+            }),
+            "ready index points to a retired candidate"
+        );
         let observed_active = active_ready_reference(data_dir, output_dir, wiki)?;
         ensure!(
             observed_active == index.active_published,
@@ -7797,6 +8104,13 @@ mod tests {
             &qualification,
         )
         .expect("qualification identity coverage should record");
+        crate::patrol::record_candidate_fingerprint_for_test(
+            "nlwiki",
+            "2026-03",
+            fixture.data.path(),
+            &qualification,
+        )
+        .expect("qualification patrol receipt should record");
     }
 
     #[test]
@@ -7909,6 +8223,128 @@ mod tests {
             .expect("publisher candidate scan should succeed")
             .is_empty()
         );
+    }
+
+    #[test]
+    fn qualification_promotion_and_candidate_retirement_are_transactional() -> Result<()> {
+        let fixture = Fixture::new()?;
+        prepare_hidden_qualification_fixture(&fixture, "qualification-source");
+        let qualification_path = mark_wiki_qualification_ready(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "nlwiki",
+            "2026-03",
+            "qualification-source",
+        )?;
+
+        let ready_path = promote_wiki_qualification(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "nlwiki",
+            "2026-03",
+            "qualification-source",
+            "promotion-1",
+        )?;
+        let ready: ReadyWikiCandidate = read_json(&ready_path)?;
+        assert_eq!(
+            ready.promoted_from_qualification,
+            Some(QualificationPromotion {
+                snapshot: "2026-03".to_string(),
+                run_id: "qualification-source".to_string(),
+                receipt_sha256: storage::sha256_file(&qualification_path)?.1,
+            })
+        );
+        assert_eq!(
+            promote_wiki_qualification(
+                fixture.data.path(),
+                fixture.output.path(),
+                &fixture.lifecycle_path,
+                "nlwiki",
+                "2026-03",
+                "qualification-source",
+                "promotion-1",
+            )?,
+            ready_path
+        );
+        assert!(
+            qualification_path.is_file(),
+            "promotion must preserve qualification evidence"
+        );
+
+        let retired_path = retire_wiki_candidate(
+            fixture.data.path(),
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            "promotion-1",
+            "Alice",
+        )?;
+        assert!(retired_path.is_file());
+        assert!(!ready_path.exists());
+        assert_eq!(
+            retire_wiki_candidate(
+                fixture.data.path(),
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                "promotion-1",
+                "Alice",
+            )?,
+            retired_path
+        );
+        assert_eq!(
+            crate::generation_lifecycle::load(
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                "promotion-1",
+            )?
+            .context("promoted generation state should exist")?
+            .state,
+            GState::Retired
+        );
+        assert!(!ready_index_path(fixture.output.path(), "nlwiki").is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn qualification_promotion_fails_closed_without_complete_evidence() -> Result<()> {
+        let fixture = Fixture::new()?;
+        prepare_hidden_qualification_fixture(&fixture, "qualification-incomplete");
+        let qualification_path = mark_wiki_qualification_ready(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "nlwiki",
+            "2026-03",
+            "qualification-incomplete",
+        )?;
+        let qualification_dir = qualification_path
+            .parent()
+            .context("qualification receipt should have a parent")?;
+        fs::remove_file(qualification_dir.join("nlwiki/gdp.parquet"))?;
+        promote_wiki_qualification(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "nlwiki",
+            "2026-03",
+            "qualification-incomplete",
+            "promotion-incomplete",
+        )
+        .expect_err("missing qualification evidence must block promotion");
+        assert!(
+            !wiki_candidate_dir(
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                "promotion-incomplete",
+            )?
+            .exists()
+        );
+        Ok(())
     }
 
     #[test]

@@ -392,6 +392,42 @@ enum Commands {
         lifecycle: PathBuf,
     },
 
+    /// Promote one exact authenticated qualification into a ready candidate
+    PromoteQualification {
+        /// Wiki database name
+        wiki: String,
+
+        /// Qualified snapshot version (YYYY-MM)
+        #[arg(long)]
+        version: String,
+
+        /// Run ID recorded by the completed qualification receipt
+        #[arg(long)]
+        qualification_run_id: String,
+
+        /// Wiki lifecycle containing the hidden qualification entry
+        #[arg(long, default_value = "config/wiki-lifecycle.json")]
+        lifecycle: PathBuf,
+    },
+
+    /// Retire one exact unpublished ready candidate without deleting its evidence
+    RetireCandidate {
+        /// Wiki database name
+        wiki: String,
+
+        /// Candidate snapshot version (YYYY-MM)
+        #[arg(long)]
+        version: String,
+
+        /// Exact candidate run ID
+        #[arg(long)]
+        candidate_run_id: String,
+
+        /// Authenticated operator identity retained in generation history
+        #[arg(long)]
+        operator: String,
+    },
+
     /// Select ready wiki candidates, merge, and issue a publication receipt
     PublicationPrepareReady {
         /// Wiki lifecycle and publication contract
@@ -1271,6 +1307,44 @@ fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
                 },
             )?;
             println!("{}", receipt.display());
+        }
+
+        Commands::PromoteQualification {
+            wiki,
+            version,
+            qualification_run_id,
+            lifecycle,
+        } => {
+            let promotion_run_id = context
+                .run_id
+                .context("qualification promotion requires --run-id")?;
+            let ready = publication::promote_wiki_qualification(
+                &data_dir,
+                &output_dir,
+                &lifecycle,
+                &wiki,
+                &version,
+                &qualification_run_id,
+                promotion_run_id,
+            )?;
+            println!("{}", ready.display());
+        }
+
+        Commands::RetireCandidate {
+            wiki,
+            version,
+            candidate_run_id,
+            operator,
+        } => {
+            let retired = publication::retire_wiki_candidate(
+                &data_dir,
+                &output_dir,
+                &wiki,
+                &version,
+                &candidate_run_id,
+                &operator,
+            )?;
+            println!("{}", retired.display());
         }
 
         Commands::PublicationPrepareReady { lifecycle } => {
