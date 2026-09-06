@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "namespace_memory_limit_bytes": 8589934592,
+  "resident_service_memory_bytes": 536870912,
+  "minimum_schedulable_job_bytes": 2147483648,
+  "resource_requests": {
+    "small": 2147483648,
+    "medium_large": 6442450944,
+    "isolated": 6442450944,
+    "admin_dispatcher": 6442450944,
+    "publisher": 6442450944,
+    "scrubber": 2147483648
+  },
+  "source": "Toolforge jobs quota and deployed job definitions",
+  "verified_at": "2026-09-06"
+}

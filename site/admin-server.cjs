@@ -28,6 +28,7 @@ const {
 } = require("../scripts/wiki-lifecycle.cjs");
 const {evaluateFreshness} = require("./freshness.cjs");
 const {stripAnsi, summarizeOperationLog} = require("./admin-operation-status.cjs");
+const {buildOperationalTruth} = require("./admin-operational-truth.cjs");
 
 const ROOT = path.resolve(__dirname, "..");
 const RUNTIME_ENV = process.env.WIKI_ECON_ENV || "local";
@@ -1733,6 +1734,12 @@ function buildStatusPayload(req, session) {
   const progress = getProgress();
   const scheduledRefresh = readRefreshStatus();
   const adminOperations = readAdminOperations();
+  const fleet = readFleetStatus();
+  const freshness = evaluateFreshness({
+    ...scheduledRefresh,
+    lifecycle: WIKI_LIFECYCLE,
+    scrubStatus: readArtifactScrubStatus(),
+  });
   const effectiveJob = currentJob
     ? {
         runId: currentJob.runId,
@@ -1750,6 +1757,16 @@ function buildStatusPayload(req, session) {
       }
     : lastJob;
   const manifest = refreshManifestSafely() || { error: "Manifest unavailable" };
+  const operationalTruth = buildOperationalTruth({
+    root: ROOT,
+    dataDir: DATA_DIR,
+    outputDir: OUTPUT_DIR,
+    lifecycle: WIKI_LIFECYCLE,
+    freshness,
+    fleet,
+    adminOperations,
+    scheduledRefresh,
+  });
   return {
     running: currentJob !== null,
     command: effectiveJob?.command ?? null,
@@ -1776,12 +1793,9 @@ function buildStatusPayload(req, session) {
     wikiStates: wikiLifecycleStatus(),
     runner: runnerInfo(),
     scheduledRefresh,
-    freshness: evaluateFreshness({
-      ...scheduledRefresh,
-      lifecycle: WIKI_LIFECYCLE,
-      scrubStatus: readArtifactScrubStatus(),
-    }),
-    fleet: readFleetStatus(),
+    freshness,
+    operationalTruth,
+    fleet,
     snapshotPlans: readSnapshotPlans(),
     adminOperations,
     adminRuns: {
