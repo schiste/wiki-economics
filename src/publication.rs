@@ -1607,6 +1607,13 @@ pub(crate) fn retire_wiki_candidate(
     let ready_path = candidate_dir.join("ready.json");
     let retired_path = candidate_dir.join("retired.json");
     if retired_path.is_file() && !ready_path.exists() {
+        let state = crate::generation_lifecycle::load(output_dir, wiki, snapshot, run_id)?
+            .context("retired candidate generation state is missing")?;
+        ensure!(
+            state.state == GState::Retired,
+            "retired candidate state mismatch"
+        );
+        repair_ready_index_after_retirement(data_dir, output_dir, wiki)?;
         return Ok(retired_path);
     }
     let ready: ReadyWikiCandidate = read_json(&ready_path)?;
@@ -1614,7 +1621,7 @@ pub(crate) fn retire_wiki_candidate(
     let state = crate::generation_lifecycle::load(output_dir, wiki, snapshot, run_id)?
         .context("ready candidate generation state is missing")?;
     ensure!(
-        state.state == GState::Ready,
+        matches!(state.state, GState::Ready | GState::Retired),
         "only an unpublished ready candidate can be retired"
     );
     if let Some(active) = active_ready_reference(data_dir, output_dir, wiki)? {
@@ -1624,19 +1631,23 @@ pub(crate) fn retire_wiki_candidate(
         );
     }
     let reason = format!("retired by operator {operator}");
-    CandidateGeneration::new(output_dir, wiki, snapshot, run_id).transition(
-        GState::Superseded,
-        &reason,
-        None,
-    )?;
-    CandidateGeneration::new(output_dir, wiki, snapshot, run_id).transition(
-        GState::Retired,
-        &reason,
-        None,
-    )?;
+    crate::generation_lifecycle::retire_ready(output_dir, wiki, snapshot, run_id, &reason)?;
     fs::rename(&ready_path, &retired_path)?;
     File::open(&candidate_dir)?.sync_all()?;
 
+    repair_ready_index_after_retirement(data_dir, output_dir, wiki)?;
+    info!(
+        wiki,
+        snapshot, run_id, operator, "unpublished ready candidate retired"
+    );
+    Ok(retired_path)
+}
+
+fn repair_ready_index_after_retirement(
+    data_dir: &Path,
+    output_dir: &Path,
+    wiki: &str,
+) -> Result<()> {
     let index_path = ready_index_path(output_dir, wiki);
     if index_path.is_file() {
         fs::remove_file(&index_path)?;
@@ -1644,11 +1655,7 @@ pub(crate) fn retire_wiki_candidate(
     if let Some(latest) = discover_latest_ready_candidate(data_dir, output_dir, wiki)? {
         write_ready_index(data_dir, output_dir, wiki, &latest)?;
     }
-    info!(
-        wiki,
-        snapshot, run_id, operator, "unpublished ready candidate retired"
-    );
-    Ok(retired_path)
+    Ok(())
 }
 
 fn validate_ready_candidate_metadata(
@@ -1705,7 +1712,10 @@ fn validate_ready_candidate(
     Ok(())
 }
 
-fn reconcile_ready_generation_state(output_dir: &Path, ready: &ReadyWikiCandidate) -> Result<()> {
+fn reconcile_ready_generation_state(
+    output_dir: &Path,
+    ready: &ReadyWikiCandidate,
+) -> Result<crate::generation_lifecycle::GenerationRecord> {
     let generation =
         CandidateGeneration::new(output_dir, &ready.wiki, &ready.snapshot, &ready.run_id);
     let reason = "adopted legacy validated ready receipt";
@@ -1716,9 +1726,9 @@ fn reconcile_ready_generation_state(output_dir: &Path, ready: &ReadyWikiCandidat
     }
     if record.state == crate::generation_lifecycle::GenerationState::Validated {
         let reason = "recovered durable ready receipt";
-        generation.transition(GState::Ready, reason, None)?;
+        record = generation.transition(GState::Ready, reason, None)?;
     }
-    Ok(())
+    Ok(record)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2610,28 +2620,24 @@ fn discover_latest_ready_candidate(
             if !ready_path.is_file() {
                 continue;
             }
-            let candidate = (|| -> Result<(ReadyWikiCandidate, PathBuf)> {
+            let candidate = (|| -> Result<(
+                ReadyWikiCandidate,
+                PathBuf,
+                crate::generation_lifecycle::GenerationRecord,
+            )> {
                 let ready: ReadyWikiCandidate = read_json(&ready_path)?;
                 ensure!(ready.wiki == wiki, "ready candidate wiki mismatch");
                 validate_ready_candidate_metadata(data_dir, &candidate_dir, &ready)?;
-                reconcile_ready_generation_state(output_dir, &ready)?;
+                let state = reconcile_ready_generation_state(output_dir, &ready)?;
                 resilient_ready_candidate_reference(data_dir, output_dir, &candidate_dir, &ready)?;
-                Ok((ready, candidate_dir.clone()))
+                Ok((ready, candidate_dir.clone(), state))
             })();
             match candidate {
                 Ok(candidate) => {
-                    let state = crate::generation_lifecycle::load(
-                        output_dir,
-                        &candidate.0.wiki,
-                        &candidate.0.snapshot,
-                        &candidate.0.run_id,
-                    )?;
-                    if state.is_some_and(|record| {
-                        matches!(record.state, GState::Superseded | GState::Retired)
-                    }) {
+                    if matches!(candidate.2.state, GState::Superseded | GState::Retired) {
                         continue;
                     }
-                    candidates.push(candidate);
+                    candidates.push((candidate.0, candidate.1));
                 }
                 Err(error) => {
                     invalid_candidates += 1;
@@ -2674,16 +2680,9 @@ fn indexed_latest_ready_candidate(
             "unsupported ready index identity"
         );
         let newest = ready_from_reference(data_dir, output_dir, wiki, &index.newest_valid_ready)?;
-        let newest_state = crate::generation_lifecycle::load(
-            output_dir,
-            &newest.0.wiki,
-            &newest.0.snapshot,
-            &newest.0.run_id,
-        )?;
+        let newest_state = reconcile_ready_generation_state(output_dir, &newest.0)?;
         ensure!(
-            newest_state.is_none_or(|record| {
-                !matches!(record.state, GState::Superseded | GState::Retired)
-            }),
+            !matches!(newest_state.state, GState::Superseded | GState::Retired),
             "ready index points to a retired candidate"
         );
         let observed_active = active_ready_reference(data_dir, output_dir, wiki)?;
@@ -2691,7 +2690,6 @@ fn indexed_latest_ready_candidate(
             observed_active == index.active_published,
             "ready index active candidate is stale"
         );
-        reconcile_ready_generation_state(output_dir, &newest.0)?;
         Ok(Some(newest))
     })();
     if path.is_file() {
@@ -5326,7 +5324,7 @@ mod tests {
     use super::*;
     use crate::test_support::TestDir;
     use serde_json::{Value, json};
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::PathBuf;
 
     fn reuse_success() -> std::io::Result<()> {
@@ -8288,8 +8286,8 @@ mod tests {
     }
 
     #[test]
-    fn qualification_promotion_and_candidate_retirement_are_transactional() -> Result<()> {
-        let fixture = Fixture::new()?;
+    fn qualification_promotion_and_candidate_retirement_are_transactional() {
+        let fixture = Fixture::new().expect("promotion fixture should initialize");
         prepare_hidden_qualification_fixture(&fixture, "qualification-source");
         let qualification_path = mark_wiki_qualification_ready(
             fixture.data.path(),
@@ -8298,7 +8296,8 @@ mod tests {
             "nlwiki",
             "2026-03",
             "qualification-source",
-        )?;
+        )
+        .expect("qualification receipt should become ready");
 
         let ready_path = promote_wiki_qualification(
             fixture.data.path(),
@@ -8308,14 +8307,18 @@ mod tests {
             "2026-03",
             "qualification-source",
             "promotion-1",
-        )?;
-        let ready: ReadyWikiCandidate = read_json(&ready_path)?;
+        )
+        .expect("qualification should promote");
+        let ready: ReadyWikiCandidate =
+            read_json(&ready_path).expect("promoted candidate should parse");
         assert_eq!(
             ready.promoted_from_qualification,
             Some(QualificationPromotion {
                 snapshot: "2026-03".to_string(),
                 run_id: "qualification-source".to_string(),
-                receipt_sha256: storage::sha256_file(&qualification_path)?.1,
+                receipt_sha256: storage::sha256_file(&qualification_path)
+                    .expect("qualification should hash")
+                    .1,
             })
         );
         assert_eq!(
@@ -8327,13 +8330,39 @@ mod tests {
                 "2026-03",
                 "qualification-source",
                 "promotion-1",
-            )?,
+            )
+            .expect("promotion should be idempotent"),
             ready_path
         );
         assert!(
             qualification_path.is_file(),
             "promotion must preserve qualification evidence"
         );
+
+        let second_ready = promote_wiki_qualification(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "nlwiki",
+            "2026-03",
+            "qualification-source",
+            "promotion-2",
+        )
+        .expect("a qualification may seed a second immutable candidate");
+        retire_wiki_candidate(
+            fixture.data.path(),
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            "promotion-2",
+            "Alice",
+        )
+        .expect("newer unpublished candidate should retire");
+        assert!(!second_ready.exists());
+        let repaired_index: ReadyCandidateIndex =
+            read_json(&ready_index_path(fixture.output.path(), "nlwiki"))
+                .expect("retirement should reindex the remaining ready candidate");
+        assert_eq!(repaired_index.newest_valid_ready.run_id, "promotion-1");
 
         let retired_path = retire_wiki_candidate(
             fixture.data.path(),
@@ -8342,7 +8371,8 @@ mod tests {
             "2026-03",
             "promotion-1",
             "Alice",
-        )?;
+        )
+        .expect("unpublished candidate should retire");
         assert!(retired_path.is_file());
         assert!(!ready_path.exists());
         assert_eq!(
@@ -8353,7 +8383,8 @@ mod tests {
                 "2026-03",
                 "promotion-1",
                 "Alice",
-            )?,
+            )
+            .expect("retirement should be idempotent"),
             retired_path
         );
         assert_eq!(
@@ -8362,18 +8393,18 @@ mod tests {
                 "nlwiki",
                 "2026-03",
                 "promotion-1",
-            )?
-            .context("promoted generation state should exist")?
+            )
+            .expect("generation state should load")
+            .expect("promoted generation state should exist")
             .state,
             GState::Retired
         );
         assert!(!ready_index_path(fixture.output.path(), "nlwiki").is_file());
-        Ok(())
     }
 
     #[test]
-    fn qualification_promotion_fails_closed_without_complete_evidence() -> Result<()> {
-        let fixture = Fixture::new()?;
+    fn qualification_promotion_fails_closed_without_complete_evidence() {
+        let fixture = Fixture::new().expect("incomplete promotion fixture should initialize");
         prepare_hidden_qualification_fixture(&fixture, "qualification-incomplete");
         let qualification_path = mark_wiki_qualification_ready(
             fixture.data.path(),
@@ -8382,11 +8413,13 @@ mod tests {
             "nlwiki",
             "2026-03",
             "qualification-incomplete",
-        )?;
+        )
+        .expect("qualification receipt should become ready");
         let qualification_dir = qualification_path
             .parent()
-            .context("qualification receipt should have a parent")?;
-        fs::remove_file(qualification_dir.join("nlwiki/gdp.parquet"))?;
+            .expect("qualification receipt should have a parent");
+        fs::remove_file(qualification_dir.join("nlwiki/gdp.parquet"))
+            .expect("qualification artifact should be removable");
         promote_wiki_qualification(
             fixture.data.path(),
             fixture.output.path(),
@@ -8403,10 +8436,311 @@ mod tests {
                 "nlwiki",
                 "2026-03",
                 "promotion-incomplete",
-            )?
+            )
+            .expect("promotion candidate path should resolve")
             .exists()
         );
-        Ok(())
+    }
+
+    #[test]
+    fn qualification_promotion_recovers_storage_failure_boundaries() {
+        let missing_retention =
+            Fixture::new().expect("missing retention fixture should initialize");
+        prepare_hidden_qualification_fixture(&missing_retention, "qualification-no-input");
+        mark_wiki_qualification_ready(
+            missing_retention.data.path(),
+            missing_retention.output.path(),
+            &missing_retention.lifecycle_path,
+            "nlwiki",
+            "2026-03",
+            "qualification-no-input",
+        )
+        .expect("qualification should become ready");
+        fs::remove_file(
+            storage::generation_manifest_path(missing_retention.data.path(), "nlwiki", "2026-03")
+                .expect("manifest path should resolve"),
+        )
+        .expect("generation manifest should be removable");
+        assert!(
+            promote_wiki_qualification(
+                missing_retention.data.path(),
+                missing_retention.output.path(),
+                &missing_retention.lifecycle_path,
+                "nlwiki",
+                "2026-03",
+                "qualification-no-input",
+                "promotion-no-input",
+            )
+            .is_err()
+        );
+
+        let linked = Fixture::new().expect("linked qualification fixture should initialize");
+        prepare_hidden_qualification_fixture(&linked, "qualification-linked");
+        let linked_receipt = mark_wiki_qualification_ready(
+            linked.data.path(),
+            linked.output.path(),
+            &linked.lifecycle_path,
+            "nlwiki",
+            "2026-03",
+            "qualification-linked",
+        )
+        .expect("linked qualification should become ready");
+        let linked_dir = linked_receipt
+            .parent()
+            .expect("qualification should have a root");
+        symlink(linked.data.path(), linked_dir.join("unexpected-link"))
+            .expect("symlink fault should be created");
+        assert!(
+            promote_wiki_qualification(
+                linked.data.path(),
+                linked.output.path(),
+                &linked.lifecycle_path,
+                "nlwiki",
+                "2026-03",
+                "qualification-linked",
+                "promotion-linked",
+            )
+            .is_err()
+        );
+        assert!(
+            !wiki_candidate_dir(
+                linked.output.path(),
+                "nlwiki",
+                "2026-03",
+                "promotion-linked",
+            )
+            .expect("promotion target should resolve")
+            .exists()
+        );
+
+        let interrupted = Fixture::new().expect("interrupted promotion fixture should initialize");
+        prepare_hidden_qualification_fixture(&interrupted, "qualification-interrupted");
+        mark_wiki_qualification_ready(
+            interrupted.data.path(),
+            interrupted.output.path(),
+            &interrupted.lifecycle_path,
+            "nlwiki",
+            "2026-03",
+            "qualification-interrupted",
+        )
+        .expect("interrupted qualification should become ready");
+        let blocker = block_generation_state_write(&interrupted, "promotion-interrupted");
+        assert!(
+            promote_wiki_qualification(
+                interrupted.data.path(),
+                interrupted.output.path(),
+                &interrupted.lifecycle_path,
+                "nlwiki",
+                "2026-03",
+                "qualification-interrupted",
+                "promotion-interrupted",
+            )
+            .is_err()
+        );
+        fs::remove_dir(&blocker).expect("state-write blocker should be removable");
+        promote_wiki_qualification(
+            interrupted.data.path(),
+            interrupted.output.path(),
+            &interrupted.lifecycle_path,
+            "nlwiki",
+            "2026-03",
+            "qualification-interrupted",
+            "promotion-interrupted",
+        )
+        .expect("promotion retry should reconcile the ready state");
+    }
+
+    #[test]
+    fn candidate_retirement_recovers_interrupted_state_and_protects_active() {
+        let active = Fixture::new().expect("active retirement fixture should initialize");
+        prepare_hidden_qualification_fixture(&active, "qualification-active");
+        mark_wiki_qualification_ready(
+            active.data.path(),
+            active.output.path(),
+            &active.lifecycle_path,
+            "nlwiki",
+            "2026-03",
+            "qualification-active",
+        )
+        .expect("active qualification should become ready");
+        promote_wiki_qualification(
+            active.data.path(),
+            active.output.path(),
+            &active.lifecycle_path,
+            "nlwiki",
+            "2026-03",
+            "qualification-active",
+            "promotion-active",
+        )
+        .expect("active candidate should promote");
+        fs::remove_dir_all(active.output.path().join("nlwiki"))
+            .expect("legacy active output should be removable in fixture");
+        symlink(
+            "_candidates/nlwiki/2026-03/promotion-active/nlwiki",
+            active.output.path().join("nlwiki"),
+        )
+        .expect("active candidate symlink should be installed");
+        assert!(
+            retire_wiki_candidate(
+                active.data.path(),
+                active.output.path(),
+                "nlwiki",
+                "2026-03",
+                "promotion-active",
+                "Alice",
+            )
+            .is_err()
+        );
+
+        let interrupted = Fixture::new().expect("interrupted retirement fixture should initialize");
+        prepare_hidden_qualification_fixture(&interrupted, "qualification-retire");
+        mark_wiki_qualification_ready(
+            interrupted.data.path(),
+            interrupted.output.path(),
+            &interrupted.lifecycle_path,
+            "nlwiki",
+            "2026-03",
+            "qualification-retire",
+        )
+        .expect("retirement qualification should become ready");
+        promote_wiki_qualification(
+            interrupted.data.path(),
+            interrupted.output.path(),
+            &interrupted.lifecycle_path,
+            "nlwiki",
+            "2026-03",
+            "qualification-retire",
+            "promotion-retire",
+        )
+        .expect("retirement candidate should promote");
+        let blocker = block_generation_state_write(&interrupted, "promotion-retire");
+        assert!(
+            retire_wiki_candidate(
+                interrupted.data.path(),
+                interrupted.output.path(),
+                "nlwiki",
+                "2026-03",
+                "promotion-retire",
+                "Alice",
+            )
+            .is_err()
+        );
+        fs::remove_dir(&blocker).expect("retirement blocker should be removable");
+        let candidate = wiki_candidate_dir(
+            interrupted.output.path(),
+            "nlwiki",
+            "2026-03",
+            "promotion-retire",
+        )
+        .expect("retirement candidate path should resolve");
+        fs::create_dir(candidate.join("retired.json"))
+            .expect("rename target blocker should be created");
+        assert!(
+            retire_wiki_candidate(
+                interrupted.data.path(),
+                interrupted.output.path(),
+                "nlwiki",
+                "2026-03",
+                "promotion-retire",
+                "Alice",
+            )
+            .is_err()
+        );
+        fs::remove_dir(candidate.join("retired.json"))
+            .expect("rename target blocker should be removable");
+        retire_wiki_candidate(
+            interrupted.data.path(),
+            interrupted.output.path(),
+            "nlwiki",
+            "2026-03",
+            "promotion-retire",
+            "Alice",
+        )
+        .expect("retirement retry should finish from retired state");
+
+        let index_failure =
+            Fixture::new().expect("index repair retirement fixture should initialize");
+        prepare_hidden_qualification_fixture(&index_failure, "qualification-index-repair");
+        mark_wiki_qualification_ready(
+            index_failure.data.path(),
+            index_failure.output.path(),
+            &index_failure.lifecycle_path,
+            "nlwiki",
+            "2026-03",
+            "qualification-index-repair",
+        )
+        .expect("index repair qualification should become ready");
+        promote_wiki_qualification(
+            index_failure.data.path(),
+            index_failure.output.path(),
+            &index_failure.lifecycle_path,
+            "nlwiki",
+            "2026-03",
+            "qualification-index-repair",
+            "promotion-index-repair",
+        )
+        .expect("index repair candidate should promote");
+        let index = ready_index_path(index_failure.output.path(), "nlwiki");
+        let index_parent = index.parent().expect("ready index should have a parent");
+        let mut protected = fs::metadata(index_parent)
+            .expect("ready index metadata should load")
+            .permissions();
+        protected.set_mode(0o500);
+        fs::set_permissions(index_parent, protected)
+            .expect("ready index directory should become read-only");
+        let failed = retire_wiki_candidate(
+            index_failure.data.path(),
+            index_failure.output.path(),
+            "nlwiki",
+            "2026-03",
+            "promotion-index-repair",
+            "Alice",
+        );
+        let mut restored = fs::metadata(index_parent)
+            .expect("protected ready index metadata should load")
+            .permissions();
+        restored.set_mode(0o700);
+        fs::set_permissions(index_parent, restored)
+            .expect("ready index directory permissions should restore");
+        assert!(failed.is_err());
+        retire_wiki_candidate(
+            index_failure.data.path(),
+            index_failure.output.path(),
+            "nlwiki",
+            "2026-03",
+            "promotion-index-repair",
+            "Alice",
+        )
+        .expect("idempotent retirement should repair the stale ready index");
+        assert!(!index.exists());
+    }
+
+    #[test]
+    fn ready_discovery_rejects_lifecycle_retired_evidence() {
+        let fixture = Fixture::new().expect("ready discovery fixture should initialize");
+        fixture
+            .ready_candidate("candidate-superseded")
+            .expect("candidate should become ready");
+        crate::generation_lifecycle::transition(
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            "candidate-superseded",
+            GState::Superseded,
+            "retirement interrupted before ready receipt rename",
+            None,
+        )
+        .expect("candidate should become superseded");
+        assert!(
+            indexed_latest_ready_candidate(fixture.data.path(), fixture.output.path(), "nlwiki")
+                .expect("retired ready index should fall back to discovery")
+                .is_none()
+        );
+        assert!(
+            discover_latest_ready_candidate(fixture.data.path(), fixture.output.path(), "nlwiki")
+                .expect("candidate discovery should complete")
+                .is_none()
+        );
     }
 
     #[test]

@@ -177,6 +177,45 @@ pub(crate) fn transition(
     Ok(record)
 }
 
+/// Retire a ready generation with one durable state replacement. Recording
+/// both semantic transitions preserves the lifecycle history without leaving
+/// a crash window where an operator retirement is only half-applied.
+pub(crate) fn retire_ready(
+    output_dir: &Path,
+    wiki: &str,
+    snapshot: &str,
+    run_id: &str,
+    reason: &str,
+) -> Result<GenerationRecord> {
+    let mut record = load(output_dir, wiki, snapshot, run_id)?.with_context(|| {
+        format!("candidate generation state is missing for {wiki}/{snapshot}/{run_id}")
+    })?;
+    if record.state == GenerationState::Retired {
+        return Ok(record);
+    }
+    ensure!(
+        record.state == GenerationState::Ready,
+        "only a ready candidate generation can be retired"
+    );
+    let now = now_unix()?;
+    record.history.push(StateTransition {
+        state: GenerationState::Superseded,
+        at_unix: now,
+        reason: reason.to_string(),
+        publication_run_id: None,
+    });
+    record.history.push(StateTransition {
+        state: GenerationState::Retired,
+        at_unix: now,
+        reason: reason.to_string(),
+        publication_run_id: None,
+    });
+    record.state = GenerationState::Retired;
+    record.updated_at_unix = now;
+    write(output_dir, &record)?;
+    Ok(record)
+}
+
 fn transition_allowed(current: GenerationState, next: GenerationState) -> bool {
     matches!(
         (current, next),
@@ -358,6 +397,60 @@ mod tests {
             retired
         );
         assert!(begin(output, "nlwiki", "2026-08", "run-1").is_err());
+    }
+
+    #[test]
+    fn ready_retirement_is_one_atomic_idempotent_state_change() {
+        let root = must(TestDir::new());
+        let output = root.path();
+        must(begin(output, "nlwiki", "2026-08", "retire-1"));
+        must(transition(
+            output,
+            "nlwiki",
+            "2026-08",
+            "retire-1",
+            GenerationState::Validated,
+            "validated",
+            None,
+        ));
+        must(transition(
+            output,
+            "nlwiki",
+            "2026-08",
+            "retire-1",
+            GenerationState::Ready,
+            "ready",
+            None,
+        ));
+        let state = must(state_path(output, "nlwiki", "2026-08", "retire-1"));
+        let blocker = state
+            .parent()
+            .expect("state should have a parent")
+            .join(format!(".retire-1.json.{}.tmp", std::process::id()));
+        must(fs::create_dir(&blocker));
+        assert!(retire_ready(output, "nlwiki", "2026-08", "retire-1", "operator").is_err());
+        assert_eq!(
+            must(load(output, "nlwiki", "2026-08", "retire-1"))
+                .expect("ready state should survive")
+                .state,
+            GenerationState::Ready
+        );
+        must(fs::remove_dir(&blocker));
+        let retired = must(retire_ready(
+            output, "nlwiki", "2026-08", "retire-1", "operator",
+        ));
+        assert_eq!(retired.state, GenerationState::Retired);
+        assert_eq!(
+            retired.history[retired.history.len() - 2].state,
+            GenerationState::Superseded
+        );
+        assert_eq!(
+            must(retire_ready(
+                output, "nlwiki", "2026-08", "retire-1", "operator",
+            )),
+            retired
+        );
+        assert!(retire_ready(output, "nlwiki", "2026-08", "missing", "operator").is_err());
     }
 
     #[test]
