@@ -94,3 +94,28 @@ test("operator audit ledger exposes authenticated immutable lifecycle evidence",
   assert.match(source, /event\.eventSha256/);
   assert.match(source, /Registry revision/);
 });
+
+test("admin is split into keyboard-addressable focused views", () => {
+  assert.match(source, /createAdminViewNavigation/);
+  for (const view of ["overview", "wikis", "runs", "quality"]) {
+    assert.match(source, new RegExp(`id="admin-view-${view}"`));
+    assert.match(source, new RegExp(`data-admin-view="${view}"`));
+  }
+  assert.match(source, /\.admin-view-navigation button:focus-visible/);
+  assert.match(source, /@media \(max-width: 760px\)[\s\S]*\.admin-view-navigation/);
+});
+
+test("operator outcomes use durable inline receipts instead of blocking alerts", () => {
+  assert.match(source, /readOperationReceipts\(\)/);
+  assert.match(source, /persistOperationReceipts/);
+  assert.match(source, /role="log" aria-live="polite"/);
+  assert.match(source, /Admin authentication is required/);
+  assert.doesNotMatch(source, /\balert\s*\(/);
+});
+
+test("admin uses one adaptive poll with no fixed polling intervals", () => {
+  assert.match(source, /createAdaptivePoll/);
+  assert.match(source, /hasActiveAdminWork/);
+  assert.doesNotMatch(source, /setInterval\s*\(/);
+  assert.doesNotMatch(source, /pollTimer|bgTimer/);
+});

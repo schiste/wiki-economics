@@ -11,6 +11,18 @@ See what is running, what needs attention, and what is ready to publish. Durable
 </div>
 
 ```js
+import {
+  createAdaptivePoll,
+  createAdminViewNavigation,
+  hasActiveAdminWork,
+  persistOperationReceipts,
+  readOperationReceipts,
+  reconcileOperationReceipts,
+  upsertOperationReceipt
+} from "./components/admin-console.js"
+```
+
+```js
 const initialManifest = await FileAttachment("data/manifest.json").json()
 
 function emptyWikiStatus(name) {
@@ -36,6 +48,7 @@ const liveManifest = Mutable(initialManifest)
 const selectedWikiState = Mutable(null)
 const initialRunId = typeof location !== "undefined" ? new URL(location.href).searchParams.get("run") : null
 const selectedRunState = Mutable(initialRunId)
+const operationReceiptState = Mutable(readOperationReceipts())
 function setSelectedWiki(value, userInitiated = true) {
   if (userInitiated) adminUiState.selectedWikiUser = true
   selectedWikiState.value = value
@@ -57,10 +70,11 @@ const adminUiState = globalThis.__wikiEconAdminState ??= {
   lastKnownRunner: null,
   onboardingMode: "qualification",
   onboardingResourceClass: "medium_large",
-  notice: null
+  notice: null,
+  receiptSequence: 0
 }
 adminUiState.selectedWikiUser ??= false
-let pollTimer = null
+let statusPoller = null
 const SNAPSHOT_VERSION_RE = /^\d{4}-\d{2}$/
 const languageNames = typeof Intl !== "undefined" && Intl.DisplayNames
   ? new Intl.DisplayNames(["en"], {type: "language"})
@@ -212,6 +226,28 @@ function adminConnectionWarning() {
   return html`<div class="warning">Start the dev/operator admin server to enable commands: <code>scripts/dev.sh</code> or <code>WIKI_ECON_ADMIN_ENABLED=1 node site/admin-server.cjs</code></div>`
 }
 
+function recordOperationReceipt(receipt) {
+  const now = new Date().toISOString()
+  const id = receipt.id || `local:${Date.now()}:${adminUiState.receiptSequence++}`
+  const next = upsertOperationReceipt(operationReceiptState.value, {
+    ...receipt,
+    id,
+    updatedAt: receipt.updatedAt || now,
+    recordedAt: receipt.recordedAt || now
+  })
+  operationReceiptState.value = next
+  persistOperationReceipts(next)
+  return id
+}
+
+function syncOperationReceipts(status) {
+  const next = reconcileOperationReceipts(operationReceiptState.value, status)
+  if (JSON.stringify(next) !== JSON.stringify(operationReceiptState.value)) {
+    operationReceiptState.value = next
+    persistOperationReceipts(next)
+  }
+}
+
 async function checkApi() {
   try {
     const r = await fetch(`${API}/status`, {credentials: "same-origin"})
@@ -232,13 +268,15 @@ async function checkApi() {
       if (data.runner?.label) {
         adminUiState.lastKnownRunner = data.runner
       }
+      syncOperationReceipts(data)
     } else {
       apiAvailable.value = false
       jobStatus.value = data
     }
-  } catch {
+  } catch (error) {
     apiAvailable.value = false
     jobStatus.value = null
+    throw error
   }
 }
 
@@ -249,8 +287,14 @@ async function runCommand(action, wikiOrOptions = null) {
       : (wikiOrOptions ?? {})
     const requestedVersion = normalizeSnapshotVersion(options.version)
     if (requestedVersion && !SNAPSHOT_VERSION_RE.test(requestedVersion)) {
-      alert("Invalid snapshot version. Use YYYY-MM.")
-      return
+      recordOperationReceipt({
+        action,
+        wiki: options.wiki,
+        state: "failed",
+        title: `${actionLabel(action)} was not started`,
+        detail: "Invalid snapshot version. Use YYYY-MM."
+      })
+      return null
     }
     const body = JSON.stringify({
       ...(options.wiki ? {wiki: options.wiki} : {}),
@@ -276,36 +320,56 @@ async function runCommand(action, wikiOrOptions = null) {
     const data = await r.json()
     if (r.status === 401) {
       authState.value = data?.auth || {enabled: true, authenticated: false, loginUrl: "/admin/login", logoutUrl: null, user: null}
-      alert("Admin authentication required. Sign in again to continue.")
+      recordOperationReceipt({
+        action,
+        wiki: options.wiki,
+        state: "failed",
+        title: `${actionLabel(action)} was not started`,
+        detail: "Admin authentication is required. Sign in again to continue."
+      })
       return null
     }
-    if (data.error) { alert(data.error); return null }
+    if (data.error) {
+      recordOperationReceipt({
+        action,
+        wiki: options.wiki,
+        state: "failed",
+        title: `${actionLabel(action)} was not started`,
+        detail: data.error
+      })
+      return null
+    }
     adminUiState.notice = data.queued
       ? `${actionLabel(action)} queued as ${data.requestId}`
       : `${actionLabel(action)} accepted`
+    recordOperationReceipt({
+      id: data.requestId ? `request:${data.requestId}` : undefined,
+      requestId: data.requestId,
+      action,
+      wiki: options.wiki,
+      state: data.queued ? "queued" : "accepted",
+      title: `${actionLabel(action)} ${data.queued ? "queued" : "accepted"}`,
+      detail: data.requestId ? `Request ${data.requestId}` : "The admin server accepted the operation."
+    })
     adminUiState.showRunningLog = false
     adminUiState.showJobLog = false
-    await checkApi()
-    // Start polling
-    if (pollTimer) clearInterval(pollTimer)
-    pollTimer = setInterval(async () => {
-      await checkApi()
-      const operations = jobStatus.value?.adminOperations
-      if (jobStatus.value && !jobStatus.value.running && !operations?.counts?.running && !operations?.counts?.queued) {
-        clearInterval(pollTimer)
-        pollTimer = null
-      }
-    }, 500)
+    await statusPoller?.refresh()
     return data
   } catch (e) {
-    alert("Admin server not reachable. Run scripts/dev.sh or WIKI_ECON_ADMIN_ENABLED=1 node site/admin-server.cjs")
+    recordOperationReceipt({
+      action,
+      wiki: typeof wikiOrOptions === "string" ? wikiOrOptions : wikiOrOptions?.wiki,
+      state: "failed",
+      title: `${actionLabel(action)} was not started`,
+      detail: "Admin server not reachable. Run scripts/dev.sh or start the Toolforge admin service."
+    })
     return null
   }
 }
 
 async function registerWiki(wiki, mode, resourceClass, {start = false, version = null} = {}) {
   const result = await runCommand(start ? "onboard-wiki" : "register-wiki", {
-    wiki, mode, resourceClass, version, lifecycleRevision
+    wiki, mode, resourceClass, version, lifecycleRevision: jobStatus.value?.lifecycleRevision || null
   })
   if (!result?.registered) return
   setSelectedWiki(wiki)
@@ -405,13 +469,15 @@ function actionTooltipWithApi(action, enabled = true) {
   return enabled ? base : `${base} Admin API offline.`
 }
 
-checkApi()
-// Poll every 3s to detect if server comes online or job finishes
-const bgTimer = setInterval(checkApi, 3000)
-// Clean up intervals on hot-reload to prevent stale Mutable references
+statusPoller = createAdaptivePoll({
+  poll: checkApi,
+  isActive: () => hasActiveAdminWork(jobStatus.value),
+  onError: () => {}
+})
+void statusPoller.start()
+// Stop the sole adaptive status loop on hot reload.
 invalidation.then(() => {
-  clearInterval(bgTimer)
-  if (pollTimer) clearInterval(pollTimer)
+  statusPoller?.stop()
 })
 ```
 
@@ -461,6 +527,65 @@ const supportedWikis = Array.from(new Set(job?.supportedWikis || [])).sort((a, b
 ```
 
 <p class="filter-desc">Last scanned: ${currentManifest.generated_at}${apiStatus ? html` · <span style="color:#2e7d32">API connected</span>` : html` · ${adminConnectionHelp()}`}</p>
+
+```js
+const adminViewController = createAdminViewNavigation()
+invalidation.then(() => adminViewController.dispose())
+display(adminViewController.element)
+```
+
+```js
+const operationReceipts = operationReceiptState
+const visibleOperationReceipts = operationReceipts.slice(0, 8)
+
+function receiptTone(state) {
+  if (["failed", "interrupted", "quarantined", "stalled"].includes(state)) return "danger"
+  if (["running", "cancelling"].includes(state)) return "active"
+  if (["queued", "waiting_upstream", "accepted"].includes(state)) return "waiting"
+  if (state === "succeeded") return "success"
+  return "neutral"
+}
+
+function receiptStateLabel(state) {
+  return state ? state.replaceAll("_", " ").replace(/^./, (character) => character.toUpperCase()) : "Unknown"
+}
+
+function receiptTime(value) {
+  if (!value) return "time unknown"
+  const delta = Date.now() - Date.parse(value)
+  if (!Number.isFinite(delta)) return value
+  if (Math.abs(delta) < 60_000) return "just now"
+  if (Math.abs(delta) < 3_600_000) return `${Math.floor(Math.abs(delta) / 60_000)}m ago`
+  return `${Math.floor(Math.abs(delta) / 3_600_000)}h ago`
+}
+
+function clearResolvedOperationReceipts() {
+  const retained = operationReceiptState.value.filter((receipt) =>
+    !["succeeded", "failed", "cancelled", "accepted"].includes(receipt.state))
+  operationReceiptState.value = retained
+  persistOperationReceipts(retained)
+}
+
+display(visibleOperationReceipts.length ? html`<section class="admin-operation-receipts" aria-labelledby="operation-receipts-title">
+  <header>
+    <div>
+      <h2 id="operation-receipts-title">Operation receipts</h2>
+      <span>Durable outcomes from this browser and authenticated server records.</span>
+    </div>
+    <button class="admin-btn small" onclick=${clearResolvedOperationReceipts}>Clear resolved</button>
+  </header>
+  <div class="admin-operation-receipt-list" role="log" aria-live="polite" aria-relevant="additions text">
+    ${visibleOperationReceipts.map((receipt) => html`<article class=${`admin-operation-receipt ${receiptTone(receipt.state)}`}>
+      <span class="admin-operation-receipt-state">${receiptStateLabel(receipt.state)}</span>
+      <div><strong>${receipt.title}</strong>${receipt.detail ? html`<span>${receipt.detail}</span>` : ""}</div>
+      <time datetime=${receipt.updatedAt}>${receiptTime(receipt.updatedAt)}</time>
+    </article>`)}
+  </div>
+</section>` : html`<div class="admin-operation-receipts empty" role="status" aria-live="polite">
+  <strong>No operator action receipts yet.</strong>
+  <span>Queued, completed, and failed actions will remain here across page reloads.</span>
+</div>`)
+```
 
 <!-- ── Job output panel ───────────────────────────────────── -->
 
@@ -599,7 +724,7 @@ display(html`<div class="admin-command-header">
 
 ```js
 topLevelJob
-  ? html`<div class="admin-job-panel ${topLevelJob.running ? "running" : topLevelJob.cancelled ? "failed" : topLevelJob.exitCode === 0 ? "success" : "failed"}">
+  ? html`<div data-admin-view="runs" class="admin-job-panel ${topLevelJob.running ? "running" : topLevelJob.cancelled ? "failed" : topLevelJob.exitCode === 0 ? "success" : "failed"}">
       <div class="admin-job-header">
         <strong>${topLevelJob.running ? "Running..." : topLevelJob.cancelled ? "Cancelled" : topLevelJob.exitCode === 0 ? "Completed" : "Failed"}</strong>
         <code>${topLevelJob.command || ""}</code>
@@ -653,7 +778,7 @@ topLevelJob
   : html`<span></span>`
 ```
 
-<div class="chart-section admin-activity-section">
+<div id="admin-view-runs" class="chart-section admin-activity-section" data-admin-view="runs">
 
 ## Activity
 
@@ -843,7 +968,7 @@ selectedRun ? display(html`<section class="admin-run-sheet" aria-label="Run deta
 
 <!-- ── Scheduled refresh panel ─────────────────────────────── -->
 
-<div class="chart-section">
+<div id="admin-view-overview" class="chart-section" data-admin-view="overview">
 
 ## Publication health
 
@@ -1004,7 +1129,7 @@ display(html`<div class="admin-refresh-panel">
 
 <!-- ── Data quality ledger ───────────────────────────────── -->
 
-<div class="chart-section">
+<div id="admin-view-quality" class="chart-section" data-admin-view="quality">
 
 ## Data quality
 
@@ -1112,7 +1237,7 @@ display(qualityEntries.length ? html`<div class="admin-quality-ledger">
 
 <!-- ── Pipeline status matrix ─────────────────────────────── -->
 
-<div class="chart-section">
+<div id="admin-view-wikis" class="chart-section" data-admin-view="wikis">
 
 ## Pipeline Status
 
@@ -1573,7 +1698,7 @@ display(html`<div class="admin-pipeline-board">
 
 <!-- ── Fetch a new wiki ───────────────────────────────────── -->
 
-<div class="chart-section">
+<div class="chart-section" data-admin-view="wikis">
 
 ## Start or inspect a project
 
@@ -1757,7 +1882,10 @@ html`<div class="admin-onboarding-console">
   ` : html`<button class="admin-btn primary" ?disabled=${!apiStatus || !onboardingCanRun} onclick=${() => {
         const w = onboardingWiki
         const version = normalizeSnapshotVersion(snapshotVersion)
-        if (!w) { alert("Pick a supported Wikipedia project."); return }
+        if (!w) {
+          recordOperationReceipt({state: "failed", action: "run", title: "Preparation was not started", detail: "Pick a supported Wikipedia project first."})
+          return
+        }
         const action = onboardingLifecycle?.refresh === "qualification" ? "qualify" : "run"
         if (confirm(`${action === "qualify" ? "Qualify" : "Prepare"} ${w}${version ? ` at exact snapshot ${version}` : " using the latest completed snapshot"}?`)) {
           runCommand(action, {wiki: w, version})
@@ -1766,7 +1894,10 @@ html`<div class="admin-onboarding-console">
   <button class="admin-btn" ?disabled=${!apiStatus || !onboardingCanRun} title=${actionTooltipWithApi("fetch", apiStatus)} onclick=${() => {
         const w = onboardingWiki
         const version = normalizeSnapshotVersion(snapshotVersion)
-        if (!w) { alert("Pick a supported Wikipedia project."); return }
+        if (!w) {
+          recordOperationReceipt({state: "failed", action: "fetch", title: "Fetch was not started", detail: "Pick a supported Wikipedia project first."})
+          return
+        }
         runCommand("fetch", {wiki: w, version})
       }}>Fetch missing</button>
   </div>
@@ -1781,7 +1912,7 @@ html`<div class="admin-onboarding-console">
 
 <!-- ── Immutable lifecycle audit ──────────────────────────── -->
 
-<div class="chart-section">
+<div class="chart-section" data-admin-view="runs">
 
 ## Operator audit
 
@@ -1818,7 +1949,7 @@ html`<div class="admin-audit-ledger">
 
 <!-- ── Wiki details ───────────────────────────────────────── -->
 
-<div class="chart-section">
+<div class="chart-section" data-admin-view="wikis">
 
 ## Artifact inventory
 
@@ -1964,7 +2095,7 @@ const selectedTruth = operationalWikiTruth[selectedWiki] || null
 
 <!-- ── Merged site data files ─────────────────────────────── -->
 
-<div class="chart-section">
+<div class="chart-section" data-admin-view="quality">
 
 ## Merged Site Data Files
 
@@ -1981,6 +2112,78 @@ currentManifest.merged.length > 0
 </div>
 
 <style>
+.admin-view-navigation {
+  position: sticky;
+  top: 0;
+  z-index: 8;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 1.1rem 0 0.8rem;
+  padding: 0.24rem;
+  border: 1px solid var(--theme-foreground-faintest);
+  border-radius: 0.55rem;
+  background: color-mix(in srgb, var(--theme-background) 94%, #315b8a 6%);
+  box-shadow: 0 0.35rem 1rem color-mix(in srgb, var(--theme-foreground) 8%, transparent);
+}
+.admin-view-navigation button {
+  min-height: 2.55rem;
+  border: 0;
+  border-radius: 0.35rem;
+  color: var(--theme-foreground-muted);
+  background: transparent;
+  font: inherit;
+  font-size: 0.82rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+.admin-view-navigation button[aria-selected="true"] {
+  color: var(--theme-foreground);
+  background: var(--theme-background);
+  box-shadow: 0 1px 0.35rem color-mix(in srgb, var(--theme-foreground) 10%, transparent);
+}
+.admin-view-navigation button:focus-visible,
+.admin-operation-receipts button:focus-visible {
+  outline: 3px solid color-mix(in srgb, #315b8a 70%, white 30%);
+  outline-offset: 2px;
+}
+[data-admin-view][hidden] { display: none !important; }
+.admin-operation-receipts {
+  margin: 0 0 1rem;
+  border: 1px solid var(--theme-foreground-faintest);
+  border-left: 4px solid #315b8a;
+  background: var(--theme-background);
+}
+.admin-operation-receipts > header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.7rem 0.85rem;
+  border-bottom: 1px solid var(--theme-foreground-faintest);
+}
+.admin-operation-receipts h2 { margin: 0; font-size: 0.88rem; }
+.admin-operation-receipts header span,
+.admin-operation-receipts.empty span { display: block; color: var(--theme-foreground-muted); font-size: 0.7rem; }
+.admin-operation-receipts.empty { display: flex; gap: 0.45rem; padding: 0.62rem 0.8rem; border-left-color: var(--theme-foreground-faintest); font-size: 0.72rem; }
+.admin-operation-receipt-list { max-height: 15rem; overflow-y: auto; }
+.admin-operation-receipt {
+  display: grid;
+  grid-template-columns: 6.25rem minmax(0, 1fr) auto;
+  gap: 0.75rem;
+  align-items: start;
+  padding: 0.62rem 0.8rem;
+  border-top: 1px solid var(--theme-foreground-faintest);
+  font-size: 0.72rem;
+}
+.admin-operation-receipt:first-child { border-top: 0; }
+.admin-operation-receipt-state { font-weight: 750; }
+.admin-operation-receipt.active .admin-operation-receipt-state { color: #315b8a; }
+.admin-operation-receipt.waiting .admin-operation-receipt-state { color: #6956a1; }
+.admin-operation-receipt.success .admin-operation-receipt-state { color: #2e7d32; }
+.admin-operation-receipt.danger .admin-operation-receipt-state { color: #c62828; }
+.admin-operation-receipt > div { display: grid; gap: 0.1rem; }
+.admin-operation-receipt > div span,
+.admin-operation-receipt time { color: var(--theme-foreground-muted); }
 .admin-quality-ledger { border-block: 1px solid var(--theme-foreground-faintest); }
 .admin-quality-summary {
   display: grid;
@@ -3093,6 +3296,18 @@ currentManifest.merged.length > 0
   }
 }
 @media (max-width: 760px) {
+  .admin-view-navigation {
+    top: 0;
+    grid-template-columns: repeat(4, minmax(5.2rem, 1fr));
+    overflow-x: auto;
+    overscroll-behavior-inline: contain;
+    scrollbar-width: thin;
+  }
+  .admin-view-navigation button { min-height: 2.8rem; }
+  .admin-operation-receipts > header { align-items: flex-start; }
+  .admin-operation-receipts.empty { display: grid; }
+  .admin-operation-receipt { grid-template-columns: 5.5rem minmax(0, 1fr); }
+  .admin-operation-receipt time { grid-column: 2; }
   .admin-quality-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .admin-quality-summary > div:nth-child(2) { border-right: 0; }
   .admin-quality-wiki > summary { grid-template-columns: 1fr; gap: 0.35rem; }
