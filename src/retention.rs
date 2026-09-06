@@ -151,6 +151,22 @@ pub(crate) fn validate_purged_snapshot(
     Ok(receipt)
 }
 
+pub(crate) fn validate_purged_snapshot_for_ready(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot: &str,
+    ready_path: &Path,
+) -> Result<RetentionReceipt> {
+    let receipt = validate_purged_snapshot(data_dir, wiki, snapshot)?;
+    let (_, ready_sha256) = storage::sha256_file(ready_path)
+        .with_context(|| format!("failed to hash retained candidate {}", ready_path.display()))?;
+    ensure!(
+        ready_sha256 == receipt.authorized_ready_sha256,
+        "retention receipt does not authorize this ready candidate"
+    );
+    Ok(receipt)
+}
+
 pub(crate) fn audit_or_apply(
     data_dir: &Path,
     authorization: RetentionAuthorization,

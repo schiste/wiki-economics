@@ -1680,16 +1680,15 @@ fn validate_ready_candidate_metadata(
     if storage::generation_manifest_path(data_dir, &ready.wiki, &ready.snapshot)?.is_file() {
         storage::ensure_generation_manifest(data_dir, &ready.wiki, &ready.snapshot)?;
     } else {
-        let retained =
-            crate::retention::validate_purged_snapshot(data_dir, &ready.wiki, &ready.snapshot);
-        let retained = retained.context(
+        crate::retention::validate_purged_snapshot_for_ready(
+            data_dir,
+            &ready.wiki,
+            &ready.snapshot,
+            &candidate_dir.join("ready.json"),
+        )
+        .context(
             "ready candidate input generation is absent without valid retention authorization",
         )?;
-        let (_, ready_sha256) = storage::sha256_file(&candidate_dir.join("ready.json"))?;
-        ensure!(
-            ready_sha256 == retained.authorized_ready_sha256,
-            "retention receipt does not authorize this ready candidate"
-        );
     }
     if let Some(profile) = &ready.workload_profile {
         profile.validate(&ready.wiki, &ready.snapshot)?;
@@ -3842,8 +3841,26 @@ fn rollback_selection_files(
         {
             std::os::unix::fs::symlink(PathBuf::from(previous).join(&entry.wiki), &active)?;
         }
-        let previous_snapshot = entry.previous_snapshot.as_deref();
-        storage::restore_current_snapshot(data_dir, &entry.wiki, previous_snapshot)?;
+        if let Some(previous_snapshot) = entry.previous_snapshot.as_deref() {
+            let manifest =
+                storage::generation_manifest_path(data_dir, &entry.wiki, previous_snapshot)?;
+            if manifest.is_file() {
+                storage::restore_current_snapshot(data_dir, &entry.wiki, Some(previous_snapshot))?;
+            } else {
+                let previous = entry
+                    .previous_candidate_relative
+                    .as_deref()
+                    .context("retained rollback snapshot has no previous candidate")?;
+                storage::restore_retained_current_snapshot(
+                    data_dir,
+                    &entry.wiki,
+                    previous_snapshot,
+                    &output_dir.join(previous).join("ready.json"),
+                )?;
+            }
+        } else {
+            storage::restore_current_snapshot(data_dir, &entry.wiki, None)?;
+        }
         discover_latest_ready_candidate(data_dir, output_dir, &entry.wiki)?
             .map(|newest| write_ready_index(data_dir, output_dir, &entry.wiki, &newest))
             .transpose()?;
@@ -9398,24 +9415,21 @@ mod tests {
         let (_, source_plan_sha256) = storage::sha256_file(&plan_path)?;
         let retention_path =
             crate::retention::receipt_path(fixture.data.path(), "nlwiki", "2026-03")?;
-        atomic_json(
-            &retention_path,
-            &crate::retention::RetentionReceipt {
-                schema_version: crate::retention::RETENTION_RECEIPT_SCHEMA_VERSION,
-                wiki: "nlwiki".to_string(),
-                snapshot: "2026-03".to_string(),
-                state: crate::retention::RetentionState::Applied,
-                authorized_ready_sha256: ready_sha256,
-                source_plan_sha256,
-                history_input: crate::retention::InputRetention::PurgeAfterReady,
-                patrol_source: crate::retention::InputRetention::PurgeAfterReady,
-                authorized_at_unix: 1,
-                applied_at_unix: Some(1),
-                removed_bytes: 1,
-                removed_paths: vec!["fixture-generation".to_string()],
-            },
-        )
-        .expect("retention receipt should be written");
+        let receipt = crate::retention::RetentionReceipt {
+            schema_version: crate::retention::RETENTION_RECEIPT_SCHEMA_VERSION,
+            wiki: "nlwiki".to_string(),
+            snapshot: "2026-03".to_string(),
+            state: crate::retention::RetentionState::Applied,
+            authorized_ready_sha256: ready_sha256,
+            source_plan_sha256,
+            history_input: crate::retention::InputRetention::PurgeAfterReady,
+            patrol_source: crate::retention::InputRetention::PurgeAfterReady,
+            authorized_at_unix: 1,
+            applied_at_unix: Some(1),
+            removed_bytes: 1,
+            removed_paths: vec!["fixture-generation".to_string()],
+        };
+        atomic_json(&retention_path, &receipt).expect("retention receipt should be written");
         let generation_manifest =
             storage::generation_manifest_path(fixture.data.path(), "nlwiki", "2026-03")
                 .expect("generation manifest path should be valid");
@@ -9451,6 +9465,47 @@ mod tests {
         assert!(
             backups_recoverable(fixture.data.path(), fixture.output.path(), &selection)
                 .expect("retained rollback evidence should be readable")
+        );
+        let mut invalid_receipt = receipt.clone();
+        invalid_receipt.authorized_ready_sha256 = "0".repeat(64);
+        atomic_json(&retention_path, &invalid_receipt)?;
+        let error =
+            rollback_selection_files(fixture.data.path(), fixture.output.path(), &selection)
+                .expect_err("a retention receipt for another candidate must fail closed");
+        assert!(format!("{error:#}").contains("does not authorize this ready candidate"));
+        atomic_json(&retention_path, &receipt)?;
+        remove_selection_link(&active)?;
+        std::os::unix::fs::symlink("_candidates/nlwiki/2026-04/selected/nlwiki", &active)?;
+        rollback_selection_files(fixture.data.path(), fixture.output.path(), &selection)?;
+        assert_eq!(
+            active_candidate_relative(fixture.output.path(), "nlwiki")?.as_deref(),
+            Some("_candidates/nlwiki/2026-03/retained-previous")
+        );
+        assert_eq!(
+            storage::current_snapshot_version(fixture.data.path(), "nlwiki")?.as_deref(),
+            Some("2026-03")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_of_an_initial_publication_removes_the_snapshot_pointer() -> Result<()> {
+        let fixture = Fixture::new()?;
+        fixture.ready_candidate("candidate")?;
+        let mut selection = activate_ready_candidates(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "initial-rollback",
+        )
+        .expect("initial candidate activation should succeed");
+        let entry = &mut selection.entries[0];
+        entry.previous_candidate_relative = None;
+        entry.previous_snapshot = None;
+        rollback_selection_files(fixture.data.path(), fixture.output.path(), &selection)?;
+        assert_eq!(
+            storage::current_snapshot_version(fixture.data.path(), "nlwiki")?,
+            None
         );
         Ok(())
     }
