@@ -4398,12 +4398,8 @@ pub(crate) fn recover_publication_transactions(
                 repaired = true;
             }
             PublicationRecoveryClassification::NeedsResume => {
-                resume_unpublished_selection(
-                    data_dir,
-                    output_dir,
-                    lifecycle_path,
-                    &transaction.run_id,
-                )?;
+                let run_id = transaction.run_id.as_str();
+                resume_unpublished_selection(data_dir, output_dir, lifecycle_path, run_id)?;
                 repaired = true;
                 site_rebuild_required = true;
             }
