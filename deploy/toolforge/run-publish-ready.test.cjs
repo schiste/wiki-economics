@@ -44,13 +44,16 @@ test("lock helper preserves failure status and still releases its heartbeat lock
 });
 
 test("publisher exits before the site build for an unchanged selection", () => {
+  const preflight = transactionScript.indexOf("publication-preflight");
   const prepare = transactionScript.indexOf("publication-prepare-ready");
   const noOpState = transactionScript.indexOf("no_op)");
   const noOpExit = transactionScript.indexOf("exit 0", noOpState);
   const siteBuild = transactionScript.indexOf('"$ROOT/scripts/build-site.sh"', noOpExit);
   const commit = transactionScript.lastIndexOf("publication-commit-ready");
 
-  assert.ok(prepare >= 0);
+  assert.ok(preflight >= 0);
+  assert.ok(prepare > preflight);
+  assert.match(transactionScript, /preflight_report=.*\.preflight\.json/);
   assert.ok(noOpState > prepare);
   assert.ok(noOpExit > noOpState);
   assert.ok(siteBuild > noOpExit);

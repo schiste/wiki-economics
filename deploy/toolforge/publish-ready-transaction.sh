@@ -78,6 +78,13 @@ if node -e '
     --report "$recovery_report"
 fi
 
+echo "==> Validating publication change plan before candidate activation"
+preflight_report="${WIKI_ECON_RUN_STATE_FILE%.state}.preflight.json"
+wiki_econ_run_cli publication-preflight \
+  --lifecycle "$WIKI_ECON_WIKI_LIFECYCLE_FILE" \
+  --site-dist-dir "$WIKI_ECON_SITE_DIST_DIR" \
+  --report "$preflight_report"
+
 wiki_econ_run_cli publication-prepare-ready \
   --lifecycle "$WIKI_ECON_WIKI_LIFECYCLE_FILE"
 selection_file="$WIKI_ECON_OUTPUT_DIR/_publication_transactions/$WIKI_ECON_RUN_ID/selection.json"
