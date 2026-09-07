@@ -11,6 +11,7 @@ import {
   readOperationReceipts,
   reconcileOperationReceipts,
   summarizeOperatorStatus,
+  summarizePipelineIssues,
   summarizePublicationBlockers,
   upsertOperationReceipt
 } from "./src/components/admin-console.js";
@@ -224,7 +225,7 @@ test("stage ledger keeps an older healthy publication separate from a blocked up
   assert.equal(stages[7].publishedSnapshot, "2026-07");
 });
 
-test("stage ledger reports a fully validated private qualification without pretending it is published", () => {
+test("stage ledger makes promotion the next safe action for a validated private qualification", () => {
   const stages = deriveProjectPipelineStages({
     lifecycle: {publication: "hidden", refresh: "qualification"},
     candidate: {
@@ -247,8 +248,9 @@ test("stage ledger reports a fully validated private qualification without prete
   });
 
   assert.equal(stages.slice(0, 7).every((stage) => stage.status === "complete"), true);
-  assert.equal(stages[7].status, "not_applicable");
-  assert.match(stages[7].blockedReason, /remain private/);
+  assert.equal(stages[7].status, "ready");
+  assert.equal(stages[7].actionAllowed, true);
+  assert.equal(stages[7].blockedReason, null);
 });
 
 test("publication blocker summary groups repeated schema mismatches", () => {
@@ -261,4 +263,21 @@ test("publication blocker summary groups repeated schema mismatches", () => {
   assert.deepEqual(summary[0].metrics, ["gdp", "inequality"]);
   assert.match(summary[0].detail, /2 metrics differ/);
   assert.equal(summary[1].detail, "publication recovery audit is not clean");
+});
+
+test("overview issue summary collapses symptoms and omits snapshot noise covered by a blocker", () => {
+  const summary = summarizePipelineIssues([
+    {wiki: "frwiki", code: "candidate_failed", severity: "critical", message: "frwiki failed"},
+    {wiki: "frwiki", code: "snapshot_pending", severity: "warning", message: "frwiki is pending"},
+    {wiki: "afwiki", code: "candidate_ready_not_published", severity: "warning", message: "afwiki ready"},
+    {wiki: "eswiki", code: "candidate_ready_not_published", severity: "warning", message: "eswiki ready"},
+    {wiki: "afwiki", code: "unexpected_rows_change", severity: "warning", message: "afwiki rows rose"},
+    {wiki: "eswiki", code: "artifact_scrub_stale", severity: "warning", message: "eswiki scrub stale"},
+  ], [{affectedWikis: ["frwiki"]}]);
+
+  assert.deepEqual(summary.map((group) => [group.code, group.count, group.affectedWikis]), [
+    ["candidate_ready_not_published", 2, ["afwiki", "eswiki"]],
+    ["data_quality_findings", 2, ["afwiki", "eswiki"]],
+  ]);
+  assert.match(summary[1].detail, /not separate pipeline failures/);
 });

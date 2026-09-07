@@ -112,7 +112,7 @@ export function deriveProjectPipelineStages({candidate = null, truth = {}, manif
     const receipt = receiptFor(candidate, stage.receiptStages);
     const active = stage.receiptStages.includes(activeStage);
     let status;
-    if (stage.id === "publication" && hiddenQualification) status = "not_applicable";
+    if (stage.id === "publication" && hiddenQualification) status = qualificationReady ? "ready" : "waiting";
     else if (active) status = "running";
     else if (failedStageIds.has(stage.id)) status = "blocked";
     else if (completed[stage.id]) status = "complete";
@@ -121,7 +121,7 @@ export function deriveProjectPipelineStages({candidate = null, truth = {}, manif
     else status = "ready";
 
     if (status === "blocked") upstreamBlocked = true;
-    const actionAllowed = !operationActive && !hiddenQualification || stage.id !== "publication";
+    const actionAllowed = !operationActive;
     let blockedReason = null;
     if (operationActive) blockedReason = "Another operation is already active for this project.";
     else if (blockedRetry && (status === "blocked" || upstreamBlocked)) {
@@ -129,8 +129,6 @@ export function deriveProjectPipelineStages({candidate = null, truth = {}, manif
     } else if (!dependency[stage.id] && status !== "not_applicable") {
       const previous = PROJECT_PIPELINE_STAGES[Math.max(0, PROJECT_PIPELINE_STAGES.findIndex((item) => item.id === stage.id) - 1)];
       blockedReason = `Complete ${previous.label.toLowerCase()} first.`;
-    } else if (stage.id === "publication" && hiddenQualification) {
-      blockedReason = "Qualification candidates remain private until they are promoted.";
     }
     return {
       ...stage,
@@ -142,6 +140,56 @@ export function deriveProjectPipelineStages({candidate = null, truth = {}, manif
       blockedReason,
     };
   });
+}
+
+const PIPELINE_ISSUE_LABELS = Object.freeze({
+  candidate_ready_not_published: "Validated candidates are waiting for publication",
+  snapshot_pending: "Newer snapshots are waiting for preparation",
+  published_metrics_incomplete: "Published metric evidence is incomplete",
+});
+
+function isQualityIssue(code) {
+  return code === "artifact_scrub_stale"
+    || code.startsWith("unexpected_")
+    || /_(?:metric_receipt_invalid|metric_schema_mismatch|metric_algorithm_mismatch)$/.test(code);
+}
+
+/**
+ * Reduce per-wiki symptoms to operator decisions for the overview. Detailed
+ * evidence remains available in the project and data-quality views.
+ */
+export function summarizePipelineIssues(issues = [], blockerGroups = []) {
+  const blockedWikis = new Set(blockerGroups.flatMap((group) => group.affectedWikis || []));
+  const groups = new Map();
+  for (const issue of issues) {
+    const code = String(issue?.code || "pipeline_issue");
+    if (code === "candidate_failed") continue;
+    if (code === "snapshot_pending" && blockedWikis.has(issue?.wiki)) continue;
+    const groupCode = isQualityIssue(code) ? "data_quality_findings" : code;
+    if (!groups.has(groupCode)) groups.set(groupCode, {
+      code: groupCode,
+      severity: issue?.severity === "critical" ? "critical" : "warning",
+      count: 0,
+      affectedWikis: new Set(),
+      examples: [],
+    });
+    const group = groups.get(groupCode);
+    group.count += 1;
+    if (issue?.severity === "critical") group.severity = "critical";
+    if (issue?.wiki) group.affectedWikis.add(issue.wiki);
+    if (group.examples.length < 2 && issue?.message) group.examples.push(issue.message);
+  }
+  return [...groups.values()].map((group) => {
+    const affectedWikis = [...group.affectedWikis].sort();
+    const title = group.code === "data_quality_findings"
+      ? "Data-quality findings require review"
+      : PIPELINE_ISSUE_LABELS[group.code] || "Pipeline evidence requires review";
+    const detail = group.code === "data_quality_findings"
+      ? `${group.count} finding${group.count === 1 ? "" : "s"} across ${affectedWikis.length || "unknown"} project${affectedWikis.length === 1 ? "" : "s"}. Review the data-quality view; these are not separate pipeline failures.`
+      : `${group.count} project${group.count === 1 ? "" : "s"}${affectedWikis.length ? `: ${affectedWikis.join(", ")}` : ""}.`;
+    return {...group, title, detail, affectedWikis, examples: group.examples};
+  }).sort((left, right) => (left.severity === "critical" ? 0 : 1) - (right.severity === "critical" ? 0 : 1)
+    || right.count - left.count || left.code.localeCompare(right.code));
 }
 
 export function summarizePublicationBlockers(blockers = []) {

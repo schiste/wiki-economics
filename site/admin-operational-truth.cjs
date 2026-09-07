@@ -282,12 +282,14 @@ function wikiOperationalTruth({wiki, definitions, lifecycle, dataDir, outputDir,
   });
   issues.push(...quality.anomalies.map((anomaly) => ({
     ...anomaly,
+    wiki,
     message: `${wiki}: ${anomaly.message}`,
   })));
   const candidateIsNewer = candidate?.snapshot && (!publishedSnapshot || candidate.snapshot > publishedSnapshot);
   if (candidateIsNewer && candidate.state === "failed") {
     issues.push({
       code: "candidate_failed",
+      wiki,
       severity: "critical",
       message: `${wiki} candidate ${candidate.snapshot} failed${candidate.failingStage ? ` during ${candidate.failingStage}` : ""}: ${candidate.error || "unknown error"}`,
       runId: candidate.runId,
@@ -296,6 +298,7 @@ function wikiOperationalTruth({wiki, definitions, lifecycle, dataDir, outputDir,
   if (entry?.publication === "published" && !publishedCompleteness.complete) {
     issues.push({
       code: "published_metrics_incomplete",
+      wiki,
       severity: "critical",
       message: `${wiki} is missing published metric proof for ${publishedCompleteness.missing.join(", ") || "the required metric set"}.`,
     });
@@ -304,12 +307,14 @@ function wikiOperationalTruth({wiki, definitions, lifecycle, dataDir, outputDir,
     if (candidate?.state !== "failed" && readySnapshot && readySnapshot > publishedSnapshot) {
       issues.push({
         code: "candidate_ready_not_published",
+        wiki,
         severity: "warning",
         message: `${wiki} candidate ${readySnapshot} is ready, while ${publishedSnapshot} remains public.`,
       });
     } else if (!candidate || !["starting", "running"].includes(candidate.state)) {
       issues.push({
         code: "snapshot_pending",
+        wiki,
         severity: "warning",
         message: `${wiki} has completed snapshot ${latestAvailable}, while ${publishedSnapshot} is public.`,
       });
