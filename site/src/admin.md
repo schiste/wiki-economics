@@ -1,14 +1,11 @@
 ---
 title: Admin
+toc: false
 ---
 
-# Operations
+# Operator control room
 
-<div class="page-intro">
-
-See what is running, what needs attention, and what is ready to publish. Durable operator, fleet, snapshot, and publication evidence is reconciled into four human milestones for every wiki.
-
-</div>
+<p class="admin-page-intro">Start and monitor data work, understand what stopped, and make publication decisions.</p>
 
 ```js
 import {
@@ -18,6 +15,7 @@ import {
   persistOperationReceipts,
   readOperationReceipts,
   reconcileOperationReceipts,
+  summarizeOperatorStatus,
   upsertOperationReceipt
 } from "./components/admin-console.js"
 ```
@@ -524,6 +522,7 @@ const operationalTruth = job?.operationalTruth || {
 }
 const operationalWikiTruth = operationalTruth.wikis || {}
 const supportedWikis = Array.from(new Set(job?.supportedWikis || [])).sort((a, b) => a.localeCompare(b))
+const operatorSummary = summarizeOperatorStatus(job || {})
 ```
 
 <p class="filter-desc">Last scanned: ${currentManifest.generated_at}${apiStatus ? html` · <span style="color:#2e7d32">API connected</span>` : html` · ${adminConnectionHelp()}`}</p>
@@ -533,6 +532,8 @@ const adminViewController = createAdminViewNavigation()
 invalidation.then(() => adminViewController.dispose())
 display(adminViewController.element)
 ```
+
+<div data-admin-view="runs">
 
 ```js
 const operationReceipts = operationReceiptState
@@ -586,6 +587,8 @@ display(visibleOperationReceipts.length ? html`<section class="admin-operation-r
   <span>Queued, completed, and failed actions will remain here across page reloads.</span>
 </div>`)
 ```
+
+</div>
 
 <!-- ── Job output panel ───────────────────────────────────── -->
 
@@ -701,6 +704,8 @@ const selectedWiki = selectedWikiCandidate.trim().toLowerCase()
 const hasSelectedWiki = selectedWiki !== "—"
 ```
 
+</div>
+
 ```js
 const attentionStates = new Set(["stalled", "quarantined", "interrupted", "failed"])
 const attentionCount = wikiEntries.filter(([name, wiki]) => attentionStates.has(operationalState(name, wiki))).length
@@ -723,13 +728,33 @@ const activeRunKeys = new Set([
   ...(adminOperations.running || []).map((entry) => `run:${entry.runId || entry.requestId}`),
 ])
 const activeCount = activeRunKeys.size
+const activeWork = [
+  ...(adminOperations.running || []).map((entry) => ({...entry, source: "operator"})),
+  ...(fleet.work || []).filter((entry) => entry.state === "running").map((entry) => ({...entry, source: "fleet"})),
+]
+
+function showAdminArea(viewName, targetId = null, focusSelector = null) {
+  adminViewController.select(viewName)
+  requestAnimationFrame(() => requestAnimationFrame(() => {
+    const target = targetId ? document.getElementById(targetId) : null
+    target?.scrollIntoView({behavior: "smooth", block: "start"})
+    const focusTarget = focusSelector ? document.querySelector(focusSelector) : null
+    focusTarget?.focus({preventScroll: true})
+  }))
+}
+
+function inspectProject(name) {
+  setSelectedWiki(name)
+  showAdminArea("wikis", "admin-view-wikis")
+}
+
 display(html`<div class="admin-command-header">
-  <div class="admin-command-health ${operatorIssueCount > 0 ? "attention" : "clear"}">
-    <span class="admin-command-kicker">Operator status</span>
-    <strong>${attentionCount > 0
-      ? `${attentionCount} ${attentionCount === 1 ? "project is" : "projects are"} paused by ${blockerGroupCount || 1} ${blockerGroupCount === 1 ? "shared blocker" : "blockers"}`
-      : operatorIssueCount > 0 ? `${operatorIssueCount} operational ${operatorIssueCount === 1 ? "issue" : "issues"}` : "No blocking issues"}</strong>
-    <span>${activeCount > 0 ? `${activeCount} active ${activeCount === 1 ? "run" : "runs"}` : "No process is currently running"}</span>
+  <div class="admin-command-health ${operatorSummary.publicStatus !== "healthy" ? "attention" : operatorSummary.decisionCount ? "decision" : "clear"}">
+    <span class="admin-command-kicker">Right now</span>
+    <strong>${operatorSummary.publicStatus === "healthy" ? "Public data is healthy" : `Public data is ${operatorSummary.publicStatus}`}</strong>
+    <span>${activeCount > 0
+      ? `${activeCount} ${activeCount === 1 ? "operation is" : "operations are"} running now`
+      : `${operatorSummary.queuedCount > 0 ? `${operatorSummary.queuedCount} queued · ` : ""}Nothing is running; scheduled workers sleep between checks`}</span>
   </div>
   <dl class="admin-command-facts">
     <div><dt>Public data</dt><dd class=${operationalTruth.public?.status === "healthy" ? "ok" : operationalTruth.public?.status === "critical" ? "bad" : ""}>${operationalTruth.public?.status || "unknown"}</dd></div>
@@ -741,8 +766,51 @@ display(html`<div class="admin-command-header">
     <span>${auth?.user?.email || (auth?.enabled ? "Sign-in required" : "Local operator")}</span>
     ${auth?.logoutUrl ? html`<a href=${auth.logoutUrl}>Sign out</a>` : ""}
   </div>
+  <div class="admin-command-actions" aria-label="Primary operator actions">
+    <button class="admin-btn primary" onclick=${() => showAdminArea("wikis", "admin-start-work", ".admin-wiki-combobox")}>Start or update a project</button>
+    <button class="admin-btn" onclick=${() => showAdminArea("runs", "admin-view-runs")}>See runs and logs${activeCount ? ` (${activeCount})` : ""}</button>
+    <button class="admin-btn" onclick=${() => showAdminArea("overview", "admin-decisions")}>Review decisions${operatorSummary.decisionCount ? ` (${operatorSummary.decisionCount})` : ""}</button>
+  </div>
 </div>`)
 ```
+
+<div id="admin-control-room" class="chart-section admin-control-room" data-admin-view="overview">
+
+## Work and decisions
+
+```js
+display(html`<div class="admin-control-grid">
+  <section class="admin-now-panel" aria-labelledby="admin-now-title">
+    <header><div><span>Current work</span><h3 id="admin-now-title">${activeWork.length ? `${activeWork.length} running now` : "Nothing is running"}</h3></div><button class="admin-text-action" onclick=${() => showAdminArea("runs", "admin-view-runs")}>Open run history</button></header>
+    ${activeWork.length ? html`<div class="admin-now-list">${activeWork.slice(0, 4).map((work) => html`<button onclick=${() => {
+      if (work.wiki) setSelectedWiki(work.wiki)
+      setSelectedRun(work.runId || work.taskId || null)
+      showAdminArea("runs", "admin-view-runs")
+    }}><i></i><span><strong>${work.wiki ? wikipediaProjectLabel(work.wiki) : "Global operation"}</strong><small>${work.stageLabel || work.stage || "Starting"}${work.progress?.percent != null ? ` · ${work.progress.percent}%` : ""}</small></span></button>`)}</div>`
+      : html`<div class="admin-idle-explanation"><strong>Idle is normal.</strong><span>Fleet workers wake on schedule, discover new snapshots, and exit when nothing changed. Starting a project creates a durable request that remains visible after you close this page.</span></div>`}
+    ${operatorSummary.queuedCount || operatorSummary.waitingUpstreamCount ? html`<div class="admin-queue-note"><strong>${operatorSummary.queuedCount} queued</strong><span>${operatorSummary.waitingUpstreamCount ? ` · ${operatorSummary.waitingUpstreamCount} waiting for Wikimedia` : " · waiting for the next worker"}</span></div>` : ""}
+    <button class="admin-btn primary" onclick=${() => showAdminArea("wikis", "admin-start-work", ".admin-wiki-combobox")}>Choose a project and start work</button>
+  </section>
+  <section id="admin-decisions" class="admin-decision-panel" aria-labelledby="admin-decisions-title">
+    <header><div><span>Operator decisions</span><h3 id="admin-decisions-title">${operatorSummary.decisionCount ? `${operatorSummary.decisionCount} ${operatorSummary.decisionCount === 1 ? "decision" : "decisions"} waiting` : "No decision needed"}</h3></div></header>
+    ${operatorSummary.qualificationReady.map((qualification) => html`<article class="admin-decision-item ready">
+      <i aria-hidden="true"></i>
+      <div><strong>${wikipediaProjectLabel(qualification.wiki)} passed qualification</strong><span>Snapshot ${qualification.snapshot || "unknown"} · ${qualification.artifactCount} validated artifacts · still hidden from the public site.</span></div>
+      <button class="admin-btn" onclick=${() => inspectProject(qualification.wiki)}>Review and promote</button>
+    </article>`)}
+    ${operatorSummary.blockerGroups.map((blocker) => html`<article class="admin-decision-item blocked">
+      <i aria-hidden="true"></i>
+      <div><strong>One setup constraint affects ${blocker.affectedWikis?.length || 0} projects</strong><span>${blocker.summary} Public versions remain online; these are not ${blocker.affectedWikis?.length || 0} separate data failures.</span><small><b>Required next step:</b> ${blocker.remediation}</small></div>
+      <button class="admin-btn" onclick=${() => showAdminArea("wikis", "admin-view-wikis")}>See affected projects</button>
+    </article>`)}
+    ${operatorSummary.decisionCount === 0 ? html`<div class="admin-empty-decision"><strong>No manual decision is blocking the pipeline.</strong><span>Failures that can safely retry are handled by the worker queue.</span></div>` : ""}
+  </section>
+</div>`)
+```
+
+</div>
+
+<div data-admin-view="runs">
 
 ```js
 topLevelJob
@@ -1302,9 +1370,13 @@ display(qualityEntries.length ? html`<div class="admin-quality-ledger">
 
 <div id="admin-view-wikis" class="chart-section" data-admin-view="wikis">
 
-## Pipeline Status
+## Projects and updates
 
-<div class="note">Ordered by operator urgency: stalled and failed work first, then active and incomplete projects, with healthy published wikis last. Select a row for evidence and controls.</div>
+<div class="note">Open a project to see its current state, the evidence behind it, and the one recommended action. Shared infrastructure constraints are grouped instead of presented as unrelated project failures.</div>
+
+```js
+html`<div class="admin-projects-toolbar"><div><strong>Need to start something?</strong><span>Use the guided launcher for a complete, resumable preparation or qualification.</span></div><button class="admin-btn primary" onclick=${() => showAdminArea("wikis", "admin-start-work", ".admin-wiki-combobox")}>Start work</button></div>`
+```
 
 ```js
 const statusColors = {
@@ -1730,15 +1802,15 @@ display(html`<div class="admin-pipeline-board">
   <div class="admin-pipeline-summary concise">
     <div><strong>${wikiEntries.length}</strong><span>known wikis</span></div>
     <div><strong>${activeCount}</strong><span>running</span></div>
-    <div class=${attentionCount ? "danger" : ""}><strong>${attentionCount}</strong><span>paused</span></div>
+    <div class=${blockerGroupCount ? "danger" : ""}><strong>${blockerGroupCount}</strong><span>shared constraints</span></div>
     <div><strong>${statusSummary.complete || 0} + ${statusSummary.qualified || 0}</strong><span>published + qualified</span></div>
   </div>
   ${(operationalTruth.pipeline?.blockerGroups || []).length ? html`<div class="admin-shared-blockers">
     ${(operationalTruth.pipeline.blockerGroups || []).map((blocker) => html`<article>
-      <div><strong>${blocker.affectedWikis.length} ${blocker.affectedWikis.length === 1 ? "project" : "projects"} share one blocker</strong><span>${blocker.affectedWikis.join(", ")}</span></div>
+      <div><strong>One setup constraint affects ${blocker.affectedWikis.length} ${blocker.affectedWikis.length === 1 ? "project" : "projects"}</strong><span>${blocker.affectedWikis.join(", ")}</span></div>
       <p>${blocker.summary}</p>
       <p><strong>Next step:</strong> ${blocker.remediation}</p>
-      <small>${blocker.retryable === false ? "Automatic retry is disabled because unchanged inputs would fail again." : "Validated work is retained; retry can resume after the cause is corrected."}</small>
+      <small>Published data remains online. ${blocker.retryable === false ? "Automatic retry is disabled because unchanged inputs would fail again." : "Validated work is retained; retry can resume after the cause is corrected."}</small>
     </article>`)}
   </div>` : ""}
   <div class="admin-pipeline-toolbar">${pipelineFilterInput}<span>${visibleWikiEntries.length} shown</span></div>
@@ -1751,6 +1823,7 @@ display(html`<div class="admin-pipeline-board">
           const fleetWork = fleetByWiki.get(name)
           const plan = latestPlanByWiki.get(name)
           const state = operationalState(name, wiki)
+          const sharedBlocker = operatorSummary.blockerGroups.find((blocker) => blocker.affectedWikis?.includes(name))
           const isRunning = ["running", "cancelling"].includes(state)
           const stageDetail = isRunning
             ? `${direct?.stageLabel || direct?.stage || "Starting"}${direct?.progress?.percent != null ? ` · ${direct.progress.percent}%` : ""}`
@@ -1765,11 +1838,13 @@ display(html`<div class="admin-pipeline-board">
               <strong>${name}</strong>
               <small>${wikipediaProjectLabel(name).replace(` (${name})`, "")}</small>
             </span>
-            <span class="admin-pipeline-state">
-              <i style=${`--state-color:${statusColors[state] || "#607d8b"}`}></i>
-              <span><strong>${statusLabels[state] || operationLabel(state)}</strong><small>${stageDetail}</small></span>
+            <span class="admin-pipeline-state ${sharedBlocker ? "shared-constraint" : ""}">
+              <i style=${`--state-color:${sharedBlocker ? "#b26a00" : statusColors[state] || "#607d8b"}`}></i>
+              <span><strong>${sharedBlocker ? "Update paused by shared setup" : statusLabels[state] || operationLabel(state)}</strong><small>${stageDetail}</small></span>
             </span>
-            <span class="admin-pipeline-message">${projectRowDetail(name, wiki, state, lifecycle, direct, fleetWork)}</span>
+            <span class="admin-pipeline-message">${sharedBlocker
+              ? `${sharedBlocker.summary} The currently published data remains online.`
+              : projectRowDetail(name, wiki, state, lifecycle, direct, fleetWork)}</span>
             <span class="admin-stage-rail" aria-label="Project lifecycle">
               ${pipelineSteps.map((step) => {
                 const stepState = milestoneState(name, wiki, step.key, lifecycle, direct, state)
@@ -1789,11 +1864,17 @@ display(html`<div class="admin-pipeline-board">
 
 <!-- ── Fetch a new wiki ───────────────────────────────────── -->
 
-<div class="chart-section" data-admin-view="wikis">
+<div id="admin-start-work" class="chart-section admin-start-work" data-admin-view="wikis">
 
-## Start or inspect a project
+## Start work
 
-<div class="note">Only lifecycle-registered projects should be processed. An unregistered project can be inspected, but must first be added as a publication-invisible qualification project before downloading or computing data.</div>
+<div class="note">Choose a Wikipedia, review how it will be managed, then start the complete safe workflow. The request is durable and resumable; closing this page does not stop it.</div>
+
+<ol class="admin-start-steps" aria-label="How to start project work">
+  <li><strong>Choose a project</strong><span>Search by language or wiki code.</span></li>
+  <li><strong>Review its policy</strong><span>New projects start hidden as qualifications unless you deliberately choose otherwise.</span></li>
+  <li><strong>Start the workflow</strong><span>Fetch, ingest, compute, enrich, and validate run as one tracked operation.</span></li>
+</ol>
 
 ```js
 // Searchable project picker. It starts empty by default, opens the full
@@ -2193,7 +2274,7 @@ const selectedTruth = operationalWikiTruth[selectedWiki] || null
 <div class="note">Combined parquet files served to the browser. These are the final site data files the frontend reads.</div>
 
 ```js
-currentManifest.merged.length > 0
+Array.isArray(currentManifest.merged) && currentManifest.merged.length > 0
   ? Inputs.table(currentManifest.merged.map(f => ({metric: f.name, size: f.size_kb + " KB"})), {
       header: {metric: "Metric", size: "Size"}, sort: "metric"
     })
@@ -2203,6 +2284,7 @@ currentManifest.merged.length > 0
 </div>
 
 <style>
+.admin-page-intro { max-width: 64ch; margin-top: -0.35rem; color: var(--theme-foreground-muted); font-size: 0.96rem; line-height: 1.55; }
 .admin-view-navigation {
   position: sticky;
   top: 0;
@@ -3085,6 +3167,7 @@ currentManifest.merged.length > 0
   border-left: 5px solid #2e7d32;
 }
 .admin-command-health.attention { border-left-color: #c13c32; }
+.admin-command-health.decision { border-left-color: #b26a00; }
 .admin-command-health strong { font-size: 1.05rem; }
 .admin-command-health > span:last-child { color: var(--theme-foreground-muted); font-size: 0.78rem; }
 .admin-command-kicker {
@@ -3097,10 +3180,11 @@ currentManifest.merged.length > 0
 .admin-command-facts {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
+  min-width: 0;
   margin: 0;
   border-inline: 1px solid var(--admin-line);
 }
-.admin-command-facts > div { padding: 0.9rem 1rem; border-left: 1px solid var(--admin-line); }
+.admin-command-facts > div { min-width: 0; padding: 0.9rem 1rem; border-left: 1px solid var(--admin-line); }
 .admin-command-facts > div:first-child { border-left: 0; }
 .admin-command-facts dt,
 .admin-wiki-focus span {
@@ -3110,10 +3194,150 @@ currentManifest.merged.length > 0
   letter-spacing: 0.08em;
   text-transform: uppercase;
 }
-.admin-command-facts dd { margin: 0.3rem 0 0; font-size: 0.78rem; font-weight: 650; }
+.admin-command-facts dd { margin: 0.3rem 0 0; overflow-wrap: anywhere; font-size: 0.78rem; font-weight: 650; }
 .admin-command-facts dd.ok { color: #2e7d32; }
 .admin-command-facts dd.bad { color: #c62828; }
 .admin-command-session { display: grid; align-content: center; gap: 0.2rem; padding: 0.9rem 1rem; font-size: 0.75rem; }
+.admin-command-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  padding: 0.7rem 1rem;
+  border-top: 1px solid var(--admin-line);
+}
+.admin-control-room { scroll-margin-top: 5rem; }
+.admin-control-grid {
+  display: grid;
+  grid-template-columns: minmax(17rem, 0.85fr) minmax(24rem, 1.45fr);
+  border-block: 1px solid var(--theme-foreground-faintest);
+}
+.admin-control-grid > section { min-width: 0; padding: 1rem; }
+.admin-control-grid > section + section { border-left: 1px solid var(--theme-foreground-faintest); }
+.admin-control-grid section > header {
+  display: flex;
+  align-items: start;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-bottom: 0.9rem;
+}
+.admin-control-grid section > header > div { display: grid; gap: 0.12rem; }
+.admin-control-grid section > header span {
+  color: var(--theme-foreground-muted);
+  font-size: 0.66rem;
+  font-weight: 750;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.admin-control-grid h3 { margin: 0; font-size: 1.05rem; }
+.admin-text-action {
+  min-height: 2.2rem;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #315b8a;
+  font: inherit;
+  font-size: 0.72rem;
+  font-weight: 700;
+  cursor: pointer;
+}
+.admin-text-action:focus-visible { outline: 2px solid #315b8a; outline-offset: 3px; }
+.admin-idle-explanation,
+.admin-empty-decision {
+  display: grid;
+  gap: 0.22rem;
+  margin-bottom: 0.9rem;
+  padding: 0.8rem 0;
+  border-block: 1px solid var(--theme-foreground-faintest);
+}
+.admin-idle-explanation strong,
+.admin-empty-decision strong { font-size: 0.82rem; }
+.admin-idle-explanation span,
+.admin-empty-decision span { max-width: 62ch; color: var(--theme-foreground-muted); font-size: 0.74rem; line-height: 1.5; }
+.admin-now-list { display: grid; margin-bottom: 0.8rem; border-top: 1px solid var(--theme-foreground-faintest); }
+.admin-now-list button {
+  appearance: none;
+  display: grid;
+  grid-template-columns: 0.65rem minmax(0, 1fr);
+  gap: 0.6rem;
+  width: 100%;
+  padding: 0.7rem 0;
+  border: 0;
+  border-bottom: 1px solid var(--theme-foreground-faintest);
+  background: transparent;
+  color: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.admin-now-list i { width: 0.6rem; height: 0.6rem; margin-top: 0.25rem; border-radius: 50%; background: #315b8a; animation: admin-pulse 1.7s ease-in-out infinite; }
+.admin-now-list span { display: grid; gap: 0.12rem; }
+.admin-now-list strong { font-size: 0.8rem; }
+.admin-now-list small { color: var(--theme-foreground-muted); font-size: 0.7rem; }
+.admin-queue-note { display: flex; gap: 0.3rem; margin: 0 0 0.8rem; font-size: 0.72rem; }
+.admin-queue-note span { color: var(--theme-foreground-muted); }
+.admin-decision-panel { scroll-margin-top: 5rem; }
+.admin-decision-item {
+  display: grid;
+  grid-template-columns: 0.75rem minmax(0, 1fr) auto;
+  gap: 0.75rem;
+  align-items: start;
+  padding: 0.75rem 0;
+  border-top: 1px solid var(--theme-foreground-faintest);
+}
+.admin-decision-item > i { width: 0.65rem; height: 0.65rem; margin-top: 0.25rem; border: 2px solid #b26a00; border-radius: 50%; }
+.admin-decision-item.ready > i { border-color: #2e7d32; background: #2e7d32; box-shadow: inset 0 0 0 2px var(--theme-background); }
+.admin-decision-item > div { display: grid; gap: 0.16rem; }
+.admin-decision-item strong { font-size: 0.8rem; }
+.admin-decision-item span,
+.admin-decision-item small { max-width: 68ch; color: var(--theme-foreground-muted); font-size: 0.71rem; line-height: 1.45; }
+.admin-decision-item small b { color: var(--theme-foreground); }
+.admin-projects-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-block: 0.75rem;
+  padding: 0.75rem 0;
+  border-block: 1px solid var(--theme-foreground-faintest);
+}
+.admin-projects-toolbar > div { display: grid; gap: 0.12rem; }
+.admin-projects-toolbar strong { font-size: 0.8rem; }
+.admin-projects-toolbar span { color: var(--theme-foreground-muted); font-size: 0.72rem; }
+.admin-start-work { scroll-margin-top: 5rem; }
+.admin-start-steps {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin: 0.8rem 0 1rem;
+  padding: 0;
+  border-block: 1px solid var(--theme-foreground-faintest);
+  list-style: none;
+  counter-reset: admin-start-step;
+}
+.admin-start-steps li {
+  counter-increment: admin-start-step;
+  display: grid;
+  grid-template-columns: 1.35rem minmax(0, 1fr);
+  gap: 0.12rem 0.55rem;
+  padding: 0.75rem;
+  border-left: 1px solid var(--theme-foreground-faintest);
+}
+.admin-start-steps li:first-child { border-left: 0; }
+.admin-start-steps li::before {
+  grid-row: 1 / 3;
+  display: grid;
+  place-items: center;
+  width: 1.25rem;
+  height: 1.25rem;
+  border: 1px solid #315b8a;
+  border-radius: 50%;
+  color: #315b8a;
+  content: counter(admin-start-step);
+  font-size: 0.65rem;
+  font-weight: 800;
+}
+.admin-start-steps strong { font-size: 0.75rem; }
+.admin-start-steps span { color: var(--theme-foreground-muted); font-size: 0.68rem; line-height: 1.4; }
+.admin-pipeline-state.shared-constraint strong { color: #8a5700; }
 .admin-activity-ledger { border-top: 1px solid var(--theme-foreground-faintest); }
 .admin-activity-row {
   appearance: none;
@@ -3404,6 +3628,8 @@ currentManifest.merged.length > 0
   .admin-command-header { grid-template-columns: 1fr; }
   .admin-command-facts { border: 0; border-block: 1px solid var(--admin-line); }
   .admin-command-session { grid-auto-flow: column; justify-content: start; }
+  .admin-control-grid { grid-template-columns: 1fr; }
+  .admin-control-grid > section + section { border-top: 1px solid var(--theme-foreground-faintest); border-left: 0; }
   .admin-pipeline-row { grid-template-columns: minmax(9rem, 0.8fr) minmax(9rem, 0.8fr) minmax(13rem, 1.2fr) minmax(7rem, 0.7fr) 1rem; }
   .pipeline-stage-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -3412,10 +3638,7 @@ currentManifest.merged.length > 0
 @media (max-width: 760px) {
   .admin-view-navigation {
     top: 0;
-    grid-template-columns: repeat(4, minmax(5.2rem, 1fr));
-    overflow-x: auto;
-    overscroll-behavior-inline: contain;
-    scrollbar-width: thin;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
   .admin-view-navigation button { min-height: 2.8rem; }
   .admin-operation-receipts > header { align-items: flex-start; }
@@ -3446,6 +3669,15 @@ currentManifest.merged.length > 0
   .admin-command-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .admin-command-facts > div:nth-child(3) { border-left: 0; }
   .admin-command-facts > div:nth-child(n+3) { border-top: 1px solid var(--admin-line); }
+  .admin-command-actions { display: grid; grid-template-columns: 1fr; }
+  .admin-command-actions .admin-btn { width: 100%; min-height: 2.75rem; }
+  .admin-decision-item { grid-template-columns: 0.75rem minmax(0, 1fr); }
+  .admin-decision-item .admin-btn { grid-column: 2; width: 100%; min-height: 2.75rem; }
+  .admin-projects-toolbar { align-items: stretch; flex-direction: column; }
+  .admin-projects-toolbar .admin-btn { width: 100%; min-height: 2.75rem; }
+  .admin-start-steps { grid-template-columns: 1fr; }
+  .admin-start-steps li { border-top: 1px solid var(--theme-foreground-faintest); border-left: 0; }
+  .admin-start-steps li:first-child { border-top: 0; }
   .admin-activity-row { grid-template-columns: 6.5rem minmax(0, 1fr) 4.5rem; gap: 0.6rem; }
   .admin-activity-source { display: none; }
   .admin-pipeline-summary.concise { grid-template-columns: repeat(2, minmax(0, 1fr)); }

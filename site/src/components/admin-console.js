@@ -2,11 +2,53 @@ const RECEIPT_SCHEMA_VERSION = 1;
 const DEFAULT_RECEIPT_KEY = "wiki-economics.admin.operation-receipts.v1";
 
 export const ADMIN_VIEWS = Object.freeze([
-  {id: "overview", label: "Overview", description: "Publication health and current operating state"},
-  {id: "wikis", label: "Wikis", description: "Project lifecycle, preparation, and artifacts"},
-  {id: "runs", label: "Runs", description: "Active work, run evidence, and operator audit"},
-  {id: "quality", label: "Quality", description: "Metric receipts, anomalies, and merged outputs"}
+  {id: "overview", label: "Control room", description: "What is happening and what needs a decision"},
+  {id: "wikis", label: "Projects", description: "Start work and manage project lifecycle"},
+  {id: "runs", label: "Runs & logs", description: "Active work, run evidence, and operator audit"},
+  {id: "quality", label: "Data quality", description: "Metric receipts, anomalies, and merged outputs"}
 ]);
+
+export function summarizeOperatorStatus(status = {}) {
+  const operations = status.adminOperations || {};
+  const fleetWork = status.fleet?.work || [];
+  const truth = status.operationalTruth || {};
+  const wikis = truth.wikis || {};
+  const blockerGroups = truth.pipeline?.blockerGroups || [];
+  const activeIds = new Set([
+    ...(operations.running || []).map((operation) => `operator:${operation.runId || operation.requestId}`),
+    ...fleetWork.filter((work) => work.state === "running")
+      .map((work) => `fleet:${work.taskId || work.wiki}`),
+    ...(status.job?.running ? [`direct:${status.job.runId || status.job.wiki || "global"}`] : [])
+  ]);
+  const qualificationReady = Object.entries(wikis)
+    .filter(([, wiki]) => wiki.lifecycle?.publication === "hidden"
+      && wiki.lifecycle?.refresh === "qualification"
+      && wiki.qualification?.structurallyValid)
+    .map(([wiki, value]) => ({
+      wiki,
+      snapshot: value.qualification.snapshot || value.snapshots?.qualification || null,
+      runId: value.qualification.runId || null,
+      artifactCount: Number(value.qualification.artifactCount || 0)
+    }))
+    .sort((left, right) => left.wiki.localeCompare(right.wiki));
+  const blockedWikis = Array.from(new Set(blockerGroups.flatMap((group) => group.affectedWikis || []))).sort();
+  const queued = Number(operations.counts?.queued ?? (operations.queued || []).length);
+  const waitingUpstream = [...(operations.queued || []), ...(operations.recent || [])]
+    .filter((operation) => operation.state === "waiting_upstream").length;
+
+  return {
+    publicStatus: truth.public?.status || status.freshness?.status || "unknown",
+    pipelineStatus: truth.pipeline?.status || "unknown",
+    infrastructureStatus: truth.infrastructure?.status || "unknown",
+    activeCount: activeIds.size,
+    queuedCount: queued,
+    waitingUpstreamCount: waitingUpstream,
+    blockerGroups,
+    blockedWikis,
+    qualificationReady,
+    decisionCount: blockerGroups.length + qualificationReady.length,
+  };
+}
 
 export function normalizeAdminView(value) {
   return ADMIN_VIEWS.some((view) => view.id === value) ? value : ADMIN_VIEWS[0].id;

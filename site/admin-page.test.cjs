@@ -40,9 +40,19 @@ test("hidden qualifications and shared blockers have explicit human states", () 
   assert.match(source, /Qualification ready/);
   assert.match(source, /Qualification completed and remains hidden/);
   assert.match(source, /passed \$\{qualification\?\.artifactCount/);
-  assert.match(source, /share one blocker/);
+  assert.match(source, /One setup constraint affects/);
+  assert.match(source, /not \$\{blocker\.affectedWikis\?\.length \|\| 0\} separate data failures/);
   assert.match(source, /Automatic retry is disabled because unchanged inputs would fail again/);
   assert.doesNotMatch(source, /quarantined: "Needs intervention"/);
+});
+
+test("control room makes starting work, idle workers, and pending decisions explicit", () => {
+  assert.match(source, /Start or update a project/);
+  assert.match(source, /Choose a project and start work/);
+  assert.match(source, /Idle is normal/);
+  assert.match(source, /scheduled workers sleep between checks/);
+  assert.match(source, /Review and promote/);
+  assert.match(source, /The request is durable and resumable/);
 });
 
 test("admin run details expose timelines, resource evidence, and specific next actions", () => {

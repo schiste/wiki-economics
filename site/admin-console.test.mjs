@@ -9,6 +9,7 @@ import {
   persistOperationReceipts,
   readOperationReceipts,
   reconcileOperationReceipts,
+  summarizeOperatorStatus,
   upsertOperationReceipt
 } from "./src/components/admin-console.js";
 
@@ -141,4 +142,45 @@ test("active-work classification covers direct, queued, and fleet execution", ()
   assert.equal(hasActiveAdminWork({fleet: {counts: {running: 1}}}), true);
   assert.equal(hasActiveAdminWork({job: {running: true}}), true);
   assert.equal(hasActiveAdminWork({adminOperations: {counts: {queued: 0, running: 0}}}), false);
+});
+
+test("operator summary counts shared causes and qualification decisions instead of alarming per wiki", () => {
+  const summary = summarizeOperatorStatus({
+    adminOperations: {
+      counts: {queued: 2},
+      running: [{requestId: "request-1", wiki: "dewiki"}],
+      queued: [{state: "waiting_upstream", wiki: "nlwiki"}],
+      recent: [],
+    },
+    fleet: {
+      work: [
+        {taskId: "same-run", wiki: "dewiki", state: "running"},
+        {taskId: "fleet-2", wiki: "frwiki", state: "running"},
+      ],
+    },
+    operationalTruth: {
+      public: {status: "healthy"},
+      pipeline: {
+        status: "degraded",
+        blockerGroups: [{code: "profile", affectedWikis: ["nlwiki", "frwiki"], summary: "One profile is unqualified"}],
+      },
+      infrastructure: {status: "available"},
+      wikis: {
+        dewiki: {
+          lifecycle: {publication: "hidden", refresh: "qualification"},
+          qualification: {structurallyValid: true, snapshot: "2026-08", runId: "qualified-dewiki", artifactCount: 10},
+        },
+      },
+    },
+  });
+
+  assert.equal(summary.publicStatus, "healthy");
+  assert.equal(summary.activeCount, 3);
+  assert.equal(summary.queuedCount, 2);
+  assert.equal(summary.waitingUpstreamCount, 1);
+  assert.equal(summary.decisionCount, 2, "one shared blocker and one qualification are two decisions");
+  assert.deepEqual(summary.blockedWikis, ["frwiki", "nlwiki"]);
+  assert.deepEqual(summary.qualificationReady, [{
+    wiki: "dewiki", snapshot: "2026-08", runId: "qualified-dewiki", artifactCount: 10,
+  }]);
 });

@@ -139,14 +139,42 @@ async function runAdminBrowserWorkflow({distDir}) {
 
     const initial = await evaluate(cdp, `({
       selected: Array.from(document.querySelectorAll('[data-admin-view-tab]')).filter(tab => tab.getAttribute('aria-selected') === 'true').map(tab => tab.dataset.adminViewTab),
-      visible: Array.from(document.querySelectorAll('[data-admin-view]')).filter(section => !section.hidden).map(section => section.dataset.adminView),
+      visible: Array.from(document.querySelectorAll('[data-admin-view]')).filter(section => section.getClientRects().length > 0).map(section => section.dataset.adminView),
       controlsValid: Array.from(document.querySelectorAll('[data-admin-view-tab]')).every(tab => document.getElementById(tab.getAttribute('aria-controls'))),
       liveRegion: Boolean(document.querySelector('[role=log][aria-live=polite], [role=status][aria-live=polite]'))
     })`);
     assertContract(initial.selected.length === 1 && initial.selected[0] === "overview", "overview is not the single default view", initial);
     assertContract(initial.visible.every((view) => view.split(' ').includes("overview")), "another focused view leaked into overview", initial);
     assertContract(initial.controlsValid && initial.liveRegion, "tab or receipt accessibility contract is incomplete", initial);
+    await waitFor(cdp, "document.querySelector('#admin-decisions')?.textContent.includes('still hidden')");
+    const controlRoom = await evaluate(cdp, `({
+      heading: document.querySelector('#admin-control-room')?.textContent,
+      decisions: document.querySelector('#admin-decisions')?.textContent,
+      primaryAction: Array.from(document.querySelectorAll('.admin-command-actions button')).find(button => button.textContent.includes('Start or update a project'))?.textContent
+    })`);
+    assertContract(controlRoom.heading?.includes("Nothing is running") && controlRoom.heading.includes("Idle is normal"),
+      "the control room does not explain an idle scheduler", controlRoom);
+    assertContract(controlRoom.decisions?.includes("German Wikipedia") && controlRoom.decisions.includes("still hidden"),
+      "the qualification decision is not visible from the control room", controlRoom);
+    assertContract(controlRoom.decisions?.includes("One setup constraint affects 5 projects")
+      && controlRoom.decisions.includes("not 5 separate data failures"),
+      "the shared setup constraint still looks like separate project failures", controlRoom);
+    assertContract(controlRoom.primaryAction === "Start or update a project",
+      "the primary run launcher is not visible from the control room", controlRoom);
 
+    await evaluate(cdp, "Array.from(document.querySelectorAll('.admin-command-actions button')).find(button => button.textContent.includes('Start or update a project')).click()");
+    await waitFor(cdp, "document.querySelector('[data-admin-view-tab=wikis]').getAttribute('aria-selected') === 'true'");
+    await waitFor(cdp, "document.activeElement?.classList.contains('admin-wiki-combobox')");
+    const launchNavigation = await evaluate(cdp, `({
+      view: new URL(location.href).searchParams.get('view'),
+      focused: document.activeElement?.classList.contains('admin-wiki-combobox'),
+      startHeading: document.querySelector('#admin-start-work')?.textContent
+    })`);
+    assertContract(launchNavigation.view === "wikis" && launchNavigation.focused
+      && launchNavigation.startHeading.includes("Start work"),
+      "the primary action did not open and focus the guided run launcher", launchNavigation);
+
+    await evaluate(cdp, "document.querySelector('[data-admin-view-tab=overview]').click()");
     await evaluate(cdp, "document.querySelector('[data-admin-view-tab=overview]').focus()");
     await cdp.send("Input.dispatchKeyEvent", {type: "keyDown", key: "ArrowRight", code: "ArrowRight"});
     await cdp.send("Input.dispatchKeyEvent", {type: "keyUp", key: "ArrowRight", code: "ArrowRight"});
@@ -154,7 +182,7 @@ async function runAdminBrowserWorkflow({distDir}) {
     const keyboard = await evaluate(cdp, `({
       view: new URL(location.href).searchParams.get('view'),
       focus: document.activeElement?.dataset?.adminViewTab,
-      visible: Array.from(document.querySelectorAll('[data-admin-view]')).filter(section => !section.hidden).map(section => section.dataset.adminView)
+      visible: Array.from(document.querySelectorAll('[data-admin-view]')).filter(section => section.getClientRects().length > 0).map(section => section.dataset.adminView)
     })`);
     assertContract(keyboard.view === "wikis" && keyboard.focus === "wikis", "keyboard navigation did not preserve focus and URL state", keyboard);
     assertContract(keyboard.visible.every((view) => view.split(' ').includes("wikis")), "wiki view leaked unrelated sections", keyboard);
@@ -164,7 +192,7 @@ async function runAdminBrowserWorkflow({distDir}) {
       blockerText: document.querySelector('.admin-shared-blockers')?.textContent
     })`);
     assertContract(operationalTruth.qualification?.includes("Qualification ready"), "dewiki qualification is not visible as completed", operationalTruth);
-    assertContract(operationalTruth.blockerPanels === 1 && operationalTruth.blockerText.includes("5 projects share one blocker"),
+    assertContract(operationalTruth.blockerPanels === 1 && operationalTruth.blockerText.includes("One setup constraint affects 5 projects"),
       "shared fleet failure was rendered as unrelated interventions", operationalTruth);
 
     await evaluate(cdp, "document.querySelector('[data-admin-view-tab=overview]').click()");
