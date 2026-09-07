@@ -11,10 +11,12 @@ toc: false
 import {
   createAdaptivePoll,
   createAdminViewNavigation,
+  deriveProjectPipelineStages,
   hasActiveAdminWork,
   persistOperationReceipts,
   readOperationReceipts,
   reconcileOperationReceipts,
+  summarizePublicationBlockers,
   summarizeOperatorStatus,
   upsertOperationReceipt
 } from "./components/admin-console.js"
@@ -1174,6 +1176,7 @@ const operationalAlerts = [
 ].sort((left, right) => (left.severity === "critical" ? 0 : 1) - (right.severity === "critical" ? 0 : 1))
 const publicationOps = operationalTruth.public?.publication || {}
 const publicationPreflight = publicationOps.preflight || null
+const publicationBlockerSummaries = summarizePublicationBlockers(publicationPreflight?.blockers || [])
 const preflightCanPublish = Boolean(publicationPreflight?.eligible && publicationPreflight?.current)
 const displayedChangePlan = publicationPreflight?.current
   ? {changed: publicationPreflight.changed || [], reused: publicationPreflight.reused || [], source: "Current preflight"}
@@ -1183,7 +1186,7 @@ const displayedChangePlan = publicationPreflight?.current
 ```
 
 ```js
-display(html`<div class="admin-refresh-panel">
+display(html`<div id="admin-publication-workbench" class="admin-refresh-panel">
   <div class="admin-control-strip">
     <div class="admin-control-chip">
       <span class="admin-control-label">Public data</span>
@@ -1232,7 +1235,10 @@ display(html`<div class="admin-refresh-panel">
   </div>
   <section class="admin-preflight ${publicationPreflight?.eligible ? "eligible" : publicationPreflight ? "blocked" : "missing"}">
     <header><div><span>Publication preflight</span><strong>${publicationPreflight ? publicationPreflight.current ? publicationPreflight.eligible ? "Ready to publish" : "Blocked" : "Out of date" : "Not run"}</strong></div>${publicationPreflight ? html`<time>${relativeTime(new Date(publicationPreflight.generated_at_unix * 1000).toISOString())}</time>` : ""}</header>
-    ${publicationPreflight?.blockers?.length ? html`<ul>${publicationPreflight.blockers.map((blocker) => html`<li>${blocker}</li>`)}</ul>` : publicationPreflight?.eligible ? html`<p>Ready candidates, recovery state, scrub state, and current publication evidence passed.</p>` : html`<p>Run preflight to authenticate the candidate set and unlock publication.</p>`}
+    ${publicationBlockerSummaries.length ? html`<div class="admin-preflight-blockers">${publicationBlockerSummaries.map((blocker) => html`<article>
+      <strong>${blocker.title}</strong><span>${blocker.detail}</span>
+      ${blocker.metrics.length ? html`<small>${blocker.metrics.join(", ")}</small>` : ""}
+    </article>`)}</div>` : publicationPreflight?.eligible ? html`<p>Ready candidates, recovery state, scrub state, and current publication evidence passed.</p>` : html`<p>Run preflight to authenticate the candidate set and unlock publication.</p>`}
     ${displayedChangePlan ? html`<details open><summary>${displayedChangePlan.source} change plan · ${displayedChangePlan.changed?.length || 0} changed · ${displayedChangePlan.reused?.length || 0} reused</summary>
       <div class="admin-change-plan">
         <div><strong>Will rebuild</strong>${displayedChangePlan.changed?.length ? html`<ul>${displayedChangePlan.changed.map((item) => html`<li><code>${item.wiki}</code><span>${item.family}</span></li>`)}</ul>` : html`<p>No metric family changes.</p>`}</div>
@@ -1675,6 +1681,89 @@ function lifecycleControls(name, lifecycle, direct) {
   </section>`
 }
 
+const pipelineStageLabels = {
+  complete: "Complete",
+  running: "Running",
+  ready: "Ready",
+  waiting: "Waiting",
+  blocked: "Blocked",
+  not_applicable: "Private",
+}
+
+const pipelineStageDescriptions = {
+  snapshot: "Resolve and pin one completed Wikimedia snapshot for this run.",
+  source: "Download immutable source objects into bounded run staging.",
+  ingest: "Validate and convert history into the qualified metric-input generation.",
+  metrics: "Build the registry-defined core metric families from history.",
+  patrol_source: "Fetch and validate the independent logging event generation.",
+  patrol_metrics: "Join patrol and rights evidence to revision history.",
+  validation: "Check schemas, totals, dates, hashes, and candidate identity.",
+  publication: "Preflight all projects, merge compatible candidates, and switch atomically.",
+}
+
+function formatStageDuration(milliseconds) {
+  if (!Number.isFinite(milliseconds)) return null
+  if (milliseconds < 1_000) return `${Math.max(1, Math.round(milliseconds))} ms`
+  return formatRefreshDuration(Math.max(1, Math.round(milliseconds / 1_000)))
+}
+
+function pipelineStageEvidence(name, wiki, stage, truth, direct) {
+  const receipt = stage.receipt
+  if (receipt) {
+    const disposition = receipt.reused ? "Reused" : receipt.skipped ? "Skipped" : receipt.state === "failed" ? "Failed" : "Receipt verified"
+    const duration = formatStageDuration(receipt.durationMs)
+    return `${disposition}${duration ? ` · ${duration}` : ""}${receipt.error ? ` · ${receipt.error}` : ""}`
+  }
+  const selected = stage.selectedSnapshot || direct?.selectedSnapshot || "not selected"
+  if (stage.id === "snapshot") return `Selected ${selected}`
+  if (stage.id === "source") {
+    if (direct?.progress?.totalSources) return `${direct.progress.completedSources || 0}/${direct.progress.totalSources} source objects committed`
+    return wiki.raw?.files ? `${wiki.raw.files} raw source files retained` : "No source-window receipt for this candidate"
+  }
+  if (stage.id === "ingest") {
+    if (wiki.ingest?.ready) return `${Number(wiki.ingest.rows || 0).toLocaleString()} rows validated`
+    return wiki.parquet?.total ? `${wiki.parquet.done || 0}/${wiki.parquet.total} source transactions committed` : "Waiting for qualified metric input"
+  }
+  if (stage.id === "metrics") {
+    const completeness = metricCompletenessForMilestone(name, lifecycleStates[name])
+    return completeness ? `${completeness.present.length}/${completeness.expected.length} required metrics` : "No candidate metric receipt set"
+  }
+  if (stage.id === "patrol_source") return wiki.patrol?.source_ready ? "Patrol source generation verified" : "No verified patrol source generation"
+  if (stage.id === "patrol_metrics") return wiki.patrol?.metric_ready ? "Patrol metric receipt verified" : "No verified patrol metric receipt"
+  if (stage.id === "validation") return truth?.qualification?.structurallyValid ? "Private qualification accepted" : truth?.ready?.snapshot === stage.selectedSnapshot ? "Ready-index identity verified" : "Candidate gate has not passed"
+  if (stage.id === "publication") {
+    if (stage.status === "not_applicable") return "Hidden until explicit promotion"
+    if (stage.publishedSnapshot === stage.selectedSnapshot) return `Snapshot ${stage.publishedSnapshot} is live`
+    return `${stage.publishedSnapshot || "No snapshot"} live · ${stage.selectedSnapshot || "no candidate"} selected`
+  }
+  return "No receipt evidence"
+}
+
+function pipelineStageAction(name, stage, lifecycle, operationActive, candidate) {
+  const isQualification = lifecycle?.publication === "hidden" && lifecycle?.refresh === "qualification"
+  const commonDisabled = !apiStatus || operationActive || !stage.actionAllowed
+  const selectedVersion = stage.selectedSnapshot || preferredSnapshotVersion()
+  if (stage.id === "snapshot") {
+    const blocked = candidate?.retryable === false
+    return html`<button class="admin-btn small" ?disabled=${commonDisabled || blocked}
+      title=${blocked ? candidate.remediation : actionTooltipWithApi(isQualification ? "qualify" : "run", apiStatus)}
+      onclick=${() => runCommand(isQualification ? "qualify" : "run", {wiki: name, version: selectedVersion})}>Start / resume</button>`
+  }
+  if (stage.id === "source") return html`<button class="admin-btn small" ?disabled=${commonDisabled} title=${stage.blockedReason || actionTooltipWithApi("fetch", apiStatus)} onclick=${() => runCommand("fetch", {wiki: name, version: selectedVersion})}>Fetch history</button>`
+  if (stage.id === "ingest") return html`<button class="admin-btn small" ?disabled=${commonDisabled} title=${stage.blockedReason || actionTooltipWithApi("ingest", apiStatus)} onclick=${() => runCommand("ingest", name)}>Ingest</button>`
+  if (stage.id === "metrics") return html`<button class="admin-btn small" ?disabled=${commonDisabled} title=${stage.blockedReason || actionTooltipWithApi("compute", apiStatus)} onclick=${() => runCommand("compute", name)}>Compute</button>`
+  if (stage.id === "patrol_source") return html`<button class="admin-btn small" ?disabled=${commonDisabled} title=${stage.blockedReason || actionTooltipWithApi("patrol-fetch", apiStatus)} onclick=${() => runCommand("patrol-fetch", name)}>Fetch patrol</button>`
+  if (stage.id === "patrol_metrics") return html`<button class="admin-btn small" ?disabled=${commonDisabled} title=${stage.blockedReason || actionTooltipWithApi("patrol-compute", apiStatus)} onclick=${() => runCommand("patrol-compute", name)}>Compute patrol</button>`
+  if (stage.id === "validation") return html`<button class="admin-btn small" ?disabled=${commonDisabled} title=${stage.blockedReason || actionTooltipWithApi(isQualification ? "qualify" : "run", apiStatus)} onclick=${() => runCommand(isQualification ? "qualify" : "run", {wiki: name, version: selectedVersion})}>Run through checks</button>`
+  if (stage.id === "publication") {
+    const button = html`<button class="admin-btn small" onclick=${() => showAdminArea("overview", "admin-publication-workbench")}>Review publication</button>`
+    button.disabled = stage.status === "not_applicable"
+    button.title = stage.blockedReason || "Open the fleet-wide publication preflight and change plan."
+    return button
+  }
+  return ""
+}
+
 function pipelineDossier(name, wiki, state, lifecycle, direct, fleetWork, plan) {
   const canRun = Boolean(apiStatus && lifecycle)
   const isQualification = lifecycle?.publication === "hidden" && lifecycle?.refresh === "qualification"
@@ -1685,6 +1774,19 @@ function pipelineDossier(name, wiki, state, lifecycle, direct, fleetWork, plan) 
   const stoppedWithExplanation = direct?.errorSummary && ["failed", "interrupted", "quarantined", "waiting_upstream"].includes(state)
   const failureState = ["failed", "interrupted", "quarantined", "stalled"].includes(state)
   const allowedActions = operationalWikiTruth[name]?.allowedActions || []
+  const truth = operationalWikiTruth[name] || {}
+  const activeDirect = ["queued", "waiting_upstream", "running", "cancelling"].includes(direct?.state) || direct?.running
+  const stageCandidate = activeDirect
+    ? {...(truth.candidate || {}), ...direct, stages: direct?.stages?.length ? direct.stages : truth.candidate?.stages || []}
+    : truth.candidate || direct
+  const stageRows = deriveProjectPipelineStages({
+    candidate: stageCandidate,
+    truth,
+    manifestWiki: wiki,
+    lifecycle,
+    operationActive,
+    publicationPreflight,
+  })
   return html`<section class="admin-pipeline-dossier" aria-label=${`${name} pipeline details`}>
     <div class="admin-dossier-lead ${operationTone(state)}">
       <span class="admin-command-kicker">${statusLabels[state] || operationLabel(state)}</span>
@@ -1701,14 +1803,17 @@ function pipelineDossier(name, wiki, state, lifecycle, direct, fleetWork, plan) 
       </div>` : ""}
       ${stoppedWithExplanation ? html`<div class="admin-human-error"><strong>Why it stopped</strong><span>${direct.errorSummary}</span>${direct.remediation ? html`<small>${direct.remediation}</small>` : ""}</div>` : ""}
     </div>
-    <div class="admin-milestone-line" aria-label="Project lifecycle">
-      ${pipelineSteps.map((step) => {
-        const stepState = milestoneState(name, wiki, step.key, lifecycle, direct, state)
-        return html`<div class="admin-milestone ${stepState}">
-          <i aria-hidden="true"></i><span>${step.label}</span><strong>${milestoneCaption(name, wiki, step.key, lifecycle, direct, state)}</strong>
-        </div>`
-      })}
-    </div>
+    <section class="admin-stage-ledger" aria-labelledby=${`${name}-stage-heading`}>
+      <header><div><span>Pipeline stages</span><strong id=${`${name}-stage-heading`}>Inspect evidence or run one bounded stage</strong></div><small>Buttons are disabled when an upstream invariant makes the action unsafe.</small></header>
+      <ol>
+        ${stageRows.map((stage) => html`<li class=${`admin-stage-row ${stage.status}`}>
+          <span class="admin-stage-number" aria-hidden="true">${String(stageRows.indexOf(stage) + 1).padStart(2, "0")}</span>
+          <span class="admin-stage-status"><i aria-hidden="true"></i>${pipelineStageLabels[stage.status] || stage.status}</span>
+          <span class="admin-stage-copy"><strong>${stage.label}</strong><small>${pipelineStageDescriptions[stage.id]}</small><em>${pipelineStageEvidence(name, wiki, stage, truth, direct)}</em>${stage.blockedReason ? html`<b>${stage.blockedReason}</b>` : ""}</span>
+          <span class="admin-stage-action">${pipelineStageAction(name, stage, lifecycle, operationActive, stageCandidate)}</span>
+        </li>`)}
+      </ol>
+    </section>
     <dl class="admin-dossier-facts">${evidenceItems(name, wiki, lifecycle, direct, fleetWork, plan).map(([label, value]) => html`<div><dt>${label}</dt><dd>${value}</dd></div>`)}</dl>
     <div class="admin-dossier-actions">
       ${!lifecycle ? html`<button class="admin-btn primary" ?disabled=${!apiStatus} onclick=${() => {
@@ -1738,15 +1843,9 @@ function pipelineDossier(name, wiki, state, lifecycle, direct, fleetWork, plan) 
       ${operationActive ? html`<button class="admin-btn danger" ?disabled=${!apiStatus} onclick=${() => runCommand("cancel", {requestId: direct?.requestId, wiki: name})}>Cancel operation</button>` : ""}
     </div>
     ${lifecycleControls(name, lifecycle, direct)}
-    ${lifecycle ? html`<details class="admin-advanced-actions"><summary>Advanced stage controls</summary><div>
-      <button class="admin-btn" ?disabled=${!canRun || operationActive} onclick=${() => runCommand("fetch", {wiki: name, version: preferredSnapshotVersion()})}>Fetch history</button>
-      <button class="admin-btn" ?disabled=${!canRun || operationActive} onclick=${() => runCommand("ingest", name)}>Ingest</button>
-      <button class="admin-btn" ?disabled=${!canRun || operationActive} onclick=${() => runCommand("compute", name)}>Compute metrics</button>
-      ${!isQualification ? html`
-        <button class="admin-btn" ?disabled=${!canRun || operationActive} onclick=${() => runCommand("patrol-fetch", name)}>Fetch patrol</button>
-        <button class="admin-btn" ?disabled=${!canRun || operationActive} onclick=${() => runCommand("patrol-compute", name)}>Refresh patrol</button>
-      ` : ""}
-      <button class="admin-btn" ?disabled=${!canRun || operationActive} onclick=${() => runCommand("cleanup", name)}>Clean staging</button>
+    ${lifecycle ? html`<details class="admin-advanced-actions"><summary>Maintenance controls</summary><div>
+      <button class="admin-btn" ?disabled=${!canRun || operationActive} onclick=${() => runCommand("cleanup", name)}>Clean stale staging</button>
+      ${!isQualification ? html`<button class="admin-btn" ?disabled=${!canRun || operationActive} onclick=${() => runCommand("patrol-rebuild", name)}>Refetch and rebuild patrol</button>` : ""}
     </div></details>` : ""}
     ${log ? html`<details class="admin-dossier-log"><summary>Latest output (${(direct.log || []).length} chunks)</summary><pre class="admin-job-log">${log}</pre></details>` : ""}
   </section>`
@@ -3469,16 +3568,46 @@ Array.isArray(currentManifest.merged) && currentManifest.merged.length > 0
 .admin-human-error strong { font-size: 0.72rem; }
 .admin-human-error span { font-size: 0.76rem; line-height: 1.45; }
 .admin-human-error small { margin-top: 0.2rem; color: var(--theme-foreground-muted); font-size: 0.7rem; line-height: 1.45; }
-.admin-milestone-line { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); border-top: 1px solid var(--theme-foreground-faintest); }
-.admin-milestone { position: relative; display: grid; grid-template-columns: 0.8rem minmax(0, 1fr); gap: 0.15rem 0.45rem; min-height: 4.2rem; padding: 0.75rem; border-left: 1px solid var(--theme-foreground-faintest); }
-.admin-milestone:first-child { border-left: 0; }
-.admin-milestone > i { grid-row: 1 / 3; width: 0.7rem; height: 0.7rem; margin-top: 0.14rem; border-radius: 50%; border: 2px solid #a2aab3; background: var(--theme-background); }
-.admin-milestone.done > i { border-color: #3d8a53; background: #3d8a53; box-shadow: inset 0 0 0 2px var(--theme-background); }
-.admin-milestone.active > i { border-color: #315b8a; background: #315b8a; animation: admin-pulse 1.7s ease-in-out infinite; }
-.admin-milestone.issue > i { border-color: #c13c32; background: #c13c32; }
-.admin-milestone.not-applicable > i { border-style: dashed; }
-.admin-milestone > span { color: var(--theme-foreground-muted); font-size: 0.63rem; font-weight: 750; letter-spacing: 0.05em; text-transform: uppercase; }
-.admin-milestone > strong { font-size: 0.72rem; line-height: 1.35; }
+.admin-stage-ledger { border-top: 1px solid var(--theme-foreground-faintest); }
+.admin-stage-ledger > header { display: flex; align-items: end; justify-content: space-between; gap: 1rem; padding: 0.8rem 1rem; }
+.admin-stage-ledger > header > div { display: grid; gap: 0.12rem; }
+.admin-stage-ledger > header span { color: var(--theme-foreground-muted); font-size: 0.62rem; font-weight: 800; letter-spacing: 0.06em; text-transform: uppercase; }
+.admin-stage-ledger > header strong { font-size: 0.86rem; }
+.admin-stage-ledger > header small { max-width: 32rem; color: var(--theme-foreground-muted); font-size: 0.67rem; line-height: 1.4; text-align: right; }
+.admin-stage-ledger ol { margin: 0; padding: 0; border-top: 1px solid var(--theme-foreground-faintest); list-style: none; }
+.admin-stage-row {
+  display: grid;
+  grid-template-columns: 2.25rem 7.25rem minmax(15rem, 1fr) minmax(8.5rem, auto);
+  gap: 0.7rem;
+  align-items: center;
+  min-height: 4.1rem;
+  padding: 0.55rem 0.8rem;
+  border-bottom: 1px solid var(--theme-foreground-faintest);
+  border-left: 3px solid transparent;
+}
+.admin-stage-row:last-child { border-bottom: 0; }
+.admin-stage-row.running { border-left-color: #315b8a; background: color-mix(in srgb, #315b8a 5%, transparent); }
+.admin-stage-row.blocked { border-left-color: #c13c32; background: color-mix(in srgb, #c13c32 5%, transparent); }
+.admin-stage-row.ready { border-left-color: #b26a00; }
+.admin-stage-number { color: color-mix(in srgb, var(--theme-foreground-muted) 72%, transparent); font-size: 0.65rem; font-variant-numeric: tabular-nums; font-weight: 800; }
+.admin-stage-status { display: flex; align-items: center; gap: 0.42rem; color: var(--theme-foreground-muted); font-size: 0.67rem; font-weight: 800; }
+.admin-stage-status i { width: 0.58rem; height: 0.58rem; flex: 0 0 auto; border: 2px solid #8b949e; border-radius: 50%; background: transparent; }
+.admin-stage-row.complete .admin-stage-status { color: #2e7d32; }
+.admin-stage-row.complete .admin-stage-status i { border-color: #2e7d32; background: #2e7d32; box-shadow: inset 0 0 0 2px var(--theme-background); }
+.admin-stage-row.running .admin-stage-status { color: #315b8a; }
+.admin-stage-row.running .admin-stage-status i { border-color: #315b8a; background: #315b8a; animation: admin-pulse 1.7s ease-in-out infinite; }
+.admin-stage-row.blocked .admin-stage-status { color: #c13c32; }
+.admin-stage-row.blocked .admin-stage-status i { border-color: #c13c32; background: #c13c32; }
+.admin-stage-row.ready .admin-stage-status { color: #8a5700; }
+.admin-stage-row.ready .admin-stage-status i { border-color: #b26a00; }
+.admin-stage-row.not_applicable .admin-stage-status i { border-style: dashed; }
+.admin-stage-copy { display: grid; min-width: 0; gap: 0.1rem; }
+.admin-stage-copy strong { font-size: 0.78rem; }
+.admin-stage-copy small { color: var(--theme-foreground-muted); font-size: 0.68rem; line-height: 1.4; }
+.admin-stage-copy em { color: var(--theme-foreground); font-size: 0.67rem; font-style: normal; font-weight: 650; overflow-wrap: anywhere; }
+.admin-stage-copy b { margin-top: 0.1rem; color: #a62e27; font-size: 0.66rem; font-weight: 700; line-height: 1.4; }
+.admin-stage-action { display: flex; justify-content: flex-end; }
+.admin-stage-action .admin-btn { min-width: 8.5rem; }
 .admin-dossier-facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); margin: 0; border-top: 1px solid var(--theme-foreground-faintest); }
 .admin-dossier-facts > div { min-width: 0; padding: 0.7rem 0.8rem; border-left: 1px solid var(--theme-foreground-faintest); border-bottom: 1px solid var(--theme-foreground-faintest); }
 .admin-dossier-facts > div:nth-child(3n + 1) { border-left: 0; }
@@ -3568,6 +3697,12 @@ Array.isArray(currentManifest.merged) && currentManifest.merged.length > 0
 .admin-preflight > header strong { font-size: 0.82rem; }
 .admin-preflight > p, .admin-preflight > ul { margin: 0; padding: 0 0.9rem 0.75rem; font-size: 0.72rem; }
 .admin-preflight > ul { padding-left: 2rem; color: #c13c32; }
+.admin-preflight-blockers { display: grid; padding: 0 0.9rem 0.75rem; }
+.admin-preflight-blockers article { display: grid; gap: 0.15rem; padding: 0.65rem 0.75rem; border-left: 3px solid #c13c32; background: color-mix(in srgb, #c13c32 5%, transparent); }
+.admin-preflight-blockers article + article { margin-top: 0.4rem; }
+.admin-preflight-blockers strong { color: #a62e27; font-size: 0.74rem; }
+.admin-preflight-blockers span { max-width: 76ch; font-size: 0.71rem; line-height: 1.45; }
+.admin-preflight-blockers small { color: var(--theme-foreground-muted); font-size: 0.64rem; overflow-wrap: anywhere; }
 .admin-preflight details { border-top: 1px solid var(--theme-foreground-faintest); }
 .admin-preflight summary { padding: 0.65rem 0.9rem; cursor: pointer; font-size: 0.7rem; font-weight: 700; }
 .admin-change-plan { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); border-top: 1px solid var(--theme-foreground-faintest); }
@@ -3622,6 +3757,7 @@ Array.isArray(currentManifest.merged) && currentManifest.merged.length > 0
 [data-theme="dark"] .admin-command-header { --admin-ink: #d7e2ee; background: color-mix(in srgb, var(--theme-background) 96%, #26384c 4%); }
 @media (prefers-reduced-motion: reduce) {
   .admin-stage-rail > i.active,
+  .admin-stage-row.running .admin-stage-status i,
   .admin-job-panel.running .admin-progress-fill { animation: none; }
 }
 @media (max-width: 1100px) {
@@ -3690,10 +3826,13 @@ Array.isArray(currentManifest.merged) && currentManifest.merged.length > 0
   .admin-stage-rail { grid-column: 1 / -1; grid-row: 3; }
   .admin-row-chevron { grid-column: 3; grid-row: 1; }
   .admin-pipeline-dossier { margin-inline: 0; }
-  .admin-milestone-line { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-  .admin-milestone:nth-child(3),
-  .admin-milestone:nth-child(4) { border-top: 1px solid var(--theme-foreground-faintest); }
-  .admin-milestone:nth-child(3) { border-left: 0; }
+  .admin-stage-ledger > header { align-items: start; flex-direction: column; }
+  .admin-stage-ledger > header small { text-align: left; }
+  .admin-stage-row { grid-template-columns: 2rem minmax(0, 1fr); gap: 0.35rem 0.55rem; padding-block: 0.75rem; }
+  .admin-stage-status { justify-self: end; }
+  .admin-stage-copy { grid-column: 1 / -1; padding-left: 2.55rem; }
+  .admin-stage-action { grid-column: 1 / -1; padding-left: 2.55rem; }
+  .admin-stage-action .admin-btn { width: 100%; min-height: 2.75rem; }
   .admin-dossier-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .admin-dossier-facts > div:nth-child(3n + 1) { border-left: 1px solid var(--theme-foreground-faintest); }
   .admin-dossier-facts > div:nth-child(odd) { border-left: 0; }

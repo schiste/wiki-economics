@@ -195,6 +195,24 @@ async function runAdminBrowserWorkflow({distDir}) {
     assertContract(operationalTruth.blockerPanels === 1 && operationalTruth.blockerText.includes("One setup constraint affects 5 projects"),
       "shared fleet failure was rendered as unrelated interventions", operationalTruth);
 
+    await evaluate(cdp, "Array.from(document.querySelectorAll('.admin-pipeline-row')).find(row => row.textContent.includes('dewiki')).click()");
+    await waitFor(cdp, "document.querySelector('#dewiki-stage-heading') && document.querySelectorAll('.admin-stage-ledger .admin-stage-row').length === 8");
+    const stageLedger = await evaluate(cdp, `({
+      labels: Array.from(document.querySelectorAll('.admin-stage-ledger .admin-stage-copy > strong')).map(node => node.textContent.trim()),
+      statuses: Array.from(document.querySelectorAll('.admin-stage-ledger .admin-stage-status')).map(node => node.textContent.trim()),
+      actions: Array.from(document.querySelectorAll('.admin-stage-ledger .admin-stage-action button')).map(button => ({label: button.textContent.trim(), disabled: button.disabled})),
+      horizontalOverflow: document.documentElement.scrollWidth - document.documentElement.clientWidth
+    })`);
+    assertContract(stageLedger.labels.join("|") === [
+      "Select snapshot", "Fetch history", "Ingest metric input", "Compute core metrics",
+      "Fetch patrol history", "Compute patrol metrics", "Validate candidate", "Publish",
+    ].join("|"), "the project stage ledger does not match the real pipeline order", stageLedger);
+    assertContract(stageLedger.statuses.slice(0, 7).every((status) => status === "Complete")
+      && stageLedger.statuses[7] === "Private", "qualified evidence is not represented accurately by stage", stageLedger);
+    assertContract(stageLedger.actions.length === 8 && stageLedger.actions.at(-1).disabled,
+      "each pipeline stage does not expose an appropriately gated control", stageLedger);
+    assertContract(stageLedger.horizontalOverflow <= 16, "expanded stage controls overflow the desktop viewport", stageLedger);
+
     await evaluate(cdp, "document.querySelector('[data-admin-view-tab=overview]').click()");
     await waitFor(cdp, "Array.from(document.querySelectorAll('button')).some(button => button.textContent.includes('Run publication preflight') && !button.disabled)");
     await evaluate(cdp, "Array.from(document.querySelectorAll('button')).find(button => button.textContent.includes('Run publication preflight')).click()");
@@ -210,16 +228,18 @@ async function runAdminBrowserWorkflow({distDir}) {
       "the operator action did not reach the admin API", apiRequests);
     assertContract(receipt.alerts === 0, "operator workflow opened a blocking browser alert", receipt);
 
+    await evaluate(cdp, "document.querySelector('[data-admin-view-tab=wikis]').click()");
+    await waitFor(cdp, "document.querySelector('.admin-stage-ledger')?.getClientRects().length > 0");
     await cdp.send("Emulation.setDeviceMetricsOverride", {width: 390, height: 844, deviceScaleFactor: 1, mobile: true});
     const mobile = await evaluate(cdp, `({
       viewport: document.documentElement.clientWidth,
       documentWidth: document.documentElement.scrollWidth,
       tabHeights: Array.from(document.querySelectorAll('[data-admin-view-tab]')).map(tab => tab.getBoundingClientRect().height),
-      receiptWidth: document.querySelector('.admin-operation-receipts')?.getBoundingClientRect().width
+      stageButtonHeights: Array.from(document.querySelectorAll('.admin-stage-ledger .admin-stage-action button')).map(button => button.getBoundingClientRect().height)
     })`);
     assertContract(mobile.documentWidth <= mobile.viewport, "admin page overflows the mobile viewport", mobile);
     assertContract(mobile.tabHeights.every((height) => height >= 44), "mobile view tabs miss the 44px touch target", mobile);
-    assertContract(mobile.receiptWidth <= mobile.viewport, "operation receipt overflows the mobile viewport", mobile);
+    assertContract(mobile.stageButtonHeights.every((height) => height >= 44), "mobile stage controls miss the 44px touch target", mobile);
 
     return {schema_version: 1, views: 4, keyboard_navigation: true, durable_receipt: true,
       blocking_alerts: receipt.alerts, mobile_viewport: mobile.viewport, mobile_document_width: mobile.documentWidth};

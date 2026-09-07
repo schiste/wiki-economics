@@ -6,6 +6,7 @@ const path = require("node:path");
 const test = require("node:test");
 
 const source = fs.readFileSync(path.join(__dirname, "src", "admin.md"), "utf8");
+const consoleSource = fs.readFileSync(path.join(__dirname, "src", "components", "admin-console.js"), "utf8");
 
 test("admin uses authoritative metric completeness instead of an artifact-count threshold", () => {
   assert.doesNotMatch(source, /metrics\s*\|\|\s*\[\]\)\.length\s*>=\s*\d+/);
@@ -137,4 +138,15 @@ test("admin uses one adaptive poll with no fixed polling intervals", () => {
   assert.match(source, /hasActiveAdminWork/);
   assert.doesNotMatch(source, /setInterval\s*\(/);
   assert.doesNotMatch(source, /pollTimer|bgTimer/);
+});
+
+test("project dossiers expose receipt-backed controls for every pipeline stage", () => {
+  assert.match(source, /deriveProjectPipelineStages/);
+  assert.match(source, /class="admin-stage-ledger"/);
+  for (const label of [
+    "Select snapshot", "Fetch history", "Ingest metric input", "Compute core metrics",
+    "Fetch patrol history", "Compute patrol metrics", "Validate candidate", "Publish",
+  ]) assert.match(`${source}\n${consoleSource}`, new RegExp(label));
+  assert.match(source, /Buttons are disabled when an upstream invariant makes the action unsafe/);
+  assert.doesNotMatch(source, /Advanced stage controls/);
 });
