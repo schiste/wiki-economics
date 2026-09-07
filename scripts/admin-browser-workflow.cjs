@@ -43,20 +43,56 @@ async function runAdminBrowserWorkflow({distDir}) {
         response.end(JSON.stringify({
           manifest,
           runner: {label: "fixture runner"},
-          wikiStates: manifest.lifecycle?.wikis || {},
+          wikiStates: {
+            ...(manifest.lifecycle?.wikis || {}),
+            dewiki: {publication: "hidden", refresh: "qualification", fleet_resource_class: "medium_large"},
+          },
           refreshWikis: [],
           publishedWikis: Object.keys(manifest.wikis || {}),
-          supportedWikis: Object.keys(manifest.wikis || {}),
-          wikiJobs: {}, wikiJobHistory: {}, snapshotPlans: [], qualifications: {},
+          supportedWikis: [...Object.keys(manifest.wikis || {}), "dewiki"],
+          wikiJobs: {}, wikiJobHistory: {}, snapshotPlans: [], qualifications: {
+            dewiki: [{
+              wiki: "dewiki", snapshot: "2026-08", runId: "qualified-dewiki", structurallyValid: true,
+              qualifiedAtUnix: 1788526634, cutoffDate: "2026-08", artifactCount: 10,
+              artifactBytes: 704892841, artifactRows: 118027706,
+            }],
+          },
           adminOperations: {executionMode: "queue", counts: {queued: queued.length, running: 0}, queued, running: [], recent},
           adminRuns: {active: null, recent: []},
-          fleet: {counts: {}, work: [], quarantine: [], recentFailures: []},
+          fleet: {counts: {quarantined: 5}, work: ["frwiki", "itwiki", "nlwiki", "ptwiki", "svwiki"].map((wiki) => ({
+            wiki, state: "quarantined", snapshot: "2026-08", taskId: `${wiki}-task`,
+            error: "workload profile Large has not completed production qualification",
+          })), quarantine: [], recentFailures: []},
           freshness: {status: "healthy", alerts: [], summary: {}},
           operationalTruth: {
             public: {status: "healthy", alerts: [], scrub: {state: "valid"}},
-            pipeline: {status: "healthy", issues: []},
+            pipeline: {
+              status: "degraded",
+              issues: [],
+              blockerGroups: [{
+                code: "workload_profile_unqualified",
+                summary: "The selected workload profile has not passed production qualification for this workload.",
+                remediation: "Run the profile qualification before retrying these projects.",
+                retryable: false,
+                affectedWikis: ["frwiki", "itwiki", "nlwiki", "ptwiki", "svwiki"],
+                states: ["quarantined"],
+              }],
+            },
             infrastructure: {status: "available", issues: [], activeRequests: []},
-            wikis: {}
+            wikis: {
+              dewiki: {
+                wiki: "dewiki",
+                lifecycle: {publication: "hidden", refresh: "qualification"},
+                snapshots: {latestAvailable: "2026-08", candidate: "2026-08", qualification: "2026-08", ready: null, published: null, cutoff: "2026-08"},
+                candidate: null,
+                qualification: {wiki: "dewiki", snapshot: "2026-08", runId: "qualified-dewiki", structurallyValid: true, artifactCount: 10, artifactBytes: 704892841},
+                ready: null,
+                activePublished: null,
+                metrics: {candidate: {expected: [], present: [], missing: [], complete: true}, published: {expected: [], present: [], missing: [], complete: false}, details: []},
+                quality: {summary: {healthy: 0, warning: 0, critical: 0, unavailable: 0}, metrics: [], signals: [], anomalies: []},
+                issues: [], allowedActions: [],
+              },
+            }
           },
           lifecycleAudit: {events: [], invalid: []}
         }));
@@ -118,6 +154,14 @@ async function runAdminBrowserWorkflow({distDir}) {
     })`);
     assertContract(keyboard.view === "wikis" && keyboard.focus === "wikis", "keyboard navigation did not preserve focus and URL state", keyboard);
     assertContract(keyboard.visible.every((view) => view.split(' ').includes("wikis")), "wiki view leaked unrelated sections", keyboard);
+    const operationalTruth = await evaluate(cdp, `({
+      qualification: Array.from(document.querySelectorAll('.admin-pipeline-row')).find(row => row.textContent.includes('dewiki'))?.textContent,
+      blockerPanels: document.querySelectorAll('.admin-shared-blockers article').length,
+      blockerText: document.querySelector('.admin-shared-blockers')?.textContent
+    })`);
+    assertContract(operationalTruth.qualification?.includes("Qualification ready"), "dewiki qualification is not visible as completed", operationalTruth);
+    assertContract(operationalTruth.blockerPanels === 1 && operationalTruth.blockerText.includes("5 projects share one blocker"),
+      "shared fleet failure was rendered as unrelated interventions", operationalTruth);
 
     await evaluate(cdp, "document.querySelector('[data-admin-view-tab=overview]').click()");
     await waitFor(cdp, "Array.from(document.querySelectorAll('button')).some(button => button.textContent.includes('Run publication preflight') && !button.disabled)");

@@ -604,6 +604,8 @@ const allWikiNames = Array.from(new Set([
   ...Object.keys(lifecycleStates),
   ...Object.keys(wikiJobMap),
   ...Object.keys(wikiJobHistory),
+  ...Object.keys(qualifications),
+  ...Object.keys(operationalWikiTruth),
   ...(fleet.work || []).map((entry) => entry.wiki),
   ...operatorOperations.map((entry) => entry.wiki),
   ...snapshotPlans.map((entry) => entry.wiki),
@@ -643,6 +645,8 @@ function latestWikiJob(name) {
 function operationalState(name, wiki) {
   const direct = latestWikiJob(name)
   const fleetWork = fleetByWiki.get(name)
+  const truth = operationalWikiTruth[name]
+  const lifecycle = lifecycleStates[name]
   if (direct?.running || direct?.state === "running" || direct?.state === "cancelling") return direct.state || "running"
   if (direct?.state === "queued") return "queued"
   if (direct?.state === "waiting_upstream") return "waiting_upstream"
@@ -650,6 +654,8 @@ function operationalState(name, wiki) {
   if (direct?.interrupted) return "interrupted"
   if (direct?.cancelled) return "cancelled"
   if (direct && direct.exitCode !== 0 && direct.exitCode != null) return "failed"
+  if (lifecycle?.publication === "hidden" && lifecycle?.refresh === "qualification"
+      && truth?.qualification?.structurallyValid) return "qualified"
   if (!wiki.tracked && latestPlanByWiki.has(name)) return "planned"
   return wiki.status || "needs_fetch"
 }
@@ -671,6 +677,7 @@ const operationalPriority = {
   needs_patrol_compute: 14,
   needs_merge: 15,
   cancelled: 16,
+  qualified: 29,
   complete: 30
 }
 
@@ -698,18 +705,31 @@ const hasSelectedWiki = selectedWiki !== "—"
 const attentionStates = new Set(["stalled", "quarantined", "interrupted", "failed"])
 const attentionCount = wikiEntries.filter(([name, wiki]) => attentionStates.has(operationalState(name, wiki))).length
 const publicIssueCount = (operationalTruth.public?.alerts || []).length
-const pipelineIssueCount = (operationalTruth.pipeline?.issues || []).length
 const infrastructureIssueCount = (operationalTruth.infrastructure?.issues || []).length
-const operatorIssueCount = publicIssueCount + Math.max(attentionCount, pipelineIssueCount) + infrastructureIssueCount
-const activeCount = Number(Boolean(inlineRunningJob))
-  + Number(fleet.counts?.running || 0)
-  + Number(adminOperations.counts?.running || 0)
-  + Number(adminOperations.counts?.queued || 0)
+const blockerGroupCount = operationalTruth.pipeline?.blockerGroups?.length || 0
+const groupedPipelineCodes = new Set(["candidate_failed", "candidate_ready_not_published"])
+const ungroupedPipelineIssueCount = (operationalTruth.pipeline?.issues || [])
+  .filter((issue) => !groupedPipelineCodes.has(issue.code)).length
+const readyCandidateIssueCount = (operationalTruth.pipeline?.issues || [])
+  .some((issue) => issue.code === "candidate_ready_not_published") ? 1 : 0
+const operatorIssueCount = publicIssueCount
+  + blockerGroupCount
+  + readyCandidateIssueCount
+  + ungroupedPipelineIssueCount
+  + infrastructureIssueCount
+const activeRunKeys = new Set([
+  ...(inlineRunningJob ? [`run:${inlineRunningJob.runId || inlineRunningJob.wiki || "direct"}`] : []),
+  ...(fleet.work || []).filter((entry) => entry.state === "running").map((entry) => `fleet:${entry.taskId || entry.wiki}`),
+  ...(adminOperations.running || []).map((entry) => `run:${entry.runId || entry.requestId}`),
+])
+const activeCount = activeRunKeys.size
 display(html`<div class="admin-command-header">
   <div class="admin-command-health ${operatorIssueCount > 0 ? "attention" : "clear"}">
     <span class="admin-command-kicker">Operator status</span>
-    <strong>${operatorIssueCount > 0 ? `${operatorIssueCount} ${operatorIssueCount === 1 ? "item needs" : "items need"} attention` : "No blocking issues"}</strong>
-    <span>${activeCount > 0 ? `${activeCount} active ${activeCount === 1 ? "run" : "runs"}` : "Pipeline idle"}</span>
+    <strong>${attentionCount > 0
+      ? `${attentionCount} ${attentionCount === 1 ? "project is" : "projects are"} paused by ${blockerGroupCount || 1} ${blockerGroupCount === 1 ? "shared blocker" : "blockers"}`
+      : operatorIssueCount > 0 ? `${operatorIssueCount} operational ${operatorIssueCount === 1 ? "issue" : "issues"}` : "No blocking issues"}</strong>
+    <span>${activeCount > 0 ? `${activeCount} active ${activeCount === 1 ? "run" : "runs"}` : "No process is currently running"}</span>
   </div>
   <dl class="admin-command-facts">
     <div><dt>Public data</dt><dd class=${operationalTruth.public?.status === "healthy" ? "ok" : operationalTruth.public?.status === "critical" ? "bad" : ""}>${operationalTruth.public?.status || "unknown"}</dd></div>
@@ -799,6 +819,7 @@ function operationLabel(state) {
     waiting_upstream: "Waiting upstream",
     stalled: "Stalled",
     quarantined: "Quarantined",
+    qualified: "Qualification ready",
     succeeded: "Succeeded",
     failed: "Failed",
     interrupted: "Interrupted",
@@ -810,7 +831,7 @@ function operationTone(state) {
   if (["failed", "interrupted", "quarantined", "stalled"].includes(state)) return "danger"
   if (["running", "cancelling"].includes(state)) return "active"
   if (["queued", "waiting_upstream"].includes(state)) return "waiting"
-  if (state === "succeeded") return "success"
+  if (["succeeded", "qualified"].includes(state)) return "success"
   return "neutral"
 }
 
@@ -834,6 +855,18 @@ const activityRows = [
     stage: entry.state === "queued" ? "waiting for worker" : "candidate preparation"
   })),
   ...(adminRuns.recent || []).map((entry) => ({...entry, source: "operator"})),
+  ...Object.values(qualifications).flatMap((entries) => entries
+    .filter((entry) => entry.structurallyValid)
+    .map((entry) => ({
+      ...entry,
+      state: "qualified",
+      action: "qualify",
+      source: "qualification receipt",
+      selectedSnapshot: entry.snapshot,
+      finishedAt: entry.qualifiedAtUnix ? new Date(entry.qualifiedAtUnix * 1000).toISOString() : null,
+      updatedAt: entry.qualifiedAtUnix ? new Date(entry.qualifiedAtUnix * 1000).toISOString() : null,
+      stage: "qualification accepted"
+    }))),
   ...Object.values(operationalWikiTruth)
     .filter((entry) => entry?.candidate)
     .map((entry) => ({...entry.candidate, wiki: entry.wiki, source: "candidate receipt"}))
@@ -864,7 +897,7 @@ const activityRows = [
     return (priority[left.state] ?? 20) - (priority[right.state] ?? 20)
       || Date.parse(operationTimestamp(right) || 0) - Date.parse(operationTimestamp(left) || 0)
   })
-  .slice(0, 12)
+  .slice(0, 30)
 ```
 
 ```js
@@ -945,6 +978,15 @@ selectedRun ? display(html`<section class="admin-run-sheet" aria-label="Run deta
     <div><span>CPU time</span><strong>${selectedRun.cpu?.usageUsec ? durationLabel(selectedRun.cpu.usageUsec / 1000) : "—"}</strong><small>${selectedRun.cpu?.throttledUsec ? ` throttled ${durationLabel(selectedRun.cpu.throttledUsec / 1000)}` : ""}</small></div>
     <div><span>Heartbeat</span><strong>${relativeTime(selectedRun.heartbeatAt || selectedRun.updatedAt)}</strong></div>
   </div>
+  ${Array.isArray(selectedRun.attempts) && selectedRun.attempts.length > 1 ? html`<div class="admin-run-attempts">
+    <strong>${selectedRun.attempts.length} attempts belong to this one logical operation</strong>
+    <span>${selectedRun.upstreamWaitCount || 0} upstream waits; validated work was retained between attempts.</span>
+    <ol>${selectedRun.attempts.map((attempt) => html`<li>
+      <span class="admin-run-sheet-state ${operationTone(attempt.state)}">${operationLabel(attempt.state)}</span>
+      <time>${formatRefreshTimestamp(attempt.startedAt || attempt.updatedAt)}</time>
+      ${attempt.errorSummary ? html`<small>${attempt.errorSummary}</small>` : ""}
+    </li>`)}</ol>
+  </div>` : ""}
   <div class="admin-run-timeline">
     ${runStages(selectedRun).length ? runStages(selectedRun).map((stage) => html`<div class="admin-run-stage ${stage.state || "unknown"}">
       <i aria-hidden="true"></i>
@@ -1040,9 +1082,26 @@ function formatRefreshBytes(bytes) {
 const scheduledRefresh = job?.scheduledRefresh || {schedule: null, last: null, history: []}
 const refreshHealth = classifyRefreshHealth(scheduledRefresh.last, scheduledRefresh.schedule)
 const refreshHistoryNewestFirst = [...(scheduledRefresh.history || [])].reverse()
+const blockerAlerts = (operationalTruth.pipeline?.blockerGroups || []).map((blocker) => ({
+  domain: "Pipeline",
+  code: blocker.code,
+  severity: "critical",
+  message: `${blocker.affectedWikis.length} projects (${blocker.affectedWikis.join(", ")}) are paused by one cause: ${blocker.summary} Next step: ${blocker.remediation}`
+}))
+const readyNotPublished = (operationalTruth.pipeline?.issues || []).filter((alert) => alert.code === "candidate_ready_not_published")
+const readyAlert = readyNotPublished.length ? [{
+  domain: "Pipeline",
+  code: "candidates_waiting_for_publication",
+  severity: "warning",
+  message: `${readyNotPublished.length} validated candidates are ready but cannot be published until the shared blockers are resolved and preflight passes.`
+}] : []
 const operationalAlerts = [
   ...(operationalTruth.public?.alerts || []).map((alert) => ({...alert, domain: "Public data"})),
-  ...(operationalTruth.pipeline?.issues || []).map((alert) => ({...alert, domain: "Pipeline"})),
+  ...blockerAlerts,
+  ...readyAlert,
+  ...(operationalTruth.pipeline?.issues || [])
+    .filter((alert) => !["candidate_failed", "candidate_ready_not_published"].includes(alert.code))
+    .map((alert) => ({...alert, domain: "Pipeline"})),
   ...(operationalTruth.infrastructure?.issues || []).map((alert) => ({...alert, domain: "Infrastructure"}))
 ].sort((left, right) => (left.severity === "critical" ? 0 : 1) - (right.severity === "critical" ? 0 : 1))
 const publicationOps = operationalTruth.public?.publication || {}
@@ -1250,6 +1309,7 @@ display(qualityEntries.length ? html`<div class="admin-quality-ledger">
 ```js
 const statusColors = {
   complete: "#2e7d32",
+  qualified: "#2e7d32",
   needs_fetch: "#c62828",
   needs_patrol_fetch: "#6a1b9a",
   needs_ingest: "#e65100",
@@ -1268,6 +1328,7 @@ const statusColors = {
 }
 const statusLabels = {
   complete: "Published",
+  qualified: "Qualification ready",
   needs_fetch: "Not prepared",
   needs_patrol_fetch: "Patrol source needed",
   needs_ingest: "Data conversion needed",
@@ -1279,7 +1340,7 @@ const statusLabels = {
   waiting_upstream: "Waiting for Wikimedia",
   planned: "Not managed",
   stalled: "Worker stopped reporting",
-  quarantined: "Needs intervention",
+  quarantined: "Paused after retries",
   interrupted: "Interrupted",
   failed: "Needs attention",
   cancelled: "Cancelled"
@@ -1310,14 +1371,6 @@ const technicalStageOrder = {
   publication_commit: 3,
 }
 
-function summarizeStatuses(entries) {
-  return entries.reduce((acc, [, wiki]) => {
-    const key = wiki.status || "needs_fetch"
-    acc[key] = (acc[key] || 0) + 1
-    return acc
-  }, {})
-}
-
 function metricCompletenessForMilestone(name, lifecycle) {
   const truth = operationalWikiTruth[name]
   if (!truth) return null
@@ -1331,6 +1384,8 @@ function milestoneState(name, wiki, milestoneKey, lifecycle, direct, state) {
   const candidateIsNewer = truth?.snapshots?.candidate && (!truth.snapshots?.published || truth.snapshots.candidate > truth.snapshots.published)
   const hasLivePublication = lifecycle?.publication === "published" && publishedComplete
   const hiddenQualification = lifecycle?.publication === "hidden" && lifecycle?.refresh === "qualification"
+  const qualificationReady = hiddenQualification && truth?.qualification?.structurallyValid
+  if (qualificationReady && milestoneKey !== "publication") return "done"
   if (milestoneKey === "publication" && hasLivePublication && !candidateIsNewer) return "done"
   if (hasLivePublication && state === "complete" && !candidateIsNewer) return "done"
   if (milestoneKey === "publication" && hiddenQualification) return "not-applicable"
@@ -1349,8 +1404,8 @@ function milestoneState(name, wiki, milestoneKey, lifecycle, direct, state) {
     if (wiki.snapshot?.ready || wiki.ingest?.ready || wiki.raw?.files > 0) return "done"
   }
   if (milestoneKey === "metrics" && metricCompletenessForMilestone(name, lifecycle)?.complete) return "done"
-  if (milestoneKey === "validation" && truth?.ready?.snapshot === truth?.snapshots?.candidate
-      && metricCompletenessForMilestone(name, lifecycle)?.complete) return "done"
+  if (milestoneKey === "validation" && ((truth?.ready?.snapshot === truth?.snapshots?.candidate
+      && metricCompletenessForMilestone(name, lifecycle)?.complete) || qualificationReady)) return "done"
   return "future"
 }
 
@@ -1361,6 +1416,11 @@ function milestoneCaption(name, wiki, milestoneKey, lifecycle, direct, state) {
   if (milestoneStateValue === "active") return direct?.progress?.detail || direct?.stageLabel || "In progress"
   if (milestoneStateValue === "issue") return `Stopped at ${direct?.stageLabel || "this step"}`
   if (milestoneStateValue === "not-applicable") return "Hidden qualification"
+  if (truth?.qualification?.structurallyValid && lifecycle?.publication === "hidden") {
+    if (milestoneKey === "source") return `Snapshot ${truth.qualification.snapshot}`
+    if (milestoneKey === "metrics") return `${truth.qualification.artifactCount || 0} artifacts`
+    if (milestoneKey === "validation") return "Qualification accepted"
+  }
   if (milestoneKey === "source") {
     if (wiki.snapshot?.mode === "retained-publication" && wiki.status === "complete") return "Validated; inputs retired"
     return selectedSnapshot ? `Snapshot ${selectedSnapshot}` : milestoneStateValue === "done" ? "Ready" : "Not started"
@@ -1398,7 +1458,11 @@ function stateExplanation(name, wiki, state, lifecycle, direct, fleetWork) {
   }
   if (state === "running") return `${direct?.stageLabel || "Pipeline work"} is in progress${direct?.progress?.detail ? `: ${direct.progress.detail}` : ""}. The worker heartbeat is current.`
   if (state === "stalled") return `The worker lease exists but its heartbeat is overdue. Recover the fleet lease before submitting duplicate work.`
-  if (state === "quarantined") return `Automatic retries were exhausted. Review the final log excerpt, correct the cause, then explicitly retry.`
+  if (state === "quarantined") {
+    const diagnosis = direct?.errorSummary || fleetWork?.error || "The last preparation attempt failed."
+    const remediation = direct?.remediation || "Review the final failure evidence and correct its cause before retrying the quarantined task."
+    return `Automatic retries were exhausted. ${diagnosis} ${remediation}`
+  }
   if (["failed", "interrupted"].includes(state)) return direct?.errorSummary || `The last operation did not finish. Completed source transactions remain reusable; retrying resumes from validated receipts rather than starting blindly from zero.`
   if (state === "needs_fetch") return `No validated history source or selected snapshot is available yet. Fetch is the first unblocked stage.`
   if (state === "needs_patrol_fetch") return `Core history is present, but the independent patrol source generation is incomplete.`
@@ -1406,6 +1470,7 @@ function stateExplanation(name, wiki, state, lifecycle, direct, fleetWork) {
   if (state === "needs_compute") return `The warehouse generation is ready, but one or more core metric families are missing or invalid.`
   if (state === "needs_patrol_compute") return `Patrol sources are ready, but the derived patrol metric has not been validated.`
   if (state === "needs_merge") return `Per-wiki metrics are ready. They have not yet been incorporated into the public publication generation.`
+  if (state === "qualified") return `${name} completed publication-invisible qualification for ${operationalWikiTruth[name]?.qualification?.snapshot || "the selected snapshot"}. Its source, metrics, enrichment, and validation receipts are complete. It will remain hidden until an operator explicitly promotes this exact qualification.`
   if (state === "complete") {
     if (lifecycle.publication === "published") return `${name} is live with a complete published artifact set. Redownloadable build inputs may be intentionally retired after validation to save storage.`
     if (lifecycle.refresh === "paused") return `${name} is a retained imported dataset. It remains public, but automatic refresh is paused.`
@@ -1426,13 +1491,16 @@ function evidenceItems(name, wiki, lifecycle, direct, fleetWork, plan) {
       : wiki.retention?.valid && wiki.retention?.history_input === "purge_after_ready" && wiki.status === "complete"
         ? "validated, then retired by policy"
         : `${wiki.raw?.files || 0} raw files · ${wiki.parquet?.done || 0}/${wiki.parquet?.total || 0} ingested`
+  const qualification = truth?.qualification || null
   return [
     ["Lifecycle", lifecycle ? `${lifecycle.publication} / ${lifecycle.refresh}` : "not registered"],
     ["Latest available", truth?.snapshots?.latestAvailable || plan?.snapshot || "not discovered"],
-    ["Candidate", truth?.snapshots?.candidate || "none"],
+    ["Candidate / qualification", qualification ? `${qualification.snapshot} · ${qualification.runId}` : truth?.snapshots?.candidate || "none"],
     ["Published", truth?.snapshots?.published ? `${truth.snapshots.published} · cutoff ${truth.snapshots.cutoff || "unknown"}` : "not published"],
     ["Source data", sourceEvidence],
-    ["Metrics", metricTruth ? `${metricTruth.present.length}/${metricTruth.expected.length} required${metricTruth.missing.length ? ` · missing ${metricTruth.missing.join(", ")}` : ""}` : "no receipt evidence"],
+    ["Metrics", qualification
+      ? `${qualification.artifactCount} checksum-backed artifacts · ${formatRefreshBytes(qualification.artifactBytes)}`
+      : metricTruth ? `${metricTruth.present.length}/${metricTruth.expected.length} required${metricTruth.missing.length ? ` · missing ${metricTruth.missing.join(", ")}` : ""}` : "no receipt evidence"],
     ["Last activity", direct ? `${operationLabel(direct.state || (direct.exitCode === 0 ? "succeeded" : "failed"))} · ${relativeTime(operationTimestamp(direct))}` : "no operator run recorded"],
     ["Worker", fleetWork ? `${fleetWork.workerId || fleetWork.resourceClass || "unclaimed"} · ${fleetWork.heartbeatAt ? `heartbeat ${relativeTime(fleetWork.heartbeatAt)}` : "no heartbeat"}` : "no fleet lease"]
   ]
@@ -1548,7 +1616,7 @@ function pipelineDossier(name, wiki, state, lifecycle, direct, fleetWork, plan) 
   return html`<section class="admin-pipeline-dossier" aria-label=${`${name} pipeline details`}>
     <div class="admin-dossier-lead ${operationTone(state)}">
       <span class="admin-command-kicker">${statusLabels[state] || operationLabel(state)}</span>
-      <strong>${state === "running" ? direct?.stageLabel || "Pipeline running" : state === "failed" ? `Stopped during ${direct?.stageLabel || "pipeline work"}` : state === "waiting_upstream" ? "Waiting for upstream data" : wikipediaProjectLabel(name)}</strong>
+      <strong>${state === "running" ? direct?.stageLabel || "Pipeline running" : state === "failed" ? `Stopped during ${direct?.stageLabel || "pipeline work"}` : state === "waiting_upstream" ? "Waiting for upstream data" : state === "qualified" ? "Qualification completed and remains hidden" : wikipediaProjectLabel(name)}</strong>
       <p>${state === "waiting_upstream"
         ? stateExplanation(name, wiki, state, lifecycle, direct, fleetWork)
         : stoppedWithExplanation
@@ -1576,6 +1644,8 @@ function pipelineDossier(name, wiki, state, lifecycle, direct, fleetWork, plan) 
       }}>Add as qualification</button>` : failureState ? html`
         ${allowedActions.length ? allowedActions.map((action) => html`<button class="admin-btn ${action.id === "quarantine-retry" ? "danger" : ""}" ?disabled=${!apiStatus} onclick=${() => executeAllowedAction({...action, wiki: action.wiki || name, taskId: action.taskId || fleetWork?.taskId})}>${action.label}</button>`) : html`<span class="admin-action-blocked">No automated retry is safe. Complete the stated remediation first.</span>`}
         ${direct?.requestId && state === "stalled" ? html`<button class="admin-btn" ?disabled=${!apiStatus} onclick=${() => runCommand("recover-admin")}>Recover operator queue</button>` : ""}
+      ` : state === "qualified" ? html`
+        <span class="admin-action-blocked">No processing is required. Review the qualification evidence below, then promote it explicitly when it is ready to become managed data.</span>
       ` : html`
         <button class="admin-btn primary" ?disabled=${!apiStatus || operationActive}
           onclick=${() => {
@@ -1618,19 +1688,28 @@ function projectRowDetail(name, wiki, state, lifecycle, direct, fleetWork) {
   }
   if (state === "complete" && lifecycle?.refresh === "paused") return "Published imported data · automatic updates paused"
   if (state === "complete") return `Snapshot ${direct?.selectedSnapshot || wiki.snapshot?.version || "published"} is live and usable`
+  if (state === "qualified") {
+    const qualification = operationalWikiTruth[name]?.qualification
+    return `Snapshot ${qualification?.snapshot || "—"} passed ${qualification?.artifactCount || 0} artifact checks · hidden until promoted`
+  }
   return stateExplanation(name, wiki, state, lifecycle, direct, fleetWork)
 }
 
 function snapshotProgressLabel(name) {
   const snapshots = operationalWikiTruth[name]?.snapshots
   if (!snapshots) return "Snapshot evidence unavailable"
+  if (snapshots.qualification) return `Qualified ${snapshots.qualification} · hidden · latest ${snapshots.latestAvailable || "—"}`
   return `Published ${snapshots.published || "—"} · candidate ${snapshots.candidate || "—"} · latest ${snapshots.latestAvailable || "—"}`
 }
 
 ```
 
 ```js
-const statusSummary = summarizeStatuses(wikiEntries)
+const statusSummary = wikiEntries.reduce((summary, [name, wiki]) => {
+  const state = operationalState(name, wiki)
+  summary[state] = (summary[state] || 0) + 1
+  return summary
+}, {})
 const pipelineFilterInput = Inputs.radio(
   ["All", "Attention", "Active", "Incomplete"],
   {label: "Show", value: "All"}
@@ -1643,7 +1722,7 @@ const visibleWikiEntries = wikiEntries.filter(([name, wiki]) => {
   const state = operationalState(name, wiki)
   if (pipelineFilter === "Attention") return attentionStates.has(state)
   if (pipelineFilter === "Active") return ["running", "queued", "stalled"].includes(state)
-  if (pipelineFilter === "Incomplete") return state !== "complete"
+  if (pipelineFilter === "Incomplete") return !["complete", "qualified"].includes(state)
   return true
 })
 
@@ -1651,9 +1730,17 @@ display(html`<div class="admin-pipeline-board">
   <div class="admin-pipeline-summary concise">
     <div><strong>${wikiEntries.length}</strong><span>known wikis</span></div>
     <div><strong>${activeCount}</strong><span>running</span></div>
-    <div class=${attentionCount ? "danger" : ""}><strong>${attentionCount}</strong><span>need attention</span></div>
-    <div><strong>${statusSummary.complete || 0}</strong><span>complete</span></div>
+    <div class=${attentionCount ? "danger" : ""}><strong>${attentionCount}</strong><span>paused</span></div>
+    <div><strong>${statusSummary.complete || 0} + ${statusSummary.qualified || 0}</strong><span>published + qualified</span></div>
   </div>
+  ${(operationalTruth.pipeline?.blockerGroups || []).length ? html`<div class="admin-shared-blockers">
+    ${(operationalTruth.pipeline.blockerGroups || []).map((blocker) => html`<article>
+      <div><strong>${blocker.affectedWikis.length} ${blocker.affectedWikis.length === 1 ? "project" : "projects"} share one blocker</strong><span>${blocker.affectedWikis.join(", ")}</span></div>
+      <p>${blocker.summary}</p>
+      <p><strong>Next step:</strong> ${blocker.remediation}</p>
+      <small>${blocker.retryable === false ? "Automatic retry is disabled because unchanged inputs would fail again." : "Validated work is retained; retry can resume after the cause is corrected."}</small>
+    </article>`)}
+  </div>` : ""}
   <div class="admin-pipeline-toolbar">${pipelineFilterInput}<span>${visibleWikiEntries.length} shown</span></div>
   ${visibleWikiEntries.length === 0
     ? html`<div class="admin-empty-state"><strong>Nothing matches this view.</strong><span>Choose another filter to inspect the full inventory.</span></div>`
@@ -3070,6 +3157,22 @@ currentManifest.merged.length > 0
 .admin-pipeline-toolbar { display: flex; justify-content: space-between; align-items: end; gap: 1rem; }
 .admin-pipeline-toolbar form { margin: 0; }
 .admin-pipeline-toolbar > span { color: var(--theme-foreground-muted); font-size: 0.72rem; }
+.admin-shared-blockers { display: grid; border-bottom: 1px solid var(--theme-foreground-faintest); }
+.admin-shared-blockers article {
+  display: grid;
+  grid-template-columns: minmax(12rem, 0.8fr) minmax(18rem, 1.35fr) minmax(18rem, 1.35fr);
+  gap: 0.35rem 1rem;
+  padding: 0.85rem;
+  border-left: 4px solid #c13c32;
+  background: color-mix(in srgb, #c13c32 5%, transparent);
+}
+.admin-shared-blockers article + article { border-top: 1px solid var(--theme-foreground-faintest); }
+.admin-shared-blockers article > div { display: grid; align-content: start; gap: 0.2rem; }
+.admin-shared-blockers article > div strong { font-size: 0.82rem; }
+.admin-shared-blockers article > div span,
+.admin-shared-blockers article small { color: var(--theme-foreground-muted); font-size: 0.7rem; line-height: 1.45; }
+.admin-shared-blockers article p { max-width: 64ch; margin: 0; font-size: 0.74rem; line-height: 1.5; }
+.admin-shared-blockers article small { grid-column: 2 / -1; }
 .admin-pipeline-list { border-top: 1px solid var(--theme-foreground-faintest); }
 .admin-pipeline-entry { border-bottom: 1px solid var(--theme-foreground-faintest); }
 .admin-pipeline-row {
@@ -3205,6 +3308,13 @@ currentManifest.merged.length > 0
 .admin-run-facts span { color: var(--theme-foreground-muted); font-size: 0.62rem; font-weight: 700; }
 .admin-run-facts strong { font-size: 0.78rem; }
 .admin-run-facts small { color: var(--theme-foreground-muted); font-size: 0.65rem; }
+.admin-run-attempts { display: grid; gap: 0.2rem; padding: 0.85rem 1rem; border-bottom: 1px solid var(--theme-foreground-faintest); }
+.admin-run-attempts > strong { font-size: 0.8rem; }
+.admin-run-attempts > span { color: var(--theme-foreground-muted); font-size: 0.7rem; }
+.admin-run-attempts ol { display: grid; gap: 0.35rem; margin: 0.55rem 0 0; padding: 0; list-style: none; }
+.admin-run-attempts li { display: grid; grid-template-columns: 9rem 12rem minmax(0, 1fr); gap: 0.65rem; align-items: baseline; }
+.admin-run-attempts time,
+.admin-run-attempts small { color: var(--theme-foreground-muted); font-size: 0.68rem; }
 .admin-run-timeline { position: relative; padding: 0.6rem 1rem; }
 .admin-run-stage { display: grid; grid-template-columns: 0.85rem minmax(10rem, 1fr) 5rem; gap: 0.6rem; align-items: start; min-height: 2.8rem; }
 .admin-run-stage > i { position: relative; width: 0.62rem; height: 0.62rem; margin-top: 0.28rem; border: 2px solid #738091; border-radius: 50%; background: var(--theme-background); }
@@ -3341,6 +3451,8 @@ currentManifest.merged.length > 0
   .admin-pipeline-summary.concise { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .admin-pipeline-summary.concise > div:nth-child(3) { border-left: 0; }
   .admin-pipeline-summary.concise > div:nth-child(n+3) { border-top: 1px solid var(--theme-foreground-faintest); }
+  .admin-shared-blockers article { grid-template-columns: 1fr; }
+  .admin-shared-blockers article small { grid-column: 1; }
   .admin-pipeline-row { grid-template-columns: minmax(7.8rem, 0.8fr) minmax(8.5rem, 1fr) 1rem; gap: 0.55rem 0.65rem; padding-block: 0.75rem; }
   .admin-pipeline-message { grid-column: 1 / -1; grid-row: 2; -webkit-line-clamp: 3; }
   .admin-stage-rail { grid-column: 1 / -1; grid-row: 3; }
@@ -3363,6 +3475,8 @@ currentManifest.merged.length > 0
   .admin-run-facts > div:nth-child(odd) { border-left: 0; }
   .admin-run-sheet-header { align-items: start; }
   .admin-run-stage { grid-template-columns: 0.85rem minmax(0, 1fr) 4rem; }
+  .admin-run-attempts li { grid-template-columns: 7.5rem minmax(0, 1fr); }
+  .admin-run-attempts li small { grid-column: 1 / -1; }
   .admin-change-plan { grid-template-columns: 1fr; }
   .admin-change-plan > div { border-left: 0; border-top: 1px solid var(--theme-foreground-faintest); }
   .admin-change-plan > div:first-child { border-top: 0; }

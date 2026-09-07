@@ -171,6 +171,13 @@ function qualificationCandidates(outputDir, limitPerWiki = 10) {
             qualifiedAtUnix: receipt.qualified_at_unix ?? null,
             cutoffDate: receipt.cutoff_date ?? null,
             artifactCount: receipt.artifacts?.length ?? 0,
+            artifactBytes: (receipt.artifacts || []).reduce((total, artifact) => total + Number(artifact?.bytes || 0), 0),
+            artifactRows: (receipt.artifacts || []).reduce((total, artifact) => total + Number(artifact?.rows || 0), 0),
+            metricIds: (receipt.artifacts || [])
+              .map((artifact) => path.basename(String(artifact?.path || ""), ".parquet"))
+              .filter(Boolean)
+              .sort(),
+            workloadProfile: receipt.workload_profile?.profile ?? null,
             resourceClass: receipt.workload_profile?.resource_class ?? null,
             receiptSha256: sha256(bytes),
             structurallyValid: valid,

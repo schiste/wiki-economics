@@ -98,6 +98,22 @@ test("operation summaries distinguish incomplete logging dumps from defects", ()
   assert.match(summary.errorSummary, /will not be downloaded again/);
 });
 
+test("a successful terminal receipt clears stale errors from earlier attempts", () => {
+  const summary = summarizeOperationLog({
+    state: "succeeded",
+    exitCode: 0,
+    error: "UPSTREAM_WAITING: Wikimedia logging dump 20260901 is not complete",
+  }, [
+    'run_id=test INFO starting stage stage="qualification_validate" wiki="dewiki"',
+    "[finished state=succeeded exit=0]",
+  ].join("\n"));
+
+  assert.equal(summary.errorSummary, null);
+  assert.equal(summary.rawError, null);
+  assert.equal(summary.retryable, null);
+  assert.equal(summary.remediationCode, null);
+});
+
 test("operation summaries stop retry loops for compute without patrol sources", () => {
   const summary = summarizeOperationLog({}, [
     'run_id=test INFO starting stage stage="patrol_compute" wiki="dewiki"',

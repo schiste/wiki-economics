@@ -194,6 +194,92 @@ test("local mode exposes the legacy /api/status endpoint without auth", async (t
   assert.equal("suggestedVersion" in body, false, "calendar months must not masquerade as completed snapshots");
 });
 
+test("status consolidates retried admin runs and exposes completed hidden qualifications", async (t) => {
+  const lifecycle = {
+    schema_version: 1,
+    publication_contract: {datasets: {}},
+    wikis: {dewiki: {
+      publication: "hidden",
+      refresh: "qualification",
+      provenance: "test",
+      retention: {
+        source_recoverability: "redownloadable",
+        history_input: "purge_after_ready",
+        patrol_source: "purge_after_ready",
+        computed_rollback_generations: 1,
+      },
+    }},
+  };
+  const runId = "admin-dewiki-qualification";
+  const {module, host} = await startServer(t, LOCAL_ENV, lifecycle, ({outputDir}) => {
+    const operations = path.join(outputDir, "_admin", "operations");
+    const history = path.join(operations, "history");
+    const logs = path.join(operations, "logs");
+    fs.mkdirSync(history, {recursive: true});
+    fs.mkdirSync(logs, {recursive: true});
+    const logPath = path.join(logs, `${runId}.log`);
+    fs.writeFileSync(logPath, [
+      "Error: UPSTREAM_WAITING: Wikimedia logging dump 20260901 for dewiki/2026-08 is not complete",
+      'run_id=test INFO starting stage stage="qualification_validate" wiki="dewiki"',
+      "[finished state=succeeded exit=0]",
+    ].join("\n"));
+    const base = {
+      schemaVersion: 1, requestId: runId, runId, action: "qualify", wiki: "dewiki",
+      version: "2026-08", selectedSnapshot: "2026-08", logPath,
+      requestedAt: "2026-09-03T20:19:28Z",
+    };
+    fs.writeFileSync(path.join(history, `1-${runId}.json`), JSON.stringify({
+      ...base, state: "waiting_upstream", startedAt: "2026-09-03T20:20:00Z",
+      finishedAt: "2026-09-04T00:23:00Z", updatedAt: "2026-09-04T00:23:00Z",
+    }));
+    fs.writeFileSync(path.join(history, `2-${runId}.json`), JSON.stringify({
+      ...base, state: "waiting_upstream", startedAt: "2026-09-04T06:33:00Z",
+      finishedAt: "2026-09-04T06:33:03Z", updatedAt: "2026-09-04T06:33:03Z",
+    }));
+    fs.writeFileSync(path.join(history, `3-${runId}.json`), JSON.stringify({
+      ...base, state: "succeeded", exitCode: 0, startedAt: "2026-09-04T12:43:00Z",
+      finishedAt: "2026-09-04T12:57:00Z", updatedAt: "2026-09-04T12:57:00Z",
+    }));
+    const qualificationDir = path.join(outputDir, "_qualifications", "dewiki", "2026-08", runId);
+    fs.mkdirSync(qualificationDir, {recursive: true});
+    fs.writeFileSync(path.join(qualificationDir, "qualification.json"), JSON.stringify({
+      schema_version: 2, publication_eligible: false, wiki: "dewiki", snapshot: "2026-08",
+      run_id: runId, qualified_at_unix: 1_788_526_634, cutoff_date: "2026-08",
+      artifacts: [{path: "dewiki/gdp.parquet", rows: 12, bytes: 128}],
+    }));
+  });
+
+  const response = await invoke(module, {url: "/api/status", headers: {host}});
+  assert.equal(response.statusCode, 200);
+  const body = JSON.parse(response.text());
+  assert.equal(body.adminOperations.recent.length, 1);
+  assert.equal(body.adminOperations.recent[0].state, "succeeded");
+  assert.equal(body.adminOperations.recent[0].attemptCount, 3);
+  assert.equal(body.adminOperations.recent[0].errorSummary, null);
+  assert.equal(body.operationalTruth.wikis.dewiki.qualification.runId, runId);
+  assert.equal(body.operationalTruth.wikis.dewiki.snapshots.qualification, "2026-08");
+});
+
+test("operation history never hides a later failure behind an earlier success", (t) => {
+  const {module, tempRoot} = loadAdminServer(LOCAL_ENV);
+  t.after(() => fs.rmSync(tempRoot, {recursive: true, force: true}));
+  const recent = module.collapseOperationHistory([
+    {
+      schemaVersion: 1, requestId: "retry-chain", runId: "retry-chain", wiki: "dewiki",
+      state: "succeeded", updatedAt: "2026-09-04T12:00:00Z",
+    },
+    {
+      schemaVersion: 1, requestId: "retry-chain", runId: "retry-chain", wiki: "dewiki",
+      state: "failed", errorSummary: "Later validation failed", updatedAt: "2026-09-04T13:00:00Z",
+    },
+  ]);
+
+  assert.equal(recent.length, 1);
+  assert.equal(recent[0].state, "failed");
+  assert.equal(recent[0].errorSummary, "Later validation failed");
+  assert.equal(recent[0].attemptCount, 2);
+});
+
 test("hosted mode redirects /admin to the login page when no session is present", async (t) => {
   const { module, host } = await startServer(t, HOSTED_ENV);
   const response = await invoke(module, {

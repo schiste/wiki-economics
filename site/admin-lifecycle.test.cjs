@@ -150,8 +150,8 @@ test("qualification discovery validates identities and keeps malformed receipts 
     run_id: "qualified-1",
     qualified_at_unix: 1_788_000_000,
     cutoff_date: "2026-08-31",
-    artifacts: [{path: "gdp.parquet"}],
-    workload_profile: {resource_class: "medium_large"},
+    artifacts: [{path: "dewiki/gdp.parquet", bytes: 128, rows: 42}],
+    workload_profile: {profile: "small", resource_class: "medium_large"},
   }));
   fs.writeFileSync(path.join(invalidDir, "qualification.json"), "{truncated");
 
@@ -159,6 +159,10 @@ test("qualification discovery validates identities and keeps malformed receipts 
   assert.equal(candidates.dewiki.length, 2);
   assert.equal(candidates.dewiki[0].runId, "qualified-1");
   assert.equal(candidates.dewiki[0].structurallyValid, true);
+  assert.equal(candidates.dewiki[0].artifactBytes, 128);
+  assert.equal(candidates.dewiki[0].artifactRows, 42);
+  assert.deepEqual(candidates.dewiki[0].metricIds, ["gdp"]);
+  assert.equal(candidates.dewiki[0].workloadProfile, "small");
   assert.match(candidates.dewiki[0].receiptSha256, /^[a-f0-9]{64}$/);
   assert.equal(candidates.dewiki[1].structurallyValid, false);
 });

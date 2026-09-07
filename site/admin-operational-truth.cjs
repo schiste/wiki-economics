@@ -199,6 +199,7 @@ function allowedFailureActions(candidate, fleetWork = null) {
     return [{id: "fleet-recover", label: "Recover stale lease", confirmation: "Authenticate stale leases and requeue recoverable work?"}];
   }
   if (fleetWork?.state === "quarantined" || code === "fleet_task_quarantined") {
+    if (candidate?.retryable === false && code && code !== "fleet_task_quarantined") return [];
     return [{
       id: "quarantine-retry",
       label: "Retry quarantined task",
@@ -226,7 +227,7 @@ function latestTimestamp(...values) {
   return values.filter(Boolean).sort().at(-1) || null;
 }
 
-function wikiOperationalTruth({wiki, definitions, lifecycle, dataDir, outputDir, gate, scrub, qualityPolicy, nowUnix}) {
+function wikiOperationalTruth({wiki, definitions, lifecycle, dataDir, outputDir, gate, scrub, qualityPolicy, nowUnix, qualifications}) {
   const entry = lifecycle?.wikis?.[wiki] || null;
   const expected = expectedMetricsForWiki(definitions, lifecycle, wiki);
   const status = candidateStatus(outputDir, wiki);
@@ -237,13 +238,18 @@ function wikiOperationalTruth({wiki, definitions, lifecycle, dataDir, outputDir,
     || null;
   const publishedCutoff = gate?.cutoff_dates?.[wiki] || null;
   const readySnapshot = index?.newest_valid_ready?.snapshot || null;
+  const qualification = (qualifications?.[wiki] || []).find((entry) => entry.structurallyValid) || null;
   const candidate = normalizeCandidate(status);
   if (candidate) candidate.wiki = wiki;
-  const latestAvailable = completed.at(-1) || readySnapshot || publishedSnapshot;
-  const candidateTargetSnapshot = status?.selectedSnapshot || readySnapshot;
-  const candidateReadyIds = readySnapshot && readySnapshot === candidateTargetSnapshot
-    ? readyMetricIds(index, definitions, "newest_valid_ready")
-    : [];
+  const latestAvailable = [completed.at(-1), qualification?.snapshot, readySnapshot, publishedSnapshot]
+    .filter(Boolean).sort().at(-1) || null;
+  const hiddenQualification = entry?.publication === "hidden" && entry?.refresh === "qualification";
+  const candidateTargetSnapshot = status?.selectedSnapshot || (hiddenQualification ? qualification?.snapshot : readySnapshot) || readySnapshot;
+  const candidateReadyIds = hiddenQualification && qualification
+    ? expected.filter((metric) => qualification.metricIds?.includes(metric))
+    : readySnapshot && readySnapshot === candidateTargetSnapshot
+      ? readyMetricIds(index, definitions, "newest_valid_ready")
+      : [];
   const candidateCompleteness = completeness(expected, candidateReadyIds);
   const publishedCompleteness = completeness(expected, publishedMetricIds(gate, wiki, expected));
   const candidateMetricSet = new Set(candidateCompleteness.present);
@@ -314,12 +320,14 @@ function wikiOperationalTruth({wiki, definitions, lifecycle, dataDir, outputDir,
     lifecycle: entry,
     snapshots: {
       latestAvailable,
-      candidate: candidate?.snapshot || readySnapshot,
+      candidate: candidate?.snapshot || (hiddenQualification ? qualification?.snapshot : readySnapshot) || readySnapshot,
       ready: readySnapshot,
+      qualification: qualification?.snapshot || null,
       published: publishedSnapshot,
       cutoff: publishedCutoff,
     },
     candidate,
+    qualification,
     ready: index?.newest_valid_ready || null,
     activePublished: index?.active_published || null,
     metrics: {
@@ -397,7 +405,7 @@ function infrastructureTruth({capacity, fleet, adminOperations, scheduledRefresh
   };
 }
 
-function buildOperationalTruth({root, dataDir, outputDir, lifecycle, freshness, fleet, adminOperations, scheduledRefresh, sourceIdentity}) {
+function buildOperationalTruth({root, dataDir, outputDir, lifecycle, freshness, fleet, adminOperations, qualifications = {}, scheduledRefresh, sourceIdentity}) {
   const catalog = readJson(path.join(root, "config", "generated", "metric-catalog.json"));
   const definitions = metricDefinitions(catalog);
   const gate = publicationGate(outputDir);
@@ -406,11 +414,12 @@ function buildOperationalTruth({root, dataDir, outputDir, lifecycle, freshness, 
   const nowUnix = Math.floor(Date.now() / 1000);
   const wikiNames = new Set([
     ...Object.keys(lifecycle?.wikis || {}),
+    ...Object.keys(qualifications || {}),
     ...jsonFileStems(path.join(outputDir, "_candidate-status")),
     ...jsonFileStems(path.join(outputDir, "_ready-index")),
   ]);
   const wikis = Object.fromEntries([...wikiNames].sort().map((wiki) => [wiki, wikiOperationalTruth({
-    wiki, definitions, lifecycle, dataDir, outputDir, gate, scrub, qualityPolicy, nowUnix,
+    wiki, definitions, lifecycle, dataDir, outputDir, gate, scrub, qualityPolicy, nowUnix, qualifications,
   })]));
   const pipelineIssues = Object.values(wikis).flatMap((wiki) => wiki.issues);
   if (qualityPolicy?.schema_version !== 1) pipelineIssues.unshift({
@@ -431,6 +440,38 @@ function buildOperationalTruth({root, dataDir, outputDir, lifecycle, freshness, 
       wiki.allowedActions = [];
     }
   }
+  const blockerGroups = [];
+  const blockers = new Map();
+  for (const wiki of Object.values(wikis)) {
+    const fleetWork = (fleet?.work || []).find((entry) => entry.wiki === wiki.wiki) || null;
+    if (wiki.candidate?.state !== "failed" && !["stalled", "quarantined"].includes(fleetWork?.state)) continue;
+    const failure = wiki.candidate?.errorSummary
+      ? {
+          errorSummary: wiki.candidate.errorSummary,
+          remediationCode: wiki.candidate.remediationCode,
+          remediation: wiki.candidate.remediation,
+          retryable: wiki.candidate.retryable,
+        }
+      : classifyError(fleetWork?.error || fleetWork?.quarantineReason || "Fleet task requires operator review");
+    const key = failure.remediationCode || failure.errorSummary || fleetWork?.state || "unknown";
+    if (!blockers.has(key)) blockers.set(key, {
+      code: failure.remediationCode || "unclassified_pipeline_failure",
+      summary: failure.errorSummary || "Pipeline work requires review.",
+      remediation: failure.remediation || "Inspect the latest run evidence before taking action.",
+      retryable: failure.retryable,
+      affectedWikis: [],
+      states: new Set(),
+    });
+    blockers.get(key).affectedWikis.push(wiki.wiki);
+    blockers.get(key).states.add(fleetWork?.state || wiki.candidate?.state || "failed");
+  }
+  for (const blocker of blockers.values()) blockerGroups.push({
+    ...blocker,
+    affectedWikis: blocker.affectedWikis.sort(),
+    states: [...blocker.states].sort(),
+  });
+  blockerGroups.sort((left, right) => right.affectedWikis.length - left.affectedWikis.length
+    || left.code.localeCompare(right.code));
   const publicStatus = freshness?.status || (gate ? "healthy" : "unknown");
   const pipelineStatus = pipelineIssues.some((issue) => issue.severity === "critical")
     ? "degraded"
@@ -453,7 +494,19 @@ function buildOperationalTruth({root, dataDir, outputDir, lifecycle, freshness, 
       alerts: freshness?.alerts || [],
       publication,
     },
-    pipeline: {status: pipelineStatus, issues: pipelineIssues},
+    pipeline: {
+      status: pipelineStatus,
+      issues: pipelineIssues,
+      blockerGroups,
+      counts: {
+        active: Object.values(wikis).filter((wiki) => ["starting", "running"].includes(wiki.candidate?.state)
+          || (fleet?.work || []).some((work) => work.wiki === wiki.wiki && work.state === "running")).length,
+        queued: (fleet?.work || []).filter((work) => work.state === "queued").length,
+        waitingUpstream: (fleet?.work || []).filter((work) => work.state === "waiting_upstream").length,
+        quarantined: (fleet?.work || []).filter((work) => work.state === "quarantined").length,
+        qualificationsReady: Object.values(wikis).filter((wiki) => wiki.qualification?.structurallyValid).length,
+      },
+    },
     infrastructure,
     wikis,
   };

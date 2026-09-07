@@ -848,6 +848,45 @@ function operationEntries(directory, limit = ADMIN_JOB_HISTORY_LIMIT) {
     .slice(0, limit);
 }
 
+function collapseOperationHistory(entries, limit = ADMIN_JOB_HISTORY_LIMIT) {
+  const grouped = new Map();
+  for (const entry of entries) {
+    const identity = entry.requestId || entry.runId;
+    if (!identity) continue;
+    if (!grouped.has(identity)) grouped.set(identity, []);
+    grouped.get(identity).push(entry);
+  }
+  return Array.from(grouped.values()).map((attempts) => {
+    const ordered = attempts.slice().sort((left, right) => Date.parse(left.updatedAt || left.finishedAt || left.requestedAt || 0)
+      - Date.parse(right.updatedAt || right.finishedAt || right.requestedAt || 0));
+    const latest = ordered.at(-1);
+    const selected = latest;
+    const terminalSucceeded = selected.state === "succeeded";
+    return {
+      ...selected,
+      ...(terminalSucceeded ? {
+        rawError: null,
+        error: null,
+        errorSummary: null,
+        retryable: null,
+        remediationCode: null,
+        remediation: null,
+      } : {}),
+      attemptCount: ordered.length,
+      upstreamWaitCount: Math.max(...ordered.map((entry) => Number(entry.upstreamWaitCount || 0))),
+      attempts: ordered.map((entry) => ({
+        state: entry.state,
+        startedAt: entry.startedAt || null,
+        finishedAt: entry.finishedAt || null,
+        updatedAt: entry.updatedAt || null,
+        selectedSnapshot: entry.selectedSnapshot || null,
+        errorSummary: entry.state === "succeeded" ? null : entry.errorSummary || null,
+      })),
+    };
+  }).sort((left, right) => Date.parse(right.updatedAt || right.finishedAt || right.requestedAt || 0)
+    - Date.parse(left.updatedAt || left.finishedAt || left.requestedAt || 0)).slice(0, limit);
+}
+
 function recoverStaleAdminOperations() {
   const directories = operationDirectories();
   const recovered = [];
@@ -899,7 +938,9 @@ function readAdminOperations() {
   const queued = operationEntries(directories.queued)
     .sort((left, right) => Date.parse(left.requestedAt || 0) - Date.parse(right.requestedAt || 0));
   const running = operationEntries(directories.running);
-  const recent = operationEntries(directories.history);
+  const recent = collapseOperationHistory(
+    operationEntries(directories.history, Number.MAX_SAFE_INTEGER),
+  );
   const scheduled = queued.map((entry, index) => ({
     ...entry,
     queuePosition: index + 1,
@@ -1224,6 +1265,11 @@ function readFleetStatus(now = Date.now()) {
   const quarantineEntries = directoryJsonEntries(path.join(FLEET_QUEUE_DIR, "quarantine"), { limit: 25 });
   const failureEntries = directoryJsonEntries(path.join(FLEET_QUEUE_DIR, "failures"), { limit: 25 });
   const deferredEntries = directoryJsonEntries(path.join(FLEET_QUEUE_DIR, "deferred"), { limit: 100 });
+  const failureByTask = new Map();
+  for (const entry of failureEntries) {
+    const taskId = fleetTaskFrom(entry.value).task_id;
+    if (taskId && !failureByTask.has(taskId)) failureByTask.set(taskId, entry.value);
+  }
   const deferredByWiki = new Map();
   for (const entry of deferredEntries) {
     const wiki = fleetWikiFrom(entry.value, entry.file);
@@ -1281,13 +1327,16 @@ function readFleetStatus(now = Date.now()) {
     const wiki = fleetWikiFrom(entry.value, entry.file);
     if (!wiki || byWiki.has(wiki)) continue;
     const task = fleetTaskFrom(entry.value);
+    const failure = failureByTask.get(task.task_id) || null;
     byWiki.set(wiki, {
       wiki,
       state: "quarantined",
       snapshot: task.snapshot ?? null,
       resourceClass: task.resource_class ?? null,
       attempt: task.attempt ?? null,
-      error: entry.value.error ?? entry.value.reason ?? "Fleet task requires operator review",
+      error: failure?.error ?? entry.value.error ?? entry.value.reason ?? "Fleet task requires operator review",
+      quarantineReason: entry.value.reason ?? "retry_limit_exhausted",
+      failureRunId: failure?.claim?.run_id ?? failure?.run_id ?? null,
       updatedAt: entry.modifiedAt,
       taskId: task.task_id ?? null,
     });
@@ -1313,7 +1362,9 @@ function readFleetStatus(now = Date.now()) {
     quarantine: quarantineEntries.map((entry) => ({
       wiki: fleetWikiFrom(entry.value, entry.file),
       updatedAt: entry.modifiedAt,
-      error: entry.value.error ?? entry.value.reason ?? null,
+      error: failureByTask.get(fleetTaskFrom(entry.value).task_id)?.error
+        ?? entry.value.error ?? entry.value.reason ?? null,
+      quarantineReason: entry.value.reason ?? null,
       taskId: fleetTaskFrom(entry.value).task_id ?? null,
       task: fleetTaskFrom(entry.value),
     })),
@@ -1712,6 +1763,7 @@ function buildStatusPayload(req, session) {
       }
     : lastJob;
   const manifest = refreshManifestSafely() || { error: "Manifest unavailable" };
+  const qualifications = qualificationCandidates(OUTPUT_DIR);
   const operationalTruth = buildOperationalTruth({
     root: ROOT,
     dataDir: DATA_DIR,
@@ -1720,6 +1772,7 @@ function buildStatusPayload(req, session) {
     freshness,
     fleet,
     adminOperations,
+    qualifications,
     scheduledRefresh,
     sourceIdentity: {
       sourceCommit: process.env.WIKI_ECON_SOURCE_COMMIT || null,
@@ -1751,7 +1804,7 @@ function buildStatusPayload(req, session) {
     wikiLifecycle: WIKI_LIFECYCLE,
     lifecycleRevision,
     lifecycleAudit,
-    qualifications: qualificationCandidates(OUTPUT_DIR),
+    qualifications,
     wikiStates: wikiLifecycleStatus(),
     runner: runnerInfo(),
     scheduledRefresh,
@@ -2599,6 +2652,7 @@ module.exports = {
   ADMIN_PAGE_PATH,
   FRESHNESS_STATUS_PATH,
   PROXY_API_PREFIX,
+  collapseOperationHistory,
   createServer,
   handleRequest,
   startServer,

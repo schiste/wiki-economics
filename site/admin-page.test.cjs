@@ -36,6 +36,15 @@ test("project status shows available, candidate, and published snapshots togethe
   assert.match(source, /Published \$\{snapshots\.published/);
 });
 
+test("hidden qualifications and shared blockers have explicit human states", () => {
+  assert.match(source, /Qualification ready/);
+  assert.match(source, /Qualification completed and remains hidden/);
+  assert.match(source, /passed \$\{qualification\?\.artifactCount/);
+  assert.match(source, /share one blocker/);
+  assert.match(source, /Automatic retry is disabled because unchanged inputs would fail again/);
+  assert.doesNotMatch(source, /quarantined: "Needs intervention"/);
+});
+
 test("admin run details expose timelines, resource evidence, and specific next actions", () => {
   assert.match(source, /class="admin-run-sheet"/);
   assert.match(source, /class="admin-run-timeline"/);

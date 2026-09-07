@@ -157,6 +157,7 @@ test("operational truth separates a healthy publication from a failed newer cand
     latestAvailable: "2026-08",
     candidate: "2026-08",
     ready: "2026-08",
+    qualification: null,
     published: "2026-07",
     cutoff: "2026-08",
   });
@@ -199,6 +200,66 @@ test("qualification projects expect the complete metric registry", () => {
     {id: "page_weekly_edits", family: "page_week", algorithm_version: "v1"},
   ];
   assert.deepEqual(expectedMetricsForWiki(definitions, lifecycle(), "dewiki"), ["gdp", "page_weekly_edits"]);
+});
+
+test("a validated hidden qualification is first-class pipeline evidence", (t) => {
+  const {root, dataDir, outputDir} = fixture(t);
+  const result = buildOperationalTruth({
+    root, dataDir, outputDir, lifecycle: lifecycle(),
+    freshness: {status: "healthy", alerts: [], summary: {}},
+    fleet: {work: []}, adminOperations: {counts: {}}, scheduledRefresh: {last: null},
+    qualifications: {
+      dewiki: [{
+        wiki: "dewiki",
+        snapshot: "2026-08",
+        runId: "qualified-dewiki",
+        qualifiedAtUnix: 1_788_526_634,
+        artifactCount: 2,
+        artifactBytes: 700_000_000,
+        artifactRows: 118_000_000,
+        metricIds: ["gdp", "patrol"],
+        structurallyValid: true,
+      }],
+    },
+  });
+
+  assert.equal(result.wikis.dewiki.qualification.runId, "qualified-dewiki");
+  assert.equal(result.wikis.dewiki.snapshots.qualification, "2026-08");
+  assert.equal(result.wikis.dewiki.snapshots.candidate, "2026-08");
+  assert.equal(result.wikis.dewiki.snapshots.latestAvailable, "2026-08");
+  assert.equal(result.wikis.dewiki.metrics.candidate.complete, true);
+  assert.equal(result.pipeline.counts.qualificationsReady, 1);
+});
+
+test("quarantined projects with the same root failure form one actionable blocker", (t) => {
+  const {root, dataDir, outputDir} = fixture(t);
+  const policy = lifecycle();
+  for (const wiki of ["nlwiki", "dewiki"]) {
+    writeJson(path.join(outputDir, "_candidate-status", `${wiki}.json`), {
+      schemaVersion: 2,
+      state: "failed",
+      runId: `failed-${wiki}`,
+      wikis: [wiki],
+      selectedSnapshot: "2026-08",
+      failingStage: "source_window",
+      error: "workload profile Large has not completed production qualification",
+      exitCode: 1,
+    });
+  }
+  const fleet = {work: ["nlwiki", "dewiki"].map((wiki) => ({
+    wiki, state: "quarantined", taskId: `${wiki}-task`, error: "retry_limit_exhausted",
+  }))};
+  const result = buildOperationalTruth({
+    root, dataDir, outputDir, lifecycle: policy,
+    freshness: {status: "healthy", alerts: [], summary: {}},
+    fleet, adminOperations: {counts: {}}, scheduledRefresh: {last: null},
+  });
+
+  assert.equal(result.pipeline.blockerGroups.length, 1);
+  assert.deepEqual(result.pipeline.blockerGroups[0].affectedWikis, ["dewiki", "nlwiki"]);
+  assert.equal(result.pipeline.blockerGroups[0].code, "workload_profile_unqualified");
+  assert.equal(result.pipeline.blockerGroups[0].retryable, false);
+  assert.deepEqual(result.wikis.nlwiki.allowedActions, []);
 });
 
 test("latest completed snapshot requires both the plan and remote inventory", (t) => {

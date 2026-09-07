@@ -202,8 +202,11 @@ function summarizeOperationLog(entry = {}, rawLog = "") {
   );
 
   const errorLine = lastCapture(text, /^Error:\s*(.+)$/gm);
-  const rawError = errorLine || entry.rawError || entry.error || null;
-  const failure = classifyError(rawError);
+  const succeeded = entry.state === "succeeded" || entry.exitCode === 0;
+  const rawError = succeeded ? null : errorLine || entry.rawError || entry.error || null;
+  const failure = succeeded
+    ? {errorSummary: null, retryable: null, remediationCode: null, remediation: null}
+    : classifyError(rawError);
 
   let percent = null;
   let detail = null;
