@@ -30,6 +30,10 @@ async function runAdminBrowserWorkflow({distDir}) {
   const {server, origin} = await startServer(distDir, {
     handleRequest(request, response) {
       const url = new URL(request.url, origin || "http://localhost");
+      if (url.pathname.startsWith("/admin-assets/")) {
+        request.url = `${url.pathname.slice("/admin-assets".length)}${url.search}`;
+        return false;
+      }
       if (url.pathname.startsWith("/admin-api/")) apiRequests.push(`${request.method} ${url.pathname}`);
       if (url.pathname === "/admin-api/status" && request.method === "GET") {
         if (operation) statusReadsAfterQueue += 1;

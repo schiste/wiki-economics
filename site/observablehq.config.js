@@ -2,6 +2,7 @@ import path from "node:path";
 import { siteFooter } from "./site-footer.js";
 
 const isDev = process.argv.some(a => a === "preview" || a === "dev");
+const adminStandalone = process.env.WIKI_ECON_ADMIN_STANDALONE === "1";
 const distDir = process.env.WIKI_ECON_SITE_DIST_DIR
   ? path.resolve(process.env.WIKI_ECON_SITE_DIST_DIR)
   : "dist";
@@ -32,7 +33,7 @@ export default {
   // network fetch.
   globalStylesheets: [],
   footer: siteFooter,
-  head: () => `<link rel="stylesheet" href="./style.css">
+  head: () => `${adminStandalone ? '<base href="/admin-assets/">\n' : ""}<link rel="stylesheet" href="./style.css">
 ${adminApiScript}
 <script>
 (function(){var t=localStorage.getItem("wk-theme");if(t&&t!=="auto"){document.documentElement.setAttribute("data-theme",t);document.documentElement.style.colorScheme=t;}})();
@@ -234,7 +235,7 @@ document.addEventListener("DOMContentLoaded",function(){
   }).observe(document.body,{childList:true,subtree:true});
 });
 </script>`,
-  pages: [
+  pages: adminStandalone ? [] : [
     { name: "Portfolio", path: "/" },
     {
       name: "Indicators",

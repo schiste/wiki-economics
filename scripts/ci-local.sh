@@ -44,6 +44,7 @@ node --check scripts/publish-browser-data.cjs
 node --check scripts/publish-static-root.cjs
 node --check scripts/browser-performance.cjs
 node --check scripts/admin-browser-workflow.cjs
+node --check scripts/build-admin-site.cjs
 node --check scripts/site-source-bundle.cjs
 
 echo "==> node --check site/observablehq.config.js"
@@ -62,6 +63,7 @@ node --test site/admin-console.test.mjs
 
 echo "==> node --test site/admin-server.test.cjs"
 node --test site/admin-server.test.cjs
+node --test scripts/build-admin-site.test.cjs
 
 echo "==> node --test site/build-site.test.cjs"
 node --test site/build-site.test.cjs

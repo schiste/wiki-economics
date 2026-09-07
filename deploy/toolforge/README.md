@@ -560,6 +560,22 @@ package-lock, Node pin, runtime server, vendored dependency, `Procfile`, or
 still requires the attested binary release. These invalidation boundaries are
 reported by the CI `Detect changed areas` job.
 
+Admin-only page changes do not rebuild public dashboards or dashboard
+defaults. After installing the attested site-source release, build the
+isolated admin bundle:
+
+```sh
+ssh login.toolforge.org \
+  'become wiki-economics toolforge jobs run --command /workspace/deploy/toolforge/run-admin-site.sh --image tool-wiki-economics/tool-wiki-economics:latest --filelog --mem 512Mi --cpu 1 --mount all wiki-econ-admin-site'
+```
+
+The bundle is published atomically under `/admin-assets/`, records its own
+receipt, and consumes only the published manifest. It never runs dashboard
+materialization and cannot switch the public site generation. Restart the
+authenticated webservice only when its Node runtime modules or admin-dist
+configuration changed; ordinary `site/src/admin.md` updates need only the
+isolated builder.
+
 ### Rollback
 
 List retained SHAs, switch to one, and restart the webservice:

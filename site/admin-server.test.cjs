@@ -328,6 +328,36 @@ test("hosted mode serves /admin and /admin-api/status when a valid session cooki
   assert.match(pageHtml, /Admin Test Page/);
 });
 
+test("hosted mode serves the isolated admin release without exposing its assets", async (t) => {
+  const adminDist = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-admin-release-test-"));
+  t.after(() => fs.rmSync(adminDist, {recursive: true, force: true}));
+  fs.writeFileSync(path.join(adminDist, "admin.html"), "<!doctype html><h1>Isolated Admin</h1>");
+  fs.mkdirSync(path.join(adminDist, "_observablehq"), {recursive: true});
+  fs.writeFileSync(path.join(adminDist, "_observablehq", "client.js"), "export const isolated=true;");
+  const {module, host} = await startServer(t, {
+    ...HOSTED_ENV,
+    WIKI_ECON_ADMIN_DIST_DIR: adminDist,
+  });
+  const authenticated = {
+    host,
+    cookie: sessionCookie(HOSTED_ENV.WIKI_ECON_ADMIN_SESSION_SECRET),
+  };
+
+  const page = await invoke(module, {url: "/admin", headers: authenticated});
+  assert.equal(page.statusCode, 200);
+  assert.match(page.text(), /Isolated Admin/);
+  const asset = await invoke(module, {url: "/admin-assets/_observablehq/client.js", headers: authenticated});
+  assert.equal(asset.statusCode, 200);
+  assert.match(asset.text(), /isolated=true/);
+  assert.equal(asset.getHeader("cache-control"), "public, max-age=3600");
+
+  const anonymousAsset = await invoke(module, {
+    url: "/admin-assets/_observablehq/client.js",
+    headers: {host},
+  });
+  assert.equal(anonymousAsset.statusCode, 404);
+});
+
 test("hosted mode enforces same-origin checks on mutating admin API requests", async (t) => {
   const { module, host } = await startServer(t, HOSTED_ENV);
   const cookie = sessionCookie(HOSTED_ENV.WIKI_ECON_ADMIN_SESSION_SECRET);

@@ -47,6 +47,7 @@ const DATA_DIR = resolveConfiguredPath("WIKI_ECON_DATA_DIR", "data");
 const OUTPUT_DIR = resolveConfiguredPath("WIKI_ECON_OUTPUT_DIR", "output");
 const GENERATOR_DIR = resolveConfiguredPath("WIKI_ECON_GENERATOR_DIR", path.join("site", "data-build"));
 const SITE_DIST_DIR = resolveConfiguredPath("WIKI_ECON_SITE_DIST_DIR", path.join("site", "dist"));
+const ADMIN_DIST_DIR = resolveConfiguredPath("WIKI_ECON_ADMIN_DIST_DIR", SITE_DIST_DIR);
 const CONFIGURED_BIN = process.env.WIKI_ECON_BIN || "";
 const FLEET_QUEUE_DIR = process.env.WIKI_ECON_FLEET_QUEUE_DIR
   ? resolveConfiguredPath("WIKI_ECON_FLEET_QUEUE_DIR", path.join("output", "_fleet"))
@@ -74,6 +75,7 @@ const DEFAULT_RUNNER = {
 const LEGACY_API_PREFIX = "/api";
 const PROXY_API_PREFIX = "/admin-api";
 const ADMIN_PAGE_PATH = "/admin";
+const ADMIN_ASSET_PREFIX = "/admin-assets";
 const ADMIN_LOGIN_PATH = "/admin/login";
 const ADMIN_LOGOUT_PATH = "/admin/logout";
 const ADMIN_OAUTH_START_PATH = "/admin/oauth/start";
@@ -359,17 +361,20 @@ function staticContentType(filePath) {
 }
 
 function staticCacheControl(pathname) {
-  if (pathname.startsWith("/_observablehq/") || pathname.startsWith("/_npm/")) {
+  const assetPath = pathname.startsWith(`${ADMIN_ASSET_PREFIX}/`)
+    ? pathname.slice(ADMIN_ASSET_PREFIX.length)
+    : pathname;
+  if (assetPath.startsWith("/_observablehq/") || assetPath.startsWith("/_npm/") || assetPath.startsWith("/_import/")) {
     return "public, max-age=3600";
   }
-  if (pathname.startsWith("/_file/")) {
+  if (assetPath.startsWith("/_file/")) {
     return "public, max-age=600";
   }
   return null;
 }
 
 // Mirrors nginx's `try_files $uri $uri.html $uri/ =404` against SITE_DIST_DIR.
-function resolveStaticFile(pathname) {
+function resolveStaticFileFrom(root, pathname) {
   let decoded;
   try {
     decoded = decodeURIComponent(pathname);
@@ -377,8 +382,8 @@ function resolveStaticFile(pathname) {
     return null;
   }
   const relative = decoded.replace(/^\/+/, "");
-  const candidateRoot = path.resolve(SITE_DIST_DIR, relative);
-  if (candidateRoot !== SITE_DIST_DIR && !candidateRoot.startsWith(SITE_DIST_DIR + path.sep)) {
+  const candidateRoot = path.resolve(root, relative);
+  if (candidateRoot !== root && !candidateRoot.startsWith(root + path.sep)) {
     return null;
   }
   const candidates = [candidateRoot, `${candidateRoot}.html`, path.join(candidateRoot, "index.html")];
@@ -392,10 +397,14 @@ function resolveStaticFile(pathname) {
   return null;
 }
 
-function serveStaticAsset(req, res, pathname) {
-  const filePath = resolveStaticFile(pathname);
+function resolveStaticFile(pathname) {
+  return resolveStaticFileFrom(SITE_DIST_DIR, pathname);
+}
+
+function serveStaticAssetFrom(req, res, pathname, root, cachePath = pathname) {
+  const filePath = resolveStaticFileFrom(root, pathname);
   if (!filePath) return false;
-  const cacheControl = staticCacheControl(pathname);
+  const cacheControl = staticCacheControl(cachePath);
   const headers = { "Content-Type": staticContentType(filePath) };
   if (cacheControl) headers["Cache-Control"] = cacheControl;
   res.writeHead(200, headers);
@@ -405,6 +414,10 @@ function serveStaticAsset(req, res, pathname) {
   }
   fs.createReadStream(filePath).pipe(res);
   return true;
+}
+
+function serveStaticAsset(req, res, pathname) {
+  return serveStaticAssetFrom(req, res, pathname, SITE_DIST_DIR);
 }
 
 function loginUrlFor(nextPath = ADMIN_PAGE_PATH) {
@@ -558,7 +571,7 @@ function renderMissingAdminPage() {
 }
 
 function serveAdminPage(res) {
-  const adminHtmlPath = path.join(SITE_DIST_DIR, "admin.html");
+  const adminHtmlPath = path.join(ADMIN_DIST_DIR, "admin.html");
   if (!fs.existsSync(adminHtmlPath)) {
     writeHtml(res, 503, renderMissingAdminPage());
     return;
@@ -1858,6 +1871,20 @@ async function handleRequest(req, res) {
     return;
   }
 
+  if ((req.method === "GET" || req.method === "HEAD")
+      && (url.pathname === ADMIN_ASSET_PREFIX || url.pathname.startsWith(`${ADMIN_ASSET_PREFIX}/`))) {
+    if (AUTH_ENABLED && !session) {
+      res.writeHead(404, {"Cache-Control": "no-store"});
+      res.end("Not found");
+      return;
+    }
+    const assetPath = url.pathname.slice(ADMIN_ASSET_PREFIX.length) || "/";
+    if (serveStaticAssetFrom(req, res, assetPath, ADMIN_DIST_DIR, url.pathname)) return;
+    res.writeHead(404, {"Cache-Control": "no-store"});
+    res.end("Not found");
+    return;
+  }
+
   if (AUTH_ENABLED && req.method === "GET" && url.pathname === ADMIN_LOGIN_PATH) {
     if (session) {
       redirect(res, sanitizeNextPath(url.searchParams.get("next"), ADMIN_PAGE_PATH));
@@ -2634,6 +2661,7 @@ function startServer() {
     console.log(`Output dir: ${OUTPUT_DIR}`);
     console.log(`Generator dir: ${GENERATOR_DIR}`);
     console.log(`Site dist dir: ${SITE_DIST_DIR}`);
+    console.log(`Admin dist dir: ${ADMIN_DIST_DIR}`);
     console.log(`Allowed origins: ${Array.from(ALLOWED_ORIGINS).join(", ")}`);
     console.log(`Auth mode: ${ADMIN_AUTH_MODE}`);
     if (AUTH_ENABLED) {
@@ -2649,11 +2677,13 @@ if (require.main === module) {
 }
 
 module.exports = {
+  ADMIN_ASSET_PREFIX,
   ADMIN_PAGE_PATH,
   FRESHNESS_STATUS_PATH,
   PROXY_API_PREFIX,
   collapseOperationHistory,
   createServer,
   handleRequest,
+  resolveStaticFileFrom,
   startServer,
 };

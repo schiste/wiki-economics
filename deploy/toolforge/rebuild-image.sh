@@ -111,6 +111,7 @@ toolforge envvars create WIKI_ECON_IMAGE_SOURCE_COMMIT "$SOURCE_COMMIT"
 toolforge envvars create WIKI_ECON_IMAGE_DIGEST "$image_digest"
 toolforge envvars create WIKI_ECON_ADMIN_EXECUTION_MODE queue
 toolforge envvars create WIKI_ECON_ADMIN_OPERATION_DIR /data/project/wiki-economics/output/_admin/operations
+toolforge envvars create WIKI_ECON_ADMIN_DIST_DIR /data/project/wiki-economics/admin-dist
 toolforge envvars create WIKI_ECON_WIKI_LIFECYCLE_FILE /data/project/wiki-economics/config/wiki-lifecycle.json
 
 echo "==> Restarting wiki-econ-admin webservice"
