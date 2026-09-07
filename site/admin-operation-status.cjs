@@ -91,6 +91,14 @@ function classifyError(message) {
       remediation: "Run the profile qualification with measured memory, scratch, duration, and deterministic-output evidence before retrying this project.",
     };
   }
+  if (/publication preflight is blocked/i.test(message)) {
+    return {
+      errorSummary: "Publication preflight rejected the current candidate set. The existing public generation remains unchanged.",
+      retryable: false,
+      remediationCode: "publication_preflight_blocked",
+      remediation: "Open the publication workbench for the grouped blockers and change plan. Correct those candidate-level incompatibilities before running preflight again.",
+    };
+  }
   if (/out of memory|oom|memory(?:\.max)?|cannot allocate memory|exceeded.*memory/i.test(message)) {
     return {
       errorSummary: "The run exceeded its safe memory budget.",

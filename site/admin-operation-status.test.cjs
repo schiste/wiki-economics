@@ -132,6 +132,12 @@ test("failure diagnoses prescribe only evidence-backed recovery paths", () => {
     remediationCode: "workload_profile_unqualified",
     remediation: "Run the profile qualification with measured memory, scratch, duration, and deterministic-output evidence before retrying this project.",
   });
+  assert.deepEqual(classifyError("Error: publication preflight is blocked"), {
+    errorSummary: "Publication preflight rejected the current candidate set. The existing public generation remains unchanged.",
+    retryable: false,
+    remediationCode: "publication_preflight_blocked",
+    remediation: "Open the publication workbench for the grouped blockers and change plan. Correct those candidate-level incompatibilities before running preflight again.",
+  });
   assert.equal(classifyError("publication receipt and site generation disagree").remediationCode, "publication_evidence_mismatch");
   assert.equal(classifyError("worker lease heartbeat expired").remediationCode, "fleet_lease_stale");
   assert.equal(classifyError("automatic retries exhausted").remediationCode, "fleet_task_quarantined");

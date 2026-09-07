@@ -8,6 +8,164 @@ export const ADMIN_VIEWS = Object.freeze([
   {id: "quality", label: "Data quality", description: "Metric receipts, anomalies, and merged outputs"}
 ]);
 
+export const PROJECT_PIPELINE_STAGES = Object.freeze([
+  {id: "snapshot", label: "Select snapshot", receiptStages: ["snapshot_validate", "candidate_discovery"]},
+  {id: "source", label: "Fetch history", receiptStages: ["source_window"]},
+  {id: "ingest", label: "Ingest metric input", receiptStages: ["source_window"]},
+  {id: "metrics", label: "Compute core metrics", receiptStages: ["compute"]},
+  {id: "patrol_source", label: "Fetch patrol history", receiptStages: ["patrol_preflight", "patrol_fetch"]},
+  {id: "patrol_metrics", label: "Compute patrol metrics", receiptStages: ["patrol_compute"]},
+  {id: "validation", label: "Validate candidate", receiptStages: ["candidate_validate", "qualification_validate"]},
+  {id: "publication", label: "Publish", receiptStages: []},
+]);
+
+function receiptFor(candidate, names) {
+  const receipts = Array.isArray(candidate?.stages) ? candidate.stages : [];
+  return [...receipts].reverse().find((receipt) => names.includes(receipt.stage)) || null;
+}
+
+function receiptSucceeded(receipt) {
+  return receipt && (receipt.state === "succeeded" || receipt.reused || receipt.skipped);
+}
+
+function laterReceiptSucceeded(candidate, stageIndex) {
+  return PROJECT_PIPELINE_STAGES.slice(stageIndex + 1, -1).some((stage) =>
+    stage.receiptStages.some((name) => receiptSucceeded(receiptFor(candidate, [name]))));
+}
+
+/**
+ * Convert immutable run receipts and publication evidence into one ordered
+ * operator-facing stage ledger. Status is about the selected candidate run;
+ * a healthy older public generation therefore never paints a failed update
+ * green.
+ */
+export function deriveProjectPipelineStages({candidate = null, truth = {}, manifestWiki = {}, lifecycle = null,
+  operationActive = false, publicationPreflight = null} = {}) {
+  const selectedSnapshot = candidate?.selectedSnapshot || candidate?.snapshot || truth.snapshots?.candidate
+    || truth.snapshots?.qualification || truth.snapshots?.published || null;
+  const publishedSnapshot = truth.snapshots?.published || null;
+  const manifestSnapshot = manifestWiki.snapshot?.version || manifestWiki.raw?.version || null;
+  const manifestMatchesSelection = !selectedSnapshot || !manifestSnapshot || manifestSnapshot === selectedSnapshot;
+  const qualificationReady = Boolean(truth.qualification?.structurallyValid);
+  const readyMatches = Boolean(selectedSnapshot && truth.ready?.snapshot === selectedSnapshot);
+  const failedStage = candidate?.failingStage || (candidate?.state === "failed" ? candidate?.stage : null);
+  const activeStage = operationActive ? (candidate?.currentStage || candidate?.stage || null) : null;
+  const blockedRetry = candidate?.retryable === false;
+  const sourceReceipt = receiptFor(candidate, ["source_window"]);
+  const sourceComplete = receiptSucceeded(sourceReceipt)
+    || laterReceiptSucceeded(candidate, 1)
+    || Boolean(manifestMatchesSelection && (manifestWiki.snapshot?.ready || manifestWiki.ingest?.ready));
+  const rawSourceAvailable = manifestMatchesSelection && Number(manifestWiki.raw?.files || 0) > 0;
+  const parquetTotal = Number(manifestWiki.parquet?.total || 0);
+  const ingestComplete = sourceComplete
+    || Boolean(manifestMatchesSelection && manifestWiki.ingest?.ready)
+    || (manifestMatchesSelection && parquetTotal > 0 && Number(manifestWiki.parquet?.done || 0) >= parquetTotal);
+  const candidateMetricComplete = truth.metrics?.candidate?.complete === true;
+  const publishedMetricComplete = truth.metrics?.published?.complete === true;
+  const metricsComplete = receiptSucceeded(receiptFor(candidate, ["compute"]))
+    || laterReceiptSucceeded(candidate, 3)
+    || candidateMetricComplete
+    || (!candidate && publishedMetricComplete);
+  const patrolSourceComplete = receiptSucceeded(receiptFor(candidate, ["patrol_fetch"]))
+    || laterReceiptSucceeded(candidate, 4)
+    || Boolean(manifestMatchesSelection && manifestWiki.patrol?.source_ready);
+  const patrolMetricsComplete = receiptSucceeded(receiptFor(candidate, ["patrol_compute"]))
+    || laterReceiptSucceeded(candidate, 5)
+    || Boolean(manifestMatchesSelection && manifestWiki.patrol?.metric_ready);
+  const validationComplete = receiptSucceeded(receiptFor(candidate, ["candidate_validate", "qualification_validate"]))
+    || readyMatches || qualificationReady;
+  const targetIsPublic = Boolean(selectedSnapshot && publishedSnapshot === selectedSnapshot
+    && lifecycle?.publication === "published" && publishedMetricComplete);
+  const hiddenQualification = lifecycle?.publication === "hidden" && lifecycle?.refresh === "qualification";
+
+  const completed = {
+    snapshot: receiptSucceeded(receiptFor(candidate, ["snapshot_validate"])) || Boolean(selectedSnapshot),
+    source: sourceComplete || rawSourceAvailable || qualificationReady,
+    ingest: ingestComplete || qualificationReady,
+    metrics: metricsComplete || qualificationReady,
+    patrol_source: patrolSourceComplete || qualificationReady,
+    patrol_metrics: patrolMetricsComplete || qualificationReady,
+    validation: validationComplete || qualificationReady,
+    publication: targetIsPublic,
+  };
+  const dependency = {
+    snapshot: true,
+    source: completed.snapshot,
+    ingest: completed.source,
+    metrics: completed.ingest,
+    patrol_source: completed.snapshot,
+    patrol_metrics: completed.patrol_source && completed.metrics,
+    validation: completed.metrics && completed.patrol_metrics,
+    publication: completed.validation,
+  };
+  const failedStageIds = new Set();
+  for (const stage of PROJECT_PIPELINE_STAGES) {
+    if (stage.receiptStages.includes(failedStage)) failedStageIds.add(stage.id);
+  }
+  // source_window is a transaction covering transfer and ingest. If it failed
+  // before a metric-input generation existed, only fetch is the failed stage;
+  // ingest accurately remains waiting on it.
+  if (failedStage === "source_window" && !ingestComplete) failedStageIds.delete("ingest");
+
+  let upstreamBlocked = false;
+  return PROJECT_PIPELINE_STAGES.map((stage) => {
+    const receipt = receiptFor(candidate, stage.receiptStages);
+    const active = stage.receiptStages.includes(activeStage);
+    let status;
+    if (stage.id === "publication" && hiddenQualification) status = "not_applicable";
+    else if (active) status = "running";
+    else if (failedStageIds.has(stage.id)) status = "blocked";
+    else if (completed[stage.id]) status = "complete";
+    else if (stage.id === "publication" && publicationPreflight && !publicationPreflight.eligible) status = "blocked";
+    else if (upstreamBlocked || !dependency[stage.id]) status = "waiting";
+    else status = "ready";
+
+    if (status === "blocked") upstreamBlocked = true;
+    const actionAllowed = !operationActive && !hiddenQualification || stage.id !== "publication";
+    let blockedReason = null;
+    if (operationActive) blockedReason = "Another operation is already active for this project.";
+    else if (blockedRetry && (status === "blocked" || upstreamBlocked)) {
+      blockedReason = candidate?.remediation || "Resolve the recorded failure before starting more work.";
+    } else if (!dependency[stage.id] && status !== "not_applicable") {
+      const previous = PROJECT_PIPELINE_STAGES[Math.max(0, PROJECT_PIPELINE_STAGES.findIndex((item) => item.id === stage.id) - 1)];
+      blockedReason = `Complete ${previous.label.toLowerCase()} first.`;
+    } else if (stage.id === "publication" && hiddenQualification) {
+      blockedReason = "Qualification candidates remain private until they are promoted.";
+    }
+    return {
+      ...stage,
+      status,
+      receipt,
+      selectedSnapshot,
+      publishedSnapshot,
+      actionAllowed: Boolean(actionAllowed && !blockedReason),
+      blockedReason,
+    };
+  });
+}
+
+export function summarizePublicationBlockers(blockers = []) {
+  const incompatible = [];
+  const remaining = [];
+  for (const blocker of blockers) {
+    const match = String(blocker).match(/^(.+?) candidates have incompatible merge schemas or algorithm versions between (.+)$/);
+    if (match) incompatible.push({metric: match[1], boundary: match[2]});
+    else remaining.push(String(blocker));
+  }
+  const summaries = [];
+  if (incompatible.length) {
+    const boundaries = [...new Set(incompatible.map((item) => item.boundary))];
+    summaries.push({
+      code: "incompatible_metric_versions",
+      title: "Candidate generations use incompatible metric versions",
+      detail: `${incompatible.length} metric${incompatible.length === 1 ? "" : "s"} differ across ${boundaries.join("; ")}. Rebuild the older candidates with the current algorithms before publication.`,
+      metrics: incompatible.map((item) => item.metric),
+    });
+  }
+  summaries.push(...remaining.map((detail) => ({code: "publication_blocker", title: "Publication requirement failed", detail, metrics: []})));
+  return summaries;
+}
+
 export function summarizeOperatorStatus(status = {}) {
   const operations = status.adminOperations || {};
   const fleetWork = status.fleet?.work || [];

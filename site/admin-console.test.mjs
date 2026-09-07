@@ -4,12 +4,14 @@ import test from "node:test";
 import {
   applyAdminView,
   createAdaptivePoll,
+  deriveProjectPipelineStages,
   hasActiveAdminWork,
   normalizeAdminView,
   persistOperationReceipts,
   readOperationReceipts,
   reconcileOperationReceipts,
   summarizeOperatorStatus,
+  summarizePublicationBlockers,
   upsertOperationReceipt
 } from "./src/components/admin-console.js";
 
@@ -183,4 +185,80 @@ test("operator summary counts shared causes and qualification decisions instead 
   assert.deepEqual(summary.qualificationReady, [{
     wiki: "dewiki", snapshot: "2026-08", runId: "qualified-dewiki", artifactCount: 10,
   }]);
+});
+
+test("stage ledger keeps an older healthy publication separate from a blocked update", () => {
+  const stages = deriveProjectPipelineStages({
+    lifecycle: {publication: "published", refresh: "scheduled"},
+    candidate: {
+      state: "failed",
+      selectedSnapshot: "2026-08",
+      failingStage: "source_window",
+      retryable: false,
+      remediation: "Qualify the Large profile first.",
+      stages: [
+        {stage: "snapshot_validate", state: "succeeded", durationMs: 91},
+        {stage: "candidate_discovery", state: "succeeded", durationMs: 12},
+        {stage: "source_window", state: "failed", durationMs: 13},
+      ],
+    },
+    truth: {
+      snapshots: {candidate: "2026-08", published: "2026-07"},
+      metrics: {candidate: {complete: false}, published: {complete: true}},
+    },
+    manifestWiki: {raw: {files: 0}, parquet: {done: 0, total: 0}, patrol: {}},
+  });
+
+  assert.deepEqual(stages.map((stage) => [stage.id, stage.status]), [
+    ["snapshot", "complete"],
+    ["source", "blocked"],
+    ["ingest", "waiting"],
+    ["metrics", "waiting"],
+    ["patrol_source", "waiting"],
+    ["patrol_metrics", "waiting"],
+    ["validation", "waiting"],
+    ["publication", "waiting"],
+  ]);
+  assert.equal(stages[1].actionAllowed, false);
+  assert.match(stages[1].blockedReason, /Qualify the Large profile/);
+  assert.equal(stages[7].publishedSnapshot, "2026-07");
+});
+
+test("stage ledger reports a fully validated private qualification without pretending it is published", () => {
+  const stages = deriveProjectPipelineStages({
+    lifecycle: {publication: "hidden", refresh: "qualification"},
+    candidate: {
+      state: "succeeded",
+      selectedSnapshot: "2026-08",
+      stages: [
+        {stage: "source_window", state: "succeeded", durationMs: 100},
+        {stage: "compute", state: "succeeded", durationMs: 200},
+        {stage: "patrol_fetch", state: "succeeded", durationMs: 30},
+        {stage: "patrol_compute", state: "succeeded", durationMs: 40},
+        {stage: "qualification_validate", state: "succeeded", durationMs: 5},
+      ],
+    },
+    truth: {
+      snapshots: {qualification: "2026-08", published: null},
+      qualification: {structurallyValid: true},
+      metrics: {candidate: {complete: true}, published: {complete: false}},
+    },
+    manifestWiki: {snapshot: {ready: true}, ingest: {ready: true}, patrol: {source_ready: 1, metric_ready: 1}},
+  });
+
+  assert.equal(stages.slice(0, 7).every((stage) => stage.status === "complete"), true);
+  assert.equal(stages[7].status, "not_applicable");
+  assert.match(stages[7].blockedReason, /remain private/);
+});
+
+test("publication blocker summary groups repeated schema mismatches", () => {
+  const summary = summarizePublicationBlockers([
+    "gdp candidates have incompatible merge schemas or algorithm versions between afwiki and frwiki",
+    "inequality candidates have incompatible merge schemas or algorithm versions between afwiki and frwiki",
+    "publication recovery audit is not clean",
+  ]);
+  assert.equal(summary.length, 2);
+  assert.deepEqual(summary[0].metrics, ["gdp", "inequality"]);
+  assert.match(summary[0].detail, /2 metrics differ/);
+  assert.equal(summary[1].detail, "publication recovery audit is not clean");
 });
