@@ -27,6 +27,7 @@ async function runAdminBrowserWorkflow({distDir}) {
   let operation = null;
   let statusReadsAfterQueue = 0;
   const apiRequests = [];
+  const apiPayloads = [];
   const {server, origin} = await startServer(distDir, {
     handleRequest(request, response) {
       const url = new URL(request.url, origin || "http://localhost");
@@ -38,7 +39,8 @@ async function runAdminBrowserWorkflow({distDir}) {
       if (url.pathname === "/admin-api/status" && request.method === "GET") {
         if (operation) statusReadsAfterQueue += 1;
         if (operation && statusReadsAfterQueue >= 2) {
-          operation = {...operation, state: "succeeded", stage: "preflight complete",
+          operation = {...operation, state: "succeeded",
+            stage: operation.action === "publication-preflight" ? "preflight complete" : "promotion complete",
             updatedAt: "2026-09-06T12:01:00Z", finishedAt: "2026-09-06T12:01:00Z"};
         }
         const queued = operation?.state === "queued" ? [operation] : [];
@@ -46,6 +48,7 @@ async function runAdminBrowserWorkflow({distDir}) {
         response.setHeader("content-type", "application/json");
         response.end(JSON.stringify({
           manifest,
+          lifecycleRevision: "a".repeat(64),
           runner: {label: "fixture runner"},
           wikiStates: {
             ...(manifest.lifecycle?.wikis || {}),
@@ -110,8 +113,30 @@ async function runAdminBrowserWorkflow({distDir}) {
           requestedAt: "2026-09-06T12:00:00Z",
           updatedAt: "2026-09-06T12:00:00Z"
         };
+        statusReadsAfterQueue = 0;
         response.writeHead(202, {"content-type": "application/json"});
         response.end(JSON.stringify({queued: true, requestId: operation.requestId, operation}));
+        return true;
+      }
+      if (url.pathname === "/admin-api/promote-qualification" && request.method === "POST") {
+        let body = "";
+        request.setEncoding("utf8");
+        request.on("data", (chunk) => { body += chunk; });
+        request.on("end", () => {
+          apiPayloads.push(JSON.parse(body));
+          operation = {
+            requestId: "admin-e2e-promote-dewiki",
+            runId: "admin-e2e-promote-dewiki",
+            wiki: "dewiki",
+            action: "promote-qualification",
+            state: "queued",
+            requestedAt: "2026-09-06T12:00:00Z",
+            updatedAt: "2026-09-06T12:00:00Z"
+          };
+          statusReadsAfterQueue = 0;
+          response.writeHead(202, {"content-type": "application/json"});
+          response.end(JSON.stringify({queued: true, requestId: operation.requestId, operation}));
+        });
         return true;
       }
       return false;
@@ -129,7 +154,7 @@ async function runAdminBrowserWorkflow({distDir}) {
     await cdp.open();
     await Promise.all([cdp.send("Page.enable"), cdp.send("Runtime.enable")]);
     await cdp.send("Page.addScriptToEvaluateOnNewDocument", {
-      source: "globalThis.__adminAlertCalls=0;globalThis.alert=()=>{globalThis.__adminAlertCalls+=1}"
+      source: "globalThis.__adminAlertCalls=0;globalThis.alert=()=>{globalThis.__adminAlertCalls+=1};globalThis.prompt=(message)=>message.match(/Type ([^ ]+ [^ ]+) to continue\\./)?.[1]||null"
     });
     await cdp.send("Page.navigate", {url: `${origin}/admin`});
     await waitFor(cdp, "document.readyState === 'complete'");
@@ -146,7 +171,7 @@ async function runAdminBrowserWorkflow({distDir}) {
     assertContract(initial.selected.length === 1 && initial.selected[0] === "overview", "overview is not the single default view", initial);
     assertContract(initial.visible.every((view) => view.split(' ').includes("overview")), "another focused view leaked into overview", initial);
     assertContract(initial.controlsValid && initial.liveRegion, "tab or receipt accessibility contract is incomplete", initial);
-    await waitFor(cdp, "document.querySelector('#admin-decisions')?.textContent.includes('still hidden')");
+    await waitFor(cdp, "document.querySelector('#admin-decisions')?.textContent.includes('ready for approval')");
     const controlRoom = await evaluate(cdp, `({
       heading: document.querySelector('#admin-control-room')?.textContent,
       decisions: document.querySelector('#admin-decisions')?.textContent,
@@ -154,13 +179,31 @@ async function runAdminBrowserWorkflow({distDir}) {
     })`);
     assertContract(controlRoom.heading?.includes("Nothing is running") && controlRoom.heading.includes("Idle is normal"),
       "the control room does not explain an idle scheduler", controlRoom);
-    assertContract(controlRoom.decisions?.includes("German Wikipedia") && controlRoom.decisions.includes("still hidden"),
+    assertContract(controlRoom.decisions?.includes("German Wikipedia") && controlRoom.decisions.includes("ready for approval")
+      && controlRoom.decisions.includes("Approve & schedule"),
       "the qualification decision is not visible from the control room", controlRoom);
     assertContract(controlRoom.decisions?.includes("One setup constraint affects 5 projects")
       && controlRoom.decisions.includes("not 5 separate data failures"),
       "the shared setup constraint still looks like separate project failures", controlRoom);
     assertContract(controlRoom.primaryAction === "Start or update a project",
       "the primary run launcher is not visible from the control room", controlRoom);
+
+    const promotionControl = await evaluate(cdp, `(() => {
+      const button = Array.from(document.querySelectorAll('#admin-decisions button')).find(node => node.textContent.includes('Approve & schedule'));
+      return {found: Boolean(button), disabled: button?.disabled, label: button?.textContent.trim()};
+    })()`);
+    assertContract(promotionControl.found && !promotionControl.disabled,
+      "the completed qualification has no enabled primary promotion action", promotionControl);
+    await evaluate(cdp, "Array.from(document.querySelectorAll('#admin-decisions button')).find(button => button.textContent.includes('Approve & schedule')).click()");
+    await waitFor(cdp, "JSON.parse(localStorage.getItem('wiki-economics.admin.operation-receipts.v1') || '[]').some(entry => entry.requestId === 'admin-e2e-promote-dewiki' && entry.state === 'succeeded')", 10000);
+    assertContract(apiRequests.includes("POST /admin-api/promote-qualification"),
+      "the qualification decision did not submit the exact promotion operation", apiRequests);
+    assertContract(apiPayloads.some((payload) => payload.wiki === "dewiki"
+      && payload.version === "2026-08"
+      && payload.qualificationRunId === "qualified-dewiki"
+      && payload.refresh === "scheduled"
+      && payload.lifecycleRevision === "a".repeat(64)),
+    "the promotion request omitted an immutable qualification or lifecycle identity", apiPayloads);
 
     await evaluate(cdp, "Array.from(document.querySelectorAll('.admin-command-actions button')).find(button => button.textContent.includes('Start or update a project')).click()");
     await waitFor(cdp, "document.querySelector('[data-admin-view-tab=wikis]').getAttribute('aria-selected') === 'true'");
@@ -208,15 +251,16 @@ async function runAdminBrowserWorkflow({distDir}) {
       "Fetch patrol history", "Compute patrol metrics", "Validate candidate", "Publish",
     ].join("|"), "the project stage ledger does not match the real pipeline order", stageLedger);
     assertContract(stageLedger.statuses.slice(0, 7).every((status) => status === "Complete")
-      && stageLedger.statuses[7] === "Private", "qualified evidence is not represented accurately by stage", stageLedger);
-    assertContract(stageLedger.actions.length === 8 && stageLedger.actions.at(-1).disabled,
+      && stageLedger.statuses[7] === "Approval needed", "qualified evidence is not represented accurately by stage", stageLedger);
+    assertContract(stageLedger.actions.length === 8 && !stageLedger.actions.at(-1).disabled
+      && stageLedger.actions.at(-1).label === "Approve & schedule",
       "each pipeline stage does not expose an appropriately gated control", stageLedger);
     assertContract(stageLedger.horizontalOverflow <= 16, "expanded stage controls overflow the desktop viewport", stageLedger);
 
     await evaluate(cdp, "document.querySelector('[data-admin-view-tab=overview]').click()");
     await waitFor(cdp, "Array.from(document.querySelectorAll('button')).some(button => button.textContent.includes('Run publication preflight') && !button.disabled)");
     await evaluate(cdp, "Array.from(document.querySelectorAll('button')).find(button => button.textContent.includes('Run publication preflight')).click()");
-    await waitFor(cdp, "document.body.textContent.includes('Succeeded') && document.body.textContent.includes('preflight complete')", 10000);
+    await waitFor(cdp, "JSON.parse(localStorage.getItem('wiki-economics.admin.operation-receipts.v1') || '[]').some(entry => entry.requestId === 'admin-e2e-preflight' && entry.state === 'succeeded')", 10000);
     const receipt = await evaluate(cdp, `({
       text: document.querySelector('.admin-operation-receipt')?.textContent,
       stored: JSON.parse(localStorage.getItem('wiki-economics.admin.operation-receipts.v1') || '[]'),

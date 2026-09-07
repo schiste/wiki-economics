@@ -16,6 +16,7 @@ import {
   persistOperationReceipts,
   readOperationReceipts,
   reconcileOperationReceipts,
+  summarizePipelineIssues,
   summarizePublicationBlockers,
   summarizeOperatorStatus,
   upsertOperationReceipt
@@ -710,20 +711,11 @@ const hasSelectedWiki = selectedWiki !== "—"
 
 ```js
 const attentionStates = new Set(["stalled", "quarantined", "interrupted", "failed"])
-const attentionCount = wikiEntries.filter(([name, wiki]) => attentionStates.has(operationalState(name, wiki))).length
-const publicIssueCount = (operationalTruth.public?.alerts || []).length
-const infrastructureIssueCount = (operationalTruth.infrastructure?.issues || []).length
 const blockerGroupCount = operationalTruth.pipeline?.blockerGroups?.length || 0
-const groupedPipelineCodes = new Set(["candidate_failed", "candidate_ready_not_published"])
-const ungroupedPipelineIssueCount = (operationalTruth.pipeline?.issues || [])
-  .filter((issue) => !groupedPipelineCodes.has(issue.code)).length
-const readyCandidateIssueCount = (operationalTruth.pipeline?.issues || [])
-  .some((issue) => issue.code === "candidate_ready_not_published") ? 1 : 0
-const operatorIssueCount = publicIssueCount
-  + blockerGroupCount
-  + readyCandidateIssueCount
-  + ungroupedPipelineIssueCount
-  + infrastructureIssueCount
+const pipelineIssueSummaries = summarizePipelineIssues(
+  operationalTruth.pipeline?.issues || [],
+  operationalTruth.pipeline?.blockerGroups || []
+)
 const activeRunKeys = new Set([
   ...(inlineRunningJob ? [`run:${inlineRunningJob.runId || inlineRunningJob.wiki || "direct"}`] : []),
   ...(fleet.work || []).filter((entry) => entry.state === "running").map((entry) => `fleet:${entry.taskId || entry.wiki}`),
@@ -748,6 +740,52 @@ function showAdminArea(viewName, targetId = null, focusSelector = null) {
 function inspectProject(name) {
   setSelectedWiki(name)
   showAdminArea("wikis", "admin-view-wikis")
+}
+
+function typedOperatorConfirmation(summary, token) {
+  const entered = prompt(`${summary}\n\nType ${token} to continue.`)
+  return entered === token
+}
+
+function activeOperatorOperationForWiki(name) {
+  const operation = operatorOperationByWiki.get(name)
+  return operation && ["queued", "waiting_upstream", "running", "cancelling"].includes(operation.state)
+    ? operation
+    : null
+}
+
+function promoteQualification(name, qualification, options = {}) {
+  const lifecycle = lifecycleStates[name]
+  if (!qualification?.structurallyValid || !lifecycleRevision || !lifecycle) {
+    recordOperationReceipt({
+      state: "failed",
+      action: "promote-qualification",
+      title: `${name} was not promoted`,
+      detail: "A valid qualification receipt and current lifecycle revision are required. Refresh the page before retrying."
+    })
+    return
+  }
+  const refresh = options.refresh || "scheduled"
+  const resourceClass = options.resourceClass || lifecycle.fleet_resource_class || qualification.resourceClass || "medium_large"
+  const freshnessSlaDays = Number(options.freshnessSlaDays || lifecycle.freshness_sla_days || 14)
+  const currentBlockers = operationalTruth.public?.publication?.preflight?.blockers?.length || 0
+  const publicationNote = currentBlockers
+    ? ` The current fleet publication has ${currentBlockers} preflight blocker${currentBlockers === 1 ? "" : "s"}; promotion is still safe, but dewiki will remain private until those blockers are corrected and publication succeeds.`
+    : " Promotion prepares the exact candidate; the public site changes only after a passing fleet-wide publication."
+  const token = `promote ${name}`
+  if (!typedOperatorConfirmation(
+    `Approve ${qualification.runId} at ${qualification.snapshot}, make ${name} a managed ${refresh} project, and queue it for publication.${publicationNote}`,
+    token
+  )) return
+  runCommand("promote-qualification", {
+    wiki: name,
+    version: qualification.snapshot,
+    qualificationRunId: qualification.runId,
+    lifecycleRevision,
+    refresh,
+    resourceClass,
+    freshnessSlaDays
+  })
 }
 
 display(html`<div class="admin-command-header">
@@ -795,11 +833,16 @@ display(html`<div class="admin-control-grid">
   </section>
   <section id="admin-decisions" class="admin-decision-panel" aria-labelledby="admin-decisions-title">
     <header><div><span>Operator decisions</span><h3 id="admin-decisions-title">${operatorSummary.decisionCount ? `${operatorSummary.decisionCount} ${operatorSummary.decisionCount === 1 ? "decision" : "decisions"} waiting` : "No decision needed"}</h3></div></header>
-    ${operatorSummary.qualificationReady.map((qualification) => html`<article class="admin-decision-item ready">
+    ${operatorSummary.qualificationReady.map((qualification) => {
+      const activePromotion = activeOperatorOperationForWiki(qualification.wiki)
+      return html`<article class="admin-decision-item ready">
       <i aria-hidden="true"></i>
-      <div><strong>${wikipediaProjectLabel(qualification.wiki)} passed qualification</strong><span>Snapshot ${qualification.snapshot || "unknown"} · ${qualification.artifactCount} validated artifacts · still hidden from the public site.</span></div>
-      <button class="admin-btn" onclick=${() => inspectProject(qualification.wiki)}>Review and promote</button>
-    </article>`)}
+      <div><strong>${wikipediaProjectLabel(qualification.wiki)} is ready for approval</strong><span>Processing is complete: snapshot ${qualification.snapshot || "unknown"} has ${qualification.artifactCount} validated artifacts. Approval creates a managed candidate; the site changes only after publication passes.</span></div>
+      <div class="admin-decision-actions">
+        <button class="admin-btn primary" ?disabled=${!apiStatus || !lifecycleRevision || Boolean(activePromotion)} onclick=${() => promoteQualification(qualification.wiki, operationalWikiTruth[qualification.wiki]?.qualification)}>${activePromotion ? operationLabel(activePromotion.state) : "Approve & schedule"}</button>
+        <button class="admin-btn" onclick=${() => inspectProject(qualification.wiki)}>Inspect evidence</button>
+      </div>
+    </article>`})}
     ${operatorSummary.blockerGroups.map((blocker) => html`<article class="admin-decision-item blocked">
       <i aria-hidden="true"></i>
       <div><strong>One setup constraint affects ${blocker.affectedWikis?.length || 0} projects</strong><span>${blocker.summary} Public versions remain online; these are not ${blocker.affectedWikis?.length || 0} separate data failures.</span><small><b>Required next step:</b> ${blocker.remediation}</small></div>
@@ -1158,20 +1201,15 @@ const blockerAlerts = (operationalTruth.pipeline?.blockerGroups || []).map((bloc
   severity: "critical",
   message: `${blocker.affectedWikis.length} projects (${blocker.affectedWikis.join(", ")}) are paused by one cause: ${blocker.summary} Next step: ${blocker.remediation}`
 }))
-const readyNotPublished = (operationalTruth.pipeline?.issues || []).filter((alert) => alert.code === "candidate_ready_not_published")
-const readyAlert = readyNotPublished.length ? [{
-  domain: "Pipeline",
-  code: "candidates_waiting_for_publication",
-  severity: "warning",
-  message: `${readyNotPublished.length} validated candidates are ready but cannot be published until the shared blockers are resolved and preflight passes.`
-}] : []
 const operationalAlerts = [
   ...(operationalTruth.public?.alerts || []).map((alert) => ({...alert, domain: "Public data"})),
   ...blockerAlerts,
-  ...readyAlert,
-  ...(operationalTruth.pipeline?.issues || [])
-    .filter((alert) => !["candidate_failed", "candidate_ready_not_published"].includes(alert.code))
-    .map((alert) => ({...alert, domain: "Pipeline"})),
+  ...pipelineIssueSummaries.map((summary) => ({
+    domain: summary.code === "data_quality_findings" ? "Data quality" : "Pipeline",
+    code: summary.code,
+    severity: summary.severity,
+    message: `${summary.title}. ${summary.detail}`
+  })),
   ...(operationalTruth.infrastructure?.issues || []).map((alert) => ({...alert, domain: "Infrastructure"}))
 ].sort((left, right) => (left.severity === "critical" ? 0 : 1) - (right.severity === "critical" ? 0 : 1))
 const publicationOps = operationalTruth.public?.publication || {}
@@ -1584,17 +1622,11 @@ function evidenceItems(name, wiki, lifecycle, direct, fleetWork, plan) {
   ]
 }
 
-function typedOperatorConfirmation(summary, token) {
-  const entered = prompt(`${summary}\n\nType ${token} to continue.`)
-  return entered === token
-}
-
 function lifecycleControls(name, lifecycle, direct) {
   if (!lifecycle) return ""
   const truth = operationalWikiTruth[name] || {}
   const operationActive = ["queued", "waiting_upstream", "running", "cancelling"].includes(direct?.state) || direct?.running
-  const registryBusy = Boolean(job?.running || adminOperations.counts?.running || adminOperations.counts?.queued)
-  const controlsDisabled = !apiStatus || operationActive || registryBusy || !lifecycleRevision
+  const controlsDisabled = !apiStatus || operationActive || !lifecycleRevision
   const resourceSelect = html`<select class="admin-lifecycle-select" aria-label=${`${name} resource class`}>
     ${[
       ["Small", "small"],
@@ -1621,19 +1653,11 @@ function lifecycleControls(name, lifecycle, direct) {
         </div>
         <div class="admin-lifecycle-policy">${refreshSelect}${resourceSelect}${slaInput}</div>
         <div class="admin-lifecycle-actions">
-          <button class="admin-btn primary" title=${actionTooltipWithApi("promote-qualification", apiStatus)} ?disabled=${controlsDisabled} onclick=${() => {
-            const token = `promote ${name}`
-            if (!typedOperatorConfirmation(`Promote qualification ${qualification.runId} at ${qualification.snapshot}. Lifecycle changes only after the immutable candidate is validated.`, token)) return
-            runCommand("promote-qualification", {
-              wiki: name,
-              version: qualification.snapshot,
-              qualificationRunId: qualification.runId,
-              lifecycleRevision,
+          <button class="admin-btn primary" title=${actionTooltipWithApi("promote-qualification", apiStatus)} ?disabled=${controlsDisabled} onclick=${() => promoteQualification(name, qualification, {
               refresh: refreshSelect.value,
               resourceClass: resourceSelect.value,
               freshnessSlaDays: Number(slaInput.value)
-            })
-          }}>Promote exact qualification</button>
+            })}>Approve exact qualification</button>
         </div>` : html`<p class="admin-lifecycle-empty">No structurally valid qualification receipt is available. Complete or resume qualification before promotion.</p>`}
     </section>`
   }
@@ -1732,14 +1756,17 @@ function pipelineStageEvidence(name, wiki, stage, truth, direct) {
   if (stage.id === "patrol_metrics") return wiki.patrol?.metric_ready ? "Patrol metric receipt verified" : "No verified patrol metric receipt"
   if (stage.id === "validation") return truth?.qualification?.structurallyValid ? "Private qualification accepted" : truth?.ready?.snapshot === stage.selectedSnapshot ? "Ready-index identity verified" : "Candidate gate has not passed"
   if (stage.id === "publication") {
-    if (stage.status === "not_applicable") return "Hidden until explicit promotion"
+    if (truth?.lifecycle?.publication === "hidden" && truth?.qualification?.structurallyValid) {
+      const blockers = publicationBlockerSummaries.length
+      return `Qualification accepted · approval available${blockers ? ` · ${blockers} fleet publication blocker${blockers === 1 ? "" : "s"} remains` : ""}`
+    }
     if (stage.publishedSnapshot === stage.selectedSnapshot) return `Snapshot ${stage.publishedSnapshot} is live`
     return `${stage.publishedSnapshot || "No snapshot"} live · ${stage.selectedSnapshot || "no candidate"} selected`
   }
   return "No receipt evidence"
 }
 
-function pipelineStageAction(name, stage, lifecycle, operationActive, candidate) {
+function pipelineStageAction(name, stage, lifecycle, operationActive, candidate, truth) {
   const isQualification = lifecycle?.publication === "hidden" && lifecycle?.refresh === "qualification"
   const commonDisabled = !apiStatus || operationActive || !stage.actionAllowed
   const selectedVersion = stage.selectedSnapshot || preferredSnapshotVersion()
@@ -1756,8 +1783,10 @@ function pipelineStageAction(name, stage, lifecycle, operationActive, candidate)
   if (stage.id === "patrol_metrics") return html`<button class="admin-btn small" ?disabled=${commonDisabled} title=${stage.blockedReason || actionTooltipWithApi("patrol-compute", apiStatus)} onclick=${() => runCommand("patrol-compute", name)}>Compute patrol</button>`
   if (stage.id === "validation") return html`<button class="admin-btn small" ?disabled=${commonDisabled} title=${stage.blockedReason || actionTooltipWithApi(isQualification ? "qualify" : "run", apiStatus)} onclick=${() => runCommand(isQualification ? "qualify" : "run", {wiki: name, version: selectedVersion})}>Run through checks</button>`
   if (stage.id === "publication") {
+    if (isQualification && truth?.qualification?.structurallyValid) {
+      return html`<button class="admin-btn small primary" ?disabled=${commonDisabled} title=${stage.blockedReason || "Approve this exact qualification and schedule future updates."} onclick=${() => promoteQualification(name, truth.qualification)}>Approve &amp; schedule</button>`
+    }
     const button = html`<button class="admin-btn small" onclick=${() => showAdminArea("overview", "admin-publication-workbench")}>Review publication</button>`
-    button.disabled = stage.status === "not_applicable"
     button.title = stage.blockedReason || "Open the fleet-wide publication preflight and change plan."
     return button
   }
@@ -1808,9 +1837,9 @@ function pipelineDossier(name, wiki, state, lifecycle, direct, fleetWork, plan) 
       <ol>
         ${stageRows.map((stage) => html`<li class=${`admin-stage-row ${stage.status}`}>
           <span class="admin-stage-number" aria-hidden="true">${String(stageRows.indexOf(stage) + 1).padStart(2, "0")}</span>
-          <span class="admin-stage-status"><i aria-hidden="true"></i>${pipelineStageLabels[stage.status] || stage.status}</span>
+          <span class="admin-stage-status"><i aria-hidden="true"></i>${stage.id === "publication" && isQualification && stage.status === "ready" ? "Approval needed" : pipelineStageLabels[stage.status] || stage.status}</span>
           <span class="admin-stage-copy"><strong>${stage.label}</strong><small>${pipelineStageDescriptions[stage.id]}</small><em>${pipelineStageEvidence(name, wiki, stage, truth, direct)}</em>${stage.blockedReason ? html`<b>${stage.blockedReason}</b>` : ""}</span>
-          <span class="admin-stage-action">${pipelineStageAction(name, stage, lifecycle, operationActive, stageCandidate)}</span>
+          <span class="admin-stage-action">${pipelineStageAction(name, stage, lifecycle, operationActive, stageCandidate, truth)}</span>
         </li>`)}
       </ol>
     </section>
@@ -1822,7 +1851,10 @@ function pipelineDossier(name, wiki, state, lifecycle, direct, fleetWork, plan) 
         ${allowedActions.length ? allowedActions.map((action) => html`<button class="admin-btn ${action.id === "quarantine-retry" ? "danger" : ""}" ?disabled=${!apiStatus} onclick=${() => executeAllowedAction({...action, wiki: action.wiki || name, taskId: action.taskId || fleetWork?.taskId})}>${action.label}</button>`) : html`<span class="admin-action-blocked">No automated retry is safe. Complete the stated remediation first.</span>`}
         ${direct?.requestId && state === "stalled" ? html`<button class="admin-btn" ?disabled=${!apiStatus} onclick=${() => runCommand("recover-admin")}>Recover operator queue</button>` : ""}
       ` : state === "qualified" ? html`
-        <span class="admin-action-blocked">No processing is required. Review the qualification evidence below, then promote it explicitly when it is ready to become managed data.</span>
+        <div class="admin-qualified-next">
+          <span><strong>Processing is complete.</strong> Approve this exact qualification to create a managed candidate and schedule future updates.</span>
+          <button class="admin-btn primary" ?disabled=${!apiStatus || !lifecycleRevision || operationActive} onclick=${() => promoteQualification(name, truth.qualification)}>Approve &amp; schedule ${name}</button>
+        </div>
       ` : html`
         <button class="admin-btn primary" ?disabled=${!apiStatus || operationActive}
           onclick=${() => {
@@ -3390,6 +3422,7 @@ Array.isArray(currentManifest.merged) && currentManifest.merged.length > 0
 .admin-decision-item span,
 .admin-decision-item small { max-width: 68ch; color: var(--theme-foreground-muted); font-size: 0.71rem; line-height: 1.45; }
 .admin-decision-item small b { color: var(--theme-foreground); }
+.admin-decision-actions { display: flex !important; flex-wrap: wrap; justify-content: flex-end; gap: 0.35rem !important; }
 .admin-projects-toolbar {
   display: flex;
   align-items: center;
@@ -3608,6 +3641,17 @@ Array.isArray(currentManifest.merged) && currentManifest.merged.length > 0
 .admin-stage-copy b { margin-top: 0.1rem; color: #a62e27; font-size: 0.66rem; font-weight: 700; line-height: 1.4; }
 .admin-stage-action { display: flex; justify-content: flex-end; }
 .admin-stage-action .admin-btn { min-width: 8.5rem; }
+.admin-qualified-next {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  width: 100%;
+  padding: 0.7rem 0.8rem;
+  border-left: 3px solid #2e7d32;
+  background: color-mix(in srgb, #2e7d32 6%, transparent);
+}
+.admin-qualified-next span { max-width: 66ch; font-size: 0.72rem; line-height: 1.45; }
 .admin-dossier-facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); margin: 0; border-top: 1px solid var(--theme-foreground-faintest); }
 .admin-dossier-facts > div { min-width: 0; padding: 0.7rem 0.8rem; border-left: 1px solid var(--theme-foreground-faintest); border-bottom: 1px solid var(--theme-foreground-faintest); }
 .admin-dossier-facts > div:nth-child(3n + 1) { border-left: 0; }
@@ -3803,6 +3847,10 @@ Array.isArray(currentManifest.merged) && currentManifest.merged.length > 0
   .admin-quality-table td { border-top: 0; padding: 0.35rem 0.5rem; }
   .admin-quality-table td::before { content: attr(data-label); display: block; color: var(--theme-foreground-muted); font-size: 0.65rem; margin-bottom: 0.25rem; }
   .admin-command-facts { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .admin-decision-item { grid-template-columns: 0.75rem minmax(0, 1fr); }
+  .admin-decision-actions { grid-column: 2; justify-content: flex-start; }
+  .admin-qualified-next { align-items: stretch; flex-direction: column; }
+  .admin-qualified-next .admin-btn { min-height: 44px; }
   .admin-command-facts > div:nth-child(3) { border-left: 0; }
   .admin-command-facts > div:nth-child(n+3) { border-top: 1px solid var(--admin-line); }
   .admin-command-actions { display: grid; grid-template-columns: 1fr; }

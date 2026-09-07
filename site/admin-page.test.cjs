@@ -52,7 +52,8 @@ test("control room makes starting work, idle workers, and pending decisions expl
   assert.match(source, /Choose a project and start work/);
   assert.match(source, /Idle is normal/);
   assert.match(source, /scheduled workers sleep between checks/);
-  assert.match(source, /Review and promote/);
+  assert.match(source, /Approve &amp; schedule/);
+  assert.match(source, /Inspect evidence/);
   assert.match(source, /The request is durable and resumable/);
 });
 
@@ -95,7 +96,7 @@ test("quality ledger exposes receipt evidence, candidate deltas, and anomaly sig
 });
 
 test("lifecycle console exposes safe policy, promotion, rebuild, and retirement controls", () => {
-  assert.match(source, /Promote exact qualification/);
+  assert.match(source, /Approve exact qualification/);
   assert.match(source, /Pause scheduling/);
   assert.match(source, /Resume scheduling/);
   assert.match(source, /Save resource &amp; SLA policy/);
@@ -148,5 +149,7 @@ test("project dossiers expose receipt-backed controls for every pipeline stage",
     "Fetch patrol history", "Compute patrol metrics", "Validate candidate", "Publish",
   ]) assert.match(`${source}\n${consoleSource}`, new RegExp(label));
   assert.match(source, /Buttons are disabled when an upstream invariant makes the action unsafe/);
+  assert.match(source, /Processing is complete/);
+  assert.match(source, /promoteQualification/);
   assert.doesNotMatch(source, /Advanced stage controls/);
 });
