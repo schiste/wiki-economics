@@ -1181,7 +1181,10 @@ test("admin dispatcher claims and completes one queued operation", async (t) => 
   process.env.WIKI_ECON_ADMIN_OPERATION_DIR = operationRoot;
   process.env.WIKI_ECON_BIN = "/usr/bin/true";
   const dispatcher = require(dispatcherPath);
-  const completed = await dispatcher.run();
+  const dispatched = await dispatcher.run();
+  assert.equal(dispatched[0].state, "dispatched");
+  assert.equal(dispatched[0].workerResourceClass, "small");
+  const completed = await dispatcher.runWorker("small");
   if (previousRoot == null) delete process.env.WIKI_ECON_ADMIN_OPERATION_DIR;
   else process.env.WIKI_ECON_ADMIN_OPERATION_DIR = previousRoot;
   if (previousBin == null) delete process.env.WIKI_ECON_BIN;
@@ -1313,7 +1316,9 @@ test("admin dispatcher commits lifecycle only after qualification promotion succ
   process.env.WIKI_ECON_BIN = "/usr/bin/true";
   delete require.cache[dispatcherPath];
   const dispatcher = require(dispatcherPath);
-  const completed = await dispatcher.run();
+  const dispatched = await dispatcher.run();
+  assert.equal(dispatched[0].priority, 2);
+  const completed = await dispatcher.runWorker("small");
   for (const [key, value] of Object.entries(previous)) {
     if (value == null) delete process.env[key];
     else process.env[key] = value;
@@ -1356,7 +1361,9 @@ test("admin dispatcher records upstream dump waits without reporting a pipeline 
   process.env.WIKI_ECON_ADMIN_OPERATION_DIR = operationRoot;
   process.env.WIKI_ECON_BIN = binary;
   const dispatcher = require(dispatcherPath);
-  const completed = await dispatcher.run();
+  const dispatched = await dispatcher.run();
+  assert.equal(dispatched[0].workerResourceClass, "medium_large");
+  const completed = await dispatcher.runWorker("medium_large");
   if (previousRoot == null) delete process.env.WIKI_ECON_ADMIN_OPERATION_DIR;
   else process.env.WIKI_ECON_ADMIN_OPERATION_DIR = previousRoot;
   if (previousBin == null) delete process.env.WIKI_ECON_BIN;

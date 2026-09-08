@@ -7,7 +7,7 @@
     "small": 2147483648,
     "medium_large": 6442450944,
     "isolated": 6442450944,
-    "admin_dispatcher": 6442450944,
+    "admin_dispatcher": 536870912,
     "publisher": 6442450944,
     "scrubber": 2147483648
   },

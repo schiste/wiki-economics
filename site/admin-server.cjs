@@ -815,9 +815,20 @@ function operationDirectories() {
     running: path.join(ADMIN_OPERATION_DIR, "running"),
     history: path.join(ADMIN_OPERATION_DIR, "history"),
     logs: path.join(ADMIN_OPERATION_DIR, "logs"),
+    dispatched: path.join(ADMIN_OPERATION_DIR, "dispatched"),
   };
   for (const directory of Object.values(directories)) fs.mkdirSync(directory, { recursive: true });
+  fs.mkdirSync(path.join(directories.dispatched, "small"), {recursive: true});
+  fs.mkdirSync(path.join(directories.dispatched, "medium_large"), {recursive: true});
   return directories;
+}
+
+function dispatchedOperationEntries(directories, limit = ADMIN_JOB_HISTORY_LIMIT) {
+  return ["small", "medium_large"]
+    .flatMap((resourceClass) => operationEntries(path.join(directories.dispatched, resourceClass), limit)
+      .map((entry) => ({...entry, state: "dispatched", workerResourceClass: resourceClass})))
+    .sort((left, right) => Date.parse(left.requestedAt || 0) - Date.parse(right.requestedAt || 0))
+    .slice(0, limit);
 }
 
 function operationLogTail(logPath, maxBytes = 64 * 1024) {
@@ -948,7 +959,10 @@ function recoverStaleAdminOperations() {
 
 function readAdminOperations() {
   const directories = operationDirectories();
-  const queued = operationEntries(directories.queued)
+  const queued = [
+    ...operationEntries(directories.queued),
+    ...dispatchedOperationEntries(directories),
+  ]
     .sort((left, right) => Date.parse(left.requestedAt || 0) - Date.parse(right.requestedAt || 0));
   const running = operationEntries(directories.running);
   const recent = collapseOperationHistory(
@@ -964,7 +978,11 @@ function readAdminOperations() {
   }));
   return {
     executionMode: ADMIN_EXECUTION_MODE,
-    counts: {queued: queued.length, running: running.length},
+    counts: {
+      queued: queued.filter((entry) => entry.state !== "dispatched").length,
+      dispatched: queued.filter((entry) => entry.state === "dispatched").length,
+      running: running.length,
+    },
     dispatcher: {
       kind: ADMIN_EXECUTION_MODE === "queue" ? "scheduled-single-flight" : "direct",
       minuteSlotsUtc: ADMIN_DISPATCH_MINUTES,
@@ -993,6 +1011,7 @@ function queueAdminOperation({
   const active = [
     ...operationEntries(directories.running, Number.MAX_SAFE_INTEGER),
     ...operationEntries(directories.queued, Number.MAX_SAFE_INTEGER),
+    ...dispatchedOperationEntries(directories, Number.MAX_SAFE_INTEGER),
   ];
   const sameScope = (entry) => wiki ? entry.wiki === wiki : entry.wiki == null;
   const conflict = active.find(sameScope);
@@ -1055,12 +1074,19 @@ function queueAdminOperation({
 
 function cancelAdminOperation({requestId, wiki}) {
   const directories = operationDirectories();
-  const queued = operationEntries(directories.queued, Number.MAX_SAFE_INTEGER);
+  const queuedLocations = [
+    {directory: directories.queued, entries: operationEntries(directories.queued, Number.MAX_SAFE_INTEGER)},
+    ...["small", "medium_large"].map((resourceClass) => {
+      const directory = path.join(directories.dispatched, resourceClass);
+      return {directory, entries: operationEntries(directory, Number.MAX_SAFE_INTEGER)};
+    }),
+  ];
+  const queued = queuedLocations.flatMap(({directory, entries}) => entries.map((entry) => ({...entry, directory})));
   const running = operationEntries(directories.running, Number.MAX_SAFE_INTEGER);
   const matches = (entry) => requestId ? entry.requestId === requestId : wiki && entry.wiki === wiki;
   const queuedRequest = queued.find(matches);
   if (queuedRequest) {
-    const source = path.join(directories.queued, `${queuedRequest.requestId}.json`);
+    const source = path.join(queuedRequest.directory, `${queuedRequest.requestId}.json`);
     const cancelled = {
       ...queuedRequest,
       state: "cancelled",

@@ -5,6 +5,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 const {spawn} = require("node:child_process");
 const {summarizeOperationLog} = require("../../site/admin-operation-status.cjs");
+const {compareOperations, operationPriority, resourceClassFor} = require("./admin-operation-policy.cjs");
 const {
   applyLifecycleMutation,
   immutableAuditEvent,
@@ -41,8 +42,11 @@ function directories() {
     running: path.join(OPERATION_DIR, "running"),
     history: path.join(OPERATION_DIR, "history"),
     logs: path.join(OPERATION_DIR, "logs"),
+    dispatched: path.join(OPERATION_DIR, "dispatched"),
   };
   for (const directory of Object.values(result)) fs.mkdirSync(directory, {recursive: true});
+  fs.mkdirSync(path.join(result.dispatched, "small"), {recursive: true});
+  fs.mkdirSync(path.join(result.dispatched, "medium_large"), {recursive: true});
   return result;
 }
 
@@ -183,14 +187,21 @@ function validateRequest(request) {
   return request;
 }
 
-function claimNextOperation() {
+function sortedRequests(directory) {
+  return fs.readdirSync(directory)
+    .filter((name) => name.endsWith(".json"))
+    .map((name) => ({name, request: readJson(path.join(directory, name))}))
+    .sort((left, right) => compareOperations(left.request, right.request));
+}
+
+function claimNextOperation(sourceDirectory = null) {
   const dirs = directories();
-  const names = fs.readdirSync(dirs.queued).filter((name) => name.endsWith(".json")).sort();
-  for (const name of names) {
-    const queuedPath = path.join(dirs.queued, name);
+  const source = sourceDirectory || dirs.queued;
+  const entries = sortedRequests(source);
+  for (const {name, request} of entries) {
+    const queuedPath = path.join(source, name);
     const runningPath = path.join(dirs.running, name);
-    const queued = readJson(queuedPath);
-    const notBefore = Date.parse(queued?.notBefore || 0);
+    const notBefore = Date.parse(request?.notBefore || 0);
     if (Number.isFinite(notBefore) && notBefore > Date.now()) continue;
     try {
       fs.renameSync(queuedPath, runningPath);
@@ -201,6 +212,53 @@ function claimNextOperation() {
     return {dirs, runningPath, request: readJson(runningPath)};
   }
   return null;
+}
+
+function failInvalidClaim(claim, error) {
+  const invalid = {
+    ...(claim.request || {schemaVersion: 1, requestId: path.basename(claim.runningPath, ".json")}),
+    state: "failed",
+    error: error.message,
+    exitCode: 2,
+    finishedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  atomicWriteJson(path.join(claim.dirs.history, `${Date.now()}-${invalid.requestId}.json`), invalid);
+  fs.unlinkSync(claim.runningPath);
+  return invalid;
+}
+
+function dispatchClaim(claim) {
+  let request;
+  try {
+    request = validateRequest(claim.request);
+  } catch (error) {
+    return failInvalidClaim(claim, error);
+  }
+  const workerResourceClass = resourceClassFor(request, LIFECYCLE_PATH);
+  const dispatchedAt = new Date().toISOString();
+  const dispatched = {
+    ...request,
+    state: "dispatched",
+    workerResourceClass,
+    priority: operationPriority(request),
+    dispatchedAt,
+    updatedAt: dispatchedAt,
+  };
+  const destination = path.join(claim.dirs.dispatched, workerResourceClass, path.basename(claim.runningPath));
+  atomicWriteJson(destination, dispatched);
+  fs.unlinkSync(claim.runningPath);
+  return dispatched;
+}
+
+function dispatchQueuedOperations(limit = 100) {
+  const dispatched = [];
+  for (let count = 0; count < limit; count += 1) {
+    const claim = claimNextOperation();
+    if (!claim) break;
+    dispatched.push(dispatchClaim(claim));
+  }
+  return dispatched;
 }
 
 function recoverStaleOperations() {
@@ -239,7 +297,11 @@ function recoverStaleOperations() {
       fs.unlinkSync(runningPath);
       continue;
     }
-    const queuedPath = path.join(dirs.queued, name);
+    const workerClass = request.workerResourceClass;
+    const recoveryDirectory = workerClass && ["small", "medium_large"].includes(workerClass)
+      ? path.join(dirs.dispatched, workerClass)
+      : dirs.queued;
+    const queuedPath = path.join(recoveryDirectory, name);
     if (fs.existsSync(queuedPath)) continue;
     fs.renameSync(runningPath, queuedPath);
     atomicWriteJson(queuedPath, {
@@ -278,17 +340,7 @@ async function executeClaim(claim) {
   try {
     request = validateRequest(claim.request);
   } catch (error) {
-    const invalid = {
-      ...(claim.request || {schemaVersion: 1, requestId: path.basename(runningPath, ".json")}),
-      state: "failed",
-      error: error.message,
-      exitCode: 2,
-      finishedAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
-    };
-    atomicWriteJson(path.join(dirs.history, `${Date.now()}-${invalid.requestId}.json`), invalid);
-    fs.unlinkSync(runningPath);
-    return invalid;
+    return failInvalidClaim(claim, error);
   }
 
   const command = commandFor(request);
@@ -432,9 +484,20 @@ async function executeClaim(claim) {
 
 async function run() {
   recoverStaleOperations();
-  const claim = claimNextOperation();
+  const dispatched = dispatchQueuedOperations();
+  if (!dispatched.length) console.log("No queued admin operation");
+  else console.log(JSON.stringify({dispatched: dispatched.map((entry) => ({requestId: entry.requestId, resourceClass: entry.workerResourceClass, priority: entry.priority}))}));
+  return dispatched;
+}
+
+async function runWorker(resourceClass) {
+  if (!["small", "medium_large"].includes(resourceClass)) throw new Error(`Unsupported admin worker class ${resourceClass}`);
+  recoverStaleOperations();
+  const dirs = directories();
+  const claim = claimNextOperation(path.join(dirs.dispatched, resourceClass));
   if (!claim) {
-    console.log("No queued admin operation");
+    console.log(`No dispatched ${resourceClass} admin operation`);
+    process.exitCode = 75;
     return null;
   }
   const completed = await executeClaim(claim);
@@ -444,10 +507,22 @@ async function run() {
 }
 
 if (require.main === module) {
-  run().catch((error) => {
+  const workerIndex = process.argv.indexOf("--worker");
+  const action = workerIndex >= 0 ? () => runWorker(process.argv[workerIndex + 1]) : run;
+  action().catch((error) => {
     console.error(error.stack || error.message);
     process.exitCode = 1;
   });
 }
 
-module.exports = {claimNextOperation, commandFor, executeClaim, recoverStaleOperations, run, validateRequest};
+module.exports = {
+  claimNextOperation,
+  commandFor,
+  dispatchClaim,
+  dispatchQueuedOperations,
+  executeClaim,
+  recoverStaleOperations,
+  run,
+  runWorker,
+  validateRequest,
+};

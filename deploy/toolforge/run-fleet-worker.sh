@@ -58,6 +58,20 @@ done
 [ -x "$prepare_wrapper" ] || { echo "Fleet preparation wrapper is not executable: $prepare_wrapper" >&2; exit 2; }
 export WIKI_ECON_PREPARE_LOCK_STALE_SECS="$prepare_lock_stale_secs"
 
+# Admin requests share the fixed worker pool instead of spawning long-running
+# work inside the lightweight dispatcher. Priority routing happens before
+# ordinary fleet claims, so recovery and lifecycle work cannot sit behind a
+# bulk preparation backlog.
+set +e
+node "$ROOT/deploy/toolforge/admin-dispatcher.cjs" --worker "$resource_class"
+admin_status=$?
+set -e
+case "$admin_status" in
+  0) exit 0 ;;
+  75) ;;
+  *) exit "$admin_status" ;;
+esac
+
 while true; do
   # PIDs are namespaced per container and are therefore commonly identical
   # across overlapping Toolforge pods. Include the Kubernetes pod hostname so
