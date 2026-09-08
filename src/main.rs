@@ -2705,6 +2705,33 @@ mod tests {
     }
 
     #[test]
+    fn run_with_ops_prepares_one_bounded_history_source_window() -> Result<()> {
+        init_test_tracing();
+        let cli = Cli::try_parse_from([
+            "wiki-econ",
+            "--data-dir",
+            "fixtures/data",
+            "--run-id",
+            "source-7",
+            "prepare-source",
+            "nlwiki",
+            "--version",
+            "2026-07",
+            "--source-window-size",
+            "2",
+        ])?;
+        let ops = TestApplication::default();
+
+        run_with_ops(cli, &ops)?;
+
+        assert_eq!(
+            ops.calls.into_inner(),
+            vec!["source_window:nlwiki:2026-07:fixtures/data:2"]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn forced_candidate_rebuild_never_reuses_existing_metric_families() -> Result<()> {
         let cli = Cli::try_parse_from([
             "wiki-econ",
@@ -3297,6 +3324,7 @@ mod tests {
     #[test]
     fn isolated_candidate_and_publication_commands_require_run_ids() -> Result<()> {
         for args in [
+            vec!["wiki-econ", "prepare-source", "nlwiki"],
             vec!["wiki-econ", "prepare-wiki", "nlwiki"],
             vec!["wiki-econ", "qualify-wiki", "itwiki"],
             vec!["wiki-econ", "publication-prepare-ready"],

@@ -1416,6 +1416,7 @@ fn download_attempt<T: HttpTransport>(
     dest: &Path,
     plan: DownloadPlan,
     visible_progress: bool,
+    progress_log_interval: Duration,
 ) -> std::result::Result<u64, AttemptError> {
     let range_start = (plan.resume_from > 0 && plan.accepts_ranges).then_some(plan.resume_from);
     let mut response = transport
@@ -1475,7 +1476,7 @@ fn download_attempt<T: HttpTransport>(
             file.write_all(&buffer[..read])?;
             downloaded += read as u64;
             progress.inc(read as u64);
-            if last_progress_log.elapsed() >= Duration::from_secs(5) {
+            if last_progress_log.elapsed() >= progress_log_interval {
                 let elapsed_ms = u64::try_from(download_started.elapsed().as_millis())
                     .unwrap_or(u64::MAX)
                     .max(1);
@@ -1524,7 +1525,14 @@ fn download_file_with_transport<T: HttpTransport>(
 
     let mut attempt = 1;
     loop {
-        match download_attempt(transport, url, dest, plan, visible_progress) {
+        match download_attempt(
+            transport,
+            url,
+            dest,
+            plan,
+            visible_progress,
+            Duration::from_secs(5),
+        ) {
             Ok(downloaded) => {
                 if let Err(integrity_error) = verify_bz2_magic(dest) {
                     warn!(
@@ -3981,6 +3989,7 @@ mod tests {
                 accepts_ranges: true,
             },
             false,
+            Duration::ZERO,
         )
         .expect("download attempt should resume successfully");
 
