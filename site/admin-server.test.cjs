@@ -944,6 +944,45 @@ test("candidate retirement and isolated rebuild require exact identities", async
   assert.equal(operation.version, "2026-08");
 });
 
+test("publication compatibility repair derives and queues only the older snapshot cohort", async (t) => {
+  const lifecycle = {
+    schema_version: 1,
+    publication_contract: {datasets: {}},
+    wikis: {
+      afwiki: {publication: "published", refresh: "scheduled", provenance: "toolforge", freshness_sla_days: 40},
+      frwiki: {publication: "published", refresh: "scheduled", provenance: "toolforge", freshness_sla_days: 40},
+      nlwiki: {publication: "published", refresh: "scheduled", provenance: "toolforge", freshness_sla_days: 40},
+    },
+  };
+  const {module, host, outputDir} = await startServer(t, {
+    ...LOCAL_ENV,
+    WIKI_ECON_ADMIN_EXECUTION_MODE: "queue",
+  }, lifecycle);
+  fs.mkdirSync(path.join(outputDir, "_admin"), {recursive: true});
+  fs.writeFileSync(path.join(outputDir, "_admin", "publication-preflight.json"), JSON.stringify({
+    schema_version: 1,
+    blockers: ["gdp candidates have incompatible merge schemas or algorithm versions between afwiki and frwiki"],
+    wikis: [
+      {wiki: "afwiki", candidate_snapshot: "2026-08"},
+      {wiki: "frwiki", candidate_snapshot: "2026-07"},
+      {wiki: "nlwiki", candidate_snapshot: "2026-07"},
+    ],
+  }));
+
+  const response = await invoke(module, {
+    method: "POST",
+    url: "/api/rebuild-compatibility-cohort",
+    headers: {host, "content-type": "application/json"},
+    body: "{}",
+  });
+  assert.equal(response.statusCode, 202, response.text());
+  const queued = JSON.parse(response.text()).operation;
+  assert.deepEqual(queued.compatibilityCohort, [
+    {wiki: "frwiki", version: "2026-08"},
+    {wiki: "nlwiki", version: "2026-08"},
+  ]);
+});
+
 test("production execution mode queues heavy work and supports cancellation", async (t) => {
   const lifecycle = {
     schema_version: 1,
@@ -1183,8 +1222,8 @@ test("admin dispatcher claims and completes one queued operation", async (t) => 
   const dispatcher = require(dispatcherPath);
   const dispatched = await dispatcher.run();
   assert.equal(dispatched[0].state, "dispatched");
-  assert.equal(dispatched[0].workerResourceClass, "small");
-  const completed = await dispatcher.runWorker("small");
+  assert.equal(dispatched[0].workerResourceClass, "medium_large");
+  const completed = await dispatcher.runWorker("medium_large");
   if (previousRoot == null) delete process.env.WIKI_ECON_ADMIN_OPERATION_DIR;
   else process.env.WIKI_ECON_ADMIN_OPERATION_DIR = previousRoot;
   if (previousBin == null) delete process.env.WIKI_ECON_BIN;

@@ -3,7 +3,6 @@
 const fs = require("node:fs");
 
 const SMALL_ACTIONS = new Set([
-  "fetch",
   "patrol-fetch",
   "promote-qualification",
   "retire-candidate",
@@ -25,6 +24,8 @@ const MEDIUM_ACTIONS = new Set([
   "publish",
   "site",
   "artifact-scrub",
+  "rebuild-compatibility-cohort",
+  "fetch",
 ]);
 
 const ACTION_PRIORITY = Object.freeze({
@@ -38,6 +39,7 @@ const ACTION_PRIORITY = Object.freeze({
   run: 20,
   qualify: 20,
   "rebuild-candidate": 20,
+  "rebuild-compatibility-cohort": 15,
   compute: 25,
   "patrol-compute": 25,
   "patrol-rebuild": 25,

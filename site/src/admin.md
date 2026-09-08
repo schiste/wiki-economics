@@ -381,7 +381,7 @@ async function registerWiki(wiki, mode, resourceClass, {start = false, version =
 
 function actionLabel(action) {
   switch (action) {
-    case "fetch": return "fetch missing"
+    case "fetch": return "prepare history sources"
     case "patrol-fetch": return "fetch patrol"
     case "ingest": return "ingest"
     case "compute": return "compute"
@@ -403,6 +403,7 @@ function actionLabel(action) {
     case "promote-qualification": return "promote qualification"
     case "retire-candidate": return "retire candidate"
     case "rebuild-candidate": return "rebuild candidate"
+    case "rebuild-compatibility-cohort": return "rebuild compatibility cohort"
     case "cleanup": return "cleanup"
     case "cancel": return "cancel"
     case "run": return "prepare update"
@@ -413,7 +414,7 @@ function actionLabel(action) {
 function actionTooltip(action) {
   switch (action) {
     case "fetch":
-      return "Download only the missing history dump files for this wiki; existing dump files are skipped."
+      return "Download, validate, ingest, and release one history source at a time; committed sources are reused after interruption."
     case "patrol-fetch":
       return "Download or refresh the patrol logging sources needed to compute patrol metrics."
     case "ingest":
@@ -454,6 +455,8 @@ function actionTooltip(action) {
       return "Retire one exact unpublished ready candidate. The active publication and rollback generation are protected."
     case "rebuild-candidate":
       return "Build a new immutable candidate for the exact snapshot without modifying the existing candidate or live publication."
+    case "rebuild-compatibility-cohort":
+      return "Rebuild only the older candidate cohort identified by the current publication preflight, sequentially on the bounded medium worker."
     case "cleanup":
       return "Remove temporary files and invalid ingest markers for this wiki."
     case "cancel":
@@ -1220,6 +1223,7 @@ const operationalAlerts = [
 const publicationOps = operationalTruth.public?.publication || {}
 const publicationPreflight = publicationOps.preflight || null
 const publicationBlockerSummaries = summarizePublicationBlockers(publicationPreflight?.blockers || [])
+const hasCompatibilityBlocker = publicationBlockerSummaries.some((blocker) => blocker.code === "incompatible_metric_versions")
 const preflightCanPublish = Boolean(publicationPreflight?.eligible && publicationPreflight?.current)
 const displayedChangePlan = publicationPreflight?.current
   ? {changed: publicationPreflight.changed || [], reused: publicationPreflight.reused || [], source: "Current preflight"}
@@ -1281,7 +1285,7 @@ display(html`<div id="admin-publication-workbench" class="admin-refresh-panel">
     ${publicationBlockerSummaries.length ? html`<div class="admin-preflight-blockers">${publicationBlockerSummaries.map((blocker) => html`<article>
       <strong>${blocker.title}</strong><span>${blocker.detail}</span>
       ${blocker.metrics.length ? html`<small>${blocker.metrics.join(", ")}</small>` : ""}
-    </article>`)}</div>` : publicationPreflight?.eligible ? html`<p>Ready candidates, recovery state, scrub state, and current publication evidence passed.</p>` : html`<p>Run preflight to authenticate the candidate set and unlock publication.</p>`}
+    </article>`)}</div>${hasCompatibilityBlocker ? html`<button class="admin-btn primary" ?disabled=${!apiStatus} title=${actionTooltipWithApi("rebuild-compatibility-cohort", apiStatus)} onclick=${() => { if (confirm("Sequentially rebuild the older candidate cohort at the newest candidate snapshot? Existing published data remains unchanged.")) runCommand("rebuild-compatibility-cohort") }}>Prepare compatibility cohort</button>` : ""}` : publicationPreflight?.eligible ? html`<p>Ready candidates, recovery state, scrub state, and current publication evidence passed.</p>` : html`<p>Run preflight to authenticate the candidate set and unlock publication.</p>`}
     ${displayedChangePlan ? html`<details open><summary>${displayedChangePlan.source} change plan · ${displayedChangePlan.changed?.length || 0} changed · ${displayedChangePlan.reused?.length || 0} reused</summary>
       <div class="admin-change-plan">
         <div><strong>Will rebuild</strong>${displayedChangePlan.changed?.length ? html`<ul>${displayedChangePlan.changed.map((item) => html`<li><code>${item.wiki}</code><span>${item.family}</span></li>`)}</ul>` : html`<p>No metric family changes.</p>`}</div>
@@ -1781,7 +1785,7 @@ function pipelineStageAction(name, stage, lifecycle, operationActive, candidate,
       title=${blocked ? candidate.remediation : actionTooltipWithApi(isQualification ? "qualify" : "run", apiStatus)}
       onclick=${() => runCommand(isQualification ? "qualify" : "run", {wiki: name, version: selectedVersion})}>Start / resume</button>`
   }
-  if (stage.id === "source") return html`<button class="admin-btn small" ?disabled=${commonDisabled} title=${stage.blockedReason || actionTooltipWithApi("fetch", apiStatus)} onclick=${() => runCommand("fetch", {wiki: name, version: selectedVersion})}>Fetch history</button>`
+  if (stage.id === "source") return html`<button class="admin-btn small" ?disabled=${commonDisabled} title=${stage.blockedReason || actionTooltipWithApi("fetch", apiStatus)} onclick=${() => runCommand("fetch", {wiki: name, version: selectedVersion})}>Prepare history sources</button>`
   if (stage.id === "ingest") return html`<button class="admin-btn small" ?disabled=${commonDisabled} title=${stage.blockedReason || actionTooltipWithApi("ingest", apiStatus)} onclick=${() => runCommand("ingest", name)}>Ingest</button>`
   if (stage.id === "metrics") return html`<button class="admin-btn small" ?disabled=${commonDisabled} title=${stage.blockedReason || actionTooltipWithApi("compute", apiStatus)} onclick=${() => runCommand("compute", name)}>Compute</button>`
   if (stage.id === "patrol_source") return html`<button class="admin-btn small" ?disabled=${commonDisabled} title=${stage.blockedReason || actionTooltipWithApi("patrol-fetch", apiStatus)} onclick=${() => runCommand("patrol-fetch", name)}>Fetch patrol</button>`
@@ -2204,11 +2208,11 @@ html`<div class="admin-onboarding-console">
         const w = onboardingWiki
         const version = normalizeSnapshotVersion(snapshotVersion)
         if (!w) {
-          recordOperationReceipt({state: "failed", action: "fetch", title: "Fetch was not started", detail: "Pick a supported Wikipedia project first."})
+          recordOperationReceipt({state: "failed", action: "fetch", title: "Source preparation was not started", detail: "Pick a supported Wikipedia project first."})
           return
         }
         runCommand("fetch", {wiki: w, version})
-      }}>Fetch missing</button>
+      }}>Prepare history sources</button>
   </div>
   ${!apiStatus ? html`
       <pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && WIKI_ECON_ADMIN_ENABLED=1 node site/admin-server.cjs</pre>
@@ -2297,7 +2301,7 @@ const selectedTruth = operationalWikiTruth[selectedWiki] || null
   ? html`<div class="warning">No wiki is available yet. Start a pipeline run to populate this section.</div>`
   : w.raw.files > 0
   ? html`<p><strong>${w.raw.files}</strong> dump files, <strong>${w.raw.size}</strong> total · dump version <code>${w.raw.version}</code>
-    ${apiStatus && selectedLifecycle ? html` · <button class="admin-btn refetch small" title=${actionTooltipWithApi("fetch", apiStatus)} onclick=${() => { if(confirm("Fetch missing dump files for " + selectedWiki + "? Existing files will be skipped.")) runCommand("fetch", {wiki: selectedWiki, version: preferredSnapshotVersion()}) }}>fetch missing</button>` : ""}
+    ${apiStatus && selectedLifecycle ? html` · <button class="admin-btn refetch small" title=${actionTooltipWithApi("fetch", apiStatus)} onclick=${() => { if(confirm("Prepare missing history sources for " + selectedWiki + " one at a time? Validated sources will be reused.")) runCommand("fetch", {wiki: selectedWiki, version: preferredSnapshotVersion()}) }}>prepare missing</button>` : ""}
     </p>
     ${Inputs.table(w.raw.details.map(d => ({file: d.name, size: d.size, downloaded: d.date})), {
       header: {file: "File", size: "Size", downloaded: "Downloaded"},
@@ -2308,8 +2312,8 @@ const selectedTruth = operationalWikiTruth[selectedWiki] || null
       The immutable ingest generation remains ready with <strong>${w.ingest?.rows || 0}</strong> rows.</p>`
   : html`<div class="warning">No raw dumps or validated snapshot found for <strong>${selectedWiki}</strong>.</div>
     ${apiStatus && selectedLifecycle
-      ? html`<button class="admin-btn primary" title=${actionTooltipWithApi("fetch", apiStatus)} onclick=${() => runCommand("fetch", {wiki: selectedWiki, version: preferredSnapshotVersion()})}>Fetch missing</button>`
-      : html`<pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && ${runnerCommand()} ${cliFlags(currentManifest)} fetch ${selectedWiki}</pre>`
+      ? html`<button class="admin-btn primary" title=${actionTooltipWithApi("fetch", apiStatus)} onclick=${() => runCommand("fetch", {wiki: selectedWiki, version: preferredSnapshotVersion()})}>Prepare history sources</button>`
+      : html`<pre class="admin-cmd">cd ${currentManifest.data_dir}/.. && ${runnerCommand()} ${cliFlags(currentManifest)} --run-id manual-source-window prepare-source ${selectedWiki} --source-window-size 1</pre>`
     }`
 ```
 

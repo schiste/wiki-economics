@@ -108,6 +108,13 @@ function commandFor(request) {
         "--rebuild",
         "--lifecycle", LIFECYCLE_PATH,
       ]};
+    case "rebuild-compatibility-cohort":
+      return {program: "bash", args: [
+        path.join(ROOT, "deploy", "toolforge", "run-compatibility-cohort.sh"),
+        "--run-id", request.runId,
+        "--lifecycle", LIFECYCLE_PATH,
+        ...request.compatibilityCohort.map((entry) => `${entry.wiki}=${entry.version}`),
+      ]};
     case "fetch":
       return {program: BIN, args: [...common, "prepare-source", wiki, ...version, "--source-window-size", "1"]};
     case "ingest":
@@ -182,6 +189,16 @@ function validateRequest(request) {
   }
   if (request.action === "rebuild-candidate" && !request.version) {
     throw new Error("Candidate rebuild requires an exact snapshot");
+  }
+  if (request.action === "rebuild-compatibility-cohort") {
+    if (!Array.isArray(request.compatibilityCohort) || request.compatibilityCohort.length === 0) {
+      throw new Error("Compatibility rebuild requires a non-empty authenticated cohort");
+    }
+    for (const entry of request.compatibilityCohort) {
+      if (!/^[a-z0-9_]+wiki$/.test(entry?.wiki || "") || !/^\d{4}-\d{2}$/.test(entry?.version || "")) {
+        throw new Error("Compatibility rebuild contains an invalid wiki or snapshot");
+      }
+    }
   }
   commandFor(request);
   return request;

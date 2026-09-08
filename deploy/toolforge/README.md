@@ -76,7 +76,7 @@ and higher resource envelope are being qualified.
   therefore come from different commits; each is verified independently and
   all three identities are recorded in refresh run provenance.
 - `jobs.yaml` — one Rust fleet controller, two fixed small-wiki workers, one
-  fixed medium/large worker, a staggered on-demand 6 GiB admin dispatcher,
+  fixed medium/large worker, a 512 MiB admin routing dispatcher,
   and the short `wiki-econ-publish-ready` job, plus
   legacy on-demand recovery jobs. The controller represents the sixteen
   scheduled wikis declared by the lifecycle registry: afwiki, arwiki, arzwiki,
@@ -88,9 +88,10 @@ and higher resource envelope are being qualified.
   [per-wiki candidate preparation and publication](../../docs/candidate-publication.md).
   `wiki-econ-admin` serves `/admin*` and the built static site as a separate
   buildservice webservice. Authenticated actions are persisted under
-  `output/_admin/operations`; `wiki-econ-admin-dispatcher` claims and executes
-  one outside the 512 MiB web pod every ten minutes. It exits immediately when
-  the queue is empty, leaving memory available to publication. The lifecycle registry is likewise stored
+  `output/_admin/operations`; `wiki-econ-admin-dispatcher` validates and routes
+  them by priority and resource class every ten minutes. The fixed workers claim
+  routed admin work before ordinary fleet work, so the dispatcher never retains
+  6 GiB while downloading or computing. The lifecycle registry is likewise stored
   on NFS, so the admin can register a supported wiki as hidden qualification,
   manual, or scheduled without rebuilding the image.
   The public root is a lightweight portfolio homepage built entirely from
@@ -111,8 +112,11 @@ and higher resource envelope are being qualified.
   preparation holds a per-wiki NFS-safe heartbeat lock and never changes a
   live pointer. Publication alone holds the global lock while selecting ready
   candidates, merging, validating, building, and switching the site.
-  Fleet tasks use atomic NFS leases and heartbeats, bounded retries, and
-  quarantine; see the [fleet scheduler](../../docs/fleet-scheduler.md).
+  Fleet and admin tasks use atomic NFS leases and heartbeats, bounded retries,
+  quota-aware admission, and quarantine; see the
+  [fleet scheduler](../../docs/fleet-scheduler.md). Admin history-source actions
+  use a one-object transactional source window: download, validate, ingest,
+  commit, then release the compressed input.
 - `run-refresh.sh` — wraps `scripts/refresh.sh` as an on-demand compatibility
   and recovery path; it is no longer the scheduled production path.
   Unlike Cloud VPS's `run-refresh.sh`, this does not keep a `releases/`

@@ -108,8 +108,13 @@ Supported endpoints:
 | `POST` | `/site` | Rebuild and validate only the site against the current publication. |
 | `POST` | `/fleet-recover` | Recover stale fleet leases. |
 | `POST` | `/recover-admin` | Recover a stale durable operator request. |
+| `POST` | `/rebuild-compatibility-cohort` | Derive the older incompatible candidate cohort from the current preflight and rebuild it sequentially. |
 
-Production writes heavy operations to the durable Toolforge dispatcher queue.
+Production writes operations to a durable Toolforge queue. A 512 MiB dispatcher
+only validates, prioritizes, and routes requests; the existing fixed small and
+medium workers execute them under the shared capacity-admission budget. History
+source preparation uses a one-source download→validate→ingest→commit→delete
+transaction and resumes from strict source receipts.
 Local direct mode permits one active operation and returns `409 Conflict` for
 another start while it is running.
 

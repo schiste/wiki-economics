@@ -6,6 +6,11 @@ const path = require("node:path");
 const test = require("node:test");
 
 const source = fs.readFileSync(path.join(__dirname, "src", "admin.md"), "utf8");
+
+test("publication workbench exposes one controlled compatibility-cohort action", () => {
+  assert.match(source, /Prepare compatibility cohort/);
+  assert.match(source, /runCommand\("rebuild-compatibility-cohort"\)/);
+});
 const consoleSource = fs.readFileSync(path.join(__dirname, "src", "components", "admin-console.js"), "utf8");
 
 test("admin uses authoritative metric completeness instead of an artifact-count threshold", () => {

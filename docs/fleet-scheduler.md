@@ -43,11 +43,17 @@ snapshot profile.
 - `isolated` has no production worker. Monthly source layouts always select it
   and cannot be overridden into another class.
 
-Toolforge's aggregate memory quota may serialize a 6 GiB worker and the 6 GiB
-publisher even though both have definitions. That is an admission constraint,
-not a shared lock: the pending queue and ready candidate survive until the
-corresponding job receives capacity. Enwiki remains `isolated` until a separate
-capacity report qualifies it.
+The NFS-safe capacity admission layer reserves the 512 MiB web service and
+512 MiB dispatcher from the 8 GiB namespace budget. It admits either one 6 GiB
+medium worker or multiple 2 GiB small workers, but not an unsafe combination.
+Kubernetes quota remains the outer enforcement boundary; rejected work stays
+durably queued. Enwiki remains `isolated` until a separate capacity report
+qualifies it.
+
+Authenticated admin work uses the same fixed workers. Recovery and lifecycle
+operations sort ahead of bulk preparation and raw diagnostic transfers. A
+stale worker returns the request to its original resource-class queue with the
+same run identity, preserving every committed source and candidate receipt.
 
 ## Qualification ladder
 

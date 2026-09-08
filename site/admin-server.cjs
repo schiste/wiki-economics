@@ -1006,6 +1006,7 @@ function queueAdminOperation({
   lifecycleRevision = null,
   requestedBy,
   acknowledgeBlockedRetry = false,
+  compatibilityCohort = null,
 }) {
   const directories = operationDirectories();
   const active = [
@@ -1066,10 +1067,36 @@ function queueAdminOperation({
     cancelRequested: false,
     blockedRetryAcknowledged: Boolean(blockedFailure && acknowledgeBlockedRetry),
     supersedesFailedRequestId: blockedFailure?.requestId || null,
+    compatibilityCohort,
     logPath: path.join(directories.logs, `${requestId}.log`),
   };
   atomicWriteJson(path.join(directories.queued, `${requestId}.json`), request);
   return request;
+}
+
+function compatibilityCohortFromPreflight() {
+  const reportPath = path.join(OUTPUT_DIR, "_admin", "publication-preflight.json");
+  const report = readJsonFile(reportPath);
+  if (report?.schema_version !== 1 || !Array.isArray(report.blockers) || !Array.isArray(report.wikis)) {
+    throw new Error("Run publication preflight before preparing a compatibility cohort");
+  }
+  if (!report.blockers.some((blocker) => /incompatible merge schemas or algorithm versions/i.test(blocker))) {
+    throw new Error("The current publication preflight has no metric compatibility blocker");
+  }
+  const candidateWikis = report.wikis.filter((entry) => /^\d{4}-\d{2}$/.test(entry?.candidate_snapshot || ""));
+  const targetSnapshot = candidateWikis.map((entry) => entry.candidate_snapshot).sort().at(-1);
+  const cohort = candidateWikis
+    .filter((entry) => entry.candidate_snapshot !== targetSnapshot)
+    .filter((entry) => {
+      const lifecycle = WIKI_LIFECYCLE.wikis[entry.wiki];
+      return lifecycle?.publication === "published" && new Set(["manual", "scheduled"]).has(lifecycle?.refresh);
+    })
+    .map((entry) => ({wiki: entry.wiki, version: targetSnapshot}))
+    .sort((left, right) => left.wiki.localeCompare(right.wiki));
+  if (!targetSnapshot || cohort.length === 0) {
+    throw new Error("Compatibility differs within one snapshot; rebuild candidates individually after inspecting their receipts");
+  }
+  return cohort;
 }
 
 function cancelAdminOperation({requestId, wiki}) {
@@ -2158,7 +2185,7 @@ async function handleRequest(req, res) {
 
       const globalActions = new Set([
         "merge", "publish", "site", "fleet-recover", "publication-recovery-audit",
-        "publication-preflight", "artifact-scrub",
+        "publication-preflight", "artifact-scrub", "rebuild-compatibility-cohort",
       ]);
       if (wikiActions.has(action) && !wiki) {
         writeJson(res, 400, {error: `${action} requires a wiki parameter`});
@@ -2184,6 +2211,15 @@ async function handleRequest(req, res) {
       }
 
       let requestedLifecycleMutation = null;
+      let requestedCompatibilityCohort = null;
+      if (action === "rebuild-compatibility-cohort") {
+        try {
+          requestedCompatibilityCohort = compatibilityCohortFromPreflight();
+        } catch (error) {
+          writeJson(res, 409, {error: error.message});
+          return;
+        }
+      }
       if (action === "promote-qualification") {
         const qualificationRunId = String(params.qualificationRunId || "");
         const qualification = (qualificationCandidates(OUTPUT_DIR)[wiki] || []).find((entry) => (
@@ -2277,6 +2313,7 @@ async function handleRequest(req, res) {
             lifecycleRevision: params.lifecycleRevision || null,
             requestedBy: operator,
             acknowledgeBlockedRetry: params.acknowledgeBlockedRetry === true,
+            compatibilityCohort: requestedCompatibilityCohort,
           });
           writeJson(res, 202, {
             started: false,
@@ -2439,6 +2476,18 @@ async function handleRequest(req, res) {
                 label: `${resolveRunner().label} prepare-wiki ${wiki} --version ${version} --rebuild`,
               }
             : null;
+          break;
+        case "rebuild-compatibility-cohort":
+          commandSpec = {
+            program: "bash",
+            args: [
+              path.join(ROOT, "deploy", "toolforge", "run-compatibility-cohort.sh"),
+              "--run-id", runId,
+              "--lifecycle", WIKI_LIFECYCLE_PATH,
+              ...requestedCompatibilityCohort.map((entry) => `${entry.wiki}=${entry.version}`),
+            ],
+            label: `run-compatibility-cohort ${requestedCompatibilityCohort.map((entry) => `${entry.wiki}=${entry.version}`).join(" ")}`,
+          };
           break;
         case "merge":
           commandSpec = {
