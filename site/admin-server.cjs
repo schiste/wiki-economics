@@ -2319,6 +2319,23 @@ async function handleRequest(req, res) {
       let commandSpec = null;
       switch (action) {
         case "fetch":
+          commandSpec = wiki
+            ? {
+                program: resolveRunner().program,
+                args: [
+                  ...resolveRunner().args,
+                  "--data-dir", DATA_DIR,
+                  "--output-dir", OUTPUT_DIR,
+                  "--run-id", runId,
+                  "prepare-source",
+                  wiki,
+                  ...(version ? ["--version", version] : []),
+                  "--source-window-size", "1",
+                ],
+                label: `${resolveRunner().label} --data-dir ${DATA_DIR} --output-dir ${OUTPUT_DIR} --run-id ${runId} prepare-source ${wiki}${version ? ` --version ${version}` : ""} --source-window-size 1`,
+              }
+            : null;
+          break;
         case "ingest":
         case "compute":
           commandSpec = wiki
@@ -2331,9 +2348,8 @@ async function handleRequest(req, res) {
                   "--run-id", runId,
                   action,
                   wiki,
-                  ...(version && action === "fetch" ? ["--version", version] : []),
                 ],
-                label: `${resolveRunner().label} --data-dir ${DATA_DIR} --output-dir ${OUTPUT_DIR} --run-id ${runId} ${action} ${wiki}${version && action === "fetch" ? ` --version ${version}` : ""}`,
+                label: `${resolveRunner().label} --data-dir ${DATA_DIR} --output-dir ${OUTPUT_DIR} --run-id ${runId} ${action} ${wiki}`,
               }
             : null;
           break;

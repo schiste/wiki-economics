@@ -51,6 +51,28 @@ fn binary_entrypoint_rejects_unsafe_wiki_before_fetch() {
     assert!(stderr.contains("invalid wiki database name"));
 }
 
+#[test]
+fn bounded_source_preparation_rejects_unsafe_wiki_before_network_access() {
+    init_test_tracing();
+    let data_dir = TestDir::new().expect("temp dir");
+
+    let output = instrumented_binary()
+        .arg("--data-dir")
+        .arg(data_dir.path())
+        .arg("--run-id")
+        .arg("unsafe-source-window")
+        .arg("prepare-source")
+        .arg("../enwiki")
+        .arg("--version")
+        .arg("2026-07")
+        .output()
+        .expect("binary should run");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("invalid wiki database name"));
+}
+
 fn stage_events(path: &Path) -> Vec<serde_json::Value> {
     fs::read_to_string(path)
         .expect("stage events should exist")

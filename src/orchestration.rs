@@ -43,6 +43,13 @@ pub(crate) struct PrepareWikiRequest<'a> {
     pub(crate) rebuild: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PrepareSourceRequest<'a> {
+    pub(crate) wiki: &'a str,
+    pub(crate) version: Option<&'a str>,
+    pub(crate) source_window_size: Option<usize>,
+}
+
 pub(crate) struct PromoteQualificationRequest<'a> {
     pub(crate) data_dir: &'a Path,
     pub(crate) output_dir: &'a Path,
@@ -508,6 +515,29 @@ pub(crate) fn handle_ingest(
         })?;
     }
     Ok(())
+}
+
+pub(crate) fn handle_prepare_source(
+    context: RunContext<'_>,
+    ops: &(impl SnapshotOps + HistoryInputOps),
+    request: PrepareSourceRequest<'_>,
+) -> Result<()> {
+    let run_id = context
+        .run_id
+        .context("source-window preparation requires --run-id")?;
+    let wikis = [request.wiki.to_string()];
+    let version = resolve_requested_snapshot(context, ops, &wikis, request.version)?;
+    let window_size = source_window::configured_window_size(request.source_window_size)?;
+    ops.persist_snapshot_plans(&wikis, &version, context.paths.data)?;
+    timed_stage("source_window", Some(request.wiki), || {
+        ops.prepare_wiki_snapshot(
+            request.wiki,
+            &version,
+            context.paths.data,
+            run_id,
+            window_size,
+        )
+    })
 }
 
 pub(crate) fn handle_compute(

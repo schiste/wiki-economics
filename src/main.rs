@@ -59,15 +59,15 @@ use tracing_subscriber::registry::LookupSpan;
 use orchestration::{
     AccountCreationRequest, AppPaths, ApplicationOps, BenchmarkRequest, CandidateOps,
     CapacityBenchmarkRequest, FleetDiscoveryRequest, HistoryInputOps, MetricComputeOps,
-    PatrolComputeRequest, PatrolOps, PipelineRunRequest, PreparationMode, PrepareWikiRequest,
-    PromoteQualificationRequest, PublicationOps, QualificationOps, RetireCandidateRequest,
-    RunContext, SchemaBenchmarkRequest, SnapshotOps, handle_account_creation, handle_benchmark,
-    handle_capacity_benchmark, handle_compute, handle_cpu_qualification, handle_fetch,
-    handle_fleet_discovery, handle_ingest, handle_merge, handle_patrol_compute,
-    handle_patrol_fetch, handle_patrol_refresh, handle_pipeline_run, handle_prepare_wiki,
-    handle_publication_commit, handle_publication_prepare, handle_publication_rollback,
-    handle_schema_benchmark, handle_snapshot_finalize, handle_snapshot_resolve,
-    timed_stage as run_timed_stage,
+    PatrolComputeRequest, PatrolOps, PipelineRunRequest, PreparationMode, PrepareSourceRequest,
+    PrepareWikiRequest, PromoteQualificationRequest, PublicationOps, QualificationOps,
+    RetireCandidateRequest, RunContext, SchemaBenchmarkRequest, SnapshotOps,
+    handle_account_creation, handle_benchmark, handle_capacity_benchmark, handle_compute,
+    handle_cpu_qualification, handle_fetch, handle_fleet_discovery, handle_ingest, handle_merge,
+    handle_patrol_compute, handle_patrol_fetch, handle_patrol_refresh, handle_pipeline_run,
+    handle_prepare_source, handle_prepare_wiki, handle_publication_commit,
+    handle_publication_prepare, handle_publication_rollback, handle_schema_benchmark,
+    handle_snapshot_finalize, handle_snapshot_resolve, timed_stage as run_timed_stage,
 };
 
 #[cfg(test)]
@@ -236,6 +236,20 @@ enum Commands {
         /// Dump snapshot version (YYYY-MM)
         #[arg(long)]
         version: Option<String>,
+    },
+
+    /// Download, validate, ingest, and delete history sources in a bounded window
+    PrepareSource {
+        /// Wiki database name
+        wiki: String,
+
+        /// Dump snapshot version (YYYY-MM)
+        #[arg(long)]
+        version: Option<String>,
+
+        /// Maximum number of compressed sources retained before ingest
+        #[arg(long, default_value_t = 1)]
+        source_window_size: usize,
     },
 
     /// Convert raw TSV.bz2 dumps to Parquet
@@ -1222,6 +1236,22 @@ fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
 
         Commands::Fetch { wikis, version } => {
             handle_fetch(context, ops, &wikis, version.as_deref())?;
+        }
+
+        Commands::PrepareSource {
+            wiki,
+            version,
+            source_window_size,
+        } => {
+            handle_prepare_source(
+                context,
+                ops,
+                PrepareSourceRequest {
+                    wiki: &wiki,
+                    version: version.as_deref(),
+                    source_window_size: Some(source_window_size),
+                },
+            )?;
         }
 
         Commands::Ingest { wikis, version } => {

@@ -1216,6 +1216,22 @@ test("admin dispatcher patrol actions always fetch before compute", () => {
   assert.deepEqual(rebuild.args.slice(-3), ["patrol-refresh", "nlwiki", "--rebuild"]);
 });
 
+test("admin history fetch uses bounded transactional source preparation", () => {
+  const dispatcherPath = require.resolve("../deploy/toolforge/admin-dispatcher.cjs");
+  delete require.cache[dispatcherPath];
+  const dispatcher = require(dispatcherPath);
+  const command = dispatcher.commandFor({
+    action: "fetch",
+    wiki: "frwiki",
+    version: "2026-08",
+    runId: "admin-frwiki-source-window",
+  });
+
+  assert.ok(command.args.includes("prepare-source"));
+  assert.deepEqual(command.args.slice(-2), ["--source-window-size", "1"]);
+  assert.equal(command.args.includes("fetch"), false);
+});
+
 test("admin dispatcher maps fail-closed operational controls to typed commands", () => {
   const dispatcherPath = require.resolve("../deploy/toolforge/admin-dispatcher.cjs");
   delete require.cache[dispatcherPath];

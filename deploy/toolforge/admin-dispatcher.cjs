@@ -109,7 +109,7 @@ function commandFor(request) {
         "--lifecycle", LIFECYCLE_PATH,
       ]};
     case "fetch":
-      return {program: BIN, args: [...common, "fetch", wiki, ...version]};
+      return {program: BIN, args: [...common, "prepare-source", wiki, ...version, "--source-window-size", "1"]};
     case "ingest":
       return {program: BIN, args: [...common, "ingest", wiki, ...version]};
     case "compute":
