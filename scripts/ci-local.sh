@@ -58,6 +58,7 @@ node --test site/admin-auth.test.cjs
 node --test site/admin-lifecycle.test.cjs
 node --test site/admin-quality.test.cjs
 node --test site/admin-operational-truth.test.cjs
+node --test site/admin-operation-status.test.cjs
 node --test site/admin-page.test.cjs
 node --test site/admin-console.test.mjs
 
@@ -100,6 +101,9 @@ node --test deploy/toolforge/run-capacity-benchmark.test.cjs
 node --test deploy/toolforge/run-qualify-wiki.test.cjs
 node --test deploy/toolforge/rebuild-image.test.cjs
 node --test deploy/toolforge/load-scheduled-jobs.test.cjs
+node --test deploy/toolforge/admin-operation-policy.test.cjs
+node --test deploy/toolforge/capacity-admission.test.cjs
+node --test deploy/toolforge/run-compatibility-cohort.test.cjs
 node --test deploy/toolforge/run-fleet-worker.test.cjs
 node --test deploy/toolforge/imported-backup.test.cjs
 node --test deploy/toolforge/recovery-operations.test.cjs
