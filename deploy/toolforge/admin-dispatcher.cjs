@@ -242,6 +242,11 @@ function dispatchClaim(claim) {
     state: "dispatched",
     workerResourceClass,
     priority: operationPriority(request),
+    recoveryPolicy: {
+      stableRunId: true,
+      preserveValidatedTransactions: true,
+      maximumStaleRetries: 2,
+    },
     dispatchedAt,
     updatedAt: dispatchedAt,
   };
@@ -306,7 +311,7 @@ function recoverStaleOperations() {
     fs.renameSync(runningPath, queuedPath);
     atomicWriteJson(queuedPath, {
       ...request,
-      state: "queued",
+      state: workerClass ? "dispatched" : "queued",
       retryCount: Number(request.retryCount || 0) + 1,
       recoveredAt: now,
       updatedAt: now,
@@ -360,6 +365,7 @@ async function executeClaim(claim) {
 
   const child = spawn(command.program, command.args, {
     cwd: ROOT,
+    detached: process.platform !== "win32",
     env: {
       ...process.env,
       CARGO_TERM_COLOR: "never",
@@ -377,11 +383,19 @@ async function executeClaim(claim) {
   child.stdout.on("data", append);
   child.stderr.on("data", append);
 
+  const terminateChild = () => {
+    if (child.exitCode != null || child.signalCode != null) return;
+    if (process.platform !== "win32" && Number.isInteger(child.pid)) {
+      try { process.kill(-child.pid, "SIGTERM"); return; } catch {}
+    }
+    child.kill("SIGTERM");
+  };
+
   const heartbeat = setInterval(() => {
     const latest = readJson(runningPath) || state;
     if (latest.cancelRequested && !state.cancelRequested) {
       state.cancelRequested = true;
-      child.kill("SIGTERM");
+      terminateChild();
       fs.appendFileSync(logPath, "\n[cancellation requested by operator]\n", "utf8");
     }
     const now = new Date().toISOString();

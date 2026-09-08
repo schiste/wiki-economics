@@ -1196,6 +1196,42 @@ test("admin dispatcher claims and completes one queued operation", async (t) => 
   assert.equal(fs.readdirSync(path.join(operationRoot, "history")).length, 1);
 });
 
+test("stale worker recovery preserves the routed class and stable run identity", (t) => {
+  const operationRoot = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-admin-worker-recovery-"));
+  t.after(() => fs.rmSync(operationRoot, {recursive: true, force: true}));
+  const running = path.join(operationRoot, "running");
+  fs.mkdirSync(running, {recursive: true});
+  const request = {
+    schemaVersion: 1,
+    requestId: "admin-recover-frwiki",
+    runId: "admin-recover-frwiki",
+    action: "run",
+    wiki: "frwiki",
+    workerResourceClass: "medium_large",
+    state: "running",
+    startedAt: "2020-01-01T00:00:00Z",
+    heartbeatAt: "2020-01-01T00:00:00Z",
+    retryCount: 0,
+  };
+  fs.writeFileSync(path.join(running, `${request.requestId}.json`), JSON.stringify(request));
+  const dispatcherPath = require.resolve("../deploy/toolforge/admin-dispatcher.cjs");
+  const previousRoot = process.env.WIKI_ECON_ADMIN_OPERATION_DIR;
+  process.env.WIKI_ECON_ADMIN_OPERATION_DIR = operationRoot;
+  delete require.cache[dispatcherPath];
+  const dispatcher = require(dispatcherPath);
+  assert.deepEqual(dispatcher.recoverStaleOperations(), [request.requestId]);
+  const recovered = JSON.parse(fs.readFileSync(
+    path.join(operationRoot, "dispatched", "medium_large", `${request.requestId}.json`),
+    "utf8",
+  ));
+  if (previousRoot == null) delete process.env.WIKI_ECON_ADMIN_OPERATION_DIR;
+  else process.env.WIKI_ECON_ADMIN_OPERATION_DIR = previousRoot;
+  delete require.cache[dispatcherPath];
+  assert.equal(recovered.state, "dispatched");
+  assert.equal(recovered.runId, request.runId);
+  assert.equal(recovered.retryCount, 1);
+});
+
 test("admin dispatcher patrol actions always fetch before compute", () => {
   const dispatcherPath = require.resolve("../deploy/toolforge/admin-dispatcher.cjs");
   delete require.cache[dispatcherPath];

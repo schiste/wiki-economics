@@ -18,6 +18,21 @@ const STAGE_LABELS = Object.freeze({
   publication_commit: "Publishing",
 });
 
+const RESUMABLE_STAGES = new Set([
+  "snapshot_resolve",
+  "patrol_preflight",
+  "source_window",
+  "patrol_fetch",
+  "compute",
+  "patrol_compute",
+  "candidate_validate",
+  "candidate_ready",
+  "publication_prepare",
+  "publication_verify",
+  "site",
+  "publication_commit",
+]);
+
 function stripAnsi(value) {
   return String(value || "").replace(ANSI_ESCAPE, "");
 }
@@ -295,6 +310,13 @@ function summarizeOperationLog(entry = {}, rawLog = "") {
       scratchBytes,
       persistentAvailableBytes,
     },
+    recovery: stage ? {
+      resumable: RESUMABLE_STAGES.has(stage),
+      stableRunId: entry.recoveryPolicy?.stableRunId ?? true,
+      preservesValidatedTransactions: entry.recoveryPolicy?.preserveValidatedTransactions ?? true,
+      retryCount: Number(entry.retryCount || 0),
+      maximumStaleRetries: Number(entry.recoveryPolicy?.maximumStaleRetries ?? 2),
+    } : null,
     rawError,
     ...failure,
   };

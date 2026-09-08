@@ -1835,6 +1835,7 @@ function pipelineDossier(name, wiki, state, lifecycle, direct, fleetWork, plan) 
         <div class="admin-human-progress-track"><i style=${`width:${progressPercent}%`}></i></div>
         <small>${progress?.ingestedRows ? `${progress.ingestedRows.toLocaleString()} rows ingested` : ""}${progress?.completedBytes ? ` · ${formatRefreshBytes(progress.completedBytes)} transferred` : ""}${formatTransferRate(progress?.currentSourceBytesPerSecond || progress?.downloadBytesPerSecond) ? ` · ${formatTransferRate(progress.currentSourceBytesPerSecond || progress.downloadBytesPerSecond)}` : ""}${progress?.etaSeconds != null ? ` · ETA ${formatRefreshDuration(progress.etaSeconds)}` : ""}</small>
       </div>` : ""}
+      ${operationActive && direct?.recovery?.resumable ? html`<small class="admin-resume-note">Safe to resume: validated transactions are retained under the same run identity if this worker is interrupted.</small>` : ""}
       ${stoppedWithExplanation ? html`<div class="admin-human-error"><strong>Why it stopped</strong><span>${direct.errorSummary}</span>${direct.remediation ? html`<small>${direct.remediation}</small>` : ""}</div>` : ""}
     </div>
     <section class="admin-stage-ledger" aria-labelledby=${`${name}-stage-heading`}>

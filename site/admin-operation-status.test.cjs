@@ -25,6 +25,8 @@ test("operation summaries expose bounded source-window progress in human terms",
   assert.equal(summary.progress.currentSource, "2026-07.dewiki.2003");
   assert.equal(summary.progress.downloadedBytes, 4853113);
   assert.equal(summary.progress.ingestedRows, 74872);
+  assert.equal(summary.recovery.resumable, true);
+  assert.equal(summary.recovery.preservesValidatedTransactions, true);
   assert.doesNotMatch(stripAnsi(log), /\u001b/);
 });
 
