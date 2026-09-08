@@ -530,7 +530,7 @@ pub(crate) fn handle_prepare_source(
     let window_size = source_window::configured_window_size(request.source_window_size)?;
     ops.persist_snapshot_plans(&wikis, &version, context.paths.data)?;
     timed_stage("source_window", Some(request.wiki), || {
-        ops.prepare_wiki_snapshot(
+        ops.prepare_candidate_snapshot(
             request.wiki,
             &version,
             context.paths.data,

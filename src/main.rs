@@ -2226,7 +2226,14 @@ mod tests {
             run_id: &str,
             window_size: usize,
         ) -> Result<()> {
-            self.prepare_wiki_snapshot(wiki, version, data_dir, run_id, window_size)
+            self.fail_if("fetch", "fetch failed")?;
+            self.fail_if("ingest", "ingest failed")?;
+            self.fail_if("cleanup_raw", "cleanup raw failed")?;
+            self.record(format!(
+                "candidate_source_window:{wiki}:{version}:{}:{run_id}:{window_size}",
+                data_dir.display()
+            ));
+            Ok(())
         }
     }
 
@@ -2694,7 +2701,7 @@ mod tests {
         assert_eq!(
             ops.calls.into_inner(),
             vec![
-                "source_window:nlwiki:2026-07:fixtures/data:2",
+                "candidate_source_window:nlwiki:2026-07:fixtures/data:run-7:2",
                 "compute:nlwiki:fixtures/data:fixtures/output/_candidates/nlwiki/2026-07/run-7",
                 "fetch_patrol:nlwiki:fixtures/data",
                 "compute_patrol:nlwiki:fixtures/data:fixtures/output/_candidates/nlwiki/2026-07/run-7:false:_",
@@ -2726,7 +2733,7 @@ mod tests {
 
         assert_eq!(
             ops.calls.into_inner(),
-            vec!["source_window:nlwiki:2026-07:fixtures/data:2"]
+            vec!["candidate_source_window:nlwiki:2026-07:fixtures/data:source-7:2"]
         );
         Ok(())
     }
@@ -2759,7 +2766,7 @@ mod tests {
             ops.calls.into_inner(),
             vec![
                 "candidate_rebuild:nlwiki:2026-07:rebuild-7",
-                "source_window:nlwiki:2026-07:fixtures/data:1",
+                "candidate_source_window:nlwiki:2026-07:fixtures/data:rebuild-7:1",
                 "compute:nlwiki:fixtures/data:fixtures/output/_candidates/nlwiki/2026-07/rebuild-7",
                 "fetch_patrol:nlwiki:fixtures/data",
                 "compute_patrol:nlwiki:fixtures/data:fixtures/output/_candidates/nlwiki/2026-07/rebuild-7:false:_",
@@ -2798,7 +2805,7 @@ mod tests {
             vec![
                 "qualification_lifecycle:itwiki",
                 "reset_obsolete_input:itwiki:2026-07",
-                "source_window:itwiki:2026-07:qualification/data:1",
+                "candidate_source_window:itwiki:2026-07:qualification/data:qualify-7:1",
                 "compute:itwiki:qualification/data:qualification/output/_qualifications/itwiki/2026-07/qualify-7",
                 "fetch_patrol:itwiki:qualification/data",
                 "compute_patrol:itwiki:qualification/data:qualification/output/_qualifications/itwiki/2026-07/qualify-7:false:_",
@@ -2902,7 +2909,7 @@ mod tests {
         assert_eq!(
             ops.calls.into_inner(),
             vec![
-                "source_window:nlwiki:2026-07:fixtures/data:1",
+                "candidate_source_window:nlwiki:2026-07:fixtures/data:partial-run:1",
                 "candidate_ready:nlwiki:2026-07:partial-run",
             ]
         );
@@ -2937,7 +2944,7 @@ mod tests {
         assert_eq!(
             ops.calls.into_inner(),
             vec![
-                "source_window:nlwiki:2026-07:fixtures/data:1",
+                "candidate_source_window:nlwiki:2026-07:fixtures/data:cached-patrol-run:1",
                 "compute_patrol:nlwiki:fixtures/data:fixtures/output/_candidates/nlwiki/2026-07/cached-patrol-run:false:_",
                 "candidate_ready:nlwiki:2026-07:cached-patrol-run",
             ]
@@ -2974,7 +2981,7 @@ mod tests {
             reused.calls.into_inner(),
             vec![
                 "qualification_lifecycle:itwiki",
-                "source_window:itwiki:2026-07:qualification/data:1",
+                "candidate_source_window:itwiki:2026-07:qualification/data:qualification-reuse:1",
                 "qualification_ready:itwiki:2026-07:qualification-reuse",
             ]
         );
@@ -3017,7 +3024,7 @@ mod tests {
             ops.calls.into_inner(),
             vec![
                 "qualification_lifecycle:itwiki",
-                "source_window:itwiki:2026-07:qualification/data:1",
+                "candidate_source_window:itwiki:2026-07:qualification/data:qualification-cached-patrol:1",
                 "compute_patrol:itwiki:qualification/data:qualification/output/_qualifications/itwiki/2026-07/qualification-cached-patrol:false:_",
                 "qualification_ready:itwiki:2026-07:qualification-cached-patrol",
             ]
