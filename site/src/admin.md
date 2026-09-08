@@ -1189,6 +1189,11 @@ function formatRefreshBytes(bytes) {
   const gib = bytes / (1024 ** 3)
   return `${gib.toFixed(gib >= 10 ? 1 : 2)} GiB`
 }
+
+function formatTransferRate(bytesPerSecond) {
+  if (!Number.isFinite(bytesPerSecond) || bytesPerSecond <= 0) return null
+  return `${(bytesPerSecond / (1024 ** 2)).toFixed(1)} MiB/s`
+}
 ```
 
 ```js
@@ -1828,7 +1833,7 @@ function pipelineDossier(name, wiki, state, lifecycle, direct, fleetWork, plan) 
       ${progressPercent != null && operationActive ? html`<div class="admin-human-progress" aria-label=${`${progressPercent}% of source files complete`}>
         <div><span>${progress?.detail || "Working"}</span><strong>${progressPercent}%</strong></div>
         <div class="admin-human-progress-track"><i style=${`width:${progressPercent}%`}></i></div>
-        <small>${progress?.ingestedRows ? `${progress.ingestedRows.toLocaleString()} rows ingested` : ""}${progress?.downloadedBytes ? ` · ${formatRefreshBytes(progress.downloadedBytes)} transferred` : ""}</small>
+        <small>${progress?.ingestedRows ? `${progress.ingestedRows.toLocaleString()} rows ingested` : ""}${progress?.completedBytes ? ` · ${formatRefreshBytes(progress.completedBytes)} transferred` : ""}${formatTransferRate(progress?.currentSourceBytesPerSecond || progress?.downloadBytesPerSecond) ? ` · ${formatTransferRate(progress.currentSourceBytesPerSecond || progress.downloadBytesPerSecond)}` : ""}${progress?.etaSeconds != null ? ` · ETA ${formatRefreshDuration(progress.etaSeconds)}` : ""}</small>
       </div>` : ""}
       ${stoppedWithExplanation ? html`<div class="admin-human-error"><strong>Why it stopped</strong><span>${direct.errorSummary}</span>${direct.remediation ? html`<small>${direct.remediation}</small>` : ""}</div>` : ""}
     </div>

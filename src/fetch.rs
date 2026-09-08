@@ -11,7 +11,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
 use crate::fingerprint::{self, StageSpec, TrackedPath};
@@ -1464,6 +1464,8 @@ fn download_attempt<T: HttpTransport>(
     let download_result = (|| -> std::result::Result<u64, std::io::Error> {
         let mut buffer = [0_u8; 64 * 1024];
         let mut downloaded = if append { plan.resume_from } else { 0 };
+        let download_started = Instant::now();
+        let mut last_progress_log = Instant::now();
 
         loop {
             let read = response.body.read(&mut buffer)?;
@@ -1473,6 +1475,21 @@ fn download_attempt<T: HttpTransport>(
             file.write_all(&buffer[..read])?;
             downloaded += read as u64;
             progress.inc(read as u64);
+            if last_progress_log.elapsed() >= Duration::from_secs(5) {
+                let elapsed_ms = u64::try_from(download_started.elapsed().as_millis())
+                    .unwrap_or(u64::MAX)
+                    .max(1);
+                let transferred = downloaded.saturating_sub(plan.resume_from);
+                let bytes_per_second = transferred.saturating_mul(1_000) / elapsed_ms;
+                info!(
+                    path = %dest.display(),
+                    downloaded_bytes = downloaded,
+                    expected_bytes = progress_total.unwrap_or_default(),
+                    bytes_per_second,
+                    "source download progress"
+                );
+                last_progress_log = Instant::now();
+            }
         }
 
         file.flush()?;

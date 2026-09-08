@@ -79,12 +79,36 @@ test("operation summaries use byte-weighted progress for uneven source files", (
   const summary = summarizeOperationLog({}, [
     'run_id=test INFO starting stage stage="source_window" wiki="dewiki"',
     'run_id=test INFO starting bounded source-window execution planned_sources=10 reused_sources=2 planned_bytes=1000 reused_bytes=100 pending_sources=8',
-    'run_id=test INFO resource governor source progress sample={"downloaded_bytes":400,"ingested_rows":12}',
+    'run_id=test INFO resource governor source progress sample={"memory":{"cgroup_current_bytes":200,"cgroup_peak_bytes":250},"scratch_bytes":30,"persistent_available_bytes":8000,"downloaded_bytes":400,"ingested_rows":12,"download_bytes_per_second":50,"ingest_rows_per_second":2}',
   ].join("\n"));
   assert.equal(summary.progress.percent, 50);
   assert.equal(summary.progress.plannedBytes, 1000);
   assert.equal(summary.progress.reusedBytes, 100);
   assert.equal(summary.progress.completedBytes, 500);
+  assert.equal(summary.progress.downloadBytesPerSecond, 50);
+  assert.equal(summary.progress.ingestRowsPerSecond, 2);
+  assert.equal(summary.progress.etaSeconds, 10);
+  assert.equal(summary.progress.memoryCurrentBytes, 200);
+  assert.equal(summary.progress.memoryPeakBytes, 250);
+  assert.equal(summary.progress.scratchBytes, 30);
+  assert.equal(summary.progress.persistentAvailableBytes, 8000);
+});
+
+test("operation summaries include an in-flight source in byte progress and ETA", () => {
+  const summary = summarizeOperationLog({}, [
+    'run_id=test INFO starting stage stage="source_window" wiki="frwiki"',
+    'run_id=test INFO starting bounded source-window execution planned_sources=4 reused_sources=0 planned_bytes=1000 reused_bytes=0 pending_sources=4',
+    'run_id=test INFO resource governor source progress sample={"downloaded_bytes":200,"ingested_rows":12,"download_bytes_per_second":20}',
+    'run_id=test INFO starting source-window download source="source-2"',
+    'run_id=test INFO source download progress path="source-2" downloaded_bytes=300 expected_bytes=500 bytes_per_second=50',
+  ].join("\n"));
+
+  assert.equal(summary.progress.completedBytes, 500);
+  assert.equal(summary.progress.percent, 50);
+  assert.equal(summary.progress.currentSourceDownloadedBytes, 300);
+  assert.equal(summary.progress.currentSourceExpectedBytes, 500);
+  assert.equal(summary.progress.currentSourceBytesPerSecond, 50);
+  assert.equal(summary.progress.etaSeconds, 10);
 });
 
 test("operation summaries distinguish incomplete logging dumps from defects", () => {

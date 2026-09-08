@@ -48,6 +48,21 @@ function unique(values) {
   return Array.from(new Set(values.filter(Boolean)));
 }
 
+function currentSourceTransfer(text) {
+  const progress = matches(
+    text,
+    /\bsource download progress[^\n]*\bdownloaded_bytes=(?:"?(\d+)"?)[^\n]*\bexpected_bytes=(?:"?(\d+)"?)[^\n]*\bbytes_per_second=(?:"?(\d+)"?)/g,
+  ).at(-1);
+  if (!progress) return null;
+  const completedSampleIndex = text.lastIndexOf("resource governor source progress");
+  if ((progress.index ?? -1) < completedSampleIndex) return null;
+  return {
+    downloadedBytes: Number.parseInt(progress[1], 10),
+    expectedBytes: Number.parseInt(progress[2], 10),
+    bytesPerSecond: Number.parseInt(progress[3], 10),
+  };
+}
+
 function classifyError(message) {
   if (!message) return {errorSummary: null, retryable: null, remediationCode: null, remediation: null};
   if (/UPSTREAM_WAITING:.*Wikimedia logging dump/i.test(message)) {
@@ -204,10 +219,33 @@ function summarizeOperationLog(entry = {}, rawLog = "") {
   const reusedBytes = lastInteger(text, /\breused_bytes=(?:"?(\d+)"?)/g)
     ?? entry.progress?.reusedBytes
     ?? 0;
+  const sourceTransfer = currentSourceTransfer(text);
   const completedBytes = Math.min(
     plannedBytes || Number.MAX_SAFE_INTEGER,
-    reusedBytes + (downloadedBytes || 0),
+    reusedBytes + (downloadedBytes || 0) + (sourceTransfer?.downloadedBytes || 0),
   );
+  const downloadBytesPerSecond = lastInteger(text, /"download_bytes_per_second":(\d+)/g)
+    ?? entry.progress?.downloadBytesPerSecond
+    ?? null;
+  const ingestRowsPerSecond = lastInteger(text, /"ingest_rows_per_second":(\d+)/g)
+    ?? entry.progress?.ingestRowsPerSecond
+    ?? null;
+  const memoryCurrentBytes = lastInteger(text, /"cgroup_current_bytes":(\d+)/g)
+    ?? entry.progress?.memoryCurrentBytes
+    ?? null;
+  const memoryPeakBytes = lastInteger(text, /"cgroup_peak_bytes":(\d+)/g)
+    ?? entry.progress?.memoryPeakBytes
+    ?? null;
+  const scratchBytes = lastInteger(text, /"scratch_bytes":(\d+)/g)
+    ?? entry.progress?.scratchBytes
+    ?? null;
+  const persistentAvailableBytes = lastInteger(text, /"persistent_available_bytes":(\d+)/g)
+    ?? entry.progress?.persistentAvailableBytes
+    ?? null;
+  const effectiveDownloadRate = sourceTransfer?.bytesPerSecond || downloadBytesPerSecond;
+  const etaSeconds = plannedBytes && effectiveDownloadRate
+    ? Math.max(0, Math.ceil((plannedBytes - completedBytes) / effectiveDownloadRate))
+    : entry.progress?.etaSeconds ?? null;
 
   const errorLine = lastCapture(text, /^Error:\s*(.+)$/gm);
   const succeeded = entry.state === "succeeded" || entry.exitCode === 0;
@@ -246,6 +284,16 @@ function summarizeOperationLog(entry = {}, rawLog = "") {
       reusedBytes,
       completedBytes,
       ingestedRows,
+      downloadBytesPerSecond,
+      currentSourceDownloadedBytes: sourceTransfer?.downloadedBytes ?? null,
+      currentSourceExpectedBytes: sourceTransfer?.expectedBytes ?? null,
+      currentSourceBytesPerSecond: sourceTransfer?.bytesPerSecond ?? null,
+      ingestRowsPerSecond,
+      etaSeconds,
+      memoryCurrentBytes,
+      memoryPeakBytes,
+      scratchBytes,
+      persistentAvailableBytes,
     },
     rawError,
     ...failure,
