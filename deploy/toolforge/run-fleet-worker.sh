@@ -27,6 +27,10 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 wiki_econ_init_runtime
 wiki_econ_ensure_local_dirs
 : "${WIKI_ECON_BIN:?Toolforge fleet worker requires WIKI_ECON_BIN}"
+if [ "${WIKI_ECON_CAPACITY_ADMITTED:-0}" != "1" ]; then
+  exec node "$ROOT/deploy/toolforge/capacity-admission.cjs" \
+    --resource-class "$resource_class" -- "$0" "$@"
+fi
 if [ "$resource_class" = small ]; then
   export WIKI_ECON_MEMORY_CEILING_BYTES="${WIKI_ECON_MEMORY_CEILING_BYTES:-2147483648}"
   export WIKI_ECON_MEMORY_RESERVE_BYTES="${WIKI_ECON_MEMORY_RESERVE_BYTES:-536870912}"
