@@ -53,10 +53,17 @@ frwiki variants have identical logical output (snapshot, rows, edit total, and
 date range). At least one frwiki variant must pass both resource gates; failed
 alternatives remain visible in the qualification evidence. Repeat the selected
 variant and require the same output SHA-256 before lifecycle activation.
-Frwiki passed this gate on 2026-08-24 with two byte-identical 256-bucket runs;
-production rejects other bucket counts. Any future bucket or resource-policy
-change requires a new qualification with at least 25% memory headroom plus the
-configured 50 GiB storage reserve.
+Frwiki passed this aggregation benchmark gate on 2026-08-24 with two
+byte-identical 256-bucket runs. These `required_bucket_counts` remain the
+legacy aggregation benchmark matrix. Adaptive workload admission is tracked
+separately through `qualified_workload_profiles` and
+`qualified_workload_bucket_counts`, so adding a 2,048-bucket workload layout
+does not rewrite or overstate the older benchmark evidence. Its scoped
+production decision is recorded in
+`docs/evidence/toolforge-large-workload-profile-admission-2026-09-09.json`.
+Any future profile, layout, or resource-policy change requires a new explicit
+admission record; publication still requires passing candidate receipts and a
+current preflight.
 
 ## Imported-data backup and restore
 

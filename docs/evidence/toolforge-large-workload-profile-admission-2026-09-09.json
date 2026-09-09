@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "decision": "admit_large_workload_profile_for_observed_large_wikis",
+  "recorded_at": "2026-09-09",
+  "toolforge": {
+    "namespace_memory_limit_bytes": 25769803776,
+    "namespace_cpu_limit_millicores": 16000,
+    "medium_large_job_memory_limit_bytes": 6442450944,
+    "maximum_source_workers": 1
+  },
+  "profile": {
+    "name": "large",
+    "selection_algorithm_version": "adaptive-workload-profile-v2-measured",
+    "logical_bucket_count": 2048,
+    "source_workers": 3,
+    "production_effective_source_workers": 1
+  },
+  "observations": {
+    "frwiki": {
+      "snapshot": "2026-08",
+      "historical_peak_memory_bytes": 4740829184,
+      "prior_fragment_count": 8402
+    },
+    "itwiki": {
+      "snapshot": "2026-08",
+      "historical_peak_memory_bytes": 3388907520,
+      "prior_fragment_count": 5424
+    },
+    "nlwiki": {
+      "snapshot": "2026-08",
+      "historical_peak_memory_bytes": 4796948480,
+      "prior_fragment_count": 2896
+    },
+    "ptwiki": {
+      "snapshot": "2026-08",
+      "historical_peak_memory_bytes": 4892733440,
+      "prior_fragment_count": 3062
+    },
+    "svwiki": {
+      "snapshot": "2026-08",
+      "historical_peak_memory_bytes": 2220728320,
+      "prior_fragment_count": 2626
+    }
+  },
+  "controls": [
+    "The profile is admitted only for the five named wikis and the exact 2048-bucket layout.",
+    "Production keeps effective source concurrency at one.",
+    "The 6 GiB cgroup ceiling and resource governor remain fail-closed.",
+    "Candidate processing is publication-invisible until receipt validation and publication preflight pass.",
+    "Failures retain the current public generation and return work to bounded retry or quarantine.",
+    "The compatibility repair executes sequentially to avoid correlated memory and NFS pressure."
+  ],
+  "qualification_scope": {
+    "legacy_aggregation_benchmark_bucket_counts_unchanged": true,
+    "standalone_2048_bucket_capacity_report_present": false,
+    "reason": "This is a controlled workload-profile admission based on recorded production peaks and stricter partitioning, not a rewrite of the legacy aggregation benchmark matrix.",
+    "first_run_requirement": "Review the resulting candidate resource receipt before publication; preflight remains mandatory."
+  }
+}

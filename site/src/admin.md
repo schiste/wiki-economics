@@ -1061,6 +1061,7 @@ function operationLabel(state) {
     quarantined: "Quarantined",
     qualified: "Qualification ready",
     succeeded: "Succeeded",
+    superseded: "Resolved by later success",
     failed: "Failed",
     interrupted: "Interrupted",
     cancelled: "Cancelled"
@@ -1071,7 +1072,7 @@ function operationTone(state) {
   if (["failed", "interrupted", "quarantined", "stalled"].includes(state)) return "danger"
   if (["running", "cancelling"].includes(state)) return "active"
   if (["queued", "waiting_upstream"].includes(state)) return "waiting"
-  if (["succeeded", "qualified"].includes(state)) return "success"
+  if (["succeeded", "qualified", "superseded"].includes(state)) return "success"
   return "neutral"
 }
 
@@ -1321,16 +1322,41 @@ function formatTransferRate(bytesPerSecond) {
   if (!Number.isFinite(bytesPerSecond) || bytesPerSecond <= 0) return null
   return `${(bytesPerSecond / (1024 ** 2)).toFixed(1)} MiB/s`
 }
+
+function collapsePublicationHistory(runs) {
+  const latestSuccessAt = runs
+    .filter((run) => run.state === "succeeded" || run.exitCode === 0)
+    .map((run) => Date.parse(run.finishedAt || run.startedAt || 0))
+    .filter(Number.isFinite)
+    .sort((left, right) => right - left)[0] || 0
+  const groups = new Map()
+  for (const run of runs) {
+    const failed = run.state !== "succeeded" && run.exitCode !== 0
+    const finishedAt = Date.parse(run.finishedAt || run.startedAt || 0)
+    const resolved = failed && Number.isFinite(finishedAt) && finishedAt < latestSuccessAt
+    const signature = JSON.stringify([
+      failed ? "failed" : "succeeded",
+      resolved,
+      run.failingStage || null,
+      run.errorSummary || run.error || null
+    ])
+    if (!groups.has(signature)) groups.set(signature, {...run, attemptCount: 0, resolved})
+    groups.get(signature).attemptCount += 1
+  }
+  return [...groups.values()].sort((left, right) =>
+    Date.parse(right.finishedAt || right.startedAt || 0) - Date.parse(left.finishedAt || left.startedAt || 0))
+}
 ```
 
 ```js
 const scheduledRefresh = job?.scheduledRefresh || {schedule: null, last: null, history: []}
 const refreshHealth = classifyRefreshHealth(scheduledRefresh.last, scheduledRefresh.schedule)
 const refreshHistoryNewestFirst = [...(scheduledRefresh.history || [])].reverse()
+const groupedRefreshHistory = collapsePublicationHistory(refreshHistoryNewestFirst)
 const blockerAlerts = (operationalTruth.pipeline?.blockerGroups || []).map((blocker) => ({
   domain: "Pipeline",
   code: blocker.code,
-  severity: "critical",
+  severity: blocker.retryable ? "warning" : "critical",
   message: `${blocker.affectedWikis.length} projects (${blocker.affectedWikis.join(", ")}) are paused by one cause: ${blocker.summary} Next step: ${blocker.remediation}`
 }))
 const operationalAlerts = [
@@ -1348,7 +1374,18 @@ const publicationOps = operationalTruth.public?.publication || {}
 const publicationPreflight = publicationOps.preflight || null
 const publicationBlockerSummaries = summarizePublicationBlockers(publicationPreflight?.blockers || [])
 const hasCompatibilityBlocker = publicationBlockerSummaries.some((blocker) => blocker.code === "incompatible_metric_versions")
+const unresolvedProfileAdmission = (operationalTruth.pipeline?.blockerGroups || [])
+  .find((blocker) => blocker.code === "workload_profile_unqualified")
+const retryReadyProfiles = (operationalTruth.pipeline?.blockerGroups || [])
+  .find((blocker) => blocker.code === "workload_profile_retry_ready")
 const preflightCanPublish = Boolean(publicationPreflight?.eligible && publicationPreflight?.current)
+const compatibilityRepairActive = operatorOperations.some((operation) =>
+  operation.action === "rebuild-compatibility-cohort"
+  && ["queued", "waiting_upstream", "running", "cancelling"].includes(operation.state))
+const compatibilityRepairAllowed = Boolean(apiStatus && hasCompatibilityBlocker && !unresolvedProfileAdmission && !compatibilityRepairActive)
+const recoveryHeadline = operationalTruth.public?.status === "healthy"
+  ? "Public data is safe while the next generation is repaired"
+  : "Protect the public generation before continuing"
 const displayedChangePlan = publicationPreflight?.current
   ? {changed: publicationPreflight.changed || [], reused: publicationPreflight.reused || [], source: "Current preflight"}
   : publicationOps.currentChangePlan
@@ -1378,17 +1415,42 @@ display(html`<div id="admin-publication-workbench" class="admin-refresh-panel">
     </div>
     <div class="admin-control-chip">
       <span class="admin-control-label">Artifact scrub</span>
-      <strong>${operationalTruth.public?.scrub?.state || "missing"}</strong>
+      <strong>${operationalTruth.public?.scrub?.state === "missing" ? "Not run" : operationalTruth.public?.scrub?.state || "Unknown"}</strong>
     </div>
     <div class="admin-control-chip">
       <span class="admin-control-label">Peak memory</span>
       <strong>${formatRefreshBytes(scheduledRefresh.last?.memoryPeakBytes)} / ${formatRefreshBytes(scheduledRefresh.last?.memoryLimitBytes)}</strong>
     </div>
   </div>
-  ${operationalAlerts.length ? html`<div class="admin-health-alerts">
-    ${operationalAlerts.slice(0, 10).map((alert) => html`<div class=${alert.severity || "warning"}><strong>${alert.domain} · ${alert.code.replaceAll("_", " ")}</strong><span>${alert.message}</span></div>`)}
-    ${operationalAlerts.length > 10 ? html`<span>${operationalAlerts.length - 10} more operational alerts. Filter the project list to inspect each one.</span>` : ""}
-  </div>` : html`<div class="admin-health-clear">Published data, update pipeline, and configured infrastructure checks pass.</div>`}
+  <section class=${`admin-recovery-plan ${operationalTruth.public?.status === "healthy" ? "safe" : "unsafe"}`}>
+    <header>
+      <div><strong>${recoveryHeadline}</strong><span>${operationalTruth.public?.status === "healthy" ? "Repairs change candidates only. The live site stays on the last validated publication." : "Stop candidate work until public publication evidence is healthy."}</span></div>
+      <span class="admin-recovery-state">${compatibilityRepairActive ? "Repair running" : preflightCanPublish ? "Ready to publish" : hasCompatibilityBlocker ? "Repair required" : "Verification required"}</span>
+    </header>
+    <ol>
+      <li class=${operationalTruth.public?.status === "healthy" ? "done" : "blocked"}>
+        <i aria-hidden="true"></i><div><strong>Keep the current publication online</strong><span>${operationalTruth.public?.status === "healthy" ? "Healthy. Candidate failures cannot replace it." : "Public evidence needs attention before recovery can continue."}</span></div>
+      </li>
+      <li class=${unresolvedProfileAdmission ? "blocked" : "done"}>
+        <i aria-hidden="true"></i><div><strong>Admit the required workload profile</strong><span>${unresolvedProfileAdmission ? `${unresolvedProfileAdmission.affectedWikis.length} projects still require production qualification.` : retryReadyProfiles ? `Qualification is deployed for ${retryReadyProfiles.affectedWikis.length} recorded failures; they are safe to rebuild.` : "The selected profiles and bucket layouts are covered by production policy."}</span></div>
+      </li>
+      <li class=${hasCompatibilityBlocker ? compatibilityRepairActive ? "running" : unresolvedProfileAdmission ? "waiting" : "current" : "done"}>
+        <i aria-hidden="true"></i><div><strong>Rebuild incompatible candidates with one binary</strong><span>${hasCompatibilityBlocker ? "The cohort includes every snapshot laggard and every wiki named by schema or algorithm incompatibility." : "Candidate metric identities agree."}</span></div>
+        ${hasCompatibilityBlocker ? html`<button class="admin-btn primary" ?disabled=${!compatibilityRepairAllowed} title=${unresolvedProfileAdmission ? "Complete workload-profile qualification first." : compatibilityRepairActive ? "Compatibility repair is already running." : actionTooltipWithApi("rebuild-compatibility-cohort", apiStatus)} onclick=${() => { if (confirm("Rebuild every incompatible candidate with the current pinned binary? Existing published data remains unchanged.")) runCommand("rebuild-compatibility-cohort") }}>${compatibilityRepairActive ? "Repair running" : "Repair candidate compatibility"}</button>` : ""}
+      </li>
+      <li class=${preflightCanPublish ? "done" : hasCompatibilityBlocker ? "waiting" : "current"}>
+        <i aria-hidden="true"></i><div><strong>Verify the complete candidate set</strong><span>${preflightCanPublish ? `Current ${publicationPreflight.reportSource || "admin"} preflight passed.` : hasCompatibilityBlocker ? "Available after compatibility repair finishes." : "Run a fresh preflight against the current ready-index identities."}</span></div>
+        ${!preflightCanPublish && !hasCompatibilityBlocker ? html`<button class="admin-btn primary" ?disabled=${!apiStatus} onclick=${() => runCommand("publication-preflight")}>Verify candidates</button>` : ""}
+      </li>
+      <li class=${preflightCanPublish ? "current" : "waiting"}>
+        <i aria-hidden="true"></i><div><strong>Publish atomically</strong><span>${preflightCanPublish ? "All gates passed. Publication will switch the live generation atomically." : "Locked until a current preflight passes."}</span></div>
+        ${preflightCanPublish ? html`<button class="admin-btn primary" ?disabled=${!apiStatus} onclick=${() => { if (confirm("Publish every validated ready candidate and atomically switch the live site?")) runCommand("publish") }}>Publish verified candidates</button>` : ""}
+      </li>
+    </ol>
+  </section>
+  ${operationalAlerts.length ? html`<details class="admin-incident-evidence"><summary>Operational evidence (${operationalAlerts.length} current findings)</summary><div class="admin-health-alerts">
+    ${operationalAlerts.map((alert) => html`<div class=${alert.severity || "warning"}><strong>${alert.domain} · ${alert.code.replaceAll("_", " ")}</strong><span>${alert.message}</span></div>`)}
+  </div></details>` : html`<div class="admin-health-clear">Published data, update pipeline, and configured infrastructure checks pass.</div>`}
   <div class="admin-publication-actions">
     <button class="admin-btn" ?disabled=${!apiStatus} title=${actionTooltipWithApi("publication-preflight", apiStatus)} onclick=${() => runCommand("publication-preflight")}>Run publication preflight</button>
     <button class="admin-btn primary" ?disabled=${!apiStatus || !preflightCanPublish} title=${preflightCanPublish ? actionTooltipWithApi("publish", apiStatus) : "Run a current, passing publication preflight first."} onclick=${() => {
@@ -1409,7 +1471,7 @@ display(html`<div id="admin-publication-workbench" class="admin-refresh-panel">
     ${publicationBlockerSummaries.length ? html`<div class="admin-preflight-blockers">${publicationBlockerSummaries.map((blocker) => html`<article>
       <strong>${blocker.title}</strong><span>${blocker.detail}</span>
       ${blocker.metrics.length ? html`<small>${blocker.metrics.join(", ")}</small>` : ""}
-    </article>`)}</div>${hasCompatibilityBlocker ? html`<button class="admin-btn primary" ?disabled=${!apiStatus} title=${actionTooltipWithApi("rebuild-compatibility-cohort", apiStatus)} onclick=${() => { if (confirm("Sequentially rebuild the older candidate cohort at the newest candidate snapshot? Existing published data remains unchanged.")) runCommand("rebuild-compatibility-cohort") }}>Prepare compatibility cohort</button>` : ""}` : publicationPreflight?.eligible ? html`<p>Ready candidates, recovery state, scrub state, and current publication evidence passed.</p>` : html`<p>Run preflight to authenticate the candidate set and unlock publication.</p>`}
+    </article>`)}</div>${hasCompatibilityBlocker ? html`<p>The recovery plan above owns this repair so prerequisites and progress stay visible.</p>` : ""}` : publicationPreflight?.eligible ? html`<p>Ready candidates, recovery state, scrub state, and current publication evidence passed.</p>` : html`<p>Run preflight to authenticate the candidate set and unlock publication.</p>`}
     ${displayedChangePlan ? html`<details open><summary>${displayedChangePlan.source} change plan · ${displayedChangePlan.changed?.length || 0} changed · ${displayedChangePlan.reused?.length || 0} reused</summary>
       <div class="admin-change-plan">
         <div><strong>Will rebuild</strong>${displayedChangePlan.changed?.length ? html`<ul>${displayedChangePlan.changed.map((item) => html`<li><code>${item.wiki}</code><span>${item.family}</span></li>`)}</ul>` : html`<p>No metric family changes.</p>`}</div>
@@ -1417,13 +1479,14 @@ display(html`<div id="admin-publication-workbench" class="admin-refresh-panel">
       </div>
     </details>` : ""}
   </section>
-  ${refreshHistoryNewestFirst.length ? html`<details class="admin-history-details"><summary>Publication history (${refreshHistoryNewestFirst.length})</summary><table class="admin-refresh-history">
-    <thead><tr><th>Started</th><th>Finished</th><th>Result</th><th>Duration</th><th>Peak memory</th><th>Wikis</th></tr></thead>
+  ${groupedRefreshHistory.length ? html`<details class="admin-history-details"><summary>Publication history (${refreshHistoryNewestFirst.length} runs, ${groupedRefreshHistory.length} grouped outcomes)</summary><table class="admin-refresh-history">
+    <thead><tr><th>Started</th><th>Finished</th><th>Result</th><th>Attempts</th><th>Duration</th><th>Peak memory</th><th>Wikis</th></tr></thead>
     <tbody>
-      ${refreshHistoryNewestFirst.map(run => html`<tr>
+      ${groupedRefreshHistory.map(run => html`<tr>
         <td>${formatRefreshTimestamp(run.startedAt)}</td>
         <td>${formatRefreshTimestamp(run.finishedAt)}</td>
-        <td style=${"color:" + (run.state === "succeeded" || run.exitCode === 0 ? "#2e7d32" : "#c62828")}>${run.state === "succeeded" || run.exitCode === 0 ? "Success" : `Failed (${run.exitCode})`}</td>
+        <td style=${"color:" + (run.state === "succeeded" || run.exitCode === 0 || run.resolved ? "#2e7d32" : "#c62828")}>${run.state === "succeeded" || run.exitCode === 0 ? "Success" : run.resolved ? "Resolved by later success" : `Failed (${run.exitCode})`}</td>
+        <td>${run.attemptCount}</td>
         <td>${formatRefreshDuration(run.durationSecs)}</td>
         <td>${formatRefreshBytes(run.memoryPeakBytes)} / ${formatRefreshBytes(run.memoryLimitBytes)}</td>
         <td>${(run.wikis || []).join(", ") || "—"}</td>
@@ -3915,6 +3978,29 @@ Array.isArray(currentManifest.merged) && currentManifest.merged.length > 0
 .admin-run-evidence span { color: var(--theme-foreground-muted); font-size: 0.74rem; }
 .admin-btn:disabled { cursor: not-allowed; opacity: 0.48; transform: none; box-shadow: none; }
 .admin-refresh-panel { overflow-x: auto; }
+.admin-recovery-plan { margin: 0.8rem 0; border: 1px solid var(--theme-foreground-faintest); border-left: 5px solid #315b8a; background: color-mix(in srgb, var(--theme-background) 96%, #dfe9f3 4%); }
+.admin-recovery-plan.safe { border-left-color: #2e7d32; }
+.admin-recovery-plan.unsafe { border-left-color: #c13c32; }
+.admin-recovery-plan > header { display: flex; justify-content: space-between; gap: 1rem; align-items: start; padding: 1rem; border-bottom: 1px solid var(--theme-foreground-faintest); }
+.admin-recovery-plan > header > div { display: grid; gap: 0.22rem; }
+.admin-recovery-plan > header strong { max-width: 56ch; font-size: 1rem; }
+.admin-recovery-plan > header span { max-width: 76ch; color: var(--theme-foreground-muted); font-size: 0.74rem; line-height: 1.45; }
+.admin-recovery-plan .admin-recovery-state { flex: none; padding: 0.32rem 0.52rem; border-radius: 999px; background: color-mix(in srgb, #315b8a 9%, transparent); color: #315b8a; font-weight: 750; }
+.admin-recovery-plan ol { display: grid; margin: 0; padding: 0; list-style: none; }
+.admin-recovery-plan li { display: grid; grid-template-columns: 1rem minmax(16rem, 1fr) auto; gap: 0.7rem; align-items: center; min-height: 3.7rem; padding: 0.65rem 0.9rem; border-top: 1px solid var(--theme-foreground-faintest); }
+.admin-recovery-plan li:first-child { border-top: 0; }
+.admin-recovery-plan li > i { width: 0.72rem; height: 0.72rem; border: 2px solid #9aa5b1; border-radius: 50%; background: var(--theme-background); }
+.admin-recovery-plan li > div { display: grid; gap: 0.12rem; }
+.admin-recovery-plan li strong { font-size: 0.79rem; }
+.admin-recovery-plan li span { max-width: 78ch; color: var(--theme-foreground-muted); font-size: 0.7rem; line-height: 1.4; }
+.admin-recovery-plan li.done > i { border-color: #2e7d32; background: #2e7d32; }
+.admin-recovery-plan li.current { background: color-mix(in srgb, #315b8a 6%, transparent); }
+.admin-recovery-plan li.current > i, .admin-recovery-plan li.running > i { border-color: #315b8a; background: #315b8a; }
+.admin-recovery-plan li.blocked { background: color-mix(in srgb, #c13c32 5%, transparent); }
+.admin-recovery-plan li.blocked > i { border-color: #c13c32; background: #c13c32; }
+.admin-recovery-plan li.waiting { opacity: 0.68; }
+.admin-incident-evidence { margin: 0.6rem 0; border-block: 1px solid var(--theme-foreground-faintest); }
+.admin-incident-evidence > summary { padding: 0.65rem 0.8rem; cursor: pointer; color: var(--theme-foreground-muted); font-size: 0.74rem; font-weight: 700; }
 .admin-health-alerts { display: grid; border-top: 1px solid var(--theme-foreground-faintest); }
 .admin-health-alerts > div { display: grid; grid-template-columns: minmax(10rem, 0.45fr) minmax(16rem, 1.55fr); gap: 0.8rem; padding: 0.55rem 0.75rem; border-bottom: 1px solid var(--theme-foreground-faintest); border-left: 3px solid #c13c32; }
 .admin-health-alerts > div.warning { border-left-color: #d98c2f; margin: 0; border-radius: 0; background: transparent; }
@@ -4142,6 +4228,10 @@ Array.isArray(currentManifest.merged) && currentManifest.merged.length > 0
   .admin-run-stage { grid-template-columns: 0.85rem minmax(0, 1fr) 4rem; }
   .admin-run-attempts li { grid-template-columns: 7.5rem minmax(0, 1fr); }
   .admin-run-attempts li small { grid-column: 1 / -1; }
+  .admin-recovery-plan > header { display: grid; }
+  .admin-recovery-plan .admin-recovery-state { width: fit-content; }
+  .admin-recovery-plan li { grid-template-columns: 1rem minmax(0, 1fr); }
+  .admin-recovery-plan li .admin-btn { grid-column: 2; width: 100%; min-height: 2.75rem; }
   .admin-change-plan { grid-template-columns: 1fr; }
   .admin-change-plan > div { border-left: 0; border-top: 1px solid var(--theme-foreground-faintest); }
   .admin-change-plan > div:first-child { border-top: 0; }

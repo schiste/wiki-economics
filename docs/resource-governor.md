@@ -100,11 +100,16 @@ inventory and compressed bytes still bound the decision.
 
 Preferred source workers are capped by `WIKI_ECON_SOURCE_WORKERS` and the
 source window. Production checks the resulting concurrency and logical bucket
-count against `config/capacity-qualification.json`. A manual profile override,
-an unknown wiki, or the currently unqualified `large` profile is rejected when
-`WIKI_ECON_REQUIRE_QUALIFIED_PROFILE=1`. Qualification jobs may explicitly
-override the profile with the production gate disabled; publishing it still
-requires checked-in evidence and a new binary.
+count against the per-wiki profile and layout allowlists in
+`config/capacity-qualification.json`. A manual profile override, an unknown
+wiki, or a profile/layout pair absent from those allowlists is rejected when
+`WIKI_ECON_REQUIRE_QUALIFIED_PROFILE=1`. The `large` profile is admitted only
+for frwiki, itwiki, nlwiki, ptwiki, and svwiki at the exact 2,048-bucket layout;
+the recorded decision and rollback controls are in
+`docs/evidence/toolforge-large-workload-profile-admission-2026-09-09.json`.
+Qualification jobs may explicitly override a profile with the production gate
+disabled, but publishing still requires checked-in admission, candidate
+validation, and a current publication preflight.
 
 The Toolforge wrapper pins a 6 GiB ceiling, 1.5 GiB memory reserve, 10 GiB
 safety reserve, 8 GiB bounded-scratch reserve, 8 GiB rollback reserve, one

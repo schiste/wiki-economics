@@ -194,6 +194,37 @@ test("local mode exposes the legacy /api/status endpoint without auth", async (t
   assert.equal("suggestedVersion" in body, false, "calendar months must not masquerade as completed snapshots");
 });
 
+test("fleet status treats quarantines superseded by a ready candidate as history", async (t) => {
+  const task = {task_id: "nlwiki-2026-08", wiki: "nlwiki", snapshot: "2026-08", resource_class: "medium_large"};
+  const {module, host} = await startServer(t, LOCAL_ENV, undefined, ({outputDir}) => {
+    fs.mkdirSync(path.join(outputDir, "_ready-index"), {recursive: true});
+    fs.writeFileSync(path.join(outputDir, "_ready-index", "nlwiki.json"), JSON.stringify({
+      schema_version: 2,
+      wiki: "nlwiki",
+      newest_valid_ready: {snapshot: "2026-08"},
+    }));
+    fs.mkdirSync(path.join(outputDir, "_fleet", "quarantine"), {recursive: true});
+    fs.writeFileSync(path.join(outputDir, "_fleet", "quarantine", `${task.task_id}.json`), JSON.stringify({
+      schema_version: 1,
+      reason: "retry_limit_exhausted",
+      task,
+    }));
+    fs.mkdirSync(path.join(outputDir, "_fleet", "failures"), {recursive: true});
+    fs.writeFileSync(path.join(outputDir, "_fleet", "failures", `${task.task_id}.json`), JSON.stringify({
+      schema_version: 1,
+      error: "workload profile Large has not completed production qualification",
+      claim: {task},
+    }));
+  });
+
+  const body = JSON.parse((await invoke(module, {url: "/api/status", headers: {host}})).text());
+  assert.equal(body.fleet.counts.quarantined, 0);
+  assert.equal(body.fleet.counts.resolvedQuarantines, 1, JSON.stringify(body.fleet));
+  assert.equal(body.fleet.counts.recentFailures, 0);
+  assert.equal(body.fleet.counts.historicalFailures, 1);
+  assert.deepEqual(body.fleet.quarantine, []);
+});
+
 test("status consolidates retried admin runs and exposes completed hidden qualifications", async (t) => {
   const lifecycle = {
     schema_version: 1,
@@ -278,6 +309,24 @@ test("operation history never hides a later failure behind an earlier success", 
   assert.equal(recent[0].state, "failed");
   assert.equal(recent[0].errorSummary, "Later validation failed");
   assert.equal(recent[0].attemptCount, 2);
+});
+
+test("operation history marks an older failed request resolved by a later success", (t) => {
+  const {module, tempRoot} = loadAdminServer(LOCAL_ENV);
+  t.after(() => fs.rmSync(tempRoot, {recursive: true, force: true}));
+  const recent = module.collapseOperationHistory([
+    {
+      schemaVersion: 1, requestId: "promote-old", runId: "promote-old", action: "promote-qualification", wiki: "dewiki",
+      state: "failed", errorSummary: "Old promotion failed", updatedAt: "2026-09-04T12:00:00Z",
+    },
+    {
+      schemaVersion: 1, requestId: "promote-new", runId: "promote-new", action: "promote-qualification", wiki: "dewiki",
+      state: "succeeded", updatedAt: "2026-09-04T13:00:00Z",
+    },
+  ]);
+
+  assert.equal(recent.find((entry) => entry.requestId === "promote-old").state, "superseded");
+  assert.equal(recent.find((entry) => entry.requestId === "promote-old").resolvedByRequestId, "promote-new");
 });
 
 test("hosted mode redirects /admin to the login page when no session is present", async (t) => {
@@ -944,7 +993,7 @@ test("candidate retirement and isolated rebuild require exact identities", async
   assert.equal(operation.version, "2026-08");
 });
 
-test("publication compatibility repair derives and queues only the older snapshot cohort", async (t) => {
+test("publication compatibility repair rebuilds snapshot laggards and every named identity outlier", async (t) => {
   const lifecycle = {
     schema_version: 1,
     publication_contract: {datasets: {}},
@@ -978,8 +1027,53 @@ test("publication compatibility repair derives and queues only the older snapsho
   assert.equal(response.statusCode, 202, response.text());
   const queued = JSON.parse(response.text()).operation;
   assert.deepEqual(queued.compatibilityCohort, [
+    {wiki: "afwiki", version: "2026-08"},
     {wiki: "frwiki", version: "2026-08"},
     {wiki: "nlwiki", version: "2026-08"},
+  ]);
+});
+
+test("publication compatibility repair uses the newest scheduled preflight", async (t) => {
+  const lifecycle = {
+    schema_version: 1,
+    publication_contract: {datasets: {}},
+    wikis: {
+      afwiki: {publication: "published", refresh: "scheduled", provenance: "toolforge", freshness_sla_days: 40},
+      dewiki: {publication: "published", refresh: "scheduled", provenance: "toolforge", freshness_sla_days: 40},
+    },
+  };
+  const {module, host, outputDir} = await startServer(t, {
+    ...LOCAL_ENV,
+    WIKI_ECON_ADMIN_EXECUTION_MODE: "queue",
+  }, lifecycle);
+  fs.mkdirSync(path.join(outputDir, "_admin"), {recursive: true});
+  fs.writeFileSync(path.join(outputDir, "_admin", "publication-preflight.json"), JSON.stringify({
+    schema_version: 1,
+    generated_at_unix: 1,
+    blockers: [],
+    wikis: [],
+  }));
+  fs.mkdirSync(path.join(outputDir, "logs", "publication"), {recursive: true});
+  fs.writeFileSync(path.join(outputDir, "logs", "publication", "scheduled.preflight.json"), JSON.stringify({
+    schema_version: 1,
+    generated_at_unix: 2,
+    blockers: ["gdp candidates have incompatible merge schemas or algorithm versions between afwiki and dewiki"],
+    wikis: [
+      {wiki: "afwiki", candidate_snapshot: "2026-08"},
+      {wiki: "dewiki", candidate_snapshot: "2026-08"},
+    ],
+  }));
+
+  const response = await invoke(module, {
+    method: "POST",
+    url: "/api/rebuild-compatibility-cohort",
+    headers: {host, "content-type": "application/json"},
+    body: "{}",
+  });
+  assert.equal(response.statusCode, 202, response.text());
+  assert.deepEqual(JSON.parse(response.text()).operation.compatibilityCohort, [
+    {wiki: "afwiki", version: "2026-08"},
+    {wiki: "dewiki", version: "2026-08"},
   ]);
 });
 

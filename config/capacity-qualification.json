@@ -4,84 +4,121 @@
   "minimum_memory_headroom_percent": 25,
   "minimum_storage_reserve_bytes": 53687091200,
   "cpu": 1,
+  "workload_profile_admission": {
+    "policy_version": "adaptive-workload-profile-production-v1",
+    "evidence": "docs/evidence/toolforge-large-workload-profile-admission-2026-09-09.json",
+    "rollback": "Remove large from the affected wiki allowlist; incomplete work remains publication-invisible and returns to quarantine."
+  },
   "wikis": {
     "elwiki": {
+      "qualified_workload_profiles": ["small"],
+      "qualified_workload_bucket_counts": [256],
       "raw_transient_requirement_bytes": 2147483648,
       "maximum_source_workers": 1,
       "required_bucket_counts": [256]
     },
     "itwiki": {
+      "qualified_workload_profiles": ["small", "large"],
+      "qualified_workload_bucket_counts": [256, 2048],
       "raw_transient_requirement_bytes": 17179869184,
       "maximum_source_workers": 1,
       "required_bucket_counts": [256]
     },
     "nlwiki": {
+      "qualified_workload_profiles": ["small", "large"],
+      "qualified_workload_bucket_counts": [256, 2048],
       "raw_transient_requirement_bytes": 8589934592,
       "maximum_source_workers": 1,
       "required_bucket_counts": [256]
     },
     "ptwiki": {
+      "qualified_workload_profiles": ["small", "large"],
+      "qualified_workload_bucket_counts": [256, 2048],
       "raw_transient_requirement_bytes": 9663676416,
       "maximum_source_workers": 1,
       "required_bucket_counts": [256]
     },
     "svwiki": {
+      "qualified_workload_profiles": ["small", "large"],
+      "qualified_workload_bucket_counts": [256, 2048],
       "raw_transient_requirement_bytes": 6442450944,
       "maximum_source_workers": 1,
       "required_bucket_counts": [256]
     },
     "frwiki": {
+      "qualified_workload_profiles": ["small", "large"],
+      "qualified_workload_bucket_counts": [256, 2048],
       "raw_transient_requirement_bytes": 33285996544,
       "maximum_source_workers": 1,
       "minimum_identical_runs": 2,
       "required_bucket_counts": [256, 512, 1024]
     },
     "afwiki": {
+      "qualified_workload_profiles": ["small"],
+      "qualified_workload_bucket_counts": [256],
       "raw_transient_requirement_bytes": 1073741824,
       "maximum_source_workers": 1,
       "required_bucket_counts": [256]
     },
     "arwiki": {
+      "qualified_workload_profiles": ["small"],
+      "qualified_workload_bucket_counts": [256],
       "raw_transient_requirement_bytes": 6442450944,
       "maximum_source_workers": 1,
       "required_bucket_counts": [256]
     },
     "arzwiki": {
+      "qualified_workload_profiles": ["small"],
+      "qualified_workload_bucket_counts": [256],
       "raw_transient_requirement_bytes": 1073741824,
       "maximum_source_workers": 1,
       "required_bucket_counts": [256]
     },
     "eswiki": {
+      "qualified_workload_profiles": ["small"],
+      "qualified_workload_bucket_counts": [256],
       "raw_transient_requirement_bytes": 17179869184,
       "maximum_source_workers": 1,
       "required_bucket_counts": [256]
     },
     "hawiki": {
+      "qualified_workload_profiles": ["small"],
+      "qualified_workload_bucket_counts": [256],
       "raw_transient_requirement_bytes": 1073741824,
       "maximum_source_workers": 1,
       "required_bucket_counts": [256]
     },
     "jawiki": {
+      "qualified_workload_profiles": ["small"],
+      "qualified_workload_bucket_counts": [256],
       "raw_transient_requirement_bytes": 10737418240,
       "maximum_source_workers": 1,
       "required_bucket_counts": [256]
     },
     "swwiki": {
+      "qualified_workload_profiles": ["small"],
+      "qualified_workload_bucket_counts": [256],
       "raw_transient_requirement_bytes": 1073741824,
       "maximum_source_workers": 1,
       "required_bucket_counts": [256]
     },
     "viwiki": {
+      "qualified_workload_profiles": ["small"],
+      "qualified_workload_bucket_counts": [256],
       "raw_transient_requirement_bytes": 5368709120,
       "maximum_source_workers": 1,
       "required_bucket_counts": [256]
     },
     "yowiki": {
+      "qualified_workload_profiles": ["small"],
+      "qualified_workload_bucket_counts": [256],
       "raw_transient_requirement_bytes": 1073741824,
       "maximum_source_workers": 1,
       "required_bucket_counts": [256]
     },
     "zhwiki": {
+      "qualified_workload_profiles": ["small"],
+      "qualified_workload_bucket_counts": [256],
       "raw_transient_requirement_bytes": 8589934592,
       "maximum_source_workers": 1,
       "required_bucket_counts": [256]

@@ -28,7 +28,7 @@ const {
 } = require("../scripts/wiki-lifecycle.cjs");
 const {evaluateFreshness} = require("./freshness.cjs");
 const {stripAnsi, summarizeOperationLog} = require("./admin-operation-status.cjs");
-const {buildOperationalTruth} = require("./admin-operational-truth.cjs");
+const {buildOperationalTruth, latestPublicationPreflight} = require("./admin-operational-truth.cjs");
 const {
   applyLifecycleMutation,
   immutableAuditEvent,
@@ -880,7 +880,7 @@ function collapseOperationHistory(entries, limit = ADMIN_JOB_HISTORY_LIMIT) {
     if (!grouped.has(identity)) grouped.set(identity, []);
     grouped.get(identity).push(entry);
   }
-  return Array.from(grouped.values()).map((attempts) => {
+  const collapsed = Array.from(grouped.values()).map((attempts) => {
     const ordered = attempts.slice().sort((left, right) => Date.parse(left.updatedAt || left.finishedAt || left.requestedAt || 0)
       - Date.parse(right.updatedAt || right.finishedAt || right.requestedAt || 0));
     const latest = ordered.at(-1);
@@ -907,6 +907,21 @@ function collapseOperationHistory(entries, limit = ADMIN_JOB_HISTORY_LIMIT) {
         errorSummary: entry.state === "succeeded" ? null : entry.errorSummary || null,
       })),
     };
+  });
+  return collapsed.map((entry) => {
+    if (entry.state !== "failed") return entry;
+    const entryTime = Date.parse(entry.updatedAt || entry.finishedAt || entry.requestedAt || 0);
+    const resolution = collapsed.find((candidate) => candidate.state === "succeeded"
+      && candidate.action === entry.action
+      && candidate.wiki === entry.wiki
+      && Date.parse(candidate.updatedAt || candidate.finishedAt || candidate.requestedAt || 0) > entryTime);
+    return resolution ? {
+      ...entry,
+      state: "superseded",
+      originalState: "failed",
+      resolvedByRequestId: resolution.requestId || resolution.runId || null,
+      resolvedAt: resolution.finishedAt || resolution.updatedAt || null,
+    } : entry;
   }).sort((left, right) => Date.parse(right.updatedAt || right.finishedAt || right.requestedAt || 0)
     - Date.parse(left.updatedAt || left.finishedAt || left.requestedAt || 0)).slice(0, limit);
 }
@@ -1075,8 +1090,7 @@ function queueAdminOperation({
 }
 
 function compatibilityCohortFromPreflight() {
-  const reportPath = path.join(OUTPUT_DIR, "_admin", "publication-preflight.json");
-  const report = readJsonFile(reportPath);
+  const report = latestPublicationPreflight(OUTPUT_DIR)?.report || null;
   if (report?.schema_version !== 1 || !Array.isArray(report.blockers) || !Array.isArray(report.wikis)) {
     throw new Error("Run publication preflight before preparing a compatibility cohort");
   }
@@ -1085,8 +1099,12 @@ function compatibilityCohortFromPreflight() {
   }
   const candidateWikis = report.wikis.filter((entry) => /^\d{4}-\d{2}$/.test(entry?.candidate_snapshot || ""));
   const targetSnapshot = candidateWikis.map((entry) => entry.candidate_snapshot).sort().at(-1);
+  const incompatibleWikis = new Set(report.blockers.flatMap((blocker) => {
+    const match = blocker.match(/incompatible merge schemas or algorithm versions between ([a-z0-9_]+wiki) and ([a-z0-9_]+wiki)/i);
+    return match ? [match[1], match[2]] : [];
+  }));
   const cohort = candidateWikis
-    .filter((entry) => entry.candidate_snapshot !== targetSnapshot)
+    .filter((entry) => entry.candidate_snapshot !== targetSnapshot || incompatibleWikis.has(entry.wiki))
     .filter((entry) => {
       const lifecycle = WIKI_LIFECYCLE.wikis[entry.wiki];
       return lifecycle?.publication === "published" && new Set(["manual", "scheduled"]).has(lifecycle?.refresh);
@@ -1094,7 +1112,7 @@ function compatibilityCohortFromPreflight() {
     .map((entry) => ({wiki: entry.wiki, version: targetSnapshot}))
     .sort((left, right) => left.wiki.localeCompare(right.wiki));
   if (!targetSnapshot || cohort.length === 0) {
-    throw new Error("Compatibility differs within one snapshot; rebuild candidates individually after inspecting their receipts");
+    throw new Error("The compatibility report does not identify a safe rebuild cohort");
   }
   return cohort;
 }
@@ -1325,6 +1343,13 @@ function fleetWikiFrom(value, filename = "") {
   return fleetTaskFrom(value).wiki || value?.wiki || filename.match(/^([a-z0-9_]+wiki)(?:-|\.|$)/i)?.[1] || null;
 }
 
+function readyCandidateSupersedesTask(wiki, task) {
+  if (!wiki || !/^\d{4}-\d{2}$/.test(task?.snapshot || "")) return false;
+  const index = readJsonFile(path.join(OUTPUT_DIR, "_ready-index", `${wiki}.json`));
+  const ready = index?.schema_version === 2 ? index.newest_valid_ready : null;
+  return /^\d{4}-\d{2}$/.test(ready?.snapshot || "") && ready.snapshot >= task.snapshot;
+}
+
 function readFleetStatus(now = Date.now()) {
   const pendingEntries = directoryJsonEntries(path.join(FLEET_QUEUE_DIR, "pending"));
   const leaseEntries = directoryJsonEntries(path.join(FLEET_QUEUE_DIR, "leases"), { directories: true });
@@ -1336,6 +1361,16 @@ function readFleetStatus(now = Date.now()) {
     const taskId = fleetTaskFrom(entry.value).task_id;
     if (taskId && !failureByTask.has(taskId)) failureByTask.set(taskId, entry.value);
   }
+  const unresolvedQuarantineEntries = quarantineEntries.filter((entry) => {
+    const wiki = fleetWikiFrom(entry.value, entry.file);
+    return !readyCandidateSupersedesTask(wiki, fleetTaskFrom(entry.value));
+  });
+  const unresolvedTaskIds = new Set(unresolvedQuarantineEntries.map((entry) => fleetTaskFrom(entry.value).task_id));
+  const unresolvedFailureEntries = failureEntries.filter((entry) => {
+    const task = fleetTaskFrom(entry.value);
+    const wiki = fleetWikiFrom(entry.value, entry.file);
+    return unresolvedTaskIds.has(task.task_id) || !readyCandidateSupersedesTask(wiki, task);
+  });
   const deferredByWiki = new Map();
   for (const entry of deferredEntries) {
     const wiki = fleetWikiFrom(entry.value, entry.file);
@@ -1389,7 +1424,7 @@ function readFleetStatus(now = Date.now()) {
       taskId: task.task_id ?? null,
     });
   }
-  for (const entry of quarantineEntries) {
+  for (const entry of unresolvedQuarantineEntries) {
     const wiki = fleetWikiFrom(entry.value, entry.file);
     if (!wiki || byWiki.has(wiki)) continue;
     const task = fleetTaskFrom(entry.value);
@@ -1420,12 +1455,14 @@ function readFleetStatus(now = Date.now()) {
       waitingUpstream: work.filter((entry) => entry.state === "waiting_upstream").length,
       running: work.filter((entry) => entry.state === "running").length,
       stalled: work.filter((entry) => entry.state === "stalled").length,
-      quarantined: quarantineEntries.length,
-      recentFailures: failureEntries.length,
+      quarantined: unresolvedQuarantineEntries.length,
+      resolvedQuarantines: quarantineEntries.length - unresolvedQuarantineEntries.length,
+      recentFailures: unresolvedFailureEntries.length,
+      historicalFailures: failureEntries.length - unresolvedFailureEntries.length,
       completed: completedCount,
     },
     work,
-    quarantine: quarantineEntries.map((entry) => ({
+    quarantine: unresolvedQuarantineEntries.map((entry) => ({
       wiki: fleetWikiFrom(entry.value, entry.file),
       updatedAt: entry.modifiedAt,
       error: failureByTask.get(fleetTaskFrom(entry.value).task_id)?.error
@@ -1434,7 +1471,7 @@ function readFleetStatus(now = Date.now()) {
       taskId: fleetTaskFrom(entry.value).task_id ?? null,
       task: fleetTaskFrom(entry.value),
     })),
-    recentFailures: failureEntries.map((entry) => ({
+    recentFailures: unresolvedFailureEntries.map((entry) => ({
       wiki: fleetWikiFrom(entry.value, entry.file),
       updatedAt: entry.modifiedAt,
       error: entry.value.error ?? entry.value.reason ?? null,

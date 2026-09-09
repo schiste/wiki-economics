@@ -13,6 +13,35 @@ function readJson(file) {
   }
 }
 
+function latestPublicationPreflight(outputDir) {
+  const candidates = [path.join(outputDir, "_admin", "publication-preflight.json")];
+  const publicationLogs = path.join(outputDir, "logs", "publication");
+  try {
+    for (const entry of fs.readdirSync(publicationLogs, {withFileTypes: true})) {
+      if (entry.isFile() && entry.name.endsWith(".preflight.json")) {
+        candidates.push(path.join(publicationLogs, entry.name));
+      }
+    }
+  } catch {}
+  return candidates
+    .map((file) => {
+      const report = readJson(file);
+      if (report?.schema_version !== 1) return null;
+      let generatedAtUnix = Number.isSafeInteger(report.generated_at_unix) ? report.generated_at_unix : 0;
+      try {
+        if (generatedAtUnix === 0) generatedAtUnix = Math.floor(fs.statSync(file).mtimeMs / 1_000);
+      } catch {}
+      return {
+        report,
+        file,
+        generatedAtUnix,
+        source: file.includes(`${path.sep}logs${path.sep}publication${path.sep}`) ? "scheduled" : "admin",
+      };
+    })
+    .filter(Boolean)
+    .sort((left, right) => right.generatedAtUnix - left.generatedAtUnix)[0] || null;
+}
+
 function directoryNames(directory) {
   try {
     return fs.readdirSync(directory, {withFileTypes: true})
@@ -102,6 +131,31 @@ function completedSnapshots(dataDir, wiki) {
         && inventory?.snapshot === snapshot;
     })
     .sort();
+}
+
+function workloadProfileTruth(dataDir, wiki, snapshot, capacityPolicy) {
+  if (!snapshot) return null;
+  const profile = readJson(path.join(dataDir, "snapshots", wiki, snapshot, "workload-profile.json"));
+  if (profile?.schema_version !== 2 || profile.wiki !== wiki || profile.snapshot !== snapshot) return null;
+  const policy = capacityPolicy?.wikis?.[wiki] || null;
+  const logicalBuckets = Number(profile.parameters?.primary_buckets || 0)
+    * Number(profile.parameters?.secondary_buckets || 0);
+  const profileQualified = Array.isArray(policy?.qualified_workload_profiles)
+    && policy.qualified_workload_profiles.includes(profile.profile);
+  const layoutQualified = Array.isArray(policy?.qualified_workload_bucket_counts)
+    && policy.qualified_workload_bucket_counts.includes(logicalBuckets);
+  return {
+    name: profile.profile,
+    selectionMode: profile.selection_mode,
+    selectionAlgorithmVersion: profile.selection_algorithm_version,
+    logicalBuckets,
+    productionQualified: profileQualified && layoutQualified,
+    qualificationReason: !profileQualified
+      ? `${profile.profile || "selected"} profile is not in the production qualification policy.`
+      : !layoutQualified
+        ? `${logicalBuckets || "Unknown"} logical buckets are not in the production qualification policy.`
+        : "This exact profile and bucket layout are production-qualified.",
+  };
 }
 
 function validReceiptIdentity(value) {
@@ -227,7 +281,7 @@ function latestTimestamp(...values) {
   return values.filter(Boolean).sort().at(-1) || null;
 }
 
-function wikiOperationalTruth({wiki, definitions, lifecycle, dataDir, outputDir, gate, scrub, qualityPolicy, nowUnix, qualifications}) {
+function wikiOperationalTruth({wiki, definitions, lifecycle, dataDir, outputDir, gate, scrub, qualityPolicy, capacityPolicy, nowUnix, qualifications}) {
   const entry = lifecycle?.wikis?.[wiki] || null;
   const expected = expectedMetricsForWiki(definitions, lifecycle, wiki);
   const status = candidateStatus(outputDir, wiki);
@@ -243,6 +297,15 @@ function wikiOperationalTruth({wiki, definitions, lifecycle, dataDir, outputDir,
   if (candidate) candidate.wiki = wiki;
   const latestAvailable = [completed.at(-1), qualification?.snapshot, readySnapshot, publishedSnapshot]
     .filter(Boolean).sort().at(-1) || null;
+  const profileSnapshot = candidate?.snapshot || readySnapshot || completed.at(-1) || publishedSnapshot;
+  const workloadProfile = workloadProfileTruth(dataDir, wiki, profileSnapshot, capacityPolicy);
+  if (candidate?.remediationCode === "workload_profile_unqualified" && workloadProfile?.productionQualified) {
+    candidate.prerequisiteResolved = true;
+    candidate.retryable = true;
+    candidate.remediationCode = "workload_profile_retry_ready";
+    candidate.errorSummary = "The workload profile is now production-qualified; this failure predates the deployed policy.";
+    candidate.remediation = "Retry this project or rebuild the compatibility cohort with the current binary.";
+  }
   const hiddenQualification = entry?.publication === "hidden" && entry?.refresh === "qualification";
   const candidateTargetSnapshot = status?.selectedSnapshot || (hiddenQualification ? qualification?.snapshot : readySnapshot) || readySnapshot;
   const candidateReadyIds = hiddenQualification && qualification
@@ -333,6 +396,7 @@ function wikiOperationalTruth({wiki, definitions, lifecycle, dataDir, outputDir,
     },
     candidate,
     qualification,
+    workloadProfile,
     ready: index?.newest_valid_ready || null,
     activePublished: index?.active_published || null,
     metrics: {
@@ -347,7 +411,8 @@ function wikiOperationalTruth({wiki, definitions, lifecycle, dataDir, outputDir,
 }
 
 function publicationOperations(outputDir, wikis, sourceIdentity = {}) {
-  const preflight = readJson(path.join(outputDir, "_admin", "publication-preflight.json"));
+  const selectedPreflight = latestPublicationPreflight(outputDir);
+  const preflight = selectedPreflight?.report || null;
   const recoveryAudit = readJson(path.join(outputDir, "_admin", "publication-recovery-audit.json"));
   const changePlan = readJson(path.join(outputDir, "publication-change-plan.json"));
   const validPreflight = preflight?.schema_version === 1 ? preflight : null;
@@ -359,7 +424,12 @@ function publicationOperations(outputDir, wikis, sourceIdentity = {}) {
     && (!validPreflight.site_source_commit || !sourceIdentity.siteSourceCommit
       || validPreflight.site_source_commit === sourceIdentity.siteSourceCommit);
   return {
-    preflight: validPreflight ? {...validPreflight, current: preflightCurrent} : null,
+    preflight: validPreflight ? {
+      ...validPreflight,
+      current: preflightCurrent,
+      reportSource: selectedPreflight.source,
+      reportFile: path.relative(outputDir, selectedPreflight.file),
+    } : null,
     recoveryAudit: recoveryAudit?.schema_version === 1 ? recoveryAudit : null,
     currentChangePlan: changePlan?.schema_version === 1 ? changePlan : null,
   };
@@ -448,6 +518,7 @@ function buildOperationalTruth({root, dataDir, outputDir, lifecycle, freshness, 
   const gate = publicationGate(outputDir);
   const scrub = scrubStatus(outputDir);
   const qualityPolicy = readJson(path.join(root, "config", "quality-policy.json"));
+  const capacityPolicy = readJson(path.join(root, "config", "capacity-qualification.json"));
   const nowUnix = Math.floor(Date.now() / 1000);
   const wikiNames = new Set([
     ...Object.keys(lifecycle?.wikis || {}),
@@ -456,7 +527,7 @@ function buildOperationalTruth({root, dataDir, outputDir, lifecycle, freshness, 
     ...jsonFileStems(path.join(outputDir, "_ready-index")),
   ]);
   const wikis = Object.fromEntries([...wikiNames].sort().map((wiki) => [wiki, wikiOperationalTruth({
-    wiki, definitions, lifecycle, dataDir, outputDir, gate, scrub, qualityPolicy, nowUnix, qualifications,
+    wiki, definitions, lifecycle, dataDir, outputDir, gate, scrub, qualityPolicy, capacityPolicy, nowUnix, qualifications,
   })]));
   const pipelineIssues = Object.values(wikis).flatMap((wiki) => wiki.issues);
   if (qualityPolicy?.schema_version !== 1) pipelineIssues.unshift({
@@ -554,6 +625,7 @@ module.exports = {
   completedSnapshots,
   expectedMetricsForWiki,
   infrastructureTruth,
+  latestPublicationPreflight,
   allowedFailureActions,
   metricDefinitions,
 };

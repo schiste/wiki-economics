@@ -49,6 +49,16 @@ function validatePolicy(policy) {
       || policy.wikis.frwiki.minimum_identical_runs < 2) {
     throw new Error("invalid capacity qualification policy");
   }
+  for (const [wiki, requirements] of Object.entries(policy.wikis)) {
+    if (!Array.isArray(requirements.qualified_workload_profiles)
+        || requirements.qualified_workload_profiles.length === 0
+        || requirements.qualified_workload_profiles.some((profile) => !["small", "large"].includes(profile))
+        || !Array.isArray(requirements.qualified_workload_bucket_counts)
+        || requirements.qualified_workload_bucket_counts.length === 0
+        || requirements.qualified_workload_bucket_counts.some((count) => !Number.isSafeInteger(count) || count <= 0)) {
+      throw new Error(`invalid workload profile admission policy for ${wiki}`);
+    }
+  }
   return policy;
 }
 

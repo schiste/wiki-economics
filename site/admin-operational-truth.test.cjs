@@ -274,6 +274,54 @@ test("quarantined projects with the same root failure form one actionable blocke
   assert.deepEqual(result.wikis.nlwiki.allowedActions, []);
 });
 
+test("a deployed profile admission turns an old quarantine into an explicit retry-ready state", (t) => {
+  const {root, dataDir, outputDir} = fixture(t);
+  const policy = lifecycle();
+  writeJson(path.join(root, "config", "capacity-qualification.json"), {
+    schema_version: 1,
+    wikis: {
+      nlwiki: {
+        qualified_workload_profiles: ["small", "large"],
+        qualified_workload_bucket_counts: [256, 2048],
+      },
+    },
+  });
+  writeJson(path.join(dataDir, "snapshots", "nlwiki", "2026-08", "workload-profile.json"), {
+    schema_version: 2,
+    selection_algorithm_version: "adaptive-workload-profile-v2-measured",
+    wiki: "nlwiki",
+    snapshot: "2026-08",
+    profile: "large",
+    selection_mode: "automatic",
+    signals: {},
+    parameters: {source_workers: 3, primary_buckets: 64, secondary_buckets: 32},
+  });
+  writeJson(path.join(outputDir, "_candidate-status", "nlwiki.json"), {
+    schemaVersion: 2,
+    state: "failed",
+    runId: "failed-nlwiki",
+    wikis: ["nlwiki"],
+    selectedSnapshot: "2026-08",
+    failingStage: "source_window",
+    error: "workload profile Large has not completed production qualification",
+    exitCode: 1,
+  });
+  const fleet = {work: [{
+    wiki: "nlwiki", state: "quarantined", taskId: "nlwiki-task", error: "retry_limit_exhausted",
+  }]};
+
+  const result = buildOperationalTruth({
+    root, dataDir, outputDir, lifecycle: policy,
+    freshness: {status: "healthy", alerts: [], summary: {}},
+    fleet, adminOperations: {counts: {}}, scheduledRefresh: {last: null},
+  });
+
+  assert.equal(result.wikis.nlwiki.workloadProfile.productionQualified, true);
+  assert.equal(result.pipeline.blockerGroups[0].code, "workload_profile_retry_ready");
+  assert.equal(result.pipeline.blockerGroups[0].retryable, true);
+  assert.equal(result.wikis.nlwiki.allowedActions[0].id, "quarantine-retry");
+});
+
 test("latest completed snapshot requires both the plan and remote inventory", (t) => {
   const {dataDir} = fixture(t);
   completedSnapshot(dataDir, "nlwiki", "2026-07");
@@ -327,6 +375,36 @@ test("publication preflight is current only while it names the indexed candidate
     fleet: {work: []}, adminOperations: {counts: {}}, scheduledRefresh: {last: null},
   });
   assert.equal(stale.public.publication.preflight.current, false);
+});
+
+test("newest scheduled publication preflight supersedes a stale admin report", (t) => {
+  const {root, dataDir, outputDir} = fixture(t);
+  const policy = lifecycle();
+  completedSnapshot(dataDir, "nlwiki", "2026-08");
+  readyIndex(outputDir, "nlwiki", "2026-08");
+  writeJson(path.join(outputDir, "_admin", "publication-preflight.json"), {
+    schema_version: 1,
+    generated_at_unix: 1,
+    eligible: false,
+    blockers: ["stale blocker"],
+    wikis: [{wiki: "nlwiki", candidate_run_id: "old"}],
+  });
+  writeJson(path.join(outputDir, "logs", "publication", "scheduled.preflight.json"), {
+    schema_version: 1,
+    generated_at_unix: 2,
+    eligible: true,
+    blockers: [],
+    wikis: [{wiki: "nlwiki", candidate_run_id: "ready-run"}],
+  });
+
+  const current = buildOperationalTruth({
+    root, dataDir, outputDir, lifecycle: policy,
+    freshness: {status: "healthy", alerts: [], summary: {}},
+    fleet: {work: []}, adminOperations: {counts: {}}, scheduledRefresh: {last: null},
+  });
+  assert.equal(current.public.publication.preflight.eligible, true);
+  assert.equal(current.public.publication.preflight.current, true);
+  assert.equal(current.public.publication.preflight.reportSource, "scheduled");
 });
 
 function readJsonFixture(file) {

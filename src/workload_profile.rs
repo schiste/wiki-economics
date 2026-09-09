@@ -56,10 +56,6 @@ impl WorkloadProfileName {
         }
     }
 
-    fn production_eligible(self) -> bool {
-        matches!(self, Self::Small)
-    }
-
     fn as_str(self) -> &'static str {
         match self {
             Self::Small => "small",
@@ -137,7 +133,8 @@ struct CapacityPolicy {
 
 #[derive(Deserialize)]
 struct WikiCapacityPolicy {
-    required_bucket_counts: Vec<usize>,
+    qualified_workload_profiles: Vec<WorkloadProfileName>,
+    qualified_workload_bucket_counts: Vec<usize>,
     maximum_source_workers: usize,
 }
 
@@ -322,19 +319,21 @@ impl WorkloadProfile {
             self.selection_mode == ProfileSelectionMode::Automatic,
             "production rejects a manually overridden workload profile"
         );
-        ensure!(
-            self.profile.production_eligible(),
-            "workload profile {:?} has not completed production qualification",
-            self.profile
-        );
         let policy: CapacityPolicy = serde_json::from_str(CAPACITY_POLICY)?;
         let wiki = policy
             .wikis
             .get(&self.wiki)
             .with_context(|| format!("{} has no production capacity qualification", self.wiki))?;
+        ensure!(
+            wiki.qualified_workload_profiles.contains(&self.profile),
+            "workload profile {:?} has not completed production qualification for {}",
+            self.profile,
+            self.wiki
+        );
         let logical_buckets = self.parameters.logical_buckets()?;
         ensure!(
-            wiki.required_bucket_counts.contains(&logical_buckets),
+            wiki.qualified_workload_bucket_counts
+                .contains(&logical_buckets),
             "workload layout {}x{} ({logical_buckets} logical buckets) is not qualified for {}",
             self.parameters.primary_buckets,
             self.parameters.secondary_buckets,
@@ -791,7 +790,17 @@ mod tests {
             WorkloadProfileName::Large,
             ProfileSelectionMode::Automatic,
         );
-        assert!(large.ensure_compute_qualified_with(true).is_err());
+        large.ensure_compute_qualified_with(true)?;
+        let unqualified_large = profile(
+            "afwiki",
+            WorkloadProfileName::Large,
+            ProfileSelectionMode::Automatic,
+        );
+        assert!(
+            unqualified_large
+                .ensure_compute_qualified_with(true)
+                .is_err()
+        );
         let unknown = profile(
             "testwiki",
             WorkloadProfileName::Small,

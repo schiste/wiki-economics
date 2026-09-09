@@ -7,9 +7,20 @@ const test = require("node:test");
 
 const source = fs.readFileSync(path.join(__dirname, "src", "admin.md"), "utf8");
 
-test("publication workbench exposes one controlled compatibility-cohort action", () => {
-  assert.match(source, /Prepare compatibility cohort/);
+test("publication workbench exposes one prerequisite-aware compatibility repair action", () => {
+  assert.match(source, /Repair candidate compatibility/);
   assert.match(source, /runCommand\("rebuild-compatibility-cohort"\)/);
+  assert.match(source, /compatibilityRepairAllowed/);
+  assert.match(source, /unresolvedProfileAdmission/);
+});
+
+test("publication workbench leads with one ordered recovery plan and collapses raw evidence", () => {
+  assert.match(source, /class=\$\{`admin-recovery-plan/);
+  assert.match(source, /Public data is safe while the next generation is repaired/);
+  assert.match(source, /Rebuild incompatible candidates with one binary/);
+  assert.match(source, /Verify the complete candidate set/);
+  assert.match(source, /Operational evidence \(\$\{operationalAlerts\.length\} current findings\)/);
+  assert.match(source, /Resolved by later success/);
 });
 const consoleSource = fs.readFileSync(path.join(__dirname, "src", "components", "admin-console.js"), "utf8");
 

@@ -11,9 +11,9 @@ const policy = {
   minimum_storage_reserve_bytes: 50,
   cpu: 1,
   wikis: {
-    nlwiki: {required_bucket_counts: [256]},
-    ptwiki: {required_bucket_counts: [256]},
-    frwiki: {minimum_identical_runs: 2, required_bucket_counts: [256, 512, 1024]},
+    nlwiki: {qualified_workload_profiles: ["small", "large"], qualified_workload_bucket_counts: [256, 2048], required_bucket_counts: [256]},
+    ptwiki: {qualified_workload_profiles: ["small", "large"], qualified_workload_bucket_counts: [256, 2048], required_bucket_counts: [256]},
+    frwiki: {qualified_workload_profiles: ["small", "large"], qualified_workload_bucket_counts: [256, 2048], minimum_identical_runs: 2, required_bucket_counts: [256, 512, 1024]},
   },
 };
 
@@ -71,4 +71,13 @@ test("qualification fails closed for missing, underprovisioned, or divergent rep
   ), policy), /byte-identical passing runs/);
   assert.throws(() => qualify(completeReports().map((value) => value.run_id === "frwiki-256-repeat"
     ? {...value, output_sha256: "d".repeat(64)} : value), policy), /byte-identical passing runs/);
+});
+
+test("qualification policy requires explicit workload profile and layout admission", () => {
+  const missingAdmission = structuredClone(policy);
+  delete missingAdmission.wikis.nlwiki.qualified_workload_profiles;
+  assert.throws(() => qualify(completeReports(), missingAdmission), /invalid workload profile admission policy/);
+  const unsupportedProfile = structuredClone(policy);
+  unsupportedProfile.wikis.nlwiki.qualified_workload_profiles.push("huge");
+  assert.throws(() => qualify(completeReports(), unsupportedProfile), /invalid workload profile admission policy/);
 });
