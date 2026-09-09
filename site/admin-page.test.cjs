@@ -107,10 +107,22 @@ test("lifecycle console exposes safe policy, promotion, rebuild, and retirement 
   assert.match(source, /Save resource &amp; SLA policy/);
   assert.match(source, /Rebuild exact snapshot/);
   assert.match(source, /Retire unpublished candidate/);
-  assert.match(source, /typedOperatorConfirmation/);
+  assert.match(source, /openTypedApproval/);
   assert.match(source, /lifecycleRevision/);
   assert.match(source, /qualificationRunId/);
   assert.match(source, /candidateRunId/);
+});
+
+test("typed approvals stay in-app and show the authenticated request receipt", () => {
+  assert.match(source, /<dialog class="admin-approval-dialog"/);
+  assert.match(source, /role="status" aria-live="polite"/);
+  assert.match(source, /Registering approval/);
+  assert.match(source, /Approval not registered/);
+  assert.match(source, /approval registered/);
+  assert.match(source, /View in Runs & logs/);
+  assert.match(source, /result\.requestId/);
+  assert.doesNotMatch(source, /function typedOperatorConfirmation/);
+  assert.doesNotMatch(source, /\bprompt\s*\(/);
 });
 
 test("operator audit ledger exposes authenticated immutable lifecycle evidence", () => {

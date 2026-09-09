@@ -154,7 +154,7 @@ async function runAdminBrowserWorkflow({distDir}) {
     await cdp.open();
     await Promise.all([cdp.send("Page.enable"), cdp.send("Runtime.enable")]);
     await cdp.send("Page.addScriptToEvaluateOnNewDocument", {
-      source: "globalThis.__adminAlertCalls=0;globalThis.alert=()=>{globalThis.__adminAlertCalls+=1};globalThis.prompt=(message)=>message.match(/Type ([^ ]+ [^ ]+) to continue\\./)?.[1]||null"
+      source: "globalThis.__adminAlertCalls=0;globalThis.alert=()=>{globalThis.__adminAlertCalls+=1}"
     });
     await cdp.send("Page.navigate", {url: `${origin}/admin`});
     await waitFor(cdp, "document.readyState === 'complete'");
@@ -195,7 +195,41 @@ async function runAdminBrowserWorkflow({distDir}) {
     assertContract(promotionControl.found && !promotionControl.disabled,
       "the completed qualification has no enabled primary promotion action", promotionControl);
     await evaluate(cdp, "Array.from(document.querySelectorAll('#admin-decisions button')).find(button => button.textContent.includes('Approve & schedule')).click()");
+    await waitFor(cdp, "document.querySelector('.admin-approval-dialog')?.open === true");
+    const approvalDialog = await evaluate(cdp, `({
+      title: document.querySelector('.admin-approval-dialog h2')?.textContent,
+      summary: document.querySelector('.admin-approval-summary')?.textContent,
+      facts: document.querySelector('.admin-approval-facts')?.textContent,
+      status: document.querySelector('.admin-approval-status')?.textContent,
+      token: document.querySelector('.admin-approval-token code')?.textContent,
+      submitDisabled: document.querySelector('.admin-approval-submit')?.disabled
+    })`);
+    assertContract(approvalDialog.title?.includes("German Wikipedia")
+      && approvalDialog.summary?.includes("public site changes only after")
+      && approvalDialog.facts?.includes("No immediate public change")
+      && approvalDialog.status?.includes("Not submitted")
+      && approvalDialog.token === "promote dewiki"
+      && approvalDialog.submitDisabled,
+    "the promotion approval dialog does not clearly describe its unregistered state", approvalDialog);
+    await evaluate(cdp, `(() => {
+      const input = document.querySelector('.admin-approval-dialog input');
+      input.value = 'promote dewiki';
+      input.dispatchEvent(new Event('input', {bubbles: true}));
+      document.querySelector('.admin-approval-submit').click();
+    })()`);
     await waitFor(cdp, "JSON.parse(localStorage.getItem('wiki-economics.admin.operation-receipts.v1') || '[]').some(entry => entry.requestId === 'admin-e2e-promote-dewiki' && entry.state === 'succeeded')", 10000);
+    await waitFor(cdp, "document.querySelector('.admin-approval-status.success')?.textContent.includes('admin-e2e-promote-dewiki')");
+    const registeredApproval = await evaluate(cdp, `({
+      status: document.querySelector('.admin-approval-status.success')?.textContent,
+      closeLabel: document.querySelector('.admin-approval-cancel')?.textContent,
+      receiptLabel: document.querySelector('.admin-approval-submit')?.textContent
+    })`);
+    assertContract(registeredApproval.status?.includes("dewiki approval registered")
+      && registeredApproval.status.includes("queued for a worker")
+      && registeredApproval.closeLabel === "Close"
+      && registeredApproval.receiptLabel === "View in Runs & logs",
+    "the approval dialog did not retain a clear authenticated request receipt", registeredApproval);
+    await evaluate(cdp, "document.querySelector('.admin-approval-cancel').click()");
     assertContract(apiRequests.includes("POST /admin-api/promote-qualification"),
       "the qualification decision did not submit the exact promotion operation", apiRequests);
     assertContract(apiPayloads.some((payload) => payload.wiki === "dewiki"

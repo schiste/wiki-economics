@@ -745,9 +745,123 @@ function inspectProject(name) {
   showAdminArea("wikis", "admin-view-wikis")
 }
 
-function typedOperatorConfirmation(summary, token) {
-  const entered = prompt(`${summary}\n\nType ${token} to continue.`)
-  return entered === token
+function openTypedApproval({
+  title,
+  summary,
+  token,
+  facts = [],
+  submitLabel = "Register approval",
+  successTitle = "Approval registered",
+  onApprove
+}) {
+  const previous = adminUiState.approvalDialog
+  if (previous?.isConnected) {
+    if (previous.open && typeof previous.close === "function") previous.close()
+    else previous.remove()
+  }
+
+  const dialog = html`<dialog class="admin-approval-dialog" aria-labelledby="admin-approval-title">
+    <form class="admin-approval-sheet">
+      <header>
+        <div>
+          <span>Operator approval</span>
+          <h2 id="admin-approval-title">${title}</h2>
+        </div>
+        <span class="admin-approval-lock" aria-label="Authenticated approval">Authenticated</span>
+      </header>
+      <p class="admin-approval-summary">${summary}</p>
+      ${facts.length ? html`<dl class="admin-approval-facts">
+        ${facts.map(([label, value]) => html`<div><dt>${label}</dt><dd>${value}</dd></div>`)}
+      </dl>` : ""}
+      <label class="admin-approval-token">
+        <span>Type <code>${token}</code> to authorize this exact operation.</span>
+        <input type="text" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label=${`Type ${token} to authorize`}>
+      </label>
+      <div class="admin-approval-status pending" role="status" aria-live="polite">
+        <i aria-hidden="true"></i>
+        <div><strong>Not submitted</strong><span>The approval is registered only after the server returns a request receipt.</span></div>
+      </div>
+      <footer>
+        <button type="button" class="admin-btn admin-approval-cancel">Cancel</button>
+        <button type="submit" class="admin-btn primary admin-approval-submit" disabled>${submitLabel}</button>
+      </footer>
+    </form>
+  </dialog>`
+  const form = dialog.querySelector("form")
+  const input = dialog.querySelector("input")
+  const cancelButton = dialog.querySelector(".admin-approval-cancel")
+  const submitButton = dialog.querySelector(".admin-approval-submit")
+  const status = dialog.querySelector(".admin-approval-status")
+  let submitting = false
+
+  function setStatus(tone, heading, detail) {
+    status.className = `admin-approval-status ${tone}`
+    status.querySelector("strong").textContent = heading
+    status.querySelector("span").textContent = detail
+  }
+
+  function closeDialog() {
+    if (dialog.open && typeof dialog.close === "function") dialog.close()
+    else dialog.remove()
+  }
+
+  input.addEventListener("input", () => {
+    submitButton.disabled = submitting || input.value !== token
+  })
+  cancelButton.addEventListener("click", closeDialog)
+  dialog.addEventListener("cancel", (event) => {
+    if (submitting) event.preventDefault()
+  })
+  dialog.addEventListener("close", () => {
+    if (adminUiState.approvalDialog === dialog) adminUiState.approvalDialog = null
+    dialog.remove()
+  }, {once: true})
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault()
+    if (submitting || input.value !== token) return
+    submitting = true
+    input.disabled = true
+    cancelButton.disabled = true
+    submitButton.disabled = true
+    submitButton.textContent = "Registering approval…"
+    setStatus("submitting", "Registering approval", "Waiting for the authenticated admin server to return a durable request receipt.")
+
+    const result = await onApprove()
+    if (!result) {
+      submitting = false
+      input.disabled = false
+      cancelButton.disabled = false
+      submitButton.disabled = input.value !== token
+      submitButton.textContent = "Try again"
+      setStatus("failed", "Approval not registered", "The server did not return a receipt. Review the operation receipt for the reason, then try again.")
+      input.focus()
+      return
+    }
+
+    const requestId = result.requestId || null
+    setStatus(
+      "success",
+      successTitle,
+      requestId
+        ? `Request ${requestId} is ${result.queued ? "queued for a worker" : "accepted by the admin server"}.`
+        : "The admin server accepted the operation."
+    )
+    cancelButton.disabled = false
+    cancelButton.textContent = "Close"
+    submitButton.disabled = false
+    submitButton.textContent = "View in Runs & logs"
+    submitButton.onclick = () => {
+      closeDialog()
+      showAdminArea("runs", "admin-view-runs")
+    }
+  })
+
+  document.body.append(dialog)
+  adminUiState.approvalDialog = dialog
+  if (typeof dialog.showModal === "function") dialog.showModal()
+  else dialog.setAttribute("open", "")
+  requestAnimationFrame(() => input.focus())
+  return dialog
 }
 
 function activeOperatorOperationForWiki(name) {
@@ -776,18 +890,28 @@ function promoteQualification(name, qualification, options = {}) {
     ? ` The current fleet publication has ${currentBlockers} preflight blocker${currentBlockers === 1 ? "" : "s"}; promotion is still safe, but dewiki will remain private until those blockers are corrected and publication succeeds.`
     : " Promotion prepares the exact candidate; the public site changes only after a passing fleet-wide publication."
   const token = `promote ${name}`
-  if (!typedOperatorConfirmation(
-    `Approve ${qualification.runId} at ${qualification.snapshot}, make ${name} a managed ${refresh} project, and queue it for publication.${publicationNote}`,
-    token
-  )) return
-  runCommand("promote-qualification", {
-    wiki: name,
-    version: qualification.snapshot,
-    qualificationRunId: qualification.runId,
-    lifecycleRevision,
-    refresh,
-    resourceClass,
-    freshnessSlaDays
+  openTypedApproval({
+    title: `Approve ${wikipediaProjectLabel(name)}`,
+    summary: `Approve this exact qualification and create a managed candidate.${publicationNote}`,
+    token,
+    facts: [
+      ["Qualification", qualification.runId],
+      ["Snapshot", qualification.snapshot],
+      ["Future updates", refresh === "scheduled" ? "Scheduled" : "Manual"],
+      ["Worker class", resourceClass.replaceAll("_", " / ")],
+      ["Freshness SLA", `${freshnessSlaDays} days`],
+      ["Public effect", "No immediate public change"]
+    ],
+    successTitle: `${name} approval registered`,
+    onApprove: () => runCommand("promote-qualification", {
+      wiki: name,
+      version: qualification.snapshot,
+      qualificationRunId: qualification.runId,
+      lifecycleRevision,
+      refresh,
+      resourceClass,
+      freshnessSlaDays
+    })
   })
 }
 
@@ -1701,13 +1825,27 @@ function lifecycleControls(name, lifecycle, direct) {
       })}>Save resource &amp; SLA policy</button>
       <button class="admin-btn" title=${actionTooltipWithApi("rebuild-candidate", apiStatus)} ?disabled=${!apiStatus || operationActive || !exactSnapshot} onclick=${() => {
         const token = `rebuild ${name}`
-        if (!typedOperatorConfirmation(`Start a clean immutable rebuild of ${name} snapshot ${exactSnapshot}. The live and existing ready candidates will not be changed.`, token)) return
-        runCommand("rebuild-candidate", {wiki: name, version: exactSnapshot, candidateRunId: ready?.run_id || null})
+        openTypedApproval({
+          title: `Rebuild ${name} at ${exactSnapshot}`,
+          summary: "Start a clean immutable rebuild. The live and existing ready candidates will not be changed.",
+          token,
+          facts: [["Project", name], ["Snapshot", exactSnapshot], ["Public effect", "No immediate public change"]],
+          submitLabel: "Register rebuild",
+          successTitle: `${name} rebuild registered`,
+          onApprove: () => runCommand("rebuild-candidate", {wiki: name, version: exactSnapshot, candidateRunId: ready?.run_id || null})
+        })
       }}>Rebuild exact snapshot</button>
       ${readyIsUnpublished ? html`<button class="admin-btn danger" title=${actionTooltipWithApi("retire-candidate", apiStatus)} ?disabled=${!apiStatus || operationActive} onclick=${() => {
         const token = `retire ${name}/${ready.run_id}`
-        if (!typedOperatorConfirmation(`Retire unpublished candidate ${ready.run_id} at ${ready.snapshot}. This cannot target the live or rollback generation.`, token)) return
-        runCommand("retire-candidate", {wiki: name, version: ready.snapshot, candidateRunId: ready.run_id})
+        openTypedApproval({
+          title: `Retire unpublished ${name} candidate`,
+          summary: "Remove this unpublished candidate from consideration. This cannot target the live or rollback generation.",
+          token,
+          facts: [["Candidate", ready.run_id], ["Snapshot", ready.snapshot], ["Public effect", "Published data stays live"]],
+          submitLabel: "Register retirement",
+          successTitle: `${name} retirement registered`,
+          onApprove: () => runCommand("retire-candidate", {wiki: name, version: ready.snapshot, candidateRunId: ready.run_id})
+        })
       }}>Retire unpublished candidate</button>` : ""}
     </div>
     <p class="admin-lifecycle-footnote">Policy writes use revision locking. Candidate actions use exact snapshot and run identities. Every request and result is retained in the operator audit ledger.</p>
@@ -2994,6 +3132,90 @@ Array.isArray(currentManifest.merged) && currentManifest.merged.length > 0
 }
 .admin-btn.danger:hover { background: #f9d6d2; }
 .admin-btn.small { font-size: 0.75rem; padding: 0.2rem 0.5rem; }
+.admin-approval-dialog {
+  width: min(42rem, calc(100vw - 2rem));
+  max-height: min(48rem, calc(100vh - 2rem));
+  padding: 0;
+  overflow: hidden;
+  border: 1px solid color-mix(in srgb, #315b8a 30%, var(--theme-foreground-faintest));
+  border-radius: 0.7rem;
+  background: var(--theme-background);
+  color: var(--theme-foreground);
+  box-shadow: 0 1.5rem 5rem color-mix(in srgb, #12263a 38%, transparent);
+}
+.admin-approval-dialog::backdrop {
+  background: color-mix(in srgb, #12263a 58%, transparent);
+  backdrop-filter: blur(2px);
+}
+.admin-approval-sheet { display: grid; margin: 0; max-height: inherit; overflow-y: auto; }
+.admin-approval-sheet > header {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+  align-items: start;
+  padding: 1.1rem 1.25rem 0.95rem;
+  border-bottom: 1px solid var(--theme-foreground-faintest);
+  background: color-mix(in srgb, var(--theme-background) 94%, #315b8a 6%);
+}
+.admin-approval-sheet > header > div { display: grid; gap: 0.18rem; }
+.admin-approval-sheet > header span { color: var(--theme-foreground-muted); font-size: 0.68rem; font-weight: 650; }
+.admin-approval-sheet > header h2 { margin: 0; max-width: 30rem; font-size: 1.12rem; line-height: 1.3; }
+.admin-approval-lock {
+  flex: none;
+  padding: 0.2rem 0.48rem;
+  border: 1px solid color-mix(in srgb, #315b8a 35%, var(--theme-foreground-faintest));
+  border-radius: 999px;
+  color: #315b8a !important;
+  background: color-mix(in srgb, #315b8a 7%, var(--theme-background));
+}
+.admin-approval-summary { margin: 0; padding: 1rem 1.25rem 0.8rem; max-width: 70ch; font-size: 0.82rem; line-height: 1.55; }
+.admin-approval-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin: 0 1.25rem;
+  border-block: 1px solid var(--theme-foreground-faintest);
+}
+.admin-approval-facts > div { min-width: 0; padding: 0.62rem 0.7rem; }
+.admin-approval-facts > div:nth-child(even) { border-left: 1px solid var(--theme-foreground-faintest); }
+.admin-approval-facts > div:nth-child(n+3) { border-top: 1px solid var(--theme-foreground-faintest); }
+.admin-approval-facts dt { color: var(--theme-foreground-muted); font-size: 0.62rem; }
+.admin-approval-facts dd { margin: 0.12rem 0 0; overflow-wrap: anywhere; font-size: 0.72rem; font-weight: 700; }
+.admin-approval-token { display: grid; gap: 0.5rem; padding: 0.95rem 1.25rem 0.75rem; font-size: 0.74rem; }
+.admin-approval-token code { padding: 0.12rem 0.3rem; border-radius: 0.2rem; background: color-mix(in srgb, #d98c2f 12%, var(--theme-background)); color: var(--theme-foreground); }
+.admin-approval-token input {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 2.7rem;
+  padding: 0.55rem 0.7rem;
+  border: 2px solid color-mix(in srgb, #d98c2f 52%, var(--theme-foreground-faintest));
+  border-radius: 0.38rem;
+  background: var(--theme-background);
+  color: var(--theme-foreground);
+  font: 0.82rem var(--monospace);
+}
+.admin-approval-token input:focus { outline: 3px solid color-mix(in srgb, #315b8a 28%, transparent); border-color: #315b8a; }
+.admin-approval-status {
+  display: grid;
+  grid-template-columns: 0.7rem minmax(0, 1fr);
+  gap: 0.65rem;
+  align-items: start;
+  margin: 0 1.25rem 1rem;
+  padding: 0.7rem 0.8rem;
+  border-left: 3px solid #d98c2f;
+  background: color-mix(in srgb, #d98c2f 7%, var(--theme-background));
+}
+.admin-approval-status i { width: 0.55rem; height: 0.55rem; margin-top: 0.18rem; border-radius: 50%; background: #d98c2f; }
+.admin-approval-status > div { display: grid; gap: 0.12rem; }
+.admin-approval-status strong { font-size: 0.75rem; }
+.admin-approval-status span { color: var(--theme-foreground-muted); font-size: 0.68rem; line-height: 1.45; }
+.admin-approval-status.submitting { border-left-color: #315b8a; background: color-mix(in srgb, #315b8a 7%, var(--theme-background)); }
+.admin-approval-status.submitting i { background: transparent; border: 2px solid color-mix(in srgb, #315b8a 25%, transparent); border-top-color: #315b8a; animation: admin-approval-spin 700ms linear infinite; }
+.admin-approval-status.success { border-left-color: #2e7d32; background: color-mix(in srgb, #2e7d32 8%, var(--theme-background)); }
+.admin-approval-status.success i { background: #2e7d32; box-shadow: inset 0 0 0 2px color-mix(in srgb, white 85%, transparent); }
+.admin-approval-status.failed { border-left-color: #c62828; background: color-mix(in srgb, #c62828 7%, var(--theme-background)); }
+.admin-approval-status.failed i { background: #c62828; }
+.admin-approval-sheet > footer { display: flex; justify-content: flex-end; gap: 0.55rem; padding: 0.85rem 1.25rem; border-top: 1px solid var(--theme-foreground-faintest); }
+@keyframes admin-approval-spin { to { transform: rotate(360deg); } }
 [data-theme="dark"] .admin-btn.refetch {
   background: #3e2723;
   color: #ff9800;
@@ -3002,6 +3224,7 @@ Array.isArray(currentManifest.merged) && currentManifest.merged.length > 0
   background: #4e1b1b;
   color: #ffb4ab;
 }
+[data-theme="dark"] .admin-approval-lock { color: #9cc7ef !important; }
 [data-theme="dark"] .pipeline-ghost-badge {
   color: #e1bee7;
   background: color-mix(in srgb, #6a1b9a 35%, transparent);
@@ -3810,6 +4033,7 @@ Array.isArray(currentManifest.merged) && currentManifest.merged.length > 0
 .admin-audit-empty { padding: 0.8rem; border-top: 1px solid var(--theme-foreground-faintest); color: var(--theme-foreground-muted); font-size: 0.72rem; }
 [data-theme="dark"] .admin-command-header { --admin-ink: #d7e2ee; background: color-mix(in srgb, var(--theme-background) 96%, #26384c 4%); }
 @media (prefers-reduced-motion: reduce) {
+  .admin-approval-status.submitting i,
   .admin-stage-rail > i.active,
   .admin-stage-row.running .admin-stage-status i,
   .admin-job-panel.running .admin-progress-fill { animation: none; }
@@ -3826,6 +4050,18 @@ Array.isArray(currentManifest.merged) && currentManifest.merged.length > 0
   }
 }
 @media (max-width: 760px) {
+  .admin-approval-dialog { width: calc(100vw - 1rem); max-height: calc(100vh - 1rem); }
+  .admin-approval-sheet > header,
+  .admin-approval-summary,
+  .admin-approval-token,
+  .admin-approval-sheet > footer { padding-inline: 0.85rem; }
+  .admin-approval-facts,
+  .admin-approval-status { margin-inline: 0.85rem; }
+  .admin-approval-facts { grid-template-columns: 1fr; }
+  .admin-approval-facts > div:nth-child(even) { border-left: 0; }
+  .admin-approval-facts > div:nth-child(n+2) { border-top: 1px solid var(--theme-foreground-faintest); }
+  .admin-approval-sheet > footer { display: grid; grid-template-columns: 1fr; }
+  .admin-approval-sheet > footer .admin-btn { width: 100%; min-height: 2.75rem; }
   .admin-view-navigation {
     top: 0;
     grid-template-columns: repeat(2, minmax(0, 1fr));
