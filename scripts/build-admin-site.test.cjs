@@ -50,16 +50,18 @@ test("standalone admin publication rebases and validates every entrypoint asset 
   fs.mkdirSync(path.join(dist, "_file", "data"), {recursive: true});
   fs.mkdirSync(path.join(dist, "_observablehq"), {recursive: true});
   fs.mkdirSync(path.join(dist, "_npm", "fixture"), {recursive: true});
-  fs.writeFileSync(path.join(dist, "admin.html"), '<base href="/admin-assets/"><script type="module" src="/_observablehq/client.js"></script>');
+  fs.writeFileSync(path.join(dist, "admin.html"), '<html><head><script type="module" src="./_observablehq/client.js"></script><base href="/admin-assets/"></head></html>');
   fs.writeFileSync(path.join(dist, "style.css"), "body{}\n");
   fs.writeFileSync(path.join(dist, "_file", "data", "manifest.0123abcd.json"), "{}\n");
   fs.writeFileSync(path.join(dist, "_observablehq", "client.js"), 'import "/_npm/fixture/module.js";\n');
   fs.writeFileSync(path.join(dist, "_npm", "fixture", "module.js"), "export {};\n");
 
-  assert.throws(() => verifyAdminBuild(dist), /public-root asset URL/);
+  assert.throws(() => verifyAdminBuild(dist), /asset base must precede/);
   rebaseAdminAssetUrls(dist);
   assert.ok(verifyAdminBuild(dist).includes("admin.html"));
-  assert.match(fs.readFileSync(path.join(dist, "admin.html"), "utf8"), /src="\/admin-assets\/_observablehq\/client\.js"/);
+  const html = fs.readFileSync(path.join(dist, "admin.html"), "utf8");
+  assert.ok(html.indexOf('<base href="/admin-assets/">') < html.indexOf('src="./_observablehq/client.js"'));
+  assert.doesNotMatch(html, /\.\/admin-assets\//);
   assert.match(fs.readFileSync(path.join(dist, "_observablehq", "client.js"), "utf8"), /"\/_npm\/fixture\/module\.js"/);
 
   fs.rmSync(path.join(dist, "_observablehq", "client.js"));

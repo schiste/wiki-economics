@@ -66,11 +66,11 @@ function prepareAdminSource({siteDir, manifestPath, destinationDir, vendorCacheD
 function rebaseAdminAssetUrls(distDir) {
   const absolute = path.join(distDir, "admin.html");
   const original = fs.readFileSync(absolute, "utf8");
-  let rebased = original;
-  for (const root of ADMIN_ASSET_ROOTS) {
-    rebased = rebased.replaceAll(`/${root}/`, `/admin-assets/${root}/`);
-  }
-  if (rebased !== original) fs.writeFileSync(absolute, rebased);
+  const base = '<base href="/admin-assets/">';
+  const withoutBase = original.replaceAll(base, "");
+  if (!withoutBase.includes("<head>")) throw new Error("standalone admin build has no head element");
+  const rebased = withoutBase.replace("<head>", `<head>\n${base}`);
+  fs.writeFileSync(absolute, rebased);
 }
 
 function verifyAdminBuild(distDir) {
@@ -86,11 +86,16 @@ function verifyAdminBuild(distDir) {
     throw new Error("standalone admin build has no immutable manifest attachment");
   }
   if (!files.includes("style.css")) throw new Error("standalone admin build is missing its isolated stylesheet");
-  const unrebasedPattern = new RegExp(`(^|[^A-Za-z0-9_-])/_(?:${ADMIN_ASSET_ROOTS.map((root) => root.slice(1)).join("|")})/`, "m");
-  const assetPattern = new RegExp(`/admin-assets/(_(?:${ADMIN_ASSET_ROOTS.map((root) => root.slice(1)).join("|")})/[^\\s\"'\\x60)<]+)`, "g");
-  if (unrebasedPattern.test(html)) {
+  const baseIndex = html.indexOf('<base href="/admin-assets/">');
+  const firstAssetIndex = html.search(new RegExp(`(?:\\./|/admin-assets/|\"/|'/|\\x60/)(?:${ADMIN_ASSET_ROOTS.join("|")})/`));
+  if (baseIndex === -1 || (firstAssetIndex !== -1 && baseIndex > firstAssetIndex)) {
+    throw new Error("standalone admin asset base must precede every generated asset URL");
+  }
+  const unrebasedPattern = new RegExp(`(?:\"|'|\\x60|\\()/_(?:${ADMIN_ASSET_ROOTS.map((root) => root.slice(1)).join("|")})/`);
+  if (unrebasedPattern.test(html) || html.includes("./admin-assets/_")) {
     throw new Error("standalone admin build contains a public-root asset URL: admin.html");
   }
+  const assetPattern = new RegExp(`(?:\\./|/admin-assets/)(_(?:${ADMIN_ASSET_ROOTS.map((root) => root.slice(1)).join("|")})/[^\\s\"'\\x60)<]+)`, "g");
   for (const match of html.matchAll(assetPattern)) {
     const relative = match[1].split(/[?#]/, 1)[0];
     const target = path.resolve(distDir, relative);
