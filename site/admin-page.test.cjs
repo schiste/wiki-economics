@@ -63,11 +63,13 @@ test("hidden qualifications and shared blockers have explicit human states", () 
   assert.doesNotMatch(source, /quarantined: "Needs intervention"/);
 });
 
-test("control room makes starting work, idle workers, and pending decisions explicit", () => {
+test("control room makes live work, unresolved failures, and pending decisions explicit", () => {
   assert.match(source, /Start or update a project/);
   assert.match(source, /Choose a project and start work/);
   assert.match(source, /Idle is normal/);
-  assert.match(source, /scheduled workers sleep between checks/);
+  assert.match(source, /deriveOperatorSituation/);
+  assert.match(source, /Do this next/);
+  assert.match(source, /Retry compatibility repair/);
   assert.match(source, /Approve &amp; schedule/);
   assert.match(source, /Inspect evidence/);
   assert.match(source, /The request is durable and resumable/);
@@ -132,6 +134,9 @@ test("typed approvals stay in-app and show the authenticated request receipt", (
   assert.match(source, /approval registered/);
   assert.match(source, /View in Runs & logs/);
   assert.match(source, /result\.requestId/);
+  assert.match(source, /function requestCompatibilityRepair/);
+  assert.match(source, /onApprove: \(\) => runCommand\("rebuild-compatibility-cohort"\)/);
+  assert.doesNotMatch(source, /Rebuild every incompatible candidate with the current pinned binary\?/);
   assert.doesNotMatch(source, /function typedOperatorConfirmation/);
   assert.doesNotMatch(source, /\bprompt\s*\(/);
 });

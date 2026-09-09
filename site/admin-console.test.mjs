@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   applyAdminView,
   createAdaptivePoll,
+  deriveOperatorSituation,
   deriveProjectPipelineStages,
   hasActiveAdminWork,
   normalizeAdminView,
@@ -186,6 +187,77 @@ test("operator summary counts shared causes and qualification decisions instead 
   assert.deepEqual(summary.qualificationReady, [{
     wiki: "dewiki", snapshot: "2026-08", runId: "qualified-dewiki", artifactCount: 10,
   }]);
+});
+
+test("operator situation surfaces an unresolved recovery failure instead of calling the system idle", () => {
+  const situation = deriveOperatorSituation({
+    adminOperations: {
+      running: [],
+      queued: [],
+      recent: [{
+        requestId: "repair-1",
+        action: "rebuild-compatibility-cohort",
+        state: "failed",
+        errorSummary: "Wikimedia republished the logging dump.",
+        remediation: "Retry; the inventory will be refreshed automatically.",
+        finishedAt: "2026-09-09T16:28:31Z",
+      }],
+    },
+    operationalTruth: {public: {status: "healthy"}, pipeline: {blockerGroups: []}},
+  });
+  assert.equal(situation.state, "failed");
+  assert.equal(situation.headline, "Compatibility repair stopped");
+  assert.match(situation.detail, /republished/);
+  assert.match(situation.nextAction, /Retry/);
+  assert.equal(situation.operation.requestId, "repair-1");
+});
+
+test("operator situation gives live cohort progress precedence over an earlier failure", () => {
+  const situation = deriveOperatorSituation({
+    adminOperations: {
+      running: [{
+        requestId: "repair-2",
+        action: "rebuild-compatibility-cohort",
+        state: "running",
+        stageLabel: "Preparing patrol sources",
+        cohortProgress: {currentWiki: "dewiki", currentIndex: 2, total: 7},
+        heartbeatAt: "2026-09-09T17:00:00Z",
+      }],
+      queued: [],
+      recent: [{requestId: "repair-1", action: "rebuild-compatibility-cohort", state: "failed", finishedAt: "2026-09-09T16:28:31Z"}],
+    },
+    operationalTruth: {public: {status: "healthy"}, pipeline: {blockerGroups: []}},
+  });
+  assert.equal(situation.state, "running");
+  assert.equal(situation.headline, "dewiki is running");
+  assert.match(situation.detail, /2 of 7 projects/);
+});
+
+test("operator situation treats a later successful retry as resolution", () => {
+  const situation = deriveOperatorSituation({
+    adminOperations: {
+      running: [],
+      queued: [],
+      recent: [
+        {requestId: "repair-2", action: "repair", state: "succeeded", finishedAt: "2026-09-09T17:00:00Z"},
+        {requestId: "repair-1", action: "repair", state: "failed", finishedAt: "2026-09-09T16:00:00Z"},
+      ],
+    },
+    operationalTruth: {public: {status: "healthy"}, pipeline: {blockerGroups: []}},
+  });
+  assert.equal(situation.state, "idle");
+});
+
+test("a completed compatibility repair resolves the preflight failure that requested it", () => {
+  const situation = deriveOperatorSituation({
+    operationalTruth: {public: {status: "healthy"}, pipeline: {status: "healthy", blockerGroups: []}},
+    adminOperations: {running: [], queued: [], recent: [
+      {requestId: "preflight", action: "publication-preflight", state: "failed", finishedAt: "2026-09-09T10:00:00Z"},
+      {requestId: "repair", action: "rebuild-compatibility-cohort", state: "succeeded", finishedAt: "2026-09-09T12:00:00Z"},
+    ]},
+  });
+  assert.equal(situation.state, "idle");
+  assert.equal(situation.operation, null);
 });
 
 test("stage ledger keeps an older healthy publication separate from a blocked update", () => {

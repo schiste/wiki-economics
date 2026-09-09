@@ -256,6 +256,114 @@ export function summarizeOperatorStatus(status = {}) {
   };
 }
 
+function operationTime(operation) {
+  return Date.parse(operation?.finishedAt || operation?.updatedAt || operation?.startedAt || operation?.requestedAt || 0);
+}
+
+function operationScope(operation) {
+  const action = operation?.action || "operation";
+  const family = new Set(["publication-preflight", "rebuild-compatibility-cohort", "publish"]).has(action)
+    ? "publication-recovery"
+    : action;
+  return `${family}:${operation?.wiki || "global"}`;
+}
+
+function unresolvedOperationFailure(recent = []) {
+  const terminal = [...recent].sort((left, right) => operationTime(right) - operationTime(left));
+  return terminal.find((candidate) => {
+    if (!new Set(["failed", "interrupted", "stalled", "quarantined"]).has(candidate?.state)) return false;
+    if (candidate.supersededByRequestId || candidate.resolvedByRequestId) return false;
+    const failedAt = operationTime(candidate);
+    return !terminal.some((later) => operationTime(later) > failedAt
+      && operationScope(later) === operationScope(candidate)
+      && new Set(["succeeded", "superseded"]).has(later?.state));
+  }) || null;
+}
+
+/**
+ * Produce the one sentence an operator needs first. Historical evidence is
+ * deliberately subordinate: live work wins, then queued work, then the most
+ * recent unresolved terminal failure, then pipeline-level decisions.
+ */
+export function deriveOperatorSituation(status = {}) {
+  const operations = status.adminOperations || {};
+  const truth = status.operationalTruth || {};
+  const publicStatus = truth.public?.status || status.freshness?.status || "unknown";
+  const running = [
+    ...(operations.running || []),
+    ...(status.fleet?.work || []).filter((work) => work.state === "running"),
+    ...(status.job?.running ? [status.job] : []),
+  ].filter((operation, index, all) => all.findIndex((candidate) =>
+    (candidate.runId || candidate.requestId || candidate.taskId) === (operation.runId || operation.requestId || operation.taskId)) === index);
+  const queued = [
+    ...(operations.queued || []),
+    ...(status.fleet?.work || []).filter((work) => ["queued", "waiting_upstream"].includes(work.state)),
+  ];
+  const failure = unresolvedOperationFailure([
+    ...(operations.recent || []),
+    ...(status.adminRuns?.recent || []),
+  ].filter((operation, index, all) => all.findIndex((candidate) =>
+    (candidate.runId || candidate.requestId || candidate.taskId) === (operation.runId || operation.requestId || operation.taskId)) === index));
+  const blocker = truth.pipeline?.blockerGroups?.[0] || null;
+
+  if (publicStatus !== "healthy") return {
+    state: "critical",
+    headline: "Public data needs attention",
+    detail: truth.public?.alerts?.[0]?.message || `Public health is ${publicStatus}. Protect the current publication before starting candidate work.`,
+    nextAction: "Open publication health and follow the first failed gate.",
+    operation: running[0] || null,
+  };
+  if (running.length) {
+    const operation = running[0];
+    const cohort = operation.cohortProgress;
+    const subject = operation.wiki || cohort?.currentWiki || (operation.action === "rebuild-compatibility-cohort" ? "compatibility cohort" : "pipeline");
+    const stage = operation.stageLabel || operation.stage || "Starting";
+    return {
+      state: "running",
+      headline: running.length === 1 ? `${subject} is running` : `${running.length} operations are running`,
+      detail: cohort?.total
+        ? `${cohort.currentIndex || 1} of ${cohort.total} projects · ${stage}. The public generation remains unchanged.`
+        : `${stage}. The latest heartbeat is ${operation.heartbeatAt || operation.updatedAt ? "being recorded" : "not available yet"}.`,
+      nextAction: "No action is needed while the heartbeat remains current.",
+      operation,
+    };
+  }
+  if (queued.length) {
+    const operation = queued[0];
+    const waiting = operation.state === "waiting_upstream";
+    return {
+      state: "queued",
+      headline: waiting ? "Waiting safely for Wikimedia" : `${queued.length} operation${queued.length === 1 ? " is" : "s are"} queued`,
+      detail: waiting
+        ? operation.errorSummary || operation.error || "Validated work is retained until the upstream dump is complete."
+        : "A worker will claim the durable request at its next scheduled check.",
+      nextAction: waiting ? "No repair is required; the worker will recheck automatically." : "No action is needed unless the request remains queued past the next worker check.",
+      operation,
+    };
+  }
+  if (failure) return {
+    state: "failed",
+    headline: failure.action === "rebuild-compatibility-cohort" ? "Compatibility repair stopped" : "The last operation failed",
+    detail: failure.errorSummary || failure.error || "The operation stopped without a concise diagnosis.",
+    nextAction: failure.remediation || "Open the failed run, review its final stage, and use only the offered recovery action.",
+    operation: failure,
+  };
+  if (blocker) return {
+    state: blocker.retryable === false ? "blocked" : "attention",
+    headline: "Updates need one decision",
+    detail: blocker.summary || "The candidate pipeline is blocked.",
+    nextAction: blocker.remediation || "Open the affected projects and follow the stated remediation.",
+    operation: null,
+  };
+  return {
+    state: "idle",
+    headline: "No work is running",
+    detail: "The public generation is healthy. Scheduled workers wake, check for work, and exit when nothing changed.",
+    nextAction: "No action is needed.",
+    operation: null,
+  };
+}
+
 export function normalizeAdminView(value) {
   return ADMIN_VIEWS.some((view) => view.id === value) ? value : ADMIN_VIEWS[0].id;
 }

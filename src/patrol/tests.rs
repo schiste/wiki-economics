@@ -920,6 +920,88 @@ fn patrol_plan_waits_for_completed_inventory_then_resolves_without_history_work(
 }
 
 #[test]
+fn patrol_plan_refresh_replaces_a_republished_completed_inventory() -> Result<()> {
+    let data_dir = TestDir::new()?;
+    let original = gzip_bytes("<mediawiki><logitem/></mediawiki>")?;
+    let original_status =
+        completed_dump_status("testwiki-20260901-pages-logging.xml.gz", &original);
+    let original_transport = FakePatrolTransport::new(vec![original], Vec::new())
+        .with_dump_statuses(vec![original_status]);
+    let first = plan::PatrolSourcePlan::load_or_resolve(
+        &original_transport,
+        "testwiki",
+        "2026-08",
+        data_dir.path(),
+    )?;
+
+    let republished = gzip_bytes("<mediawiki><logitem/><logitem/></mediawiki>")?;
+    let republished_status =
+        completed_dump_status("testwiki-20260901-pages-logging.xml.gz", &republished);
+    let republished_transport = FakePatrolTransport::new(
+        vec![republished.clone()],
+        vec![json!({"query": {"usergroups": []}})],
+    )
+    .with_dump_statuses(vec![republished_status])
+    .with_response_identity("new-etag", "Tue, 09 Sep 2026 16:00:00 GMT");
+    generation::preflight(
+        &republished_transport,
+        "testwiki",
+        "2026-08",
+        data_dir.path(),
+    )?;
+    let refreshed = plan::PatrolSourcePlan::load_or_resolve(
+        &republished_transport,
+        "testwiki",
+        "2026-08",
+        data_dir.path(),
+    )?;
+
+    assert_ne!(first.plan_sha256, refreshed.plan_sha256);
+    assert_eq!(
+        refreshed.sources[0].expected_size,
+        u64::try_from(republished.len())?
+    );
+    assert_eq!(refreshed.sources[0].sha1, source_sha1(&republished));
+    Ok(())
+}
+
+#[test]
+fn patrol_generation_refreshes_and_retries_one_source_identity_race() -> Result<()> {
+    let data_dir = TestDir::new()?;
+    let original = gzip_bytes("<mediawiki></mediawiki>")?;
+    let republished = gzip_bytes(&format!(
+        "<mediawiki>{}</mediawiki>",
+        "<logitem><type>move</type></logitem>".repeat(8)
+    ))?;
+    assert_ne!(original.len(), republished.len());
+    let original_status =
+        completed_dump_status("racewiki-20260901-pages-logging.xml.gz", &original);
+    let republished_status =
+        completed_dump_status("racewiki-20260901-pages-logging.xml.gz", &republished);
+    let transport = FakePatrolTransport::new(
+        vec![republished.clone(), republished.clone()],
+        vec![json!({"query": {"usergroups": []}})],
+    )
+    .with_dump_statuses(vec![original_status, republished_status])
+    .with_response_identity("republished-etag", "Tue, 09 Sep 2026 16:00:00 GMT");
+
+    let generation = generation::fetch(&transport, "racewiki", "2026-08", data_dir.path())?;
+
+    assert_eq!(transport.get_calls().len(), 2);
+    assert_eq!(generation.plan.sources[0].sha1, source_sha1(&republished));
+    assert_eq!(
+        generation.sources[0].downloaded_sha1,
+        source_sha1(&republished)
+    );
+    assert_eq!(
+        generation.plan.sources[0].expected_size,
+        u64::try_from(republished.len())?
+    );
+    assert!(generation::manifest_path(data_dir.path(), "racewiki", "2026-08")?.is_file());
+    Ok(())
+}
+
+#[test]
 fn patrol_plan_handles_year_rollover_and_cleans_failed_atomic_publication() -> Result<()> {
     let year_root = TestDir::new()?;
     let body = gzip_bytes("<mediawiki></mediawiki>")?;

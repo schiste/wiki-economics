@@ -124,6 +124,50 @@ test("operation summaries distinguish incomplete logging dumps from defects", ()
   assert.match(summary.errorSummary, /will not be downloaded again/);
 });
 
+test("operation summaries classify republished patrol sources as a safe resumable retry", () => {
+  const summary = summarizeOperationLog({}, [
+    'run_id=test INFO starting stage stage="patrol_fetch" wiki="dewiki"',
+    "Error: patrol logging source length changed during download (inventory expected 10, transport expected Some(12), received 12)",
+  ].join("\n"));
+  assert.equal(summary.retryable, true);
+  assert.equal(summary.remediationCode, "patrol_source_republished");
+  assert.match(summary.errorSummary, /rejected/);
+  assert.match(summary.remediation, /refreshes Wikimedia's authoritative/);
+});
+
+test("operation summaries expose compatibility cohort position and retained successes", () => {
+  const summary = summarizeOperationLog({
+    compatibilityCohort: [{wiki: "afwiki"}, {wiki: "dewiki"}, {wiki: "frwiki"}],
+  }, [
+    "==> Rebuilding compatibility candidate wiki=afwiki snapshot=2026-08 run_id=repair-afwiki cohort_index=1 cohort_total=3",
+    "==> Compatibility candidate ready wiki=afwiki snapshot=2026-08 cohort_index=1 cohort_total=3",
+    "==> Rebuilding compatibility candidate wiki=dewiki snapshot=2026-08 run_id=repair-dewiki cohort_index=2 cohort_total=3",
+    'run_id=test INFO starting stage stage="compute" wiki="dewiki"',
+  ].join("\n"));
+  assert.deepEqual(summary.cohortProgress, {
+    total: 3,
+    currentIndex: 2,
+    currentWiki: "dewiki",
+    completedWikis: ["afwiki"],
+    completed: 1,
+    failedWikis: [],
+  });
+});
+
+test("partial compatibility cohorts retain progress and prescribe a bounded retry", () => {
+  const summary = summarizeOperationLog({compatibilityCohort: [{wiki: "dewiki"}, {wiki: "frwiki"}]}, [
+    "==> Rebuilding compatibility candidate wiki=dewiki snapshot=2026-08 run_id=repair-dewiki cohort_index=1 cohort_total=2",
+    "==> Compatibility candidate failed wiki=dewiki snapshot=2026-08 exit_code=1; continuing with the remaining cohort",
+    "==> Rebuilding compatibility candidate wiki=frwiki snapshot=2026-08 run_id=repair-frwiki cohort_index=2 cohort_total=2",
+    "==> Compatibility candidate ready wiki=frwiki snapshot=2026-08 cohort_index=2 cohort_total=2",
+    "Error: compatibility cohort completed with failed members: dewiki:1; successful candidates were retained",
+  ].join("\n"));
+  assert.equal(summary.remediationCode, "compatibility_cohort_partial");
+  assert.equal(summary.retryable, true);
+  assert.deepEqual(summary.cohortProgress.failedWikis, ["dewiki"]);
+  assert.deepEqual(summary.cohortProgress.completedWikis, ["frwiki"]);
+});
+
 test("a successful terminal receipt clears stale errors from earlier attempts", () => {
   const summary = summarizeOperationLog({
     state: "succeeded",

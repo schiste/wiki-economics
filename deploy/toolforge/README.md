@@ -144,7 +144,14 @@ and higher resource envelope are being qualified.
   Fleet workers translate that into an atomic deferred task without consuming
   a retry; admin operations display it as `waiting_upstream` and automatically
   schedule a later readiness check. The next attempt reuses the completed core
-  work and resumes at patrol.
+  work and resumes at patrol. Wikimedia can occasionally regenerate a logging
+  dump after it first reports `done`; before a patrol generation commits, the
+  pipeline refreshes that authoritative inventory and retries one changed
+  size/checksum identity once. Downloaded bytes still fail closed against the
+  refreshed SHA-1, while retained history metrics avoid repeating expensive
+  computation. Compatibility-cohort repairs also checkpoint successful members
+  by deployed binary and snapshot. A later retry revalidates those candidates
+  through the normal planner instead of forcing their complete rebuild again.
   The [Rust resource governor](../../docs/resource-governor.md) independently
   caps concurrency and admits each source against cgroup memory, filesystem
   reserve, scratch, and file-descriptor signals. Thus a window of four is an

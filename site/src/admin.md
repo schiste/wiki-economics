@@ -11,6 +11,7 @@ toc: false
 import {
   createAdaptivePoll,
   createAdminViewNavigation,
+  deriveOperatorSituation,
   deriveProjectPipelineStages,
   hasActiveAdminWork,
   persistOperationReceipts,
@@ -529,6 +530,7 @@ const operationalTruth = job?.operationalTruth || {
 const operationalWikiTruth = operationalTruth.wikis || {}
 const supportedWikis = Array.from(new Set(job?.supportedWikis || [])).sort((a, b) => a.localeCompare(b))
 const operatorSummary = summarizeOperatorStatus(job || {})
+const operatorSituation = deriveOperatorSituation(job || {})
 ```
 
 <p class="filter-desc">Last scanned: ${currentManifest.generated_at}${apiStatus ? html` · <span style="color:#2e7d32">API connected</span>` : html` · ${adminConnectionHelp()}`}</p>
@@ -730,6 +732,30 @@ const activeWork = [
   ...(fleet.work || []).filter((entry) => entry.state === "running").map((entry) => ({...entry, source: "fleet"})),
 ]
 
+function openSituationOperation(operation = operatorSituation.operation) {
+  if (!operation) return
+  setSelectedRun(operation.runId || operation.requestId || operation.taskId || null)
+  showAdminArea("runs", "admin-view-runs")
+}
+
+function requestCompatibilityRepair(retry = false) {
+  const verb = retry ? "Retry" : "Repair"
+  const token = retry ? "retry compatibility" : "repair compatibility"
+  openTypedApproval({
+    title: `${verb} candidate compatibility`,
+    summary: `${verb} the incompatible candidate cohort with the current deployed binary. Wikimedia source identities are refreshed before patrol work, and completed candidate work is retained if another project fails.`,
+    token,
+    facts: [
+      ["Public site", "No immediate public change"],
+      ["Execution", "One project at a time; later projects continue after an individual failure"],
+      ["Reuse", "Validated history, metrics, and completed candidates are retained"],
+    ],
+    submitLabel: `${verb} compatibility repair`,
+    successTitle: `${verb} registered`,
+    onApprove: () => runCommand("rebuild-compatibility-cohort"),
+  })
+}
+
 function showAdminArea(viewName, targetId = null, focusSelector = null) {
   adminViewController.select(viewName)
   requestAnimationFrame(() => requestAnimationFrame(() => {
@@ -916,26 +942,31 @@ function promoteQualification(name, qualification, options = {}) {
 }
 
 display(html`<div class="admin-command-header">
-  <div class="admin-command-health ${operatorSummary.publicStatus !== "healthy" ? "attention" : operatorSummary.decisionCount ? "decision" : "clear"}">
+  <div class="admin-command-health ${operatorSituation.state}">
     <span class="admin-command-kicker">Right now</span>
-    <strong>${operatorSummary.publicStatus === "healthy" ? "Public data is healthy" : `Public data is ${operatorSummary.publicStatus}`}</strong>
-    <span>${activeCount > 0
-      ? `${activeCount} ${activeCount === 1 ? "operation is" : "operations are"} running now`
-      : `${operatorSummary.queuedCount > 0 ? `${operatorSummary.queuedCount} queued · ` : ""}Nothing is running; scheduled workers sleep between checks`}</span>
+    <strong>${operatorSituation.headline}</strong>
+    <span>${operatorSituation.detail}</span>
+    <small>${operatorSituation.nextAction}</small>
   </div>
   <dl class="admin-command-facts">
     <div><dt>Public data</dt><dd class=${operationalTruth.public?.status === "healthy" ? "ok" : operationalTruth.public?.status === "critical" ? "bad" : ""}>${operationalTruth.public?.status || "unknown"}</dd></div>
     <div><dt>Update pipeline</dt><dd class=${operationalTruth.pipeline?.status === "healthy" ? "ok" : operationalTruth.pipeline?.status === "degraded" ? "bad" : ""}>${operationalTruth.pipeline?.status || "unknown"}</dd></div>
     <div><dt>Infrastructure</dt><dd class=${operationalTruth.infrastructure?.status === "available" ? "ok" : ""}>${operationalTruth.infrastructure?.status || "unknown"}</dd></div>
-    <div><dt>Coverage</dt><dd>${publishedWikis.length} published · ${refreshWikis.length} scheduled</dd></div>
+    <div><dt>Last operator result</dt><dd class=${operatorSituation.state === "failed" || operatorSituation.state === "critical" ? "bad" : operatorSituation.state === "running" ? "active" : ""}>${operatorSituation.operation ? receiptStateLabel(operatorSituation.operation.state) : "No unresolved run"}</dd></div>
   </dl>
   <div class="admin-command-session">
     <span>${auth?.user?.email || (auth?.enabled ? "Sign-in required" : "Local operator")}</span>
     ${auth?.logoutUrl ? html`<a href=${auth.logoutUrl}>Sign out</a>` : ""}
   </div>
   <div class="admin-command-actions" aria-label="Primary operator actions">
-    <button class="admin-btn primary" onclick=${() => showAdminArea("wikis", "admin-start-work", ".admin-wiki-combobox")}>Start or update a project</button>
-    <button class="admin-btn" onclick=${() => showAdminArea("runs", "admin-view-runs")}>See runs and logs${activeCount ? ` (${activeCount})` : ""}</button>
+    ${operatorSituation.state === "failed" && operatorSituation.operation?.action === "rebuild-compatibility-cohort"
+      ? html`<button class="admin-btn primary" ?disabled=${!apiStatus} onclick=${() => requestCompatibilityRepair(true)}>Retry compatibility repair</button>`
+      : operatorSituation.operation
+        ? html`<button class="admin-btn primary" onclick=${() => openSituationOperation()}>${operatorSituation.state === "running" ? "Watch current run" : "Open current operation"}</button>`
+        : ["critical", "blocked", "attention"].includes(operatorSituation.state)
+          ? html`<button class="admin-btn primary" onclick=${() => showAdminArea("overview", "admin-decisions")}>Review required decision</button>`
+          : html`<button class="admin-btn primary" onclick=${() => showAdminArea("wikis", "admin-start-work", ".admin-wiki-combobox")}>Start or update a project</button>`}
+    <button class="admin-btn" onclick=${() => showAdminArea("runs", "admin-view-runs")}>See all runs and logs${activeCount ? ` (${activeCount})` : ""}</button>
     <button class="admin-btn" onclick=${() => showAdminArea("overview", "admin-decisions")}>Review decisions${operatorSummary.decisionCount ? ` (${operatorSummary.decisionCount})` : ""}</button>
   </div>
 </div>`)
@@ -948,15 +979,34 @@ display(html`<div class="admin-command-header">
 ```js
 display(html`<div class="admin-control-grid">
   <section class="admin-now-panel" aria-labelledby="admin-now-title">
-    <header><div><span>Current work</span><h3 id="admin-now-title">${activeWork.length ? `${activeWork.length} running now` : "Nothing is running"}</h3></div><button class="admin-text-action" onclick=${() => showAdminArea("runs", "admin-view-runs")}>Open run history</button></header>
+    <header><div><span>Current work</span><h3 id="admin-now-title">${activeWork.length ? `${activeWork.length} running now` : operatorSituation.headline}</h3></div><button class="admin-text-action" onclick=${() => showAdminArea("runs", "admin-view-runs")}>Open run history</button></header>
     ${activeWork.length ? html`<div class="admin-now-list">${activeWork.slice(0, 4).map((work) => html`<button onclick=${() => {
       if (work.wiki) setSelectedWiki(work.wiki)
       setSelectedRun(work.runId || work.taskId || null)
       showAdminArea("runs", "admin-view-runs")
-    }}><i></i><span><strong>${work.wiki ? wikipediaProjectLabel(work.wiki) : "Global operation"}</strong><small>${work.stageLabel || work.stage || "Starting"}${work.progress?.percent != null ? ` · ${work.progress.percent}%` : ""}</small></span></button>`)}</div>`
-      : html`<div class="admin-idle-explanation"><strong>Idle is normal.</strong><span>Fleet workers wake on schedule, discover new snapshots, and exit when nothing changed. Starting a project creates a durable request that remains visible after you close this page.</span></div>`}
+    }}><i></i><span><strong>${work.wiki ? wikipediaProjectLabel(work.wiki) : work.cohortProgress?.currentWiki ? wikipediaProjectLabel(work.cohortProgress.currentWiki) : "Global operation"}</strong><small>${work.cohortProgress?.total ? `${work.cohortProgress.currentIndex || 1} of ${work.cohortProgress.total} projects · ` : ""}${work.stageLabel || work.stage || "Starting"}${work.progress?.percent != null ? ` · ${work.progress.percent}%` : ""}</small></span></button>`)}</div>`
+      : operatorSituation.state === "failed"
+        ? html`<div class="admin-current-incident">
+            <strong>${operatorSituation.headline}</strong>
+            <span>${operatorSituation.detail}</span>
+            <small><b>Do this next:</b> ${operatorSituation.nextAction}</small>
+            <div>
+              <button class="admin-btn" onclick=${() => openSituationOperation()}>Open diagnosis and log</button>
+              ${operatorSituation.operation?.action === "rebuild-compatibility-cohort" ? html`<button class="admin-btn primary" ?disabled=${!apiStatus} onclick=${() => requestCompatibilityRepair(true)}>Retry compatibility repair</button>` : ""}
+            </div>
+          </div>`
+        : ["critical", "blocked", "attention"].includes(operatorSituation.state)
+          ? html`<div class="admin-current-incident attention">
+              <strong>${operatorSituation.headline}</strong>
+              <span>${operatorSituation.detail}</span>
+              <small><b>Do this next:</b> ${operatorSituation.nextAction}</small>
+              <div><button class="admin-btn primary" onclick=${() => showAdminArea("overview", "admin-decisions")}>Review required decision</button></div>
+            </div>`
+          : operatorSituation.state === "queued"
+            ? html`<div class="admin-idle-explanation"><strong>${operatorSituation.headline}</strong><span>${operatorSituation.detail}</span><small>${operatorSituation.nextAction}</small></div>`
+            : html`<div class="admin-idle-explanation"><strong>Idle is normal.</strong><span>${operatorSituation.detail}</span><small>${operatorSituation.nextAction}</small></div>`}
     ${operatorSummary.queuedCount || operatorSummary.waitingUpstreamCount ? html`<div class="admin-queue-note"><strong>${operatorSummary.queuedCount} queued</strong><span>${operatorSummary.waitingUpstreamCount ? ` · ${operatorSummary.waitingUpstreamCount} waiting for Wikimedia` : " · waiting for the next worker"}</span></div>` : ""}
-    <button class="admin-btn primary" onclick=${() => showAdminArea("wikis", "admin-start-work", ".admin-wiki-combobox")}>Choose a project and start work</button>
+    ${operatorSituation.state === "idle" ? html`<button class="admin-btn primary" onclick=${() => showAdminArea("wikis", "admin-start-work", ".admin-wiki-combobox")}>Choose a project and start work</button>` : ""}
   </section>
   <section id="admin-decisions" class="admin-decision-panel" aria-labelledby="admin-decisions-title">
     <header><div><span>Operator decisions</span><h3 id="admin-decisions-title">${operatorSummary.decisionCount ? `${operatorSummary.decisionCount} ${operatorSummary.decisionCount === 1 ? "decision" : "decisions"} waiting` : "No decision needed"}</h3></div></header>
@@ -1134,7 +1184,7 @@ const activityRows = [
     }) === index
   })
   .sort((left, right) => {
-    const priority = {stalled: 0, quarantined: 1, interrupted: 2, failed: 3, running: 4, cancelling: 5, queued: 6}
+    const priority = {running: 0, cancelling: 1, queued: 2, waiting_upstream: 3, stalled: 4, quarantined: 5, interrupted: 6, failed: 7}
     return (priority[left.state] ?? 20) - (priority[right.state] ?? 20)
       || Date.parse(operationTimestamp(right) || 0) - Date.parse(operationTimestamp(left) || 0)
   })
@@ -1199,6 +1249,15 @@ async function executeAllowedAction(action) {
     acknowledgeBlockedRetry: Boolean(action.acknowledgeBlockedRetry)
   })
 }
+
+function globalRetryFor(run) {
+  if (run?.retryable !== true) return null
+  if (run.action === "rebuild-compatibility-cohort") return {
+    label: "Retry compatibility repair",
+    execute: () => requestCompatibilityRepair(true)
+  }
+  return null
+}
 ```
 
 ```js
@@ -1219,6 +1278,11 @@ selectedRun ? display(html`<section class="admin-run-sheet" aria-label="Run deta
     <div><span>CPU time</span><strong>${selectedRun.cpu?.usageUsec ? durationLabel(selectedRun.cpu.usageUsec / 1000) : "—"}</strong><small>${selectedRun.cpu?.throttledUsec ? ` throttled ${durationLabel(selectedRun.cpu.throttledUsec / 1000)}` : ""}</small></div>
     <div><span>Heartbeat</span><strong>${relativeTime(selectedRun.heartbeatAt || selectedRun.updatedAt)}</strong></div>
   </div>
+  ${selectedRun.cohortProgress?.total ? html`<div class="admin-cohort-progress">
+    <strong>${selectedRun.cohortProgress.currentIndex || selectedRun.cohortProgress.completed || 0} of ${selectedRun.cohortProgress.total} projects</strong>
+    <span>${selectedRun.cohortProgress.currentWiki ? `Currently ${wikipediaProjectLabel(selectedRun.cohortProgress.currentWiki)}` : "Cohort position unavailable"}</span>
+    <small>${selectedRun.cohortProgress.completed ? `${selectedRun.cohortProgress.completed} completed and retained: ${selectedRun.cohortProgress.completedWikis.join(", ")}` : "No member has completed yet."}</small>
+  </div>` : ""}
   ${Array.isArray(selectedRun.attempts) && selectedRun.attempts.length > 1 ? html`<div class="admin-run-attempts">
     <strong>${selectedRun.attempts.length} attempts belong to this one logical operation</strong>
     <span>${selectedRun.upstreamWaitCount || 0} upstream waits; validated work was retained between attempts.</span>
@@ -1241,7 +1305,9 @@ selectedRun ? display(html`<section class="admin-run-sheet" aria-label="Run deta
     <strong>${selectedRun.errorSummary || selectedRun.error}</strong>
     <p>${selectedRun.remediation || "Review the recorded evidence before retrying."}</p>
     <div class="admin-dossier-actions">
-      ${(selectedRunTruth?.allowedActions || []).length
+      ${globalRetryFor(selectedRun)
+        ? html`<button class="admin-btn primary" ?disabled=${!apiStatus} onclick=${globalRetryFor(selectedRun).execute}>${globalRetryFor(selectedRun).label}</button>`
+        : (selectedRunTruth?.allowedActions || []).length
         ? selectedRunTruth.allowedActions.map((action) => html`<button class="admin-btn ${action.id === "quarantine-retry" ? "danger" : ""}" ?disabled=${!apiStatus} onclick=${() => executeAllowedAction(action)}>${action.label}</button>`)
         : html`<span class="admin-action-blocked">No automated action is safe for this diagnosis.</span>`}
     </div>
@@ -1436,7 +1502,7 @@ display(html`<div id="admin-publication-workbench" class="admin-refresh-panel">
       </li>
       <li class=${hasCompatibilityBlocker ? compatibilityRepairActive ? "running" : unresolvedProfileAdmission ? "waiting" : "current" : "done"}>
         <i aria-hidden="true"></i><div><strong>Rebuild incompatible candidates with one binary</strong><span>${hasCompatibilityBlocker ? "The cohort includes every snapshot laggard and every wiki named by schema or algorithm incompatibility." : "Candidate metric identities agree."}</span></div>
-        ${hasCompatibilityBlocker ? html`<button class="admin-btn primary" ?disabled=${!compatibilityRepairAllowed} title=${unresolvedProfileAdmission ? "Complete workload-profile qualification first." : compatibilityRepairActive ? "Compatibility repair is already running." : actionTooltipWithApi("rebuild-compatibility-cohort", apiStatus)} onclick=${() => { if (confirm("Rebuild every incompatible candidate with the current pinned binary? Existing published data remains unchanged.")) runCommand("rebuild-compatibility-cohort") }}>${compatibilityRepairActive ? "Repair running" : "Repair candidate compatibility"}</button>` : ""}
+        ${hasCompatibilityBlocker ? html`<button class="admin-btn primary" ?disabled=${!compatibilityRepairAllowed} title=${unresolvedProfileAdmission ? "Complete workload-profile qualification first." : compatibilityRepairActive ? "Compatibility repair is already running." : actionTooltipWithApi("rebuild-compatibility-cohort", apiStatus)} onclick=${() => requestCompatibilityRepair(false)}>${compatibilityRepairActive ? "Repair running" : "Repair candidate compatibility"}</button>` : ""}
       </li>
       <li class=${preflightCanPublish ? "done" : hasCompatibilityBlocker ? "waiting" : "current"}>
         <i aria-hidden="true"></i><div><strong>Verify the complete candidate set</strong><span>${preflightCanPublish ? `Current ${publicationPreflight.reportSource || "admin"} preflight passed.` : hasCompatibilityBlocker ? "Available after compatibility repair finishes." : "Run a fresh preflight against the current ready-index identities."}</span></div>
@@ -3593,10 +3659,15 @@ Array.isArray(currentManifest.merged) && currentManifest.merged.length > 0
   padding: 1rem 1.1rem;
   border-left: 5px solid #2e7d32;
 }
-.admin-command-health.attention { border-left-color: #c13c32; }
-.admin-command-health.decision { border-left-color: #b26a00; }
+.admin-command-health.running { border-left-color: #315b8a; background: color-mix(in srgb, #315b8a 5%, transparent); }
+.admin-command-health.queued,
+.admin-command-health.attention,
+.admin-command-health.blocked { border-left-color: #b26a00; }
+.admin-command-health.failed,
+.admin-command-health.critical { border-left-color: #c13c32; background: color-mix(in srgb, #c13c32 5%, transparent); }
 .admin-command-health strong { font-size: 1.05rem; }
-.admin-command-health > span:last-child { color: var(--theme-foreground-muted); font-size: 0.78rem; }
+.admin-command-health > span:not(.admin-command-kicker) { color: var(--theme-foreground-muted); font-size: 0.78rem; line-height: 1.42; }
+.admin-command-health > small { margin-top: 0.28rem; color: var(--theme-foreground); font-size: 0.7rem; line-height: 1.42; }
 .admin-command-kicker {
   color: var(--theme-foreground-muted);
   font-size: 0.64rem;
@@ -3624,6 +3695,7 @@ Array.isArray(currentManifest.merged) && currentManifest.merged.length > 0
 .admin-command-facts dd { margin: 0.3rem 0 0; overflow-wrap: anywhere; font-size: 0.78rem; font-weight: 650; }
 .admin-command-facts dd.ok { color: #2e7d32; }
 .admin-command-facts dd.bad { color: #c62828; }
+.admin-command-facts dd.active { color: #315b8a; }
 .admin-command-session { display: grid; align-content: center; gap: 0.2rem; padding: 0.9rem 1rem; font-size: 0.75rem; }
 .admin-command-actions {
   grid-column: 1 / -1;
@@ -3681,6 +3753,21 @@ Array.isArray(currentManifest.merged) && currentManifest.merged.length > 0
 .admin-empty-decision strong { font-size: 0.82rem; }
 .admin-idle-explanation span,
 .admin-empty-decision span { max-width: 62ch; color: var(--theme-foreground-muted); font-size: 0.74rem; line-height: 1.5; }
+.admin-idle-explanation small { color: var(--theme-foreground-muted); font-size: 0.7rem; }
+.admin-current-incident {
+  display: grid;
+  gap: 0.32rem;
+  margin-bottom: 0.9rem;
+  padding: 0.85rem 0.9rem;
+  border-left: 4px solid #c13c32;
+  background: color-mix(in srgb, #c13c32 6%, transparent);
+}
+.admin-current-incident > strong { font-size: 0.9rem; }
+.admin-current-incident > span,
+.admin-current-incident > small { max-width: 62ch; color: var(--theme-foreground-muted); font-size: 0.73rem; line-height: 1.5; }
+.admin-current-incident > small b { color: var(--theme-foreground); }
+.admin-current-incident > div { display: flex; flex-wrap: wrap; gap: 0.4rem; margin-top: 0.3rem; }
+.admin-current-incident.attention { border-left-color: #b26a00; background: color-mix(in srgb, #b26a00 6%, transparent); }
 .admin-now-list { display: grid; margin-bottom: 0.8rem; border-top: 1px solid var(--theme-foreground-faintest); }
 .admin-now-list button {
   appearance: none;
@@ -4024,6 +4111,10 @@ Array.isArray(currentManifest.merged) && currentManifest.merged.length > 0
 .admin-run-facts span { color: var(--theme-foreground-muted); font-size: 0.62rem; font-weight: 700; }
 .admin-run-facts strong { font-size: 0.78rem; }
 .admin-run-facts small { color: var(--theme-foreground-muted); font-size: 0.65rem; }
+.admin-cohort-progress { display: grid; grid-template-columns: auto minmax(12rem, 1fr); gap: 0.18rem 0.75rem; padding: 0.75rem 0.9rem; border-bottom: 1px solid var(--theme-foreground-faintest); border-left: 4px solid #315b8a; }
+.admin-cohort-progress strong { grid-row: 1 / span 2; align-self: center; color: #315b8a; font-size: 1rem; }
+.admin-cohort-progress span { font-size: 0.76rem; font-weight: 700; }
+.admin-cohort-progress small { color: var(--theme-foreground-muted); font-size: 0.68rem; }
 .admin-run-attempts { display: grid; gap: 0.2rem; padding: 0.85rem 1rem; border-bottom: 1px solid var(--theme-foreground-faintest); }
 .admin-run-attempts > strong { font-size: 0.8rem; }
 .admin-run-attempts > span { color: var(--theme-foreground-muted); font-size: 0.7rem; }

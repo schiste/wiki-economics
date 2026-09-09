@@ -175,18 +175,19 @@ async function runAdminBrowserWorkflow({distDir}) {
     const controlRoom = await evaluate(cdp, `({
       heading: document.querySelector('#admin-control-room')?.textContent,
       decisions: document.querySelector('#admin-decisions')?.textContent,
-      primaryAction: Array.from(document.querySelectorAll('.admin-command-actions button')).find(button => button.textContent.includes('Start or update a project'))?.textContent
+      primaryAction: document.querySelector('.admin-command-actions .primary')?.textContent
     })`);
-    assertContract(controlRoom.heading?.includes("Nothing is running") && controlRoom.heading.includes("Idle is normal"),
-      "the control room does not explain an idle scheduler", controlRoom);
+    assertContract(controlRoom.heading?.includes("Updates need one decision")
+      && controlRoom.heading.includes("Run the profile qualification before retrying these projects"),
+      "the control room does not surface the blocking decision and its next action", controlRoom);
     assertContract(controlRoom.decisions?.includes("German Wikipedia") && controlRoom.decisions.includes("ready for approval")
       && controlRoom.decisions.includes("Approve & schedule"),
       "the qualification decision is not visible from the control room", controlRoom);
     assertContract(controlRoom.decisions?.includes("One setup constraint affects 5 projects")
       && controlRoom.decisions.includes("not 5 separate data failures"),
       "the shared setup constraint still looks like separate project failures", controlRoom);
-    assertContract(controlRoom.primaryAction === "Start or update a project",
-      "the primary run launcher is not visible from the control room", controlRoom);
+    assertContract(controlRoom.primaryAction === "Review required decision",
+      "the control room primary action does not lead to the blocking decision", controlRoom);
 
     const promotionControl = await evaluate(cdp, `(() => {
       const button = Array.from(document.querySelectorAll('#admin-decisions button')).find(node => node.textContent.includes('Approve & schedule'));
@@ -239,8 +240,9 @@ async function runAdminBrowserWorkflow({distDir}) {
       && payload.lifecycleRevision === "a".repeat(64)),
     "the promotion request omitted an immutable qualification or lifecycle identity", apiPayloads);
 
-    await evaluate(cdp, "Array.from(document.querySelectorAll('.admin-command-actions button')).find(button => button.textContent.includes('Start or update a project')).click()");
+    await evaluate(cdp, "document.querySelector('[data-admin-view-tab=wikis]').click()");
     await waitFor(cdp, "document.querySelector('[data-admin-view-tab=wikis]').getAttribute('aria-selected') === 'true'");
+    await evaluate(cdp, "document.querySelector('.admin-wiki-combobox').focus()");
     await waitFor(cdp, "document.activeElement?.classList.contains('admin-wiki-combobox')");
     const launchNavigation = await evaluate(cdp, `({
       view: new URL(location.href).searchParams.get('view'),
@@ -249,7 +251,7 @@ async function runAdminBrowserWorkflow({distDir}) {
     })`);
     assertContract(launchNavigation.view === "wikis" && launchNavigation.focused
       && launchNavigation.startHeading.includes("Start work"),
-      "the primary action did not open and focus the guided run launcher", launchNavigation);
+      "the Projects view did not expose and focus the guided run launcher", launchNavigation);
 
     await evaluate(cdp, "document.querySelector('[data-admin-view-tab=overview]').click()");
     await evaluate(cdp, "document.querySelector('[data-admin-view-tab=overview]').focus()");

@@ -10,6 +10,8 @@ use serde_json::Value;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::error::Error;
+use std::fmt;
 use std::fs::{self, File};
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -215,6 +217,27 @@ struct LoggingSourceIdentity {
     upstream_md5: String,
     upstream_sha1: String,
     downloaded_sha1: String,
+}
+
+#[derive(Debug)]
+struct PatrolSourceIdentityChanged {
+    message: String,
+}
+
+impl fmt::Display for PatrolSourceIdentityChanged {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl Error for PatrolSourceIdentityChanged {}
+
+fn is_patrol_source_identity_changed(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<PatrolSourceIdentityChanged>()
+            .is_some()
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1816,20 +1839,23 @@ fn download_logging_source<T: PatrolTransport + ?Sized>(
         || source.expected_size != content_length
     {
         let _ = fs::remove_file(dest_path);
-        anyhow::bail!(
-            "patrol logging source length changed during download (inventory expected {}, transport expected {:?}, received {content_length})",
-            source.expected_size,
-            expected_length
-        );
+        return Err(PatrolSourceIdentityChanged {
+            message: format!(
+                "patrol logging source length changed during download (inventory expected {}, transport expected {:?}, received {content_length})",
+                source.expected_size, expected_length
+            ),
+        }
+        .into());
     }
     if downloaded_sha1 != source.sha1.to_ascii_lowercase() {
         let _ = fs::remove_file(dest_path);
-        anyhow::bail!(
-            "patrol logging source SHA-1 mismatch for {} (expected {}, received {})",
-            source.source_id,
-            source.sha1,
-            downloaded_sha1
-        );
+        return Err(PatrolSourceIdentityChanged {
+            message: format!(
+                "patrol logging source SHA-1 mismatch for {} (expected {}, received {})",
+                source.source_id, source.sha1, downloaded_sha1
+            ),
+        }
+        .into());
     }
 
     info!(wiki = wiki, path = %dest_path.display(), "downloaded patrol log dump");

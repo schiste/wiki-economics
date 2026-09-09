@@ -658,17 +658,30 @@ pub(super) fn fetch<T: PatrolTransport + ?Sized>(
         .parent()
         .context("patrol generation has no generations root")?;
     fs::create_dir_all(generations)?;
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_nanos();
-    let staging = generations.join(format!(".{snapshot}.{}.{}.tmp", std::process::id(), nonce));
-    fs::create_dir(&staging)?;
-    let result = build_generation(transport, wiki, snapshot, data_dir, &staging);
-    let generation = match result {
-        Ok(generation) => generation,
-        Err(error) => {
-            let _ = remove_directory_tree(&staging);
-            return Err(error);
+    let mut identity_refreshes = 0_u8;
+    let (generation, staging) = loop {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let staging = generations.join(format!(".{snapshot}.{}.{}.tmp", std::process::id(), nonce));
+        fs::create_dir(&staging)?;
+        match build_generation(transport, wiki, snapshot, data_dir, &staging) {
+            Ok(generation) => break (generation, staging),
+            Err(error) => {
+                let _ = remove_directory_tree(&staging);
+                if identity_refreshes == 0 && is_patrol_source_identity_changed(&error) {
+                    identity_refreshes += 1;
+                    warn!(
+                        wiki,
+                        snapshot,
+                        error = %error,
+                        "Wikimedia republished a patrol source; refreshing the authoritative inventory and retrying once"
+                    );
+                    plan::PatrolSourcePlan::refresh(transport, wiki, snapshot, data_dir)?;
+                    continue;
+                }
+                return Err(error);
+            }
         }
     };
     let publish_context = format!(
@@ -693,7 +706,10 @@ pub(super) fn preflight<T: PatrolTransport + ?Sized>(
         load(data_dir, wiki, snapshot)?;
         return Ok(());
     }
-    let source_plan = plan::PatrolSourcePlan::load_or_resolve(transport, wiki, snapshot, data_dir)?;
+    // A dump job can be regenerated after it first reports `done`. Until this
+    // generation commits, re-resolve its inventory so we do not spend a large
+    // download against an obsolete cached size/checksum identity.
+    let source_plan = plan::PatrolSourcePlan::refresh(transport, wiki, snapshot, data_dir)?;
     anyhow::ensure!(
         source_plan.coverage_through == snapshot,
         "patrol source coverage does not match history snapshot"

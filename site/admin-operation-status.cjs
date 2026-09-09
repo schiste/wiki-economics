@@ -89,6 +89,22 @@ function classifyError(message) {
       remediation: "No repair is required. The admin will recheck automatically; the next run resumes with patrol preparation.",
     };
   }
+  if (/patrol logging source (?:length changed during download|SHA-1 mismatch)/i.test(message)) {
+    return {
+      errorSummary: "Wikimedia republished a logging dump after its inventory was pinned. Downloaded bytes were rejected before they could become a candidate.",
+      retryable: true,
+      remediationCode: "patrol_source_republished",
+      remediation: "Retry the operation. The pipeline now refreshes Wikimedia's authoritative size and checksum and resumes from retained history metrics automatically.",
+    };
+  }
+  if (/compatibility cohort completed with failed members/i.test(message)) {
+    return {
+      errorSummary: "Compatibility repair completed partially. Successful candidates were retained, but one or more projects still need a retry.",
+      retryable: true,
+      remediationCode: "compatibility_cohort_partial",
+      remediation: "Retry compatibility repair. Already-ready candidates will be reused and only unfinished work will continue.",
+    };
+  }
   if (/editor identity is unavailable/i.test(message)) {
     return {
       errorSummary: "The ingested history contains editors without a usable ID or name. Retrying unchanged inputs will fail again; the input generation needs a compatible identity policy before metrics can be computed.",
@@ -257,6 +273,32 @@ function summarizeOperationLog(entry = {}, rawLog = "") {
   const persistentAvailableBytes = lastInteger(text, /"persistent_available_bytes":(\d+)/g)
     ?? entry.progress?.persistentAvailableBytes
     ?? null;
+  const cohortStarts = matches(
+    text,
+    /^==> (?:Rebuilding|Revalidating retained) compatibility candidate wiki=([^\s]+)[^\n]*?(?:cohort_index=(\d+) cohort_total=(\d+))?$/gm,
+  );
+  const lastCohortStart = cohortStarts.at(-1) || null;
+  const currentCohortWiki = lastCohortStart?.[1] || null;
+  const configuredCohort = Array.isArray(entry.compatibilityCohort) ? entry.compatibilityCohort : [];
+  const inferredCohortIndex = currentCohortWiki
+    ? configuredCohort.findIndex((item) => item?.wiki === currentCohortWiki) + 1
+    : 0;
+  const completedCohortWikis = unique([
+    ...(entry.cohortProgress?.completedWikis || []),
+    ...matches(text, /^==> Compatibility candidate ready wiki=([^\s]+)/gm).map((match) => match[1]),
+  ]);
+  const failedCohortWikis = unique([
+    ...(entry.cohortProgress?.failedWikis || []),
+    ...matches(text, /^==> Compatibility candidate failed wiki=([^\s]+)/gm).map((match) => match[1]),
+  ]);
+  const cohortTotal = Number.parseInt(lastCohortStart?.[3] || "", 10)
+    || configuredCohort.length
+    || entry.cohortProgress?.total
+    || null;
+  const cohortCurrentIndex = Number.parseInt(lastCohortStart?.[2] || "", 10)
+    || inferredCohortIndex
+    || entry.cohortProgress?.currentIndex
+    || null;
   const effectiveDownloadRate = sourceTransfer?.bytesPerSecond || downloadBytesPerSecond;
   const etaSeconds = plannedBytes && effectiveDownloadRate
     ? Math.max(0, Math.ceil((plannedBytes - completedBytes) / effectiveDownloadRate))
@@ -316,6 +358,14 @@ function summarizeOperationLog(entry = {}, rawLog = "") {
       preservesValidatedTransactions: entry.recoveryPolicy?.preserveValidatedTransactions ?? true,
       retryCount: Number(entry.retryCount || 0),
       maximumStaleRetries: Number(entry.recoveryPolicy?.maximumStaleRetries ?? 2),
+    } : null,
+    cohortProgress: cohortTotal ? {
+      total: cohortTotal,
+      currentIndex: cohortCurrentIndex,
+      currentWiki: currentCohortWiki || entry.cohortProgress?.currentWiki || null,
+      completedWikis: completedCohortWikis,
+      completed: completedCohortWikis.length,
+      failedWikis: failedCohortWikis,
     } : null,
     rawError,
     ...failure,

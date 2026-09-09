@@ -107,6 +107,22 @@ impl PatrolSourcePlan {
         Ok(resolved)
     }
 
+    /// Resolve the current completed Wikimedia inventory and atomically replace
+    /// the cached plan. This is safe only before a patrol generation commits;
+    /// committed generations retain their original authenticated source plan.
+    pub(super) fn refresh<T: PatrolTransport + ?Sized>(
+        transport: &T,
+        wiki: &str,
+        snapshot: &str,
+        data_dir: &Path,
+    ) -> Result<Self> {
+        validate_identity(wiki, snapshot)?;
+        let resolved = Self::resolve(transport, wiki, snapshot, data_dir)?;
+        atomic_json(&plan_path(data_dir, wiki, snapshot)?, &resolved)?;
+        clear_waiting_status(data_dir, wiki, snapshot)?;
+        Ok(resolved)
+    }
+
     fn resolve<T: PatrolTransport + ?Sized>(
         transport: &T,
         wiki: &str,
