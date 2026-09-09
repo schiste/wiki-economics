@@ -399,12 +399,20 @@ test("hosted mode serves the isolated admin release without exposing its assets"
   assert.equal(asset.statusCode, 200);
   assert.match(asset.text(), /isolated=true/);
   assert.equal(asset.getHeader("cache-control"), "public, max-age=3600");
+  const generatedRootAsset = await invoke(module, {url: "/_observablehq/client.js", headers: authenticated});
+  assert.equal(generatedRootAsset.statusCode, 200);
+  assert.match(generatedRootAsset.text(), /isolated=true/);
 
   const anonymousAsset = await invoke(module, {
     url: "/admin-assets/_observablehq/client.js",
     headers: {host},
   });
   assert.equal(anonymousAsset.statusCode, 404);
+  const anonymousRootAsset = await invoke(module, {
+    url: "/_observablehq/client.js",
+    headers: {host},
+  });
+  assert.equal(anonymousRootAsset.statusCode, 404);
 });
 
 test("hosted mode enforces same-origin checks on mutating admin API requests", async (t) => {

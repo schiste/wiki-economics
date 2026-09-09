@@ -76,6 +76,7 @@ const LEGACY_API_PREFIX = "/api";
 const PROXY_API_PREFIX = "/admin-api";
 const ADMIN_PAGE_PATH = "/admin";
 const ADMIN_ASSET_PREFIX = "/admin-assets";
+const ADMIN_ROOT_ASSET_PREFIXES = ["/_file/", "/_import/", "/_npm/", "/_observablehq/"];
 const ADMIN_LOGIN_PATH = "/admin/login";
 const ADMIN_LOGOUT_PATH = "/admin/logout";
 const ADMIN_OAUTH_START_PATH = "/admin/oauth/start";
@@ -1972,6 +1973,12 @@ async function handleRequest(req, res) {
     if (serveStaticAssetFrom(req, res, assetPath, ADMIN_DIST_DIR, url.pathname)) return;
     res.writeHead(404, {"Cache-Control": "no-store"});
     res.end("Not found");
+    return;
+  }
+
+  if ((req.method === "GET" || req.method === "HEAD") && session
+      && ADMIN_ROOT_ASSET_PREFIXES.some((prefix) => url.pathname.startsWith(prefix))
+      && serveStaticAssetFrom(req, res, url.pathname, ADMIN_DIST_DIR, url.pathname)) {
     return;
   }
 

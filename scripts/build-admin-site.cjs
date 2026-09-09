@@ -11,6 +11,7 @@ const ADMIN_SOURCE_FILES = [
   "style.css",
   "components/admin-console.js",
 ];
+const ADMIN_ASSET_ROOTS = ["_file", "_import", "_npm", "_observablehq"];
 
 function sha256File(file) {
   return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
@@ -62,6 +63,16 @@ function prepareAdminSource({siteDir, manifestPath, destinationDir, vendorCacheD
   return ADMIN_SOURCE_FILES;
 }
 
+function rebaseAdminAssetUrls(distDir) {
+  const absolute = path.join(distDir, "admin.html");
+  const original = fs.readFileSync(absolute, "utf8");
+  let rebased = original;
+  for (const root of ADMIN_ASSET_ROOTS) {
+    rebased = rebased.replaceAll(`/${root}/`, `/admin-assets/${root}/`);
+  }
+  if (rebased !== original) fs.writeFileSync(absolute, rebased);
+}
+
 function verifyAdminBuild(distDir) {
   const files = listFiles(distDir);
   if (!files.includes("admin.html")) throw new Error("standalone admin build is missing admin.html");
@@ -75,6 +86,19 @@ function verifyAdminBuild(distDir) {
     throw new Error("standalone admin build has no immutable manifest attachment");
   }
   if (!files.includes("style.css")) throw new Error("standalone admin build is missing its isolated stylesheet");
+  const unrebasedPattern = new RegExp(`(^|[^A-Za-z0-9_-])/_(?:${ADMIN_ASSET_ROOTS.map((root) => root.slice(1)).join("|")})/`, "m");
+  const assetPattern = new RegExp(`/admin-assets/(_(?:${ADMIN_ASSET_ROOTS.map((root) => root.slice(1)).join("|")})/[^\\s\"'\\x60)<]+)`, "g");
+  if (unrebasedPattern.test(html)) {
+    throw new Error("standalone admin build contains a public-root asset URL: admin.html");
+  }
+  for (const match of html.matchAll(assetPattern)) {
+    const relative = match[1].split(/[?#]/, 1)[0];
+    const target = path.resolve(distDir, relative);
+    if (!target.startsWith(`${path.resolve(distDir)}${path.sep}`)
+        || !fs.statSync(target, {throwIfNoEntry: false})?.isFile()) {
+      throw new Error(`standalone admin build references a missing isolated asset from admin.html: ${relative}`);
+    }
+  }
   return files;
 }
 
@@ -199,6 +223,7 @@ function buildAdminSite({root, siteDir, manifestPath, distDir, outputDir, runId,
     if (result.error) throw result.error;
     if (result.status !== 0) throw new Error(`standalone admin build failed\n${result.stdout || ""}${result.stderr || ""}`);
     copyRegularFile(path.join(siteDir, "src", "style.css"), path.join(buildDir, "style.css"));
+    rebaseAdminAssetUrls(buildDir);
     const files = verifyAdminBuild(buildDir);
     const receipt = {
       schema_version: 1,
@@ -271,5 +296,6 @@ module.exports = {
   parseArguments,
   prepareAdminSource,
   publishAdminBuild,
+  rebaseAdminAssetUrls,
   verifyAdminBuild,
 };
