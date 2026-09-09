@@ -1246,7 +1246,7 @@ display(html`<div id="admin-publication-workbench" class="admin-refresh-panel">
     <div class="admin-control-chip">
       <span class="admin-control-label">Infrastructure</span>
       <strong style=${"color:" + (operationalTruth.infrastructure?.status === "available" ? "#2e7d32" : operationalTruth.infrastructure?.status === "constrained" ? "#b26a00" : "#c62828")}>${operationalTruth.infrastructure?.status || "unknown"}</strong>
-      <small>${operationalTruth.infrastructure?.namespaceMemoryLimitBytes ? `${formatRefreshBytes(operationalTruth.infrastructure.activeJobRequestedBytes + operationalTruth.infrastructure.residentServiceMemoryBytes)} / ${formatRefreshBytes(operationalTruth.infrastructure.namespaceMemoryLimitBytes)} requested` : "No capacity evidence"}</small>
+      <small>${operationalTruth.infrastructure?.namespaceMemoryLimitBytes ? `${formatRefreshBytes(operationalTruth.infrastructure.activeJobRequestedBytes + operationalTruth.infrastructure.residentServiceMemoryBytes)} / ${formatRefreshBytes(operationalTruth.infrastructure.namespaceMemoryLimitBytes)} memory · ${((operationalTruth.infrastructure.activeJobRequestedMillicores + operationalTruth.infrastructure.residentServiceCpuMillicores) / 1000).toFixed(2)} / ${(operationalTruth.infrastructure.namespaceCpuLimitMillicores / 1000).toFixed(2)} CPU requested` : "No capacity evidence"}</small>
     </div>
     <div class="admin-control-chip">
       <span class="admin-control-label">Last publication</span>

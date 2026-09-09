@@ -1,16 +1,32 @@
 {
   "schema_version": 1,
-  "namespace_memory_limit_bytes": 8589934592,
+  "namespace_memory_limit_bytes": 25769803776,
+  "namespace_cpu_limit_millicores": 16000,
+  "per_job_memory_limit_bytes": 6442450944,
+  "per_job_cpu_limit_millicores": 4000,
   "resident_service_memory_bytes": 536870912,
+  "resident_service_cpu_millicores": 1000,
   "minimum_schedulable_job_bytes": 2147483648,
+  "minimum_schedulable_job_millicores": 1000,
+  "worker_reserve_resource_classes": ["admin_dispatcher", "publisher"],
   "resource_requests": {
     "small": 2147483648,
     "medium_large": 6442450944,
     "isolated": 6442450944,
+    "controller": 1073741824,
     "admin_dispatcher": 536870912,
     "publisher": 6442450944,
     "scrubber": 2147483648
   },
-  "source": "Toolforge jobs quota and deployed job definitions",
-  "verified_at": "2026-09-06"
+  "resource_cpu_requests_millicores": {
+    "small": 1000,
+    "medium_large": 1000,
+    "isolated": 1000,
+    "controller": 1000,
+    "admin_dispatcher": 250,
+    "publisher": 1000,
+    "scrubber": 1000
+  },
+  "source": "Toolforge maintain-kubeusers T436614-1 and checked-in job definitions",
+  "verified_at": "2026-09-08"
 }

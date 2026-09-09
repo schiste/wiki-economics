@@ -78,6 +78,17 @@
   mem: 6Gi
   cpu: "1"
 
+- name: wiki-econ-fleet-medium-b
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: deploy/toolforge/run-fleet-worker.sh medium_large medium-2 --once
+  schedule: "10,40 * * * *"
+  filelog: true
+  mount: all
+  mem: 6Gi
+  # Keep production at the qualified one-thread profile until the now-unblocked
+  # 1/2/4-CPU matrix selects a faster deterministic profile.
+  cpu: "1"
+
 # Authenticated admin actions are written to an atomic NFS queue by the
 # webservice. This lightweight dispatcher validates and routes requests to the
 # existing fixed worker pool; it never downloads, computes, or publishes.

@@ -154,7 +154,7 @@ The scheduled jobs are:
 | --- | --- | --- |
 | `wiki-econ-fleet-controller` | atomic queue writes | Discover every scheduled lifecycle wiki |
 | `wiki-econ-fleet-small-a/b` | task lease + `<wiki>.lock` | Prepare small-class wiki candidates |
-| `wiki-econ-fleet-medium` | task lease + `<wiki>.lock` | Prepare medium/large-class wiki candidates |
+| `wiki-econ-fleet-medium` / `wiki-econ-fleet-medium-b` | task lease + `<wiki>.lock` | Prepare medium/large-class wiki candidates |
 | `wiki-econ-publish-ready` | `.publication.lock` | Select, merge, build, validate, switch, retire |
 
 The weekly controller schedule is a discovery trigger rather than an
@@ -191,9 +191,20 @@ roots.
 Qualification metrics live below `_qualifications`, not `_candidates`, and the
 final `qualification.json` explicitly records `publication_eligible=false`.
 The ready-candidate selector scans only `_candidates` for published
-scheduled/manual wikis. Promoting lifecycle configuration therefore cannot
-make an old qualification receipt publishable: a new production
-`prepare-wiki` run is mandatory after qualification policy is committed.
+scheduled/manual wikis. A lifecycle edit alone therefore cannot make a
+qualification publishable. The explicit `promote-qualification` operation
+authenticates one exact qualification receipt, copies its receipted artifacts
+into an immutable ready candidate, and only then commits the reviewed
+lifecycle transition.
+
+Promotion remains valid if the application is deployed between qualification
+and approval. In that case the ready index is composed from the immutable
+qualification receipt and per-artifact receipts instead of requiring the old
+stage metadata to equal the current binary's versions. Any change to the
+qualification receipt, its recorded artifact set, or the promoted artifacts
+still fails closed. The qualification evidence must therefore be preserved for
+as long as the promoted candidate depends on it; after publication, an exact
+receipt-authorized retention record can provide the equivalent fallback proof.
 
 The qualification wrapper disables the production capacity allowlist only
 inside its isolated root so an unmeasured profile can run and produce evidence.

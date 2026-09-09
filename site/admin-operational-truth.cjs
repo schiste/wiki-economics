@@ -365,8 +365,11 @@ function publicationOperations(outputDir, wikis, sourceIdentity = {}) {
   };
 }
 
-function requestedMemoryForWork(work, capacity) {
-  return capacity.resource_requests?.[work.resourceClass] || 0;
+function requestedCapacityForWork(work, capacity) {
+  return {
+    bytes: capacity.resource_requests?.[work.resourceClass] || 0,
+    millicores: capacity.resource_cpu_requests_millicores?.[work.resourceClass] || 0,
+  };
 }
 
 function infrastructureTruth({capacity, fleet, adminOperations, scheduledRefresh}) {
@@ -376,33 +379,62 @@ function infrastructureTruth({capacity, fleet, adminOperations, scheduledRefresh
     kind: "fleet",
     wiki: work.wiki,
     resourceClass: work.resourceClass,
-    bytes: requestedMemoryForWork(work, capacity),
+    ...requestedCapacityForWork(work, capacity),
   }));
   if ((adminOperations?.counts?.running || 0) > 0) {
-    activeRequests.push({kind: "admin_dispatcher", bytes: capacity.resource_requests.admin_dispatcher});
+    activeRequests.push({
+      kind: "admin_dispatcher",
+      bytes: capacity.resource_requests.admin_dispatcher,
+      millicores: capacity.resource_cpu_requests_millicores?.admin_dispatcher || 0,
+    });
   }
   if (["starting", "running"].includes(scheduledRefresh?.last?.state)) {
-    activeRequests.push({kind: "publisher", bytes: capacity.resource_requests.publisher});
+    activeRequests.push({
+      kind: "publisher",
+      bytes: capacity.resource_requests.publisher,
+      millicores: capacity.resource_cpu_requests_millicores?.publisher || 0,
+    });
   }
   const activeJobBytes = activeRequests.reduce((total, request) => total + Number(request.bytes || 0), 0);
+  const activeJobMillicores = activeRequests.reduce(
+    (total, request) => total + Number(request.millicores || 0), 0,
+  );
   const usedBytes = Number(capacity.resident_service_memory_bytes || 0) + activeJobBytes;
+  const usedMillicores = Number(capacity.resident_service_cpu_millicores || 0) + activeJobMillicores;
   const limitBytes = Number(capacity.namespace_memory_limit_bytes || 0);
+  const limitMillicores = Number(capacity.namespace_cpu_limit_millicores || 0);
   const availableBytes = Math.max(0, limitBytes - usedBytes);
+  const availableMillicores = Math.max(0, limitMillicores - usedMillicores);
   const minimumJobBytes = Number(capacity.minimum_schedulable_job_bytes || 0);
-  const constrained = activeRequests.length > 0 && availableBytes < minimumJobBytes;
+  const minimumJobMillicores = Number(capacity.minimum_schedulable_job_millicores || 0);
+  const memoryConstrained = availableBytes < minimumJobBytes;
+  const cpuConstrained = availableMillicores < minimumJobMillicores;
+  const constrained = activeRequests.length > 0 && (memoryConstrained || cpuConstrained);
   const gib = (bytes) => `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
+  const cpu = (millicores) => `${(millicores / 1000).toFixed(2)} CPU`;
+  const constrainedResources = [
+    ...(memoryConstrained ? ["memory"] : []),
+    ...(cpuConstrained ? ["CPU"] : []),
+  ].join(" and ");
   const issues = constrained ? [{
-    code: "toolforge_memory_quota_contention",
+    code: "toolforge_resource_quota_contention",
     severity: "warning",
-    message: `Active workloads leave ${gib(availableBytes)} of the ${gib(limitBytes)} namespace memory quota, below the ${gib(minimumJobBytes)} minimum data-job request; other workers or publication must wait.`,
+    message: `Active workloads leave ${gib(availableBytes)} and ${cpu(availableMillicores)} available; ${constrainedResources} is below the minimum data-job request, so other workers or publication must wait.`,
   }] : [];
   return {
     status: constrained ? "constrained" : "available",
     namespaceMemoryLimitBytes: limitBytes,
+    namespaceCpuLimitMillicores: limitMillicores,
+    perJobMemoryLimitBytes: capacity.per_job_memory_limit_bytes,
+    perJobCpuLimitMillicores: capacity.per_job_cpu_limit_millicores,
     residentServiceMemoryBytes: capacity.resident_service_memory_bytes,
+    residentServiceCpuMillicores: capacity.resident_service_cpu_millicores,
     activeJobRequestedBytes: activeJobBytes,
+    activeJobRequestedMillicores: activeJobMillicores,
     availableRequestedBytes: availableBytes,
+    availableRequestedMillicores: availableMillicores,
     minimumSchedulableJobBytes: minimumJobBytes,
+    minimumSchedulableJobMillicores: minimumJobMillicores,
     activeRequests,
     issues,
     source: capacity.source || null,

@@ -3,9 +3,9 @@
 # overlapping cells would invalidate CPU and NFS throughput measurements.
 # These jobs reuse active immutable generations and delete isolated output and
 # scratch on exit. Only their compact capacity receipts are retained.
-# The 4-CPU cells require a per-job CPU limit of at least 4. Toolforge reported
-# a 3-CPU per-job limit for this tool on 2026-08-26; request the increase before
-# attempting to load those definitions.
+# The 4-CPU cells are enabled by the T436614-1 per-job CPU increase verified on
+# 2026-09-08. They remain qualification-only: production thread counts change
+# only after the complete matrix passes its deterministic and capacity gates.
 
 - name: wiki-econ-cpu-nl-c1-t1-w1
   image: tool-wiki-economics/tool-wiki-economics:latest

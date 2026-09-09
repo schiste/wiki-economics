@@ -52,10 +52,69 @@ function withGuard(root, action) {
 function validatedConfig(file) {
   const config = readJson(file);
   if (config?.schema_version !== 1) throw new Error(`Invalid capacity configuration ${file}`);
-  for (const field of ["namespace_memory_limit_bytes", "resident_service_memory_bytes"]) {
+  for (const field of [
+    "namespace_memory_limit_bytes",
+    "namespace_cpu_limit_millicores",
+    "per_job_memory_limit_bytes",
+    "per_job_cpu_limit_millicores",
+    "resident_service_memory_bytes",
+    "resident_service_cpu_millicores",
+    "minimum_schedulable_job_bytes",
+    "minimum_schedulable_job_millicores",
+  ]) {
     if (!Number.isSafeInteger(config[field]) || config[field] < 0) throw new Error(`Invalid capacity field ${field}`);
   }
+  if (!Array.isArray(config.worker_reserve_resource_classes)) {
+    throw new Error("Invalid capacity field worker_reserve_resource_classes");
+  }
+  const memoryClasses = Object.keys(config.resource_requests || {}).sort();
+  const cpuClasses = Object.keys(config.resource_cpu_requests_millicores || {}).sort();
+  if (JSON.stringify(memoryClasses) !== JSON.stringify(cpuClasses)) {
+    throw new Error("Memory and CPU resource request classes must match");
+  }
+  for (const resourceClass of memoryClasses) requestFor(config, resourceClass);
+  if (new Set(config.worker_reserve_resource_classes).size !== config.worker_reserve_resource_classes.length) {
+    throw new Error("Capacity field worker_reserve_resource_classes contains duplicates");
+  }
+  for (const resourceClass of config.worker_reserve_resource_classes) {
+    for (const [field, requests] of [
+      ["resource_requests", config.resource_requests],
+      ["resource_cpu_requests_millicores", config.resource_cpu_requests_millicores],
+    ]) {
+      if (!Number.isSafeInteger(requests?.[resourceClass]) || requests[resourceClass] <= 0) {
+        throw new Error(`No ${field} capacity request is configured for reserved class ${resourceClass}`);
+      }
+    }
+  }
   return config;
+}
+
+function requestFor(config, resourceClass) {
+  const requestedBytes = config.resource_requests?.[resourceClass];
+  const requestedMillicores = config.resource_cpu_requests_millicores?.[resourceClass];
+  if (!Number.isSafeInteger(requestedBytes) || requestedBytes <= 0) {
+    throw new Error(`No capacity request is configured for ${resourceClass}`);
+  }
+  if (!Number.isSafeInteger(requestedMillicores) || requestedMillicores <= 0) {
+    throw new Error(`No CPU capacity request is configured for ${resourceClass}`);
+  }
+  if (requestedBytes > config.per_job_memory_limit_bytes) {
+    throw new Error(`Memory request for ${resourceClass} exceeds the Toolforge per-job limit`);
+  }
+  if (requestedMillicores > config.per_job_cpu_limit_millicores) {
+    throw new Error(`CPU request for ${resourceClass} exceeds the Toolforge per-job limit`);
+  }
+  return {requestedBytes, requestedMillicores};
+}
+
+function reservedCapacity(config) {
+  return config.worker_reserve_resource_classes.reduce((total, resourceClass) => {
+    const request = requestFor(config, resourceClass);
+    return {
+      bytes: total.bytes + request.requestedBytes,
+      millicores: total.millicores + request.requestedMillicores,
+    };
+  }, {bytes: 0, millicores: 0});
 }
 
 function activeLeases(root, now = Date.now()) {
@@ -76,24 +135,54 @@ function activeLeases(root, now = Date.now()) {
 
 function acquire({root, configFile, resourceClass, identity, now = Date.now()}) {
   const config = validatedConfig(configFile);
-  const requestedBytes = config.resource_requests?.[resourceClass];
-  if (!Number.isSafeInteger(requestedBytes) || requestedBytes <= 0) {
-    throw new Error(`No capacity request is configured for ${resourceClass}`);
-  }
+  const {requestedBytes, requestedMillicores} = requestFor(config, resourceClass);
   return withGuard(root, () => {
     const leases = activeLeases(root, now);
+    const reserved = reservedCapacity(config);
     const workerBudgetBytes = config.namespace_memory_limit_bytes
       - config.resident_service_memory_bytes
-      - config.resource_requests.admin_dispatcher;
-    const admittedBytes = leases.reduce((total, lease) => total + lease.requestedBytes, 0);
-    if (workerBudgetBytes < 0 || admittedBytes + requestedBytes > workerBudgetBytes) {
-      return {admitted: false, requestedBytes, admittedBytes, workerBudgetBytes, active: leases.length};
+      - reserved.bytes;
+    const workerBudgetMillicores = config.namespace_cpu_limit_millicores
+      - config.resident_service_cpu_millicores
+      - reserved.millicores;
+    const admittedBytes = leases.reduce((total, lease) => {
+      if (!Number.isSafeInteger(lease.requestedBytes) || lease.requestedBytes <= 0) {
+        throw new Error(`Active capacity lease ${lease.identity || lease.file} has an invalid memory request`);
+      }
+      return total + lease.requestedBytes;
+    }, 0);
+    const admittedMillicores = leases.reduce((total, lease) => {
+      const fallback = config.resource_cpu_requests_millicores?.[lease.resourceClass] || 0;
+      const requested = Number.isSafeInteger(lease.requestedMillicores) ? lease.requestedMillicores : fallback;
+      if (requested <= 0) {
+        throw new Error(`Active capacity lease ${lease.identity || lease.file} has an invalid CPU request`);
+      }
+      return total + requested;
+    }, 0);
+    const limitingResources = [];
+    if (workerBudgetBytes < 0 || admittedBytes + requestedBytes > workerBudgetBytes) limitingResources.push("memory");
+    if (workerBudgetMillicores < 0 || admittedMillicores + requestedMillicores > workerBudgetMillicores) {
+      limitingResources.push("cpu");
+    }
+    if (limitingResources.length > 0) {
+      return {
+        admitted: false,
+        requestedBytes,
+        requestedMillicores,
+        admittedBytes,
+        admittedMillicores,
+        workerBudgetBytes,
+        workerBudgetMillicores,
+        limitingResources,
+        active: leases.length,
+      };
     }
     const lease = {
       schemaVersion: 1,
       identity,
       resourceClass,
       requestedBytes,
+      requestedMillicores,
       acquiredAt: new Date(now).toISOString(),
       heartbeatAt: new Date(now).toISOString(),
       pid: process.pid,
@@ -101,7 +190,19 @@ function acquire({root, configFile, resourceClass, identity, now = Date.now()}) 
     };
     const file = path.join(root, `${identity}.json`);
     atomicWriteJson(file, lease);
-    return {admitted: true, requestedBytes, admittedBytes, workerBudgetBytes, active: leases.length, file, lease};
+    return {
+      admitted: true,
+      requestedBytes,
+      requestedMillicores,
+      admittedBytes,
+      admittedMillicores,
+      workerBudgetBytes,
+      workerBudgetMillicores,
+      limitingResources,
+      active: leases.length,
+      file,
+      lease,
+    };
   });
 }
 
@@ -158,4 +259,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = {acquire, activeLeases, validatedConfig};
+module.exports = {acquire, activeLeases, requestFor, reservedCapacity, validatedConfig};

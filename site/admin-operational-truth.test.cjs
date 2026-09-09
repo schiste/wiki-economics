@@ -33,13 +33,24 @@ function fixture(t) {
   writeJson(path.join(root, "config", "toolforge-capacity.json"), {
     schema_version: 1,
     namespace_memory_limit_bytes: 8 * 1024 ** 3,
+    namespace_cpu_limit_millicores: 4_000,
+    per_job_memory_limit_bytes: 6 * 1024 ** 3,
+    per_job_cpu_limit_millicores: 4_000,
     resident_service_memory_bytes: 512 * 1024 ** 2,
+    resident_service_cpu_millicores: 1_000,
     minimum_schedulable_job_bytes: 2 * 1024 ** 3,
+    minimum_schedulable_job_millicores: 1_000,
     resource_requests: {
       small: 2 * 1024 ** 3,
       medium_large: 6 * 1024 ** 3,
       admin_dispatcher: 6 * 1024 ** 3,
       publisher: 6 * 1024 ** 3,
+    },
+    resource_cpu_requests_millicores: {
+      small: 1_000,
+      medium_large: 1_000,
+      admin_dispatcher: 250,
+      publisher: 1_000,
     },
     source: "test",
     verified_at: "2026-09-06",
@@ -153,6 +164,7 @@ test("operational truth separates a healthy publication from a failed newer cand
   assert.match(result.pipeline.issues[0].message, /profile Large/);
   assert.equal(result.infrastructure.status, "constrained");
   assert.equal(result.infrastructure.availableRequestedBytes, 1536 * 1024 ** 2);
+  assert.equal(result.infrastructure.availableRequestedMillicores, 2_000);
   assert.deepEqual(result.wikis.nlwiki.snapshots, {
     latestAvailable: "2026-08",
     candidate: "2026-08",

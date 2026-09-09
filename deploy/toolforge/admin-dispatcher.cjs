@@ -74,6 +74,19 @@ function atomicWriteJson(file, value) {
   }
 }
 
+function terminalOperationSummary(entry, rawLog, exitCode) {
+  const summary = summarizeOperationLog(entry, rawLog);
+  if (exitCode !== 0) return summary;
+  return {
+    ...summary,
+    rawError: null,
+    errorSummary: null,
+    retryable: null,
+    remediationCode: null,
+    remediation: null,
+  };
+}
+
 function commandFor(request) {
   const common = ["--data-dir", DATA_DIR, "--output-dir", OUTPUT_DIR, "--run-id", request.runId];
   const wiki = request.wiki;
@@ -474,7 +487,7 @@ async function executeClaim(claim) {
       fs.appendFileSync(logPath, `\n[immutable operator audit failed: ${error.message}]\n`, "utf8");
     }
   }
-  const operationSummary = summarizeOperationLog(state, logTail(logPath));
+  const operationSummary = terminalOperationSummary(state, logTail(logPath), effectiveCode);
   const waitingUpstream = effectiveCode === 75
     || operationSummary.remediationCode === "upstream_logging_waiting";
   const completed = {
@@ -553,6 +566,7 @@ module.exports = {
   dispatchQueuedOperations,
   executeClaim,
   recoverStaleOperations,
+  terminalOperationSummary,
   run,
   runWorker,
   validateRequest,

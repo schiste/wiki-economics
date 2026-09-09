@@ -9,6 +9,20 @@ const {test} = require("node:test");
 
 const script = path.join(__dirname, "load-scheduled-jobs.sh");
 
+function jobResources(manifest, name) {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const block = manifest.match(new RegExp(`(?:^|\\n)- name: ${escaped}\\n(?<body>[\\s\\S]*?)(?=\\n- name:|$)`));
+  assert.ok(block, `missing job ${name}`);
+  const memory = block.groups.body.match(/^  mem: (\d+)(Gi|Mi)$/m);
+  const cpu = block.groups.body.match(/^  cpu: "([0-9.]+)"$/m);
+  assert.ok(memory, `missing memory request for ${name}`);
+  assert.ok(cpu, `missing CPU request for ${name}`);
+  return {
+    bytes: Number(memory[1]) * (memory[2] === "Gi" ? 1024 ** 3 : 1024 ** 2),
+    millicores: Number(cpu[1]) * 1000,
+  };
+}
+
 test("fleet capacity uses a fixed controller and worker pool", () => {
   const manifest = fs.readFileSync(path.join(__dirname, "jobs.yaml"), "utf8");
   const fleetJobs = [...manifest.matchAll(/^- name: (wiki-econ-fleet-[a-z-]+)$/gm)]
@@ -18,6 +32,7 @@ test("fleet capacity uses a fixed controller and worker pool", () => {
     "wiki-econ-fleet-small-a",
     "wiki-econ-fleet-small-b",
     "wiki-econ-fleet-medium",
+    "wiki-econ-fleet-medium-b",
   ]);
   assert.doesNotMatch(manifest, /^- name: wiki-econ-prepare-/m);
   assert.match(
@@ -57,6 +72,7 @@ esac
       `jobs load --job wiki-econ-fleet-small-a ${manifest}`,
       `jobs load --job wiki-econ-fleet-small-b ${manifest}`,
       `jobs load --job wiki-econ-fleet-medium ${manifest}`,
+      `jobs load --job wiki-econ-fleet-medium-b ${manifest}`,
       `jobs load --job wiki-econ-admin-dispatcher ${manifest}`,
       `jobs load --job wiki-econ-publish-ready ${manifest}`,
       `jobs load --job wiki-econ-artifact-scrub ${manifest}`,
@@ -71,6 +87,32 @@ esac
     }
   } finally {
     fs.rmSync(fixture, {recursive: true, force: true});
+  }
+});
+
+test("scheduled job resources match the capacity admission source of truth", () => {
+  const manifest = fs.readFileSync(path.join(__dirname, "jobs.yaml"), "utf8");
+  const capacity = JSON.parse(fs.readFileSync(path.join(__dirname, "../../config/toolforge-capacity.json"), "utf8"));
+  const classes = {
+    "wiki-econ-fleet-controller": "controller",
+    "wiki-econ-fleet-small-a": "small",
+    "wiki-econ-fleet-small-b": "small",
+    "wiki-econ-fleet-medium": "medium_large",
+    "wiki-econ-fleet-medium-b": "medium_large",
+    "wiki-econ-admin-dispatcher": "admin_dispatcher",
+    "wiki-econ-publish-ready": "publisher",
+    "wiki-econ-artifact-scrub": "scrubber",
+  };
+  for (const [name, resourceClass] of Object.entries(classes)) {
+    const request = jobResources(manifest, name);
+    assert.equal(request.bytes, capacity.resource_requests[resourceClass], `${name} memory drift`);
+    assert.equal(
+      request.millicores,
+      capacity.resource_cpu_requests_millicores[resourceClass],
+      `${name} CPU drift`,
+    );
+    assert.ok(request.bytes <= capacity.per_job_memory_limit_bytes);
+    assert.ok(request.millicores <= capacity.per_job_cpu_limit_millicores);
   }
 });
 

@@ -2,7 +2,7 @@
 
 The production scheduler has a fixed Toolforge footprint even when the managed
 language set grows. One Rust controller discovers work, two small workers and
-one medium/large worker claim it from shared NFS, and the existing publisher
+two medium/large workers claim it from shared NFS, and the existing publisher
 remains the only process allowed to switch public data.
 
 ## Control plane
@@ -39,16 +39,19 @@ are stored under `data/workload-observations/` and seed the next immutable
 snapshot profile.
 
 - `small` runs in the two fixed 2 GiB workers.
-- `medium_large` runs in the fixed 6 GiB worker.
+- `medium_large` runs in either of the two fixed 6 GiB workers.
 - `isolated` has no production worker. Monthly source layouts always select it
   and cannot be overridden into another class.
 
-The NFS-safe capacity admission layer reserves the 512 MiB web service and
-512 MiB dispatcher from the 8 GiB namespace budget. It admits either one 6 GiB
-medium worker or multiple 2 GiB small workers, but not an unsafe combination.
-Kubernetes quota remains the outer enforcement boundary; rejected work stays
-durably queued. Enwiki remains `isolated` until a separate capacity report
-qualifies it.
+The NFS-safe capacity admission layer accounts for both dimensions of the
+16-CPU/24-GiB namespace quota and enforces the 4-CPU cap and unchanged 6-GiB
+per-job memory ceiling. It reserves the 512 MiB web service, 512 MiB
+dispatcher, and 6 GiB publisher before admitting fleet work. The resulting
+17 GiB worker-memory budget safely admits the full two-medium/two-small pool
+(16 GiB) while keeping
+publication schedulable. Kubernetes quota remains the outer enforcement
+boundary; rejected work stays durably queued. Enwiki remains `isolated` until
+a separate capacity report qualifies it.
 
 Authenticated admin work uses the same fixed workers. Recovery and lifecycle
 operations sort ahead of bulk preparation and raw diagnostic transfers. A

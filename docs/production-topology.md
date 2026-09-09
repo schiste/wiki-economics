@@ -69,8 +69,9 @@ mount:
   entries (afwiki, arwiki, arzwiki, elwiki, eswiki, frwiki, hawiki, itwiki,
   jawiki, nlwiki, ptwiki, svwiki, swwiki, viwiki, yowiki, and zhwiki) and
   writes atomic tasks.
-  `wiki-econ-fleet-small-a`, `wiki-econ-fleet-small-b`, and
-  `wiki-econ-fleet-medium` are a fixed worker pool. Each claimed task owns only
+  `wiki-econ-fleet-small-a`, `wiki-econ-fleet-small-b`,
+  `wiki-econ-fleet-medium`, and `wiki-econ-fleet-medium-b` are a fixed worker
+  pool. Each claimed task owns only
   its wiki's candidate-generation paths; leases, heartbeats, bounded retries,
   and quarantine keep failures independent. There is deliberately no isolated
   production worker.
@@ -188,9 +189,10 @@ For a fresh Toolforge tool account:
    `WIKI_ECON_OUTPUT_DIR`, and `WIKI_ECON_SITE_DIST_DIR` values shown in the
    [Toolforge runbook](../deploy/toolforge/README.md#operator-prerequisites).
 4. Start the Build Service webservice from `Procfile`, run the allowlisted
-   `deploy/toolforge/load-scheduled-jobs.sh`, and confirm the six preparation
-   Jobs and publisher Job are waiting for their schedules, the legacy one-off
-   Jobs are absent, and the webservice is healthy.
+   `deploy/toolforge/load-scheduled-jobs.sh`, and confirm the controller, four
+   preparation workers, dispatcher, publisher, and scrubber are waiting for
+   their schedules, the legacy one-off Jobs are absent, and the webservice is
+   healthy.
 5. Run one preparation Job manually and then invoke
    `deploy/toolforge/run-publish-ready.sh`; validate the per-wiki run record,
    publication receipt, current site symlink, and public freshness endpoint

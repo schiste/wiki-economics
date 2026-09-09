@@ -2179,7 +2179,24 @@ fn resilient_ready_candidate_reference(
     match ready_candidate_reference(data_dir, output_dir, candidate_dir, ready) {
         Ok(reference) => Ok(reference),
         Err(error) => {
-            ensure_artifact_fallback_authorized(data_dir, candidate_dir, ready)?;
+            if ready.promoted_from_qualification.is_some()
+                && let Err(qualification_error) = ensure_qualification_fallback_authorized(
+                    data_dir,
+                    output_dir,
+                    candidate_dir,
+                    ready,
+                )
+            {
+                ensure_artifact_fallback_authorized(data_dir, candidate_dir, ready).with_context(
+                    || {
+                        format!(
+                            "qualification-backed candidate authentication failed: {qualification_error:#}"
+                        )
+                    },
+                )?;
+            } else if ready.promoted_from_qualification.is_none() {
+                ensure_artifact_fallback_authorized(data_dir, candidate_dir, ready)?;
+            }
             warn!(
                 wiki = ready.wiki,
                 snapshot = ready.snapshot,
@@ -2190,6 +2207,56 @@ fn resilient_ready_candidate_reference(
             artifact_backed_ready_candidate_reference(output_dir, candidate_dir, ready)
         }
     }
+}
+
+fn ensure_qualification_fallback_authorized(
+    data_dir: &Path,
+    output_dir: &Path,
+    candidate_dir: &Path,
+    ready: &ReadyWikiCandidate,
+) -> Result<()> {
+    let promotion = ready
+        .promoted_from_qualification
+        .as_ref()
+        .context("ready candidate has no qualification promotion identity")?;
+    ensure!(
+        promotion.snapshot == ready.snapshot,
+        "qualification promotion snapshot does not match ready candidate"
+    );
+    let qualification_dir = wiki_qualification_dir(
+        output_dir,
+        &ready.wiki,
+        &promotion.snapshot,
+        &promotion.run_id,
+    )?;
+    let qualification_path = qualification_dir.join("qualification.json");
+    let (_, observed_receipt_sha256) = storage::sha256_file(&qualification_path)?;
+    ensure!(
+        observed_receipt_sha256 == promotion.receipt_sha256,
+        "qualification promotion receipt identity changed"
+    );
+    let qualification: QualificationReceipt = read_json(&qualification_path)?;
+    validate_qualification_receipt(
+        data_dir,
+        &qualification_dir,
+        &qualification,
+        &ready.wiki,
+        &ready.snapshot,
+        &promotion.run_id,
+    )?;
+    ensure!(
+        ready.generating_commit == qualification.generating_commit
+            && ready.cutoff_date == qualification.cutoff_date
+            && ready.workload_profile.as_ref() == Some(&qualification.workload_profile)
+            && ready.editor_identity_coverage == qualification.editor_identity_coverage
+            && ready.quality_signals == qualification.quality_signals
+            && ready.artifacts == qualification.artifacts,
+        "ready candidate does not match its authenticated qualification"
+    );
+    for artifact in &ready.artifacts {
+        validate_prepared_artifact(candidate_dir, artifact)?;
+    }
+    Ok(())
 }
 
 fn publication_family_for_metric(metric: &str) -> Result<&'static str> {
@@ -9329,6 +9396,103 @@ mod tests {
             GState::Retired
         );
         assert!(!ready_index_path(fixture.output.path(), "nlwiki").is_file());
+    }
+
+    #[test]
+    fn qualification_promotion_survives_release_metadata_changes() {
+        let fixture = Fixture::new().expect("promotion fixture should initialize");
+        let qualification_run_id = "qualification-prior-release";
+        prepare_hidden_qualification_fixture(&fixture, qualification_run_id);
+        let qualification_path = mark_wiki_qualification_ready(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "nlwiki",
+            "2026-03",
+            qualification_run_id,
+        )
+        .expect("qualification should become ready");
+        let qualification_dir = qualification_path
+            .parent()
+            .expect("qualification receipt should have a parent");
+        let stage_receipt_path = qualification_dir
+            .join("_stages")
+            .join("compute")
+            .join("monthly")
+            .join("nlwiki.json");
+        let mut stage_receipt: Value =
+            read_json(&stage_receipt_path).expect("stage receipt should parse");
+        stage_receipt["computation_version"] = json!("prior-release");
+        atomic_json(&stage_receipt_path, &stage_receipt)
+            .expect("prior release metadata should persist");
+
+        let ready_path = promote_wiki_qualification(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "nlwiki",
+            "2026-03",
+            qualification_run_id,
+            "promotion-after-release",
+        )
+        .expect("prior-release qualification should promote");
+        assert!(ready_path.is_file());
+        let index: ReadyCandidateIndex =
+            read_json(&ready_index_path(fixture.output.path(), "nlwiki"))
+                .expect("promoted qualification should be indexed");
+        assert_eq!(index.newest_valid_ready.run_id, "promotion-after-release");
+
+        let ready: ReadyWikiCandidate = read_json(&ready_path).expect("ready receipt should parse");
+        let mut unsafe_promotion = ready.clone();
+        unsafe_promotion
+            .promoted_from_qualification
+            .as_mut()
+            .expect("promotion identity should exist")
+            .run_id = "../unsafe".to_string();
+        ensure_qualification_fallback_authorized(
+            fixture.data.path(),
+            fixture.output.path(),
+            ready_path
+                .parent()
+                .expect("ready candidate should have a root"),
+            &unsafe_promotion,
+        )
+        .expect_err("unsafe qualification identity must fail closed");
+
+        let mut invalid_qualification: Value =
+            read_json(&qualification_path).expect("qualification receipt should parse");
+        invalid_qualification["publication_eligible"] = json!(true);
+        atomic_json(&qualification_path, &invalid_qualification)
+            .expect("invalid qualification fixture should persist");
+        let (_, invalid_qualification_sha256) =
+            storage::sha256_file(&qualification_path).expect("invalid qualification should hash");
+        let mut invalid_ready = ready;
+        invalid_ready
+            .promoted_from_qualification
+            .as_mut()
+            .expect("promotion identity should exist")
+            .receipt_sha256 = invalid_qualification_sha256;
+        ensure_qualification_fallback_authorized(
+            fixture.data.path(),
+            fixture.output.path(),
+            ready_path
+                .parent()
+                .expect("ready candidate should have a root"),
+            &invalid_ready,
+        )
+        .expect_err("structurally invalid qualification evidence must fail closed");
+
+        fs::remove_file(ready_index_path(fixture.output.path(), "nlwiki"))
+            .expect("ready index should be removable");
+        let error =
+            indexed_latest_ready_candidate(fixture.data.path(), fixture.output.path(), "nlwiki")
+                .expect_err(
+                    "tampered qualification evidence must invalidate its promoted candidate",
+                );
+        assert!(
+            format!("{error:#}").contains("qualification promotion receipt identity changed"),
+            "unexpected qualification authentication error: {error:#}"
+        );
     }
 
     #[test]

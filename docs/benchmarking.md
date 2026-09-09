@@ -149,12 +149,11 @@ on-demand definitions live in
 it, so wait for a terminal state before loading the next one; overlapping runs
 would contaminate both CPU and shared-NFS throughput evidence:
 
-As checked with `toolforge jobs quota` on 2026-08-26, wiki-economics currently
-has 16 aggregate CPUs but a 3-CPU per-job ceiling. The required 4-CPU cells
-must not be launched until that per-job limit is raised to at least 4. Until
-then, the six-cell scope can authorize at most the 2-CPU/2-thread profile. A
-3-CPU substitution is useful exploratory evidence but does not satisfy the
-complete matrix.
+T436614-1 raised the wiki-economics per-job ceiling from 3 to 4 CPUs on
+2026-09-08 while retaining the 16-CPU namespace quota. All twelve cells can
+therefore run. Production remains at one thread until the complete matrix
+selects a deterministic profile with at least 15% aggregate wall-time speedup
+and at least 25% memory headroom.
 
 ```sh
 toolforge jobs load --job wiki-econ-cpu-nl-c1-t1-w1 \

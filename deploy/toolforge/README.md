@@ -75,8 +75,8 @@ and higher resource envelope are being qualified.
   source releases. The active Rust binary, Node image, and site source may
   therefore come from different commits; each is verified independently and
   all three identities are recorded in refresh run provenance.
-- `jobs.yaml` — one Rust fleet controller, two fixed small-wiki workers, one
-  fixed medium/large worker, a 512 MiB admin routing dispatcher,
+- `jobs.yaml` — one Rust fleet controller, two fixed small-wiki workers, two
+  fixed medium/large workers, a 512 MiB admin routing dispatcher,
   and the short `wiki-econ-publish-ready` job, plus
   legacy on-demand recovery jobs. The controller represents the sixteen
   scheduled wikis declared by the lifecycle registry: afwiki, arwiki, arzwiki,
@@ -196,15 +196,16 @@ and higher resource envelope are being qualified.
   or malformed status raises a public freshness alert and blocks later
   publication until a successful scrub. This job does not deploy or republish
   data.
-  The one-CPU Toolforge job also defaults `RAYON_NUM_THREADS` and
+  Production Toolforge jobs still default `RAYON_NUM_THREADS` and
   `POLARS_MAX_THREADS` to `1`, because the container currently sees eight host
-  CPUs despite its one-CPU quota. Sequential raw/hash/ingest I/O uses Linux
+  CPUs regardless of its cgroup quota. Sequential raw/hash/ingest I/O uses Linux
   cache-discard hints after durable writes or completed reads so reproducible
   dump files do not consume the 6 GiB memory limit as retained page cache.
-  `WIKI_ECON_WEEKLY_WORKERS` likewise defaults to `1`. The separate
-  publication-invisible CPU matrix in `cpu-qualification-jobs.yaml` measures
-  1/2/4-CPU profiles for nlwiki, ptwiki, and frwiki before any production
-  default changes; see [benchmarking](../../docs/benchmarking.md#cpu-and-bounded-worker-qualification).
+  `WIKI_ECON_WEEKLY_WORKERS` likewise defaults to `1`. T436614-1 raised the
+  per-job ceiling from 3 to 4 CPUs, so the separate publication-invisible CPU
+  matrix in `cpu-qualification-jobs.yaml` can now measure all 1/2/4-CPU
+  profiles for nlwiki, ptwiki, and frwiki before any production default
+  changes; see [benchmarking](../../docs/benchmarking.md#cpu-and-bounded-worker-qualification).
 - `run-record.cjs` — the single atomic writer for live refresh status and the
   bounded terminal history. It folds Rust/site stage events together with
   cgroup, disk, deployment provenance, and publication-gate data.

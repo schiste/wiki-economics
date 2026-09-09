@@ -106,10 +106,15 @@ the public imported baseline until its replacement has passed qualification.
 Scheduled and manual entries are not eligible for the qualification command.
 
 Promotion is deliberately not automatic. After capacity, determinism,
-semantic, rollover, and browser evidence passes, change the wiki to
-`publication=published`, `refresh=manual`, add its production capacity policy,
-and run a new normal `prepare-wiki`. A qualification receipt cannot be
-selected or reused as a publication candidate.
+semantic, rollover, and browser evidence passes, submit
+`promote-qualification` for the exact snapshot, qualification run ID, and
+optimistic lifecycle revision. The operation authenticates and preserves that
+qualification, creates a ready candidate, then changes the wiki to
+`publication=published` with its reviewed refresh and capacity policy. A
+deploy between qualification and promotion does not require recomputation:
+the immutable qualification and artifact receipts remain the authority. A
+qualification is never selected directly, and any receipt or artifact change
+blocks promotion.
 
 `publication_contract.datasets` defines which published wikis each metric must
 contain and its conservative `minimum_rows_per_wiki`. A dataset may add a
