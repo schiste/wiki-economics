@@ -22,6 +22,14 @@ binary_identity=${WIKI_ECON_BINARY_SOURCE_COMMIT:-local}
 completion_dir="$WIKI_ECON_OUTPUT_DIR/_admin/compatibility-completions"
 mkdir -p "$completion_dir"
 
+report_compatibility_exit() {
+  local status=$?
+  if [ "$status" -ne 0 ]; then
+    echo "!!! COMPATIBILITY COHORT FAILED run_id=$base_run_id exit_code=$status failed_members=${failures[*]:-unknown} completion_dir=$completion_dir" >&2
+  fi
+}
+trap report_compatibility_exit EXIT
+
 run_candidate() {
   local candidate_wiki=$1
   local candidate_snapshot=$2
@@ -36,6 +44,15 @@ run_candidate() {
     --source-window-size 1 \
     "$@" \
     --lifecycle "$lifecycle"
+}
+
+run_candidate_logged() {
+  candidate_capture="$(mktemp "${TMPDIR:-/tmp}/wiki-econ-compat.XXXXXX")"
+  set +e
+  run_candidate "$@" 2>&1 | tee "$candidate_capture"
+  candidate_status=${PIPESTATUS[0]}
+  set -e
+  return "$candidate_status"
 }
 
 for item in "$@"; do
@@ -57,15 +74,29 @@ for item in "$@"; do
   candidate_succeeded=0
   exit_code=0
   if [ "$rebuild" -eq 0 ]; then
-    if run_candidate "$wiki" "$snapshot" "$run_id"; then
+    if run_candidate_logged "$wiki" "$snapshot" "$run_id"; then
       candidate_succeeded=1
     else
       exit_code=$?
+      if grep -qi "unchanged candidate is not the newest indexed ready candidate" "$candidate_capture"; then
+        echo "!!! RETAINED CANDIDATE STALE wiki=$wiki snapshot=$snapshot; forcing a complete rebuild so the ready index is repaired" >&2
+        rm -f -- "$candidate_capture"
+        candidate_capture=""
+        if run_candidate_logged "$wiki" "$snapshot" "$run_id" --rebuild; then
+          candidate_succeeded=1
+          exit_code=0
+        else
+          exit_code=$?
+        fi
+      fi
     fi
-  elif run_candidate "$wiki" "$snapshot" "$run_id" --rebuild; then
+  elif run_candidate_logged "$wiki" "$snapshot" "$run_id" --rebuild; then
     candidate_succeeded=1
   else
     exit_code=$?
+  fi
+  if [ -n "${candidate_capture:-}" ]; then
+    rm -f -- "$candidate_capture"
   fi
   if [ "$candidate_succeeded" -eq 1 ]; then
     completion_tmp="$completion_marker.$$"

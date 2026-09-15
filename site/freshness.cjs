@@ -19,9 +19,9 @@ function timestamp(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function successfulRuns(last, history) {
+function successfulRuns(last, history, durableSuccess = null, durablePublication = null) {
   const byRun = new Map();
-  for (const record of [...(history || []), last].filter(Boolean)) {
+  for (const record of [...(history || []), last, durableSuccess, durablePublication].filter(Boolean)) {
     if (record.state !== "succeeded" && record.exitCode !== 0) continue;
     if (!record.runId) continue;
     byRun.set(record.runId, record);
@@ -41,7 +41,7 @@ function stageStart(record) {
   return timestamp(current?.startedAt);
 }
 
-function evaluateFreshness({last = null, history = [], lifecycle, scrubStatus = null, now = Date.now(), thresholds = {}}) {
+function evaluateFreshness({last = null, history = [], lastSuccessful = null, lastSuccessfulPublication = null, lifecycle, scrubStatus = null, now = Date.now(), thresholds = {}}) {
   const settings = {
     ...DEFAULT_THRESHOLDS,
     ...thresholds,
@@ -49,7 +49,7 @@ function evaluateFreshness({last = null, history = [], lifecycle, scrubStatus = 
   };
   const scheduledWikis = Object.entries(lifecycle?.wikis || {})
     .filter(([, entry]) => entry.publication === "published" && entry.refresh === "scheduled");
-  const successes = successfulRuns(last, history);
+  const successes = successfulRuns(last, history, lastSuccessful, lastSuccessfulPublication);
   const latestSuccess = successes.at(-1) || null;
   const publicationSuccesses = successes.filter((record) => record.publication);
   const latestPublication = publicationSuccesses.at(-1) || null;

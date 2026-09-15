@@ -390,6 +390,9 @@ finish_refresh() {
       exit_code=1
     fi
   fi
+  if [ "$exit_code" -ne 0 ]; then
+    echo "!!! REFRESH FAILED run_id=$WIKI_ECON_RUN_ID stage=${REFRESH_FAILURE_STAGE:-unknown} exit_code=$exit_code error=${REFRESH_FAILURE_ERROR:-unknown refresh failure} log_file=${REFRESH_LOG_FILE:-unknown} status_file=$WIKI_ECON_OUTPUT_DIR/.refresh-status.json" >&2
+  fi
   echo "=== wiki-economics refresh end run_id=$WIKI_ECON_RUN_ID exit_code=$exit_code at=$(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
   release_refresh_lock
   exit "$exit_code"
@@ -441,7 +444,7 @@ if [ -n "${WIKI_ECON_SCRATCH_DIR:-}" ]; then
   cleanup_cmd+=(--scratch-dir "$WIKI_ECON_SCRATCH_DIR")
 fi
 cleanup_cmd+=("${wikis[@]}")
-if ! cleanup_summary="$(RUST_LOG=error "${cleanup_cmd[@]}")"; then
+if ! cleanup_summary="$(RUST_LOG="$WIKI_ECON_RUST_LOG" "${cleanup_cmd[@]}")"; then
   REFRESH_FAILURE_STAGE=cleanup_stale
   REFRESH_FAILURE_ERROR="safe abandoned-artifact cleanup failed"
   wiki_econ_record_stage_event failed cleanup_stale "" \
@@ -489,7 +492,7 @@ else
     printf ' %q' "$arg"
   done
   printf '\n'
-  selected_snapshot="$(RUST_LOG=error "${resolve_cmd[@]}")"
+  selected_snapshot="$(RUST_LOG="$WIKI_ECON_RUST_LOG" "${resolve_cmd[@]}")"
   set_refresh_lock_snapshot "$selected_snapshot"
 
   echo "==> Toolforge refresh: ${wikis[*]} (snapshot $SELECTED_SNAPSHOT, stage $REFRESH_STAGE)"

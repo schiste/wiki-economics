@@ -1823,7 +1823,7 @@ where
 }
 
 fn init_tracing(run_id: &str) {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .fmt_fields(DefaultFields::new())

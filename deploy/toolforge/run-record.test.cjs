@@ -218,7 +218,24 @@ test("atomic status writes and compact history retains and deduplicates 104 runs
   assert.equal(history.length, 104);
   assert.equal(history.at(-1).runId, environment.WIKI_ECON_RUN_ID);
   assert.equal(history.filter((entry) => entry.runId === environment.WIKI_ECON_RUN_ID).length, 1);
+  const durableSuccess = JSON.parse(fs.readFileSync(path.join(output, ".last-successful-refresh.json"), "utf8"));
+  assert.equal(durableSuccess.runId, environment.WIKI_ECON_RUN_ID);
+  assert.equal(durableSuccess.state, "succeeded");
   assert.equal(fs.readdirSync(output).some((name) => name.includes(".tmp.")), false);
+});
+
+test("successful publication evidence is retained separately from later site-only runs", () => {
+  const {environment, output} = fixture("publication-marker");
+  fs.writeFileSync(environment.WIKI_ECON_RUN_PUBLICATION_FILE, JSON.stringify({
+    run_id: environment.WIKI_ECON_RUN_ID,
+    selected_snapshot_versions: {nlwiki: "2026-07"},
+    metrics: {gdp: {rows: 1, wikis: {nlwiki: {minimum_date: "2026-01", maximum_date: "2026-07"}}}},
+  }));
+  writeRunRecord(environment, 0);
+  assert.equal(
+    JSON.parse(fs.readFileSync(path.join(output, ".last-successful-publication.json"), "utf8")).runId,
+    environment.WIKI_ECON_RUN_ID,
+  );
 });
 
 test("parsers and bounds fail safely", () => {

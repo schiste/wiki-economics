@@ -145,6 +145,38 @@ function classifyError(message) {
       remediation: "Open the publication workbench for the grouped blockers and change plan. Correct those candidate-level incompatibilities before running preflight again.",
     };
   }
+  if (/artifact scrub failed|artifact=.*(?:stage=validate_schema|stage=read_schema)|(?:period_start|week_start|year_month|cohort_month).*not found/i.test(message)) {
+    return {
+      errorSummary: "Artifact scrub found a published Parquet file whose schema no longer matches its metric contract.",
+      retryable: false,
+      remediationCode: "artifact_scrub_schema_mismatch",
+      remediation: "Open the scrub details to identify the exact artifact, rebuild that candidate from the current metric registry, run artifact scrub again, and publish only after scrub succeeds.",
+    };
+  }
+  if (/secondary bucket count .*exceeds .*Parquet writer limit|secondary routing exceeded the governed Parquet writer limit/i.test(message)) {
+    return {
+      errorSummary: "Weekly routing exceeded the process writer cap before the governed batching fix was applied.",
+      retryable: true,
+      remediationCode: "writer_limit_exceeded",
+      remediation: "Deploy the current pipeline and retry the candidate. Secondary buckets are now routed in deterministic writer-sized batches, so the 32-bucket qualified topology stays within a 16-writer cap.",
+    };
+  }
+  if (/unchanged candidate is not the newest indexed ready candidate/i.test(message)) {
+    return {
+      errorSummary: "The retained candidate is behind the ready-candidate index and cannot be reused as-is.",
+      retryable: true,
+      remediationCode: "stale_ready_index",
+      remediation: "Rebuild or revalidate the candidate with the latest indexed snapshot; the compatibility retry should refresh the ready index before selecting it.",
+    };
+  }
+  if (/resource governor memory gate closed/i.test(message)) {
+    return {
+      errorSummary: "The resource governor closed the live memory gate during this run.",
+      retryable: true,
+      remediationCode: "memory_gate_closed",
+      remediation: "Retry after deploying the current governor. Admission now uses current cgroup/RSS memory while retaining historical peaks as loud diagnostics; if current usage is still high, lower concurrency or use a qualified profile.",
+    };
+  }
   if (/out of memory|oom|memory(?:\.max)?|cannot allocate memory|exceeded.*memory/i.test(message)) {
     return {
       errorSummary: "The run exceeded its safe memory budget.",
@@ -304,7 +336,8 @@ function summarizeOperationLog(entry = {}, rawLog = "") {
     ? Math.max(0, Math.ceil((plannedBytes - completedBytes) / effectiveDownloadRate))
     : entry.progress?.etaSeconds ?? null;
 
-  const errorLine = lastCapture(text, /^Error:\s*(.+)$/gm);
+  const errorLine = lastCapture(text, /^Error:\s*(.+)$/gm)
+    || lastCapture(text, /^(!!![^\n]+)$/gm);
   const succeeded = entry.state === "succeeded" || entry.exitCode === 0;
   const rawError = succeeded ? null : errorLine || entry.rawError || entry.error || null;
   const failure = succeeded

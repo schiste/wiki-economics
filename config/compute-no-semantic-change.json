@@ -156,6 +156,30 @@
       "paths": ["src/compute/gdp.rs", "src/compute/labor.rs"],
       "reason": "Family-module extraction changes only sibling module paths used by the legacy parity adapters; lifecycle formulas and artifact bytes are unchanged.",
       "base_commit": "da16b4e15850a00b76a8a6b61da6d85638398786"
+    },
+    {
+      "family": "monthly",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Extend writer-batching regression coverage only; monthly computation semantics and artifact bytes are unchanged.",
+      "base_commit": "2b72928cccb363986d8c0dabf2105d3bda5df74f"
+    },
+    {
+      "family": "activity_tiers",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Extend writer-batching regression coverage only; activity-tier computation semantics and artifact bytes are unchanged.",
+      "base_commit": "2b72928cccb363986d8c0dabf2105d3bda5df74f"
+    },
+    {
+      "family": "lifecycle",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Extend writer-batching regression coverage only; lifecycle computation semantics and artifact bytes are unchanged.",
+      "base_commit": "2b72928cccb363986d8c0dabf2105d3bda5df74f"
+    },
+    {
+      "family": "page_week",
+      "paths": ["src/compute/mod.rs", "src/compute/weekly/mod.rs"],
+      "reason": "Route logical secondary buckets in bounded writer batches without changing page-week rows, totals, or artifact bytes.",
+      "base_commit": "2b72928cccb363986d8c0dabf2105d3bda5df74f"
     }
   ]
 }

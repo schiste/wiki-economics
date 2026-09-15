@@ -3341,7 +3341,7 @@ mod tests {
     }
 
     #[test]
-    fn two_level_routing_rejects_more_secondary_writers_than_budgeted() -> Result<()> {
+    fn two_level_routing_batches_more_secondary_buckets_than_budgeted() -> Result<()> {
         let output = TestDir::new()?;
         let runs = WeeklyRunDir::new(output.path(), "testwiki", None)?;
         let mut budget = ResourceBudget::from_environment()?;
@@ -3351,18 +3351,46 @@ mod tests {
             GovernorPaths::new(output.path().to_path_buf(), None),
         );
         let config = WeeklyAggregationConfig::new_two_level(64, 32, None)?;
+        let mut page_ids = vec![None; config.secondary_bucket_count];
+        for page_id in 0_i64..1_000_000 {
+            let hash = determinism::stable_page_hash(Some(page_id));
+            if hash as usize & (config.primary_bucket_count - 1) != 0 {
+                continue;
+            }
+            let secondary = (hash >> config.primary_bucket_count.trailing_zeros()) as usize
+                & (config.secondary_bucket_count - 1);
+            page_ids[secondary].get_or_insert(page_id);
+            if page_ids.iter().all(Option::is_some) {
+                break;
+            }
+        }
+        anyhow::ensure!(
+            page_ids.iter().all(Option::is_some),
+            "fixture could not cover every secondary bucket"
+        );
+        let rows = page_ids
+            .iter()
+            .map(|page_id| (*page_id, Some(0), Some("Page"), Some(19_723), Some(1)))
+            .collect::<Vec<_>>();
+        let mut frame = weekly_batch_df(&rows)?;
+        let primary_path = runs.primary_path(0);
+        ParquetWriter::new(File::create(&primary_path)?).finish(&mut frame)?;
         let mut peak = ResourcePeak::default();
-        let error = route_primary_to_secondary_buckets(
+        let routing = route_primary_to_secondary_buckets(
             &runs,
-            &runs.primary_path(0),
+            &primary_path,
             0,
             &config,
-            BucketTotals { rows: 1, edits: 1 },
+            BucketTotals {
+                rows: config.secondary_bucket_count,
+                edits: i64::try_from(config.secondary_bucket_count)?,
+            },
             &governor,
             &mut peak,
         )
-        .expect_err("32 secondary writers must not exceed a 16-writer budget");
-        assert!(error.to_string().contains("exceeds the governed"));
+        .expect("secondary routing should batch writers within the governed limit");
+        assert_eq!(routing.paths.iter().flatten().count(), 32);
+        assert_eq!(routing.peak_active_writers, 16);
         Ok(())
     }
 
@@ -3509,7 +3537,7 @@ mod tests {
         budget.memory_reserve_bytes = 0;
         budget.scratch_limit_bytes = u64::MAX;
         budget.max_open_files = usize::MAX;
-        budget.max_active_parquet_writers = 32;
+        budget.max_active_parquet_writers = 16;
         let governor = ResourceGovernor::new(
             budget,
             GovernorPaths::new(output.path().to_path_buf(), None),
@@ -3529,7 +3557,7 @@ mod tests {
         )
         .expect("bounded routing fixture must succeed");
 
-        assert_eq!(routing.peak_active_writers, 32);
+        assert_eq!(routing.peak_active_writers, 16);
         assert_eq!(routing.paths.iter().flatten().count(), 32);
         assert!(config.logical_bucket_count() > routing.peak_active_writers * 32);
         let mut scratch_bytes = runs.size_bytes()?;

@@ -27,6 +27,9 @@ finish_candidate() {
   else
     node "$WIKI_ECON_RUN_RECORD_HELPER" finish 0
   fi
+  if [ "$status" -ne 0 ]; then
+    echo "!!! CANDIDATE PREPARATION FAILED wiki=$wiki run_id=$WIKI_ECON_RUN_ID exit_code=$status error=${failure_error:-unknown candidate preparation failure} log_file=${WIKI_ECON_RUN_LOG_FILE:-unknown} status_file=${WIKI_ECON_RUN_STATUS_FILE:-unknown}" >&2
+  fi
   exit "$status"
 }
 trap finish_candidate EXIT
@@ -36,7 +39,7 @@ if [ -n "${WIKI_ECON_PREPARE_SNAPSHOT:-}" ]; then
   selected_snapshot="$WIKI_ECON_PREPARE_SNAPSHOT"
 else
   selected_snapshot="$(
-    RUST_LOG=error "$WIKI_ECON_BIN" \
+    RUST_LOG="$WIKI_ECON_RUST_LOG" "$WIKI_ECON_BIN" \
       --data-dir "$WIKI_ECON_DATA_DIR" \
       --output-dir "$WIKI_ECON_OUTPUT_DIR" \
       --run-id "$WIKI_ECON_RUN_ID" \

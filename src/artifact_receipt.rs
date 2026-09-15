@@ -8,6 +8,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use tracing::{error, info};
 
 use crate::{metric_registry::MetricId, storage};
 
@@ -104,6 +105,11 @@ pub struct ScrubStatus {
     pub updated_at_unix: u64,
     pub report_sha256: Option<String>,
     pub error: Option<String>,
+    /// Human-readable, path-qualified failures retained for the admin and
+    /// freshness endpoints. This is deliberately additive so old status
+    /// documents remain readable after a deployment.
+    #[serde(default)]
+    pub failure_details: Vec<String>,
 }
 
 const SCRUB_STATUS_PATH: &str = "_scrubs/status.json";
@@ -504,22 +510,40 @@ pub fn scan(
     input_fingerprint: &str,
 ) -> Result<ArtifactReceipt> {
     let spec = SemanticSpec::for_identity(identity);
-    let mut reader = storage::SequentialParquetReader::new(artifact, None, SEMANTIC_BATCH_ROWS)?;
-    let expected_rows = u64::try_from(reader.rows())?;
+    let mut reader = storage::SequentialParquetReader::new(artifact, None, SEMANTIC_BATCH_ROWS)
+        .with_context(|| format!("artifact={} stage=open_parquet", artifact.display()))?;
+    let expected_rows = u64::try_from(reader.rows())
+        .with_context(|| format!("artifact={} stage=read_parquet_footer", artifact.display()))?;
     let mut accumulator = SemanticAccumulator::new(spec);
-    accumulator.observe(&reader.schema_frame()?)?;
-    while let Some(batch) = reader.next_batch()? {
-        accumulator.observe(&batch)?;
+    let schema_frame = reader
+        .schema_frame()
+        .with_context(|| format!("artifact={} stage=read_schema", artifact.display()))?;
+    accumulator.observe(&schema_frame).with_context(|| {
+        format!(
+            "artifact={} identity={} stage=validate_schema",
+            artifact.display(),
+            identity
+        )
+    })?;
+    while let Some(batch) = reader
+        .next_batch()
+        .with_context(|| format!("artifact={} stage=read_batch", artifact.display()))?
+    {
+        accumulator.observe(&batch).with_context(|| {
+            format!(
+                "artifact={} identity={} stage=semantic_batch",
+                artifact.display(),
+                identity
+            )
+        })?;
     }
-    let (bytes, artifact_sha256) = storage::sha256_file(artifact)?;
+    let (bytes, artifact_sha256) = storage::sha256_file(artifact)
+        .with_context(|| format!("artifact={} stage=hash", artifact.display()))?;
     let identity = identity.to_string();
     let algorithm = algorithm_version.to_string();
     let inputs = input_fingerprint.to_string();
     let receipt = accumulator.finish(identity, artifact_sha256, bytes, algorithm, inputs)?;
-    ensure!(
-        receipt.rows == expected_rows,
-        "receipt row count disagrees with Parquet footer"
-    );
+    ensure_receipt_row_count(artifact, &receipt, expected_rows)?;
     Ok(receipt)
 }
 
@@ -530,23 +554,57 @@ pub fn scan_and_write_with_spec(
     input_fingerprint: &str,
     spec: SemanticSpec,
 ) -> Result<ArtifactReceiptDocument> {
-    let mut reader = storage::SequentialParquetReader::new(artifact, None, SEMANTIC_BATCH_ROWS)?;
-    let expected_rows = u64::try_from(reader.rows())?;
+    let mut reader = storage::SequentialParquetReader::new(artifact, None, SEMANTIC_BATCH_ROWS)
+        .with_context(|| format!("artifact={} stage=open_parquet", artifact.display()))?;
+    let expected_rows = u64::try_from(reader.rows())
+        .with_context(|| format!("artifact={} stage=read_parquet_footer", artifact.display()))?;
     let mut accumulator = SemanticAccumulator::new(spec);
-    accumulator.observe(&reader.schema_frame()?)?;
-    while let Some(batch) = reader.next_batch()? {
-        accumulator.observe(&batch)?;
+    let schema_frame = reader
+        .schema_frame()
+        .with_context(|| format!("artifact={} stage=read_schema", artifact.display()))?;
+    accumulator.observe(&schema_frame).with_context(|| {
+        format!(
+            "artifact={} identity={} stage=validate_schema",
+            artifact.display(),
+            identity
+        )
+    })?;
+    while let Some(batch) = reader
+        .next_batch()
+        .with_context(|| format!("artifact={} stage=read_batch", artifact.display()))?
+    {
+        accumulator.observe(&batch).with_context(|| {
+            format!(
+                "artifact={} identity={} stage=semantic_batch",
+                artifact.display(),
+                identity
+            )
+        })?;
     }
-    let (bytes, artifact_sha256) = storage::sha256_file(artifact)?;
+    let (bytes, artifact_sha256) = storage::sha256_file(artifact)
+        .with_context(|| format!("artifact={} stage=hash", artifact.display()))?;
     let identity = identity.to_string();
     let algorithm = algorithm_version.to_string();
     let inputs = input_fingerprint.to_string();
     let receipt = accumulator.finish(identity, artifact_sha256, bytes, algorithm, inputs)?;
+    ensure_receipt_row_count(artifact, &receipt, expected_rows)?;
+    write(artifact, receipt)
+}
+
+fn ensure_receipt_row_count(
+    artifact: &Path,
+    receipt: &ArtifactReceipt,
+    expected_rows: u64,
+) -> Result<()> {
     ensure!(
         receipt.rows == expected_rows,
-        "receipt row count disagrees with Parquet footer"
+        "artifact={} identity={} stage=verify_footer receipt row count {} disagrees with Parquet footer {}",
+        artifact.display(),
+        receipt.identity,
+        receipt.rows,
+        expected_rows
     );
-    write(artifact, receipt)
+    Ok(())
 }
 
 pub fn write(artifact: &Path, receipt: ArtifactReceipt) -> Result<ArtifactReceiptDocument> {
@@ -699,28 +757,73 @@ pub fn scrub_published(output_dir: &Path) -> Result<ScrubReport> {
         !artifacts.is_empty(),
         "no published Parquet artifacts to scrub"
     );
+    info!(
+        output_dir = %output_dir.display(),
+        artifact_count = artifacts.len(),
+        "artifact scrub started"
+    );
     let mut scrubbed = Vec::with_capacity(artifacts.len());
+    let mut failures = Vec::new();
     let mut total_bytes = 0_u64;
     let mut total_rows = 0_u64;
-    for artifact in artifacts {
-        let document = read(&artifact)?;
-        let scanned = scan(
+    let artifact_count = artifacts.len();
+    for (index, artifact) in artifacts.into_iter().enumerate() {
+        info!(
+            artifact = %artifact.display(),
+            artifact_index = index + 1,
+            artifact_count,
+            "scrubbing published artifact"
+        );
+        let document = match read(&artifact)
+            .with_context(|| format!("artifact={} stage=read_receipt", artifact.display()))
+        {
+            Ok(document) => document,
+            Err(error) => {
+                let detail = format!("{:#}", error);
+                let artifact_path = artifact.display().to_string();
+                error!(artifact = %artifact_path, error = %detail, "published artifact scrub failed");
+                failures.push(detail);
+                continue;
+            }
+        };
+        let scanned = match scan(
             &artifact,
             &document.receipt.identity,
             &document.receipt.algorithm_version,
             &document.receipt.input_fingerprint,
-        )?;
-        ensure!(
-            scanned == document.receipt,
-            "deep semantic scrub disagrees with authoritative receipt for {}",
-            artifact.display()
-        );
+        ) {
+            Ok(scanned) => scanned,
+            Err(error) => {
+                let detail = format!("{:#}", error);
+                let artifact_path = artifact.display().to_string();
+                let identity = document.receipt.identity.clone();
+                error!(artifact = %artifact_path, identity = %identity, error = %detail, "published artifact scrub failed");
+                failures.push(detail);
+                continue;
+            }
+        };
+        if let Err(error) = ensure_scrub_matches_receipt(&artifact, &scanned, &document.receipt) {
+            let detail = format!("{:#}", error);
+            let artifact_path = artifact.display().to_string();
+            let identity = document.receipt.identity.clone();
+            error!(artifact = %artifact_path, identity = %identity, error = %detail, "published artifact scrub failed");
+            failures.push(detail);
+            continue;
+        }
         total_bytes = total_bytes
             .checked_add(scanned.bytes)
-            .context("scrub byte total overflow")?;
+            .with_context(|| format!("artifact={} stage=total_bytes", artifact.display()))?;
         total_rows = total_rows
             .checked_add(scanned.rows)
-            .context("scrub row total overflow")?;
+            .with_context(|| format!("artifact={} stage=total_rows", artifact.display()))?;
+        info!(
+            artifact = %artifact.display(),
+            rows = scanned.rows,
+            bytes = scanned.bytes,
+            minimum_date = ?scanned.minimum_date,
+            maximum_date = ?scanned.maximum_date,
+            "published artifact scrub passed"
+        );
         scrubbed.push(ScrubbedArtifact {
             path: artifact
                 .strip_prefix(output_dir)
@@ -738,6 +841,27 @@ pub fn scrub_published(output_dir: &Path) -> Result<ScrubReport> {
             maximum_wiki: scanned.maximum_wiki,
         });
     }
+    if !failures.is_empty() {
+        let preview = failures
+            .iter()
+            .take(32)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" | ");
+        anyhow::bail!(
+            "artifact scrub failed for {} of {} artifacts: {}",
+            failures.len(),
+            artifact_count,
+            preview
+        );
+    }
+    info!(
+        output_dir = %output_dir.display(),
+        artifact_count,
+        total_bytes,
+        total_rows,
+        "artifact scrub completed successfully"
+    );
     Ok(ScrubReport {
         schema_version: 2,
         scrubbed_at_unix: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
@@ -745,6 +869,19 @@ pub fn scrub_published(output_dir: &Path) -> Result<ScrubReport> {
         total_bytes,
         total_rows,
     })
+}
+
+fn ensure_scrub_matches_receipt(
+    artifact: &Path,
+    scanned: &ArtifactReceipt,
+    recorded: &ArtifactReceipt,
+) -> Result<()> {
+    ensure!(
+        scanned == recorded,
+        "artifact={} stage=compare_receipt deep semantic scrub disagrees with authoritative receipt",
+        artifact.display()
+    );
+    Ok(())
 }
 
 fn scrub_status_path(output_dir: &Path) -> PathBuf {
@@ -783,18 +920,26 @@ pub fn record_scrub_success(output_dir: &Path, run_id: &str, report: &ScrubRepor
             updated_at_unix: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
             report_sha256: Some(report_sha256),
             error: None,
+            failure_details: Vec::new(),
         },
     )
 }
 
 pub fn record_scrub_failure(output_dir: &Path, run_id: &str, error: &anyhow::Error) -> Result<()> {
     ensure!(!run_id.trim().is_empty(), "scrub run ID cannot be empty");
-    let concise = format!("{error:#}")
+    let rendered = format!("{error:#}");
+    let concise = rendered
         .lines()
         .next()
         .unwrap_or("artifact scrub failed")
         .chars()
-        .take(500)
+        .take(2_000)
+        .collect();
+    let failure_details = rendered
+        .split(" | ")
+        .filter(|detail| !detail.trim().is_empty())
+        .take(64)
+        .map(|detail| detail.chars().take(1_000).collect::<String>())
         .collect();
     write_scrub_status(
         output_dir,
@@ -805,6 +950,7 @@ pub fn record_scrub_failure(output_dir: &Path, run_id: &str, error: &anyhow::Err
             updated_at_unix: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
             report_sha256: None,
             error: Some(concise),
+            failure_details,
         },
     )
 }
@@ -1009,6 +1155,55 @@ mod tests {
         assert_eq!(sum_numeric(&Column::new("v".into(), [1_u64, 2]), "v")?, 3);
         assert_eq!(sum_numeric(&Column::new("v".into(), [-1_i32, 2]), "v")?, 1);
         assert!(sum_numeric(&Column::new("v".into(), [true]), "v").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn scan_failures_keep_artifact_and_stage_context() -> Result<()> {
+        let directory = TestDir::new()?;
+        let gdp = directory.path().join("gdp.parquet");
+        write_gdp(&gdp, "nlwiki")?;
+        let schema_error = scan_and_write_with_spec(
+            &gdp,
+            "nlwiki/gdp.parquet",
+            "gdp-v1",
+            "inputs",
+            SemanticSpec {
+                date_column: Some("period_start".to_string()),
+                conservation_columns: Vec::new(),
+                ordering_contract: "writer-order/v1".to_string(),
+                page_week_consistency: false,
+            },
+        )
+        .expect_err("a missing semantic date column must identify its artifact and stage");
+        let schema_message = format!("{schema_error:#}");
+        assert!(
+            schema_message.contains("artifact=")
+                && schema_message.contains("stage=validate_schema")
+        );
+
+        let weekly = directory.path().join("page_weekly_edits.parquet");
+        write_weekly(&weekly, &[1, 2], &["2026-01-05", "2026-01-12"])?;
+        let batch_error = scan_and_write_with_spec(
+            &weekly,
+            "nlwiki/page_weekly_edits.parquet",
+            "weekly-v1",
+            "inputs",
+            SemanticSpec::for_identity("nlwiki/page_weekly_edits.parquet"),
+        )
+        .expect_err("an invalid page-week batch must identify its artifact and stage");
+        let batch_message = format!("{batch_error:#}");
+        assert!(
+            batch_message.contains("artifact=") && batch_message.contains("stage=semantic_batch")
+        );
+
+        let mut receipt = scan(&gdp, "nlwiki/gdp.parquet", "gdp-v1", "inputs")?;
+        receipt.rows += 1;
+        let row_error = ensure_receipt_row_count(&gdp, &receipt, 2)
+            .expect_err("a footer mismatch must include receipt identity and artifact path");
+        let row_message = format!("{row_error:#}");
+        assert!(row_message.contains("stage=verify_footer"));
+        assert!(row_message.contains("nlwiki/gdp.parquet"));
         Ok(())
     }
 

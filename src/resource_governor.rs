@@ -6,7 +6,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::observability::MemorySnapshot;
 
@@ -510,15 +510,27 @@ impl ResourceGovernor {
         let observed_memory = sample
             .memory
             .cgroup_current_bytes
-            .into_iter()
-            .chain(sample.memory.cgroup_peak_bytes)
-            .chain(sample.memory.rss_bytes)
-            .max();
+            .or(sample.memory.rss_bytes);
         #[cfg(target_os = "linux")]
         let observed_memory =
             observed_memory.context("resource governor requires memory telemetry")?;
         #[cfg(not(target_os = "linux"))]
         let observed_memory = observed_memory.unwrap_or(0);
+        if let Some(reported_peak) = sample.memory.cgroup_peak_bytes
+            && reported_peak > self.budget.memory_admission_bytes()
+        {
+            // cgroup.events/memory.peak is cumulative for the lifetime of the
+            // process. It is valuable evidence for the run record, but using
+            // it as the live admission value permanently bricks a long-lived
+            // worker after one transient spike. Gate on current usage and
+            // retain the peak as a loud diagnostic instead.
+            warn!(
+                current_bytes = observed_memory,
+                reported_peak_bytes = reported_peak,
+                admission_ceiling_bytes = self.budget.memory_admission_bytes(),
+                "resource governor observed a historical cgroup peak above the admission ceiling; continuing with the current-memory gate"
+            );
+        }
         anyhow::ensure!(
             observed_memory <= self.budget.memory_admission_bytes(),
             "resource governor memory gate closed at {observed_memory} bytes; admission ceiling is {} bytes",
@@ -1252,6 +1264,44 @@ mod tests {
         unmetered_fds.memory.rss_bytes = Some(1);
         unmetered_fds.open_file_descriptors = None;
         governor.validate_sample(&unmetered_fds, 0)?;
+        Ok(())
+    }
+
+    #[test]
+    fn historical_cgroup_peak_does_not_close_live_memory_gate() -> Result<()> {
+        let root = TestDir::new()?;
+        let governor = ResourceGovernor::new(
+            budget(),
+            GovernorPaths::new(root.path().to_path_buf(), None),
+        );
+        let sample = ResourceSample {
+            sampled_at_epoch_ms: 0,
+            memory: MemorySnapshot {
+                rss_bytes: Some(1),
+                cgroup_current_bytes: Some(1),
+                cgroup_peak_bytes: Some(900_000_000),
+                cgroup_limit_bytes: Some(1_000_000_000),
+            },
+            cpu: CpuSnapshot::default(),
+            page_cache_bytes: None,
+            io: IoSnapshot::default(),
+            scratch_bytes: 0,
+            persistent_filesystem_used_bytes: Some(0),
+            persistent_available_bytes: Some(1_000_000),
+            open_file_descriptors: Some(1),
+            active_source_workers: 0,
+            active_bucket_workers: 0,
+            reserved_persistent_bytes: 0,
+            reserved_bucket_memory_bytes: 0,
+            reserved_bucket_scratch_bytes: 0,
+            downloaded_bytes: 0,
+            ingested_rows: 0,
+            download_elapsed_ms: 0,
+            ingest_elapsed_ms: 0,
+            download_bytes_per_second: None,
+            ingest_rows_per_second: None,
+        };
+        governor.validate_sample(&sample, 0)?;
         Ok(())
     }
 }

@@ -6737,6 +6737,7 @@ mod tests {
                 updated_at_unix: 1,
                 report_sha256: None,
                 error: Some("corrupt artifact".to_string()),
+                failure_details: Vec::new(),
             },
         )
         .expect("failed scrub fixture must be written");

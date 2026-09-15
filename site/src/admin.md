@@ -1417,7 +1417,16 @@ function collapsePublicationHistory(runs) {
 ```js
 const scheduledRefresh = job?.scheduledRefresh || {schedule: null, last: null, history: []}
 const refreshHealth = classifyRefreshHealth(scheduledRefresh.last, scheduledRefresh.schedule)
-const refreshHistoryNewestFirst = [...(scheduledRefresh.history || [])].reverse()
+const refreshHistoryByRun = new Map()
+for (const run of [
+  ...(scheduledRefresh.history || []),
+  scheduledRefresh.lastSuccessful,
+  scheduledRefresh.lastSuccessfulPublication
+].filter(Boolean)) {
+  if (run.runId) refreshHistoryByRun.set(run.runId, run)
+}
+const refreshHistoryNewestFirst = [...refreshHistoryByRun.values()].sort((left, right) =>
+  Date.parse(right.finishedAt || right.startedAt || 0) - Date.parse(left.finishedAt || left.startedAt || 0))
 const groupedRefreshHistory = collapsePublicationHistory(refreshHistoryNewestFirst)
 const blockerAlerts = (operationalTruth.pipeline?.blockerGroups || []).map((blocker) => ({
   domain: "Pipeline",
@@ -1436,6 +1445,9 @@ const operationalAlerts = [
   })),
   ...(operationalTruth.infrastructure?.issues || []).map((alert) => ({...alert, domain: "Infrastructure"}))
 ].sort((left, right) => (left.severity === "critical" ? 0 : 1) - (right.severity === "critical" ? 0 : 1))
+const scrubFailureDetails = Array.isArray(operationalTruth.public?.scrub?.failure_details)
+  ? operationalTruth.public.scrub.failure_details.filter(Boolean).slice(0, 32)
+  : []
 const publicationOps = operationalTruth.public?.publication || {}
 const publicationPreflight = publicationOps.preflight || null
 const publicationBlockerSummaries = summarizePublicationBlockers(publicationPreflight?.blockers || [])
@@ -1488,6 +1500,11 @@ display(html`<div id="admin-publication-workbench" class="admin-refresh-panel">
       <strong>${formatRefreshBytes(scheduledRefresh.last?.memoryPeakBytes)} / ${formatRefreshBytes(scheduledRefresh.last?.memoryLimitBytes)}</strong>
     </div>
   </div>
+  ${scrubFailureDetails.length ? html`<section class="admin-scrub-failure" role="alert">
+    <header><strong>Artifact scrub failed — publication is blocked</strong><span>${scrubFailureDetails.length} artifact-level finding${scrubFailureDetails.length === 1 ? "" : "s"} require repair.</span></header>
+    <ol>${scrubFailureDetails.map((detail) => html`<li><code>${detail}</code></li>`)}</ol>
+    <p>Rebuild the named candidate artifact, run <strong>Scrub published artifacts</strong>, then rerun publication preflight. The current public generation remains unchanged.</p>
+  </section>` : ""}
   <section class=${`admin-recovery-plan ${operationalTruth.public?.status === "healthy" ? "safe" : "unsafe"}`}>
     <header>
       <div><strong>${recoveryHeadline}</strong><span>${operationalTruth.public?.status === "healthy" ? "Repairs change candidates only. The live site stays on the last validated publication." : "Stop candidate work until public publication evidence is healthy."}</span></div>
@@ -4094,6 +4111,18 @@ Array.isArray(currentManifest.merged) && currentManifest.merged.length > 0
 .admin-health-alerts strong { font-size: 0.68rem; letter-spacing: 0.05em; text-transform: uppercase; }
 .admin-health-alerts span { color: var(--theme-foreground-muted); font-size: 0.74rem; }
 .admin-health-clear { padding: 0.65rem 0.8rem; border-left: 3px solid #2e7d32; color: #2e7d32; font-size: 0.76rem; font-weight: 700; }
+.admin-scrub-failure {
+  border: 2px solid #c62828;
+  border-radius: 0.45rem;
+  background: color-mix(in srgb, #c62828 6%, var(--theme-background));
+  padding: 0.75rem 0.9rem;
+}
+.admin-scrub-failure header { display: flex; flex-wrap: wrap; gap: 0.55rem; align-items: baseline; color: #a62e27; }
+.admin-scrub-failure header span { color: var(--theme-foreground-muted); font-size: 0.75rem; }
+.admin-scrub-failure ol { display: grid; gap: 0.35rem; margin: 0.65rem 0; padding-left: 1.35rem; }
+.admin-scrub-failure li { overflow-wrap: anywhere; font-size: 0.72rem; }
+.admin-scrub-failure code { white-space: pre-wrap; }
+.admin-scrub-failure p { margin: 0; color: var(--theme-foreground-muted); font-size: 0.75rem; line-height: 1.45; }
 .admin-history-details { margin-top: 0.25rem; }
 .admin-history-details summary { cursor: pointer; color: var(--theme-foreground-muted); font-size: 0.74rem; font-weight: 700; }
 .admin-run-sheet { margin-top: 1rem; border-block: 1px solid var(--theme-foreground-faintest); background: color-mix(in srgb, var(--theme-background) 96%, #dfe9f3 4%); }

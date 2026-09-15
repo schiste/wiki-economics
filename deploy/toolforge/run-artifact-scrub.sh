@@ -15,6 +15,13 @@ mkdir -p "$report_dir" "$log_dir"
 export CARGO_TERM_COLOR=never NO_COLOR=1 OBSERVABLE_TELEMETRY_DISABLE=true WIKI_ECON_LOG_ANSI=0
 
 exec > >(tee -a "$log_dir/$run_id.log") 2>&1
+report_artifact_scrub_exit() {
+  local status=$?
+  if [ "$status" -ne 0 ]; then
+    echo "!!! ARTIFACT SCRUB FAILED run_id=$run_id exit_code=$status log_file=$log_dir/$run_id.log status_file=$WIKI_ECON_OUTPUT_DIR/_scrubs/status.json" >&2
+  fi
+}
+trap report_artifact_scrub_exit EXIT
 echo "=== artifact scrub start run_id=$run_id at=$(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
 "$ROOT/deploy/toolforge/run-with-lock.sh" \
   "$WIKI_ECON_OUTPUT_DIR/.publication.lock" \

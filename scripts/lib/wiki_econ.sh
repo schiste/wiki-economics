@@ -29,6 +29,10 @@ wiki_econ_init_runtime() {
   WIKI_ECON_SITE_DIST_DIR="$(wiki_econ_abs_path "$WIKI_ECON_ROOT" "${WIKI_ECON_SITE_DIST_DIR:-site/dist}")"
   WIKI_ECON_SITE_PORT="${WIKI_ECON_SITE_PORT:-3000}"
   WIKI_ECON_ADMIN_PORT="${WIKI_ECON_ADMIN_PORT:-3001}"
+  # Keep production diagnostics actionable by default. Operators can lower
+  # this for a deliberately quiet local run without changing the wrappers.
+  WIKI_ECON_RUST_LOG="${WIKI_ECON_RUST_LOG:-debug}"
+  RUST_LOG="${RUST_LOG:-$WIKI_ECON_RUST_LOG}"
 
   export WIKI_ECON_ROOT
   export WIKI_ECON_ENV
@@ -40,6 +44,8 @@ wiki_econ_init_runtime() {
   export WIKI_ECON_SITE_DIST_DIR
   export WIKI_ECON_SITE_PORT
   export WIKI_ECON_ADMIN_PORT
+  export WIKI_ECON_RUST_LOG
+  export RUST_LOG
 
   wiki_econ_init_binary_provenance
   wiki_econ_init_image_provenance
@@ -170,6 +176,7 @@ Site dist:    $WIKI_ECON_SITE_DIST_DIR
 Binary commit: ${WIKI_ECON_BINARY_SOURCE_COMMIT:-unverified}
 Image commit:  ${WIKI_ECON_IMAGE_SOURCE_COMMIT:-unverified}
 Site commit:   ${WIKI_ECON_SITE_SOURCE_COMMIT:-unverified}
+Rust log:      ${WIKI_ECON_RUST_LOG:-debug}
 EOF
 }
 

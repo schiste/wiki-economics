@@ -55,6 +55,13 @@ export WIKI_ECON_RUN_LOG_FILE="$log_dir/$WIKI_ECON_RUN_ID.log"
 export WIKI_ECON_REFRESH_HISTORY_LIMIT="${WIKI_ECON_REFRESH_HISTORY_LIMIT:-104}"
 export WIKI_ECON_SITE_DIST_DIR WIKI_ECON_OUTPUT_DIR
 exec > >(tee -a "$log_dir/$WIKI_ECON_RUN_ID.log") 2>&1
+report_candidate_exit() {
+  local status=$?
+  if [ "$status" -ne 0 ]; then
+    echo "!!! CANDIDATE PREPARATION FAILED wiki=$wiki run_id=$WIKI_ECON_RUN_ID exit_code=$status log_file=$WIKI_ECON_RUN_LOG_FILE status_file=$WIKI_ECON_RUN_STATUS_FILE" >&2
+  fi
+}
+trap report_candidate_exit EXIT
 echo "=== candidate preparation start wiki=$wiki run_id=$WIKI_ECON_RUN_ID at=$(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
 
 "$ROOT/deploy/toolforge/run-with-lock.sh" \

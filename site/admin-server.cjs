@@ -1302,7 +1302,19 @@ function readRefreshStatus() {
   } catch {
     history = [];
   }
-  return { schedule: REFRESH_SCHEDULE, last, history };
+  let lastSuccessful = null;
+  try {
+    lastSuccessful = JSON.parse(fs.readFileSync(path.join(OUTPUT_DIR, ".last-successful-refresh.json"), "utf8"));
+  } catch {
+    lastSuccessful = null;
+  }
+  let lastSuccessfulPublication = null;
+  try {
+    lastSuccessfulPublication = JSON.parse(fs.readFileSync(path.join(OUTPUT_DIR, ".last-successful-publication.json"), "utf8"));
+  } catch {
+    lastSuccessfulPublication = null;
+  }
+  return { schedule: REFRESH_SCHEDULE, last, history, lastSuccessful, lastSuccessfulPublication };
 }
 
 function readArtifactScrubStatus() {
@@ -2651,7 +2663,7 @@ async function handleRequest(req, res) {
         cwd: ROOT,
         env: {
           ...process.env,
-          RUST_LOG: "info",
+          RUST_LOG: process.env.WIKI_ECON_RUST_LOG || process.env.RUST_LOG || "debug",
           PYTHONUNBUFFERED: "1",
           WIKI_ECON_DATA_DIR: DATA_DIR,
           WIKI_ECON_OUTPUT_DIR: OUTPUT_DIR,

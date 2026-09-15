@@ -401,7 +401,7 @@ async function executeClaim(claim) {
       CARGO_TERM_COLOR: "never",
       NO_COLOR: "1",
       OBSERVABLE_TELEMETRY_DISABLE: "true",
-      RUST_LOG: "info",
+      RUST_LOG: process.env.WIKI_ECON_RUST_LOG || process.env.RUST_LOG || "debug",
       WIKI_ECON_LOG_ANSI: "0",
       WIKI_ECON_DATA_DIR: DATA_DIR,
       WIKI_ECON_OUTPUT_DIR: OUTPUT_DIR,

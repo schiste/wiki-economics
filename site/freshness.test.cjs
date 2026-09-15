@@ -74,6 +74,26 @@ test("a failed or malformed deep scrub is a publication-blocking alert", () => {
   assert.equal(malformed.alerts[0].code, "artifact_scrub_status_invalid");
 });
 
+test("durable successful-run evidence survives a history window of failures", () => {
+  const durable = success({runId: "publish-durable", finishedAt: "2026-08-21T03:00:00Z"});
+  const failures = Array.from({length: 104}, (_, index) => ({
+    runId: `failed-${index}`,
+    state: "failed",
+    exitCode: 1,
+    finishedAt: `2026-08-${String((index % 9) + 22).padStart(2, "0")}T03:00:00Z`,
+  }));
+  const result = evaluateFreshness({
+    last: failures.at(-1),
+    history: failures,
+    lastSuccessful: durable,
+    lifecycle,
+    now: Date.parse("2026-08-22T03:00:00Z"),
+  });
+  assert.equal(result.summary.lastSuccessfulRunId, "publish-durable");
+  assert.equal(result.summary.lastPublicationRunId, "publish-durable");
+  assert.ok(!result.alerts.some((alert) => alert.code === "refresh_success_missing"));
+});
+
 test("a later site-only success retains the latest validated publication", () => {
   const publication = success({runId: "publish-1"});
   const siteOnly = success({

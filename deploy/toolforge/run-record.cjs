@@ -357,12 +357,31 @@ function appendHistory(file, record, limit) {
 function writeRunRecord(environment, finalExitCode = null) {
   const record = buildRecord(environment, finalExitCode);
   if (finalExitCode != null) {
+    const historyFile = environment.WIKI_ECON_RUN_HISTORY_FILE;
     appendHistory(
-      environment.WIKI_ECON_RUN_HISTORY_FILE,
+      historyFile,
       record,
       historyLimit(environment.WIKI_ECON_REFRESH_HISTORY_LIMIT),
     );
     atomicWriteText(environment.WIKI_ECON_RUN_STATE_FILE, record.state);
+    // Keep the most recent successful scheduled/publication run outside the
+    // bounded terminal history. A long streak of failures must not erase the
+    // evidence that the currently published generation is still fresh.
+    if (finalExitCode === 0
+        && historyFile
+        && environment.WIKI_ECON_RUN_STATUS_FILE
+        && path.basename(historyFile) === ".refresh-history.jsonl") {
+      atomicWriteJson(
+        path.join(path.dirname(environment.WIKI_ECON_RUN_STATUS_FILE), ".last-successful-refresh.json"),
+        compactHistoryEntry(record),
+      );
+      if (record.publication) {
+        atomicWriteJson(
+          path.join(path.dirname(environment.WIKI_ECON_RUN_STATUS_FILE), ".last-successful-publication.json"),
+          compactHistoryEntry(record),
+        );
+      }
+    }
   }
   atomicWriteJson(environment.WIKI_ECON_RUN_STATUS_FILE, record);
   return record;

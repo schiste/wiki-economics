@@ -1290,89 +1290,114 @@ pub(super) fn route_primary_to_secondary_buckets(
 ) -> Result<SecondaryRouting> {
     let primary_bucket_count = config.primary_bucket_count;
     let secondary_bucket_count = config.secondary_bucket_count;
+    let writer_limit = governor.budget().max_active_parquet_writers;
     anyhow::ensure!(
-        secondary_bucket_count <= governor.budget().max_active_parquet_writers,
-        "secondary bucket count {secondary_bucket_count} exceeds the governed Parquet writer limit {}",
-        governor.budget().max_active_parquet_writers
+        writer_limit > 0,
+        "secondary routing requires a positive governed Parquet writer limit"
     );
     let mut paths = vec![None; secondary_bucket_count];
     let mut rows = vec![0usize; secondary_bucket_count];
     let mut edits = vec![0i64; secondary_bucket_count];
-    let mut writers: BTreeMap<usize, BatchedWriter<File>> = BTreeMap::new();
     let mut peak_active_writers = 0usize;
-    let mut reader =
-        storage::SequentialParquetReader::new(primary_path, None, WEEKLY_ROUTING_BATCH_ROWS)?;
-    anyhow::ensure!(
-        reader.rows() == expected.rows,
-        "primary bucket {primary_bucket} footer row count changed before secondary routing"
-    );
+    let mut routed_rows = 0usize;
+    let mut routed_edits = 0i64;
 
-    while let Some(batch) = reader.next_batch()? {
-        let input_edits = sum_edits_column(std::slice::from_ref(&batch))?;
-        let page_ids = batch.column("page_id")?.i64()?;
-        let mut row_indices: Vec<Vec<IdxSize>> =
-            (0..secondary_bucket_count).map(|_| Vec::new()).collect();
-        for row in 0..batch.height() {
-            let secondary = stable_weekly_secondary_bucket(
-                page_ids.get(row),
-                primary_bucket_count,
-                secondary_bucket_count,
-            );
-            row_indices[secondary].push(row as IdxSize);
-        }
-        let mut routed_edits = 0i64;
-        for (secondary, indices) in row_indices.into_iter().enumerate() {
-            if indices.is_empty() {
-                continue;
-            }
-            let take = IdxCa::from_vec("secondary_routing_rows".into(), indices);
-            let mut frame = batch.take(&take)?;
-            frame.rechunk_mut();
-            let frame_edits = sum_edits_column(std::slice::from_ref(&frame))?;
-            routed_edits = routed_edits
-                .checked_add(frame_edits)
-                .context("secondary routing edit count overflow")?;
-            rows[secondary] = rows[secondary]
-                .checked_add(frame.height())
-                .context("secondary routing row count overflow")?;
-            edits[secondary] = edits[secondary]
-                .checked_add(frame_edits)
-                .context("secondary routing edit count overflow")?;
-            let path = runs.secondary_path(primary_bucket, secondary);
-            let writer = match writers.entry(secondary) {
-                std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
-                std::collections::btree_map::Entry::Vacant(entry) => {
-                    paths[secondary] = Some(path.clone());
-                    entry.insert(
-                        ParquetWriter::new(File::create(path)?)
-                            .with_compression(ParquetCompression::Zstd(None))
-                            .batched(frame.schema())?,
-                    )
-                }
-            };
-            writer.write_batch(&frame)?;
-            peak_active_writers = peak_active_writers.max(writers.len());
-            anyhow::ensure!(
-                peak_active_writers <= governor.budget().max_active_parquet_writers,
-                "secondary routing exceeded the governed Parquet writer limit"
-            );
-        }
-        anyhow::ensure!(
-            input_edits == routed_edits,
-            "primary bucket {primary_bucket} lost or duplicated edits during secondary routing"
+    // A large qualified topology can intentionally contain more logical
+    // secondary buckets than the process can keep open at once. Route those
+    // buckets in deterministic writer-sized batches. Each batch rereads the
+    // immutable primary file, so memory and file descriptors stay bounded by
+    // the governed writer limit while the logical topology is preserved.
+    for secondary_start in (0..secondary_bucket_count).step_by(writer_limit) {
+        let secondary_end = (secondary_start + writer_limit).min(secondary_bucket_count);
+        info!(
+            primary_bucket,
+            secondary_start,
+            secondary_end,
+            secondary_bucket_count,
+            writer_limit,
+            "page_weekly_edits: routing secondary writer batch"
         );
-        reconciliation_peak.observe(MemorySnapshot::capture(), None);
-        governor.checkpoint("page_weekly_edits_route_secondary")?;
-    }
-    for writer in writers.into_values() {
-        writer.finish()?;
+        let mut writers: BTreeMap<usize, BatchedWriter<File>> = BTreeMap::new();
+        let mut reader =
+            storage::SequentialParquetReader::new(primary_path, None, WEEKLY_ROUTING_BATCH_ROWS)?;
+        anyhow::ensure!(
+            reader.rows() == expected.rows,
+            "primary bucket {primary_bucket} footer row count changed before secondary routing"
+        );
+
+        while let Some(batch) = reader.next_batch()? {
+            let page_ids = batch.column("page_id")?.i64()?;
+            let mut row_indices: Vec<Vec<IdxSize>> = (secondary_start..secondary_end)
+                .map(|_| Vec::new())
+                .collect();
+            for row in 0..batch.height() {
+                let secondary = stable_weekly_secondary_bucket(
+                    page_ids.get(row),
+                    primary_bucket_count,
+                    secondary_bucket_count,
+                );
+                if (secondary_start..secondary_end).contains(&secondary) {
+                    row_indices[secondary - secondary_start].push(row as IdxSize);
+                }
+            }
+            for (offset, indices) in row_indices.into_iter().enumerate() {
+                if indices.is_empty() {
+                    continue;
+                }
+                let secondary = secondary_start + offset;
+                let take = IdxCa::from_vec("secondary_routing_rows".into(), indices);
+                let mut frame = batch.take(&take)?;
+                frame.rechunk_mut();
+                let frame_edits = sum_edits_column(std::slice::from_ref(&frame))?;
+                routed_rows = routed_rows
+                    .checked_add(frame.height())
+                    .context("secondary routing row count overflow")?;
+                routed_edits = routed_edits
+                    .checked_add(frame_edits)
+                    .context("secondary routing edit count overflow")?;
+                rows[secondary] = rows[secondary]
+                    .checked_add(frame.height())
+                    .context("secondary routing row count overflow")?;
+                edits[secondary] = edits[secondary]
+                    .checked_add(frame_edits)
+                    .context("secondary routing edit count overflow")?;
+                let path = runs.secondary_path(primary_bucket, secondary);
+                let writer = match writers.entry(secondary) {
+                    std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(entry) => {
+                        paths[secondary] = Some(path.clone());
+                        entry.insert(
+                            ParquetWriter::new(File::create(path)?)
+                                .with_compression(ParquetCompression::Zstd(None))
+                                .batched(frame.schema())?,
+                        )
+                    }
+                };
+                writer.write_batch(&frame)?;
+                peak_active_writers = peak_active_writers.max(writers.len());
+            }
+            reconciliation_peak.observe(MemorySnapshot::capture(), None);
+            governor.checkpoint("page_weekly_edits_route_secondary")?;
+        }
+        info!(
+            primary_bucket,
+            secondary_start,
+            secondary_end,
+            active_writers = writers.len(),
+            peak_active_writers,
+            "page_weekly_edits: finished secondary writer batch"
+        );
+        for writer in writers.into_values() {
+            writer.finish()?;
+        }
     }
     anyhow::ensure!(
-        checked_sum_usize(&rows, "secondary routing row count")? == expected.rows,
+        checked_sum_usize(&rows, "secondary routing row count")? == expected.rows
+            && routed_rows == expected.rows,
         "primary bucket {primary_bucket} row count changed during secondary routing"
     );
     anyhow::ensure!(
-        checked_sum_i64(&edits, "secondary routing edit count")? == expected.edits,
+        routed_edits == expected.edits,
         "primary bucket {primary_bucket} edit count changed during secondary routing"
     );
     Ok(SecondaryRouting {

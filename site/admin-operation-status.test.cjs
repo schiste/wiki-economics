@@ -212,4 +212,8 @@ test("failure diagnoses prescribe only evidence-backed recovery paths", () => {
   assert.equal(classifyError("worker lease heartbeat expired").remediationCode, "fleet_lease_stale");
   assert.equal(classifyError("automatic retries exhausted").remediationCode, "fleet_task_quarantined");
   assert.equal(classifyError("No space left on device").remediationCode, "storage_reserve_exhausted");
+  assert.equal(classifyError('Error: not found: "period_start" not found').remediationCode, "artifact_scrub_schema_mismatch");
+  assert.equal(classifyError("secondary bucket count 32 exceeds the governed Parquet writer limit 16").remediationCode, "writer_limit_exceeded");
+  assert.equal(classifyError("resource governor memory gate closed at 5201457152 bytes").remediationCode, "memory_gate_closed");
+  assert.equal(classifyError("unchanged candidate is not the newest indexed ready candidate").remediationCode, "stale_ready_index");
 });
