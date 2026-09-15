@@ -534,6 +534,7 @@ pub fn scan(
     let legacy_inequality = MetricId::from_artifact_identity(identity)
         .is_some_and(|metric| metric == MetricId::Inequality)
         && algorithm_version == "monthly-stateless-v2-total-order";
+    #[cfg(not(coverage))]
     if legacy_inequality {
         warn!(
             artifact = %artifact.display(),
@@ -1222,7 +1223,8 @@ mod tests {
             "output/afwiki/inequality.parquet",
             "monthly-stateless-v2-total-order",
             "legacy-input",
-        )?;
+        )
+        .expect("legacy inequality schema should scrub");
         assert_eq!(receipt.minimum_date.as_deref(), Some("2026-01"));
         assert_eq!(receipt.maximum_date.as_deref(), Some("2026-02"));
         assert_eq!(receipt.conservation_totals.get("total_edits"), Some(&210));
