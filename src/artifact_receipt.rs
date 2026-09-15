@@ -15,6 +15,8 @@ use crate::{metric_registry::MetricId, storage};
 pub const ARTIFACT_RECEIPT_SCHEMA_VERSION: u32 = 1;
 const RECEIPT_DOCUMENT_SCHEMA_VERSION: u32 = 1;
 const SEMANTIC_BATCH_ROWS: usize = 250_000;
+const LEGACY_INEQUALITY_ALGORITHM_VERSION: &str = "monthly-stateless-v2-total-order";
+const MERGED_INEQUALITY_ALGORITHM_VERSION: &str = "merged-wiki-runs-v1/inequality.parquet";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FieldIdentity {
@@ -136,7 +138,7 @@ impl SemanticSpec {
         if let Some(metric) = MetricId::from_artifact_identity(identity) {
             let definition = metric.definition();
             let legacy_inequality = metric == MetricId::Inequality
-                && algorithm_version == Some("monthly-stateless-v2-total-order");
+                && algorithm_version == Some(LEGACY_INEQUALITY_ALGORITHM_VERSION);
             if legacy_inequality {
                 return Self {
                     date_column: None,
@@ -165,6 +167,63 @@ impl SemanticSpec {
             page_week_consistency: false,
         }
     }
+
+    fn for_identity_with_schema(
+        identity: &str,
+        algorithm_version: &str,
+        schema: &Schema,
+    ) -> (Self, bool) {
+        let mut spec = Self::for_identity_with_algorithm(identity, Some(algorithm_version));
+        let legacy_inequality =
+            is_legacy_inequality_contract(identity, algorithm_version, Some(schema));
+        if legacy_inequality {
+            spec.date_column = None;
+            spec.conservation_columns = vec!["total_edits".to_string()];
+            spec.page_week_consistency = false;
+        }
+        (spec, legacy_inequality)
+    }
+}
+
+fn is_legacy_inequality_contract(
+    identity: &str,
+    algorithm_version: &str,
+    schema: Option<&Schema>,
+) -> bool {
+    let Some(metric) = MetricId::from_artifact_identity(identity) else {
+        return false;
+    };
+    if metric != MetricId::Inequality {
+        return false;
+    }
+    if algorithm_version == LEGACY_INEQUALITY_ALGORITHM_VERSION {
+        return true;
+    }
+    // The merged v1 algorithm string predates the period_start migration and
+    // is shared by current merged output. Treat only a receipt whose physical
+    // schema proves the old year_month-only contract as legacy; a current
+    // merged receipt must still contain period_start and remains strict.
+    algorithm_version == MERGED_INEQUALITY_ALGORITHM_VERSION
+        && schema.is_some_and(is_legacy_inequality_schema)
+}
+
+fn is_legacy_inequality_schema(schema: &Schema) -> bool {
+    let expected = [
+        "year_month",
+        "user_type",
+        "gini",
+        "theil",
+        "palma",
+        "min_editors_50pct",
+        "total_editors",
+        "total_edits",
+        "wiki",
+    ];
+    schema.iter_fields().count() == expected.len()
+        && schema
+            .iter_fields()
+            .zip(expected)
+            .all(|(field, name)| field.name() == name)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -531,9 +590,16 @@ pub fn scan(
     algorithm_version: &str,
     input_fingerprint: &str,
 ) -> Result<ArtifactReceipt> {
-    let legacy_inequality = MetricId::from_artifact_identity(identity)
-        .is_some_and(|metric| metric == MetricId::Inequality)
-        && algorithm_version == "monthly-stateless-v2-total-order";
+    let mut reader = storage::SequentialParquetReader::new(artifact, None, SEMANTIC_BATCH_ROWS)
+        .with_context(|| format!("artifact={} stage=open_parquet", artifact.display()))?;
+    let expected_rows = u64::try_from(reader.rows())
+        .with_context(|| format!("artifact={} stage=read_parquet_footer", artifact.display()))?;
+    let schema_frame = reader
+        .schema_frame()
+        .with_context(|| format!("artifact={} stage=read_schema", artifact.display()))?;
+    let (spec, legacy_inequality) =
+        SemanticSpec::for_identity_with_schema(identity, algorithm_version, schema_frame.schema());
+    let mut accumulator = SemanticAccumulator::new(spec);
     #[cfg(not(coverage))]
     if legacy_inequality {
         warn!(
@@ -544,15 +610,6 @@ pub fn scan(
             "scrubbing versioned legacy inequality schema with explicit compatibility contract"
         );
     }
-    let spec = SemanticSpec::for_identity_with_algorithm(identity, Some(algorithm_version));
-    let mut reader = storage::SequentialParquetReader::new(artifact, None, SEMANTIC_BATCH_ROWS)
-        .with_context(|| format!("artifact={} stage=open_parquet", artifact.display()))?;
-    let expected_rows = u64::try_from(reader.rows())
-        .with_context(|| format!("artifact={} stage=read_parquet_footer", artifact.display()))?;
-    let mut accumulator = SemanticAccumulator::new(spec);
-    let schema_frame = reader
-        .schema_frame()
-        .with_context(|| format!("artifact={} stage=read_schema", artifact.display()))?;
     accumulator.observe(&schema_frame).with_context(|| {
         format!(
             "artifact={} identity={} stage=validate_schema",
@@ -1082,6 +1139,30 @@ mod tests {
         Ok(())
     }
 
+    fn write_current_inequality(path: &Path) -> Result<()> {
+        let mut frame = df!(
+            "year_month" => &["2026-01", "2026-02"],
+            "period" => &["2026-01", "2026-02"],
+            "period_start" => &["2026-01-01", "2026-02-01"],
+            "period_end" => &["2026-01-31", "2026-02-28"],
+            "period_type" => &["month", "month"],
+            "period_months" => &[1_u32, 1],
+            "user_type" => &["registered", "registered"],
+            "gini" => &[0.2_f64, 0.3],
+            "theil" => &[0.1_f64, 0.2],
+            "palma" => &[1.2_f64, 1.3],
+            "min_editors_50pct" => &[2_u32, 3],
+            "total_editors" => &[10_u32, 11],
+            "total_edits" => &[100_u32, 110],
+            "wiki" => &["afwiki", "afwiki"],
+        )
+        .expect("valid current inequality receipt fixture");
+        ParquetWriter::new(File::create(path).expect("create current inequality fixture"))
+            .finish(&mut frame)
+            .expect("write current inequality fixture");
+        Ok(())
+    }
+
     #[test]
     fn semantic_receipt_is_canonical_transactional_and_fail_closed() -> Result<()> {
         let directory = TestDir::new()?;
@@ -1229,6 +1310,35 @@ mod tests {
         assert_eq!(receipt.maximum_date.as_deref(), Some("2026-02"));
         assert_eq!(receipt.conservation_totals.get("total_edits"), Some(&210));
         assert_eq!(receipt.parquet_schema[0].name, "year_month");
+
+        let merged_receipt = scan(
+            &artifact,
+            "merged/inequality.parquet",
+            MERGED_INEQUALITY_ALGORITHM_VERSION,
+            "legacy-input",
+        )
+        .expect("legacy merged inequality schema should scrub");
+        assert_eq!(merged_receipt.minimum_date.as_deref(), Some("2026-01"));
+        assert_eq!(merged_receipt.maximum_date.as_deref(), Some("2026-02"));
+        assert_eq!(
+            merged_receipt.conservation_totals.get("total_edits"),
+            Some(&210)
+        );
+
+        let current = directory.path().join("current-inequality.parquet");
+        write_current_inequality(&current)?;
+        let current_merged_receipt = scan(
+            &current,
+            "merged/inequality.parquet",
+            MERGED_INEQUALITY_ALGORITHM_VERSION,
+            "current-input",
+        )
+        .expect("current merged inequality schema should remain strict");
+        assert_eq!(
+            current_merged_receipt.minimum_date.as_deref(),
+            Some("2026-01-01")
+        );
+        assert!(current_merged_receipt.conservation_totals.is_empty());
 
         assert!(
             scan(
