@@ -550,6 +550,11 @@ pub fn write_output(df: &mut DataFrame, wiki: &str, metric: &str, output_dir: &P
     drop(file);
     let bytes = pending.publish()?;
     crate::artifact_receipt::write_semantic_draft(&path, semantics)?;
+    // The output is durable and will be reopened by later pipeline stages.
+    // Release its page-cache charge now so the cgroup admission gate measures
+    // memory that cannot be reclaimed, rather than accumulating every metric
+    // written earlier in this run.
+    storage::discard_path_cache(&path);
     info!(
         wiki = wiki,
         metric = metric,

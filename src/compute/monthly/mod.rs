@@ -12,6 +12,7 @@ use super::{
     PendingOutput, add_wiki_column, concat_frames, editor_identity_available_expr,
     ensure_editor_identity_inputs, sort_frame, unique_identified_editors_expr, write_output,
 };
+use crate::storage;
 use anyhow::{Context, Result};
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -188,13 +189,14 @@ pub(super) fn write_editor_identity_coverage(
         periods,
     };
     let path = editor_identity_report_path(output_dir, wiki);
-    let pending = PendingOutput::new(path)?;
+    let pending = PendingOutput::new(path.clone())?;
     let mut file = File::create(&pending.temp_path)?;
     serde_json::to_writer_pretty(&mut file, &report)?;
     file.write_all(b"\n")?;
     file.sync_all()?;
     drop(file);
     pending.publish()?;
+    storage::discard_path_cache(&path);
     info!(
         wiki,
         total_edits, identified_edits, excluded_edits, "recorded editor identity coverage"

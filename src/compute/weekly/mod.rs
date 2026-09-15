@@ -1245,6 +1245,12 @@ pub(super) fn compact_weekly_primary_buckets(
         for writer in writers.into_values() {
             writer.finish()?;
         }
+        // The staged partitions are read completely during compaction and
+        // removed below. Drop their reclaimable pages before the next
+        // resource checkpoint rather than charging them to the next stage.
+        for path in staged_paths {
+            storage::discard_path_cache(path);
+        }
         *scratch_peak_bytes = (*scratch_peak_bytes).max(runs.size_bytes()?);
         reduction_peak.observe(MemorySnapshot::capture(), Some(*scratch_peak_bytes));
         governor.checkpoint("page_weekly_edits_compact_primary")?;
@@ -1390,6 +1396,11 @@ pub(super) fn route_primary_to_secondary_buckets(
         for writer in writers.into_values() {
             writer.finish()?;
         }
+        // This primary bucket is reread once per writer-sized batch. Its
+        // cache is no longer useful after the final batch has closed.
+        if secondary_end == secondary_bucket_count {
+            storage::discard_path_cache(primary_path);
+        }
     }
     anyhow::ensure!(
         checked_sum_usize(&rows, "secondary routing row count")? == expected.rows
@@ -1409,6 +1420,7 @@ pub(super) fn route_primary_to_secondary_buckets(
 
 pub(super) fn reclaim_completed_weekly_scratch(path: Option<&Path>) -> Result<()> {
     if let Some(path) = path {
+        storage::discard_path_cache(path);
         fs::remove_file(path)?;
     }
     Ok(())
@@ -1576,6 +1588,7 @@ pub(super) fn append_weekly_bucket_results(
             .as_mut()
             .context("page_weekly_edits output writer was not initialized")?
             .write_batch(&mut frame)?;
+        storage::discard_path_cache(&result.result_path);
         fs::remove_file(&result.result_path)?;
         *output_rows = output_rows
             .checked_add(result.output_rows)
@@ -1844,6 +1857,7 @@ impl AtomicBatchedParquetWriter {
         let final_path = self.pending.final_path.clone();
         let bytes = self.pending.publish()?;
         crate::artifact_receipt::write_semantic_draft(&final_path, self.semantics)?;
+        storage::discard_path_cache(&final_path);
         Ok(bytes)
     }
 }
