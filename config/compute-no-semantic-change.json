@@ -180,6 +180,30 @@
       "paths": ["src/compute/mod.rs", "src/compute/weekly/mod.rs"],
       "reason": "Route logical secondary buckets in bounded writer batches without changing page-week rows, totals, or artifact bytes.",
       "base_commit": "2b72928cccb363986d8c0dabf2105d3bda5df74f"
+    },
+    {
+      "family": "monthly",
+      "paths": ["src/compute/mod.rs", "src/compute/monthly/mod.rs"],
+      "reason": "Release reclaimable output page cache after durable writes; monthly rows, formulas, and artifact bytes are unchanged.",
+      "base_commit": "00428885d9de596d1f9cf51e92620ebf3dfccd85"
+    },
+    {
+      "family": "activity_tiers",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Release reclaimable output page cache after durable writes; activity-tier rows, formulas, and artifact bytes are unchanged.",
+      "base_commit": "00428885d9de596d1f9cf51e92620ebf3dfccd85"
+    },
+    {
+      "family": "lifecycle",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Release reclaimable output page cache after durable writes; lifecycle rows, formulas, and artifact bytes are unchanged.",
+      "base_commit": "00428885d9de596d1f9cf51e92620ebf3dfccd85"
+    },
+    {
+      "family": "page_week",
+      "paths": ["src/compute/mod.rs", "src/compute/weekly/mod.rs"],
+      "reason": "Release reclaimable weekly bucket and output page cache between stages; page-week rows, totals, and artifact bytes are unchanged.",
+      "base_commit": "00428885d9de596d1f9cf51e92620ebf3dfccd85"
     }
   ]
 }
