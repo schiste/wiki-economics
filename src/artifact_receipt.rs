@@ -8,7 +8,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::{metric_registry::MetricId, storage};
 
@@ -124,8 +124,30 @@ pub struct SemanticSpec {
 
 impl SemanticSpec {
     pub fn for_identity(identity: &str) -> Self {
+        Self::for_identity_with_algorithm(identity, None)
+    }
+
+    /// Build the semantic contract for an artifact receipt. A small number of
+    /// immutable artifacts predate the current inequality schema; their
+    /// authoritative receipt records the version explicitly, so the scrubber
+    /// can validate the old date column without weakening validation for a
+    /// current artifact that is missing `period_start`.
+    pub fn for_identity_with_algorithm(identity: &str, algorithm_version: Option<&str>) -> Self {
         if let Some(metric) = MetricId::from_artifact_identity(identity) {
             let definition = metric.definition();
+            let legacy_inequality = metric == MetricId::Inequality
+                && algorithm_version == Some("monthly-stateless-v2-total-order");
+            if legacy_inequality {
+                return Self {
+                    date_column: None,
+                    // The legacy receipt contract included the monthly edit
+                    // total even though the current inequality definition is
+                    // intentionally non-composable.
+                    conservation_columns: vec!["total_edits".to_string()],
+                    ordering_contract: definition.ordering.as_str().to_string(),
+                    page_week_consistency: false,
+                };
+            }
             return Self {
                 date_column: definition.date_column.map(str::to_string),
                 conservation_columns: definition
@@ -509,7 +531,19 @@ pub fn scan(
     algorithm_version: &str,
     input_fingerprint: &str,
 ) -> Result<ArtifactReceipt> {
-    let spec = SemanticSpec::for_identity(identity);
+    let legacy_inequality = MetricId::from_artifact_identity(identity)
+        .is_some_and(|metric| metric == MetricId::Inequality)
+        && algorithm_version == "monthly-stateless-v2-total-order";
+    if legacy_inequality {
+        warn!(
+            artifact = %artifact.display(),
+            identity,
+            algorithm_version,
+            date_column = "year_month",
+            "scrubbing versioned legacy inequality schema with explicit compatibility contract"
+        );
+    }
+    let spec = SemanticSpec::for_identity_with_algorithm(identity, Some(algorithm_version));
     let mut reader = storage::SequentialParquetReader::new(artifact, None, SEMANTIC_BATCH_ROWS)
         .with_context(|| format!("artifact={} stage=open_parquet", artifact.display()))?;
     let expected_rows = u64::try_from(reader.rows())
@@ -1028,6 +1062,25 @@ mod tests {
         Ok(())
     }
 
+    fn write_legacy_inequality(path: &Path) -> Result<()> {
+        let mut frame = df!(
+            "year_month" => &["2026-01", "2026-02"],
+            "user_type" => &["registered", "registered"],
+            "gini" => &[0.2_f64, 0.3],
+            "theil" => &[0.1_f64, 0.2],
+            "palma" => &[1.2_f64, 1.3],
+            "min_editors_50pct" => &[2_u32, 3],
+            "total_editors" => &[10_u32, 11],
+            "total_edits" => &[100_u32, 110],
+            "wiki" => &["afwiki", "afwiki"],
+        )
+        .expect("valid legacy inequality receipt fixture");
+        ParquetWriter::new(File::create(path).expect("create legacy inequality fixture"))
+            .finish(&mut frame)
+            .expect("write legacy inequality fixture");
+        Ok(())
+    }
+
     #[test]
     fn semantic_receipt_is_canonical_transactional_and_fail_closed() -> Result<()> {
         let directory = TestDir::new()?;
@@ -1155,6 +1208,35 @@ mod tests {
         assert_eq!(sum_numeric(&Column::new("v".into(), [1_u64, 2]), "v")?, 3);
         assert_eq!(sum_numeric(&Column::new("v".into(), [-1_i32, 2]), "v")?, 1);
         assert!(sum_numeric(&Column::new("v".into(), [true]), "v").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn versioned_legacy_inequality_schema_is_scrubbed_with_its_recorded_contract() -> Result<()> {
+        let directory = TestDir::new()?;
+        let artifact = directory.path().join("inequality.parquet");
+        write_legacy_inequality(&artifact)?;
+
+        let receipt = scan(
+            &artifact,
+            "output/afwiki/inequality.parquet",
+            "monthly-stateless-v2-total-order",
+            "legacy-input",
+        )?;
+        assert_eq!(receipt.minimum_date.as_deref(), Some("2026-01"));
+        assert_eq!(receipt.maximum_date.as_deref(), Some("2026-02"));
+        assert_eq!(receipt.conservation_totals.get("total_edits"), Some(&210));
+        assert_eq!(receipt.parquet_schema[0].name, "year_month");
+
+        assert!(
+            scan(
+                &artifact,
+                "output/afwiki/inequality.parquet",
+                "monthly-stateless-v5-exact-period-inequality",
+                "current-input",
+            )
+            .is_err()
+        );
         Ok(())
     }
 
