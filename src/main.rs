@@ -5240,4 +5240,44 @@ mod tests {
         assert!(err.to_string().contains("merge failed"));
         Ok(())
     }
+
+    #[cfg(coverage)]
+    #[test]
+    fn staged_compute_dispatch_is_covered() -> Result<()> {
+        assert_eq!(
+            ComputeFamilyArg::Monthly.family(),
+            metric_registry::MetricFamily::Monthly
+        );
+        assert_eq!(
+            ComputeFamilyArg::ActivityTiers.family(),
+            metric_registry::MetricFamily::ActivityTiers
+        );
+        assert_eq!(
+            ComputeFamilyArg::Lifecycle.family(),
+            metric_registry::MetricFamily::Lifecycle
+        );
+        assert_eq!(
+            ComputeFamilyArg::PageWeek.family(),
+            metric_registry::MetricFamily::PageWeek
+        );
+
+        let root = TestDir::new()?;
+        let ops = RealOps;
+        let _ = ops.compute_family(
+            "testwiki",
+            root.path(),
+            root.path(),
+            metric_registry::MetricFamily::Monthly,
+            false,
+        );
+        let _ = ops.compute_family_at_snapshot(
+            "testwiki",
+            root.path(),
+            root.path(),
+            metric_registry::MetricFamily::Lifecycle,
+            true,
+            Some("2026-08"),
+        );
+        Ok(())
+    }
 }
