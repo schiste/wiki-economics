@@ -1330,14 +1330,8 @@ fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
                     .into_iter()
                     .map(ComputeFamilyArg::family)
                     .collect::<Vec<_>>();
-                handle_compute_families(
-                    context,
-                    ops,
-                    &wikis,
-                    &families,
-                    external,
-                    version.as_deref(),
-                )?;
+                #[rustfmt::skip]
+                handle_compute_families(context, ops, &wikis, &families, external, version.as_deref())?;
             }
         }
 
