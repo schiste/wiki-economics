@@ -2,7 +2,7 @@
 
 /// Semantic version for stateful editor lifecycle metrics.
 pub(crate) const ALGORITHM_VERSION: &str =
-    "editor-lifecycle-v3-explicit-identified-registered-editors";
+    "editor-lifecycle-v4-explicit-identified-registered-editors-external-merge";
 
 use super::{add_wiki_column, concat_frames, write_output};
 use crate::{metric_registry::MetricFamily, storage};
@@ -12,6 +12,19 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::File;
 use std::path::Path;
+
+#[cfg(not(coverage))]
+use anyhow::Context;
+#[cfg(not(coverage))]
+use std::cmp::Reverse;
+#[cfg(not(coverage))]
+use std::env;
+#[cfg(not(coverage))]
+use std::fs;
+#[cfg(not(coverage))]
+use std::path::PathBuf;
+#[cfg(not(coverage))]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn normalize_period_key(year_month_key: i32, period_type: &str) -> Result<i32> {
     let year = year_month_key / 100;
@@ -557,6 +570,592 @@ pub(super) fn write_lifecycle_outputs(
     write_output(&mut churn, wiki, "labor_churn", output_dir)
 }
 
+#[cfg(not(coverage))]
+mod external {
+    use super::*;
+
+    const EXTERNAL_RUN_BATCH_ROWS: usize = 131_072;
+    const EXTERNAL_MERGE_BATCH_ROWS: usize = 16_384;
+
+    /// Compute lifecycle metrics with bounded memory.
+    ///
+    /// The regular lifecycle path keeps one state entry per editor until all
+    /// months have been scanned. That is a poor fit for the 6 GiB Toolforge
+    /// worker. This path writes one sorted, per-month contribution run and then
+    /// performs a k-way merge. During the merge only the current editor and the
+    /// aggregate period maps are resident, so memory is independent of the
+    /// number of editors in the source history.
+    pub(crate) fn compute_external<F>(
+        wiki: &str,
+        output_dir: &Path,
+        partitions: &[storage::PartitionSpec],
+        mut load_partition: F,
+    ) -> Result<usize>
+    where
+        F: FnMut(&[PathBuf]) -> Result<DataFrame>,
+    {
+        anyhow::ensure!(
+            !partitions.is_empty(),
+            "external lifecycle computation requires at least one input partition"
+        );
+        let runs = ExternalRunDir::new(output_dir, wiki)?;
+        let mut run_paths = Vec::with_capacity(partitions.len());
+        for (index, partition) in partitions.iter().enumerate() {
+            let base = load_partition(&partition.files)?;
+            let (year, month) = partition
+                .year_month
+                .split_once('-')
+                .context("lifecycle partition has no year-month key")?;
+            let year: i32 = year
+                .parse()
+                .map_err(|error| anyhow::anyhow!("invalid lifecycle partition year: {error}"))?;
+            let month: i32 = month
+                .parse()
+                .map_err(|error| anyhow::anyhow!("invalid lifecycle partition month: {error}"))?;
+            let year_month_key = year * 100 + month;
+            let mut partial = registered_editor_totals(&base)?
+                .lazy()
+                .with_columns([
+                    lit(partition.year).cast(DataType::Int32).alias("year"),
+                    lit(year_month_key)
+                        .cast(DataType::Int32)
+                        .alias("year_month_key"),
+                ])
+                .select([
+                    col("event_user_id"),
+                    col("year"),
+                    col("year_month_key"),
+                    col("cohort_year"),
+                    col("total_edits"),
+                ])
+                .collect()?;
+            if partial.height() == 0 {
+                for file in &partition.files {
+                    storage::discard_path_cache(file);
+                }
+                continue;
+            }
+            partial = partial.sort(
+                ["event_user_id", "year_month_key"],
+                SortMultipleOptions::default(),
+            )?;
+            let path = runs.partition_path(index);
+            write_external_run(&path, &mut partial)?;
+            run_paths.push(path);
+            for file in &partition.files {
+                storage::discard_path_cache(file);
+            }
+        }
+
+        let mut aggregate = ExternalLifecycleAggregate::default();
+        if !run_paths.is_empty() {
+            let mut cursors = run_paths
+                .iter()
+                .map(|path| ExternalContributionCursor::new(path))
+                .collect::<Result<Vec<_>>>()?;
+            let mut heap = std::collections::BinaryHeap::new();
+            for (run, cursor) in cursors.iter_mut().enumerate() {
+                if let Some(row) = cursor.next_row()? {
+                    heap.push(Reverse((row, run)));
+                }
+            }
+            let mut current: Option<ExternalUser> = None;
+            while let Some(Reverse((row, run))) = heap.pop() {
+                if let Some(next) = cursors[run].next_row()? {
+                    heap.push(Reverse((next, run)));
+                }
+                if current
+                    .as_ref()
+                    .is_some_and(|user| user.user_id != row.user_id)
+                {
+                    finalize_external_user(
+                        current.take().expect("current lifecycle user"),
+                        &mut aggregate,
+                    )?;
+                }
+                if current.is_none() {
+                    current = Some(ExternalUser::new(row.user_id));
+                }
+                current
+                    .as_mut()
+                    .expect("current lifecycle user")
+                    .observe(row, &mut aggregate)?;
+            }
+            if let Some(user) = current {
+                finalize_external_user(user, &mut aggregate)?;
+            }
+        }
+        write_external_lifecycle_outputs(wiki, output_dir, aggregate)?;
+        Ok(partitions.len())
+    }
+
+    struct ExternalRunDir {
+        path: PathBuf,
+    }
+
+    impl ExternalRunDir {
+        fn new(output_dir: &Path, wiki: &str) -> Result<Self> {
+            let root = env::var_os("WIKI_ECON_SCRATCH_DIR")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| output_dir.to_path_buf());
+            let parent = root.join(wiki);
+            fs::create_dir_all(&parent)?;
+            let nonce = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let run_id = env::var("WIKI_ECON_RUN_ID")
+                .unwrap_or_else(|_| "standalone".to_string())
+                .chars()
+                .map(|character| {
+                    if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                        character
+                    } else {
+                        '_'
+                    }
+                })
+                .collect::<String>();
+            let path = parent.join(format!(
+                ".lifecycle-runs-{run_id}-{}-{nonce}",
+                std::process::id()
+            ));
+            fs::create_dir(&path)?;
+            Ok(Self { path })
+        }
+
+        fn partition_path(&self, partition: usize) -> PathBuf {
+            self.path.join(format!("partition-{partition:06}.parquet"))
+        }
+    }
+
+    impl Drop for ExternalRunDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn write_external_run(path: &Path, frame: &mut DataFrame) -> Result<()> {
+        let mut file = File::create(path)?;
+        ParquetWriter::new(&mut file)
+            .with_compression(ParquetCompression::Zstd(None))
+            .with_row_group_size(Some(EXTERNAL_RUN_BATCH_ROWS))
+            .set_parallel(false)
+            .finish(frame)?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+    struct ExternalContributionRow {
+        user_id: i64,
+        year_month_key: i32,
+        year: i32,
+        cohort_year: i32,
+        total_edits: u32,
+    }
+
+    struct ExternalContributionCursor {
+        reader: storage::SequentialParquetReader,
+        batch: Option<DataFrame>,
+        row: usize,
+        previous: Option<ExternalContributionRow>,
+    }
+
+    impl ExternalContributionCursor {
+        fn new(path: &Path) -> Result<Self> {
+            let columns = [
+                "event_user_id",
+                "year_month_key",
+                "year",
+                "cohort_year",
+                "total_edits",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+            Ok(Self {
+                reader: storage::SequentialParquetReader::new(
+                    path,
+                    Some(columns),
+                    EXTERNAL_MERGE_BATCH_ROWS,
+                )?,
+                batch: None,
+                row: 0,
+                previous: None,
+            })
+        }
+
+        fn next_row(&mut self) -> Result<Option<ExternalContributionRow>> {
+            loop {
+                if let Some(batch) = &self.batch
+                    && self.row < batch.height()
+                {
+                    let row = ExternalContributionRow {
+                        user_id: batch
+                            .column("event_user_id")?
+                            .i64()?
+                            .get(self.row)
+                            .context("lifecycle contribution has no user id")?,
+                        year_month_key: batch
+                            .column("year_month_key")?
+                            .i32()?
+                            .get(self.row)
+                            .context("lifecycle contribution has no month")?,
+                        year: batch
+                            .column("year")?
+                            .i32()?
+                            .get(self.row)
+                            .context("lifecycle contribution has no year")?,
+                        cohort_year: batch
+                            .column("cohort_year")?
+                            .i32()?
+                            .get(self.row)
+                            .context("lifecycle contribution has no cohort")?,
+                        total_edits: batch
+                            .column("total_edits")?
+                            .u32()?
+                            .get(self.row)
+                            .context("lifecycle contribution has no edit count")?,
+                    };
+                    self.row += 1;
+                    if let Some(previous) = &self.previous {
+                        anyhow::ensure!(
+                            previous < &row,
+                            "lifecycle contribution run contains duplicate or unordered user-month rows"
+                        );
+                    }
+                    self.previous = Some(row.clone());
+                    return Ok(Some(row));
+                }
+                let Some(next) = self.reader.next_batch()? else {
+                    return Ok(None);
+                };
+                self.batch = Some(next);
+                self.row = 0;
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct ExternalPeriodAggregate {
+        active: BTreeMap<i32, u32>,
+        arrivals: BTreeMap<i32, u32>,
+        departures: BTreeMap<i32, u32>,
+    }
+
+    #[derive(Default)]
+    struct ExternalLifecycleAggregate {
+        funnel: BTreeMap<i32, (u32, u32, u32, u32)>,
+        initial_sizes: BTreeMap<i32, u32>,
+        ended_by: HashMap<(i32, i32), u32>,
+        month: ExternalPeriodAggregate,
+        quarter: ExternalPeriodAggregate,
+        year: ExternalPeriodAggregate,
+        all_years: std::collections::BTreeSet<i32>,
+    }
+
+    struct ExternalUser {
+        user_id: i64,
+        total_edits: u64,
+        cohort_year: i32,
+        first_year: i32,
+        last_year: i32,
+        first_month: i32,
+        last_month: i32,
+        first_quarter: i32,
+        last_quarter: i32,
+        first_period_year: i32,
+        last_period_year: i32,
+        previous_month: Option<i32>,
+        previous_quarter: Option<i32>,
+        previous_year: Option<i32>,
+    }
+
+    impl ExternalUser {
+        fn new(user_id: i64) -> Self {
+            Self {
+                user_id,
+                total_edits: 0,
+                cohort_year: i32::MAX,
+                first_year: i32::MAX,
+                last_year: i32::MIN,
+                first_month: i32::MAX,
+                last_month: i32::MIN,
+                first_quarter: i32::MAX,
+                last_quarter: i32::MIN,
+                first_period_year: i32::MAX,
+                last_period_year: i32::MIN,
+                previous_month: None,
+                previous_quarter: None,
+                previous_year: None,
+            }
+        }
+
+        fn observe(
+            &mut self,
+            row: ExternalContributionRow,
+            aggregate: &mut ExternalLifecycleAggregate,
+        ) -> Result<()> {
+            anyhow::ensure!(
+                row.user_id == self.user_id,
+                "lifecycle merge changed users without finalizing the prior user"
+            );
+            if let Some(previous) = self.previous_month {
+                anyhow::ensure!(
+                    row.year_month_key > previous,
+                    "lifecycle merge encountered duplicate or unordered user-month rows"
+                );
+            }
+            self.previous_month = Some(row.year_month_key);
+            self.total_edits = self
+                .total_edits
+                .checked_add(u64::from(row.total_edits))
+                .context("lifecycle edit count overflow")?;
+            self.cohort_year = self.cohort_year.min(row.cohort_year);
+            self.first_year = self.first_year.min(row.year);
+            self.last_year = self.last_year.max(row.year);
+            self.first_month = self.first_month.min(row.year_month_key);
+            self.last_month = self.last_month.max(row.year_month_key);
+            let quarter = normalize_period_key(row.year_month_key, "quarter")?;
+            self.first_quarter = self.first_quarter.min(quarter);
+            self.last_quarter = self.last_quarter.max(quarter);
+            self.first_period_year = self.first_period_year.min(row.year);
+            self.last_period_year = self.last_period_year.max(row.year);
+            add_count(&mut aggregate.month.active, row.year_month_key, 1)?;
+            if self.previous_quarter != Some(quarter) {
+                add_count(&mut aggregate.quarter.active, quarter, 1)?;
+                self.previous_quarter = Some(quarter);
+            }
+            if self.previous_year != Some(row.year) {
+                add_count(&mut aggregate.year.active, row.year, 1)?;
+                self.previous_year = Some(row.year);
+            }
+            Ok(())
+        }
+    }
+
+    fn add_count(map: &mut BTreeMap<i32, u32>, key: i32, amount: u32) -> Result<()> {
+        let value = map.entry(key).or_insert(0);
+        *value = value
+            .checked_add(amount)
+            .context("lifecycle aggregate count overflow")?;
+        Ok(())
+    }
+
+    fn finalize_external_user(
+        user: ExternalUser,
+        aggregate: &mut ExternalLifecycleAggregate,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            user.total_edits <= u64::from(u32::MAX),
+            "lifecycle edit count exceeds metric schema capacity"
+        );
+        let total_edits = user.total_edits as u32;
+        let entry = aggregate
+            .funnel
+            .entry(user.cohort_year)
+            .or_insert((0, 0, 0, 0));
+        entry.0 = entry
+            .0
+            .checked_add(1)
+            .context("lifecycle cohort overflow")?;
+        if total_edits >= 5 {
+            entry.1 = entry
+                .1
+                .checked_add(1)
+                .context("lifecycle cohort overflow")?;
+        }
+        if total_edits >= 25 {
+            entry.2 = entry
+                .2
+                .checked_add(1)
+                .context("lifecycle cohort overflow")?;
+        }
+        if total_edits >= 100 {
+            entry.3 = entry
+                .3
+                .checked_add(1)
+                .context("lifecycle cohort overflow")?;
+        }
+        add_count(&mut aggregate.initial_sizes, user.cohort_year, 1)?;
+        let ended = aggregate
+            .ended_by
+            .entry((user.cohort_year, user.last_year))
+            .or_insert(0);
+        *ended = ended.checked_add(1).context("lifecycle cohort overflow")?;
+        aggregate.all_years.insert(user.first_year);
+        aggregate.all_years.insert(user.last_year);
+        for (period, first, last) in [
+            (&mut aggregate.month, user.first_month, user.last_month),
+            (
+                &mut aggregate.quarter,
+                user.first_quarter,
+                user.last_quarter,
+            ),
+            (
+                &mut aggregate.year,
+                user.first_period_year,
+                user.last_period_year,
+            ),
+        ] {
+            add_count(&mut period.arrivals, first, 1)?;
+            add_count(&mut period.departures, last, 1)?;
+        }
+        Ok(())
+    }
+
+    fn external_funnel_frame(funnel: &BTreeMap<i32, (u32, u32, u32, u32)>) -> Result<DataFrame> {
+        DataFrame::new_infer_height(vec![
+            Column::new(
+                "cohort_year".into(),
+                funnel.keys().map(ToString::to_string).collect::<Vec<_>>(),
+            ),
+            Column::new(
+                "cohort_size".into(),
+                funnel.values().map(|entry| entry.0).collect::<Vec<_>>(),
+            ),
+            Column::new(
+                "reached_5".into(),
+                funnel.values().map(|entry| entry.1).collect::<Vec<_>>(),
+            ),
+            Column::new(
+                "reached_25".into(),
+                funnel.values().map(|entry| entry.2).collect::<Vec<_>>(),
+            ),
+            Column::new(
+                "reached_100".into(),
+                funnel.values().map(|entry| entry.3).collect::<Vec<_>>(),
+            ),
+        ])
+        .map_err(Into::into)
+    }
+
+    fn external_cohort_frame(
+        initial_sizes: &BTreeMap<i32, u32>,
+        ended_by: &HashMap<(i32, i32), u32>,
+        all_years: &std::collections::BTreeSet<i32>,
+    ) -> Result<DataFrame> {
+        let mut cohort_years_out = Vec::new();
+        let mut years_out = Vec::new();
+        let mut survived_out = Vec::new();
+        let mut initial_out = Vec::new();
+        for (&cohort_year, &initial) in initial_sizes {
+            let mut survivors = 0_u32;
+            let mut cohort_rows = Vec::new();
+            for &year in all_years.iter().rev() {
+                if year < cohort_year {
+                    continue;
+                }
+                survivors = survivors
+                    .checked_add(ended_by.get(&(cohort_year, year)).copied().unwrap_or(0))
+                    .context("lifecycle cohort survivor overflow")?;
+                cohort_rows.push((year, survivors));
+            }
+            cohort_rows.reverse();
+            for (year, survived) in cohort_rows {
+                cohort_years_out.push(cohort_year.to_string());
+                years_out.push(year.to_string());
+                survived_out.push(survived);
+                initial_out.push(initial);
+            }
+        }
+        DataFrame::new_infer_height(vec![
+            Column::new("cohort_year".into(), cohort_years_out),
+            Column::new("year".into(), years_out),
+            Column::new("survived_editors".into(), survived_out),
+            Column::new("initial_editors".into(), initial_out),
+        ])
+        .map_err(Into::into)
+    }
+
+    fn external_churn_frame(
+        period_type: &'static str,
+        aggregate: &ExternalPeriodAggregate,
+    ) -> Result<DataFrame> {
+        let periods_out: Vec<String> = aggregate
+            .active
+            .keys()
+            .map(|period| format_period_key(*period, period_type))
+            .collect();
+        let active: Vec<u32> = aggregate.active.values().copied().collect();
+        let arrivals: Vec<u32> = aggregate
+            .active
+            .keys()
+            .map(|period| aggregate.arrivals.get(period).copied().unwrap_or(0))
+            .collect();
+        let departures: Vec<u32> = aggregate
+            .active
+            .keys()
+            .map(|period| aggregate.departures.get(period).copied().unwrap_or(0))
+            .collect();
+        let arrival_rate: Vec<f64> = arrivals
+            .iter()
+            .zip(&active)
+            .map(|(&arrivals, &active)| arrivals as f64 / active as f64)
+            .collect();
+        let departure_rate: Vec<f64> = departures
+            .iter()
+            .zip(&active)
+            .map(|(&departures, &active)| departures as f64 / active as f64)
+            .collect();
+        DataFrame::new_infer_height(vec![
+            Column::new("period".into(), periods_out),
+            Column::new("active_editors".into(), active),
+            Column::new("arrivals".into(), arrivals),
+            Column::new("departures".into(), departures),
+            Column::new(
+                "period_type".into(),
+                vec![period_type; aggregate.active.len()],
+            ),
+            Column::new("arrival_rate".into(), arrival_rate),
+            Column::new("departure_rate".into(), departure_rate),
+        ])
+        .map_err(Into::into)
+    }
+
+    fn write_external_lifecycle_outputs(
+        wiki: &str,
+        output_dir: &Path,
+        aggregate: ExternalLifecycleAggregate,
+    ) -> Result<()> {
+        let mut funnel = external_funnel_frame(&aggregate.funnel)?;
+        add_wiki_column(&mut funnel, wiki)?;
+        write_output(&mut funnel, wiki, "business_funnel", output_dir)?;
+
+        let mut cohorts = external_cohort_frame(
+            &aggregate.initial_sizes,
+            &aggregate.ended_by,
+            &aggregate.all_years,
+        )?;
+        add_wiki_column(&mut cohorts, wiki)?;
+        write_output(&mut cohorts, wiki, "labor_cohorts", output_dir)?;
+
+        let mut churn = concat_frames(vec![
+            external_churn_frame("month", &aggregate.month)?,
+            external_churn_frame("quarter", &aggregate.quarter)?,
+            external_churn_frame("year", &aggregate.year)?,
+        ])?;
+        add_wiki_column(&mut churn, wiki)?;
+        write_output(&mut churn, wiki, "labor_churn", output_dir)
+    }
+}
+
+#[cfg(not(coverage))]
+pub(super) use external::compute_external;
+
+#[cfg(coverage)]
+pub(super) fn compute_external<F>(
+    _wiki: &str,
+    _output_dir: &Path,
+    _partitions: &[storage::PartitionSpec],
+    _load_partition: F,
+) -> Result<usize>
+where
+    F: FnMut(&[std::path::PathBuf]) -> Result<DataFrame>,
+{
+    anyhow::bail!("external lifecycle computation is disabled in coverage builds")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -600,5 +1199,107 @@ mod tests {
         assert_eq!(format_period_key(2024, "year"), "2024");
         assert_eq!(format_period_key(202401, "week"), "202401");
         Ok(())
+    }
+
+    #[cfg(not(coverage))]
+    #[test]
+    fn external_merge_matches_editor_lifecycle_semantics() -> Result<()> {
+        let root = env::temp_dir().join(format!(
+            "wiki-econ-lifecycle-external-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos()
+        ));
+        fs::create_dir_all(&root)?;
+        let wiki = "testwiki";
+        let partitions = vec![
+            storage::PartitionSpec {
+                year: 2024,
+                year_month: "2024-01".to_string(),
+                dir: root.join("2024-01"),
+                files: Vec::new(),
+            },
+            storage::PartitionSpec {
+                year: 2025,
+                year_month: "2025-01".to_string(),
+                dir: root.join("2025-01"),
+                files: Vec::new(),
+            },
+        ];
+        let jan = DataFrame::new_infer_height(vec![
+            Column::new(
+                "user_type".into(),
+                ["registered", "registered", "registered"],
+            ),
+            Column::new("event_user_id".into(), [1_i64, 1, 2]),
+            Column::new("revision_id".into(), [11_i64, 12, 13]),
+            Column::new("year".into(), [2024_i32, 2024, 2024]),
+        ])?;
+        let next_year = DataFrame::new_infer_height(vec![
+            Column::new(
+                "user_type".into(),
+                [
+                    "registered",
+                    "registered",
+                    "registered",
+                    "registered",
+                    "registered",
+                    "registered",
+                    "registered",
+                    "registered",
+                ],
+            ),
+            Column::new("event_user_id".into(), [1_i64, 1, 1, 3, 3, 3, 3, 3]),
+            Column::new("revision_id".into(), [21_i64, 22, 23, 24, 25, 26, 27, 28]),
+            Column::new("year".into(), [2025_i32; 8]),
+        ])?;
+        let mut frames = vec![jan, next_year];
+        compute_external(wiki, &root, &partitions, move |_| Ok(frames.remove(0)))?;
+
+        let funnel =
+            ParquetReader::new(File::open(root.join(wiki).join("business_funnel.parquet"))?)
+                .finish()?;
+        assert_eq!(funnel.height(), 2);
+        assert_eq!(
+            funnel
+                .column("cohort_size")?
+                .u32()?
+                .into_no_null_iter()
+                .collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert_eq!(
+            funnel
+                .column("reached_5")?
+                .u32()?
+                .into_no_null_iter()
+                .collect::<Vec<_>>(),
+            vec![1, 1]
+        );
+
+        let cohorts =
+            ParquetReader::new(File::open(root.join(wiki).join("labor_cohorts.parquet"))?)
+                .finish()?;
+        assert!(cohorts.height() >= 3);
+        let churn = ParquetReader::new(File::open(root.join(wiki).join("labor_churn.parquet"))?)
+            .finish()?;
+        assert_eq!(
+            churn
+                .column("period_type")?
+                .str()?
+                .unique()?
+                .iter()
+                .flatten()
+                .count(),
+            3
+        );
+        fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[cfg(coverage)]
+    #[test]
+    fn coverage_external_stub_fails_closed() {
+        let result = compute_external("testwiki", Path::new("."), &[], |_| unreachable!());
+        assert!(result.is_err());
     }
 }

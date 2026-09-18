@@ -4,6 +4,24 @@
     {
       "family": "monthly",
       "paths": ["src/compute/mod.rs"],
+      "reason": "Add ordered family-stage orchestration and receipt recording without changing monthly formulas or artifact bytes.",
+      "base_commit": "89f4b0f16510368a699614407b209dfdb5c6602c"
+    },
+    {
+      "family": "activity_tiers",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Add ordered family-stage orchestration and receipt recording without changing activity-tier formulas or artifact bytes.",
+      "base_commit": "89f4b0f16510368a699614407b209dfdb5c6602c"
+    },
+    {
+      "family": "page_week",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Add ordered family-stage orchestration and receipt recording without changing page-week formulas or artifact bytes.",
+      "base_commit": "89f4b0f16510368a699614407b209dfdb5c6602c"
+    },
+    {
+      "family": "monthly",
+      "paths": ["src/compute/mod.rs"],
       "reason": "Add governed page-week bucket workers and capacity telemetry without changing monthly metric semantics or bytes.",
       "base_commit": "c232c4342a856f76a1aad1875683a125b5ac72c3"
     },

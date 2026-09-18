@@ -386,9 +386,10 @@ fn clean_weekly_scratch(
                 continue;
             }
             let name = entry.file_name().to_string_lossy().into_owned();
-            let Some(owner) = name.strip_prefix(".page_weekly_edits-runs-") else {
-                continue;
-            };
+            let owner = name
+                .strip_prefix(".page_weekly_edits-runs-")
+                .or_else(|| name.strip_prefix(".lifecycle-runs-"));
+            let Some(owner) = owner else { continue };
             if owner.is_empty()
                 || !owner.bytes().all(is_safe_id_byte)
                 || current_run_id.is_some_and(|run_id| owner.starts_with(&format!("{run_id}-")))

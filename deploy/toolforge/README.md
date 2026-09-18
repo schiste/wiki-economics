@@ -78,7 +78,7 @@ and higher resource envelope are being qualified.
 - `jobs.yaml` — one Rust fleet controller, two fixed small-wiki workers, two
   fixed medium/large workers, a 512 MiB admin routing dispatcher,
   and the short `wiki-econ-publish-ready` job, plus
-  legacy on-demand recovery jobs. The controller represents the sixteen
+  legacy recovery jobs and six unscheduled large-wiki pipeline jobs. The controller represents the sixteen
   scheduled wikis declared by the lifecycle registry: afwiki, arwiki, arzwiki,
   elwiki, eswiki, frwiki, hawiki, itwiki, jawiki, nlwiki, ptwiki, svwiki,
   swwiki, viwiki, yowiki, and zhwiki. Adding a wiki does not add a Toolforge
@@ -98,9 +98,12 @@ and higher resource envelope are being qualified.
   Rust-generated all-wiki defaults. It makes no browser Parquet request and
   routes readers into concrete-wiki detail dashboards; `all` is deliberately
   absent from those dashboards' wiki pickers.
-- `run-refresh-ingest.sh`, `run-refresh-compute.sh`, `run-refresh-site.sh` —
-  thin wrappers, one per on-demand Job, that export
-  `WIKI_ECON_REFRESH_STAGE` and exec `run-refresh.sh` unmodified. Toolforge
+- `run-refresh-ingest.sh`, `run-refresh-pipeline-ingest.sh`,
+  `run-refresh-compute.sh`, `run-refresh-site.sh`,
+  and the six `run-refresh-{metrics,lifecycle,page-week,patrol,publish}.sh`
+  wrappers — thin entry points that export `WIKI_ECON_REFRESH_STAGE` (and,
+  for the six-stage path, enable the durable pipeline lease) before execing
+  `run-refresh.sh` unmodified. Toolforge
   Jobs Framework CLI 0.3.9 has no per-job envvar support (`jobs run` takes no
   `--envvar`/`--envvars` flag; `toolforge envvars create` is tool-wide only),
   so `jobs.yaml` points each on-demand Job's `command:` at its wrapper
@@ -127,10 +130,11 @@ and higher resource envelope are being qualified.
   atomically switched and the prior site release is removed. Raw `.bz2` dump
   cleanup happens inside the pipeline itself, not in this script. `wiki-econ
   run` processes `WIKI_ECON_SOURCE_WINDOW_SIZE` planned sources at a time
-  (Toolforge defaults to two and rejects values outside 1–4). With that
-  default, one source may download while the preceding source is ingested;
-  the zero-capacity handoff bounds raw staging to two sources and keeps a
-  single active Parquet ingestion writer. Each source is downloaded to
+  (Toolforge defaults to one and rejects values outside 1–4). With that
+  default, one source is downloaded and ingested at a time; operators may
+  raise the window only after checking NFS headroom. The zero-capacity handoff
+  bounds raw staging to the selected window and keeps a single active Parquet
+  ingestion writer. Each source is downloaded to
   pipeline-owned staging, stream-ingested, validated, committed
   with an atomic strict marker, and immediately deleted. This bounds compressed
   raw storage to the selected window instead of retaining the whole wiki dump.
@@ -278,31 +282,55 @@ context, and the published site generation; 104 compact weekly entries are
 retained by default. See the [refresh run record](../../docs/run-record.md) for
 the field contract and operator checks.
 
-### On-demand stage jobs
+### Sequential low-memory pipeline
 
-`wiki-econ-refresh` can still run the full fetch → ingest → compute → merge →
-site pipeline, which is unnecessary when only one part changed — a
-`site/`-only or `docs/`-only commit still has to wait through a full
-fetch/compute cycle before the new page is live. `jobs.yaml` also defines three
-on-demand-only Jobs (no `schedule:`, so they never run on their own), each
-pointed at its own `run-refresh-<stage>.sh` wrapper (see the `run-refresh.sh`
-bullet above) which sets `WIKI_ECON_REFRESH_STAGE` and reuses `run-refresh.sh`
-unmodified:
+For a large wiki such as enwiki, start the six unscheduled Jobs in this order:
 
-- `wiki-econ-ingest` — fetch, ingest, and patrol-fetch only, per wiki.
-- `wiki-econ-compute` — compute, patrol-compute, and merge only, then
-  publication-validate. Assumes a prior ingest already populated the
-  selected generation; the existing stage-fingerprint checks fail closed otherwise.
-- `wiki-econ-site` — the Observable production build only, against whatever
-  a prior compute last published. `build-site.sh` re-verifies the
-  publication gate itself, so this needs no wikis and no `run` invocation.
-  It deliberately skips remote snapshot discovery, so a frontend deployment
-  cannot select a newer dump or change data-freshness state.
-  Before Observable runs, the deployed Rust binary regenerates dashboard JSON
-  into a site-private temporary overlay from the authenticated merged
-  Parquets. This lets a dashboard-generator fix ship without mutating the
-  receipt-covered publication tree or recomputing history metrics; the
-  overlay is removed after the atomic site switch.
+1. `wiki-econ-pipeline-ingest` — fetch, ingest, and source cleanup.
+2. `wiki-econ-pipeline-metrics` — monthly and activity-tier metrics.
+3. `wiki-econ-pipeline-lifecycle` — external, sorted-run lifecycle metrics.
+4. `wiki-econ-pipeline-page-week` — external page-week aggregation.
+5. `wiki-econ-pipeline-patrol` — patrol computation and per-wiki validation.
+6. `wiki-econ-pipeline-publish` — merge, publication validation, site build,
+   and snapshot finalization.
+
+Qualification wikis are hidden from the scheduled resolver. Before starting
+stage 1, select one explicitly (the registry is checked and unregistered names
+are rejected), for example the currently registered `dewiki` qualification
+entry (use `enwiki` after it is added to the lifecycle registry):
+
+```sh
+become wiki-economics toolforge envvars create WIKI_ECON_PIPELINE_WIKIS dewiki
+become wiki-economics toolforge jobs load --job wiki-econ-pipeline-ingest \
+  /workspace/deploy/toolforge/jobs.yaml
+```
+
+Unset that tool-wide variable after the ingest job if the normal scheduled
+fleet should remain unchanged. Later stages read the wiki set from
+`.pipeline-state.json`; they do not re-resolve it.
+
+The Jobs Framework has no dependency primitive, so `pipeline-state.cjs` is the
+NFS-backed dependency gate. Ingest records the selected snapshot and wiki set;
+each later job reads that exact state and refuses a different snapshot, wiki
+set, overlap, or out-of-order start. A failed stage can be retried after the
+same stage's receipt is inspected. A lease older than
+`WIKI_ECON_PIPELINE_STALE_SECS` (six hours by default) is marked failed before
+retry, which makes pod eviction recoverable without manually editing state.
+
+Inspect the coordinator from the tool account with:
+
+```sh
+become wiki-economics node /workspace/deploy/toolforge/pipeline-state.cjs \
+  show --state /data/project/wiki-economics/output/.pipeline-state.json
+```
+
+The former `wiki-econ-refresh`, `wiki-econ-ingest`, `wiki-econ-compute`, and
+`wiki-econ-site` entries remain compatibility/recovery jobs. The site-only job
+still skips remote snapshot discovery and builds only from the authenticated
+publication. `build-site.sh` re-verifies the publication gate before its
+atomic site switch. A hidden qualification wiki can run stages 1–5 for
+evidence, but publication remains blocked until its lifecycle entry is
+promoted to `published`.
 
 The scheduled-job loader deliberately removes these definitions after use.
 Start the site stage as an isolated one-off against the current image:
@@ -315,17 +343,11 @@ become wiki-economics toolforge jobs run \
   wiki-econ-site
 ```
 
-All four legacy jobs — `wiki-econ-refresh` and the three on-demand
-stage jobs — still serialize through `run-refresh.sh`'s single shared
-`.refresh-lock` (see below), so a manual site rebuild can't race a concurrent
-scheduled refresh or another on-demand job; it will simply exit `75` and wait
-for the next attempt.
-
-Each on-demand run produces its own independent `.refresh-status.json` /
-`.refresh-history.jsonl` entry rather than one unified ingest→compute→site
-record — deliberately, for now, to avoid unifying run-record/event-log state
-across three separate job invocations. `currentStage`/`stageDurationsMs` in
-that entry only cover the stage that actually ran.
+All refresh jobs still serialize through `run-refresh.sh`'s single shared
+`.refresh-lock` (see below), so a stage cannot race a scheduled refresh or a
+second stage. Each stage also publishes its own live `.refresh-status.json`
+record; the shared `.pipeline-state.json` links those six records into one
+ingest→publish generation.
 
 ## Runbook
 

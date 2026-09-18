@@ -4,7 +4,7 @@
     {
       "id": "business_funnel",
       "family": "lifecycle",
-      "algorithm_version": "editor-lifecycle-v3-explicit-identified-registered-editors",
+      "algorithm_version": "editor-lifecycle-v4-explicit-identified-registered-editors-external-merge",
       "schema": [
         {
           "name": "cohort_year",
@@ -59,7 +59,7 @@
       "fingerprint": {
         "artifact_identity": "business_funnel.parquet",
         "family": "lifecycle",
-        "algorithm_version": "editor-lifecycle-v3-explicit-identified-registered-editors"
+        "algorithm_version": "editor-lifecycle-v4-explicit-identified-registered-editors-external-merge"
       },
       "browser": {
         "partitioning": "per_wiki_and_global_year_shards",
@@ -513,7 +513,7 @@
     {
       "id": "labor_churn",
       "family": "lifecycle",
-      "algorithm_version": "editor-lifecycle-v3-explicit-identified-registered-editors",
+      "algorithm_version": "editor-lifecycle-v4-explicit-identified-registered-editors-external-merge",
       "schema": [
         {
           "name": "period",
@@ -596,7 +596,7 @@
       "fingerprint": {
         "artifact_identity": "labor_churn.parquet",
         "family": "lifecycle",
-        "algorithm_version": "editor-lifecycle-v3-explicit-identified-registered-editors"
+        "algorithm_version": "editor-lifecycle-v4-explicit-identified-registered-editors-external-merge"
       },
       "browser": {
         "partitioning": "per_wiki_and_global_year_shards",
@@ -607,7 +607,7 @@
     {
       "id": "labor_cohorts",
       "family": "lifecycle",
-      "algorithm_version": "editor-lifecycle-v3-explicit-identified-registered-editors",
+      "algorithm_version": "editor-lifecycle-v4-explicit-identified-registered-editors-external-merge",
       "schema": [
         {
           "name": "cohort_year",
@@ -657,7 +657,7 @@
       "fingerprint": {
         "artifact_identity": "labor_cohorts.parquet",
         "family": "lifecycle",
-        "algorithm_version": "editor-lifecycle-v3-explicit-identified-registered-editors"
+        "algorithm_version": "editor-lifecycle-v4-explicit-identified-registered-editors-external-merge"
       },
       "browser": {
         "partitioning": "per_wiki_and_global_year_shards",

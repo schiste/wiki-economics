@@ -165,3 +165,59 @@
   # references for wiki-econ-refresh).
   mem: 2Gi
   cpu: "1"
+
+# Enwiki/large-wiki low-memory pipeline. These jobs intentionally have no
+# schedule: an operator starts exactly one stage at a time, and the shared
+# pipeline state file refuses out-of-order or overlapping execution. Every
+# stage is capped at the live 6 GiB per-job memory limit; compute stages may
+# use the live 4-CPU per-job ceiling without increasing thread concurrency
+# until the stage-specific qualification evidence permits it.
+- name: wiki-econ-pipeline-ingest
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: deploy/toolforge/run-refresh-pipeline-ingest.sh
+  filelog: true
+  mount: all
+  mem: 6Gi
+  cpu: "4"
+
+- name: wiki-econ-pipeline-metrics
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: deploy/toolforge/run-refresh-metrics.sh
+  filelog: true
+  mount: all
+  mem: 6Gi
+  cpu: "4"
+
+- name: wiki-econ-pipeline-lifecycle
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: deploy/toolforge/run-refresh-lifecycle.sh
+  filelog: true
+  mount: all
+  mem: 6Gi
+  cpu: "4"
+
+- name: wiki-econ-pipeline-page-week
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: deploy/toolforge/run-refresh-page-week.sh
+  filelog: true
+  mount: all
+  mem: 6Gi
+  cpu: "4"
+
+- name: wiki-econ-pipeline-patrol
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: deploy/toolforge/run-refresh-patrol.sh
+  filelog: true
+  mount: all
+  # Patrol loads the logging and revision lookup windows together on a large
+  # wiki; give it the same qualified ceiling as the other heavy stages.
+  mem: 6Gi
+  cpu: "4"
+
+- name: wiki-econ-pipeline-publish
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: deploy/toolforge/run-refresh-publish.sh
+  filelog: true
+  mount: all
+  mem: 6Gi
+  cpu: "4"

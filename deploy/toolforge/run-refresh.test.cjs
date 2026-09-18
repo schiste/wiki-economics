@@ -235,7 +235,7 @@ test("production refresh rejects an unknown stage", () => {
   const fixture = createFixture("unknown-stage");
   const result = runFixture(fixture, {WIKI_ECON_REFRESH_STAGE: "bogus"});
   assert.equal(result.status, 2, `${result.stdout}\n${result.stderr}`);
-  assert.match(result.stderr, /requires WIKI_ECON_REFRESH_STAGE to be all, ingest, compute, or site/);
+  assert.match(result.stderr, /requires WIKI_ECON_REFRESH_STAGE to be all, ingest, metrics, lifecycle, page-week, patrol, publish, compute, or site/);
   assert.equal(fs.existsSync(path.join(fixture.output, ".refresh-lock")), false);
 });
 
@@ -250,6 +250,35 @@ test("an on-demand stage is passed through to the refresh driver", () => {
     fs.readFileSync(fixture.driverArgs, "utf8").trim(),
     "--version 2026-07 afwiki arwiki arzwiki elwiki eswiki frwiki hawiki itwiki jawiki nlwiki ptwiki svwiki swwiki viwiki yowiki zhwiki --stage ingest",
   );
+});
+
+test("the staged ingest job records a resumable pipeline lease", () => {
+  const fixture = createFixture("pipeline-ingest");
+  const result = runFixture(fixture, {
+    WIKI_ECON_REFRESH_STAGE: "ingest",
+    WIKI_ECON_PIPELINE_MODE: "1",
+    WIKI_ECON_RUN_ID: "pipeline-ingest-run",
+  });
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  const state = JSON.parse(fs.readFileSync(path.join(fixture.output, ".pipeline-state.json"), "utf8"));
+  assert.equal(state.pipeline_id, "pipeline-ingest-run");
+  assert.equal(state.snapshot, "2026-07");
+  assert.equal(state.current_stage, null);
+  assert.equal(state.stages.ingest.status, "succeeded");
+  assert.equal(state.stages.metrics.status, "pending");
+});
+
+test("the staged ingest job permits an explicitly registered qualification wiki", () => {
+  const fixture = createFixture("pipeline-qualification-ingest");
+  const result = runFixture(fixture, {
+    WIKI_ECON_REFRESH_STAGE: "ingest",
+    WIKI_ECON_PIPELINE_MODE: "1",
+    WIKI_ECON_PIPELINE_WIKIS: "dewiki",
+    WIKI_ECON_RUN_ID: "pipeline-qualification-ingest-run",
+  });
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  const state = JSON.parse(fs.readFileSync(path.join(fixture.output, ".pipeline-state.json"), "utf8"));
+  assert.deepEqual(state.wikis, ["dewiki"]);
 });
 
 test("a site-only refresh cannot discover or select a newer snapshot", () => {
@@ -330,4 +359,20 @@ test("failure records status and never strands the owned lock", () => {
   assert.equal(status.state, "failed");
   assert.equal(status.failingStage, "fake_pipeline");
   assert.equal(status.error, "fake pipeline failure");
+});
+
+test("a staged failure is retained in the pipeline coordinator", () => {
+  const fixture = createFixture("pipeline-failure");
+  const result = runFixture(fixture, {
+    WIKI_ECON_REFRESH_STAGE: "ingest",
+    WIKI_ECON_PIPELINE_MODE: "1",
+    WIKI_ECON_RUN_ID: "pipeline-failed-run",
+    FAKE_REFRESH_EXIT: "9",
+  });
+  assert.equal(result.status, 9, `${result.stdout}\n${result.stderr}`);
+  const state = JSON.parse(fs.readFileSync(path.join(fixture.output, ".pipeline-state.json"), "utf8"));
+  assert.equal(state.current_stage, null);
+  assert.equal(state.state, "failed");
+  assert.equal(state.stages.ingest.status, "failed");
+  assert.match(state.stages.ingest.error, /fake pipeline failure|command exited 9|status 9/);
 });

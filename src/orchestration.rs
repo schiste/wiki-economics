@@ -251,6 +251,36 @@ pub(crate) trait PatrolOps {
 pub(crate) trait MetricComputeOps {
     fn compute_all(&self, wiki: &str, data_dir: &Path, output_dir: &Path) -> Result<()>;
 
+    /// Compute one independently resumable metric family. Implementations
+    /// may select an external/disk-backed algorithm for low-memory jobs.
+    fn compute_family(
+        &self,
+        wiki: &str,
+        data_dir: &Path,
+        output_dir: &Path,
+        family: crate::metric_registry::MetricFamily,
+        external: bool,
+    ) -> Result<()> {
+        let _ = (family, external);
+        self.compute_all(wiki, data_dir, output_dir)
+    }
+
+    /// Compute one family against an explicitly pinned snapshot when a
+    /// staged worker supplies one. Existing test/adaptor implementations keep
+    /// the older method contract through this default fallback.
+    fn compute_family_at_snapshot(
+        &self,
+        wiki: &str,
+        data_dir: &Path,
+        output_dir: &Path,
+        family: crate::metric_registry::MetricFamily,
+        external: bool,
+        snapshot: Option<&str>,
+    ) -> Result<()> {
+        let _ = snapshot;
+        self.compute_family(wiki, data_dir, output_dir, family, external)
+    }
+
     fn compute_candidate(
         &self,
         wiki: &str,
@@ -556,6 +586,36 @@ pub(crate) fn handle_compute(
     timed_stage("merge", None, || {
         ops.merge_outputs(context.paths.output, context.run_id)
     })
+}
+
+pub(crate) fn handle_compute_families(
+    context: RunContext<'_>,
+    ops: &impl MetricComputeOps,
+    wikis: &[String],
+    families: &[crate::metric_registry::MetricFamily],
+    external: bool,
+    snapshot: Option<&str>,
+) -> Result<()> {
+    anyhow::ensure!(
+        !families.is_empty(),
+        "at least one compute family is required"
+    );
+    for family in families {
+        for wiki in wikis {
+            let stage = format!("compute_{}", family.name());
+            timed_stage(&stage, Some(wiki), || {
+                ops.compute_family_at_snapshot(
+                    wiki,
+                    context.paths.data,
+                    context.paths.output,
+                    *family,
+                    external,
+                    snapshot,
+                )
+            })?;
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn handle_prepare_wiki(
