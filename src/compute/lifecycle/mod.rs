@@ -585,7 +585,7 @@ mod external {
     /// performs a k-way merge. During the merge only the current editor and the
     /// aggregate period maps are resident, so memory is independent of the
     /// number of editors in the source history.
-    pub(super) fn compute_external<F>(
+    pub(crate) fn compute_external<F>(
         wiki: &str,
         output_dir: &Path,
         partitions: &[storage::PartitionSpec],
@@ -1144,7 +1144,7 @@ mod external {
 pub(super) use external::compute_external;
 
 #[cfg(coverage)]
-pub(crate) fn compute_external<F>(
+pub(super) fn compute_external<F>(
     _wiki: &str,
     _output_dir: &Path,
     _partitions: &[storage::PartitionSpec],

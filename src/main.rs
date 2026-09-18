@@ -5278,6 +5278,22 @@ mod tests {
             true,
             Some("2026-08"),
         );
+
+        let cli = Cli::try_parse_from([
+            "wiki-econ",
+            "--data-dir",
+            root.path().to_str().expect("coverage data path"),
+            "--output-dir",
+            root.path().to_str().expect("coverage output path"),
+            "compute",
+            "testwiki",
+            "--family",
+            "monthly",
+            "--external",
+            "--version",
+            "2026-08",
+        ])?;
+        run_with_ops(cli, &TestApplication::default())?;
         Ok(())
     }
 }
