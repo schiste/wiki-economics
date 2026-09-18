@@ -1899,6 +1899,11 @@ fn init_tracing(run_id: &str) {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("debug"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
+        // Keep stdout reserved for command results. Several operators and
+        // shell wrappers consume snapshot/version output as a machine-readable
+        // value, while the same verbose records must remain visible in the
+        // caller's stderr/log stream.
+        .with_writer(std::io::stderr)
         .fmt_fields(DefaultFields::new())
         .event_format(RunIdEventFormat::new(run_id, log_ansi_enabled()))
         .try_init();

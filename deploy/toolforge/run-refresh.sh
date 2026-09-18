@@ -666,7 +666,33 @@ else
     printf ' %q' "$arg"
   done
   printf '\n'
-  selected_snapshot="$(RUST_LOG="$WIKI_ECON_RUST_LOG" "${resolve_cmd[@]}")"
+  # The Rust CLI emits verbose tracing records on stdout so standalone
+  # invocations remain self-contained and useful to operators.  Do not feed
+  # that mixed human log stream directly into the version validator: capture
+  # and retain it in the refresh log, then extract the final machine-readable
+  # YYYY-MM line.  A prior implementation treated the whole stream as the
+  # version and failed every Toolforge refresh before ingest began.
+  snapshot_resolve_output=""
+  if ! snapshot_resolve_output="$(RUST_LOG="$WIKI_ECON_RUST_LOG" "${resolve_cmd[@]}")"; then
+    REFRESH_FAILURE_STAGE=snapshot_resolve
+    REFRESH_FAILURE_ERROR="snapshot resolver command failed"
+    echo "Snapshot resolver failed for ${wikis[*]}" >&2
+    printf '%s\n' "$snapshot_resolve_output" >&2
+    exit 1
+  fi
+  printf '%s\n' "$snapshot_resolve_output"
+  selected_snapshot=""
+  while IFS= read -r snapshot_line; do
+    if [[ "$snapshot_line" =~ ^[0-9]{4}-[0-9]{2}$ ]]; then
+      selected_snapshot="$snapshot_line"
+    fi
+  done <<< "$snapshot_resolve_output"
+  if [ -z "$selected_snapshot" ]; then
+    REFRESH_FAILURE_STAGE=snapshot_resolve
+    REFRESH_FAILURE_ERROR="snapshot resolver returned no YYYY-MM version"
+    echo "Snapshot resolver returned no valid version for ${wikis[*]}" >&2
+    exit 1
+  fi
   set_refresh_lock_snapshot "$selected_snapshot"
 
   if pipeline_stage_enabled && [ "$REFRESH_STAGE" = "ingest" ]; then
