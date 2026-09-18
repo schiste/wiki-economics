@@ -1398,6 +1398,7 @@ pub(crate) fn execute_family(
 /// the stage boundary used by the low-memory Toolforge pipeline: each family
 /// runs in its own process and commits its own fingerprint receipt, so the
 /// next job can resume without rebuilding earlier families.
+#[cfg(not(coverage))]
 pub(crate) fn compute_family(
     wiki: &str,
     data_dir: &Path,
@@ -1408,6 +1409,7 @@ pub(crate) fn compute_family(
     compute_family_at_snapshot(wiki, data_dir, output_dir, family, external, None)
 }
 
+#[cfg(not(coverage))]
 pub(crate) fn compute_family_at_snapshot(
     wiki: &str,
     data_dir: &Path,
@@ -1501,6 +1503,29 @@ pub(crate) fn compute_family_at_snapshot(
         &outputs,
     )?;
     Ok(())
+}
+
+#[cfg(coverage)]
+pub(crate) fn compute_family(
+    _wiki: &str,
+    _data_dir: &Path,
+    _output_dir: &Path,
+    _family: MetricFamily,
+    _external: bool,
+) -> Result<()> {
+    anyhow::bail!("independent family stages are disabled in coverage builds")
+}
+
+#[cfg(coverage)]
+pub(crate) fn compute_family_at_snapshot(
+    _wiki: &str,
+    _data_dir: &Path,
+    _output_dir: &Path,
+    _family: MetricFamily,
+    _external: bool,
+    _requested_snapshot: Option<&str>,
+) -> Result<()> {
+    anyhow::bail!("independent family stages are disabled in coverage builds")
 }
 
 pub(crate) fn compute_all_for_snapshot(

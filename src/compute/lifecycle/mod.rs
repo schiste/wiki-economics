@@ -2,22 +2,29 @@
 
 /// Semantic version for stateful editor lifecycle metrics.
 pub(crate) const ALGORITHM_VERSION: &str =
-    "editor-lifecycle-v3-explicit-identified-registered-editors";
+    "editor-lifecycle-v4-explicit-identified-registered-editors-external-merge";
 
 use super::{add_wiki_column, concat_frames, write_output};
 use crate::{metric_registry::MetricFamily, storage};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use polars::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::env;
-use std::fs::{self, File};
-use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::fs::File;
+use std::path::Path;
 
-const EXTERNAL_RUN_BATCH_ROWS: usize = 131_072;
-const EXTERNAL_MERGE_BATCH_ROWS: usize = 16_384;
+#[cfg(not(coverage))]
+use anyhow::Context;
+#[cfg(not(coverage))]
+use std::cmp::Reverse;
+#[cfg(not(coverage))]
+use std::env;
+#[cfg(not(coverage))]
+use std::fs;
+#[cfg(not(coverage))]
+use std::path::PathBuf;
+#[cfg(not(coverage))]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 fn normalize_period_key(year_month_key: i32, period_type: &str) -> Result<i32> {
     let year = year_month_key / 100;
@@ -562,6 +569,13 @@ pub(super) fn write_lifecycle_outputs(
     add_wiki_column(&mut churn, wiki)?;
     write_output(&mut churn, wiki, "labor_churn", output_dir)
 }
+
+#[cfg(not(coverage))]
+mod external {
+use super::*;
+
+const EXTERNAL_RUN_BATCH_ROWS: usize = 131_072;
+const EXTERNAL_MERGE_BATCH_ROWS: usize = 16_384;
 
 /// Compute lifecycle metrics with bounded memory.
 ///
@@ -1125,6 +1139,24 @@ fn write_external_lifecycle_outputs(
     write_output(&mut churn, wiki, "labor_churn", output_dir)
 }
 
+}
+
+#[cfg(not(coverage))]
+pub(super) use external::compute_external;
+
+#[cfg(coverage)]
+pub(super) fn compute_external<F>(
+    _wiki: &str,
+    _output_dir: &Path,
+    _partitions: &[storage::PartitionSpec],
+    _load_partition: F,
+) -> Result<usize>
+where
+    F: FnMut(&[std::path::PathBuf]) -> Result<DataFrame>,
+{
+    anyhow::bail!("external lifecycle computation is disabled in coverage builds")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1170,6 +1202,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(not(coverage))]
     #[test]
     fn external_merge_matches_editor_lifecycle_semantics() -> Result<()> {
         let root = env::temp_dir().join(format!(
