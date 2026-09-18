@@ -20,7 +20,8 @@ Options:
   --dist-dir PATH        Override the site build output directory
   --wikis-file FILE      Read wiki names from a newline-delimited file
   --stage STAGE          Which part of the pipeline to run: all (default),
-                          ingest, compute, or site
+                          ingest, metrics, lifecycle, page-week, patrol,
+                          publish, compute, or site
   --merge-only           Only refresh merged artifacts, then build the site
   --skip-site-build      Skip the Observable production build
   -h, --help             Show this help message
@@ -28,9 +29,13 @@ Options:
 Stages:
   all      Fetch/ingest, compute, validate, build the site, finalize (today's
            full pipeline; used by the scheduled weekly refresh)
-  ingest   Fetch, ingest, and patrol-fetch only; no compute, validate, or
-           site build
-  compute  Compute, patrol-compute, merge, then validate; no site build
+  ingest   Fetch, ingest, and source cleanup only
+  metrics  Compute monthly and activity-tier families, sequentially
+  lifecycle Compute the lifecycle family in its isolated external stage
+  page-week Compute page-week output in its isolated external stage
+  patrol   Compute patrol metrics and per-wiki patrol validation
+  publish  Merge, publication validation, site build, and snapshot finalization
+  compute  Legacy combined compute/patrol/merge compatibility stage
   site     Build the site only, against whatever was last published by a
            compute run; no wikis required
 EOF
@@ -114,10 +119,10 @@ if [ -n "$WIKIS_FILE" ]; then
 fi
 
 case "$STAGE" in
-  all|ingest|compute|site) ;;
+  all|ingest|metrics|lifecycle|page-week|patrol|publish|compute|site) ;;
   *)
     usage
-    echo "Unknown --stage value: $STAGE (expected all, ingest, compute, or site)" >&2
+    echo "Unknown --stage value: $STAGE (expected all, ingest, metrics, lifecycle, page-week, patrol, publish, compute, or site)" >&2
     exit 1
     ;;
 esac
@@ -135,7 +140,7 @@ echo "Stage:        $STAGE"
 
 if [ "$MERGE_ONLY" -eq 1 ]; then
   wiki_econ_run_cli merge
-elif [ "$STAGE" != "site" ]; then
+elif [ "$STAGE" = "all" ] || [ "$STAGE" = "ingest" ] || [ "$STAGE" = "compute" ]; then
   declare -a cmd=(run "${WIKIS[@]}")
   if [ -n "$VERSION" ]; then
     cmd+=(--version "$VERSION")
@@ -146,14 +151,48 @@ elif [ "$STAGE" != "site" ]; then
   wiki_econ_run_cli "${cmd[@]}"
 fi
 
-if [ "$STAGE" != "ingest" ] && [ "$STAGE" != "site" ]; then
+run_family_stage() {
+  local family_args=()
+  for family in "$@"; do
+    family_args+=(--family "$family")
+  done
+  if [ -n "$VERSION" ]; then
+    family_args+=(--version "$VERSION")
+  fi
+  wiki_econ_run_cli compute "${family_args[@]}" --external "${WIKIS[@]}"
+}
+
+case "$STAGE" in
+  metrics)
+    run_family_stage monthly activity-tiers
+    ;;
+  lifecycle)
+    run_family_stage lifecycle
+    ;;
+  page-week)
+    run_family_stage page-week
+    ;;
+  patrol)
+    for wiki in "${WIKIS[@]}"; do
+      wiki_econ_run_cli patrol-compute "$wiki"
+    done
+    ;;
+  publish)
+    wiki_econ_run_cli merge
+    ;;
+esac
+
+if [ "$STAGE" = "compute" ] || [ "$STAGE" = "publish" ] || [ "$MERGE_ONLY" -eq 1 ]; then
   wiki_econ_run_cli publication-validate
 fi
 
 RUN_SITE_BUILD=1
 case "$STAGE" in
-  ingest|compute)
+  ingest|metrics|lifecycle|page-week|patrol|compute)
     RUN_SITE_BUILD=0
+    ;;
+  publish)
+    RUN_SITE_BUILD=1
     ;;
   all)
     [ "$SKIP_SITE_BUILD" -eq 1 ] && RUN_SITE_BUILD=0
@@ -168,10 +207,10 @@ fi
 
 # The previous warehouse generation is the rollback source until every
 # downstream artifact, including the site, has published successfully. Only
-# then is it safe to reclaim its NFS space. On-demand `ingest`/`compute`
-# stages never build the site themselves, so they never finalize either —
-# only `all` (the scheduled full pipeline) does.
-if [ "$MERGE_ONLY" -eq 0 ] && [ "$STAGE" = "all" ] && [ "$RUN_SITE_BUILD" -eq 1 ]; then
+# then is it safe to reclaim its NFS space. On-demand `ingest`, metric,
+# lifecycle, page-week, and patrol stages never build the site themselves, so
+# they never finalize either — only `all` and the final `publish` stage do.
+if [ "$MERGE_ONLY" -eq 0 ] && { [ "$STAGE" = "all" ] || [ "$STAGE" = "publish" ]; } && [ "$RUN_SITE_BUILD" -eq 1 ]; then
   wiki_econ_run_cli snapshot-finalize "${WIKIS[@]}"
 fi
 

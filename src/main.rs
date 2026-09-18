@@ -63,9 +63,9 @@ use orchestration::{
     PrepareWikiRequest, PromoteQualificationRequest, PublicationOps, QualificationOps,
     RetireCandidateRequest, RunContext, SchemaBenchmarkRequest, SnapshotOps,
     handle_account_creation, handle_benchmark, handle_capacity_benchmark, handle_compute,
-    handle_cpu_qualification, handle_fetch, handle_fleet_discovery, handle_ingest, handle_merge,
-    handle_patrol_compute, handle_patrol_fetch, handle_patrol_refresh, handle_pipeline_run,
-    handle_prepare_source, handle_prepare_wiki, handle_publication_commit,
+    handle_compute_families, handle_cpu_qualification, handle_fetch, handle_fleet_discovery,
+    handle_ingest, handle_merge, handle_patrol_compute, handle_patrol_fetch, handle_patrol_refresh,
+    handle_pipeline_run, handle_prepare_source, handle_prepare_wiki, handle_publication_commit,
     handle_publication_prepare, handle_publication_rollback, handle_schema_benchmark,
     handle_snapshot_finalize, handle_snapshot_resolve, timed_stage as run_timed_stage,
 };
@@ -266,6 +266,23 @@ enum Commands {
     Compute {
         /// Wiki database names
         wikis: Vec<String>,
+
+        /// Exact snapshot generation to compute. Staged jobs pass the
+        /// coordinator's pinned version rather than re-reading a moving
+        /// current pointer.
+        #[arg(long)]
+        version: Option<String>,
+
+        /// Compute only the selected metric family. Repeat for multiple
+        /// families; omitting this option preserves the legacy all-families
+        /// behavior.
+        #[arg(long = "family", value_enum)]
+        families: Vec<ComputeFamilyArg>,
+
+        /// Use the disk-backed external algorithm where supported. This is
+        /// intended for the low-memory staged Toolforge pipeline.
+        #[arg(long, default_value_t = false)]
+        external: bool,
     },
 
     /// Prepare one immutable wiki candidate without changing the published site
@@ -761,6 +778,25 @@ enum RunStage {
     Compute,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum ComputeFamilyArg {
+    Monthly,
+    ActivityTiers,
+    Lifecycle,
+    PageWeek,
+}
+
+impl ComputeFamilyArg {
+    fn family(self) -> metric_registry::MetricFamily {
+        match self {
+            Self::Monthly => metric_registry::MetricFamily::Monthly,
+            Self::ActivityTiers => metric_registry::MetricFamily::ActivityTiers,
+            Self::Lifecycle => metric_registry::MetricFamily::Lifecycle,
+            Self::PageWeek => metric_registry::MetricFamily::PageWeek,
+        }
+    }
+}
+
 impl RunStage {
     fn runs_ingest(self) -> bool {
         matches!(self, RunStage::All | RunStage::Ingest)
@@ -921,6 +957,29 @@ impl PatrolOps for RealOps {
 impl MetricComputeOps for RealOps {
     fn compute_all(&self, wiki: &str, data_dir: &Path, output_dir: &Path) -> Result<()> {
         compute::compute_all(wiki, data_dir, output_dir)
+    }
+
+    fn compute_family(
+        &self,
+        wiki: &str,
+        data_dir: &Path,
+        output_dir: &Path,
+        family: metric_registry::MetricFamily,
+        external: bool,
+    ) -> Result<()> {
+        compute::compute_family(wiki, data_dir, output_dir, family, external)
+    }
+
+    fn compute_family_at_snapshot(
+        &self,
+        wiki: &str,
+        data_dir: &Path,
+        output_dir: &Path,
+        family: metric_registry::MetricFamily,
+        external: bool,
+        snapshot: Option<&str>,
+    ) -> Result<()> {
+        compute::compute_family_at_snapshot(wiki, data_dir, output_dir, family, external, snapshot)
     }
 
     fn compute_candidate(
@@ -1258,8 +1317,28 @@ fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
             handle_ingest(context, ops, &wikis, version.as_deref())?;
         }
 
-        Commands::Compute { wikis } => {
-            handle_compute(context, ops, &wikis)?;
+        Commands::Compute {
+            wikis,
+            version,
+            families,
+            external,
+        } => {
+            if families.is_empty() {
+                handle_compute(context, ops, &wikis)?;
+            } else {
+                let families = families
+                    .into_iter()
+                    .map(ComputeFamilyArg::family)
+                    .collect::<Vec<_>>();
+                handle_compute_families(
+                    context,
+                    ops,
+                    &wikis,
+                    &families,
+                    external,
+                    version.as_deref(),
+                )?;
+            }
         }
 
         Commands::PrepareWiki {

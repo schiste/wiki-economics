@@ -1394,6 +1394,115 @@ pub(crate) fn execute_family(
         .map(|_| ())
 }
 
+/// Compute one core metric family into the active candidate output. This is
+/// the stage boundary used by the low-memory Toolforge pipeline: each family
+/// runs in its own process and commits its own fingerprint receipt, so the
+/// next job can resume without rebuilding earlier families.
+pub(crate) fn compute_family(
+    wiki: &str,
+    data_dir: &Path,
+    output_dir: &Path,
+    family: MetricFamily,
+    external: bool,
+) -> Result<()> {
+    compute_family_at_snapshot(wiki, data_dir, output_dir, family, external, None)
+}
+
+pub(crate) fn compute_family_at_snapshot(
+    wiki: &str,
+    data_dir: &Path,
+    output_dir: &Path,
+    family: MetricFamily,
+    external: bool,
+    requested_snapshot: Option<&str>,
+) -> Result<()> {
+    anyhow::ensure!(
+        MetricFamily::CORE.contains(&family),
+        "only core metric families can run as an independent compute stage"
+    );
+    let snapshot = match requested_snapshot {
+        Some(snapshot) => {
+            storage::validate_snapshot_version(snapshot)?;
+            Some(snapshot.to_string())
+        }
+        None => storage::current_snapshot_version(data_dir, wiki)?,
+    };
+    let weekly_config = WeeklyAggregationConfig::for_snapshot(data_dir, wiki, snapshot.as_deref())?;
+    let cross_snapshot = (!external)
+        .then_some(snapshot.as_deref())
+        .flatten()
+        .map(|version| crate::cross_snapshot::production_cache(data_dir, wiki, version))
+        .transpose()?
+        .flatten();
+
+    if family == MetricFamily::Lifecycle && external {
+        let mut partitions = match snapshot.as_deref() {
+            Some(snapshot) => {
+                let layer = storage::snapshot_compute_layer(
+                    data_dir,
+                    wiki,
+                    snapshot,
+                    storage::GenerationLayer::Analytical,
+                )?;
+                storage::snapshot_partition_specs(data_dir, wiki, snapshot, layer)?
+            }
+            None => {
+                let layer = storage::active_compute_layer(
+                    data_dir,
+                    wiki,
+                    storage::GenerationLayer::Analytical,
+                )?;
+                storage::active_partition_specs(data_dir, wiki, layer)?
+            }
+        };
+        if let Some(snapshot) = snapshot.as_deref() {
+            partitions.retain(|partition| {
+                snapshot_contains_complete_month(snapshot, &partition.year_month)
+            });
+        }
+        lifecycle::compute_external(wiki, output_dir, &partitions, load_partition)?;
+    } else if family == MetricFamily::PageWeek && external {
+        let snapshot = snapshot
+            .as_deref()
+            .context("external page-week computation requires a snapshot")?;
+        compute_page_weekly_external_qualification(
+            wiki,
+            data_dir,
+            output_dir,
+            &weekly_config,
+            Some(snapshot),
+            None,
+        )?
+        .context("external page-week computation produced no output")?;
+    } else {
+        let plan = ComputePlan::only(family)?;
+        compute_all_incremental_cached(
+            wiki,
+            data_dir,
+            output_dir,
+            snapshot.as_deref(),
+            plan,
+            cross_snapshot.as_ref(),
+        )?;
+    }
+
+    let algorithm = family.algorithm_version(&weekly_config);
+    let inputs = family_inputs(family, wiki, data_dir, snapshot.as_deref())?;
+    let outputs = family_outputs(family, wiki, output_dir);
+    anyhow::ensure!(
+        outputs.iter().all(|output| output.path.is_file()),
+        "independent compute family {} did not produce all declared outputs",
+        family.name()
+    );
+    fingerprint::record(
+        &family_stage_receipt(output_dir, wiki, family),
+        family_stage_spec(family, wiki, snapshot.as_deref(), &algorithm),
+        &inputs,
+        &outputs,
+    )?;
+    Ok(())
+}
+
 pub(crate) fn compute_all_for_snapshot(
     wiki: &str,
     snapshot: &str,

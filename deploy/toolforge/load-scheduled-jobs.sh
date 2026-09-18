@@ -35,6 +35,12 @@ on_demand_jobs=(
   wiki-econ-ingest
   wiki-econ-compute
   wiki-econ-site
+  wiki-econ-pipeline-ingest
+  wiki-econ-pipeline-metrics
+  wiki-econ-pipeline-lifecycle
+  wiki-econ-pipeline-page-week
+  wiki-econ-pipeline-patrol
+  wiki-econ-pipeline-publish
 )
 
 delete_if_loaded() {

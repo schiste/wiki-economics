@@ -41,8 +41,9 @@ export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-1}"
 export POLARS_MAX_THREADS="${POLARS_MAX_THREADS:-1}"
 # Fail before a source transaction or logical partition can consume the
 # reserves required to finish already-admitted work. These defaults describe
-# the current 6 GiB Toolforge job; a future enwiki job must override them with
-# its separately qualified 16 GiB / 250 GiB-reserve profile.
+# the current maximum 6 GiB Toolforge job. If Toolforge grants a different
+# per-job ceiling later, change these values only with a matching qualification
+# receipt; the pipeline must not assume an unavailable 16 GiB profile.
 export WIKI_ECON_MEMORY_CEILING_BYTES="${WIKI_ECON_MEMORY_CEILING_BYTES:-6442450944}"
 export WIKI_ECON_MEMORY_RESERVE_BYTES="${WIKI_ECON_MEMORY_RESERVE_BYTES:-1610612736}"
 export WIKI_ECON_PERSISTENT_STORAGE_RESERVE_BYTES="${WIKI_ECON_PERSISTENT_STORAGE_RESERVE_BYTES:-10737418240}"
@@ -66,16 +67,25 @@ export WIKI_ECON_SOURCE_WINDOW_SIZE
 # Rust owns the weekly layout and rejects configurations absent from the
 # checked-in capacity qualification registry before expensive work starts.
 # Which portion of the pipeline to run. `all` (the weekly scheduled job) runs
-# everything; `ingest`/`compute`/`site` are for on-demand jobs that trigger
-# just one stage between scheduled runs.
+# everything; the six named stages are resumable on-demand jobs. `compute` and
+# `site` remain compatibility entry points for the older monolithic workflow.
 REFRESH_STAGE="${WIKI_ECON_REFRESH_STAGE:-all}"
 case "$REFRESH_STAGE" in
-  all|ingest|compute|site) ;;
+  all|ingest|metrics|lifecycle|page-week|patrol|publish|compute|site) ;;
   *)
-    echo "Toolforge refresh requires WIKI_ECON_REFRESH_STAGE to be all, ingest, compute, or site (got: $REFRESH_STAGE)" >&2
+    echo "Toolforge refresh requires WIKI_ECON_REFRESH_STAGE to be all, ingest, metrics, lifecycle, page-week, patrol, publish, compute, or site (got: $REFRESH_STAGE)" >&2
     exit 2
     ;;
 esac
+PIPELINE_MODE="${WIKI_ECON_PIPELINE_MODE:-0}"
+if [ "$PIPELINE_MODE" != "0" ] && [ "$PIPELINE_MODE" != "1" ]; then
+  echo "WIKI_ECON_PIPELINE_MODE must be 0 or 1 (got: $PIPELINE_MODE)" >&2
+  exit 2
+fi
+PIPELINE_STAGE_ACTIVE=0
+PIPELINE_STATE_HELPER="$ROOT/deploy/toolforge/pipeline-state.cjs"
+PIPELINE_STATE_FILE="${WIKI_ECON_PIPELINE_STATE_FILE:-}"
+PIPELINE_ID=""
 REFRESH_LOCK_HEARTBEAT_SECS="${WIKI_ECON_REFRESH_LOCK_HEARTBEAT_SECS:-60}"
 REFRESH_LOCK_STALE_SECS="${WIKI_ECON_REFRESH_LOCK_STALE_SECS:-21600}"
 REFRESH_LOCK_RECHECK_SECS="${WIKI_ECON_REFRESH_LOCK_RECHECK_SECS:-2}"
@@ -366,6 +376,114 @@ initialize_refresh_run_record() {
   node "$RUN_RECORD_HELPER" write
 }
 
+pipeline_stage_enabled() {
+  [ "$PIPELINE_MODE" = "1" ] && case "$REFRESH_STAGE" in
+    ingest|metrics|lifecycle|page-week|patrol|publish) return 0 ;;
+  esac
+  return 1
+}
+
+load_pipeline_wikis() {
+  local state_json
+  state_json="$(node "$PIPELINE_STATE_HELPER" show --state "$PIPELINE_STATE_FILE")" || {
+    REFRESH_FAILURE_STAGE=pipeline_state
+    REFRESH_FAILURE_ERROR="unable to read the existing pipeline state"
+    echo "$REFRESH_FAILURE_ERROR: $PIPELINE_STATE_FILE" >&2
+    return 1
+  }
+  mapfile -t wikis < <(printf '%s\n' "$state_json" | node -e '
+    let input = "";
+    process.stdin.on("data", (chunk) => { input += chunk; });
+    process.stdin.on("end", () => {
+      const state = JSON.parse(input);
+      for (const wiki of state.wikis) process.stdout.write(`${wiki}\n`);
+    });
+  ')
+  if [ "${#wikis[@]}" -eq 0 ]; then
+    REFRESH_FAILURE_STAGE=pipeline_state
+    REFRESH_FAILURE_ERROR="pipeline state contains no wikis"
+    echo "$REFRESH_FAILURE_ERROR: $PIPELINE_STATE_FILE" >&2
+    return 1
+  fi
+}
+
+begin_pipeline_stage() {
+  local response
+  local -a begin_cmd=(
+    node "$PIPELINE_STATE_HELPER" begin
+    --state "$PIPELINE_STATE_FILE"
+    --stage "$REFRESH_STAGE"
+    --run-id "$WIKI_ECON_RUN_ID"
+    --wikis-json "$WIKI_ECON_RUN_WIKIS_JSON"
+    --stale-after-secs "${WIKI_ECON_PIPELINE_STALE_SECS:-21600}"
+  )
+  if [ "$REFRESH_STAGE" = "ingest" ]; then
+    begin_cmd+=(--snapshot "$SELECTED_SNAPSHOT")
+  fi
+  if ! response="$("${begin_cmd[@]}")"; then
+    REFRESH_FAILURE_STAGE=pipeline_state
+    REFRESH_FAILURE_ERROR="pipeline stage $REFRESH_STAGE could not acquire its state lease"
+    echo "$REFRESH_FAILURE_ERROR" >&2
+    return 1
+  fi
+  PIPELINE_ID="$(printf '%s\n' "$response" | node -e '
+    let input = "";
+    process.stdin.on("data", (chunk) => { input += chunk; });
+    process.stdin.on("end", () => {
+      const value = JSON.parse(input);
+      process.stdout.write(String(value.pipeline_id));
+    });
+  ')"
+  SELECTED_SNAPSHOT="$(printf '%s\n' "$response" | node -e '
+    let input = "";
+    process.stdin.on("data", (chunk) => { input += chunk; });
+    process.stdin.on("end", () => {
+      const value = JSON.parse(input);
+      process.stdout.write(String(value.snapshot));
+    });
+  ')"
+  export WIKI_ECON_PIPELINE_ID="$PIPELINE_ID"
+  export WIKI_ECON_PIPELINE_STATE_FILE="$PIPELINE_STATE_FILE"
+  PIPELINE_STAGE_ACTIVE=1
+  echo "==> Pipeline lease acquired: pipeline_id=$PIPELINE_ID stage=$REFRESH_STAGE snapshot=$SELECTED_SNAPSHOT"
+}
+
+finish_pipeline_stage() {
+  local exit_code=$1
+  [ "$PIPELINE_STAGE_ACTIVE" -eq 1 ] || return 0
+  local result
+  if [ "$exit_code" -eq 0 ]; then
+    if ! result="$(node "$PIPELINE_STATE_HELPER" complete \
+      --state "$PIPELINE_STATE_FILE" \
+      --stage "$REFRESH_STAGE" \
+      --run-id "$WIKI_ECON_RUN_ID")"; then
+      echo "Unable to mark pipeline stage $REFRESH_STAGE complete" >&2
+      REFRESH_FAILURE_STAGE=pipeline_state
+      REFRESH_FAILURE_ERROR="unable to publish pipeline stage completion"
+      node "$PIPELINE_STATE_HELPER" fail \
+        --state "$PIPELINE_STATE_FILE" \
+        --stage "$REFRESH_STAGE" \
+        --run-id "$WIKI_ECON_RUN_ID" \
+        --error "$REFRESH_FAILURE_ERROR" >/dev/null 2>&1 || true
+      PIPELINE_STAGE_ACTIVE=0
+      return 1
+    fi
+    echo "==> Pipeline stage completed: $result"
+  else
+    result="$(node "$PIPELINE_STATE_HELPER" fail \
+      --state "$PIPELINE_STATE_FILE" \
+      --stage "$REFRESH_STAGE" \
+      --run-id "$WIKI_ECON_RUN_ID" \
+      --error "${REFRESH_FAILURE_ERROR:-refresh exited with status $exit_code}" 2>&1)"
+    if [ $? -ne 0 ]; then
+      echo "Unable to mark pipeline stage $REFRESH_STAGE failed: $result" >&2
+    else
+      echo "==> Pipeline stage failed: $result" >&2
+    fi
+  fi
+  PIPELINE_STAGE_ACTIVE=0
+}
+
 capture_refresh_error() {
   local exit_code=$1 command=$2
   if [ -z "$REFRESH_FAILURE_ERROR" ]; then
@@ -380,6 +498,13 @@ finish_refresh() {
   stop_refresh_lock_heartbeat
   if [ "$exit_code" -ne 0 ] && [ -z "$REFRESH_FAILURE_ERROR" ]; then
     REFRESH_FAILURE_ERROR="refresh exited with status $exit_code"
+  fi
+  if ! finish_pipeline_stage "$exit_code"; then
+    if [ "$exit_code" -eq 0 ]; then
+      exit_code=1
+      REFRESH_FAILURE_STAGE=pipeline_state
+      REFRESH_FAILURE_ERROR="unable to publish pipeline stage completion"
+    fi
   fi
   WIKI_ECON_RUN_ERROR="$REFRESH_FAILURE_ERROR"
   WIKI_ECON_RUN_FAILING_STAGE="$REFRESH_FAILURE_STAGE"
@@ -399,17 +524,60 @@ finish_refresh() {
 }
 
 wiki_econ_init_runtime
+PIPELINE_STATE_FILE="${PIPELINE_STATE_FILE:-$WIKI_ECON_OUTPUT_DIR/.pipeline-state.json}"
+export PIPELINE_STATE_FILE
 wiki_econ_ensure_local_dirs
 initialize_refresh_logging
 
-refresh_wikis=$(node "$ROOT/scripts/wiki-lifecycle.cjs" refresh-wikis)
 wikis=()
-while IFS= read -r wiki; do
-  [ -n "$wiki" ] && wikis+=("$wiki")
-done <<< "$refresh_wikis"
-if [ "${#wikis[@]}" -eq 0 ]; then
-  echo "Wiki lifecycle registry selected no scheduled refresh wikis" >&2
-  exit 1
+if pipeline_stage_enabled && [ "$REFRESH_STAGE" != "ingest" ]; then
+  load_pipeline_wikis || exit 1
+elif pipeline_stage_enabled && [ "$REFRESH_STAGE" = "ingest" ] && [ -n "${WIKI_ECON_PIPELINE_WIKIS:-}" ]; then
+  # Qualification wikis (for example enwiki) are intentionally hidden from
+  # the normal scheduled refresh resolver. The staged operator path may name
+  # them explicitly, but the registry is still authoritative: unregistered
+  # names are rejected before any network or storage work starts.
+  pipeline_wikis_json="$(node - "$WIKI_ECON_WIKI_LIFECYCLE_FILE" <<'NODE'
+const fs = require("node:fs");
+const registry = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const selected = (process.env.WIKI_ECON_PIPELINE_WIKIS || "")
+  .split(/[ ,\t\r\n]+/).map((wiki) => wiki.trim()).filter(Boolean);
+if (!selected.length) throw new Error("WIKI_ECON_PIPELINE_WIKIS is empty");
+const unique = [...new Set(selected)].sort();
+for (const wiki of unique) {
+  const entry = registry.wikis?.[wiki];
+  if (!entry) throw new Error(`pipeline wiki is not registered: ${wiki}`);
+  const allowed = entry.refresh === "qualification"
+    || entry.refresh === "manual"
+    || entry.refresh === "scheduled";
+  if (!allowed) throw new Error(`pipeline wiki ${wiki} has refresh state ${entry.refresh}`);
+  if (entry.refresh === "qualification" && entry.publication !== "hidden") {
+    throw new Error(`qualification pipeline wiki ${wiki} must be hidden`);
+  }
+}
+process.stdout.write(JSON.stringify(unique));
+NODE
+  )" || {
+    REFRESH_FAILURE_STAGE=pipeline_state
+    REFRESH_FAILURE_ERROR="invalid WIKI_ECON_PIPELINE_WIKIS selection"
+    echo "$REFRESH_FAILURE_ERROR" >&2
+    exit 1
+  }
+  while IFS= read -r wiki; do
+    [ -n "$wiki" ] && wikis+=("$wiki")
+  done < <(printf '%s\n' "$pipeline_wikis_json" | node -e '
+    const value = JSON.parse(require("fs").readFileSync(0, "utf8"));
+    for (const wiki of value) process.stdout.write(`${wiki}\n`);
+  ')
+else
+  refresh_wikis=$(node "$ROOT/scripts/wiki-lifecycle.cjs" refresh-wikis)
+  while IFS= read -r wiki; do
+    [ -n "$wiki" ] && wikis+=("$wiki")
+  done <<< "$refresh_wikis"
+  if [ "${#wikis[@]}" -eq 0 ]; then
+    echo "Wiki lifecycle registry selected no scheduled refresh wikis" >&2
+    exit 1
+  fi
 fi
 
 if ! acquire_refresh_lock; then
@@ -440,9 +608,7 @@ declare -a cleanup_cmd=(
   --minimum-age-secs "${WIKI_ECON_STALE_ARTIFACT_SECS:-21600}"
   --capacity-dir "${WIKI_ECON_CAPACITY_ROOT:-/data/project/wiki-economics/capacity}"
 )
-if [ -n "${WIKI_ECON_SCRATCH_DIR:-}" ]; then
-  cleanup_cmd+=(--scratch-dir "$WIKI_ECON_SCRATCH_DIR")
-fi
+cleanup_cmd+=(--scratch-dir "${WIKI_ECON_SCRATCH_DIR:-$WIKI_ECON_OUTPUT_DIR}")
 cleanup_cmd+=("${wikis[@]}")
 if ! cleanup_summary="$(RUST_LOG="$WIKI_ECON_RUST_LOG" "${cleanup_cmd[@]}")"; then
   REFRESH_FAILURE_STAGE=cleanup_stale
@@ -478,6 +644,14 @@ if [ "$REFRESH_STAGE" = "site" ]; then
   printf '%s\n' running > "$REFRESH_LOCK_DIR/run-state"
   refresh_driver_cmd+=(--stage site)
   echo "==> Toolforge site refresh against the current publication"
+elif pipeline_stage_enabled && [ "$REFRESH_STAGE" != "ingest" ]; then
+  # Every stage after ingest consumes the immutable snapshot and wiki set
+  # recorded by the coordinator. Never re-resolve a newer remote snapshot in
+  # the middle of a pipeline generation.
+  begin_pipeline_stage
+  set_refresh_lock_snapshot "$SELECTED_SNAPSHOT"
+  echo "==> Toolforge pipeline refresh: ${wikis[*]} (snapshot $SELECTED_SNAPSHOT, stage $REFRESH_STAGE)"
+  refresh_driver_cmd+=(--version "$SELECTED_SNAPSHOT" "${wikis[@]}" --stage "$REFRESH_STAGE")
 else
   declare -a resolve_cmd=(
     "$WIKI_ECON_BIN"
@@ -495,6 +669,10 @@ else
   selected_snapshot="$(RUST_LOG="$WIKI_ECON_RUST_LOG" "${resolve_cmd[@]}")"
   set_refresh_lock_snapshot "$selected_snapshot"
 
+  if pipeline_stage_enabled && [ "$REFRESH_STAGE" = "ingest" ]; then
+    begin_pipeline_stage
+  fi
+
   echo "==> Toolforge refresh: ${wikis[*]} (snapshot $SELECTED_SNAPSHOT, stage $REFRESH_STAGE)"
   refresh_driver_cmd+=(--version "$SELECTED_SNAPSHOT" "${wikis[@]}")
   if [ "$REFRESH_STAGE" != "all" ]; then
@@ -505,46 +683,141 @@ fi
 
 ARTIFACT_CHECK_STARTED_EPOCH="$(date +%s)"
 wiki_econ_record_stage_event started artifact_check
-for required in \
-  manifest.json \
-  defaults_business.json \
-  defaults_gdp.json \
-  defaults_inequality.json \
-  defaults_labor.json \
-  defaults_patrol.json \
-  defaults_edit_variation.json \
-  business_funnel.parquet \
-  gdp.parquet \
-  gdp_activity_tiers.parquet \
-  gdp_user_type_share.parquet \
-  inequality.parquet \
-  labor_churn.parquet \
-  labor_cohorts.parquet \
-  labor_monthly.parquet \
-  patrol.parquet
-do
-  if [ ! -f "$WIKI_ECON_OUTPUT_DIR/$required" ]; then
-    REFRESH_FAILURE_STAGE=artifact_check
-    REFRESH_FAILURE_ERROR="required artifact is missing: $required"
-    wiki_econ_record_stage_event failed artifact_check "" \
-      "$(( ($(date +%s) - ARTIFACT_CHECK_STARTED_EPOCH) * 1000 ))" \
-      "$REFRESH_FAILURE_ERROR"
-    echo "Refresh succeeded but required artifact is missing: $WIKI_ECON_OUTPUT_DIR/$required" >&2
-    exit 1
-  fi
-done
+if pipeline_stage_enabled; then
+  case "$REFRESH_STAGE" in
+    ingest)
+      # Ingest commits source/warehouse receipts per wiki; the next stage is
+      # the first one with a stable metric artifact to validate.
+      echo "==> Ingest stage committed source and analytical receipts"
+      ;;
+    metrics)
+      required_metrics=(gdp.parquet gdp_user_type_share.parquet inequality.parquet labor_monthly.parquet gdp_activity_tiers.parquet editor_identity_coverage.json)
+      for wiki in "${wikis[@]}"; do
+        for required in "${required_metrics[@]}"; do
+          if [ ! -f "$WIKI_ECON_OUTPUT_DIR/$wiki/$required" ]; then
+            REFRESH_FAILURE_STAGE=artifact_check
+            REFRESH_FAILURE_ERROR="metrics artifact is missing for $wiki: $required"
+            wiki_econ_record_stage_event failed artifact_check "" \
+              "$(( ($(date +%s) - ARTIFACT_CHECK_STARTED_EPOCH) * 1000 ))" \
+              "$REFRESH_FAILURE_ERROR"
+            echo "Metrics stage succeeded but required artifact is missing: $WIKI_ECON_OUTPUT_DIR/$wiki/$required" >&2
+            exit 1
+          fi
+        done
+      done
+      ;;
+    lifecycle)
+      required_metrics=(business_funnel.parquet labor_churn.parquet labor_cohorts.parquet)
+      for wiki in "${wikis[@]}"; do
+        for required in "${required_metrics[@]}"; do
+          if [ ! -f "$WIKI_ECON_OUTPUT_DIR/$wiki/$required" ]; then
+            REFRESH_FAILURE_STAGE=artifact_check
+            REFRESH_FAILURE_ERROR="lifecycle artifact is missing for $wiki: $required"
+            wiki_econ_record_stage_event failed artifact_check "" \
+              "$(( ($(date +%s) - ARTIFACT_CHECK_STARTED_EPOCH) * 1000 ))" \
+              "$REFRESH_FAILURE_ERROR"
+            echo "Lifecycle stage succeeded but required artifact is missing: $WIKI_ECON_OUTPUT_DIR/$wiki/$required" >&2
+            exit 1
+          fi
+        done
+      done
+      ;;
+    page-week)
+      for wiki in "${wikis[@]}"; do
+        required="$WIKI_ECON_OUTPUT_DIR/$wiki/page_weekly_edits.parquet"
+        if [ ! -f "$required" ]; then
+          REFRESH_FAILURE_STAGE=artifact_check
+          REFRESH_FAILURE_ERROR="page-week artifact is missing for $wiki"
+          wiki_econ_record_stage_event failed artifact_check "" \
+            "$(( ($(date +%s) - ARTIFACT_CHECK_STARTED_EPOCH) * 1000 ))" \
+            "$REFRESH_FAILURE_ERROR"
+          echo "Page-week stage succeeded but required artifact is missing: $required" >&2
+          exit 1
+        fi
+      done
+      ;;
+    patrol)
+      for wiki in "${wikis[@]}"; do
+        required="$WIKI_ECON_OUTPUT_DIR/$wiki/patrol.parquet"
+        if [ ! -f "$required" ]; then
+          REFRESH_FAILURE_STAGE=artifact_check
+          REFRESH_FAILURE_ERROR="patrol artifact is missing for $wiki"
+          wiki_econ_record_stage_event failed artifact_check "" \
+            "$(( ($(date +%s) - ARTIFACT_CHECK_STARTED_EPOCH) * 1000 ))" \
+            "$REFRESH_FAILURE_ERROR"
+          echo "Patrol stage succeeded but required artifact is missing: $required" >&2
+          exit 1
+        fi
+      done
+      ;;
+    publish)
+      required_metrics=(manifest.json defaults_business.json defaults_gdp.json defaults_inequality.json defaults_labor.json defaults_patrol.json defaults_edit_variation.json business_funnel.parquet gdp.parquet gdp_activity_tiers.parquet gdp_user_type_share.parquet inequality.parquet labor_churn.parquet labor_cohorts.parquet labor_monthly.parquet patrol.parquet)
+      for required in "${required_metrics[@]}"; do
+        if [ ! -f "$WIKI_ECON_OUTPUT_DIR/$required" ]; then
+          REFRESH_FAILURE_STAGE=artifact_check
+          REFRESH_FAILURE_ERROR="published artifact is missing: $required"
+          wiki_econ_record_stage_event failed artifact_check "" \
+            "$(( ($(date +%s) - ARTIFACT_CHECK_STARTED_EPOCH) * 1000 ))" \
+            "$REFRESH_FAILURE_ERROR"
+          echo "Publish stage succeeded but required artifact is missing: $WIKI_ECON_OUTPUT_DIR/$required" >&2
+          exit 1
+        fi
+      done
+      for page in business.html gdp.html inequality.html labor.html patrol.html edit-variation.html; do
+        if [ ! -f "$WIKI_ECON_SITE_DIST_DIR/$page" ]; then
+          REFRESH_FAILURE_STAGE=artifact_check
+          REFRESH_FAILURE_ERROR="published site page is missing: $page"
+          wiki_econ_record_stage_event failed artifact_check "" \
+            "$(( ($(date +%s) - ARTIFACT_CHECK_STARTED_EPOCH) * 1000 ))" \
+            "$REFRESH_FAILURE_ERROR"
+          echo "Publish stage succeeded but site page is missing: $WIKI_ECON_SITE_DIST_DIR/$page" >&2
+          exit 1
+        fi
+      done
+      ;;
+  esac
+else
+  for required in \
+    manifest.json \
+    defaults_business.json \
+    defaults_gdp.json \
+    defaults_inequality.json \
+    defaults_labor.json \
+    defaults_patrol.json \
+    defaults_edit_variation.json \
+    business_funnel.parquet \
+    gdp.parquet \
+    gdp_activity_tiers.parquet \
+    gdp_user_type_share.parquet \
+    inequality.parquet \
+    labor_churn.parquet \
+    labor_cohorts.parquet \
+    labor_monthly.parquet \
+    patrol.parquet
+  do
+    if [ ! -f "$WIKI_ECON_OUTPUT_DIR/$required" ]; then
+      REFRESH_FAILURE_STAGE=artifact_check
+      REFRESH_FAILURE_ERROR="required artifact is missing: $required"
+      wiki_econ_record_stage_event failed artifact_check "" \
+        "$(( ($(date +%s) - ARTIFACT_CHECK_STARTED_EPOCH) * 1000 ))" \
+        "$REFRESH_FAILURE_ERROR"
+      echo "Refresh succeeded but required artifact is missing: $WIKI_ECON_OUTPUT_DIR/$required" >&2
+      exit 1
+    fi
+  done
 
-for page in business.html gdp.html inequality.html labor.html patrol.html edit-variation.html; do
-  if [ ! -f "$WIKI_ECON_SITE_DIST_DIR/$page" ]; then
-    REFRESH_FAILURE_STAGE=artifact_check
-    REFRESH_FAILURE_ERROR="published site page is missing: $page"
-    wiki_econ_record_stage_event failed artifact_check "" \
-      "$(( ($(date +%s) - ARTIFACT_CHECK_STARTED_EPOCH) * 1000 ))" \
-      "$REFRESH_FAILURE_ERROR"
-    echo "Site build is missing required page: $WIKI_ECON_SITE_DIST_DIR/$page" >&2
-    exit 1
-  fi
-done
+  for page in business.html gdp.html inequality.html labor.html patrol.html edit-variation.html; do
+    if [ ! -f "$WIKI_ECON_SITE_DIST_DIR/$page" ]; then
+      REFRESH_FAILURE_STAGE=artifact_check
+      REFRESH_FAILURE_ERROR="published site page is missing: $page"
+      wiki_econ_record_stage_event failed artifact_check "" \
+        "$(( ($(date +%s) - ARTIFACT_CHECK_STARTED_EPOCH) * 1000 ))" \
+        "$REFRESH_FAILURE_ERROR"
+      echo "Site build is missing required page: $WIKI_ECON_SITE_DIST_DIR/$page" >&2
+      exit 1
+    fi
+  done
+fi
 
 wiki_econ_record_stage_event completed artifact_check "" \
   "$(( ($(date +%s) - ARTIFACT_CHECK_STARTED_EPOCH) * 1000 ))"
