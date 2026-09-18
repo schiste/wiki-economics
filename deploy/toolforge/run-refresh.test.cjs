@@ -35,7 +35,11 @@ function createFixture(name) {
 set -eu
 case " $* " in
   *" cleanup-stale "*) printf '%s\\n' '{"removed":[]}' ;;
-  *" snapshot-resolve "*) printf '%s\\n' "\${FAKE_SNAPSHOT:-2026-07}" ;;
+  *" snapshot-resolve "*)
+    if [ "\${FAKE_SNAPSHOT_LOG:-0}" = "1" ]; then
+      printf '%s\\n' 'run_id=fake-run INFO snapshot resolver diagnostic=visible'
+    fi
+    printf '%s\\n' "\${FAKE_SNAPSHOT:-2026-07}" ;;
   *) echo "unexpected fake wiki-econ invocation: $*" >&2; exit 2 ;;
 esac
 `,
@@ -279,6 +283,22 @@ test("the staged ingest job permits an explicitly registered qualification wiki"
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
   const state = JSON.parse(fs.readFileSync(path.join(fixture.output, ".pipeline-state.json"), "utf8"));
   assert.deepEqual(state.wikis, ["dewiki"]);
+});
+
+test("snapshot resolver logs do not corrupt the machine-readable version", () => {
+  const fixture = createFixture("snapshot-resolver-logs");
+  const result = runFixture(fixture, {
+    FAKE_SNAPSHOT_LOG: "1",
+    WIKI_ECON_RUN_ID: "snapshot-resolver-logs-run",
+  });
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  const status = JSON.parse(fs.readFileSync(path.join(fixture.output, ".refresh-status.json"), "utf8"));
+  assert.equal(status.state, "succeeded");
+  assert.equal(status.selectedSnapshot, "2026-07");
+  assert.match(
+    fs.readFileSync(path.join(fixture.output, "logs", "refresh", "snapshot-resolver-logs-run.log"), "utf8"),
+    /snapshot resolver diagnostic=visible/,
+  );
 });
 
 test("a site-only refresh cannot discover or select a newer snapshot", () => {
