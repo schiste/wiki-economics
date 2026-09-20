@@ -465,19 +465,29 @@ test("exposes churn period metadata and labels partial years; patrol status is e
     metricRowsLoader: async ({metric}) => metric.id === "labor_churn" ? churnRows : metric.id === "patrol" ? patrolRows : [],
   });
   const churn = responseJson(await invoke(api, {url: "/api/v1/metrics/labor_churn?wiki=dewiki&granularity=year"}));
-  assert.deepEqual(churn.rows.map((row) => row.period), ["2025", "2026"]);
-  assert.deepEqual(churn.rows.map((row) => row.period_months), [12, 12]);
-  assert.ok(churn.data_quality_flags.some((flag) => flag.code === "partial_period" && flag.period === "2026"));
+  assert.deepEqual(churn.rows.map((row) => row.period), ["2025"]);
+  assert.deepEqual(churn.rows.map((row) => row.period_months), [12]);
+  assert.equal(churn.rows[0].period_complete, true);
+  assert.equal(churn.rows[0].observed_months, 12);
+  assert.ok(churn.data_quality_flags.some((flag) => flag.code === "incomplete_period_excluded" && flag.periods.includes("2026")));
+  const rawChurn = responseJson(await invoke(api, {url: "/api/v1/metrics/labor_churn?wiki=dewiki&granularity=year&raw=true"}));
+  assert.deepEqual(rawChurn.rows.map((row) => row.period), ["2025", "2026"]);
+  assert.equal(rawChurn.rows.at(-1).period_complete, false);
+  assert.ok(rawChurn.data_quality_flags.some((flag) => flag.code === "raw_incomplete_period"));
   const patrol = responseJson(await invoke(api, {url: "/api/v1/metrics/patrol?wiki=dewiki&granularity=month"}));
   assert.equal(patrol.patrol_status, "not_applicable");
   assert.ok(patrol.data_quality_flags.some((flag) => flag.code === "patrol_not_applicable"));
+  const rawArtifact = await invoke(api, {url: "/api/v1/artifacts/dewiki/labor_churn.parquet"});
+  assert.equal(rawArtifact.statusCode, 200);
+  assert.equal(rawArtifact.getHeader("x-wiki-econ-raw"), "true");
+  assert.match(rawArtifact.getHeader("x-wiki-econ-data-quality"), /raw_incomplete_period/);
   const briefing = responseJson(await invoke(api, {url: "/api/v1/wikis/dewiki/briefing"}));
   assert.equal(briefing.patrol_status, "not_applicable");
   assert.ok(briefing.data_quality_flags.some((flag) => flag.code === "patrol_not_applicable"));
   const churnHeadline = briefing.headline_metrics.find((metric) => metric.dataset === "labor_churn");
   assert.equal(churnHeadline.latest.period, "2026-07");
   assert.equal(churnHeadline.latest.departure_rate, 0.45);
-  assert.ok(briefing.data_quality_flags.some((flag) => flag.code === "trailing_period_excluded" && flag.period === "2026-08"));
+  assert.ok(briefing.data_quality_flags.some((flag) => flag.code === "incomplete_period_excluded" && flag.periods.includes("2026-08")));
 });
 
 test("publishes a value fingerprint so stable algorithm versions cannot hide value changes", async (t) => {

@@ -45,6 +45,7 @@ const VALUE_FINGERPRINT_ALGORITHM = "sha256-canonical-query-rows-v1";
 const PERIOD_METADATA_FIELDS = new Set([
   "period", "period_start", "period_end", "period_type", "period_months",
   "year_month", "week_start", "year", "cohort_year", "date",
+  "period_complete", "observed_months", "expected_months", "population_scope",
 ]);
 
 // Some projects expose more than one review mechanism.  A zero in the
@@ -95,7 +96,7 @@ const TOOL_DEFINITIONS = [
   {
     name: "get_metric",
     title: "Get aggregated metric data",
-    description: "Return bounded, server-aggregated metric rows with summary, semantics, coverage, and truncation metadata. Default granularity is month and the response is capped at 500 rows.",
+    description: "Return bounded, server-aggregated metric rows with summary, semantics, completeness metadata, and truncation metadata. Incomplete churn periods are excluded by default; set raw=true only when you explicitly need them (the response carries a warning). Default granularity is month and the response is capped at 500 rows.",
     inputSchema: {
       type: "object",
       properties: {
@@ -108,6 +109,7 @@ const TOOL_DEFINITIONS = [
         agg: {type: "array", items: {type: "string"}, maxItems: 32},
         limit: {type: "integer", minimum: 1, maximum: MAX_METRIC_LIMIT},
         cursor: {type: "string"},
+        raw: {type: "boolean", description: "Opt into incomplete churn periods. Raw responses are unsuitable for trends, YoY, movers, comparisons, and briefings and include an explicit warning."},
       },
       required: ["dataset"],
       additionalProperties: false,
@@ -369,6 +371,12 @@ function normalizeArtifactName(value) {
 function metricSemantics(metric) {
   const known = METRIC_SEMANTICS[metric?.id] || {};
   const units = {...(known.units || {})};
+  Object.assign(units, {
+    period_complete: "boolean",
+    observed_months: "months",
+    expected_months: "months",
+    population_scope: "scope",
+  });
   for (const field of metric?.schema || []) {
     if (field?.name && !units[field.name]) units[field.name] = field.unit || null;
   }
@@ -379,6 +387,36 @@ function metricSemantics(metric) {
     caveats: Array.isArray(known.caveats) ? known.caveats : [],
     date_coverage: known.date_coverage || null,
   };
+}
+
+// These fields are part of the public response contract even when an older
+// Parquet artifact predates them.  Keeping them virtual lets us harden the
+// delivery surface without rewriting immutable source files.
+function metricPopulationScope(metric) {
+  const scopes = {
+    business_funnel: "wiki_cohort_year",
+    gdp: "wiki_month_namespace_user_type",
+    gdp_activity_tiers: "wiki_period_user_type_activity_tier",
+    gdp_user_type_share: "wiki_month_user_type",
+    inequality: "wiki_period_user_type",
+    labor_churn: "wiki_observed_editor_population",
+    labor_cohorts: "wiki_cohort_year_followup_year",
+    labor_monthly: "wiki_month_namespace_user_type",
+    page_weekly_edits: "wiki_page_namespace_week",
+    patrol: "wiki_month_namespace_user_type",
+  };
+  return scopes[metric?.id] || "published_population";
+}
+
+function virtualPeriodFields(metric) {
+  const names = new Set(schemaFields(metric).map((field) => field.name));
+  const fields = [
+    {name: "period_complete", data_type: "boolean", unit: null},
+    {name: "observed_months", data_type: "integer", unit: "months"},
+    {name: "expected_months", data_type: "integer", unit: "months"},
+    {name: "population_scope", data_type: "string", unit: null},
+  ];
+  return fields.filter((field) => !names.has(field.name));
 }
 
 function schemaFields(metric) {
@@ -477,6 +515,15 @@ function parseCursor(value) {
   }
 }
 
+function parseBoolean(value, fallback = false) {
+  if (value === undefined || value === null || value === "") return fallback;
+  if (value === true || value === false) return value;
+  const text = String(value).trim().toLowerCase();
+  if (["1", "true", "yes"].includes(text)) return true;
+  if (["0", "false", "no"].includes(text)) return false;
+  return null;
+}
+
 function encodeCursor(offset) {
   return Buffer.from(String(offset), "utf8").toString("base64url");
 }
@@ -530,6 +577,46 @@ function periodMonthsForType(periodType) {
   if (periodType === "quarter") return 3;
   if (periodType === "year") return 12;
   return null;
+}
+
+function sourceMonthKey(source) {
+  for (const field of ["year_month", "period_start", "period", "date", "week_start"]) {
+    const value = source?.[field];
+    if (value === undefined || value === null || value === "") continue;
+    const match = /^(\d{4})[-/](\d{1,2})/.exec(String(value));
+    if (match) return `${match[1]}-${match[2].padStart(2, "0")}`;
+  }
+  return null;
+}
+
+function annotatePeriodMetadata(aggregatedRows, metric, query, snapshot) {
+  const version = snapshotVersion(snapshot);
+  const snapshotMonth = /^\d{4}-\d{2}$/.test(String(version || "")) ? version : null;
+  const snapshotYear = snapshotMonth?.slice(0, 4) || null;
+  return aggregatedRows.map((row) => {
+    const periodType = row.period_type || (query.granularity === "year" ? "year" : "month");
+    const expected = Number(row.expected_months ?? row.period_months ?? (periodMonthsForType(periodType) || 1));
+    let observed = Number(row.observed_months);
+    if (!Number.isFinite(observed) || observed < 0) observed = periodType === "month" ? 1 : expected;
+    let complete = row.period_complete !== false;
+    if (metric?.id === "labor_churn" && snapshotMonth) {
+      if (periodType === "month" && String(row.period) === snapshotMonth) {
+        complete = false;
+        observed = Math.min(observed, 1);
+      } else if (periodType === "year" && String(row.period) === snapshotYear) {
+        complete = false;
+        observed = Math.min(observed, Number(snapshotMonth.slice(5, 7)));
+      }
+    }
+    complete = complete && observed >= expected;
+    return {
+      ...row,
+      period_complete: Boolean(complete),
+      observed_months: Math.max(0, Math.trunc(observed)),
+      expected_months: Math.max(1, Math.trunc(expected)),
+      population_scope: row.population_scope || metricPopulationScope(metric),
+    };
+  });
 }
 
 function metricDimensionFields(metric) {
@@ -702,7 +789,7 @@ function completeBriefingRows(metric, rows, snapshot) {
   return {rows: rows.slice(0, -1), trailing};
 }
 
-function dataQualityFlags(metric, query, aggregated, coverage, snapshot) {
+function dataQualityFlags(metric, query, aggregated, coverage, snapshot, filterInfo = {}) {
   const flags = [];
   if (coverage?.missing_periods?.length) {
     flags.push({
@@ -742,10 +829,30 @@ function dataQualityFlags(metric, query, aggregated, coverage, snapshot) {
       message: quality.patrol_note,
     });
   }
-  const latest = aggregated?.rows?.at(-1);
   const version = snapshotVersion(snapshot);
-  const trailing = trailingChurnRow(metric, aggregated?.rows || [], snapshot);
-  if (trailing) {
+  const incomplete = Array.isArray(filterInfo.incompleteRows) ? filterInfo.incompleteRows : [];
+  if (incomplete.length && !query.raw) {
+    flags.push({
+      severity: "warning",
+      code: "incomplete_period_excluded",
+      dataset: metric.id,
+      periods: incomplete.map((row) => row.period),
+      snapshot: version,
+      message: "Incomplete churn periods were excluded from rows, summaries, YoY changes, movers, comparisons, and briefings. Set raw=true only for diagnostic access.",
+    });
+  }
+  if (incomplete.length && query.raw) {
+    flags.push({
+      severity: "critical",
+      code: "raw_incomplete_period",
+      dataset: metric.id,
+      periods: incomplete.map((row) => row.period),
+      snapshot: version,
+      message: "This raw response includes incomplete churn periods and must not be used for trends, YoY changes, movers, comparisons, or briefings.",
+    });
+  }
+  const trailing = incomplete.find((row) => row.period_complete === false);
+  if (trailing && query.raw) {
     flags.push({
       severity: "warning",
       code: "partial_period",
@@ -754,6 +861,8 @@ function dataQualityFlags(metric, query, aggregated, coverage, snapshot) {
       period_type: trailing.period_type || (query.granularity === "year" ? "year" : "month"),
       period_months: trailing.period_months ?? periodMonthsForType(trailing.period_type || query.granularity),
       snapshot: version,
+      observed_months: trailing.observed_months,
+      expected_months: trailing.expected_months,
       message: `The trailing ${trailing.period} churn observation is incomplete at snapshot ${version}; its departure rate includes the unobserved future period and must not be interpreted as a complete observation.`,
     });
   }
@@ -775,6 +884,19 @@ function aggregateRows(sourceRows, metric, query) {
   const buckets = new Map();
   const nullDimensions = new Map();
   const dimensions = metricDimensionFields(metric);
+  // Ratio expressions need their published numerator/denominator even when a
+  // caller requests only the ratio field (for example, agg=revert_rate:ratio).
+  // Keep those dependency vectors private to the bucket; only requested
+  // expressions are emitted below.
+  const collectionFields = new Set(expressions.keys());
+  for (const [fieldName] of expressions) {
+    const rule = metricAggregationForField(metric, fieldName);
+    if (rule?.kind === "ratio") {
+      for (const dependency of [...(rule.numerators || []), rule.denominator]) {
+        if (typeof dependency === "string" && fieldNames.has(dependency)) collectionFields.add(dependency);
+      }
+    }
+  }
   for (const raw of rows) {
     const source = safeJsonValue(raw) || {};
     if (query.wiki && source.wiki && source.wiki !== query.wiki) continue;
@@ -793,20 +915,38 @@ function aggregateRows(sourceRows, metric, query) {
             || field.name === "wiki" || groupFields.includes(field.name)) continue;
         bucket[field.name] = [];
       }
+      for (const field of collectionFields) {
+        if (field !== dateColumn && field !== "period" && field !== "wiki" && !groupFields.includes(field)) {
+          bucket[field] ||= [];
+        }
+      }
       for (const field of ["period", "period_start", "period_end", "period_type", "period_months"]) {
         if (field === "period" || fieldNames.has(field)
             || (field === "period_months" && fieldNames.has("period_type"))) {
           bucket[`__${field}`] = source[field] ?? null;
         }
       }
+      bucket.__months = new Set();
+      bucket.__observedMonthsHint = null;
+      bucket.__periodComplete = true;
+      bucket.__sourcePeriodType = source.period_type || null;
+      bucket.__sourcePeriodMonths = Number(source.period_months) || null;
       buckets.set(key, bucket);
     }
+    const month = sourceMonthKey(source);
+    if (month) bucket.__months.add(month);
+    const observedHint = Number(source.observed_months);
+    if (Number.isFinite(observedHint)) {
+      bucket.__observedMonthsHint = Math.max(bucket.__observedMonthsHint || 0, observedHint);
+    }
+    if (source.period_complete === false) bucket.__periodComplete = false;
     for (const field of dimensions) {
       if (source[field] === null || source[field] === undefined || source[field] === "") {
         nullDimensions.set(field, (nullDimensions.get(field) || 0) + 1);
       }
     }
-    for (const [fieldName] of expressions) {
+    for (const fieldName of collectionFields) {
+      if (fieldName === dateColumn || fieldName === "period" || fieldName === "wiki" || groupFields.includes(fieldName)) continue;
       if (!bucket[fieldName]) bucket[fieldName] = [];
       bucket[fieldName].push(source[fieldName]);
     }
@@ -849,6 +989,16 @@ function aggregateRows(sourceRows, metric, query) {
       else value = values.length ? values.at(-1) : null;
       output[fieldName] = safeJsonValue(value);
     }
+    const periodType = output.period_type || (granularity === "year" ? "year" : "month");
+    const expectedMonths = Number(output.period_months || periodMonthsForType(periodType) || 1);
+    const observedMonths = bucket.__observedMonthsHint
+      ?? (bucket.__sourcePeriodType === periodType && bucket.__sourcePeriodMonths === expectedMonths
+        ? (bucket.__periodComplete ? expectedMonths : 0)
+        : (bucket.__months.size || (periodType === "month" ? 1 : expectedMonths)));
+    output.period_complete = Boolean(bucket.__periodComplete && observedMonths >= expectedMonths);
+    output.observed_months = Math.max(0, Math.trunc(observedMonths));
+    output.expected_months = Math.max(1, Math.trunc(expectedMonths));
+    output.population_scope = metricPopulationScope(metric);
     result.push(output);
   }
   result.sort((left, right) => String(left.period).localeCompare(String(right.period)) || JSON.stringify(left).localeCompare(JSON.stringify(right)));
@@ -920,7 +1070,9 @@ function rowsToCsv(rows, metadata) {
     `# value_fingerprint_algorithm=${metadata.value_fingerprint_algorithm || ""}`,
     `# value_fingerprint=${metadata.value_fingerprint || ""}`,
     `# caveats=${JSON.stringify(metadata.caveats || [])}`,
+    `# period_metadata=${JSON.stringify(metadata.period_metadata || {})}`,
     `# data_quality_flags=${JSON.stringify(metadata.data_quality_flags || [])}`,
+    `# raw=${Boolean(metadata.query?.raw)}`,
     `# license=${JSON.stringify(metadata.license ?? null)}`,
     `# attribution=${JSON.stringify(metadata.attribution ?? null)}`,
     `# rows_returned=${metadata.rows_returned}`,
@@ -963,7 +1115,7 @@ function addPublicHeaders(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Range, MCP-Protocol-Version, Mcp-Method, Mcp-Name");
-  res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range, ETag, Last-Modified, MCP-Protocol-Version, RateLimit-Limit, RateLimit-Remaining, RateLimit-Reset, RateLimit-Policy, Retry-After, X-Wiki-Econ-Dataset, X-Wiki-Econ-Algorithm-Version, X-Wiki-Econ-Definition, X-Wiki-Econ-License, X-Wiki-Econ-Attribution, X-Wiki-Econ-Metadata, X-Wiki-Econ-Snapshot, X-Wiki-Econ-Generated-At, X-Wiki-Econ-Caveats, X-Wiki-Econ-Rows-Returned, X-Wiki-Econ-Rows-Total");
+  res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range, ETag, Last-Modified, MCP-Protocol-Version, RateLimit-Limit, RateLimit-Remaining, RateLimit-Reset, RateLimit-Policy, Retry-After, X-Wiki-Econ-Dataset, X-Wiki-Econ-Algorithm-Version, X-Wiki-Econ-Definition, X-Wiki-Econ-License, X-Wiki-Econ-Attribution, X-Wiki-Econ-Metadata, X-Wiki-Econ-Snapshot, X-Wiki-Econ-Generated-At, X-Wiki-Econ-Caveats, X-Wiki-Econ-Period-Metadata, X-Wiki-Econ-Data-Quality, X-Wiki-Econ-Raw, X-Wiki-Econ-Rows-Returned, X-Wiki-Econ-Rows-Total");
   res.setHeader("X-Content-Type-Options", "nosniff");
 }
 
@@ -979,6 +1131,7 @@ function writeJson(res, statusCode, body, cacheControl = PUBLIC_CACHE_CONTROL, e
 
 function toPublicMetric(metric, artifacts) {
   const semantics = metricSemantics(metric);
+  const fields = [...schemaFields(metric), ...virtualPeriodFields(metric)];
   return {
     id: metric.id,
     family: metric.family,
@@ -986,12 +1139,14 @@ function toPublicMetric(metric, artifacts) {
     definition: semantics.definition,
     units: semantics.units,
     caveats: semantics.caveats,
-    schema: metric.schema,
+    schema: fields.map((field) => ({...field, unit: field.unit || semantics.units[field.name] || null})),
     aggregation: metric.aggregation,
     publication: metric.publication,
     receipt: metric.receipt,
     fingerprint: metric.fingerprint,
     browser: metric.browser,
+    population_scope: metricPopulationScope(metric),
+    period_metadata: {fields: ["period_complete", "observed_months", "expected_months", "population_scope"]},
     artifacts,
   };
 }
@@ -1004,6 +1159,8 @@ function compactPublicCatalog(catalog) {
     definition: dataset.definition,
     units: dataset.units,
     caveats: dataset.caveats,
+    population_scope: dataset.population_scope || null,
+    period_metadata: dataset.period_metadata || null,
     artifact_count: dataset.artifacts.length,
     wikis: [...new Set(dataset.artifacts.map((artifact) => artifact.wiki).filter(Boolean))].sort(),
   }));
@@ -1209,7 +1366,7 @@ function openApiDocument(req, configuredOrigin) {
       [`${METRICS_PREFIX}/{dataset}`]: {
         get: {
           summary: "Query one metric",
-          description: "Return bounded server-aggregated rows as JSON (default), CSV, or Parquet. JSON includes semantic metadata, summary, and explicit pagination/truncation fields.",
+          description: "Return bounded server-aggregated rows as JSON (default), CSV, or Parquet. Every period row carries period_complete, observed_months, expected_months, and population_scope. Incomplete churn periods are excluded from all derived results by default; raw=true opts into them with a loud warning.",
           parameters: [
             {name: "dataset", in: "path", required: true, schema: {type: "string"}},
             {name: "wiki", in: "query", schema: {type: "string"}},
@@ -1221,6 +1378,7 @@ function openApiDocument(req, configuredOrigin) {
             {name: "format", in: "query", schema: {type: "string", enum: ["json", "csv", "parquet"], default: "json"}},
             {name: "limit", in: "query", schema: {type: "integer", minimum: 1, maximum: MAX_METRIC_LIMIT, default: DEFAULT_METRIC_LIMIT}},
             {name: "cursor", in: "query", schema: {type: "string"}},
+            {name: "raw", in: "query", schema: {type: "boolean", default: false}, description: "Include incomplete churn periods for diagnostics only; do not use raw output for trends, YoY, movers, comparisons, or briefings."},
           ],
           responses: {"200": {description: "Metric response or rendered rows"}, "400": {description: "Invalid metric query"}, "404": {description: "Metric or wiki not published"}, "413": {description: "Source too large for a transformed response"}, "429": rateLimited},
         },
@@ -1514,6 +1672,12 @@ function createMachineApi(options = {}) {
       error.code = "invalid_cursor";
       throw error;
     }
+    const raw = parseBoolean(get("raw") ?? get("include_incomplete"), false);
+    if (raw === null) {
+      const error = new Error("raw must be a boolean");
+      error.code = "invalid_raw";
+      throw error;
+    }
     return {
       dataset: metric.id,
       wiki,
@@ -1525,10 +1689,11 @@ function createMachineApi(options = {}) {
       format,
       limit: parsedLimit,
       cursor,
+      raw,
     };
   }
 
-  function metricMetadata(catalog, metric, query, summary, coverage, rowsReturned, rowsTotal, truncated, nextCursor, aggregated) {
+  function metricMetadata(catalog, metric, query, summary, coverage, rowsReturned, rowsTotal, truncated, nextCursor, aggregated, filterInfo = {}) {
     const semantics = metricSemantics(metric);
     const wikiState = query.wiki ? catalog.wikis.find((entry) => entry.wiki === query.wiki) : null;
     const artifact = metricArtifact(catalog, metric, query.wiki);
@@ -1545,6 +1710,7 @@ function createMachineApi(options = {}) {
         granularity: query.granularity,
         group_by: parseMetricList(query.groupBy),
         agg: parseMetricList(query.agg),
+        raw: Boolean(query.raw),
       },
     }, aggregated?.rows || []);
     return {
@@ -1561,6 +1727,12 @@ function createMachineApi(options = {}) {
       value_fingerprint_algorithm: VALUE_FINGERPRINT_ALGORITHM,
       value_fingerprint: valueFingerprint,
       caveats: semantics.caveats,
+      population_scope: metricPopulationScope(metric),
+      period_metadata: {
+        fields: ["period_complete", "observed_months", "expected_months", "population_scope"],
+        incomplete_periods_excluded: filterInfo.incompleteRows?.length > 0 && !query.raw,
+        raw_access: Boolean(query.raw),
+      },
       license: catalog.license,
       attribution: catalog.attribution,
       provenance: {
@@ -1571,7 +1743,7 @@ function createMachineApi(options = {}) {
         value_fingerprint: valueFingerprint,
       },
       coverage,
-      data_quality_flags: dataQualityFlags(metric, query, aggregated, coverage, snapshot),
+      data_quality_flags: dataQualityFlags(metric, query, aggregated, coverage, snapshot, filterInfo),
       ...(quality ? {patrol_status: quality.patrol_status, patrol_note: quality.patrol_note} : {}),
       query: {
         from: query.from || null,
@@ -1579,10 +1751,13 @@ function createMachineApi(options = {}) {
         granularity: query.granularity,
         group_by: parseMetricList(query.groupBy),
         agg: parseMetricList(query.agg),
+        raw: Boolean(query.raw),
       },
       summary,
       rows_returned: rowsReturned,
       rows_total: rowsTotal,
+      raw_rows_total: filterInfo.rawRowsTotal ?? rowsTotal,
+      incomplete_periods_excluded: filterInfo.incompleteRows?.length || 0,
       truncated,
       next_cursor: nextCursor,
     };
@@ -1591,14 +1766,23 @@ function createMachineApi(options = {}) {
   async function queryMetric(catalog, metric, query) {
     const sourceRows = await loadMetricRows({catalog, metric, wiki: query.wiki});
     const aggregated = aggregateRows(sourceRows, metric, query);
-    const rowsTotal = aggregated.rows.length;
+    const wikiState = query.wiki ? catalog.wikis.find((entry) => entry.wiki === query.wiki) : null;
+    const snapshot = wikiState?.snapshot || (query.wiki ? null : catalog.provenance?.selected_snapshot_versions || null);
+    const annotatedRows = annotatePeriodMetadata(aggregated.rows, metric, query, snapshot);
+    const incompleteRows = metric.id === "labor_churn"
+      ? annotatedRows.filter((row) => row.period_complete === false)
+      : [];
+    const visibleRows = query.raw ? annotatedRows : annotatedRows.filter((row) => !incompleteRows.includes(row));
+    aggregated.rows = visibleRows;
+    const filterInfo = {rawRowsTotal: annotatedRows.length, incompleteRows};
+    const rowsTotal = visibleRows.length;
     const start = Math.min(query.cursor, rowsTotal);
-    const rows = aggregated.rows.slice(start, start + query.limit);
+    const rows = visibleRows.slice(start, start + query.limit);
     const truncated = start + rows.length < rowsTotal;
     const nextCursor = truncated ? encodeCursor(start + rows.length) : null;
     const coverage = metricCoverage(aggregated.rows, aggregated.dateColumn, query.granularity);
     const summary = summarizeRows(aggregated.rows, aggregated.expressions, query.granularity);
-    const metadata = metricMetadata(catalog, metric, query, summary, coverage, rows.length, rowsTotal, truncated, nextCursor, aggregated);
+    const metadata = metricMetadata(catalog, metric, query, summary, coverage, rows.length, rowsTotal, truncated, nextCursor, aggregated, filterInfo);
     return {metadata, rows, aggregated};
   }
 
@@ -1615,12 +1799,14 @@ function createMachineApi(options = {}) {
       algorithm_version: metric.algorithm_version || null,
       date_column: metricDateColumn(metric),
       receipt: metric.receipt || null,
-      fields: schemaFields(metric).map((field) => ({...field, unit: semantics.units[field.name] || null})),
+      fields: [...schemaFields(metric), ...virtualPeriodFields(metric)].map((field) => ({...field, unit: field.unit || semantics.units[field.name] || null})),
       aggregation: metric.aggregation || [],
       coverage: {minimum_date: dates[0] || null, maximum_date: dates.at(-1) || null},
       license: catalog.license,
       attribution: catalog.attribution,
       caveats: semantics.caveats,
+      population_scope: metricPopulationScope(metric),
+      period_metadata: {fields: ["period_complete", "observed_months", "expected_months", "population_scope"]},
     };
   }
 
@@ -1640,6 +1826,8 @@ function createMachineApi(options = {}) {
       caveats: semantics.caveats,
       license: catalog.license,
       attribution: catalog.attribution,
+      population_scope: metricPopulationScope(metric),
+      period_metadata: {fields: ["period_complete", "observed_months", "expected_months", "population_scope"]},
     };
   }
 
@@ -1660,25 +1848,12 @@ function createMachineApi(options = {}) {
       try {
         const query = {dataset: metric.id, wiki, granularity: "month", groupBy: "", agg: "", from: undefined, to: undefined, limit: 24, cursor: 0};
         const result = await queryMetric(catalog, metric, query);
-        const complete = completeBriefingRows(metric, result.aggregated.rows, result.metadata.snapshot);
-        const briefingSummary = complete.trailing
-          ? summarizeRows(complete.rows, result.aggregated.expressions, query.granularity)
-          : result.metadata.summary;
-        const briefingCoverage = complete.trailing
-          ? metricCoverage(complete.rows, result.aggregated.dateColumn, query.granularity)
-          : result.metadata.coverage;
+        const briefingSummary = result.metadata.summary;
+        const briefingCoverage = result.metadata.coverage;
         const latest = briefingSummary.latest;
         const headlineLatest = withoutNullFields(latest);
         const headlineTrend = withoutNullFields(briefingSummary.yoy_change);
-        const briefingFingerprint = complete.trailing
-          ? metricValueFingerprint({
-            dataset: metric.id,
-            wiki,
-            algorithmVersion: result.metadata.algorithm_version,
-            snapshot: result.metadata.snapshot,
-            query: result.metadata.query,
-          }, complete.rows)
-          : result.metadata.value_fingerprint;
+        const briefingFingerprint = result.metadata.value_fingerprint;
         headlineMetrics.push({
           dataset: metric.id,
           algorithm_version: result.metadata.algorithm_version,
@@ -1689,18 +1864,6 @@ function createMachineApi(options = {}) {
           coverage: briefingCoverage,
         });
         qualityFlags.push(...(result.metadata.data_quality_flags || []));
-        if (complete.trailing) {
-          qualityFlags.push({
-            severity: "warning",
-            code: "trailing_period_excluded",
-            dataset: metric.id,
-            period: complete.trailing.period,
-            period_type: complete.trailing.period_type || "month",
-            period_months: complete.trailing.period_months ?? periodMonthsForType(complete.trailing.period_type || "month"),
-            snapshot: snapshotVersion(result.metadata.snapshot),
-            message: `The trailing ${complete.trailing.period} churn observation is excluded from the briefing because its future comparison period is not observed.`,
-          });
-        }
         for (const [field, change] of Object.entries(briefingSummary.yoy_change || {})) {
           if (change && Number.isFinite(change.percent) && Number.isFinite(Number(latest?.[field]))) {
             movers.push({dataset: metric.id, field, ...change, latest: latest[field]});
@@ -1760,8 +1923,13 @@ function createMachineApi(options = {}) {
     if (list.some((wiki) => !validWiki(wiki) || !catalog.wikis.some((entry) => entry.wiki === wiki))) throw new Error("All compared wikis must be currently published");
     const comparisons = [];
     for (const wiki of list) {
-      const result = await queryMetric(catalog, metric, {dataset: metric.id, wiki, granularity, groupBy: "", agg: "", limit: 2, cursor: 0});
-      comparisons.push({wiki, latest: result.metadata.summary.latest, previous: result.rows.at(-2) || null, trend: result.metadata.summary.yoy_change, coverage: result.metadata.coverage});
+      const result = await queryMetric(catalog, metric, {dataset: metric.id, wiki, granularity, groupBy: "", agg: "", limit: MAX_METRIC_LIMIT, cursor: 0, raw: false});
+      const periods = [...new Set(result.aggregated.rows.map((row) => row.period))];
+      const previousPeriod = periods.length > (granularity === "year" ? 1 : 12)
+        ? periods[periods.length - 1 - (granularity === "year" ? 1 : 12)]
+        : null;
+      const previous = previousPeriod ? result.aggregated.rows.find((row) => row.period === previousPeriod) || null : null;
+      comparisons.push({wiki, latest: result.metadata.summary.latest, previous, trend: result.metadata.summary.yoy_change, coverage: result.metadata.coverage, data_quality_flags: result.metadata.data_quality_flags});
     }
     const semantics = metricSemantics(metric);
     return {
@@ -1771,6 +1939,8 @@ function createMachineApi(options = {}) {
       definition: semantics.definition,
       units: semantics.units,
       algorithm_version: metric.algorithm_version || null,
+      population_scope: metricPopulationScope(metric),
+      period_metadata: {fields: ["period_complete", "observed_months", "expected_months", "population_scope"], incomplete_periods_excluded: true, raw_access: false},
       granularity,
       comparisons,
       license: catalog.license,
@@ -1827,6 +1997,27 @@ function createMachineApi(options = {}) {
       writeJson(res, 404, {error: "Published artifact not found", code: "artifact_not_found"});
       return true;
     }
+    // Immutable artifact URLs are intentionally still available for
+    // reproducible research, but a churn artifact is raw by definition: it
+    // can contain a trailing partial period. Carry the same loud warning as
+    // the transformed metric endpoint so a client cannot bypass the safety
+    // contract merely by switching download URLs.
+    if (/(?:^|\/)labor_churn(?:\.parquet|\/)/.test(name)) {
+      extraHeaders = {
+        ...extraHeaders,
+        "X-Wiki-Econ-Raw": "true",
+        "X-Wiki-Econ-Period-Metadata": JSON.stringify({
+          fields: ["period_complete", "observed_months", "expected_months", "population_scope"],
+          raw_access: true,
+          warning: "This immutable churn artifact may include incomplete trailing periods; use the metrics endpoint for default filtered rows.",
+        }),
+        "X-Wiki-Econ-Data-Quality": JSON.stringify([{
+          severity: "critical",
+          code: "raw_incomplete_period",
+          message: "This raw churn artifact may include incomplete trailing periods and must not be used for trends, YoY changes, movers, comparisons, or briefings.",
+        }]),
+      };
+    }
     const {artifact, file, stat} = loaded;
     const etag = artifact.sha256 ? `"${artifact.sha256}"` : `"${crypto.createHash("sha256").update(`${stat.size}:${stat.mtimeMs}`).digest("hex")}"`;
     if (requestHeader(req, "if-none-match") === etag) {
@@ -1878,7 +2069,7 @@ function createMachineApi(options = {}) {
   }
 
   function metricErrorStatus(error) {
-    if (["invalid_dataset", "invalid_wiki", "wiki_required", "invalid_granularity", "invalid_date_boundary", "invalid_format", "invalid_limit", "invalid_cursor"].includes(error.code)) return 400;
+    if (["invalid_dataset", "invalid_wiki", "wiki_required", "invalid_granularity", "invalid_date_boundary", "invalid_format", "invalid_limit", "invalid_cursor", "invalid_raw"].includes(error.code)) return 400;
     if (["metric_not_found", "metric_not_available", "wiki_not_published"].includes(error.code)) return 404;
     if (error.code === "metric_source_too_large") return 413;
     return 503;
@@ -1911,7 +2102,11 @@ function createMachineApi(options = {}) {
     const query = parseMetricQuery(url, catalog, metric);
     const isDirectParquet = query.format === "parquet"
       && !query.from && !query.to && !parseMetricList(query.groupBy).length && !parseMetricList(query.agg).length
-      && query.cursor === 0 && !url.searchParams.has("limit");
+      && query.cursor === 0 && !url.searchParams.has("limit")
+      // Churn must pass through queryMetric even for raw Parquet downloads so
+      // period metadata and the explicit raw-access warning cannot be bypassed
+      // by the immutable-artifact fast path.
+      && metric.id !== "labor_churn";
     if (isDirectParquet) {
       const loaded = metricArtifact(catalog, metric, query.wiki);
       if (!loaded) {
@@ -1929,6 +2124,7 @@ function createMachineApi(options = {}) {
         "X-Wiki-Econ-Snapshot": JSON.stringify(query.wiki ? catalog.wikis.find((entry) => entry.wiki === query.wiki)?.snapshot || null : catalog.provenance?.selected_snapshot_versions || null),
         "X-Wiki-Econ-Generated-At": new Date().toISOString(),
         "X-Wiki-Econ-Caveats": JSON.stringify(semantics.caveats),
+        "X-Wiki-Econ-Period-Metadata": JSON.stringify({fields: ["period_complete", "observed_months", "expected_months", "population_scope"]}),
         "X-Wiki-Econ-Metadata": `${METRICS_PREFIX}/${encodeURIComponent(metric.id)}/schema`,
       });
     }
@@ -1978,6 +2174,8 @@ function createMachineApi(options = {}) {
       "X-Wiki-Econ-Snapshot": JSON.stringify(result.metadata.snapshot ?? null),
       "X-Wiki-Econ-Generated-At": result.metadata.generated_at,
       "X-Wiki-Econ-Caveats": JSON.stringify(result.metadata.caveats || []),
+      "X-Wiki-Econ-Period-Metadata": JSON.stringify(result.metadata.period_metadata || {}),
+      "X-Wiki-Econ-Data-Quality": JSON.stringify(result.metadata.data_quality_flags || []),
     });
     res.end(body);
     return true;
@@ -2050,6 +2248,7 @@ function createMachineApi(options = {}) {
           agg: Array.isArray(args.agg) ? args.agg.join(",") : (args.agg || ""),
           limit: args.limit,
           cursor: args.cursor,
+          raw: args.raw,
           format: "json",
         });
         const result = await queryMetric(catalog, metric, query);

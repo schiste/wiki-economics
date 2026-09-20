@@ -531,6 +531,19 @@ enum Commands {
         report_path: Option<PathBuf>,
     },
 
+    /// Re-run stable-version value fingerprints against the current gate.
+    /// This is scheduled independently so same-snapshot drift cannot remain
+    /// silent between publications.
+    PublicationFingerprintCheck {
+        /// Wiki lifecycle and publication contract
+        #[arg(long, default_value = "config/wiki-lifecycle.json")]
+        lifecycle: PathBuf,
+
+        /// Optional atomic JSON report retained by operations
+        #[arg(long = "report")]
+        report_path: Option<PathBuf>,
+    },
+
     /// Repair one or all interrupted publication transactions
     PublicationRecover {
         /// Wiki lifecycle and publication contract
@@ -1563,6 +1576,19 @@ fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
             &site_dist_dir,
             report_path.as_deref(),
         )?,
+
+        Commands::PublicationFingerprintCheck {
+            lifecycle,
+            report_path,
+        } => {
+            let report = publication::fingerprint_check(
+                &data_dir,
+                &output_dir,
+                &lifecycle,
+                report_path.as_deref(),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+        }
 
         Commands::PublicationRecover {
             lifecycle,

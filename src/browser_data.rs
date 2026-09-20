@@ -137,6 +137,8 @@ fn build_index_with_previous(
                             conservation_columns: Vec::new(),
                             ordering_contract: "wiki-major/v1".to_string(),
                             page_week_consistency: false,
+                            metric: None,
+                            enforce_invariants: false,
                         },
                     )
                 })?
@@ -662,6 +664,8 @@ fn write_year_shards(
                 conservation_columns: Vec::new(),
                 ordering_contract: "global-time-shard/v1".to_string(),
                 page_week_consistency: false,
+                metric: None,
+                enforce_invariants: false,
             },
         );
         receipt?;

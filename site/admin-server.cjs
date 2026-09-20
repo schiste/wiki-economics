@@ -1328,6 +1328,16 @@ function readArtifactScrubStatus() {
   }
 }
 
+function readFingerprintDriftStatus() {
+  const file = path.join(OUTPUT_DIR, "fingerprint-drift-alert.json");
+  if (!fs.existsSync(file)) return null;
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return {invalid: true};
+  }
+}
+
 function directoryJsonEntries(directory, { directories = false, limit = 100 } = {}) {
   const entries = [];
   for (const entry of safeReadDir(directory)) {
@@ -1862,6 +1872,7 @@ function buildStatusPayload(req, session) {
     ...scheduledRefresh,
     lifecycle: WIKI_LIFECYCLE,
     scrubStatus: readArtifactScrubStatus(),
+    fingerprintDriftStatus: readFingerprintDriftStatus(),
   });
   const effectiveJob = currentJob
     ? {

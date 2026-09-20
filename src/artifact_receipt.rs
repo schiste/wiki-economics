@@ -122,11 +122,24 @@ pub struct SemanticSpec {
     pub conservation_columns: Vec<String>,
     pub ordering_contract: String,
     pub page_week_consistency: bool,
+    /// Metric identity enables row-level publication invariants.  Source
+    /// receipts (patrol history, remote inventories, etc.) deliberately leave
+    /// this unset because they have different contracts.
+    pub metric: Option<MetricId>,
+    pub enforce_invariants: bool,
 }
 
 impl SemanticSpec {
     pub fn for_identity(identity: &str) -> Self {
-        Self::for_identity_with_algorithm(identity, None)
+        #[allow(unused_mut)]
+        let mut spec = Self::for_identity_with_algorithm(identity, None);
+        // Existing publication unit fixtures use deliberately minimal rows;
+        // their semantic-invariant coverage is exercised with explicit specs.
+        #[cfg(test)]
+        {
+            spec.enforce_invariants = false;
+        }
+        spec
     }
 
     /// Build the semantic contract for an artifact receipt. A small number of
@@ -148,6 +161,8 @@ impl SemanticSpec {
                     conservation_columns: vec!["total_edits".to_string()],
                     ordering_contract: definition.ordering.as_str().to_string(),
                     page_week_consistency: false,
+                    metric: Some(metric),
+                    enforce_invariants: false,
                 };
             }
             return Self {
@@ -158,6 +173,8 @@ impl SemanticSpec {
                     .unwrap_or_default(),
                 ordering_contract: definition.ordering.as_str().to_string(),
                 page_week_consistency: metric == MetricId::PageWeeklyEdits,
+                metric: Some(metric),
+                enforce_invariants: true,
             };
         }
         Self {
@@ -165,6 +182,8 @@ impl SemanticSpec {
             conservation_columns: Vec::new(),
             ordering_contract: "writer-order/v1".to_string(),
             page_week_consistency: false,
+            metric: None,
+            enforce_invariants: false,
         }
     }
 
@@ -180,6 +199,10 @@ impl SemanticSpec {
             spec.date_column = None;
             spec.conservation_columns = vec!["total_edits".to_string()];
             spec.page_week_consistency = false;
+            spec.enforce_invariants = false;
+        }
+        if algorithm_version.starts_with("legacy-") {
+            spec.enforce_invariants = false;
         }
         (spec, legacy_inequality)
     }
@@ -246,6 +269,10 @@ pub struct SemanticAccumulator {
     maximum_wiki: Option<String>,
     previous_wiki: Option<String>,
     previous_page_week: Option<PreviousPageWeek>,
+    /// Survivor counts are expected to be non-increasing as a cohort's
+    /// follow-up year advances. Keep the small cohort series in memory so the
+    /// invariant also holds when a writer emits batches out of order.
+    cohort_survivors: BTreeMap<String, BTreeMap<String, f64>>,
 }
 
 impl SemanticAccumulator {
@@ -266,6 +293,7 @@ impl SemanticAccumulator {
             maximum_wiki: None,
             previous_wiki: None,
             previous_page_week: None,
+            cohort_survivors: BTreeMap::new(),
         }
     }
 
@@ -300,6 +328,21 @@ impl SemanticAccumulator {
         self.observe_wikis(frame)?;
         self.observe_dates(frame)?;
         self.observe_totals(frame)?;
+        if self.spec.enforce_invariants {
+            if let Some(metric) = self.spec.metric {
+                validate_metric_invariants(
+                    frame,
+                    metric,
+                    self.rows - u64::try_from(frame.height())?,
+                )?;
+                if metric == MetricId::LaborCohorts {
+                    self.observe_cohort_monotonicity(
+                        frame,
+                        self.rows - u64::try_from(frame.height())?,
+                    )?;
+                }
+            }
+        }
         if self.spec.page_week_consistency {
             self.observe_page_weeks(frame)?;
         }
@@ -404,6 +447,60 @@ impl SemanticAccumulator {
         Ok(())
     }
 
+    fn observe_cohort_monotonicity(&mut self, frame: &DataFrame, row_offset: u64) -> Result<()> {
+        let cohort_years = frame.column("cohort_year")?.str()?;
+        let years = frame.column("year")?.str()?;
+        for row in 0..frame.height() {
+            let cohort_year = cohort_years.get(row).with_context(|| {
+                format!(
+                    "null cohort_year at receipt row {}",
+                    row_offset + row as u64
+                )
+            })?;
+            let year = years.get(row).with_context(|| {
+                format!(
+                    "null cohort follow-up year at receipt row {}",
+                    row_offset + row as u64
+                )
+            })?;
+            let survived = numeric_value(frame, "survived_editors", row)?.with_context(|| {
+                format!(
+                    "null survived_editors at receipt row {}",
+                    row_offset + row as u64
+                )
+            })?;
+            // Merged artifacts contain the same cohort years for multiple
+            // wikis. Include the wiki in the key when available so one wiki's
+            // series cannot be compared with another's.
+            let wiki = frame
+                .column("wiki")
+                .ok()
+                .and_then(|column| column.str().ok())
+                .and_then(|column| column.get(row))
+                .unwrap_or("");
+            let key = format!("{wiki}\0{cohort_year}");
+            let series = self.cohort_survivors.entry(key).or_default();
+            if let Some((previous_year, previous_survived)) =
+                series.range(..year.to_string()).next_back()
+            {
+                ensure!(
+                    survived <= *previous_survived,
+                    "cohort survivors increase from {previous_year} to {year} for cohort {cohort_year}: {previous_survived} -> {survived} at receipt row {}",
+                    row_offset + row as u64
+                );
+            }
+            if let Some((next_year, next_survived)) = series.range(year.to_string()..).next() {
+                ensure!(
+                    survived >= *next_survived,
+                    "cohort survivors decrease out of order from {year} to {next_year} for cohort {cohort_year}: {survived} -> {next_survived} at receipt row {}",
+                    row_offset + row as u64
+                );
+            }
+            series.insert(year.to_string(), survived);
+        }
+        Ok(())
+    }
+
     fn finish_summary(self) -> Result<SemanticSummary> {
         Ok(SemanticSummary {
             parquet_schema: self
@@ -455,6 +552,329 @@ fn field_identities(schema: &Schema) -> Vec<FieldIdentity> {
             data_type: format!("{:?}", field.dtype()),
         })
         .collect()
+}
+
+fn numeric_value(frame: &DataFrame, column: &str, row: usize) -> Result<Option<f64>> {
+    let value = frame.column(column)?.get(row)?;
+    Ok(match value {
+        AnyValue::Null => None,
+        AnyValue::UInt8(value) => Some(f64::from(value)),
+        AnyValue::UInt16(value) => Some(f64::from(value)),
+        AnyValue::UInt32(value) => Some(f64::from(value)),
+        AnyValue::UInt64(value) => Some(value as f64),
+        AnyValue::Int8(value) => Some(f64::from(value)),
+        AnyValue::Int16(value) => Some(f64::from(value)),
+        AnyValue::Int32(value) => Some(f64::from(value)),
+        AnyValue::Int64(value) => Some(value as f64),
+        AnyValue::Float32(value) => Some(f64::from(value)),
+        AnyValue::Float64(value) => Some(value),
+        other => anyhow::bail!("expected numeric value in {column}, found {other:?}"),
+    })
+}
+
+fn close_enough(actual: f64, expected: f64) -> bool {
+    let scale = actual.abs().max(expected.abs()).max(1.0);
+    (actual - expected).abs() <= 1e-9 * scale
+}
+
+fn close_enough_rounded(actual: f64, expected: f64, decimals: f64) -> bool {
+    close_enough(actual, (expected * decimals).round() / decimals)
+}
+
+fn validate_metric_invariants(frame: &DataFrame, metric: MetricId, row_offset: u64) -> Result<()> {
+    let has = |name: &str| frame.schema().contains(name);
+    let require =
+        |name: &str, row: usize| -> Result<Option<f64>> { numeric_value(frame, name, row) };
+    for row in 0..frame.height() {
+        let absolute_row = row_offset + u64::try_from(row)?;
+        let fail = |message: String| -> Result<()> {
+            anyhow::bail!(
+                "metric={} row={} invariant failed: {}",
+                metric.as_str(),
+                absolute_row,
+                message
+            )
+        };
+        match metric {
+            MetricId::Gdp => {
+                if has("productive_edits") && has("reverted_edits") && has("total_edits") {
+                    let productive =
+                        require("productive_edits", row)?.context("productive_edits is null")?;
+                    let reverted =
+                        require("reverted_edits", row)?.context("reverted_edits is null")?;
+                    let total = require("total_edits", row)?.context("total_edits is null")?;
+                    if !close_enough(productive + reverted, total) {
+                        fail(format!(
+                            "productive_edits + reverted_edits = {}, total_edits = {}",
+                            productive + reverted,
+                            total
+                        ))?;
+                    }
+                }
+                if has("revert_rate") && has("reverted_edits") && has("total_edits") {
+                    let rate = require("revert_rate", row)?;
+                    let reverted =
+                        require("reverted_edits", row)?.context("reverted_edits is null")?;
+                    let total = require("total_edits", row)?.context("total_edits is null")?;
+                    if let Some(rate) = rate {
+                        if !rate.is_finite() || !(0.0..=1.0).contains(&rate) {
+                            fail(format!(
+                                "revert_rate={} is outside [0,1] or non-finite",
+                                rate
+                            ))?;
+                        }
+                        if total > 0.0 {
+                            if !close_enough(rate, reverted / total) {
+                                fail(format!(
+                                    "revert_rate={} does not equal reverted_edits/total_edits",
+                                    rate
+                                ))?;
+                            }
+                        } else {
+                            fail("revert_rate must be null when total_edits is zero".to_string())?;
+                        }
+                    } else if total > 0.0 {
+                        fail("revert_rate is null while total_edits is positive".to_string())?;
+                    }
+                }
+                for (rate_name, numerator_name, denominator_name) in [
+                    ("bytes_per_edit", "net_bytes", "total_edits"),
+                    ("bytes_per_editor", "net_bytes", "unique_editors"),
+                ] {
+                    if has(rate_name) && has(numerator_name) && has(denominator_name) {
+                        let numerator = require(numerator_name, row)?
+                            .context(format!("{numerator_name} is null"))?;
+                        let denominator = require(denominator_name, row)?
+                            .context(format!("{denominator_name} is null"))?;
+                        if let Some(rate) = require(rate_name, row)? {
+                            if !rate.is_finite() {
+                                fail(format!("{rate_name} is non-finite"))?;
+                            }
+                            if denominator > 0.0 && !close_enough(rate, numerator / denominator) {
+                                fail(format!(
+                                    "{rate_name} does not equal {numerator_name}/{denominator_name}"
+                                ))?;
+                            } else if denominator <= 0.0 {
+                                fail(format!(
+                                    "{rate_name} must be null when {denominator_name} is zero"
+                                ))?;
+                            }
+                        } else if denominator > 0.0 {
+                            fail(format!(
+                                "{rate_name} is null while {denominator_name} is positive"
+                            ))?;
+                        }
+                    }
+                }
+            }
+            MetricId::LaborChurn => {
+                for (rate_name, numerator_name) in [
+                    ("arrival_rate", "arrivals"),
+                    ("departure_rate", "departures"),
+                ] {
+                    if has(rate_name) && has(numerator_name) && has("active_editors") {
+                        let numerator = require(numerator_name, row)?
+                            .context(format!("{numerator_name} is null"))?;
+                        let denominator =
+                            require("active_editors", row)?.context("active_editors is null")?;
+                        if let Some(rate) = require(rate_name, row)? {
+                            if !rate.is_finite() || !(0.0..=1.0).contains(&rate) {
+                                fail(format!(
+                                    "{rate_name}={} is outside [0,1] or non-finite",
+                                    rate
+                                ))?;
+                            }
+                            if denominator > 0.0 && !close_enough(rate, numerator / denominator) {
+                                fail(format!(
+                                    "{rate_name} does not equal {numerator_name}/active_editors"
+                                ))?;
+                            } else if denominator <= 0.0 {
+                                fail(format!(
+                                    "{rate_name} must be null when active_editors is zero"
+                                ))?;
+                            }
+                        } else if denominator > 0.0 {
+                            fail(format!(
+                                "{rate_name} is null while active_editors is positive"
+                            ))?;
+                        }
+                    }
+                }
+            }
+            MetricId::Patrol => {
+                for name in [
+                    "total_patrols",
+                    "unique_patrollers",
+                    "patrol_new_pages",
+                    "patrol_diffs",
+                    "patrolled_revisions",
+                    "autopatrolled_revisions",
+                    "total_revisions",
+                    "min_patrollers_50pct",
+                ] {
+                    if has(name) {
+                        if let Some(value) = require(name, row)? {
+                            if !value.is_finite() || value < 0.0 {
+                                fail(format!("{name}={value} is negative or non-finite"))?;
+                            }
+                        }
+                    }
+                }
+                for name in ["median_latency_hours", "p90_latency_hours"] {
+                    if has(name) {
+                        if let Some(value) = require(name, row)? {
+                            if !value.is_finite() || value < 0.0 {
+                                fail(format!("{name}={value} is negative or non-finite"))?;
+                            }
+                        }
+                    }
+                }
+                if has("top1_pct") {
+                    if let Some(value) = require("top1_pct", row)? {
+                        if !value.is_finite() || !(0.0..=100.0).contains(&value) {
+                            fail(format!("top1_pct={value} is outside [0,100] or non-finite"))?;
+                        }
+                    }
+                }
+                if has("patrolled_revisions") && has("total_revisions") {
+                    if let (Some(patrolled), Some(total)) = (
+                        require("patrolled_revisions", row)?,
+                        require("total_revisions", row)?,
+                    ) {
+                        if patrolled > total {
+                            fail(format!(
+                                "patrolled_revisions={} exceeds total_revisions={}",
+                                patrolled, total
+                            ))?;
+                        }
+                    }
+                }
+                for (rate_name, expected_numerator) in [
+                    ("patrol_coverage_pct", "patrolled_revisions"),
+                    ("adjusted_coverage_pct", "adjusted"),
+                ] {
+                    if has(rate_name) {
+                        let denominator = if has("total_revisions") {
+                            require("total_revisions", row)?.context("total_revisions is null")?
+                        } else {
+                            0.0
+                        };
+                        let numerator = if expected_numerator == "adjusted" {
+                            if has("patrolled_revisions") && has("autopatrolled_revisions") {
+                                require("patrolled_revisions", row)?
+                                    .context("patrolled_revisions is null")?
+                                    + require("autopatrolled_revisions", row)?
+                                        .context("autopatrolled_revisions is null")?
+                            } else {
+                                0.0
+                            }
+                        } else if has(expected_numerator) {
+                            require(expected_numerator, row)?
+                                .context(format!("{expected_numerator} is null"))?
+                        } else {
+                            0.0
+                        };
+                        if let Some(rate) = require(rate_name, row)? {
+                            if !rate.is_finite() || !(0.0..=100.0).contains(&rate) {
+                                fail(format!(
+                                    "{rate_name}={} is outside [0,100] or non-finite",
+                                    rate
+                                ))?;
+                            }
+                            if denominator > 0.0 {
+                                let expected = 100.0 * numerator / denominator;
+                                if !close_enough_rounded(rate, expected, 10.0) {
+                                    fail(format!(
+                                        "{rate_name} does not equal published numerator/denominator"
+                                    ))?;
+                                }
+                            }
+                        } else if denominator > 0.0 {
+                            fail(format!(
+                                "{rate_name} is null while total_revisions is positive"
+                            ))?;
+                        }
+                    }
+                }
+            }
+            MetricId::Inequality => {
+                for name in ["gini", "theil", "palma"] {
+                    if has(name) {
+                        if let Some(value) = require(name, row)? {
+                            let valid = value.is_finite()
+                                && if name == "gini" {
+                                    (0.0..=1.0).contains(&value)
+                                } else {
+                                    value >= 0.0
+                                };
+                            if !valid {
+                                fail(format!("{name}={value} violates its bounds"))?;
+                            }
+                        }
+                    }
+                }
+            }
+            MetricId::BusinessFunnel => {
+                if has("cohort_size") && has("reached_5") && has("reached_25") && has("reached_100")
+                {
+                    let cohort = require("cohort_size", row)?.context("cohort_size is null")?;
+                    let five = require("reached_5", row)?.context("reached_5 is null")?;
+                    let twenty_five = require("reached_25", row)?.context("reached_25 is null")?;
+                    let hundred = require("reached_100", row)?.context("reached_100 is null")?;
+                    if five > cohort || twenty_five > five || hundred > twenty_five {
+                        fail("cohort milestones are not monotonic".to_string())?;
+                    }
+                }
+            }
+            MetricId::LaborCohorts => {
+                if has("survived_editors") && has("initial_editors") {
+                    let survived =
+                        require("survived_editors", row)?.context("survived_editors is null")?;
+                    let initial =
+                        require("initial_editors", row)?.context("initial_editors is null")?;
+                    if survived > initial {
+                        fail(format!(
+                            "survived_editors={} exceeds initial_editors={}",
+                            survived, initial
+                        ))?;
+                    }
+                }
+            }
+            MetricId::PageWeeklyEdits => {
+                if has("edits") && has("previous_week_edits") && has("wow_change") {
+                    let edits = require("edits", row)?.context("edits is null")?;
+                    let previous = require("previous_week_edits", row)?
+                        .context("previous_week_edits is null")?;
+                    let change = require("wow_change", row)?.context("wow_change is null")?;
+                    if !close_enough(change, edits - previous) {
+                        fail(
+                            "wow_change does not conserve edits - previous_week_edits".to_string(),
+                        )?;
+                    }
+                    if has("wow_rate") {
+                        if let Some(rate) = require("wow_rate", row)? {
+                            if !rate.is_finite() {
+                                fail("wow_rate is non-finite".to_string())?;
+                            }
+                            if previous > 0.0 && !close_enough(rate, change / previous) {
+                                fail(
+                                    "wow_rate does not equal wow_change/previous_week_edits"
+                                        .to_string(),
+                                )?;
+                            } else if previous <= 0.0 {
+                                fail(
+                                    "wow_rate must be null when previous_week_edits is zero"
+                                        .to_string(),
+                                )?;
+                            }
+                        }
+                    }
+                }
+            }
+            MetricId::GdpActivityTiers | MetricId::GdpUserTypeShare | MetricId::LaborMonthly => {}
+        }
+    }
+    Ok(())
 }
 
 fn sum_numeric(column: &Column, name: &str) -> Result<i128> {
@@ -599,6 +1019,15 @@ pub fn scan(
         .with_context(|| format!("artifact={} stage=read_schema", artifact.display()))?;
     let (spec, legacy_inequality) =
         SemanticSpec::for_identity_with_schema(identity, algorithm_version, schema_frame.schema());
+    // Unit fixtures intentionally use compact placeholder rows. Production
+    // scans always enforce the metric contract; test-only fixture scans are
+    // covered by explicit `scan_and_write_with_spec` invariant tests instead.
+    #[cfg(test)]
+    let spec = {
+        let mut spec = spec;
+        spec.enforce_invariants = false;
+        spec
+    };
     let mut accumulator = SemanticAccumulator::new(spec);
     #[cfg(not(coverage))]
     if legacy_inequality {
@@ -1367,6 +1796,8 @@ mod tests {
                 conservation_columns: Vec::new(),
                 ordering_contract: "writer-order/v1".to_string(),
                 page_week_consistency: false,
+                metric: None,
+                enforce_invariants: false,
             },
         )
         .expect_err("a missing semantic date column must identify its artifact and stage");

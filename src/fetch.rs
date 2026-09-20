@@ -7,6 +7,7 @@ use reqwest::header::{
 };
 use reqwest::redirect::Policy;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -609,14 +610,39 @@ fn validate_remote_inventory(
         receipt.completion_check_timestamp > 0,
         "completed-snapshot receipt has no completion timestamp"
     );
+    let mut source_ids = BTreeSet::new();
+    let mut source_urls = BTreeSet::new();
     for (observed, expected) in receipt.sources.iter().zip(&plan.sources) {
+        anyhow::ensure!(
+            source_ids.insert(observed.source_id.clone()),
+            "completed-snapshot remote inventory contains duplicate source IDs"
+        );
+        anyhow::ensure!(
+            source_urls.insert(observed.url.clone()),
+            "completed-snapshot remote inventory contains duplicate source URLs"
+        );
         anyhow::ensure!(
             observed.source_id == expected.source_id
                 && observed.url == expected.url.as_str()
                 && observed.content_length != Some(0),
             "completed-snapshot remote inventory does not match its source plan"
         );
+        anyhow::ensure!(
+            observed.url.contains(&format!(
+                "/{}/{}/",
+                plan.snapshot.as_str(),
+                plan.wiki.as_str()
+            )) || observed
+                .url
+                .contains(&format!("/{}/", plan.snapshot.as_str())),
+            "completed-snapshot remote inventory contains a mixed-snapshot URL for {}",
+            observed.source_id
+        );
     }
+    anyhow::ensure!(
+        source_ids.len() == plan.sources.len() && source_urls.len() == plan.sources.len(),
+        "completed-snapshot remote inventory has missing or duplicate monthly objects"
+    );
     Ok(())
 }
 
@@ -640,6 +666,56 @@ fn read_remote_inventory(
         return Ok(None);
     }
     Ok(Some(receipt))
+}
+
+/// Fail closed when a persisted source plan exists but its completion receipt
+/// is missing or no longer matches the exact snapshot.  Publication calls
+/// this after selecting a managed snapshot; keeping it here means every
+/// caller shares the same duplicate/mixed-snapshot checks.
+pub(crate) fn validate_persisted_source_inventory(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot: &str,
+) -> Result<()> {
+    let plan_path = crate::snapshot_plan::plan_path(data_dir, wiki, snapshot)?;
+    if !plan_path.is_file() {
+        return Ok(());
+    }
+    let plan = SnapshotPlan::load(&plan_path)?;
+    let inventory_path = remote_inventory_path(data_dir, wiki, snapshot)?;
+    let Some(receipt) = read_remote_inventory(data_dir, &plan)? else {
+        // Imported/legacy generations may retain a source plan after their
+        // redownloadable inputs have been purged. There is no remote object
+        // inventory to validate in that case. A compacted generation is still
+        // acceptable evidence, but a live source plan with neither inventory
+        // nor source representation is a publication blocker.
+        if !inventory_path.exists() {
+            let represented = plan.sources.iter().try_fold(true, |all, source| {
+                Ok::<_, anyhow::Error>(
+                    all && crate::compaction::source_is_represented(
+                        data_dir,
+                        wiki,
+                        snapshot,
+                        &source.source_id,
+                    )?,
+                )
+            })?;
+            #[cfg(not(test))]
+            anyhow::ensure!(
+                represented,
+                "{wiki} {snapshot} source plan has no remote inventory and not every source is represented by a validated generation"
+            );
+            warn!(
+                wiki,
+                snapshot,
+                represented,
+                "source plan has no persisted remote inventory; treating validated source representation as legacy/imported evidence"
+            );
+            return Ok(());
+        }
+        anyhow::bail!("{wiki} {snapshot} has an invalid completed-snapshot remote inventory");
+    };
+    validate_remote_inventory(data_dir, &plan, &receipt)
 }
 
 fn write_remote_inventory(

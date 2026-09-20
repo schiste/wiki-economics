@@ -41,7 +41,7 @@ function stageStart(record) {
   return timestamp(current?.startedAt);
 }
 
-function evaluateFreshness({last = null, history = [], lastSuccessful = null, lastSuccessfulPublication = null, lifecycle, scrubStatus = null, now = Date.now(), thresholds = {}}) {
+function evaluateFreshness({last = null, history = [], lastSuccessful = null, lastSuccessfulPublication = null, lifecycle, scrubStatus = null, fingerprintDriftStatus = null, now = Date.now(), thresholds = {}}) {
   const settings = {
     ...DEFAULT_THRESHOLDS,
     ...thresholds,
@@ -69,6 +69,26 @@ function evaluateFreshness({last = null, history = [], lastSuccessful = null, la
       alert("artifact_scrub_failed", "critical", `Artifact scrub ${scrubStatus.run_id} failed; publication is blocked.`, {
         runId: scrubStatus.run_id,
         error: scrubStatus.error || "unknown scrub failure",
+      });
+    }
+  }
+
+  if (fingerprintDriftStatus) {
+    const valid = fingerprintDriftStatus.schema_version === 1
+      && ["ok", "snapshot_changed", "drift_detected"].includes(fingerprintDriftStatus.status)
+      && typeof fingerprintDriftStatus.publication_run_id === "string"
+      && fingerprintDriftStatus.publication_run_id.length > 0
+      && Number.isSafeInteger(fingerprintDriftStatus.checked_at_unix);
+    if (!valid) {
+      alert("fingerprint_check_status_invalid", "critical", "The scheduled same-snapshot fingerprint check report is malformed; publication trust is blocked.");
+    } else if (fingerprintDriftStatus.status === "drift_detected") {
+      alert("fingerprint_drift_detected", "critical", "Published values changed while the snapshot and algorithm version remained stable; bump the algorithm version and republish before serving the data.", {
+        runId: fingerprintDriftStatus.publication_run_id,
+        drift: fingerprintDriftStatus.drift || [],
+      });
+    } else if (fingerprintDriftStatus.status === "snapshot_changed") {
+      alert("fingerprint_check_deferred", "warning", "The fingerprint check observed a changed snapshot selection and will resume after the next publication gate.", {
+        runId: fingerprintDriftStatus.publication_run_id,
       });
     }
   }
@@ -225,6 +245,7 @@ function evaluateFreshness({last = null, history = [], lastSuccessful = null, la
       selectedSnapshot: last?.selectedSnapshot || latestSuccess?.selectedSnapshot || null,
       publishedSnapshots,
       artifactScrub: scrubStatus,
+      fingerprintCheck: fingerprintDriftStatus,
       slos: {
         memoryWarningRatio: settings.memoryWarningRatio,
         memoryCriticalRatio: settings.memoryCriticalRatio,

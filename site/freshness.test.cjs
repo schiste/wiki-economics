@@ -74,6 +74,45 @@ test("a failed or malformed deep scrub is a publication-blocking alert", () => {
   assert.equal(malformed.alerts[0].code, "artifact_scrub_status_invalid");
 });
 
+test("same-snapshot fingerprint drift is a publication-blocking alert", () => {
+  const record = success();
+  const result = evaluateFreshness({
+    last: record,
+    history: [record],
+    lifecycle,
+    fingerprintDriftStatus: {
+      schema_version: 1,
+      checked_at_unix: 1_787_700_000,
+      publication_run_id: "publish-1",
+      status: "drift_detected",
+      drift: ["nlwiki/monthly fingerprint changed"],
+    },
+    now: Date.parse("2026-08-22T03:00:00Z"),
+  });
+  assert.equal(result.status, "critical");
+  assert.equal(result.alerts[0].code, "fingerprint_drift_detected");
+  assert.equal(result.summary.fingerprintCheck.status, "drift_detected");
+});
+
+test("a snapshot transition is visible but does not masquerade as value drift", () => {
+  const record = success();
+  const result = evaluateFreshness({
+    last: record,
+    history: [record],
+    lifecycle,
+    fingerprintDriftStatus: {
+      schema_version: 1,
+      checked_at_unix: 1_787_700_000,
+      publication_run_id: "publish-2",
+      status: "snapshot_changed",
+      drift: ["snapshot selection changed"],
+    },
+    now: Date.parse("2026-08-22T03:00:00Z"),
+  });
+  assert.equal(result.status, "warning");
+  assert.equal(result.alerts[0].code, "fingerprint_check_deferred");
+});
+
 test("durable successful-run evidence survives a history window of failures", () => {
   const durable = success({runId: "publish-durable", finishedAt: "2026-08-21T03:00:00Z"});
   const failures = Array.from({length: 104}, (_, index) => ({

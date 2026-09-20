@@ -125,6 +125,18 @@
   mem: 2Gi
   cpu: "1"
 
+# Re-run the stable-version value fingerprint guard between publications. A
+# same-snapshot drift is a publication blocker and is retained in the loud
+# fingerprint-drift-alert.json report for the admin/freshness surface.
+- name: wiki-econ-fingerprint-check
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: deploy/toolforge/run-fingerprint-check.sh
+  schedule: "7,37 * * * *"
+  filelog: true
+  mount: all
+  mem: 1Gi
+  cpu: "0.25"
+
 # Legacy on-demand-only jobs (no `schedule:`): trigger with
 # `toolforge jobs restart <name>`, e.g. after a site/docs-only change that
 # doesn't need a fresh fetch or compute. See README.md's "On-demand stage jobs"

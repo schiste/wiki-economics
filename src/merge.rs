@@ -525,6 +525,8 @@ fn manifest_row_counts(output_dir: &Path) -> Result<BTreeMap<String, usize>> {
                     conservation_columns: Vec::new(),
                     ordering_contract: "source-row-order/v1".to_string(),
                     page_week_consistency: false,
+                    metric: None,
+                    enforce_invariants: false,
                 },
             )?
         };

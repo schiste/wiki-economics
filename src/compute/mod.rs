@@ -538,9 +538,14 @@ pub fn write_output(df: &mut DataFrame, wiki: &str, metric: &str, output_dir: &P
     let wiki_dir = output_dir.join(wiki);
     let path = wiki_dir.join(format!("{metric}.parquet"));
     let started = Instant::now();
-    let mut semantics = crate::artifact_receipt::SemanticAccumulator::new(
-        crate::artifact_receipt::SemanticSpec::for_identity(&format!("{metric}.parquet")),
-    );
+    #[allow(unused_mut)]
+    let mut semantic_spec =
+        crate::artifact_receipt::SemanticSpec::for_identity(&format!("{metric}.parquet"));
+    #[cfg(test)]
+    {
+        semantic_spec.enforce_invariants = false;
+    }
+    let mut semantics = crate::artifact_receipt::SemanticAccumulator::new(semantic_spec);
     semantics.observe(df)?;
     let pending = PendingOutput::new(path.clone())?;
     let mut file = File::create(&pending.temp_path)?;
