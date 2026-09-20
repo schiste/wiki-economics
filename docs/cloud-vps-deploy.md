@@ -90,7 +90,8 @@ service user so that code deploys can run without building as `root`.
 The supported hosted admin model is:
 
 - `site/admin-server.cjs` still binds to `127.0.0.1`
-- nginx proxies `/admin` and `/admin-api/*` to that loopback server
+- nginx proxies `/admin`, `/admin-api/*`, `/api/v1/*`, `/mcp`, and the public
+  freshness endpoint to that loopback server
 - the server requires `WIKI_ECON_ADMIN_AUTH_MODE=mediawiki`
 - the signed-in Wikimedia username must be present in `WIKI_ECON_ADMIN_ALLOWED_USERNAMES`
 
@@ -210,6 +211,8 @@ The provided config:
 
 - serves `/srv/wiki-economics/site/current`
 - proxies `/admin`, `/admin.html`, and `/admin-api/*` to the loopback auth server
+- proxies the public read-only `/api/v1/*`, `/mcp`, and
+  `/health/freshness.json` machine interfaces to the same Node process
 - serves Observable assets directly
 
 ## Rollback

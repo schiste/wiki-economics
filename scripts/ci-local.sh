@@ -23,6 +23,7 @@ node --check site/admin-auth.cjs
 
 echo "==> node --check site/admin-server.cjs"
 node --check site/admin-server.cjs
+node --check site/machine-api.cjs
 node --check site/src/components/admin-console.js
 
 echo "==> node --check site/freshness.cjs scripts/check-freshness.cjs"
@@ -64,6 +65,7 @@ node --test site/admin-console.test.mjs
 
 echo "==> node --test site/admin-server.test.cjs"
 node --test site/admin-server.test.cjs
+node --test site/machine-api.test.cjs
 node --test scripts/build-admin-site.test.cjs
 
 echo "==> node --test site/build-site.test.cjs"

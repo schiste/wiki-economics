@@ -24,10 +24,12 @@ Expanded commands:
 bash -n scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh deploy/toolforge/*.sh
 node --check site/admin-auth.cjs
 node --check site/admin-server.cjs
+node --check site/machine-api.cjs
 node --check site/observablehq.config.js
 for f in site/data-build/*.cjs; do node --check "$f"; done
 node --test site/admin-auth.test.cjs
 node --test site/admin-server.test.cjs
+node --test site/machine-api.test.cjs
 node scripts/generate-stack-reference.cjs --check
 node --test scripts/check-compute-versions.test.cjs
 node scripts/check-compute-versions.cjs

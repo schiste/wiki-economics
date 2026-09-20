@@ -82,6 +82,41 @@ refuses to start with `WIKI_ECON_ADMIN_AUTH_MODE=none`.
 not expose logs or credentials and remains accessible when hosted admin auth is
 enabled so an external scheduled monitor can detect a stalled refresh.
 
+### Public data API and MCP
+
+The same webservice exposes a public, read-only interface for automated
+consumers. It is deliberately backed by `output/manifest.json`: only artifacts
+listed there and associated with a wiki whose lifecycle publication is
+`published` can be downloaded.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `GET` | `/api/v1` | Versioned endpoint discovery. |
+| `GET` | `/api/v1/openapi.json` | Small OpenAPI 3.1 description for generated clients. |
+| `GET` | `/api/v1/catalog` | Full publication catalog, schemas, hashes, provenance, and links. |
+| `GET` | `/api/v1/wikis` | Published wiki list and per-wiki artifact metadata. |
+| `GET` | `/api/v1/datasets` | Published metric definitions and artifact metadata. |
+| `GET` | `/api/v1/datasets/{dataset}?wiki={wiki}` | Resolve one dataset to download links. |
+| `GET`/`HEAD` | `/api/v1/artifacts/{path}` | Stream an allow-listed Parquet/JSON artifact with ETag, range, and last-modified support. |
+| `POST` | `/mcp` | MCP Streamable HTTP JSON-RPC endpoint. |
+
+The MCP endpoint has no mutation tools. It supports `initialize`, `ping`, tool
+and resource discovery, and these read-only tools: `list_published_wikis`,
+`list_datasets`, `get_dataset`, and `get_freshness`. The `catalog` and
+`freshness` resources are available at `wiki-economics://catalog` and
+`wiki-economics://freshness`; artifact metadata uses the
+`wiki-economics://artifact/{artifact}` template. It accepts the current
+stateless protocol version (`2026-07-28`) plus the previous compatibility
+versions used by existing clients. Every response includes cache hints where
+the protocol supports them, while artifact bytes remain cacheable and
+content-addressed through their SHA-256 ETag.
+
+The public interface intentionally omits operator logs, credentials, raw
+source paths, and unpublished/qualification data. Consumers should discover
+the current generation through `/api/v1/catalog` rather than guessing file
+names; a missing or invalid publication manifest returns `503` until the next
+valid site publication is available.
+
 The server accepts both the legacy local prefix and the hosted prefix:
 
 - local/dev: `/api/*`

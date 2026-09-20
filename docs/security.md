@@ -15,7 +15,9 @@ The repository ships three runtime surfaces:
 1. **The Rust CLI (`wiki-econ`).** Reads from `dumps.wikimedia.org`,
    writes to local disk. No inbound surface.
 2. **The Node admin server (`site/admin-server.cjs`).** Loopback-only developer
-   tool locally and authenticated Toolforge/VPS operator surface in production.
+   tool locally and authenticated Toolforge/VPS operator surface in production;
+   its `/api/v1` and `/mcp` routes are intentionally public read-only views of
+   the current publication.
 3. **The Observable Framework dashboard (`site/`).** Static pages served by
    the Toolforge webservice or VPS nginx in production; dev preview locally.
 
@@ -88,6 +90,8 @@ Recommended practice:
   `spawn`).
 - Anonymous or unapproved logins in hosted mode (Wikimedia OAuth 2 plus
   a username allowlist).
+- Unpublished data exposure through the machine interface (manifest allow-list,
+  published-lifecycle filtering, path normalization, and realpath confinement).
 
 ### What this still does NOT protect against
 

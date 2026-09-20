@@ -27,6 +27,7 @@ const {
   wikisWithState,
 } = require("../scripts/wiki-lifecycle.cjs");
 const {evaluateFreshness} = require("./freshness.cjs");
+const {createMachineApi} = require("./machine-api.cjs");
 const {stripAnsi, summarizeOperationLog} = require("./admin-operation-status.cjs");
 const {buildOperationalTruth, latestPublicationPreflight} = require("./admin-operational-truth.cjs");
 const {
@@ -1942,7 +1943,28 @@ function buildStatusPayload(req, session) {
 
 restorePersistedJobHistory();
 
+function publicFreshnessPayload() {
+  reloadWikiLifecycle();
+  return evaluateFreshness({
+    ...readRefreshStatus(),
+    lifecycle: WIKI_LIFECYCLE,
+    scrubStatus: readArtifactScrubStatus(),
+  });
+}
+
+// Public machine consumers share the same published manifest as the admin
+// surface, but have no access to mutation routes or operator state.
+const MACHINE_API = createMachineApi({
+  outputDir: OUTPUT_DIR,
+  metricCatalogPath: path.join(ROOT, "config", "generated", "metric-catalog.json"),
+  publicOrigin: ADMIN_PUBLIC_ORIGIN,
+  freshnessLoader: publicFreshnessPayload,
+});
+
 async function handleRequest(req, res) {
+  const url = new URL(req.url, `http://localhost:${PORT}`);
+  if (await MACHINE_API.handleRequest(req, res, url)) return;
+
   applyCors(req, res);
   res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -1952,7 +1974,6 @@ async function handleRequest(req, res) {
     return;
   }
 
-  const url = new URL(req.url, `http://localhost:${PORT}`);
   const session = AUTH_ENABLED ? readSession(req) : null;
 
   if (req.method === "GET" && url.pathname === FRESHNESS_STATUS_PATH) {
