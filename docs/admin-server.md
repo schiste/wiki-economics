@@ -95,23 +95,40 @@ listed there and associated with a wiki whose lifecycle publication is
 | --- | --- | --- |
 | `GET` | `/api/v1` | Versioned endpoint discovery. |
 | `GET` | `/api/v1/openapi.json` | Small OpenAPI 3.1 description for generated clients. |
-| `GET` | `/api/v1/catalog` | Full publication catalog, schemas, hashes, provenance, and links. |
+| `GET` | `/api/v1/catalog` | Full publication catalog, schemas, hashes, provenance, and links. Add `?compact=true` for a small discovery payload without artifact blobs. |
 | `GET` | `/api/v1/wikis` | Published wiki list and per-wiki artifact metadata. |
+| `GET` | `/api/v1/wikis/{wiki}/briefing` | Compact situation card with snapshot/freshness, latest headline metrics, trends, ratios, biggest movers, quality flags, and drill-down links. |
 | `GET` | `/api/v1/datasets` | Published metric definitions and artifact metadata. |
 | `GET` | `/api/v1/datasets/{dataset}?wiki={wiki}` | Resolve one dataset to download links. |
+| `GET` | `/api/v1/metrics/{dataset}` | One bounded metric contract. Use `wiki`, `from`, `to`, `granularity=year|month`, `group_by`, `agg`, `limit`, and `cursor`; choose `format=json|csv|parquet`. |
+| `GET` | `/api/v1/metrics/{dataset}/schema` | Fields, types, units, coverage, algorithm version, licence, and attribution. |
+| `GET` | `/api/v1/metrics/{dataset}/explain` | Definition, methodology, caveats, and aggregation rules. |
 | `GET`/`HEAD` | `/api/v1/artifacts/{path}` | Stream an allow-listed Parquet/JSON artifact with ETag, range, and last-modified support. |
 | `POST` | `/mcp` | MCP Streamable HTTP JSON-RPC endpoint. |
 
 The MCP endpoint has no mutation tools. It supports `initialize`, `ping`, tool
 and resource discovery, and these read-only tools: `list_published_wikis`,
-`list_datasets`, `get_dataset`, and `get_freshness`. The `catalog` and
-`freshness` resources are available at `wiki-economics://catalog` and
+`list_datasets`, `get_dataset`, `get_freshness`, `get_metric`,
+`get_wiki_briefing` (also exposed as the compatibility alias
+`read_wiki_briefing`), `get_schema`, `explain_metric`, and `compare_wikis`.
+`get_metric` is bounded and aggregated by default; `get_wiki_briefing` is the
+recommended first call for a human-style “how is my wiki doing?” question.
+The `catalog` and `freshness` resources are available at `wiki-economics://catalog` and
 `wiki-economics://freshness`; artifact metadata uses the
 `wiki-economics://artifact/{artifact}` template. It accepts the current
 stateless protocol version (`2026-07-28`) plus the previous compatibility
 versions used by existing clients. Every response includes cache hints where
 the protocol supports them, while artifact bytes remain cacheable and
 content-addressed through their SHA-256 ETag.
+
+Metric JSON responses carry their definition, units, algorithm version,
+snapshot, generation time, caveats, licence, attribution, coverage, and a
+summary (`latest`, `total`, `min`, `max`, `yoy_change`, and `top_n`). The
+pagination fields are always present, even when a result is not truncated.
+CSV repeats semantic metadata in comment lines; transformed Parquet and direct
+immutable Parquet downloads expose identity and provenance in `X-Wiki-Econ-*`
+headers. Bulk clients should use Parquet, while chat and agent clients should
+prefer bounded JSON.
 
 The public interface intentionally omits operator logs, credentials, raw
 source paths, and unpublished/qualification data. Consumers should discover

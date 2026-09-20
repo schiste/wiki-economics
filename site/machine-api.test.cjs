@@ -73,8 +73,19 @@ function fixture() {
       id: "gdp",
       family: "monthly",
       algorithm_version: "test-v1",
-      schema: [{name: "year_month", data_type: "string"}],
-      aggregation: [{kind: "additive", columns: ["total_edits"]}],
+      schema: [
+        {name: "year_month", data_type: "string"},
+        {name: "total_edits", data_type: "u32"},
+        {name: "net_bytes", data_type: "i64"},
+        {name: "revert_rate", data_type: "f64"},
+        {name: "unique_editors", data_type: "u32"},
+        {name: "wiki", data_type: "string"},
+      ],
+      aggregation: [
+        {kind: "additive", columns: ["total_edits", "net_bytes"]},
+        {kind: "ratio", columns: ["revert_rate"], numerators: ["total_edits"], denominator: "total_edits"},
+        {kind: "distinct_at_grain", columns: ["unique_editors"], grain: ["wiki", "year_month"]},
+      ],
       publication: {
         scope: "merged_and_per_wiki",
         per_wiki_artifact: "{wiki}/gdp.parquet",
@@ -182,6 +193,7 @@ function startApi(t, options = {}) {
     logger: options.logger || {info() {}, warn() {}, error() {}},
     rateLimitPerSecond: options.rateLimitPerSecond,
     rateLimitMaxClients: options.rateLimitMaxClients,
+    metricRowsLoader: options.metricRowsLoader,
   });
   t.after(() => fs.rmSync(data.root, {recursive: true, force: true}));
   return {api, data};
@@ -239,6 +251,83 @@ test("artifact endpoint enforces the manifest allow-list and supports cache/rang
   assert.equal((await invoke(api, {url: "/api/v1/artifacts/%2e%2e%2fnot-allowlisted.txt"})).statusCode, 404);
 });
 
+test("metrics contract returns bounded JSON, summaries, compact catalog, and renderings", async (t) => {
+  const rows = [
+    {year_month: "2025-01", total_edits: 10, net_bytes: 100, revert_rate: 0.1, unique_editors: 2, wiki: "frwiki"},
+    {year_month: "2025-02", total_edits: 12, net_bytes: 120, revert_rate: 0.2, unique_editors: 3, wiki: "frwiki"},
+    {year_month: "2026-01", total_edits: 20, net_bytes: 240, revert_rate: 0.15, unique_editors: 4, wiki: "frwiki"},
+    {year_month: "2026-02", total_edits: 25, net_bytes: 300, revert_rate: 0.12, unique_editors: 5, wiki: "frwiki"},
+  ];
+  const {api} = startApi(t, {metricRowsLoader: async () => rows});
+  const response = await invoke(api, {url: "/api/v1/metrics/gdp?wiki=frwiki&from=2025-01&to=2026-02&granularity=month&limit=2"});
+  const body = responseJson(response);
+  assert.equal(response.statusCode, 200);
+  assert.equal(body.dataset, "gdp");
+  assert.equal(body.algorithm_version, "test-v1");
+  assert.ok(body.definition);
+  assert.ok(body.units.total_edits);
+  assert.equal(body.rows_returned, 2);
+  assert.equal(body.rows_total, 4);
+  assert.equal(body.truncated, true);
+  assert.ok(body.next_cursor);
+  assert.equal(body.summary.latest.period, "2026-02");
+  assert.equal(body.summary.total.total_edits, 67);
+  const metricEtag = response.getHeader("etag");
+  assert.match(metricEtag, /^"[0-9a-f]{64}"$/);
+  assert.equal((await invoke(api, {url: "/api/v1/metrics/gdp?wiki=frwiki&from=2025-01&to=2026-02&granularity=month&limit=2", headers: {"if-none-match": metricEtag}})).statusCode, 304);
+
+  const csv = await invoke(api, {url: "/api/v1/metrics/gdp?wiki=frwiki&format=csv&limit=1"});
+  assert.equal(csv.statusCode, 200);
+  assert.match(csv.getHeader("content-type"), /^text\/csv/);
+  assert.match(csv.text(), /# dataset=gdp/);
+  assert.match(csv.text(), /period,total_edits/);
+
+  const transformedParquet = await invoke(api, {url: "/api/v1/metrics/gdp?wiki=frwiki&from=2026-01&format=parquet&limit=2"});
+  assert.equal(transformedParquet.statusCode, 200);
+  assert.equal(transformedParquet.getHeader("content-type"), "application/vnd.apache.parquet");
+  assert.ok(transformedParquet.text().length > 8);
+
+  const compact = responseJson(await invoke(api, {url: "/api/v1/catalog?compact=true"}));
+  assert.equal(compact.api_schema_version, 1);
+  assert.equal(compact.counts.wikis, 1);
+  assert.equal(compact.datasets[0].artifact_count > 0, true);
+  assert.equal(Object.hasOwn(compact.datasets[0], "artifacts"), false);
+  assert.equal(Object.hasOwn(compact.wikis[0], "artifacts"), false);
+  assert.equal((await invoke(api, {url: "/api/v1/metrics/does_not_exist"})).statusCode, 404);
+  assert.equal((await invoke(api, {url: "/api/v1/metrics/page_weekly_edits"})).statusCode, 404);
+});
+
+test("wiki briefing, metric schema/explanation, and MCP analytical tools are usable", async (t) => {
+  const rows = [
+    {year_month: "2026-01", total_edits: 20, net_bytes: 200, revert_rate: 0.1, unique_editors: 4, wiki: "frwiki"},
+    {year_month: "2026-02", total_edits: 25, net_bytes: 300, revert_rate: 0.12, unique_editors: 5, wiki: "frwiki"},
+  ];
+  const {api} = startApi(t, {metricRowsLoader: async () => rows});
+  const briefing = responseJson(await invoke(api, {url: "/api/v1/wikis/frwiki/briefing"}));
+  assert.equal(briefing.wiki, "frwiki");
+  assert.equal(briefing.freshness.status, "fresh");
+  assert.ok(Array.isArray(briefing.headline_metrics));
+  assert.ok(Array.isArray(briefing.drill_down_links));
+  assert.ok(Array.isArray(briefing.data_quality_flags));
+
+  const schema = responseJson(await invoke(api, {url: "/api/v1/metrics/gdp/schema"}));
+  assert.equal(schema.dataset, "gdp");
+  assert.ok(schema.fields.some((field) => field.name === "total_edits" && field.unit === "edits"));
+  const explanation = responseJson(await invoke(api, {url: "/api/v1/metrics/gdp/explain"}));
+  assert.ok(explanation.methodology);
+
+  const call = (message) => invoke(api, {
+    method: "POST", url: "/mcp", headers: {"content-type": "application/json"}, body: JSON.stringify(message),
+  });
+  const metric = responseJson(await call({jsonrpc: "2.0", id: 10, method: "tools/call", params: {name: "get_metric", arguments: {dataset: "gdp", wiki: "frwiki", limit: 1}}}));
+  assert.equal(metric.result.isError, false);
+  assert.equal(metric.result.structuredContent.rows_returned, 1);
+  const mcpBriefing = responseJson(await call({jsonrpc: "2.0", id: 11, method: "tools/call", params: {name: "get_wiki_briefing", arguments: {wiki: "frwiki"}}}));
+  assert.equal(mcpBriefing.result.isError, false);
+  const mcpSchema = responseJson(await call({jsonrpc: "2.0", id: 12, method: "tools/call", params: {name: "get_schema", arguments: {dataset: "gdp"}}}));
+  assert.equal(mcpSchema.result.isError, false);
+});
+
 test("MCP endpoint provides discovery, tools, resources, and compatibility initialization", async (t) => {
   const {api} = startApi(t);
   const call = (message, headers = {}) => invoke(api, {
@@ -257,6 +346,8 @@ test("MCP endpoint provides discovery, tools, resources, and compatibility initi
 
   const tools = responseJson(await call({jsonrpc: "2.0", id: 2, method: "tools/list"}));
   assert.ok(tools.result.tools.some((tool) => tool.name === "get_dataset"));
+  assert.ok(tools.result.tools.some((tool) => tool.name === "get_metric"));
+  assert.ok(tools.result.tools.some((tool) => tool.name === "read_wiki_briefing"));
 
   const dataset = responseJson(await call({
     jsonrpc: "2.0", id: 3, method: "tools/call",
