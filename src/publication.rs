@@ -2610,6 +2610,42 @@ fn derive_publication_change_plan(
     }
 }
 
+fn stable_version_value_drift_messages(
+    current: &BTreeMap<String, WikiPublicationProof>,
+    previous: Option<&BTreeMap<String, WikiPublicationProof>>,
+) -> Vec<String> {
+    let Some(previous) = previous else {
+        return Vec::new();
+    };
+    let mut messages = Vec::new();
+    for (wiki, proof) in current {
+        let Some(previous_proof) = previous.get(wiki) else {
+            continue;
+        };
+        if previous_proof.snapshot != proof.snapshot {
+            continue;
+        }
+        for (family, family_proof) in &proof.families {
+            let Some(previous_family) = previous_proof.families.get(family) else {
+                continue;
+            };
+            if previous_family.algorithm_version == family_proof.algorithm_version
+                && previous_family.receipt_identity != family_proof.receipt_identity
+            {
+                messages.push(format!(
+                    "{wiki}/{family} snapshot {} changed its value fingerprint from {} to {} while algorithm_version {} remained stable; bump the algorithm version before publishing",
+                    proof.snapshot,
+                    previous_family.receipt_identity,
+                    family_proof.receipt_identity,
+                    family_proof.algorithm_version,
+                ));
+            }
+        }
+    }
+    messages.sort();
+    messages
+}
+
 fn ready_from_reference(
     data_dir: &Path,
     output_dir: &Path,
@@ -3739,6 +3775,31 @@ pub(crate) fn publication_preflight(
                 "{wiki} candidate {} would downgrade the published snapshot",
                 reference.snapshot
             ));
+        }
+        if let Some(previous) = previous.filter(|proof| proof.snapshot == reference.snapshot) {
+            match artifact_backed_family_proofs(&candidate_dir, &ready.artifacts) {
+                Ok(candidate_proofs) => {
+                    let drift = stable_version_value_drift_messages(
+                        &BTreeMap::from([(
+                            wiki.clone(),
+                            WikiPublicationProof {
+                                snapshot: reference.snapshot.clone(),
+                                candidate_run_id: reference.run_id.clone(),
+                                candidate_relative: reference.candidate_relative.clone(),
+                                ready_receipt_sha256: String::new(),
+                                families: candidate_proofs,
+                                artifacts: BTreeMap::new(),
+                                quality_signals: None,
+                            },
+                        )]),
+                        Some(&BTreeMap::from([(wiki.clone(), (*previous).clone())])),
+                    );
+                    blockers.extend(drift);
+                }
+                Err(error) => blockers.push(format!(
+                    "{wiki} candidate value fingerprints could not be authenticated: {error:#}"
+                )),
+            }
         }
         let mut candidate_families = reference.core_family_receipt_identities.clone();
         if !reference.patrol_receipt_identity.is_empty() {
@@ -5544,6 +5605,15 @@ pub fn validate(
     ensure!(
         wiki_proofs.keys().cloned().collect::<BTreeSet<_>>() == expected_proof_wikis,
         "publication proof set does not cover every published wiki"
+    );
+    let stable_version_drifts = stable_version_value_drift_messages(
+        &wiki_proofs,
+        previous_gate.as_ref().map(|receipt| &receipt.wiki_proofs),
+    );
+    ensure!(
+        stable_version_drifts.is_empty(),
+        "stable-version value drift detected: {}",
+        stable_version_drifts.join("; ")
     );
     let change_plan = derive_publication_change_plan(
         run_id,
@@ -7476,6 +7546,54 @@ mod tests {
             }]
         );
         assert_eq!(plan.reused.len(), wikis.len() * families.len() - 1);
+    }
+
+    #[test]
+    fn stable_algorithm_versions_reject_same_snapshot_value_drift() {
+        let previous = BTreeMap::from([(
+            "dewiki".to_string(),
+            WikiPublicationProof {
+                snapshot: "2026-08".to_string(),
+                candidate_run_id: "previous".to_string(),
+                candidate_relative: "_candidates/dewiki/2026-08/previous".to_string(),
+                ready_receipt_sha256: "ready-previous".to_string(),
+                families: BTreeMap::from([(
+                    "lifecycle".to_string(),
+                    FamilyPublicationProof {
+                        receipt_identity: "value-before".to_string(),
+                        algorithm_version: "lifecycle-v4".to_string(),
+                    },
+                )]),
+                artifacts: BTreeMap::new(),
+                quality_signals: None,
+            },
+        )]);
+        let mut current = previous.clone();
+        current
+            .get_mut("dewiki")
+            .expect("dewiki proof")
+            .families
+            .get_mut("lifecycle")
+            .expect("lifecycle proof")
+            .receipt_identity = "value-after".to_string();
+
+        let messages = stable_version_value_drift_messages(&current, Some(&previous));
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("dewiki/lifecycle"));
+        assert!(messages[0].contains("bump the algorithm version"));
+
+        current.get_mut("dewiki").expect("dewiki proof").snapshot = "2026-09".to_string();
+        assert!(stable_version_value_drift_messages(&current, Some(&previous)).is_empty());
+
+        current.get_mut("dewiki").expect("dewiki proof").snapshot = "2026-08".to_string();
+        current
+            .get_mut("dewiki")
+            .expect("dewiki proof")
+            .families
+            .get_mut("lifecycle")
+            .expect("lifecycle proof")
+            .algorithm_version = "lifecycle-v5".to_string();
+        assert!(stable_version_value_drift_messages(&current, Some(&previous)).is_empty());
     }
 
     #[test]

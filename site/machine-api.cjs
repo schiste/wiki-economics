@@ -41,6 +41,7 @@ const MAX_METRIC_LIMIT = 1_000;
 const MAX_METRIC_WIKIS = 20;
 const MAX_METRIC_SOURCE_BYTES = 512 * 1024 * 1024;
 const MAX_METRIC_SOURCE_ROWS = 2_000_000;
+const VALUE_FINGERPRINT_ALGORITHM = "sha256-canonical-query-rows-v1";
 const PERIOD_METADATA_FIELDS = new Set([
   "period", "period_start", "period_end", "period_type", "period_months",
   "year_month", "week_start", "year", "cohort_year", "date",
@@ -655,10 +656,50 @@ function withoutNullFields(value) {
     .map(([key, child]) => [key, child && typeof child === "object" && !Array.isArray(child) ? withoutNullFields(child) : child]));
 }
 
+function stableJson(value) {
+  if (Array.isArray(value)) return value.map(stableJson);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stableJson(value[key])]));
+  }
+  return value;
+}
+
+function metricValueFingerprint({dataset, wiki, algorithmVersion, snapshot, query}, rows) {
+  const canonical = stableJson({
+    algorithm: VALUE_FINGERPRINT_ALGORITHM,
+    dataset,
+    wiki: wiki || null,
+    algorithm_version: algorithmVersion || null,
+    snapshot: snapshot ?? null,
+    query: query || null,
+    rows: Array.isArray(rows) ? rows : [],
+  });
+  return crypto.createHash("sha256").update(JSON.stringify(canonical)).digest("hex");
+}
+
 function snapshotVersion(snapshot) {
   if (typeof snapshot === "string") return snapshot;
   if (snapshot && typeof snapshot.version === "string") return snapshot.version;
   return null;
+}
+
+function trailingChurnRow(metric, rows, snapshot) {
+  if (metric?.id !== "labor_churn" || !Array.isArray(rows) || rows.length === 0) return null;
+  const version = snapshotVersion(snapshot);
+  if (!/^\d{4}-\d{2}$/.test(String(version || ""))) return null;
+  const latest = rows.at(-1);
+  const period = String(latest?.period || "");
+  const periodType = latest?.period_type
+    || (/^\d{4}-\d{2}$/.test(period) ? "month" : /^\d{4}$/.test(period) ? "year" : null);
+  const isTrailingMonth = periodType === "month" && period === version;
+  const isTrailingYear = periodType === "year" && period === version.slice(0, 4);
+  return isTrailingMonth || isTrailingYear ? latest : null;
+}
+
+function completeBriefingRows(metric, rows, snapshot) {
+  const trailing = trailingChurnRow(metric, rows, snapshot);
+  if (!trailing) return {rows, trailing: null};
+  return {rows: rows.slice(0, -1), trailing};
 }
 
 function dataQualityFlags(metric, query, aggregated, coverage, snapshot) {
@@ -703,19 +744,17 @@ function dataQualityFlags(metric, query, aggregated, coverage, snapshot) {
   }
   const latest = aggregated?.rows?.at(-1);
   const version = snapshotVersion(snapshot);
-  if (metric.id === "labor_churn" && query.granularity === "year"
-      && latest?.period_type === "year" && /^\d{4}$/.test(String(latest.period || ""))
-      && /^\d{4}-\d{2}$/.test(String(version || ""))
-      && latest.period === version.slice(0, 4) && version.slice(5) !== "12") {
+  const trailing = trailingChurnRow(metric, aggregated?.rows || [], snapshot);
+  if (trailing) {
     flags.push({
       severity: "warning",
       code: "partial_period",
       dataset: metric.id,
-      period: latest.period,
-      period_type: latest.period_type,
-      period_months: latest.period_months ?? periodMonthsForType(latest.period_type),
+      period: trailing.period,
+      period_type: trailing.period_type || (query.granularity === "year" ? "year" : "month"),
+      period_months: trailing.period_months ?? periodMonthsForType(trailing.period_type || query.granularity),
       snapshot: version,
-      message: `The latest ${latest.period} churn observation is incomplete at snapshot ${version}; do not interpret its departure rate as a full-year value.`,
+      message: `The trailing ${trailing.period} churn observation is incomplete at snapshot ${version}; its departure rate includes the unobserved future period and must not be interpreted as a complete observation.`,
     });
   }
   return flags;
@@ -878,6 +917,8 @@ function rowsToCsv(rows, metadata) {
     `# algorithm_version=${metadata.algorithm_version || ""}`,
     `# snapshot=${JSON.stringify(metadata.snapshot ?? null)}`,
     `# generated_at=${metadata.generated_at || ""}`,
+    `# value_fingerprint_algorithm=${metadata.value_fingerprint_algorithm || ""}`,
+    `# value_fingerprint=${metadata.value_fingerprint || ""}`,
     `# caveats=${JSON.stringify(metadata.caveats || [])}`,
     `# data_quality_flags=${JSON.stringify(metadata.data_quality_flags || [])}`,
     `# license=${JSON.stringify(metadata.license ?? null)}`,
@@ -892,12 +933,20 @@ function rowsToCsv(rows, metadata) {
 }
 
 function metricResponseEtag(metadata, rows) {
+  const valueFingerprint = metadata.value_fingerprint || metricValueFingerprint({
+    dataset: metadata.dataset,
+    wiki: metadata.wiki,
+    algorithmVersion: metadata.algorithm_version,
+    snapshot: metadata.snapshot,
+    query: metadata.query,
+  }, rows);
   const stable = {
     dataset: metadata.dataset,
     wiki: metadata.wiki,
     query: metadata.query,
     snapshot: metadata.snapshot,
     artifact_sha256: metadata.provenance?.artifact_sha256 || null,
+    value_fingerprint: valueFingerprint,
     rows,
   };
   return `"${crypto.createHash("sha256").update(JSON.stringify(stable)).digest("hex")}"`;
@@ -1485,6 +1534,19 @@ function createMachineApi(options = {}) {
     const artifact = metricArtifact(catalog, metric, query.wiki);
     const snapshot = wikiState?.snapshot || (query.wiki ? null : catalog.provenance?.selected_snapshot_versions || null);
     const quality = wikiMetricQuality(metric, query.wiki);
+    const valueFingerprint = metricValueFingerprint({
+      dataset: metric.id,
+      wiki: query.wiki,
+      algorithmVersion: metric.algorithm_version,
+      snapshot,
+      query: {
+        from: query.from || null,
+        to: query.to || null,
+        granularity: query.granularity,
+        group_by: parseMetricList(query.groupBy),
+        agg: parseMetricList(query.agg),
+      },
+    }, aggregated?.rows || []);
     return {
       api_schema_version: API_SCHEMA_VERSION,
       metric_contract_version: "1.0",
@@ -1496,6 +1558,8 @@ function createMachineApi(options = {}) {
       algorithm_version: metric.algorithm_version || null,
       snapshot,
       generated_at: new Date().toISOString(),
+      value_fingerprint_algorithm: VALUE_FINGERPRINT_ALGORITHM,
+      value_fingerprint: valueFingerprint,
       caveats: semantics.caveats,
       license: catalog.license,
       attribution: catalog.attribution,
@@ -1503,6 +1567,8 @@ function createMachineApi(options = {}) {
         source_datasets: catalog.source_datasets,
         artifact: artifact?.artifact?.name || null,
         artifact_sha256: artifact?.artifact?.sha256 || null,
+        value_fingerprint_algorithm: VALUE_FINGERPRINT_ALGORITHM,
+        value_fingerprint: valueFingerprint,
       },
       coverage,
       data_quality_flags: dataQualityFlags(metric, query, aggregated, coverage, snapshot),
@@ -1594,12 +1660,48 @@ function createMachineApi(options = {}) {
       try {
         const query = {dataset: metric.id, wiki, granularity: "month", groupBy: "", agg: "", from: undefined, to: undefined, limit: 24, cursor: 0};
         const result = await queryMetric(catalog, metric, query);
-        const latest = result.metadata.summary.latest;
+        const complete = completeBriefingRows(metric, result.aggregated.rows, result.metadata.snapshot);
+        const briefingSummary = complete.trailing
+          ? summarizeRows(complete.rows, result.aggregated.expressions, query.granularity)
+          : result.metadata.summary;
+        const briefingCoverage = complete.trailing
+          ? metricCoverage(complete.rows, result.aggregated.dateColumn, query.granularity)
+          : result.metadata.coverage;
+        const latest = briefingSummary.latest;
         const headlineLatest = withoutNullFields(latest);
-        const headlineTrend = withoutNullFields(result.metadata.summary.yoy_change);
-        headlineMetrics.push({dataset: metric.id, latest: headlineLatest, trend: headlineTrend, coverage: result.metadata.coverage});
+        const headlineTrend = withoutNullFields(briefingSummary.yoy_change);
+        const briefingFingerprint = complete.trailing
+          ? metricValueFingerprint({
+            dataset: metric.id,
+            wiki,
+            algorithmVersion: result.metadata.algorithm_version,
+            snapshot: result.metadata.snapshot,
+            query: result.metadata.query,
+          }, complete.rows)
+          : result.metadata.value_fingerprint;
+        headlineMetrics.push({
+          dataset: metric.id,
+          algorithm_version: result.metadata.algorithm_version,
+          value_fingerprint_algorithm: result.metadata.value_fingerprint_algorithm,
+          value_fingerprint: briefingFingerprint,
+          latest: headlineLatest,
+          trend: headlineTrend,
+          coverage: briefingCoverage,
+        });
         qualityFlags.push(...(result.metadata.data_quality_flags || []));
-        for (const [field, change] of Object.entries(result.metadata.summary.yoy_change || {})) {
+        if (complete.trailing) {
+          qualityFlags.push({
+            severity: "warning",
+            code: "trailing_period_excluded",
+            dataset: metric.id,
+            period: complete.trailing.period,
+            period_type: complete.trailing.period_type || "month",
+            period_months: complete.trailing.period_months ?? periodMonthsForType(complete.trailing.period_type || "month"),
+            snapshot: snapshotVersion(result.metadata.snapshot),
+            message: `The trailing ${complete.trailing.period} churn observation is excluded from the briefing because its future comparison period is not observed.`,
+          });
+        }
+        for (const [field, change] of Object.entries(briefingSummary.yoy_change || {})) {
           if (change && Number.isFinite(change.percent) && Number.isFinite(Number(latest?.[field]))) {
             movers.push({dataset: metric.id, field, ...change, latest: latest[field]});
           }

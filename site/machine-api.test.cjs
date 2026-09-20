@@ -368,6 +368,9 @@ test("metrics contract returns bounded JSON, summaries, compact catalog, and ren
   assert.equal(response.statusCode, 200);
   assert.equal(body.dataset, "gdp");
   assert.equal(body.algorithm_version, "test-v1");
+  assert.equal(body.value_fingerprint_algorithm, "sha256-canonical-query-rows-v1");
+  assert.match(body.value_fingerprint, /^[0-9a-f]{64}$/);
+  assert.equal(body.provenance.value_fingerprint, body.value_fingerprint);
   assert.ok(body.definition);
   assert.ok(body.units.total_edits);
   assert.equal(body.rows_returned, 2);
@@ -384,6 +387,7 @@ test("metrics contract returns bounded JSON, summaries, compact catalog, and ren
   assert.equal(csv.statusCode, 200);
   assert.match(csv.getHeader("content-type"), /^text\/csv/);
   assert.match(csv.text(), /# dataset=gdp/);
+  assert.match(csv.text(), /# value_fingerprint=[0-9a-f]{64}/);
   assert.match(csv.text(), /period,total_edits/);
 
   const transformedParquet = await invoke(api, {url: "/api/v1/metrics/gdp?wiki=frwiki&from=2026-01&format=parquet&limit=2"});
@@ -451,6 +455,7 @@ test("exposes churn period metadata and labels partial years; patrol status is e
   const churnRows = [
     {period: "2025", period_type: "year", active_editors: 100, arrivals: 50, departures: 45, arrival_rate: 0.5, departure_rate: 0.45, wiki: "dewiki"},
     {period: "2026", period_type: "year", active_editors: 120, arrivals: 60, departures: 120, arrival_rate: 0.5, departure_rate: 1, wiki: "dewiki"},
+    {period: "2026-07", period_type: "month", active_editors: 20, arrivals: 2, departures: 9, arrival_rate: 0.1, departure_rate: 0.45, wiki: "dewiki"},
     {period: "2026-08", period_type: "month", active_editors: 20, arrivals: 2, departures: 20, arrival_rate: 0.1, departure_rate: 1, wiki: "dewiki"},
   ];
   const patrolRows = [{year_month: "2026-08", total_patrols: 0, wiki: "dewiki"}];
@@ -469,6 +474,25 @@ test("exposes churn period metadata and labels partial years; patrol status is e
   const briefing = responseJson(await invoke(api, {url: "/api/v1/wikis/dewiki/briefing"}));
   assert.equal(briefing.patrol_status, "not_applicable");
   assert.ok(briefing.data_quality_flags.some((flag) => flag.code === "patrol_not_applicable"));
+  const churnHeadline = briefing.headline_metrics.find((metric) => metric.dataset === "labor_churn");
+  assert.equal(churnHeadline.latest.period, "2026-07");
+  assert.equal(churnHeadline.latest.departure_rate, 0.45);
+  assert.ok(briefing.data_quality_flags.some((flag) => flag.code === "trailing_period_excluded" && flag.period === "2026-08"));
+});
+
+test("publishes a value fingerprint so stable algorithm versions cannot hide value changes", async (t) => {
+  const rows = [
+    {year_month: "2026-01", total_edits: 20, net_bytes: 200, revert_rate: 0.1, unique_editors: 4, wiki: "frwiki"},
+  ];
+  const {api} = startApi(t, {metricRowsLoader: async () => rows});
+  const first = responseJson(await invoke(api, {url: "/api/v1/metrics/gdp?wiki=frwiki&granularity=month"}));
+  const firstEtag = (await invoke(api, {url: "/api/v1/metrics/gdp?wiki=frwiki&granularity=month"})).getHeader("etag");
+  rows[0].total_edits = 21;
+  const secondResponse = await invoke(api, {url: "/api/v1/metrics/gdp?wiki=frwiki&granularity=month"});
+  const second = responseJson(secondResponse);
+  assert.equal(first.algorithm_version, second.algorithm_version);
+  assert.notEqual(first.value_fingerprint, second.value_fingerprint);
+  assert.notEqual(firstEtag, secondResponse.getHeader("etag"));
 });
 
 test("metric downloads fall back to the published browser partition when the raw wiki artifact is absent", async (t) => {
