@@ -47,6 +47,15 @@ fn format_period_key(period_key: i32, period_type: &str) -> String {
     }
 }
 
+fn period_months_for_type(period_type: &str) -> u32 {
+    match period_type {
+        "month" => 1,
+        "quarter" => 3,
+        "year" => 12,
+        _ => 0,
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct ChurnAccumulator {
     period_type: &'static str,
@@ -128,6 +137,10 @@ impl ChurnAccumulator {
             Column::new(
                 "period_type".into(),
                 vec![self.period_type; self.active.len()],
+            ),
+            Column::new(
+                "period_months".into(),
+                vec![period_months_for_type(self.period_type); self.active.len()],
             ),
             Column::new("arrival_rate".into(), arrival_rate),
             Column::new("departure_rate".into(), departure_rate),
@@ -1106,6 +1119,10 @@ mod external {
             Column::new(
                 "period_type".into(),
                 vec![period_type; aggregate.active.len()],
+            ),
+            Column::new(
+                "period_months".into(),
+                vec![period_months_for_type(period_type); aggregate.active.len()],
             ),
             Column::new("arrival_rate".into(), arrival_rate),
             Column::new("departure_rate".into(), departure_rate),

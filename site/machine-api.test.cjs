@@ -77,6 +77,8 @@ function fixture() {
       algorithm_version: "test-v1",
       schema: [
         {name: "year_month", data_type: "string"},
+        {name: "page_namespace", data_type: "i32"},
+        {name: "user_type", data_type: "string"},
         {name: "total_edits", data_type: "u32"},
         {name: "net_bytes", data_type: "i64"},
         {name: "revert_rate", data_type: "f64"},
@@ -86,7 +88,7 @@ function fixture() {
       aggregation: [
         {kind: "additive", columns: ["total_edits", "net_bytes"]},
         {kind: "ratio", columns: ["revert_rate"], numerators: ["total_edits"], denominator: "total_edits"},
-        {kind: "distinct_at_grain", columns: ["unique_editors"], grain: ["wiki", "year_month"]},
+        {kind: "distinct_at_grain", columns: ["unique_editors"], grain: ["wiki", "year_month", "page_namespace", "user_type"]},
       ],
       publication: {
         scope: "merged_and_per_wiki",
@@ -187,6 +189,28 @@ function responseJson(response) {
 
 function startApi(t, options = {}) {
   const data = fixture();
+  for (const wiki of options.extraWikis || []) {
+    data.manifest.lifecycle.wikis[wiki] = {publication: "published"};
+    data.manifest.wikis[wiki] = {snapshot: {version: "2026-08"}, status: "complete"};
+    data.manifest.provenance.selected_snapshot_versions[wiki] = "2026-08";
+  }
+  for (const metric of options.extraMetrics || []) {
+    const wiki = metric.testWiki || "frwiki";
+    const name = `${wiki}/${metric.id}.parquet`;
+    const content = `fixture-${metric.id}`;
+    const file = path.join(data.outputDir, ...name.split("/"));
+    fs.mkdirSync(path.dirname(file), {recursive: true});
+    fs.writeFileSync(file, content);
+    data.manifest.downloadable_artifacts.push({
+      name,
+      bytes: Buffer.byteLength(content),
+      size_kb: 0,
+      sha256: sha256(content),
+      media_type: "application/vnd.apache.parquet",
+      license_spdx: "MIT",
+    });
+    data.metricCatalog.metrics.push(metric);
+  }
   const api = createMachineApi({
     outputDir: data.outputDir,
     artifactDirs: [data.siteDistDir],
@@ -201,6 +225,79 @@ function startApi(t, options = {}) {
   t.after(() => fs.rmSync(data.root, {recursive: true, force: true}));
   return {api, data};
 }
+
+function publishedMetric({id, schema, aggregation, receipt = {date_column: "year_month"}, family = "monthly"}) {
+  return {
+    id,
+    family,
+    algorithm_version: "test-v1",
+    schema,
+    aggregation,
+    publication: {
+      scope: "merged_and_per_wiki",
+      per_wiki_artifact: `{wiki}/${id}.parquet`,
+      merged_artifact: `${id}.parquet`,
+    },
+    receipt,
+    fingerprint: {artifact_identity: `${id}.parquet`},
+    browser: {partitioning: "rust_defaults_only"},
+  };
+}
+
+const INEQUALITY_FIXTURE_METRIC = publishedMetric({
+  id: "inequality",
+  schema: [
+    {name: "year_month", data_type: "string"},
+    {name: "period", data_type: "string"},
+    {name: "period_start", data_type: "string"},
+    {name: "period_end", data_type: "string"},
+    {name: "period_type", data_type: "string"},
+    {name: "period_months", data_type: "u32"},
+    {name: "user_type", data_type: "string"},
+    {name: "gini", data_type: "f64"},
+    {name: "total_editors", data_type: "u32"},
+    {name: "total_edits", data_type: "u32"},
+    {name: "wiki", data_type: "string"},
+  ],
+  aggregation: [
+    {kind: "additive", columns: ["total_edits"]},
+    {kind: "distinct_at_grain", columns: ["total_editors"], grain: ["wiki", "period", "period_type", "user_type"]},
+    {kind: "non_composable", columns: ["gini"]},
+  ],
+  receipt: {date_column: "period_start"},
+});
+
+const CHURN_FIXTURE_METRIC = publishedMetric({
+  id: "labor_churn",
+  family: "lifecycle",
+  schema: [
+    {name: "period", data_type: "string"},
+    {name: "active_editors", data_type: "u32"},
+    {name: "arrivals", data_type: "u32"},
+    {name: "departures", data_type: "u32"},
+    {name: "period_type", data_type: "string"},
+    {name: "period_months", data_type: "u32"},
+    {name: "arrival_rate", data_type: "f64"},
+    {name: "departure_rate", data_type: "f64"},
+    {name: "wiki", data_type: "string"},
+  ],
+  aggregation: [
+    {kind: "distinct_at_grain", columns: ["active_editors", "arrivals", "departures"], grain: ["wiki", "period", "period_type"]},
+    {kind: "ratio", columns: ["arrival_rate"], numerators: ["arrivals"], denominator: "active_editors"},
+    {kind: "ratio", columns: ["departure_rate"], numerators: ["departures"], denominator: "active_editors"},
+  ],
+  receipt: {date_column: "period"},
+});
+
+const PATROL_FIXTURE_METRIC = publishedMetric({
+  id: "patrol",
+  schema: [
+    {name: "year_month", data_type: "string"},
+    {name: "total_patrols", data_type: "i64"},
+    {name: "wiki", data_type: "string"},
+  ],
+  aggregation: [{kind: "additive", columns: ["total_patrols"]}],
+});
 
 test("public catalog exposes only published artifacts and groups browser partitions", async (t) => {
   const {api} = startApi(t);
@@ -302,6 +399,74 @@ test("metrics contract returns bounded JSON, summaries, compact catalog, and ren
   assert.equal(Object.hasOwn(compact.wikis[0], "artifacts"), false);
   assert.equal((await invoke(api, {url: "/api/v1/metrics/does_not_exist"})).statusCode, 404);
   assert.equal((await invoke(api, {url: "/api/v1/metrics/page_weekly_edits"})).statusCode, 404);
+});
+
+test("nulls non-additive fields above publication grain and removes them from briefings", async (t) => {
+  const rows = [
+    {year_month: "2025-08", page_namespace: 0, user_type: "registered", total_edits: 10, net_bytes: 100, revert_rate: 0.1, unique_editors: 4, wiki: "frwiki"},
+    {year_month: "2025-08", page_namespace: 1, user_type: "registered", total_edits: 5, net_bytes: 50, revert_rate: 0.1, unique_editors: 3, wiki: "frwiki"},
+    {year_month: "2026-08", page_namespace: 0, user_type: "registered", total_edits: 20, net_bytes: 200, revert_rate: 0.1, unique_editors: 5, wiki: "frwiki"},
+    {year_month: "2026-08", page_namespace: 1, user_type: "registered", total_edits: 8, net_bytes: 80, revert_rate: 0.1, unique_editors: 4, wiki: "frwiki"},
+  ];
+  const {api} = startApi(t, {metricRowsLoader: async () => rows});
+  const coarse = responseJson(await invoke(api, {url: "/api/v1/metrics/gdp?wiki=frwiki&from=2026-08&to=2026-08"}));
+  assert.equal(coarse.summary.latest.unique_editors, null);
+  assert.equal(coarse.summary.yoy_change.unique_editors, null);
+  assert.equal(coarse.summary.total.unique_editors, null);
+  assert.ok(coarse.data_quality_flags.some((flag) => flag.code === "non_additive_fields_null" && flag.fields.includes("unique_editors")));
+
+  const exact = responseJson(await invoke(api, {url: "/api/v1/metrics/gdp?wiki=frwiki&from=2026-08&to=2026-08&group_by=page_namespace,user_type"}));
+  assert.deepEqual(exact.rows.map((row) => row.unique_editors), [5, 4]);
+  const briefing = responseJson(await invoke(api, {url: "/api/v1/wikis/frwiki/briefing"}));
+  const gdpHeadline = briefing.headline_metrics.find((metric) => metric.dataset === "gdp");
+  assert.equal(Object.hasOwn(gdpHeadline.latest, "unique_editors"), false);
+  assert.equal(Object.hasOwn(gdpHeadline.trend, "unique_editors"), false);
+});
+
+test("aligns period-start metrics, filters period types, and announces missing months", async (t) => {
+  const rows = [
+    {year_month: "2001-01", period: "2001", period_start: "2001-01", period_end: "2001-12", period_type: "year", period_months: 12, user_type: "registered", gini: 0.2, total_editors: 10, total_edits: 100, wiki: "frwiki"},
+    {year_month: "2001-01", period: "2001-01", period_start: "2001-01", period_end: "2001-01", period_type: "month", period_months: 1, user_type: "registered", gini: 0.1, total_editors: 2, total_edits: 10, wiki: "frwiki"},
+    {year_month: "2001-03", period: "2001-03", period_start: "2001-03", period_end: "2001-03", period_type: "month", period_months: 1, user_type: "registered", gini: 0.3, total_editors: 3, total_edits: 20, wiki: "frwiki"},
+  ];
+  const {api} = startApi(t, {extraMetrics: [INEQUALITY_FIXTURE_METRIC], metricRowsLoader: async ({metric}) => metric.id === "inequality" ? rows : []});
+  const monthly = responseJson(await invoke(api, {url: "/api/v1/metrics/inequality?wiki=frwiki&from=2001-01&to=2001-03&granularity=month"}));
+  assert.deepEqual(monthly.rows.map((row) => row.period), ["2001-01", "2001-03"]);
+  assert.equal(monthly.coverage.minimum_date, "2001-01");
+  assert.equal(monthly.coverage.maximum_date, "2001-03");
+  assert.deepEqual(monthly.coverage.missing_periods, ["2001-02"]);
+  assert.ok(monthly.data_quality_flags.some((flag) => flag.code === "missing_periods"));
+  assert.equal(monthly.rows[0].period_type, "month");
+  assert.equal(monthly.rows[0].period_months, 1);
+
+  const yearly = responseJson(await invoke(api, {url: "/api/v1/metrics/inequality?wiki=frwiki&granularity=year"}));
+  assert.deepEqual(yearly.rows.map((row) => row.period), ["2001"]);
+  assert.equal(yearly.coverage.minimum_date, "2001");
+  assert.equal(yearly.rows[0].period_type, "year");
+});
+
+test("exposes churn period metadata and labels partial years; patrol status is explicit", async (t) => {
+  const churnRows = [
+    {period: "2025", period_type: "year", active_editors: 100, arrivals: 50, departures: 45, arrival_rate: 0.5, departure_rate: 0.45, wiki: "dewiki"},
+    {period: "2026", period_type: "year", active_editors: 120, arrivals: 60, departures: 120, arrival_rate: 0.5, departure_rate: 1, wiki: "dewiki"},
+    {period: "2026-08", period_type: "month", active_editors: 20, arrivals: 2, departures: 20, arrival_rate: 0.1, departure_rate: 1, wiki: "dewiki"},
+  ];
+  const patrolRows = [{year_month: "2026-08", total_patrols: 0, wiki: "dewiki"}];
+  const {api} = startApi(t, {
+    extraWikis: ["dewiki"],
+    extraMetrics: [{...CHURN_FIXTURE_METRIC, testWiki: "dewiki"}, {...PATROL_FIXTURE_METRIC, testWiki: "dewiki"}],
+    metricRowsLoader: async ({metric}) => metric.id === "labor_churn" ? churnRows : metric.id === "patrol" ? patrolRows : [],
+  });
+  const churn = responseJson(await invoke(api, {url: "/api/v1/metrics/labor_churn?wiki=dewiki&granularity=year"}));
+  assert.deepEqual(churn.rows.map((row) => row.period), ["2025", "2026"]);
+  assert.deepEqual(churn.rows.map((row) => row.period_months), [12, 12]);
+  assert.ok(churn.data_quality_flags.some((flag) => flag.code === "partial_period" && flag.period === "2026"));
+  const patrol = responseJson(await invoke(api, {url: "/api/v1/metrics/patrol?wiki=dewiki&granularity=month"}));
+  assert.equal(patrol.patrol_status, "not_applicable");
+  assert.ok(patrol.data_quality_flags.some((flag) => flag.code === "patrol_not_applicable"));
+  const briefing = responseJson(await invoke(api, {url: "/api/v1/wikis/dewiki/briefing"}));
+  assert.equal(briefing.patrol_status, "not_applicable");
+  assert.ok(briefing.data_quality_flags.some((flag) => flag.code === "patrol_not_applicable"));
 });
 
 test("metric downloads fall back to the published browser partition when the raw wiki artifact is absent", async (t) => {

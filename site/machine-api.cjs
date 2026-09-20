@@ -41,6 +41,20 @@ const MAX_METRIC_LIMIT = 1_000;
 const MAX_METRIC_WIKIS = 20;
 const MAX_METRIC_SOURCE_BYTES = 512 * 1024 * 1024;
 const MAX_METRIC_SOURCE_ROWS = 2_000_000;
+const PERIOD_METADATA_FIELDS = new Set([
+  "period", "period_start", "period_end", "period_type", "period_months",
+  "year_month", "week_start", "year", "cohort_year", "date",
+]);
+
+// Some projects expose more than one review mechanism.  A zero in the
+// patrol-right event stream is not evidence that the community did no review
+// when the project uses FlaggedRevs/Sichtung instead.
+const WIKI_METRIC_QUALITY = Object.freeze({
+  dewiki: Object.freeze({
+    patrol_status: "not_applicable",
+    patrol_note: "dewiki uses FlaggedRevs/Sichtung rather than the patrol-right event stream; zero values do not mean no review activity.",
+  }),
+});
 
 const DEFAULT_METRIC_CATALOG = path.resolve(__dirname, "../config/generated/metric-catalog.json");
 
@@ -510,9 +524,201 @@ function metricGroupFields(metric, requested) {
   return result;
 }
 
+function periodMonthsForType(periodType) {
+  if (periodType === "month") return 1;
+  if (periodType === "quarter") return 3;
+  if (periodType === "year") return 12;
+  return null;
+}
+
+function metricDimensionFields(metric) {
+  const dateColumn = metricDateColumn(metric);
+  const aggregateColumns = new Set((metric?.aggregation || []).flatMap((rule) => rule?.columns || []));
+  return schemaFields(metric)
+    .map((field) => field.name)
+    .filter((name) => name
+      && name !== dateColumn
+      && name !== "wiki"
+      && !PERIOD_METADATA_FIELDS.has(name)
+      && !aggregateColumns.has(name));
+}
+
+function metricPeriodType(metric, granularity) {
+  if (!schemaFields(metric).some((field) => field.name === "period_type")) return null;
+  return granularity === "year" ? "year" : "month";
+}
+
+function sourceMatchesGranularity(source, metric, granularity) {
+  const expected = metricPeriodType(metric, granularity);
+  if (!expected || source.period_type === undefined || source.period_type === null || source.period_type === "") return true;
+  return String(source.period_type).toLowerCase() === expected;
+}
+
+function publicationGrainFields(metric, rule) {
+  const explicit = Array.isArray(rule?.grain) && rule.grain.length > 0 ? rule.grain : metricDimensionFields(metric);
+  return new Set(explicit);
+}
+
+function queryCoversPublicationGrain(metric, rule, query) {
+  const grain = publicationGrainFields(metric, rule);
+  const groupFields = new Set(query.groupFields || metricGroupFields(metric, query.groupBy));
+  const schemaNames = new Set(schemaFields(metric).map((field) => field.name));
+  const dateColumn = metricDateColumn(metric);
+  for (const field of grain) {
+    if (field === "wiki") {
+      if (!query.wiki && !groupFields.has("wiki")) return false;
+      continue;
+    }
+    if (field === "period_type" || field === "period_months") continue;
+    if (PERIOD_METADATA_FIELDS.has(field) || field === dateColumn
+        || ["year_month", "week_start", "year", "cohort_year", "date"].includes(field)) {
+      // When a source publishes explicit period types, aggregateRows selects
+      // the exact requested type before this check.  Without them, a
+      // year_month/week grain cannot safely be rolled up to a year.
+      if (schemaNames.has("period_type")) continue;
+      if (["year_month", "week_start"].includes(field) && query.granularity !== "month") return false;
+      if (["year", "cohort_year"].includes(field) && query.granularity !== "year") return false;
+      continue;
+    }
+    if (!groupFields.has(field)) return false;
+  }
+  return true;
+}
+
+function nonAdditiveFields(metric, expressions, query) {
+  const incompatible = new Set();
+  for (const [fieldName] of expressions) {
+    const rule = metricAggregationForField(metric, fieldName);
+    if (["distinct_at_grain", "non_composable", "sufficient_statistic"].includes(rule?.kind)
+        && !queryCoversPublicationGrain(metric, rule, query)) {
+      incompatible.add(fieldName);
+    }
+  }
+  // A ratio that depends on an unsafe distinct/non-composable value is unsafe
+  // too; otherwise its numerator/denominator would silently use raw source
+  // rows while the displayed dependency is null.
+  for (const [fieldName] of expressions) {
+    const rule = metricAggregationForField(metric, fieldName);
+    if (rule?.kind !== "ratio") continue;
+    const dependencies = [...(rule.numerators || []), rule.denominator].filter(Boolean);
+    if (dependencies.some((dependency) => incompatible.has(dependency))) incompatible.add(fieldName);
+  }
+  return incompatible;
+}
+
+function expectedPeriods(minimum, maximum, granularity) {
+  if (!minimum || !maximum) return [];
+  if (granularity === "year" && /^\d{4}$/.test(minimum) && /^\d{4}$/.test(maximum)) {
+    const start = Number(minimum);
+    const end = Number(maximum);
+    if (end < start || end - start > 1000) return [];
+    return Array.from({length: end - start + 1}, (_, index) => String(start + index));
+  }
+  if (granularity !== "month" || !/^\d{4}-\d{2}$/.test(minimum) || !/^\d{4}-\d{2}$/.test(maximum)) return [];
+  const start = Number(minimum.slice(0, 4)) * 12 + Number(minimum.slice(5, 7)) - 1;
+  const end = Number(maximum.slice(0, 4)) * 12 + Number(maximum.slice(5, 7)) - 1;
+  if (end < start || end - start > 2400) return [];
+  return Array.from({length: end - start + 1}, (_, index) => {
+    const monthIndex = start + index;
+    const year = Math.floor(monthIndex / 12);
+    const month = monthIndex % 12 + 1;
+    return `${year}-${String(month).padStart(2, "0")}`;
+  });
+}
+
 function metricCoverage(rows, dateColumn, granularity) {
   const periods = rows.map((row) => normalizePeriod(row.period ?? row[dateColumn], granularity)).filter(Boolean).sort();
-  return {minimum_date: periods[0] || null, maximum_date: periods.at(-1) || null};
+  const minimum = periods[0] || null;
+  const maximum = periods.at(-1) || null;
+  const observed = [...new Set(periods)];
+  const expected = expectedPeriods(minimum, maximum, granularity);
+  const missing = expected.filter((period) => !observed.includes(period));
+  return {
+    minimum_date: minimum,
+    maximum_date: maximum,
+    observed_periods: observed.length,
+    expected_periods: expected.length || null,
+    missing_periods: missing.slice(0, 500),
+    complete: expected.length > 0 ? missing.length === 0 : null,
+  };
+}
+
+function wikiMetricQuality(metric, wiki) {
+  if (metric?.id !== "patrol" || !wiki) return null;
+  return WIKI_METRIC_QUALITY[wiki] || null;
+}
+
+function withoutNullFields(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  return Object.fromEntries(Object.entries(value)
+    .filter(([, child]) => child !== null && child !== undefined)
+    .map(([key, child]) => [key, child && typeof child === "object" && !Array.isArray(child) ? withoutNullFields(child) : child]));
+}
+
+function snapshotVersion(snapshot) {
+  if (typeof snapshot === "string") return snapshot;
+  if (snapshot && typeof snapshot.version === "string") return snapshot.version;
+  return null;
+}
+
+function dataQualityFlags(metric, query, aggregated, coverage, snapshot) {
+  const flags = [];
+  if (coverage?.missing_periods?.length) {
+    flags.push({
+      severity: "warning",
+      code: "missing_periods",
+      dataset: metric.id,
+      periods: coverage.missing_periods,
+      message: `${coverage.missing_periods.length} expected ${query.granularity} period(s) are absent; no values were fabricated.`,
+    });
+  }
+  if (aggregated?.incompatibleFields?.length) {
+    flags.push({
+      severity: "info",
+      code: "non_additive_fields_null",
+      dataset: metric.id,
+      fields: aggregated.incompatibleFields,
+      message: "Non-additive fields are null because the requested grain is coarser than the publication grain.",
+    });
+  }
+  for (const [field, count] of Object.entries(aggregated?.nullDimensions || {})) {
+    flags.push({
+      severity: "warning",
+      code: "null_dimension",
+      dataset: metric.id,
+      field,
+      rows: count,
+      message: `${field} contains unlabeled null bucket(s); null was retained rather than mapped to a valid category.`,
+    });
+  }
+  const quality = wikiMetricQuality(metric, query.wiki);
+  if (quality) {
+    flags.push({
+      severity: "warning",
+      code: "patrol_not_applicable",
+      dataset: metric.id,
+      patrol_status: quality.patrol_status,
+      message: quality.patrol_note,
+    });
+  }
+  const latest = aggregated?.rows?.at(-1);
+  const version = snapshotVersion(snapshot);
+  if (metric.id === "labor_churn" && query.granularity === "year"
+      && latest?.period_type === "year" && /^\d{4}$/.test(String(latest.period || ""))
+      && /^\d{4}-\d{2}$/.test(String(version || ""))
+      && latest.period === version.slice(0, 4) && version.slice(5) !== "12") {
+    flags.push({
+      severity: "warning",
+      code: "partial_period",
+      dataset: metric.id,
+      period: latest.period,
+      period_type: latest.period_type,
+      period_months: latest.period_months ?? periodMonthsForType(latest.period_type),
+      snapshot: version,
+      message: `The latest ${latest.period} churn observation is incomplete at snapshot ${version}; do not interpret its departure rate as a full-year value.`,
+    });
+  }
+  return flags;
 }
 
 function aggregateRows(sourceRows, metric, query) {
@@ -522,13 +728,18 @@ function aggregateRows(sourceRows, metric, query) {
   const from = boundaryPeriod(query.from, granularity, "from");
   const to = boundaryPeriod(query.to, granularity, "to");
   const groupFields = metricGroupFields(metric, query.groupBy);
+  query.groupFields = groupFields;
   const expressions = parseAggregateExpressions(query.agg, metric);
+  const incompatibleFields = nonAdditiveFields(metric, expressions, query);
   const fields = schemaFields(metric);
   const fieldNames = new Set(fields.map((field) => field.name));
   const buckets = new Map();
+  const nullDimensions = new Map();
+  const dimensions = metricDimensionFields(metric);
   for (const raw of rows) {
     const source = safeJsonValue(raw) || {};
     if (query.wiki && source.wiki && source.wiki !== query.wiki) continue;
+    if (!sourceMatchesGranularity(source, metric, granularity)) continue;
     const sourcePeriod = source[dateColumn] ?? source.period ?? source.year_month ?? source.week_start ?? source.year;
     const period = normalizePeriod(sourcePeriod, granularity);
     if (!period || (from && period < from) || (to && period > to)) continue;
@@ -539,10 +750,22 @@ function aggregateRows(sourceRows, metric, query) {
       bucket = {period};
       for (const field of groupFields) bucket[field] = source[field] ?? null;
       for (const field of fields) {
-        if (!fieldNames.has(field.name) || field.name === dateColumn || field.name === "wiki" || groupFields.includes(field.name)) continue;
+        if (!fieldNames.has(field.name) || field.name === dateColumn || field.name === "period"
+            || field.name === "wiki" || groupFields.includes(field.name)) continue;
         bucket[field.name] = [];
       }
+      for (const field of ["period", "period_start", "period_end", "period_type", "period_months"]) {
+        if (field === "period" || fieldNames.has(field)
+            || (field === "period_months" && fieldNames.has("period_type"))) {
+          bucket[`__${field}`] = source[field] ?? null;
+        }
+      }
       buckets.set(key, bucket);
+    }
+    for (const field of dimensions) {
+      if (source[field] === null || source[field] === undefined || source[field] === "") {
+        nullDimensions.set(field, (nullDimensions.get(field) || 0) + 1);
+      }
     }
     for (const [fieldName] of expressions) {
       if (!bucket[fieldName]) bucket[fieldName] = [];
@@ -553,7 +776,20 @@ function aggregateRows(sourceRows, metric, query) {
   for (const bucket of buckets.values()) {
     const output = {period: bucket.period};
     for (const field of groupFields) output[field] = bucket[field];
+    for (const field of ["period", "period_start", "period_end", "period_type", "period_months"]) {
+      if (field === "period" || fieldNames.has(field)
+          || (field === "period_months" && fieldNames.has("period_type"))) {
+        if (field !== "period" && groupFields.includes(field)) continue;
+        const value = bucket[`__${field}`];
+        if (field === "period_months") output[field] = value ?? periodMonthsForType(bucket.__period_type);
+        else if (field !== "period" && value !== undefined) output[field] = value;
+      }
+    }
     for (const [fieldName, op] of expressions) {
+      if (incompatibleFields.has(fieldName)) {
+        output[fieldName] = null;
+        continue;
+      }
       const values = (bucket[fieldName] || []).filter((value) => value !== null && value !== undefined && value !== "");
       const numbers = values.map(Number).filter(Number.isFinite);
       let value = null;
@@ -577,7 +813,14 @@ function aggregateRows(sourceRows, metric, query) {
     result.push(output);
   }
   result.sort((left, right) => String(left.period).localeCompare(String(right.period)) || JSON.stringify(left).localeCompare(JSON.stringify(right)));
-  return {rows: result, dateColumn, groupFields, expressions};
+  return {
+    rows: result,
+    dateColumn,
+    groupFields,
+    expressions,
+    incompatibleFields: [...incompatibleFields],
+    nullDimensions: Object.fromEntries(nullDimensions),
+  };
 }
 
 function summarizeRows(rows, expressions, granularity) {
@@ -634,6 +877,7 @@ function rowsToCsv(rows, metadata) {
     `# snapshot=${JSON.stringify(metadata.snapshot ?? null)}`,
     `# generated_at=${metadata.generated_at || ""}`,
     `# caveats=${JSON.stringify(metadata.caveats || [])}`,
+    `# data_quality_flags=${JSON.stringify(metadata.data_quality_flags || [])}`,
     `# license=${JSON.stringify(metadata.license ?? null)}`,
     `# attribution=${JSON.stringify(metadata.attribution ?? null)}`,
     `# rows_returned=${metadata.rows_returned}`,
@@ -694,6 +938,8 @@ function toPublicMetric(metric, artifacts) {
     schema: metric.schema,
     aggregation: metric.aggregation,
     publication: metric.publication,
+    receipt: metric.receipt,
+    fingerprint: metric.fingerprint,
     browser: metric.browser,
     artifacts,
   };
@@ -1231,10 +1477,12 @@ function createMachineApi(options = {}) {
     };
   }
 
-  function metricMetadata(catalog, metric, query, summary, coverage, rowsReturned, rowsTotal, truncated, nextCursor) {
+  function metricMetadata(catalog, metric, query, summary, coverage, rowsReturned, rowsTotal, truncated, nextCursor, aggregated) {
     const semantics = metricSemantics(metric);
     const wikiState = query.wiki ? catalog.wikis.find((entry) => entry.wiki === query.wiki) : null;
     const artifact = metricArtifact(catalog, metric, query.wiki);
+    const snapshot = wikiState?.snapshot || (query.wiki ? null : catalog.provenance?.selected_snapshot_versions || null);
+    const quality = wikiMetricQuality(metric, query.wiki);
     return {
       api_schema_version: API_SCHEMA_VERSION,
       metric_contract_version: "1.0",
@@ -1244,7 +1492,7 @@ function createMachineApi(options = {}) {
       methodology: semantics.methodology,
       units: semantics.units,
       algorithm_version: metric.algorithm_version || null,
-      snapshot: wikiState?.snapshot || (query.wiki ? null : catalog.provenance?.selected_snapshot_versions || null),
+      snapshot,
       generated_at: new Date().toISOString(),
       caveats: semantics.caveats,
       license: catalog.license,
@@ -1255,6 +1503,8 @@ function createMachineApi(options = {}) {
         artifact_sha256: artifact?.artifact?.sha256 || null,
       },
       coverage,
+      data_quality_flags: dataQualityFlags(metric, query, aggregated, coverage, snapshot),
+      ...(quality ? {patrol_status: quality.patrol_status, patrol_note: quality.patrol_note} : {}),
       query: {
         from: query.from || null,
         to: query.to || null,
@@ -1280,7 +1530,7 @@ function createMachineApi(options = {}) {
     const nextCursor = truncated ? encodeCursor(start + rows.length) : null;
     const coverage = metricCoverage(aggregated.rows, aggregated.dateColumn, query.granularity);
     const summary = summarizeRows(aggregated.rows, aggregated.expressions, query.granularity);
-    const metadata = metricMetadata(catalog, metric, query, summary, coverage, rows.length, rowsTotal, truncated, nextCursor);
+    const metadata = metricMetadata(catalog, metric, query, summary, coverage, rows.length, rowsTotal, truncated, nextCursor, aggregated);
     return {metadata, rows, aggregated};
   }
 
@@ -1296,6 +1546,7 @@ function createMachineApi(options = {}) {
       methodology: semantics.methodology,
       algorithm_version: metric.algorithm_version || null,
       date_column: metricDateColumn(metric),
+      receipt: metric.receipt || null,
       fields: schemaFields(metric).map((field) => ({...field, unit: semantics.units[field.name] || null})),
       aggregation: metric.aggregation || [],
       coverage: {minimum_date: dates[0] || null, maximum_date: dates.at(-1) || null},
@@ -1316,6 +1567,7 @@ function createMachineApi(options = {}) {
       units: semantics.units,
       algorithm_version: metric.algorithm_version || null,
       date_column: metricDateColumn(metric),
+      receipt: metric.receipt || null,
       aggregation: metric.aggregation || [],
       caveats: semantics.caveats,
       license: catalog.license,
@@ -1341,13 +1593,19 @@ function createMachineApi(options = {}) {
         const query = {dataset: metric.id, wiki, granularity: "month", groupBy: "", agg: "", from: undefined, to: undefined, limit: 24, cursor: 0};
         const result = await queryMetric(catalog, metric, query);
         const latest = result.metadata.summary.latest;
-        headlineMetrics.push({dataset: metric.id, latest, trend: result.metadata.summary.yoy_change, coverage: result.metadata.coverage});
+        const headlineLatest = withoutNullFields(latest);
+        const headlineTrend = withoutNullFields(result.metadata.summary.yoy_change);
+        headlineMetrics.push({dataset: metric.id, latest: headlineLatest, trend: headlineTrend, coverage: result.metadata.coverage});
+        qualityFlags.push(...(result.metadata.data_quality_flags || []));
         for (const [field, change] of Object.entries(result.metadata.summary.yoy_change || {})) {
-          if (change && Number.isFinite(change.percent)) movers.push({dataset: metric.id, field, ...change, latest: latest?.[field] ?? null});
+          if (change && Number.isFinite(change.percent) && Number.isFinite(Number(latest?.[field]))) {
+            movers.push({dataset: metric.id, field, ...change, latest: latest[field]});
+          }
         }
         for (const [field, value] of Object.entries(latest || {})) {
           const unit = metricSemantics(metric).units[field];
-          if (unit === "ratio" || unit === "percent" || /(?:rate|gini|theil|palma|coverage|wow)/i.test(field)) {
+          if (value !== null && value !== undefined && Number.isFinite(Number(value))
+              && (unit === "ratio" || unit === "percent" || /(?:rate|gini|theil|palma|coverage|wow)/i.test(field))) {
             ratios.push({dataset: metric.id, field, value, unit: unit || null});
           }
         }
@@ -1363,10 +1621,12 @@ function createMachineApi(options = {}) {
     movers.sort((a, b) => Math.abs(Number(b.percent) || 0) - Math.abs(Number(a.percent) || 0));
     const state = catalog.wikis.find((entry) => entry.wiki === wiki);
     const lastSuccessfulAt = freshness?.summary?.lastSuccessfulAt || freshness?.lastSuccessfulAt || freshness?.last_successful_at || null;
+    const patrolQuality = WIKI_METRIC_QUALITY[wiki] || null;
     return {
       api_schema_version: API_SCHEMA_VERSION,
       metric_contract_version: "1.0",
       wiki,
+      ...(patrolQuality ? {patrol_status: patrolQuality.patrol_status, patrol_note: patrolQuality.patrol_note} : {}),
       snapshot: state?.snapshot || null,
       generated_at: new Date().toISOString(),
       freshness: {

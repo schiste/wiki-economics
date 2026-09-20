@@ -398,7 +398,7 @@ fn aggregate_global_metric(metric: &str, frame: DataFrame) -> Result<DataFrame> 
     const ACTIVITY_SUMS: &[&str] = &["editors", "total_edits", "net_bytes", "gross_bytes"];
     const SHARE_KEYS: &[&str] = &["year_month", "user_type"];
     const SHARE_SUMS: &[&str] = &["edits", "net_bytes", "editors"];
-    const CHURN_KEYS: &[&str] = &["period", "period_type"];
+    const CHURN_KEYS: &[&str] = &["period", "period_type", "period_months"];
     const CHURN_SUMS: &[&str] = &["active_editors", "arrivals", "departures"];
     const COHORT_KEYS: &[&str] = &["cohort_year", "year"];
     const COHORT_SUMS: &[&str] = &["survived_editors", "initial_editors"];

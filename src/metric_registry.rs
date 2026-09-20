@@ -325,6 +325,7 @@ const CHURN_SCHEMA: &[FieldDefinition] = &[
     field("arrivals", FieldKind::U32),
     field("departures", FieldKind::U32),
     field("period_type", FieldKind::String),
+    field("period_months", FieldKind::U32),
     field("arrival_rate", FieldKind::F64),
     field("departure_rate", FieldKind::F64),
     field("wiki", FieldKind::String),
