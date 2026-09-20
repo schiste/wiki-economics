@@ -12,6 +12,7 @@ const crypto = require("node:crypto");
 
 const API_PREFIX = "/api/v1";
 const MCP_PATH = "/mcp";
+const FRESHNESS_PATH = "/health/freshness.json";
 const API_SCHEMA_VERSION = 1;
 const MCP_SERVER_VERSION = "1.0.0";
 const MCP_LATEST_PROTOCOL = "2026-07-28";
@@ -21,6 +22,10 @@ const MCP_SUPPORTED_PROTOCOLS = new Set([
   "2024-11-05",
 ]);
 const MAX_MCP_BODY_BYTES = 1024 * 1024;
+const MAX_MCP_BATCH_MESSAGES = 64;
+const RATE_WINDOW_MS = 1_000;
+const DEFAULT_RATE_LIMIT_PER_SECOND = 30;
+const DEFAULT_RATE_LIMIT_MAX_CLIENTS = 4_096;
 const PUBLIC_CACHE_CONTROL = "public, max-age=60, must-revalidate";
 const ARTIFACT_CACHE_CONTROL = "public, max-age=300, must-revalidate";
 const JSON_MEDIA_TYPE = "application/json; charset=utf-8";
@@ -66,9 +71,95 @@ function readJson(file) {
   return JSON.parse(fs.readFileSync(file, "utf8"));
 }
 
+function positiveInteger(value, fallback) {
+  const text = String(value ?? "").trim();
+  if (!/^\d+$/.test(text)) return fallback;
+  const parsed = Number(text);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback;
+}
+
 function requestHeader(req, name) {
   const value = req.headers?.[name.toLowerCase()];
   return Array.isArray(value) ? value[0] || "" : value || "";
+}
+
+function machineClientKey(req) {
+  const forwarded = requestHeader(req, "x-forwarded-for").split(",")[0].trim();
+  const peer = req.socket?.remoteAddress;
+  return forwarded
+    || requestHeader(req, "x-real-ip").trim()
+    || (typeof peer === "string" ? peer.trim() : "")
+    || "unknown";
+}
+
+function shortClientFingerprint(client) {
+  return crypto.createHash("sha256").update(client).digest("hex").slice(0, 12);
+}
+
+function logMessage(logger, level, message) {
+  const method = logger?.[level];
+  if (typeof method !== "function") return;
+  try { method.call(logger, message); } catch {}
+}
+
+function createRateLimiter({
+  limitPerSecond = DEFAULT_RATE_LIMIT_PER_SECOND,
+  maxClients = DEFAULT_RATE_LIMIT_MAX_CLIENTS,
+  now = Date.now,
+  logger = console,
+} = {}) {
+  const limit = positiveInteger(limitPerSecond, DEFAULT_RATE_LIMIT_PER_SECOND);
+  const clientLimit = positiveInteger(maxClients, DEFAULT_RATE_LIMIT_MAX_CLIENTS);
+  const buckets = new Map();
+  let checks = 0;
+
+  function prune(current) {
+    checks += 1;
+    if (checks % 128 !== 0) return;
+    for (const [key, bucket] of buckets) {
+      if (bucket.resetAt <= current) buckets.delete(key);
+    }
+  }
+
+  function check(req) {
+    const current = now();
+    const key = machineClientKey(req);
+    prune(current);
+    let bucket = buckets.get(key);
+    if (!bucket || bucket.resetAt <= current) {
+      if (!bucket && buckets.size >= clientLimit) {
+        const oldest = buckets.keys().next().value;
+        if (oldest !== undefined) buckets.delete(oldest);
+      }
+      bucket = {count: 0, resetAt: current + RATE_WINDOW_MS, warned: false};
+      buckets.set(key, bucket);
+    }
+    bucket.count += 1;
+    const allowed = bucket.count <= limit;
+    if (!allowed && !bucket.warned) {
+      bucket.warned = true;
+      logMessage(logger, "warn", `[machine-api] rate limit exceeded client=${shortClientFingerprint(key)} limit=${limit}/s`);
+    }
+    return {
+      allowed,
+      limit,
+      remaining: Math.max(0, limit - bucket.count),
+      resetAt: bucket.resetAt,
+      now: current,
+    };
+  }
+
+  return {check, size: () => buckets.size, limit, maxClients: clientLimit};
+}
+
+function rateLimitHeaders(decision) {
+  const resetSeconds = Math.max(1, Math.ceil((decision.resetAt - decision.now) / 1_000));
+  return {
+    "RateLimit-Limit": String(decision.limit),
+    "RateLimit-Remaining": String(decision.remaining),
+    "RateLimit-Reset": String(resetSeconds),
+    "RateLimit-Policy": `${decision.limit};w=1`,
+  };
 }
 
 function jsonRpcError(id, code, message, data) {
@@ -116,7 +207,7 @@ function addPublicHeaders(res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Range, MCP-Protocol-Version, Mcp-Method, Mcp-Name");
-  res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range, ETag, Last-Modified, MCP-Protocol-Version");
+  res.setHeader("Access-Control-Expose-Headers", "Content-Length, Content-Range, ETag, Last-Modified, MCP-Protocol-Version, RateLimit-Limit, RateLimit-Remaining, RateLimit-Reset, RateLimit-Policy, Retry-After");
   res.setHeader("X-Content-Type-Options", "nosniff");
 }
 
@@ -143,39 +234,55 @@ function toPublicMetric(metric, artifacts) {
   };
 }
 
-function artifactDatasetName(name) {
-  const parts = name.split("/");
-  if (parts[0] === "browser-data" && parts.length >= 3) return parts[1];
-  const base = path.posix.basename(name);
-  return base.endsWith(".parquet") || base.endsWith(".json")
-    ? base.slice(0, base.lastIndexOf("."))
-    : base;
-}
-
-function artifactWiki(name) {
-  const parts = name.split("/");
-  if (validWiki(parts[0])) return parts[0];
-  if (parts[0] === "browser-data" && validWiki(parts.at(-1)?.replace(/\.parquet$/, ""))) {
-    return parts.at(-1).replace(/\.parquet$/, "");
-  }
-  return null;
-}
-
 function artifactUrl(req, name, configuredOrigin) {
   const base = requestBaseUrl(req, configuredOrigin);
   return new URL(`${API_PREFIX}/artifacts/${name.split("/").map(encodeURIComponent).join("/")}`, `${base}/`).toString();
 }
 
-function publicArtifact(record, req, configuredOrigin, publishedWikis) {
+function classifyArtifact(name, metricsById, publishedWikis) {
+  if (name === "browser-data-index.json") {
+    return publishedWikis.size > 0 ? {kind: "browser_index", dataset: null, wiki: null} : null;
+  }
+
+  const metadata = /^(?:defaults|meta)_([a-z0-9_]+)\.json$/.exec(name);
+  if (metadata && metricsById.has(metadata[1])) {
+    return {kind: "metric_metadata", dataset: metadata[1], wiki: null};
+  }
+
+  const rootMetric = /^([a-z0-9_]+)\.parquet$/.exec(name);
+  if (rootMetric && metricsById.has(rootMetric[1])
+      && metricsById.get(rootMetric[1]).publication?.scope !== "per_wiki_only") {
+    return {kind: "merged_metric", dataset: rootMetric[1], wiki: null};
+  }
+
+  const wikiMetric = /^([a-z0-9_]+wiki)\/([a-z0-9_]+)\.parquet$/.exec(name);
+  if (wikiMetric && publishedWikis.has(wikiMetric[1]) && metricsById.has(wikiMetric[2])) {
+    return {kind: "wiki_metric", dataset: wikiMetric[2], wiki: wikiMetric[1]};
+  }
+
+  const browserMetric = /^browser-data\/([a-z0-9_]+)\/([^/]+)\.parquet$/.exec(name);
+  const metric = browserMetric && metricsById.get(browserMetric[1]);
+  if (!metric || metric.browser?.partitioning !== "per_wiki_and_global_year_shards") return null;
+  const partition = browserMetric[2];
+  if (validWiki(partition) && publishedWikis.has(partition)) {
+    return {kind: "browser_wiki_partition", dataset: browserMetric[1], wiki: partition};
+  }
+  if (/^all-\d{4}$/.test(partition) && publishedWikis.size > 0) {
+    return {kind: "browser_global_partition", dataset: browserMetric[1], wiki: null};
+  }
+  return null;
+}
+
+function publicArtifact(record, req, configuredOrigin, metricsById, publishedWikis) {
   const name = normalizeArtifactName(record?.name);
   if (!name) return null;
-  const wiki = artifactWiki(name);
-  if (wiki && !publishedWikis.has(wiki)) return null;
-  const dataset = artifactDatasetName(name);
+  const classification = classifyArtifact(name, metricsById, publishedWikis);
+  if (!classification) return null;
   return {
     name,
-    dataset,
-    wiki,
+    kind: classification.kind,
+    dataset: classification.dataset,
+    wiki: classification.wiki,
     bytes: Number.isSafeInteger(record.bytes) ? record.bytes : null,
     size_kb: Number.isSafeInteger(record.size_kb) ? record.size_kb : null,
     rows: Number.isSafeInteger(record.rows) ? record.rows : null,
@@ -201,15 +308,28 @@ function buildPublicCatalog({manifest, metricCatalog, req, configuredOrigin}) {
     throw new Error("metric catalog is missing or unsupported");
   }
   const lifecycle = manifest.lifecycle?.wikis || {};
+  const manifestWikis = manifest.wikis || {};
   const publishedWikis = new Set(Object.entries(lifecycle)
-    .filter(([, entry]) => entry?.publication === "published")
+    .filter(([wiki, entry]) => validWiki(wiki) && entry?.publication === "published" && manifestWikis[wiki])
     .map(([wiki]) => wiki));
+  const metrics = metricCatalog.metrics.filter((metric) => {
+    if (!validDataset(metric?.id)) return false;
+    const scope = metric.publication?.scope;
+    if (!["merged_and_per_wiki", "per_wiki_only"].includes(scope)) return false;
+    if (metric.publication?.per_wiki_artifact !== `{wiki}/${metric.id}.parquet`) return false;
+    if (scope === "merged_and_per_wiki" && metric.publication?.merged_artifact !== `${metric.id}.parquet`) return false;
+    if (scope === "per_wiki_only" && metric.publication?.merged_artifact != null) return false;
+    return metric.fingerprint?.artifact_identity === `${metric.id}.parquet`;
+  });
+  const metricsById = new Map(metrics.map((metric) => [metric.id, metric]));
   const artifacts = (manifest.downloadable_artifacts || [])
-    .map((record) => publicArtifact(record, req, configuredOrigin, publishedWikis))
+    .filter((record) => record && typeof record === "object")
+    .map((record) => publicArtifact(record, req, configuredOrigin, metricsById, publishedWikis))
     .filter(Boolean)
     .sort((left, right) => left.name.localeCompare(right.name));
   const artifactsByDataset = new Map();
   for (const artifact of artifacts) {
+    if (!artifact.dataset) continue;
     const list = artifactsByDataset.get(artifact.dataset) || [];
     list.push(artifact);
     artifactsByDataset.set(artifact.dataset, list);
@@ -225,9 +345,9 @@ function buildPublicCatalog({manifest, metricCatalog, req, configuredOrigin}) {
       artifacts: wikiArtifacts,
     };
   });
-  const datasets = metricCatalog.metrics
+  const datasets = metrics
     .map((metric) => toPublicMetric(metric, artifactsByDataset.get(metric.id) || []))
-    .filter((metric) => metric.artifacts.length > 0 || metric.publication?.scope === "merged_and_per_wiki")
+    .filter((metric) => metric.artifacts.length > 0)
     .sort((left, right) => left.id.localeCompare(right.id));
   return {
     api_schema_version: API_SCHEMA_VERSION,
@@ -239,8 +359,14 @@ function buildPublicCatalog({manifest, metricCatalog, req, configuredOrigin}) {
     privacy: manifest.privacy || null,
     provenance: {
       generating_commit: manifest.provenance?.generating_commit || null,
-      selected_snapshot_versions: manifest.provenance?.selected_snapshot_versions || {},
-      workload_profiles: manifest.provenance?.workload_profiles || {},
+      selected_snapshot_versions: Object.fromEntries(
+        Object.entries(manifest.provenance?.selected_snapshot_versions || {})
+          .filter(([wiki]) => publishedWikis.has(wiki)),
+      ),
+      workload_profiles: Object.fromEntries(
+        Object.entries(manifest.provenance?.workload_profiles || {})
+          .filter(([wiki]) => publishedWikis.has(wiki)),
+      ),
     },
     wikis,
     datasets,
@@ -258,6 +384,7 @@ function buildPublicCatalog({manifest, metricCatalog, req, configuredOrigin}) {
 
 function openApiDocument(req, configuredOrigin) {
   const server = requestBaseUrl(req, configuredOrigin);
+  const rateLimited = {description: "Rate limit exceeded", headers: {"Retry-After": {schema: {type: "integer"}}}};
   return {
     openapi: "3.1.0",
     info: {
@@ -267,10 +394,10 @@ function openApiDocument(req, configuredOrigin) {
     },
     servers: [{url: server}],
     paths: {
-      [`${API_PREFIX}`]: {get: {summary: "API discovery", responses: {"200": {description: "Endpoint index"}}}},
-      [`${API_PREFIX}/catalog`]: {get: {summary: "Published catalog", responses: {"200": {description: "Published datasets and artifacts"}}}},
-      [`${API_PREFIX}/wikis`]: {get: {summary: "Published wikis", responses: {"200": {description: "Published wiki list"}}}},
-      [`${API_PREFIX}/datasets`]: {get: {summary: "Published datasets", responses: {"200": {description: "Dataset definitions"}}}},
+      [`${API_PREFIX}`]: {get: {summary: "API discovery", responses: {"200": {description: "Endpoint index"}, "429": rateLimited}}},
+      [`${API_PREFIX}/catalog`]: {get: {summary: "Published catalog", responses: {"200": {description: "Published datasets and artifacts"}, "429": rateLimited}}},
+      [`${API_PREFIX}/wikis`]: {get: {summary: "Published wikis", responses: {"200": {description: "Published wiki list"}, "429": rateLimited}}},
+      [`${API_PREFIX}/datasets`]: {get: {summary: "Published datasets", responses: {"200": {description: "Dataset definitions"}, "429": rateLimited}}},
       [`${API_PREFIX}/datasets/{dataset}`]: {
         get: {
           summary: "Resolve a dataset",
@@ -278,19 +405,19 @@ function openApiDocument(req, configuredOrigin) {
             {name: "dataset", in: "path", required: true, schema: {type: "string"}},
             {name: "wiki", in: "query", required: false, schema: {type: "string"}},
           ],
-          responses: {"200": {description: "Dataset metadata and artifact links"}, "404": {description: "Dataset not published"}},
+          responses: {"200": {description: "Dataset metadata and artifact links"}, "404": {description: "Dataset not published"}, "429": rateLimited},
         },
       },
       [`${API_PREFIX}/artifacts/{path}`]: {
         get: {
           summary: "Download a published artifact",
           parameters: [{name: "path", in: "path", required: true, schema: {type: "string"}}],
-          responses: {"200": {description: "Artifact bytes"}, "206": {description: "Partial artifact bytes"}, "404": {description: "Artifact not published"}},
+          responses: {"200": {description: "Artifact bytes"}, "206": {description: "Partial artifact bytes"}, "404": {description: "Artifact not published"}, "429": rateLimited},
         },
-        head: {summary: "Inspect an artifact", responses: {"200": {description: "Artifact headers"}}},
+        head: {summary: "Inspect an artifact", responses: {"200": {description: "Artifact headers"}, "429": rateLimited}},
       },
-      "/health/freshness.json": {get: {summary: "Publication freshness", responses: {"200": {description: "Freshness and alert assessment"}}}},
-      [MCP_PATH]: {post: {summary: "MCP Streamable HTTP JSON-RPC", responses: {"200": {description: "JSON-RPC response"}}}},
+      [FRESHNESS_PATH]: {get: {summary: "Publication freshness", responses: {"200": {description: "Freshness and alert assessment"}, "429": rateLimited}}},
+      [MCP_PATH]: {post: {summary: "MCP Streamable HTTP JSON-RPC", responses: {"200": {description: "JSON-RPC response"}, "429": rateLimited}}},
     },
   };
 }
@@ -365,18 +492,45 @@ function mcpText(value) {
 
 function createMachineApi(options = {}) {
   const outputDir = path.resolve(options.outputDir || path.join(__dirname, "..", "output"));
+  const logger = options.logger || console;
   const manifestLoader = options.manifestLoader || (() => readJson(path.join(outputDir, "manifest.json")));
   const metricCatalogLoader = options.metricCatalogLoader || (() => readJson(options.metricCatalogPath || DEFAULT_METRIC_CATALOG));
   const freshnessLoader = options.freshnessLoader || (() => ({status: "unknown", alerts: []}));
   const configuredOrigin = options.publicOrigin ? String(options.publicOrigin).replace(/\/+$/, "") : "";
+  const rateLimiter = createRateLimiter({
+    limitPerSecond: options.rateLimitPerSecond ?? process.env.WIKI_ECON_MACHINE_API_RATE_LIMIT_PER_SECOND,
+    maxClients: options.rateLimitMaxClients ?? process.env.WIKI_ECON_MACHINE_API_RATE_LIMIT_MAX_CLIENTS,
+    logger,
+  });
+  if (options.announceRateLimit !== false) {
+    logMessage(logger, "info", `[machine-api] per-client rate limit enabled limit=${rateLimiter.limit}/s max_clients=${rateLimiter.maxClients}`);
+  }
 
   function loadCatalog(req) {
-    return buildPublicCatalog({
-      manifest: manifestLoader(),
-      metricCatalog: metricCatalogLoader(),
-      req,
-      configuredOrigin,
-    });
+    try {
+      return buildPublicCatalog({
+        manifest: manifestLoader(),
+        metricCatalog: metricCatalogLoader(),
+        req,
+        configuredOrigin,
+      });
+    } catch (error) {
+      logMessage(logger, "error", `[machine-api] published catalog unavailable: ${error.message}`);
+      const safe = new Error("Published catalog unavailable");
+      safe.code = "catalog_unavailable";
+      throw safe;
+    }
+  }
+
+  function loadFreshness() {
+    try {
+      return freshnessLoader();
+    } catch (error) {
+      logMessage(logger, "error", `[machine-api] freshness unavailable: ${error.message}`);
+      const safe = new Error("Publication freshness unavailable");
+      safe.code = "freshness_unavailable";
+      throw safe;
+    }
   }
 
   function loadArtifact(catalog, name) {
@@ -416,6 +570,18 @@ function createMachineApi(options = {}) {
         artifacts: `${API_PREFIX}/artifacts/{path}`,
         freshness: "/health/freshness.json",
         mcp: MCP_PATH,
+      },
+      security: {
+        rate_limit: {
+          scope: "client",
+          requests_per_second: rateLimiter.limit,
+          window_seconds: RATE_WINDOW_MS / 1_000,
+          max_tracked_clients: rateLimiter.maxClients,
+          client_identity: "trusted X-Forwarded-For address, X-Real-IP, or socket peer",
+          response_status: 429,
+          headers: ["RateLimit-Limit", "RateLimit-Remaining", "RateLimit-Reset", "RateLimit-Policy", "Retry-After"],
+        },
+        mcp: {max_batch_messages: MAX_MCP_BATCH_MESSAGES},
       },
     });
   }
@@ -477,7 +643,7 @@ function createMachineApi(options = {}) {
 
   function resolveMcpResource(uri, req) {
     if (uri === "wiki-economics://catalog") return {mimeType: JSON_MEDIA_TYPE, value: loadCatalog(req)};
-    if (uri === "wiki-economics://freshness") return {mimeType: JSON_MEDIA_TYPE, value: freshnessLoader()};
+    if (uri === "wiki-economics://freshness") return {mimeType: JSON_MEDIA_TYPE, value: loadFreshness()};
     const prefix = "wiki-economics://artifact/";
     if (uri.startsWith(prefix)) {
       const name = normalizeArtifactName(uri.slice(prefix.length));
@@ -515,7 +681,7 @@ function createMachineApi(options = {}) {
       case "list_datasets":
         return catalog.datasets;
       case "get_freshness":
-        return freshnessLoader();
+        return loadFreshness();
       case "get_dataset": {
         const dataset = args.dataset;
         const wiki = args.wiki;
@@ -558,7 +724,7 @@ function createMachineApi(options = {}) {
               resources: {subscribe: false, listChanged: false},
             },
             serverInfo: {name: "wiki-economics", version: MCP_SERVER_VERSION},
-            instructions: "Read-only access to published wiki-economics datasets. Use get_dataset for immutable download links.",
+            instructions: `Read-only access to published wiki-economics datasets. Use get_dataset for immutable download links. Public calls are limited to ${rateLimiter.limit} requests per second per client.`,
           });
         }
         case "ping":
@@ -646,6 +812,10 @@ function createMachineApi(options = {}) {
       writeJson(res, 400, jsonRpcError(null, -32600, "Empty JSON-RPC batch"));
       return true;
     }
+    if (messages.length > MAX_MCP_BATCH_MESSAGES) {
+      writeJson(res, 413, jsonRpcError(null, -32600, `MCP batch exceeds ${MAX_MCP_BATCH_MESSAGES} messages`), "no-store");
+      return true;
+    }
     const headerMethod = requestHeader(req, "mcp-method");
     const headerName = requestHeader(req, "mcp-name");
     const responses = [];
@@ -676,7 +846,40 @@ function createMachineApi(options = {}) {
   async function handleRequest(req, res, url) {
     const isMcp = url.pathname === MCP_PATH;
     const isApi = url.pathname === API_PREFIX || url.pathname.startsWith(`${API_PREFIX}/`);
-    if (!isMcp && !isApi) return false;
+    const isFreshness = url.pathname === FRESHNESS_PATH;
+    if (!isMcp && !isApi && !isFreshness) return false;
+    const rateDecision = rateLimiter.check(req);
+    for (const [name, value] of Object.entries(rateLimitHeaders(rateDecision))) res.setHeader(name, value);
+    if (!rateDecision.allowed) {
+      const retryAfter = rateLimitHeaders(rateDecision)["RateLimit-Reset"];
+      writeJson(res, 429, {
+        error: "Rate limit exceeded",
+        code: "rate_limited",
+        limit_per_second: rateDecision.limit,
+        retry_after_seconds: Number(retryAfter),
+      }, "no-store", {"Retry-After": retryAfter});
+      return true;
+    }
+    if (isFreshness) {
+      if (req.method !== "GET" && req.method !== "HEAD" && req.method !== "OPTIONS") {
+        addPublicHeaders(res);
+        res.writeHead(405, {Allow: "GET, HEAD, OPTIONS", "Cache-Control": "no-store"});
+        res.end();
+        return true;
+      }
+      if (req.method === "OPTIONS") {
+        addPublicHeaders(res);
+        res.writeHead(204, {"Cache-Control": "no-store"});
+        res.end();
+        return true;
+      }
+      try {
+        writeJson(res, 200, loadFreshness(), "no-store");
+      } catch (error) {
+        writeJson(res, 503, {error: error.message, code: error.code || "freshness_unavailable"}, "no-store", {"Retry-After": "30"});
+      }
+      return true;
+    }
     if (req.method === "OPTIONS") {
       addPublicHeaders(res);
       res.writeHead(204, {"Cache-Control": "no-store"});
@@ -694,7 +897,7 @@ function createMachineApi(options = {}) {
     try {
       catalog = loadCatalog(req);
     } catch (error) {
-      writeJson(res, 503, {error: "Published catalog unavailable", code: "catalog_unavailable", detail: error.message}, "no-store", {"Retry-After": "30"});
+      writeJson(res, 503, {error: error.message, code: error.code || "catalog_unavailable"}, "no-store", {"Retry-After": "30"});
       return true;
     }
     const suffix = url.pathname.slice(API_PREFIX.length).replace(/^\/+/, "");
@@ -751,10 +954,13 @@ function createMachineApi(options = {}) {
 
 module.exports = {
   API_PREFIX,
+  FRESHNESS_PATH,
   MCP_PATH,
   MCP_LATEST_PROTOCOL,
+  MAX_MCP_BATCH_MESSAGES,
   TOOL_DEFINITIONS,
   buildPublicCatalog,
+  createRateLimiter,
   createMachineApi,
   normalizeArtifactName,
 };

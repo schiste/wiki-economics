@@ -63,6 +63,8 @@ refuses to start with `WIKI_ECON_ADMIN_AUTH_MODE=none`.
 | `WIKI_ECON_ADMIN_MEDIAWIKI_CLIENT_SECRET` | empty | OAuth2 consumer client secret. |
 | `WIKI_ECON_WIKI_LIFECYCLE_FILE` | `config/wiki-lifecycle.json` | Validated publication/refresh lifecycle registry. |
 | `WIKI_ECON_ADMIN_PUBLIC_ORIGIN` | unset | Optional canonical external origin. If unset, the server derives it from `X-Forwarded-*` headers. |
+| `WIKI_ECON_MACHINE_API_RATE_LIMIT_PER_SECOND` | `30` | Fixed one-second request budget per machine-client identity for `/api/v1`, `/mcp`, and `/health/freshness.json`. Invalid values fall back to the default. |
+| `WIKI_ECON_MACHINE_API_RATE_LIMIT_MAX_CLIENTS` | `4096` | Maximum number of in-memory client buckets per webservice process; oldest buckets are evicted when the cap is reached. |
 
 ## Routes
 
@@ -116,6 +118,28 @@ source paths, and unpublished/qualification data. Consumers should discover
 the current generation through `/api/v1/catalog` rather than guessing file
 names; a missing or invalid publication manifest returns `503` until the next
 valid site publication is available.
+
+Public machine calls are deliberately bounded. Each webservice process applies
+the configured fixed one-second budget independently to the first address in a
+trusted `X-Forwarded-For` header, then `X-Real-IP`, then the socket peer. Every
+machine response advertises `RateLimit-Limit`, `RateLimit-Remaining`,
+`RateLimit-Reset`, and `RateLimit-Policy`; an exhausted budget returns `429`
+with `Retry-After` and a stable `rate_limited` error code. Startup logs announce
+the active limit and client-bucket cap, and the API discovery document exposes
+the same policy under `security.rate_limit`. The limiter is intentionally a
+small per-process guard, not a replacement for a fleet-wide ingress limit; the
+proxy must overwrite forwarded-client headers rather than trusting arbitrary
+caller-supplied values.
+
+The artifact filter is fail-closed: only known metric identities from the
+generated catalog, canonical merged/per-wiki paths, declared browser partitions,
+the browser index, and the generated `defaults_`/`meta_` JSON files can be
+served. A record must also be present in the publication manifest, belong to a
+published lifecycle wiki, and resolve beneath the real output directory.
+Unknown files, hidden wikis, unsupported browser partitions, traversal paths,
+and stale/unlisted records return `404` without revealing filesystem details.
+MCP batches are capped at 64 JSON-RPC messages to keep one HTTP request from
+turning into an unbounded burst of logical calls.
 
 The server accepts both the legacy local prefix and the hosted prefix:
 

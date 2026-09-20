@@ -31,9 +31,15 @@ function fixture() {
   addArtifact("gdp.parquet", "merged-gdp", "application/vnd.apache.parquet");
   addArtifact("frwiki/gdp.parquet", "frwiki-gdp", "application/vnd.apache.parquet");
   addArtifact("hiddenwiki/gdp.parquet", "hidden-gdp", "application/vnd.apache.parquet");
+  addArtifact("hiddenwiki/not_metric.parquet", "hidden-not-metric", "application/vnd.apache.parquet");
   addArtifact("browser-data/gdp/frwiki.parquet", "browser-gdp", "application/vnd.apache.parquet");
+  addArtifact("browser-data/gdp/hiddenwiki.parquet", "hidden-browser-gdp", "application/vnd.apache.parquet");
   addArtifact("browser-data/gdp/all-2026.parquet", "global-gdp", "application/vnd.apache.parquet");
+  addArtifact("browser-data/not_metric/frwiki.parquet", "browser-not-metric", "application/vnd.apache.parquet");
+  addArtifact("browser-data/page_weekly_edits/frwiki.parquet", "browser-non-partitioned", "application/vnd.apache.parquet");
+  addArtifact("page_weekly_edits.parquet", "merged-non-partitioned", "application/vnd.apache.parquet");
   addArtifact("meta_gdp.json", "{\"dataset\":\"gdp\"}", "application/json");
+  addArtifact("leak.json", "private", "application/json");
   fs.writeFileSync(path.join(outputDir, "not-allowlisted.txt"), "private");
 
   const manifest = {
@@ -46,8 +52,8 @@ function fixture() {
     privacy: {status: "aggregated"},
     provenance: {
       generating_commit: "abc123",
-      selected_snapshot_versions: {frwiki: "2026-08"},
-      workload_profiles: {},
+      selected_snapshot_versions: {frwiki: "2026-08", hiddenwiki: "2026-08"},
+      workload_profiles: {hiddenwiki: {profile: "large"}},
     },
     lifecycle: {
       wikis: {
@@ -69,8 +75,26 @@ function fixture() {
       algorithm_version: "test-v1",
       schema: [{name: "year_month", data_type: "string"}],
       aggregation: [{kind: "additive", columns: ["total_edits"]}],
-      publication: {scope: "merged_and_per_wiki"},
+      publication: {
+        scope: "merged_and_per_wiki",
+        per_wiki_artifact: "{wiki}/gdp.parquet",
+        merged_artifact: "gdp.parquet",
+      },
+      fingerprint: {artifact_identity: "gdp.parquet"},
       browser: {partitioning: "per_wiki_and_global_year_shards"},
+    }, {
+      id: "page_weekly_edits",
+      family: "page_week",
+      algorithm_version: "test-v1",
+      schema: [{name: "week_start", data_type: "string"}],
+      aggregation: [{kind: "additive", columns: ["edits"]}],
+      publication: {
+        scope: "per_wiki_only",
+        per_wiki_artifact: "{wiki}/page_weekly_edits.parquet",
+        merged_artifact: null,
+      },
+      fingerprint: {artifact_identity: "page_weekly_edits.parquet"},
+      browser: {partitioning: "rust_defaults_only"},
     }],
   };
   return {root, outputDir, manifest, metricCatalog};
@@ -148,13 +172,16 @@ function responseJson(response) {
   return JSON.parse(response.text());
 }
 
-function startApi(t) {
+function startApi(t, options = {}) {
   const data = fixture();
   const api = createMachineApi({
     outputDir: data.outputDir,
     manifestLoader: () => data.manifest,
     metricCatalogLoader: () => data.metricCatalog,
     freshnessLoader: () => ({status: "fresh", alerts: [], checked_at: "2026-09-20T08:00:00Z"}),
+    logger: options.logger || {info() {}, warn() {}, error() {}},
+    rateLimitPerSecond: options.rateLimitPerSecond,
+    rateLimitMaxClients: options.rateLimitMaxClients,
   });
   t.after(() => fs.rmSync(data.root, {recursive: true, force: true}));
   return {api, data};
@@ -171,10 +198,15 @@ test("public catalog exposes only published artifacts and groups browser partiti
   assert.ok(body.artifacts.some((artifact) => artifact.name === "frwiki/gdp.parquet"));
   assert.ok(body.artifacts.some((artifact) => artifact.name === "browser-data/gdp/frwiki.parquet"));
   assert.equal(body.artifacts.some((artifact) => artifact.name.includes("hiddenwiki")), false);
+  assert.equal(body.artifacts.some((artifact) => artifact.name.includes("not_metric")), false);
+  assert.equal(body.artifacts.some((artifact) => artifact.name.includes("page_weekly_edits")), false);
+  assert.equal(body.artifacts.some((artifact) => artifact.name === "leak.json"), false);
   assert.deepEqual(
     body.datasets.find((dataset) => dataset.id === "gdp").artifacts.map((artifact) => artifact.dataset),
-    ["gdp", "gdp", "gdp", "gdp"],
+    ["gdp", "gdp", "gdp", "gdp", "gdp"],
   );
+  assert.deepEqual(body.provenance.selected_snapshot_versions, {frwiki: "2026-08"});
+  assert.deepEqual(body.provenance.workload_profiles, {});
   assert.equal(body.links.openapi, "/api/v1/openapi.json");
 
   const openapiResponse = await invoke(api, {url: "/api/v1/openapi.json"});
@@ -199,6 +231,10 @@ test("artifact endpoint enforces the manifest allow-list and supports cache/rang
   assert.equal(range.getHeader("content-range"), "bytes 1-3/10");
 
   assert.equal((await invoke(api, {url: "/api/v1/artifacts/hiddenwiki/gdp.parquet"})).statusCode, 404);
+  assert.equal((await invoke(api, {url: "/api/v1/artifacts/browser-data/gdp/hiddenwiki.parquet"})).statusCode, 404);
+  assert.equal((await invoke(api, {url: "/api/v1/artifacts/browser-data/not_metric/frwiki.parquet"})).statusCode, 404);
+  assert.equal((await invoke(api, {url: "/api/v1/artifacts/browser-data/page_weekly_edits/frwiki.parquet"})).statusCode, 404);
+  assert.equal((await invoke(api, {url: "/api/v1/artifacts/page_weekly_edits.parquet"})).statusCode, 404);
   assert.equal((await invoke(api, {url: "/api/v1/artifacts/not-allowlisted.txt"})).statusCode, 404);
   assert.equal((await invoke(api, {url: "/api/v1/artifacts/%2e%2e%2fnot-allowlisted.txt"})).statusCode, 404);
 });
@@ -238,5 +274,40 @@ test("MCP endpoint provides discovery, tools, resources, and compatibility initi
 
   const mismatch = responseJson(await call({jsonrpc: "2.0", id: 5, method: "ping"}, {"mcp-method": "tools/list"}));
   assert.equal(mismatch.error.code, -32600);
+  const oversizedBatch = await call(Array.from({length: 65}, (_, id) => ({jsonrpc: "2.0", id, method: "ping"})));
+  assert.equal(oversizedBatch.statusCode, 413);
   assert.equal((await invoke(api, {url: "/mcp"})).statusCode, 405);
+});
+
+test("rate limits machine calls per client and announces the rejection", async (t) => {
+  const logs = [];
+  const {api} = startApi(t, {
+    rateLimitPerSecond: 2,
+    logger: {
+      info(message) { logs.push({level: "info", message}); },
+      warn(message) { logs.push({level: "warn", message}); },
+      error(message) { logs.push({level: "error", message}); },
+    },
+  });
+  const request = {url: "/api/v1", headers: {"x-real-ip": "192.0.2.10"}};
+  const first = await invoke(api, request);
+  const second = await invoke(api, request);
+  const rejected = await invoke(api, request);
+  assert.equal(first.statusCode, 200);
+  assert.equal(second.statusCode, 200);
+  assert.equal(rejected.statusCode, 429);
+  assert.equal(responseJson(rejected).code, "rate_limited");
+  assert.equal(rejected.getHeader("ratelimit-limit"), "2");
+  assert.equal(rejected.getHeader("ratelimit-remaining"), "0");
+  assert.equal(rejected.getHeader("ratelimit-policy"), "2;w=1");
+  assert.equal(rejected.getHeader("retry-after"), "1");
+  assert.equal(logs.filter((entry) => entry.level === "warn").length, 1);
+
+  const otherClient = await invoke(api, {url: "/api/v1", headers: {"x-real-ip": "192.0.2.11"}});
+  assert.equal(otherClient.statusCode, 200);
+  const discovery = responseJson(otherClient);
+  assert.equal(discovery.security.rate_limit.window_seconds, 1);
+  assert.equal(discovery.security.rate_limit.max_tracked_clients, 4096);
+  assert.equal(discovery.security.mcp.max_batch_messages, 64);
+  assert.ok(logs.some((entry) => entry.level === "info" && entry.message.includes("limit=2/s")));
 });

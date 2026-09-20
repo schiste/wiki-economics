@@ -91,7 +91,11 @@ Recommended practice:
 - Anonymous or unapproved logins in hosted mode (Wikimedia OAuth 2 plus
   a username allowlist).
 - Unpublished data exposure through the machine interface (manifest allow-list,
-  published-lifecycle filtering, path normalization, and realpath confinement).
+  published-lifecycle filtering, canonical metric/browser-path filtering,
+  path normalization, and realpath confinement).
+- Unbounded anonymous bursts against the public machine interface (a transparent,
+  per-client one-second budget, `429`/`Retry-After` responses, bounded client
+  state, and a 64-message MCP batch cap).
 
 ### What this still does NOT protect against
 
@@ -108,6 +112,8 @@ The hosted model therefore assumes:
 - the configured `WIKI_ECON_ADMIN_PUBLIC_ORIGIN` is correct when set.
 - `meta.wikimedia.org` is the trusted authority for the usernames in
   `WIKI_ECON_ADMIN_ALLOWED_USERNAMES`.
+- the reverse proxy overwrites `X-Forwarded-For`/`X-Real-IP`; otherwise a caller
+  can rotate a spoofed client identity and bypass the per-process limiter.
 
 ## Wikimedia OAuth today
 
