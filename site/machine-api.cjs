@@ -831,8 +831,10 @@ function summarizeRows(rows, expressions, granularity) {
   const previous = latest && periods.length > yearOffset
     ? rows.filter((row) => row.period === periods[periods.length - 1 - yearOffset]).at(-1)
     : null;
+  const finiteMetricNumber = (value) => value !== null && value !== undefined && value !== ""
+    && Number.isFinite(Number(value));
   const aggregateObject = (kind) => Object.fromEntries(numericFields.map((field) => {
-    const values = rows.map((row) => Number(row[field])).filter(Number.isFinite);
+    const values = rows.map((row) => row[field]).filter(finiteMetricNumber).map(Number);
     if (!values.length) return [field, null];
     const operation = expressions.get(field);
     if (kind === "total") {
@@ -843,13 +845,13 @@ function summarizeRows(rows, expressions, granularity) {
     return [field, kind === "min" ? Math.min(...values) : Math.max(...values)];
   }));
   const yoyChange = Object.fromEntries(numericFields.map((field) => {
-    const current = Number(latest?.[field]);
-    const prior = Number(previous?.[field]);
-    if (!Number.isFinite(current) || !Number.isFinite(prior)) return [field, null];
+    const current = finiteMetricNumber(latest?.[field]) ? Number(latest[field]) : null;
+    const prior = finiteMetricNumber(previous?.[field]) ? Number(previous[field]) : null;
+    if (current === null || prior === null) return [field, null];
     return [field, {absolute: current - prior, percent: prior === 0 ? null : (current - prior) / Math.abs(prior)}];
   }));
   const topN = Object.fromEntries(numericFields.slice(0, 3).map((field) => [field, rows
-    .filter((row) => Number.isFinite(Number(row[field])))
+    .filter((row) => finiteMetricNumber(row[field]))
     .sort((a, b) => Number(b[field]) - Number(a[field]))
     .slice(0, 5)]));
   return {

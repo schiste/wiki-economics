@@ -413,6 +413,8 @@ test("nulls non-additive fields above publication grain and removes them from br
   assert.equal(coarse.summary.latest.unique_editors, null);
   assert.equal(coarse.summary.yoy_change.unique_editors, null);
   assert.equal(coarse.summary.total.unique_editors, null);
+  assert.equal(coarse.summary.min.unique_editors, null);
+  assert.equal(coarse.summary.max.unique_editors, null);
   assert.ok(coarse.data_quality_flags.some((flag) => flag.code === "non_additive_fields_null" && flag.fields.includes("unique_editors")));
 
   const exact = responseJson(await invoke(api, {url: "/api/v1/metrics/gdp?wiki=frwiki&from=2026-08&to=2026-08&group_by=page_namespace,user_type"}));
