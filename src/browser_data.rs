@@ -421,13 +421,35 @@ fn aggregate_global_metric(metric: &str, frame: DataFrame) -> Result<DataFrame> 
             .collect()?,
         MetricId::GdpActivityTiers => aggregate_sums(frame, ACTIVITY_KEYS, ACTIVITY_SUMS)?,
         MetricId::GdpUserTypeShare => aggregate_sums(frame, SHARE_KEYS, SHARE_SUMS)?,
-        MetricId::LaborChurn => aggregate_sums(frame, CHURN_KEYS, CHURN_SUMS)?
-            .lazy()
-            .with_columns([
-                safe_ratio("arrivals", "active_editors", "arrival_rate"),
-                safe_ratio("departures", "active_editors", "departure_rate"),
-            ])
-            .collect()?,
+        MetricId::LaborChurn => {
+            // Older published lifecycle frames predate the explicit
+            // period_months field. Derive it from period_type so browser
+            // global aggregation remains readable during a rolling refresh.
+            let frame = if frame.column("period_months").is_err() {
+                frame
+                    .lazy()
+                    .with_column(
+                        when(col("period_type").eq(lit("month")))
+                            .then(lit(1_u32))
+                            .when(col("period_type").eq(lit("quarter")))
+                            .then(lit(3_u32))
+                            .when(col("period_type").eq(lit("year")))
+                            .then(lit(12_u32))
+                            .otherwise(lit(NULL).cast(DataType::UInt32))
+                            .alias("period_months"),
+                    )
+                    .collect()?
+            } else {
+                frame
+            };
+            aggregate_sums(frame, CHURN_KEYS, CHURN_SUMS)?
+                .lazy()
+                .with_columns([
+                    safe_ratio("arrivals", "active_editors", "arrival_rate"),
+                    safe_ratio("departures", "active_editors", "departure_rate"),
+                ])
+                .collect()?
+        }
         MetricId::LaborCohorts => aggregate_sums(frame, COHORT_KEYS, COHORT_SUMS)?,
         MetricId::LaborMonthly => aggregate_sums(frame, GDP_KEYS, LABOR_SUMS)?,
         MetricId::Inequality => aggregate_global_inequality(frame)?,
