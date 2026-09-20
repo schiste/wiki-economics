@@ -1098,11 +1098,14 @@ function createMachineApi(options = {}) {
   }
 
   function metricArtifact(catalog, metric, wiki) {
-    const artifactName = wiki
-      ? `${wiki}/${metric.id}.parquet`
-      : metric.publication?.merged_artifact;
-    if (!artifactName) return null;
-    return loadArtifact(catalog, artifactName);
+    const candidates = wiki
+      ? [`${wiki}/${metric.id}.parquet`, `browser-data/${metric.id}/${wiki}.parquet`]
+      : [metric.publication?.merged_artifact].filter(Boolean);
+    for (const artifactName of candidates) {
+      const loaded = loadArtifact(catalog, artifactName);
+      if (loaded) return loaded;
+    }
+    return null;
   }
 
   async function defaultMetricRowsLoader({catalog, metric, wiki}) {

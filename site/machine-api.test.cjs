@@ -297,6 +297,14 @@ test("metrics contract returns bounded JSON, summaries, compact catalog, and ren
   assert.equal((await invoke(api, {url: "/api/v1/metrics/page_weekly_edits"})).statusCode, 404);
 });
 
+test("metric downloads fall back to the published browser partition when the raw wiki artifact is absent", async (t) => {
+  const {api, data} = startApi(t);
+  fs.rmSync(path.join(data.outputDir, "frwiki", "gdp.parquet"));
+  const response = await invoke(api, {url: "/api/v1/metrics/gdp?wiki=frwiki&format=parquet"});
+  assert.equal(response.statusCode, 200);
+  assert.equal(response.text(), "browser-gdp");
+});
+
 test("wiki briefing, metric schema/explanation, and MCP analytical tools are usable", async (t) => {
   const rows = [
     {year_month: "2026-01", total_edits: 20, net_bytes: 200, revert_rate: 0.1, unique_editors: 4, wiki: "frwiki"},
