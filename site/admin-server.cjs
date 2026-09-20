@@ -1956,6 +1956,7 @@ function publicFreshnessPayload() {
 // surface, but have no access to mutation routes or operator state.
 const MACHINE_API = createMachineApi({
   outputDir: OUTPUT_DIR,
+  artifactDirs: [ADMIN_DIST_DIR, SITE_DIST_DIR],
   metricCatalogPath: path.join(ROOT, "config", "generated", "metric-catalog.json"),
   publicOrigin: ADMIN_PUBLIC_ORIGIN,
   freshnessLoader: publicFreshnessPayload,

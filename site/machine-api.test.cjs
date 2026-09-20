@@ -17,11 +17,13 @@ function sha256(value) {
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-machine-api-"));
   const outputDir = path.join(root, "output");
+  const siteDistDir = path.join(root, "site-dist");
   fs.mkdirSync(outputDir, {recursive: true});
+  fs.mkdirSync(siteDistDir, {recursive: true});
   const records = [];
 
-  function addArtifact(name, content, mediaType = "application/octet-stream") {
-    const file = path.join(outputDir, ...name.split("/"));
+  function addArtifact(name, content, mediaType = "application/octet-stream", rootDir = outputDir) {
+    const file = path.join(rootDir, ...name.split("/"));
     fs.mkdirSync(path.dirname(file), {recursive: true});
     fs.writeFileSync(file, content);
     const bytes = Buffer.byteLength(content);
@@ -32,11 +34,11 @@ function fixture() {
   addArtifact("frwiki/gdp.parquet", "frwiki-gdp", "application/vnd.apache.parquet");
   addArtifact("hiddenwiki/gdp.parquet", "hidden-gdp", "application/vnd.apache.parquet");
   addArtifact("hiddenwiki/not_metric.parquet", "hidden-not-metric", "application/vnd.apache.parquet");
-  addArtifact("browser-data/gdp/frwiki.parquet", "browser-gdp", "application/vnd.apache.parquet");
-  addArtifact("browser-data/gdp/hiddenwiki.parquet", "hidden-browser-gdp", "application/vnd.apache.parquet");
-  addArtifact("browser-data/gdp/all-2026.parquet", "global-gdp", "application/vnd.apache.parquet");
-  addArtifact("browser-data/not_metric/frwiki.parquet", "browser-not-metric", "application/vnd.apache.parquet");
-  addArtifact("browser-data/page_weekly_edits/frwiki.parquet", "browser-non-partitioned", "application/vnd.apache.parquet");
+  addArtifact("browser-data/gdp/frwiki.parquet", "browser-gdp", "application/vnd.apache.parquet", siteDistDir);
+  addArtifact("browser-data/gdp/hiddenwiki.parquet", "hidden-browser-gdp", "application/vnd.apache.parquet", siteDistDir);
+  addArtifact("browser-data/gdp/all-2026.parquet", "global-gdp", "application/vnd.apache.parquet", siteDistDir);
+  addArtifact("browser-data/not_metric/frwiki.parquet", "browser-not-metric", "application/vnd.apache.parquet", siteDistDir);
+  addArtifact("browser-data/page_weekly_edits/frwiki.parquet", "browser-non-partitioned", "application/vnd.apache.parquet", siteDistDir);
   addArtifact("page_weekly_edits.parquet", "merged-non-partitioned", "application/vnd.apache.parquet");
   addArtifact("meta_gdp.json", "{\"dataset\":\"gdp\"}", "application/json");
   addArtifact("leak.json", "private", "application/json");
@@ -108,7 +110,7 @@ function fixture() {
       browser: {partitioning: "rust_defaults_only"},
     }],
   };
-  return {root, outputDir, manifest, metricCatalog};
+  return {root, outputDir, siteDistDir, manifest, metricCatalog};
 }
 
 class MockRequest extends Readable {
@@ -187,6 +189,7 @@ function startApi(t, options = {}) {
   const data = fixture();
   const api = createMachineApi({
     outputDir: data.outputDir,
+    artifactDirs: [data.siteDistDir],
     manifestLoader: () => data.manifest,
     metricCatalogLoader: () => data.metricCatalog,
     freshnessLoader: () => ({status: "fresh", alerts: [], checked_at: "2026-09-20T08:00:00Z"}),
@@ -241,6 +244,10 @@ test("artifact endpoint enforces the manifest allow-list and supports cache/rang
   assert.equal(range.statusCode, 206);
   assert.equal(range.text(), "rwi");
   assert.equal(range.getHeader("content-range"), "bytes 1-3/10");
+
+  const browser = await invoke(api, {url: "/api/v1/artifacts/browser-data/gdp/frwiki.parquet"});
+  assert.equal(browser.statusCode, 200);
+  assert.equal(browser.text(), "browser-gdp");
 
   assert.equal((await invoke(api, {url: "/api/v1/artifacts/hiddenwiki/gdp.parquet"})).statusCode, 404);
   assert.equal((await invoke(api, {url: "/api/v1/artifacts/browser-data/gdp/hiddenwiki.parquet"})).statusCode, 404);

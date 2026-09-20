@@ -1015,6 +1015,14 @@ function mcpText(value) {
 
 function createMachineApi(options = {}) {
   const outputDir = path.resolve(options.outputDir || path.join(__dirname, "..", "output"));
+  // Published browser partitions are copied into the static site release,
+  // while merged/raw artifacts remain in the pipeline output directory. Keep
+  // both roots behind the manifest allow-list so one API can serve the exact
+  // artifacts advertised by the catalog without exposing arbitrary files.
+  const artifactRoots = Array.from(new Set([
+    outputDir,
+    ...(Array.isArray(options.artifactDirs) ? options.artifactDirs : []),
+  ].filter(Boolean).map((root) => path.resolve(root))));
   const logger = options.logger || console;
   const manifestLoader = options.manifestLoader || (() => readJson(path.join(outputDir, "manifest.json")));
   const metricCatalogLoader = options.metricCatalogLoader || (() => readJson(options.metricCatalogPath || DEFAULT_METRIC_CATALOG));
@@ -1061,25 +1069,24 @@ function createMachineApi(options = {}) {
   function loadArtifact(catalog, name) {
     const artifact = catalog.artifacts.find((candidate) => candidate.name === name);
     if (!artifact) return null;
-    const file = path.resolve(outputDir, name);
-    if (file !== outputDir && !file.startsWith(`${outputDir}${path.sep}`)) return null;
-    let realFile;
-    try {
-      realFile = fs.realpathSync(file);
-    } catch {
-      return null;
+    for (const root of artifactRoots) {
+      const file = path.resolve(root, name);
+      if (file !== root && !file.startsWith(`${root}${path.sep}`)) continue;
+      let realFile;
+      let realRoot;
+      try {
+        realFile = fs.realpathSync(file);
+        realRoot = fs.realpathSync(root);
+      } catch {
+        continue;
+      }
+      if (realFile !== realRoot && !realFile.startsWith(`${realRoot}${path.sep}`)) continue;
+      let stat;
+      try { stat = fs.statSync(realFile); } catch { continue; }
+      if (!stat.isFile()) continue;
+      return {artifact, file: realFile, stat};
     }
-    let realRoot;
-    try {
-      realRoot = fs.realpathSync(outputDir);
-    } catch {
-      return null;
-    }
-    if (realFile !== realRoot && !realFile.startsWith(`${realRoot}${path.sep}`)) return null;
-    let stat;
-    try { stat = fs.statSync(realFile); } catch { return null; }
-    if (!stat.isFile()) return null;
-    return {artifact, file: realFile, stat};
+    return null;
   }
 
   function resolveMetric(catalog, dataset) {
