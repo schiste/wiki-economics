@@ -11,6 +11,10 @@ systemd, no persistent VM. Containers run as Kubernetes Jobs/webservices,
 and storage is NFS-backed under `/data/project/<tool>`. Toolforge's shared NFS
 currently has no per-tool quota; its free space is shared capacity, not a
 private reservation. Measure live headroom and keep reproducible data bounded.
+The project has a binding no-expansion resource contract: see
+[`docs/toolforge-resource-envelope.md`](../../docs/toolforge-resource-envelope.md).
+Enwiki must fit the current 6 GiB/4-vCPU per-job and 24 GiB/16-vCPU namespace
+ceilings; no quota increase is assumed or requested as part of onboarding.
 The [generated lifecycle table](../../docs/generated/stack-reference.md#published-wiki-lifecycle)
 is the source of truth for scheduled Toolforge datasets and paused imports.
 frwiki completed the measured capacity qualification documented in

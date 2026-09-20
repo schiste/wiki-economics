@@ -27,6 +27,13 @@
     "publisher": 1000,
     "scrubber": 1000
   },
+  "capacity_policy": {
+    "id": "toolforge-current-envelope-no-expansion-v1",
+    "status": "binding",
+    "assume_future_capacity_increase": false,
+    "enwiki_must_fit_current_per_job_limit": true,
+    "change_control": "A future capacity change requires an explicit operator decision, a new checked-in capacity receipt, and requalification; no enwiki plan may depend on it."
+  },
   "source": "Toolforge maintain-kubeusers T436614-1 and checked-in job definitions",
-  "verified_at": "2026-09-08"
+  "verified_at": "2026-09-20"
 }

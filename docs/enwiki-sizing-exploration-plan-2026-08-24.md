@@ -11,6 +11,12 @@ but enwiki has not been computed by this project and must not be added to the
 production schedule before the remaining bounded-compute and qualification
 gates in this report pass.
 
+**Permanent resource constraint:** This plan is bound to the current Toolforge
+envelope documented in [`toolforge-resource-envelope.md`](toolforge-resource-envelope.md):
+16 vCPU and 24 GiB for the namespace, 4 vCPU and 6 GiB per job, with no
+capacity increase assumed. Enwiki must work within those limits or remain
+unqualified. A 16 GiB job is not an available option.
+
 **Reference evidence:**
 [`frwiki-capacity-report-2026-08-24.md`](frwiki-capacity-report-2026-08-24.md)
 
@@ -23,22 +29,21 @@ implementation cannot safely scale by merely raising its bucket count. Enwiki
 still needs a hierarchical or capped-writer aggregation before a complete run
 is attempted.
 
-The recommended target production envelope is:
+The only production envelope available to enwiki is:
 
-| Resource | Current Toolforge limit | Enwiki target |
+| Resource | Fixed Toolforge ceiling | Enwiki requirement |
 | --- | ---: | ---: |
-| Memory per job | 6 GiB | **16 GiB** |
-| Namespace memory | 8 GiB | **24 GiB** |
-| CPU per job | 3 vCPU maximum | **4 vCPU preferred; 3 workable** |
-| Namespace CPU | 16 vCPU | Existing aggregate quota is sufficient |
+| Memory per job | **6 GiB** | **Must fit; peak at most 4.5 GiB** |
+| Namespace memory | **24 GiB** | **One heavy stage at a time** |
+| CPU per job | **4 vCPU maximum** | **At most 4; default pools remain conservative** |
+| Namespace CPU | **16 vCPU** | **No expansion assumed** |
 | Guaranteed free working storage | Shared NFS; no per-tool quota exposed | **250 GiB with windowed ingestion** |
 | Working storage without windowed ingestion | n/a | **400 GiB** |
 | Qualification job allowance | Not explicitly configured | **24 hours** |
 
-Production acceptance must require a measured peak below **12 GiB**, leaving
-at least 25% headroom in a 16 GiB container. A temporary 24 GiB ceiling would
-be useful for the first exploratory full run, but it must not be used to hide
-an unbounded algorithm.
+Production acceptance must require a measured peak below **4.5 GiB**, leaving
+at least 25% headroom in the fixed 6 GiB container. There is no larger
+exploratory ceiling available to hide an unbounded algorithm.
 
 The storage request assumes that compressed sources are deleted immediately
 after strict ingest validation. Retaining all raw sources until ingest
@@ -135,7 +140,9 @@ the shared filesystem.
 
 If all compressed history files are retained until a later ingest stage, the
 same rollover adds 127.88 GiB of raw input. The safe working requirement rises
-to roughly 350 GiB; the capacity request should therefore be **400 GiB**.
+to roughly 350 GiB; the preflight gate should therefore require **400 GiB
+free** for this compatibility mode. This is an admission check against shared
+NFS, not a request for additional quota.
 
 Toolforge exposes shared NFS rather than a guaranteed per-tool storage quota.
 The capacity must be agreed operationally, and the preflight check must still
@@ -269,29 +276,29 @@ no-ops. A newly completed monthly snapshot triggers the expensive full
 generation unless a separately proven, semantically equivalent incremental
 source protocol is introduced.
 
-## Resource request rationale
+## Fixed resource envelope and implications
 
 ### Memory
 
-The present live Toolforge limits observed through `toolforge jobs quota` and
-the namespace `ResourceQuota` are:
+The live Toolforge limits observed through `toolforge jobs quota` and the
+namespace `ResourceQuota` are the permanent planning limits:
 
 - 6 GiB maximum memory per job;
-- 8 GiB total namespace memory;
+- 24 GiB total namespace memory;
 - 0.5 GiB reserved by the web service at rest.
 
-The requested steady envelope is 16 GiB per batch job and 24 GiB for the
-namespace. Acceptance requires the full pipeline to stay below 12 GiB, leaving
-25% sustained headroom. The additional namespace capacity allows the web
-service and operational processes to coexist with one enwiki batch job; it is
-not permission to run multiple full refreshes concurrently.
+There is no 16 GiB per-job request in the enwiki plan. Acceptance requires
+each stage to stay below 4.5 GiB, leaving 25% sustained headroom in the fixed
+6 GiB job. The namespace capacity allows the web service and operational
+processes to coexist with one heavy enwiki stage; it is not permission to run
+multiple full refreshes concurrently.
 
 ### CPU
 
-The namespace has a 16-vCPU aggregate quota, but jobs currently have a 3-vCPU
-per-job ceiling. Four vCPUs would allow bounded concurrency across independent
-bzip2 sources and speed Polars reductions. Three vCPUs remains a viable initial
-configuration if the per-job ceiling cannot be raised.
+The namespace has a fixed 16-vCPU aggregate quota and jobs have a fixed
+4-vCPU ceiling. The current wrappers still default Rayon, Polars, source
+workers, and weekly workers conservatively; extra CPU may be used only after a
+qualification matrix proves that it does not violate the 6 GiB memory gate.
 
 Concurrency must be memory-governed. The orchestrator should lower the number
 of concurrent source workers automatically when cgroup or scratch headroom
@@ -362,7 +369,7 @@ new-snapshot run. These are scheduling assumptions, not an SLO or benchmark.
 
 Enwiki may be scheduled only when all of the following hold:
 
-- full-run cgroup peak is at most 12 GiB in a 16 GiB container;
+- every heavy-stage cgroup peak is at most 4.5 GiB in the fixed 6 GiB container;
 - sustained memory headroom is at least 25%;
 - startup storage reserve is at least 250 GiB with windowed ingestion;
 - scratch and persistent high-water marks are recorded and remain within their
@@ -381,12 +388,10 @@ Enwiki may be scheduled only when all of the following hold:
 
 ## Decision
 
-Do not attempt enwiki in the current 6 GiB production job and do not add it by
-only increasing `WIKI_ECON_WEEKLY_BUCKETS`.
-
-Continue with bounded open writers, hierarchical aggregation, and sequential
-validation. Then request a
-16 GiB per-job/24 GiB namespace memory envelope and an operational guarantee of
-250 GiB working headroom. Use a separate qualification job, retain current
-publication until every semantic gate passes, and replace the estimates in
-this document with measured enwiki evidence before activation.
+Do not request or assume a larger Toolforge job. Continue with bounded open
+writers, hierarchical aggregation, and sequential validation inside the fixed
+6 GiB/4-vCPU job and 24 GiB/16-vCPU namespace. Use a separate qualification
+job, retain current publication until every semantic gate passes, and replace
+the estimates in this document with measured enwiki evidence before activation.
+If the measured implementation cannot pass the fixed envelope, enwiki remains
+unqualified until the algorithm is redesigned.

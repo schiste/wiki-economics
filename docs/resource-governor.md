@@ -1,5 +1,11 @@
 # Rust resource governor
 
+Production Toolforge runs are permanently bounded by the current
+[Toolforge resource envelope](toolforge-resource-envelope.md): 6 GiB per job,
+4 vCPU per job, 24 GiB namespace memory, and 16 vCPU namespace CPU. The
+non-production fallback below must never be used to justify a larger enwiki
+production request.
+
 The `wiki-econ run` orchestrator admits work from an explicit resource budget.
 It does not rely on the number of visible host CPUs, which is not a reliable
 description of a Toolforge job's CPU or memory quota.
@@ -52,7 +58,7 @@ All byte values are integer bytes.
 
 | Environment variable | Meaning | Rust default |
 | --- | --- | ---: |
-| `WIKI_ECON_MEMORY_CEILING_BYTES` | Absolute process/cgroup memory budget | detected cgroup limit, otherwise 16 GiB |
+| `WIKI_ECON_MEMORY_CEILING_BYTES` | Absolute process/cgroup memory budget | detected cgroup limit; Toolforge production is fixed at 6 GiB |
 | `WIKI_ECON_MEMORY_RESERVE_BYTES` | Memory that admission must keep unused | 25% of ceiling |
 | `WIKI_ECON_PERSISTENT_STORAGE_RESERVE_BYTES` | Free persistent bytes retained after admitted work | 0 |
 | `WIKI_ECON_BOUNDED_SCRATCH_RESERVE_BYTES` | Free bytes reserved for the current bounded scratch unit | 0 |
