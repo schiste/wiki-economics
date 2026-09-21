@@ -122,6 +122,7 @@ jobs:
           node --check site/admin-server.cjs
           node --check site/freshness.cjs
           node --check deploy/toolforge/qualification-receipt.cjs
+          node --check deploy/toolforge/qualification-proof.cjs
           node -e 'const p=require("./config/operations-slos.json"); if(p.schema_version !== 1) process.exit(1)'
           node --check site/observablehq.config.js
           node --check scripts/check-npm-advisories.cjs
@@ -159,6 +160,7 @@ jobs:
           node --test site/freshness.test.cjs
           node --test deploy/toolforge/run-record.test.cjs
           node --test deploy/toolforge/qualification-receipt.test.cjs
+          node --test deploy/toolforge/qualification-proof.test.cjs
           node --test deploy/toolforge/run-refresh.test.cjs
           node --test deploy/toolforge/run-publish-ready.test.cjs
           node --test deploy/toolforge/install-binary.test.cjs

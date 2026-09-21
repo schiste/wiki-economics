@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "policy_version": "enwiki-correctness-recovery-v1",
+  "wiki": "enwiki",
+  "publication": "hidden",
+  "refresh": "qualification",
+  "publication_eligible": false,
+  "required_stages": [
+    "ingest",
+    "metrics",
+    "lifecycle",
+    "page-week",
+    "patrol",
+    "publish"
+  ],
+  "required_checks": [
+    "source_inventory",
+    "snapshot_consistency",
+    "invariants",
+    "deterministic_same_warehouse",
+    "noop_same_snapshot",
+    "interruption_resume",
+    "patrol",
+    "rollback_cleanup"
+  ]
+}
