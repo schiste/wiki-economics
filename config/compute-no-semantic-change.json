@@ -222,6 +222,30 @@
       "paths": ["src/compute/mod.rs", "src/compute/weekly/mod.rs"],
       "reason": "Release reclaimable weekly bucket and output page cache between stages; page-week rows, totals, and artifact bytes are unchanged.",
       "base_commit": "00428885d9de596d1f9cf51e92620ebf3dfccd85"
+    },
+    {
+      "family": "monthly",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Disable invariant checks in test-only receipt observations without changing monthly computation semantics or artifact bytes.",
+      "base_commit": "b2098308ca50d346e951d848b9c4c9f3b5494eeb"
+    },
+    {
+      "family": "activity_tiers",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Disable invariant checks in test-only receipt observations without changing activity-tier computation semantics or artifact bytes.",
+      "base_commit": "b2098308ca50d346e951d848b9c4c9f3b5494eeb"
+    },
+    {
+      "family": "lifecycle",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Disable invariant checks in test-only receipt observations without changing lifecycle computation semantics or artifact bytes.",
+      "base_commit": "b2098308ca50d346e951d848b9c4c9f3b5494eeb"
+    },
+    {
+      "family": "page_week",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Disable invariant checks in test-only receipt observations without changing page-week computation semantics or artifact bytes.",
+      "base_commit": "b2098308ca50d346e951d848b9c4c9f3b5494eeb"
     }
   ]
 }

@@ -328,20 +328,16 @@ impl SemanticAccumulator {
         self.observe_wikis(frame)?;
         self.observe_dates(frame)?;
         self.observe_totals(frame)?;
-        if self.spec.enforce_invariants {
-            if let Some(metric) = self.spec.metric {
-                validate_metric_invariants(
+        if self.spec.enforce_invariants
+            && let Some(metric) = self.spec.metric
+        {
+            validate_metric_invariants(frame, metric, self.rows - u64::try_from(frame.height())?)?;
+            warn_metric_outliers(frame, metric, self.rows - u64::try_from(frame.height())?)?;
+            if metric == MetricId::LaborCohorts {
+                self.observe_cohort_monotonicity(
                     frame,
-                    metric,
                     self.rows - u64::try_from(frame.height())?,
                 )?;
-                warn_metric_outliers(frame, metric, self.rows - u64::try_from(frame.height())?)?;
-                if metric == MetricId::LaborCohorts {
-                    self.observe_cohort_monotonicity(
-                        frame,
-                        self.rows - u64::try_from(frame.height())?,
-                    )?;
-                }
             }
         }
         if self.spec.page_week_consistency {
@@ -649,7 +645,7 @@ fn median(values: &mut [f64]) -> Option<f64> {
     }
     values.sort_by(f64::total_cmp);
     let middle = values.len() / 2;
-    Some(if values.len() % 2 == 0 {
+    Some(if values.len().is_multiple_of(2) {
         (values[middle - 1] + values[middle]) / 2.0
     } else {
         values[middle]
@@ -687,13 +683,12 @@ fn warn_metric_outliers(frame: &DataFrame, metric: MetricId, row_offset: u64) ->
             let mut neighbors = Vec::new();
             let start = row.saturating_sub(RADIUS);
             let end = (row + RADIUS).min(frame.height() - 1);
-            for index in start..=end {
-                if index != row {
-                    if let Some(candidate) = values[index] {
-                        if candidate.is_finite() {
-                            neighbors.push(candidate);
-                        }
-                    }
+            for (index, candidate) in values.iter().enumerate().skip(start).take(end - start + 1) {
+                if index != row
+                    && let Some(candidate) = candidate
+                    && candidate.is_finite()
+                {
+                    neighbors.push(*candidate);
                 }
             }
             if neighbors.len() < 6 {
@@ -910,42 +905,39 @@ fn validate_metric_invariants(frame: &DataFrame, metric: MetricId, row_offset: u
                     "total_revisions",
                     "min_patrollers_50pct",
                 ] {
-                    if has(name) {
-                        if let Some(value) = require(name, row)? {
-                            if !value.is_finite() || value < 0.0 {
-                                fail(format!("{name}={value} is negative or non-finite"))?;
-                            }
-                        }
+                    if has(name)
+                        && let Some(value) = require(name, row)?
+                        && (!value.is_finite() || value < 0.0)
+                    {
+                        fail(format!("{name}={value} is negative or non-finite"))?;
                     }
                 }
                 for name in ["median_latency_hours", "p90_latency_hours"] {
-                    if has(name) {
-                        if let Some(value) = require(name, row)? {
-                            if !value.is_finite() || value < 0.0 {
-                                fail(format!("{name}={value} is negative or non-finite"))?;
-                            }
-                        }
+                    if has(name)
+                        && let Some(value) = require(name, row)?
+                        && (!value.is_finite() || value < 0.0)
+                    {
+                        fail(format!("{name}={value} is negative or non-finite"))?;
                     }
                 }
-                if has("top1_pct") {
-                    if let Some(value) = require("top1_pct", row)? {
-                        if !value.is_finite() || !(0.0..=100.0).contains(&value) {
-                            fail(format!("top1_pct={value} is outside [0,100] or non-finite"))?;
-                        }
-                    }
+                if has("top1_pct")
+                    && let Some(value) = require("top1_pct", row)?
+                    && (!value.is_finite() || !(0.0..=100.0).contains(&value))
+                {
+                    fail(format!("top1_pct={value} is outside [0,100] or non-finite"))?;
                 }
-                if has("patrolled_revisions") && has("total_revisions") {
-                    if let (Some(patrolled), Some(total)) = (
+                if has("patrolled_revisions")
+                    && has("total_revisions")
+                    && let (Some(patrolled), Some(total)) = (
                         require("patrolled_revisions", row)?,
                         require("total_revisions", row)?,
-                    ) {
-                        if patrolled > total {
-                            fail(format!(
-                                "patrolled_revisions={} exceeds total_revisions={}",
-                                patrolled, total
-                            ))?;
-                        }
-                    }
+                    )
+                    && patrolled > total
+                {
+                    fail(format!(
+                        "patrolled_revisions={} exceeds total_revisions={}",
+                        patrolled, total
+                    ))?;
                 }
                 for (rate_name, expected_numerator) in [
                     ("patrol_coverage_pct", "patrolled_revisions"),
@@ -997,17 +989,17 @@ fn validate_metric_invariants(frame: &DataFrame, metric: MetricId, row_offset: u
             }
             MetricId::Inequality => {
                 for name in ["gini", "theil", "palma"] {
-                    if has(name) {
-                        if let Some(value) = require(name, row)? {
-                            let valid = value.is_finite()
-                                && if name == "gini" {
-                                    (0.0..=1.0).contains(&value)
-                                } else {
-                                    value >= 0.0
-                                };
-                            if !valid {
-                                fail(format!("{name}={value} violates its bounds"))?;
-                            }
+                    if has(name)
+                        && let Some(value) = require(name, row)?
+                    {
+                        let valid = value.is_finite()
+                            && if name == "gini" {
+                                (0.0..=1.0).contains(&value)
+                            } else {
+                                value >= 0.0
+                            };
+                        if !valid {
+                            fail(format!("{name}={value} violates its bounds"))?;
                         }
                     }
                 }
@@ -1049,22 +1041,22 @@ fn validate_metric_invariants(frame: &DataFrame, metric: MetricId, row_offset: u
                             "wow_change does not conserve edits - previous_week_edits".to_string(),
                         )?;
                     }
-                    if has("wow_rate") {
-                        if let Some(rate) = require("wow_rate", row)? {
-                            if !rate.is_finite() {
-                                fail("wow_rate is non-finite".to_string())?;
-                            }
-                            if previous > 0.0 && !close_enough(rate, change / previous) {
-                                fail(
-                                    "wow_rate does not equal wow_change/previous_week_edits"
-                                        .to_string(),
-                                )?;
-                            } else if previous <= 0.0 {
-                                fail(
-                                    "wow_rate must be null when previous_week_edits is zero"
-                                        .to_string(),
-                                )?;
-                            }
+                    if has("wow_rate")
+                        && let Some(rate) = require("wow_rate", row)?
+                    {
+                        if !rate.is_finite() {
+                            fail("wow_rate is non-finite".to_string())?;
+                        }
+                        if previous > 0.0 && !close_enough(rate, change / previous) {
+                            fail(
+                                "wow_rate does not equal wow_change/previous_week_edits"
+                                    .to_string(),
+                            )?;
+                        } else if previous <= 0.0 {
+                            fail(
+                                "wow_rate must be null when previous_week_edits is zero"
+                                    .to_string(),
+                            )?;
                         }
                     }
                 }
