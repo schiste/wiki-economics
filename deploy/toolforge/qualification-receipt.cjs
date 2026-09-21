@@ -376,9 +376,9 @@ function summary(artifacts) {
   return {
     artifacts: artifacts.length,
     rows: knownRows.reduce((sum, item) => sum + item.rows, 0),
-    rows_known: knownRows.length === artifacts.length,
+    rows_known: artifacts.length > 0 && knownRows.length === artifacts.length,
     bytes: knownBytes.reduce((sum, item) => sum + item.bytes, 0),
-    bytes_known: knownBytes.length === artifacts.length,
+    bytes_known: artifacts.length > 0 && knownBytes.length === artifacts.length,
   };
 }
 
