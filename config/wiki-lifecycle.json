@@ -72,6 +72,18 @@
         "computed_rollback_generations": 1
       }
     },
+    "enwiki": {
+      "publication": "hidden",
+      "refresh": "qualification",
+      "provenance": "toolforge-admin:enwiki-qualification-freeze-2026-09-21",
+      "fleet_resource_class": "isolated",
+      "retention": {
+        "source_recoverability": "redownloadable",
+        "history_input": "purge_after_ready",
+        "patrol_source": "purge_after_ready",
+        "computed_rollback_generations": 1
+      }
+    },
     "frwiki": {
       "publication": "published",
       "refresh": "scheduled",

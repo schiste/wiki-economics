@@ -75,6 +75,7 @@ datasets are `afwiki`, `arwiki`, `arzwiki`, `elwiki`, `eswiki`, `frwiki`, `hawik
 | `arzwiki` | published | scheduled | toolforge | 10 days |
 | `dewiki` | hidden | qualification | toolforge-admin:operator | — |
 | `elwiki` | published | scheduled | toolforge | 10 days |
+| `enwiki` | hidden | qualification | toolforge-admin:enwiki-qualification-freeze-2026-09-21 | — |
 | `eswiki` | published | scheduled | toolforge | 10 days |
 | `frwiki` | published | scheduled | toolforge | 10 days |
 | `hawiki` | published | scheduled | toolforge | 10 days |
