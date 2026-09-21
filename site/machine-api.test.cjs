@@ -294,9 +294,16 @@ const PATROL_FIXTURE_METRIC = publishedMetric({
   schema: [
     {name: "year_month", data_type: "string"},
     {name: "total_patrols", data_type: "i64"},
+    {name: "patrolled_revisions", data_type: "i64"},
+    {name: "autopatrolled_revisions", data_type: "i64"},
+    {name: "total_revisions", data_type: "i64"},
+    {name: "patrol_coverage_pct", data_type: "f64"},
     {name: "wiki", data_type: "string"},
   ],
-  aggregation: [{kind: "additive", columns: ["total_patrols"]}],
+  aggregation: [
+    {kind: "additive", columns: ["total_patrols", "patrolled_revisions", "autopatrolled_revisions", "total_revisions"]},
+    {kind: "ratio", columns: ["patrol_coverage_pct"], numerators: ["patrolled_revisions"], denominator: "total_revisions"},
+  ],
 });
 
 test("public catalog exposes only published artifacts and groups browser partitions", async (t) => {
@@ -419,6 +426,7 @@ test("nulls non-additive fields above publication grain and removes them from br
   assert.equal(coarse.summary.total.unique_editors, null);
   assert.equal(coarse.summary.min.unique_editors, null);
   assert.equal(coarse.summary.max.unique_editors, null);
+  assert.equal(coarse.summary.top_n.unique_editors, null);
   assert.ok(coarse.data_quality_flags.some((flag) => flag.code === "non_additive_fields_null" && flag.fields.includes("unique_editors")));
 
   const exact = responseJson(await invoke(api, {url: "/api/v1/metrics/gdp?wiki=frwiki&from=2026-08&to=2026-08&group_by=page_namespace,user_type"}));
@@ -427,6 +435,31 @@ test("nulls non-additive fields above publication grain and removes them from br
   const gdpHeadline = briefing.headline_metrics.find((metric) => metric.dataset === "gdp");
   assert.equal(Object.hasOwn(gdpHeadline.latest, "unique_editors"), false);
   assert.equal(Object.hasOwn(gdpHeadline.trend, "unique_editors"), false);
+});
+
+test("classifies null dimensions, labels populations, and warns on robust outliers", async (t) => {
+  const rows = Array.from({length: 8}, (_, index) => ({
+    year_month: `2026-${String(index + 1).padStart(2, "0")}`,
+    page_namespace: null,
+    user_type: null,
+    total_edits: index === 4 ? 1_000 : 10,
+    net_bytes: index === 4 ? 10_000 : 100,
+    revert_rate: 0.1,
+    unique_editors: 2,
+    wiki: "frwiki",
+  }));
+  const {api} = startApi(t, {metricRowsLoader: async () => rows});
+  const response = responseJson(await invoke(api, {url: "/api/v1/metrics/gdp?wiki=frwiki&group_by=page_namespace,user_type"}));
+  assert.equal(response.rows[0].page_namespace, "unknown");
+  assert.equal(response.rows[0].user_type, "unknown");
+  assert.ok(response.data_quality_flags.some((flag) => flag.code === "unknown_dimension" && flag.classification === "unknown"));
+  assert.ok(response.data_quality_flags.some((flag) => flag.code === "outlier_detected" && flag.field === "total_edits"));
+  assert.equal(response.population_scope, "wiki_month_namespace_user_type");
+  assert.equal(response.rows[0].population_scope, response.population_scope);
+
+  const csv = await invoke(api, {url: "/api/v1/metrics/gdp?wiki=frwiki&group_by=page_namespace,user_type&format=csv"});
+  assert.match(csv.text(), /# population_scope=wiki_month_namespace_user_type/);
+  assert.match(csv.text(), /# aggregation_contract=/);
 });
 
 test("aligns period-start metrics, filters period types, and announces missing months", async (t) => {
@@ -458,7 +491,7 @@ test("exposes churn period metadata and labels partial years; patrol status is e
     {period: "2026-07", period_type: "month", active_editors: 20, arrivals: 2, departures: 9, arrival_rate: 0.1, departure_rate: 0.45, wiki: "dewiki"},
     {period: "2026-08", period_type: "month", active_editors: 20, arrivals: 2, departures: 20, arrival_rate: 0.1, departure_rate: 1, wiki: "dewiki"},
   ];
-  const patrolRows = [{year_month: "2026-08", total_patrols: 0, wiki: "dewiki"}];
+  const patrolRows = [{year_month: "2026-08", total_patrols: 0, patrolled_revisions: 10, autopatrolled_revisions: 0, total_revisions: 10, patrol_coverage_pct: 100, wiki: "dewiki"}];
   const {api} = startApi(t, {
     extraWikis: ["dewiki"],
     extraMetrics: [{...CHURN_FIXTURE_METRIC, testWiki: "dewiki"}, {...PATROL_FIXTURE_METRIC, testWiki: "dewiki"}],
@@ -475,6 +508,8 @@ test("exposes churn period metadata and labels partial years; patrol status is e
   assert.equal(rawChurn.rows.at(-1).period_complete, false);
   assert.ok(rawChurn.data_quality_flags.some((flag) => flag.code === "raw_incomplete_period"));
   const patrol = responseJson(await invoke(api, {url: "/api/v1/metrics/patrol?wiki=dewiki&granularity=month"}));
+  assert.equal(patrol.patrol_applicability, "not_applicable");
+  assert.equal(patrol.rows[0].patrol_coverage_pct, null);
   assert.equal(patrol.patrol_status, "not_applicable");
   assert.ok(patrol.data_quality_flags.some((flag) => flag.code === "patrol_not_applicable"));
   const rawArtifact = await invoke(api, {url: "/api/v1/artifacts/dewiki/labor_churn.parquet"});

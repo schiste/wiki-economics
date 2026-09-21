@@ -335,6 +335,7 @@ impl SemanticAccumulator {
                     metric,
                     self.rows - u64::try_from(frame.height())?,
                 )?;
+                warn_metric_outliers(frame, metric, self.rows - u64::try_from(frame.height())?)?;
                 if metric == MetricId::LaborCohorts {
                     self.observe_cohort_monotonicity(
                         frame,
@@ -581,6 +582,178 @@ fn close_enough_rounded(actual: f64, expected: f64, decimals: f64) -> bool {
     close_enough(actual, (expected * decimals).round() / decimals)
 }
 
+fn is_numeric_dtype(dtype: &DataType) -> bool {
+    matches!(
+        dtype,
+        DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::Float32
+            | DataType::Float64
+    )
+}
+
+fn non_negative_metric_column(name: &str) -> bool {
+    if name.contains("per_") || matches!(name, "net_bytes" | "wow_change") {
+        return false;
+    }
+    matches!(
+        name,
+        "gross_bytes_added"
+            | "gross_bytes"
+            | "total_edits"
+            | "productive_edits"
+            | "reverted_edits"
+            | "minor_edits"
+            | "unique_editors"
+            | "editors"
+            | "active_editors"
+            | "arrivals"
+            | "departures"
+            | "survived_editors"
+            | "initial_editors"
+            | "cohort_size"
+            | "reached_5"
+            | "reached_25"
+            | "reached_100"
+            | "total_patrols"
+            | "unique_patrollers"
+            | "patrol_new_pages"
+            | "patrol_diffs"
+            | "patrolled_revisions"
+            | "autopatrolled_revisions"
+            | "total_revisions"
+            | "min_patrollers_50pct"
+            | "edits"
+            | "previous_week_edits"
+    ) || name.ends_with("_count")
+}
+
+fn metric_bounds(name: &str) -> Option<(f64, f64)> {
+    match name {
+        "gini" | "revert_rate" | "arrival_rate" | "departure_rate" => Some((0.0, 1.0)),
+        "patrol_coverage_pct" | "adjusted_coverage_pct" | "top1_pct" => Some((0.0, 100.0)),
+        "theil" | "palma" => Some((0.0, f64::INFINITY)),
+        _ => None,
+    }
+}
+
+fn median(values: &mut [f64]) -> Option<f64> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f64::total_cmp);
+    let middle = values.len() / 2;
+    Some(if values.len() % 2 == 0 {
+        (values[middle - 1] + values[middle]) / 2.0
+    } else {
+        values[middle]
+    })
+}
+
+/// Emit warnings for robust local anomalies without turning a plausible but
+/// unusual observation into a publication failure.  The API repeats this
+/// contract in machine-readable `data_quality_flags`; the receipt scrubber
+/// keeps the warning visible in pipeline logs before publication.
+fn warn_metric_outliers(frame: &DataFrame, metric: MetricId, row_offset: u64) -> Result<()> {
+    const SKIP_FIELDS: [&str; 6] = [
+        "page_namespace",
+        "page_id",
+        "iso_year",
+        "iso_week",
+        "tier_rank",
+        "year",
+    ];
+    const RADIUS: usize = 6;
+    const MAX_WARNINGS: usize = 20;
+    let mut emitted = 0;
+    for column in frame.columns() {
+        let name = column.name().as_str();
+        if SKIP_FIELDS.contains(&name) || !is_numeric_dtype(column.dtype()) || frame.height() < 7 {
+            continue;
+        }
+        let values = (0..frame.height())
+            .map(|row| numeric_value(frame, name, row))
+            .collect::<Result<Vec<_>>>()?;
+        for row in 0..frame.height() {
+            let Some(value) = values[row] else {
+                continue;
+            };
+            let mut neighbors = Vec::new();
+            let start = row.saturating_sub(RADIUS);
+            let end = (row + RADIUS).min(frame.height() - 1);
+            for index in start..=end {
+                if index != row {
+                    if let Some(candidate) = values[index] {
+                        if candidate.is_finite() {
+                            neighbors.push(candidate);
+                        }
+                    }
+                }
+            }
+            if neighbors.len() < 6 {
+                continue;
+            }
+            let center = median(&mut neighbors.clone()).context("outlier median is missing")?;
+            let mut deviations = neighbors
+                .iter()
+                .map(|candidate| (candidate - center).abs())
+                .collect::<Vec<_>>();
+            let mad = median(&mut deviations);
+            let (outlier, method, score) = if let Some(mad) = mad.filter(|value| *value > 0.0) {
+                let score = (value - center).abs() / (1.4826 * mad);
+                (score >= 6.0, "rolling_mad", score)
+            } else {
+                let mut sorted = neighbors.clone();
+                sorted.sort_by(f64::total_cmp);
+                let q1 = sorted[(sorted.len() - 1) / 4];
+                let q3 = sorted[(sorted.len() - 1) * 3 / 4];
+                let iqr = q3 - q1;
+                if iqr > 0.0 {
+                    let score = if value < q1 - 3.0 * iqr {
+                        (q1 - value) / iqr
+                    } else {
+                        (value - q3) / iqr
+                    };
+                    (
+                        value < q1 - 3.0 * iqr || value > q3 + 3.0 * iqr,
+                        "rolling_iqr",
+                        score,
+                    )
+                } else {
+                    (
+                        neighbors.iter().all(|candidate| *candidate == center) && value != center,
+                        "rolling_iqr",
+                        (value - center).abs(),
+                    )
+                }
+            };
+            if outlier {
+                warn!(
+                    metric = metric.as_str(),
+                    field = name,
+                    row = row_offset + row as u64,
+                    value,
+                    baseline = center,
+                    method,
+                    score,
+                    "robust metric outlier detected; publication continues with a warning"
+                );
+                emitted += 1;
+                if emitted >= MAX_WARNINGS {
+                    return Ok(());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_metric_invariants(frame: &DataFrame, metric: MetricId, row_offset: u64) -> Result<()> {
     let has = |name: &str| frame.schema().contains(name);
     let require =
@@ -595,6 +768,31 @@ fn validate_metric_invariants(frame: &DataFrame, metric: MetricId, row_offset: u
                 message
             )
         };
+        // Every numeric publication value must be finite.  Count-like fields
+        // also cannot be negative, and bounded ratios/inequality statistics
+        // are rejected before they can reach an immutable artifact.  The
+        // metric-specific checks below validate conservation and numerator /
+        // denominator identities on top of this generic gate.
+        for column in frame.columns() {
+            if !is_numeric_dtype(column.dtype()) {
+                continue;
+            }
+            let name = column.name().as_str();
+            let Some(value) = numeric_value(frame, name, row)? else {
+                continue;
+            };
+            if !value.is_finite() {
+                fail(format!("{name}={value} is non-finite"))?;
+            }
+            if non_negative_metric_column(name) && value < 0.0 {
+                fail(format!("{name}={value} is negative"))?;
+            }
+            if let Some((lower, upper)) = metric_bounds(name)
+                && (value < lower || value > upper)
+            {
+                fail(format!("{name}={value} is outside [{lower},{upper}]"))?;
+            }
+        }
         match metric {
             MetricId::Gdp => {
                 if has("productive_edits") && has("reverted_edits") && has("total_edits") {
@@ -1719,6 +1917,28 @@ mod tests {
         assert_eq!(sum_numeric(&Column::new("v".into(), [1_u64, 2]), "v")?, 3);
         assert_eq!(sum_numeric(&Column::new("v".into(), [-1_i32, 2]), "v")?, 1);
         assert!(sum_numeric(&Column::new("v".into(), [true]), "v").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn publication_blocks_impossible_numeric_values() -> Result<()> {
+        let mut accumulator = SemanticAccumulator::new(SemanticSpec {
+            date_column: Some("year_month".to_string()),
+            conservation_columns: Vec::new(),
+            ordering_contract: "wiki-major/v1".to_string(),
+            page_week_consistency: false,
+            metric: Some(MetricId::Gdp),
+            enforce_invariants: true,
+        });
+        let frame = df!(
+            "year_month" => &["2026-01"],
+            "total_edits" => &[-1_i64],
+            "wiki" => &["nlwiki"]
+        )?;
+        let error = accumulator
+            .observe(&frame)
+            .expect_err("negative edit counts must block publication");
+        assert!(error.to_string().contains("total_edits=-1 is negative"));
         Ok(())
     }
 

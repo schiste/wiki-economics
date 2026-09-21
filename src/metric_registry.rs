@@ -252,6 +252,9 @@ pub(crate) struct MetricDefinition {
     pub(crate) conservation_column: Option<&'static str>,
     pub(crate) publication_scope: PublicationScope,
     pub(crate) browser_partitioning: BrowserPartitioning,
+    /// Explicit denominator/population identity.  Consumers must not compare
+    /// values from different scopes without an intentional harmonisation step.
+    pub(crate) population_scope: &'static str,
     pub(crate) aggregation: &'static [AggregationRule],
 }
 
@@ -584,6 +587,7 @@ pub(crate) const METRIC_DEFINITIONS: [MetricDefinition; 10] = [
         conservation_column: None,
         publication_scope: PublicationScope::MergedAndPerWiki,
         browser_partitioning: BrowserPartitioning::PerWikiAndGlobalYearShards,
+        population_scope: "wiki_cohort_year",
         aggregation: BUSINESS_AGGREGATION,
     },
     MetricDefinition {
@@ -597,6 +601,7 @@ pub(crate) const METRIC_DEFINITIONS: [MetricDefinition; 10] = [
         conservation_column: Some("total_edits"),
         publication_scope: PublicationScope::MergedAndPerWiki,
         browser_partitioning: BrowserPartitioning::PerWikiAndGlobalYearShards,
+        population_scope: "wiki_month_namespace_user_type",
         aggregation: GDP_AGGREGATION,
     },
     MetricDefinition {
@@ -610,6 +615,7 @@ pub(crate) const METRIC_DEFINITIONS: [MetricDefinition; 10] = [
         conservation_column: Some("total_edits"),
         publication_scope: PublicationScope::MergedAndPerWiki,
         browser_partitioning: BrowserPartitioning::PerWikiAndGlobalYearShards,
+        population_scope: "wiki_period_user_type_activity_tier",
         aggregation: ACTIVITY_AGGREGATION,
     },
     MetricDefinition {
@@ -623,6 +629,7 @@ pub(crate) const METRIC_DEFINITIONS: [MetricDefinition; 10] = [
         conservation_column: Some("edits"),
         publication_scope: PublicationScope::MergedAndPerWiki,
         browser_partitioning: BrowserPartitioning::PerWikiAndGlobalYearShards,
+        population_scope: "wiki_month_user_type",
         aggregation: SHARE_AGGREGATION,
     },
     MetricDefinition {
@@ -636,6 +643,7 @@ pub(crate) const METRIC_DEFINITIONS: [MetricDefinition; 10] = [
         conservation_column: None,
         publication_scope: PublicationScope::MergedAndPerWiki,
         browser_partitioning: BrowserPartitioning::PerWikiAndGlobalYearShards,
+        population_scope: "wiki_period_user_type",
         aggregation: INEQUALITY_AGGREGATION,
     },
     MetricDefinition {
@@ -649,6 +657,7 @@ pub(crate) const METRIC_DEFINITIONS: [MetricDefinition; 10] = [
         conservation_column: None,
         publication_scope: PublicationScope::MergedAndPerWiki,
         browser_partitioning: BrowserPartitioning::PerWikiAndGlobalYearShards,
+        population_scope: "wiki_observed_editor_population",
         aggregation: CHURN_AGGREGATION,
     },
     MetricDefinition {
@@ -662,6 +671,7 @@ pub(crate) const METRIC_DEFINITIONS: [MetricDefinition; 10] = [
         conservation_column: None,
         publication_scope: PublicationScope::MergedAndPerWiki,
         browser_partitioning: BrowserPartitioning::PerWikiAndGlobalYearShards,
+        population_scope: "wiki_cohort_year_followup_year",
         aggregation: COHORTS_AGGREGATION,
     },
     MetricDefinition {
@@ -675,6 +685,7 @@ pub(crate) const METRIC_DEFINITIONS: [MetricDefinition; 10] = [
         conservation_column: Some("total_edits"),
         publication_scope: PublicationScope::MergedAndPerWiki,
         browser_partitioning: BrowserPartitioning::PerWikiAndGlobalYearShards,
+        population_scope: "wiki_month_namespace_user_type",
         aggregation: LABOR_AGGREGATION,
     },
     MetricDefinition {
@@ -688,6 +699,7 @@ pub(crate) const METRIC_DEFINITIONS: [MetricDefinition; 10] = [
         conservation_column: Some("edits"),
         publication_scope: PublicationScope::PerWikiOnly,
         browser_partitioning: BrowserPartitioning::RustDefaultsOnly,
+        population_scope: "wiki_page_namespace_week",
         aggregation: WEEKLY_AGGREGATION,
     },
     MetricDefinition {
@@ -701,6 +713,7 @@ pub(crate) const METRIC_DEFINITIONS: [MetricDefinition; 10] = [
         conservation_column: Some("total_patrols"),
         publication_scope: PublicationScope::MergedAndPerWiki,
         browser_partitioning: BrowserPartitioning::PerWikiAndGlobalYearShards,
+        population_scope: "wiki_month_namespace_user_type",
         aggregation: PATROL_AGGREGATION,
     },
 ];
@@ -730,6 +743,9 @@ struct MetricCatalogEntry {
     receipt: CatalogReceipt,
     fingerprint: CatalogFingerprint,
     browser: CatalogBrowser,
+    population_scope: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    patrol_applicability_values: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -830,6 +846,13 @@ fn catalog_document() -> MetricCatalogDocument {
                     global_path: browser_enabled
                         .then(|| format!("browser-data/{}/all-{{year}}.parquet", definition.name)),
                 },
+                population_scope: definition.population_scope.to_string(),
+                patrol_applicability_values: (definition.id == MetricId::Patrol).then(|| {
+                    ["applicable", "not_applicable", "unknown"]
+                        .into_iter()
+                        .map(str::to_string)
+                        .collect()
+                }),
             }
         })
         .collect();
@@ -873,7 +896,7 @@ fn markdown_cell(value: &str) -> String {
 
 pub(crate) fn catalog_markdown() -> String {
     let mut output = String::from(
-        "# Generated metric catalog\n\n<!-- Generated from src/metric_registry.rs by `wiki-econ metric-catalog`. Do not edit by hand. -->\n\nThe tables below are deterministic projections of the canonical Rust metric registry.\n\n## Publication, receipts, fingerprints, and browser layout\n\n| Metric | Family / algorithm | Publication | Receipt contract | Fingerprint identity | Browser partitioning |\n| --- | --- | --- | --- | --- | --- |\n",
+        "# Generated metric catalog\n\n<!-- Generated from src/metric_registry.rs by `wiki-econ metric-catalog`. Do not edit by hand. -->\n\nThe tables below are deterministic projections of the canonical Rust metric registry.\n\nPopulation scopes are part of the public contract: values with different scopes must not be compared arithmetically without an explicit harmonisation step.\n\n## Publication, receipts, fingerprints, and browser layout\n\n| Metric | Family / algorithm | Population scope | Publication | Receipt contract | Fingerprint identity | Browser partitioning |\n| --- | --- | --- | --- | --- | --- | --- |\n",
     );
     for definition in definitions() {
         let publication = match definition.publication_scope {
@@ -893,10 +916,11 @@ pub(crate) fn catalog_markdown() -> String {
             definition.conservation_column.unwrap_or("—")
         );
         output.push_str(&format!(
-            "| `{}` | `{}` / `{}` | {} | {} | `{}` | {} |\n",
+            "| `{}` | `{}` / `{}` | `{}` | {} | {} | `{}` | {} |\n",
             definition.name,
             definition.family.as_str(),
             definition.algorithm_version,
+            definition.population_scope,
             publication,
             markdown_cell(&receipt),
             definition.id.parquet_name(),

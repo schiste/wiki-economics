@@ -7324,6 +7324,7 @@ mod tests {
             ordering: crate::metric_registry::OrderingContract::WikiMajor,
             publication_scope: crate::metric_registry::PublicationScope::MergedAndPerWiki,
             browser_partitioning: crate::metric_registry::BrowserPartitioning::RustDefaultsOnly,
+            population_scope: "test_population",
             aggregation: &[],
         };
         let wiki_only_summary = summarize_batched(&wiki_only_path, &wiki_only_spec, 1)?;

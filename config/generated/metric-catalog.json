@@ -65,7 +65,8 @@
         "partitioning": "per_wiki_and_global_year_shards",
         "per_wiki_path": "browser-data/business_funnel/{wiki}.parquet",
         "global_path": "browser-data/business_funnel/all-{year}.parquet"
-      }
+      },
+      "population_scope": "wiki_cohort_year"
     },
     {
       "id": "gdp",
@@ -205,7 +206,8 @@
         "partitioning": "per_wiki_and_global_year_shards",
         "per_wiki_path": "browser-data/gdp/{wiki}.parquet",
         "global_path": "browser-data/gdp/all-{year}.parquet"
-      }
+      },
+      "population_scope": "wiki_month_namespace_user_type"
     },
     {
       "id": "gdp_activity_tiers",
@@ -313,7 +315,8 @@
         "partitioning": "per_wiki_and_global_year_shards",
         "per_wiki_path": "browser-data/gdp_activity_tiers/{wiki}.parquet",
         "global_path": "browser-data/gdp_activity_tiers/all-{year}.parquet"
-      }
+      },
+      "population_scope": "wiki_period_user_type_activity_tier"
     },
     {
       "id": "gdp_user_type_share",
@@ -386,7 +389,8 @@
         "partitioning": "per_wiki_and_global_year_shards",
         "per_wiki_path": "browser-data/gdp_user_type_share/{wiki}.parquet",
         "global_path": "browser-data/gdp_user_type_share/all-{year}.parquet"
-      }
+      },
+      "population_scope": "wiki_month_user_type"
     },
     {
       "id": "inequality",
@@ -508,7 +512,8 @@
         "partitioning": "per_wiki_and_global_year_shards",
         "per_wiki_path": "browser-data/inequality/{wiki}.parquet",
         "global_path": "browser-data/inequality/all-{year}.parquet"
-      }
+      },
+      "population_scope": "wiki_period_user_type"
     },
     {
       "id": "labor_churn",
@@ -606,7 +611,8 @@
         "partitioning": "per_wiki_and_global_year_shards",
         "per_wiki_path": "browser-data/labor_churn/{wiki}.parquet",
         "global_path": "browser-data/labor_churn/all-{year}.parquet"
-      }
+      },
+      "population_scope": "wiki_observed_editor_population"
     },
     {
       "id": "labor_cohorts",
@@ -667,7 +673,8 @@
         "partitioning": "per_wiki_and_global_year_shards",
         "per_wiki_path": "browser-data/labor_cohorts/{wiki}.parquet",
         "global_path": "browser-data/labor_cohorts/all-{year}.parquet"
-      }
+      },
+      "population_scope": "wiki_cohort_year_followup_year"
     },
     {
       "id": "labor_monthly",
@@ -750,7 +757,8 @@
         "partitioning": "per_wiki_and_global_year_shards",
         "per_wiki_path": "browser-data/labor_monthly/{wiki}.parquet",
         "global_path": "browser-data/labor_monthly/all-{year}.parquet"
-      }
+      },
+      "population_scope": "wiki_month_namespace_user_type"
     },
     {
       "id": "page_weekly_edits",
@@ -839,7 +847,8 @@
         "partitioning": "rust_defaults_only",
         "per_wiki_path": null,
         "global_path": null
-      }
+      },
+      "population_scope": "wiki_page_namespace_week"
     },
     {
       "id": "patrol",
@@ -985,7 +994,13 @@
         "partitioning": "per_wiki_and_global_year_shards",
         "per_wiki_path": "browser-data/patrol/{wiki}.parquet",
         "global_path": "browser-data/patrol/all-{year}.parquet"
-      }
+      },
+      "population_scope": "wiki_month_namespace_user_type",
+      "patrol_applicability_values": [
+        "applicable",
+        "not_applicable",
+        "unknown"
+      ]
     }
   ]
 }

@@ -4,20 +4,22 @@
 
 The tables below are deterministic projections of the canonical Rust metric registry.
 
+Population scopes are part of the public contract: values with different scopes must not be compared arithmetically without an explicit harmonisation step.
+
 ## Publication, receipts, fingerprints, and browser layout
 
-| Metric | Family / algorithm | Publication | Receipt contract | Fingerprint identity | Browser partitioning |
-| --- | --- | --- | --- | --- | --- |
-| `business_funnel` | `lifecycle` / `editor-lifecycle-v4-explicit-identified-registered-editors-external-merge` | merged + per-wiki | date: cohort_year; order: wiki-major/v1; conserve: — | `business_funnel.parquet` | per-wiki files + global year shards |
-| `gdp` | `monthly` / `monthly-stateless-v5-exact-period-inequality` | merged + per-wiki | date: year_month; order: wiki-major/v1; conserve: total_edits | `gdp.parquet` | per-wiki files + global year shards |
-| `gdp_activity_tiers` | `activity_tiers` / `activity-tiers-v5-exclusive-period-user-type` | merged + per-wiki | date: period_start; order: wiki-major/v1; conserve: total_edits | `gdp_activity_tiers.parquet` | per-wiki files + global year shards |
-| `gdp_user_type_share` | `monthly` / `monthly-stateless-v5-exact-period-inequality` | merged + per-wiki | date: year_month; order: wiki-major/v1; conserve: edits | `gdp_user_type_share.parquet` | per-wiki files + global year shards |
-| `inequality` | `monthly` / `monthly-stateless-v5-exact-period-inequality` | merged + per-wiki | date: period_start; order: wiki-major/v1; conserve: — | `inequality.parquet` | per-wiki files + global year shards |
-| `labor_churn` | `lifecycle` / `editor-lifecycle-v4-explicit-identified-registered-editors-external-merge` | merged + per-wiki | date: period; order: wiki-major/v1; conserve: — | `labor_churn.parquet` | per-wiki files + global year shards |
-| `labor_cohorts` | `lifecycle` / `editor-lifecycle-v4-explicit-identified-registered-editors-external-merge` | merged + per-wiki | date: year; order: wiki-major/v1; conserve: — | `labor_cohorts.parquet` | per-wiki files + global year shards |
-| `labor_monthly` | `monthly` / `monthly-stateless-v5-exact-period-inequality` | merged + per-wiki | date: year_month; order: wiki-major/v1; conserve: total_edits | `labor_monthly.parquet` | per-wiki files + global year shards |
-| `page_weekly_edits` | `page_week` / `page-week-v2-governed-parallel-buckets` | per-wiki only | date: week_start; order: stable-page-hash-bucket/page-key/week/v1; conserve: edits | `page_weekly_edits.parquet` | Rust defaults only |
-| `patrol` | `patrol` / `patrol-metrics-v5-complete-snapshot-months` | merged + per-wiki | date: year_month; order: wiki-major/v1; conserve: total_patrols | `patrol.parquet` | per-wiki files + global year shards |
+| Metric | Family / algorithm | Population scope | Publication | Receipt contract | Fingerprint identity | Browser partitioning |
+| --- | --- | --- | --- | --- | --- | --- |
+| `business_funnel` | `lifecycle` / `editor-lifecycle-v4-explicit-identified-registered-editors-external-merge` | `wiki_cohort_year` | merged + per-wiki | date: cohort_year; order: wiki-major/v1; conserve: — | `business_funnel.parquet` | per-wiki files + global year shards |
+| `gdp` | `monthly` / `monthly-stateless-v5-exact-period-inequality` | `wiki_month_namespace_user_type` | merged + per-wiki | date: year_month; order: wiki-major/v1; conserve: total_edits | `gdp.parquet` | per-wiki files + global year shards |
+| `gdp_activity_tiers` | `activity_tiers` / `activity-tiers-v5-exclusive-period-user-type` | `wiki_period_user_type_activity_tier` | merged + per-wiki | date: period_start; order: wiki-major/v1; conserve: total_edits | `gdp_activity_tiers.parquet` | per-wiki files + global year shards |
+| `gdp_user_type_share` | `monthly` / `monthly-stateless-v5-exact-period-inequality` | `wiki_month_user_type` | merged + per-wiki | date: year_month; order: wiki-major/v1; conserve: edits | `gdp_user_type_share.parquet` | per-wiki files + global year shards |
+| `inequality` | `monthly` / `monthly-stateless-v5-exact-period-inequality` | `wiki_period_user_type` | merged + per-wiki | date: period_start; order: wiki-major/v1; conserve: — | `inequality.parquet` | per-wiki files + global year shards |
+| `labor_churn` | `lifecycle` / `editor-lifecycle-v4-explicit-identified-registered-editors-external-merge` | `wiki_observed_editor_population` | merged + per-wiki | date: period; order: wiki-major/v1; conserve: — | `labor_churn.parquet` | per-wiki files + global year shards |
+| `labor_cohorts` | `lifecycle` / `editor-lifecycle-v4-explicit-identified-registered-editors-external-merge` | `wiki_cohort_year_followup_year` | merged + per-wiki | date: year; order: wiki-major/v1; conserve: — | `labor_cohorts.parquet` | per-wiki files + global year shards |
+| `labor_monthly` | `monthly` / `monthly-stateless-v5-exact-period-inequality` | `wiki_month_namespace_user_type` | merged + per-wiki | date: year_month; order: wiki-major/v1; conserve: total_edits | `labor_monthly.parquet` | per-wiki files + global year shards |
+| `page_weekly_edits` | `page_week` / `page-week-v2-governed-parallel-buckets` | `wiki_page_namespace_week` | per-wiki only | date: week_start; order: stable-page-hash-bucket/page-key/week/v1; conserve: edits | `page_weekly_edits.parquet` | Rust defaults only |
+| `patrol` | `patrol` / `patrol-metrics-v5-complete-snapshot-months` | `wiki_month_namespace_user_type` | merged + per-wiki | date: year_month; order: wiki-major/v1; conserve: total_patrols | `patrol.parquet` | per-wiki files + global year shards |
 
 ## Schemas and aggregation semantics
 
