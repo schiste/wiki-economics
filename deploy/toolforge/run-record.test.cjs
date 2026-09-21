@@ -105,6 +105,22 @@ test("stage events fold into durations, reuse, current stage, and concise failur
 
 test("live and final records combine provenance, resources, publication, and site generation", () => {
   const {environment} = fixture("complete");
+  const qualificationDirectory = path.join(environment.WIKI_ECON_OUTPUT_DIR, "_qualification", "complete-pipeline");
+  fs.mkdirSync(qualificationDirectory, {recursive: true});
+  fs.writeFileSync(path.join(qualificationDirectory, "ingest.json"), JSON.stringify({
+    status: "succeeded",
+    receipt_sha256: "1".repeat(64),
+    wall_time_ms: 120,
+    input: {rows: 2, bytes: 20},
+    output: {rows: 3, bytes: 30},
+    resources: {cgroup: {peak_bytes: 40}, storage: {persistent_filesystem: {high_water: 50}, scratch: {high_water: 60}}},
+    warnings: ["warning"],
+    retries: [],
+    recovery_events: [],
+    bucket_size_distribution: {available: false},
+  }));
+  environment.WIKI_ECON_PIPELINE_ID = "complete-pipeline";
+  environment.WIKI_ECON_QUALIFICATION_RECEIPT_DIR = path.join(environment.WIKI_ECON_OUTPUT_DIR, "_qualification");
   appendEvent(environment.WIKI_ECON_RUN_EVENTS_FILE, "started", "fetch", "nlwiki");
   appendEvent(environment.WIKI_ECON_RUN_EVENTS_FILE, "reused", "fetch", "nlwiki");
   appendEvent(environment.WIKI_ECON_RUN_EVENTS_FILE, "completed", "fetch", "nlwiki", 1200);
@@ -122,6 +138,9 @@ test("live and final records combine provenance, resources, publication, and sit
   assert.equal(live.provenance.siteSourceCommit, environment.WIKI_ECON_SITE_SOURCE_COMMIT);
   assert.equal(live.provenance.siteSourceSha256, environment.WIKI_ECON_SITE_SOURCE_SHA256);
   assert.equal(live.disk.path, environment.WIKI_ECON_OUTPUT_DIR);
+  assert.equal(live.qualification.receipts[0].stage, "ingest");
+  assert.equal(live.qualification.receipts[0].outputBytes, 30);
+  assert.equal(live.qualification.receipts[0].memoryPeakBytes, 40);
   assert.equal(live.memoryPeakBytes, 654321);
   assert.deepEqual(live.cpu, {
     usageUsec: 12000000,

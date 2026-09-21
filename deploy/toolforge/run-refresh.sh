@@ -82,10 +82,20 @@ if [ "$PIPELINE_MODE" != "0" ] && [ "$PIPELINE_MODE" != "1" ]; then
   echo "WIKI_ECON_PIPELINE_MODE must be 0 or 1 (got: $PIPELINE_MODE)" >&2
   exit 2
 fi
+if [ "$PIPELINE_MODE" = "1" ]; then
+  # The isolated qualification jobs are admitted at the existing 4-vCPU
+  # Toolforge limit. Keep the receipt explicit about the requested contract;
+  # operators can override this only when the job manifest changes with it.
+  export WIKI_ECON_REQUESTED_CPU_CORES="${WIKI_ECON_REQUESTED_CPU_CORES:-4}"
+fi
 PIPELINE_STAGE_ACTIVE=0
 PIPELINE_STATE_HELPER="$ROOT/deploy/toolforge/pipeline-state.cjs"
 PIPELINE_STATE_FILE="${WIKI_ECON_PIPELINE_STATE_FILE:-}"
 PIPELINE_ID=""
+QUALIFICATION_RECEIPT_HELPER="$ROOT/deploy/toolforge/qualification-receipt.cjs"
+QUALIFICATION_RECEIPT_DIR=""
+QUALIFICATION_RECEIPT_ACTIVE=0
+QUALIFICATION_RECEIPT_SAMPLER_PID=""
 REFRESH_LOCK_HEARTBEAT_SECS="${WIKI_ECON_REFRESH_LOCK_HEARTBEAT_SECS:-60}"
 REFRESH_LOCK_STALE_SECS="${WIKI_ECON_REFRESH_LOCK_STALE_SECS:-21600}"
 REFRESH_LOCK_RECHECK_SECS="${WIKI_ECON_REFRESH_LOCK_RECHECK_SECS:-2}"
@@ -383,6 +393,58 @@ pipeline_stage_enabled() {
   return 1
 }
 
+start_qualification_receipt() {
+  pipeline_stage_enabled || return 0
+  QUALIFICATION_RECEIPT_DIR="${WIKI_ECON_QUALIFICATION_RECEIPT_DIR:-$WIKI_ECON_OUTPUT_DIR/_qualification}"
+  export WIKI_ECON_QUALIFICATION_RECEIPT_DIR="$QUALIFICATION_RECEIPT_DIR"
+  if ! node "$QUALIFICATION_RECEIPT_HELPER" start; then
+    REFRESH_FAILURE_STAGE=qualification_receipt
+    REFRESH_FAILURE_ERROR="unable to start the qualification receipt for $REFRESH_STAGE"
+    return 1
+  fi
+  QUALIFICATION_RECEIPT_ACTIVE=1
+  local start_file="$QUALIFICATION_RECEIPT_DIR/${PIPELINE_ID}/${REFRESH_STAGE}.start.json"
+  # Resource samples are deliberately sparse and bounded. The final sample is
+  # always taken synchronously, so a short stage still has an end measurement.
+  (
+    while [ -f "$start_file" ]; do
+      sleep "${WIKI_ECON_QUALIFICATION_SAMPLE_SECS:-15}" || exit 0
+      [ -f "$start_file" ] || exit 0
+      node "$QUALIFICATION_RECEIPT_HELPER" sample >/dev/null 2>&1 || exit 0
+    done
+  ) &
+  QUALIFICATION_RECEIPT_SAMPLER_PID=$!
+  echo "==> Qualification receipt started: $QUALIFICATION_RECEIPT_DIR/${PIPELINE_ID}/${REFRESH_STAGE}.json"
+}
+
+stop_qualification_receipt_sampler() {
+  if [ -n "$QUALIFICATION_RECEIPT_SAMPLER_PID" ]; then
+    kill "$QUALIFICATION_RECEIPT_SAMPLER_PID" 2>/dev/null || true
+    wait "$QUALIFICATION_RECEIPT_SAMPLER_PID" 2>/dev/null || true
+  fi
+  QUALIFICATION_RECEIPT_SAMPLER_PID=""
+}
+
+finish_qualification_receipt() {
+  local exit_code=$1
+  [ "$QUALIFICATION_RECEIPT_ACTIVE" -eq 1 ] || return 0
+  stop_qualification_receipt_sampler
+  if ! node "$QUALIFICATION_RECEIPT_HELPER" sample; then
+    REFRESH_FAILURE_STAGE=qualification_receipt
+    REFRESH_FAILURE_ERROR="unable to capture the final qualification resource sample for $REFRESH_STAGE"
+    QUALIFICATION_RECEIPT_ACTIVE=0
+    return 1
+  fi
+  if ! node "$QUALIFICATION_RECEIPT_HELPER" finish "$exit_code"; then
+    REFRESH_FAILURE_STAGE=qualification_receipt
+    REFRESH_FAILURE_ERROR="unable to finalize the qualification receipt for $REFRESH_STAGE"
+    QUALIFICATION_RECEIPT_ACTIVE=0
+    return 1
+  fi
+  QUALIFICATION_RECEIPT_ACTIVE=0
+  return 0
+}
+
 load_pipeline_wikis() {
   local state_json
   state_json="$(node "$PIPELINE_STATE_HELPER" show --state "$PIPELINE_STATE_FILE")" || {
@@ -499,6 +561,13 @@ finish_refresh() {
   if [ "$exit_code" -ne 0 ] && [ -z "$REFRESH_FAILURE_ERROR" ]; then
     REFRESH_FAILURE_ERROR="refresh exited with status $exit_code"
   fi
+  WIKI_ECON_RUN_ERROR="$REFRESH_FAILURE_ERROR"
+  export WIKI_ECON_RUN_ERROR
+  if ! finish_qualification_receipt "$exit_code"; then
+    if [ "$exit_code" -eq 0 ]; then
+      exit_code=1
+    fi
+  fi
   if ! finish_pipeline_stage "$exit_code"; then
     if [ "$exit_code" -eq 0 ]; then
       exit_code=1
@@ -526,6 +595,8 @@ finish_refresh() {
 wiki_econ_init_runtime
 PIPELINE_STATE_FILE="${PIPELINE_STATE_FILE:-$WIKI_ECON_OUTPUT_DIR/.pipeline-state.json}"
 export PIPELINE_STATE_FILE
+WIKI_ECON_QUALIFICATION_RECEIPT_DIR="${WIKI_ECON_QUALIFICATION_RECEIPT_DIR:-$WIKI_ECON_OUTPUT_DIR/_qualification}"
+export WIKI_ECON_QUALIFICATION_RECEIPT_DIR
 wiki_econ_ensure_local_dirs
 initialize_refresh_logging
 
@@ -650,6 +721,7 @@ elif pipeline_stage_enabled && [ "$REFRESH_STAGE" != "ingest" ]; then
   # the middle of a pipeline generation.
   begin_pipeline_stage
   set_refresh_lock_snapshot "$SELECTED_SNAPSHOT"
+  start_qualification_receipt || exit 1
   echo "==> Toolforge pipeline refresh: ${wikis[*]} (snapshot $SELECTED_SNAPSHOT, stage $REFRESH_STAGE)"
   refresh_driver_cmd+=(--version "$SELECTED_SNAPSHOT" "${wikis[@]}" --stage "$REFRESH_STAGE")
 else
@@ -697,6 +769,7 @@ else
 
   if pipeline_stage_enabled && [ "$REFRESH_STAGE" = "ingest" ]; then
     begin_pipeline_stage
+    start_qualification_receipt || exit 1
   fi
 
   echo "==> Toolforge refresh: ${wikis[*]} (snapshot $SELECTED_SNAPSHOT, stage $REFRESH_STAGE)"
