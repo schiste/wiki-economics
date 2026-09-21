@@ -107,7 +107,8 @@ test("live and final records combine provenance, resources, publication, and sit
   const {environment} = fixture("complete");
   const qualificationDirectory = path.join(environment.WIKI_ECON_OUTPUT_DIR, "_qualification", "complete-pipeline");
   fs.mkdirSync(qualificationDirectory, {recursive: true});
-  fs.writeFileSync(path.join(qualificationDirectory, "ingest.json"), JSON.stringify({
+  fs.writeFileSync(path.join(qualificationDirectory, "ingest.complete-run.json"), JSON.stringify({
+    stage: "ingest",
     status: "succeeded",
     receipt_sha256: "1".repeat(64),
     wall_time_ms: 120,

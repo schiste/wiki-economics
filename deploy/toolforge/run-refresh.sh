@@ -403,7 +403,10 @@ start_qualification_receipt() {
     return 1
   fi
   QUALIFICATION_RECEIPT_ACTIVE=1
-  local start_file="$QUALIFICATION_RECEIPT_DIR/${PIPELINE_ID}/${REFRESH_STAGE}.start.json"
+  local receipt_stage receipt_run_id start_file
+  receipt_stage="${REFRESH_STAGE//[^A-Za-z0-9._-]/_}"
+  receipt_run_id="${WIKI_ECON_RUN_ID//[^A-Za-z0-9._-]/_}"
+  start_file="$QUALIFICATION_RECEIPT_DIR/${PIPELINE_ID}/${receipt_stage}.${receipt_run_id}.start.json"
   # Resource samples are deliberately sparse and bounded. The final sample is
   # always taken synchronously, so a short stage still has an end measurement.
   (

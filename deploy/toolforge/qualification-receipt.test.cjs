@@ -88,7 +88,8 @@ test("captures complete immutable evidence for a page-week qualification stage",
   };
 
   run("start", environment);
-  assert.ok(fs.existsSync(path.join(qualification, "qualification-pipeline", "page-week.start.json")));
+  const firstStartPath = path.join(qualification, "qualification-pipeline", "page-week.qualification-run.start.json");
+  assert.ok(fs.existsSync(firstStartPath));
   write(path.join(cgroup, "memory.current"), "400\n");
   write(path.join(cgroup, "memory.peak"), "500\n");
   write(path.join(cgroup, "cpu.stat"), "usage_usec 9000\nuser_usec 6000\nsystem_usec 3000\nnr_periods 8\nnr_throttled 1\nthrottled_usec 22\n");
@@ -97,7 +98,7 @@ test("captures complete immutable evidence for a page-week qualification stage",
   fs.appendFileSync(log, "WARNING source retry attempt=2\nrecovery completed\n");
   run("sample", environment);
   const finish = run("finish", environment);
-  const finalPath = path.join(qualification, "qualification-pipeline", "page-week.json");
+  const finalPath = path.join(qualification, "qualification-pipeline", "page-week.qualification-run.json");
   const receipt = JSON.parse(fs.readFileSync(finalPath, "utf8"));
 
   assert.equal(receipt.status, "succeeded");
@@ -127,5 +128,13 @@ test("captures complete immutable evidence for a page-week qualification stage",
   assert.match(receipt.recovery_events.join("\n"), /recovery/);
   assert.equal(receipt.observability.event_count, 2);
   assert.match(finish.stdout, /receipt_sha256/);
-  assert.equal(fs.existsSync(path.join(qualification, "qualification-pipeline", "page-week.start.json")), false);
+  assert.equal(fs.existsSync(firstStartPath), false);
+
+  // A retry gets a distinct immutable document; it must never replace the
+  // evidence from the first attempt.
+  const retryEnvironment = {...environment, WIKI_ECON_RUN_ID: "qualification-retry"};
+  run("start", retryEnvironment);
+  run("finish", retryEnvironment);
+  assert.ok(fs.existsSync(finalPath));
+  assert.ok(fs.existsSync(path.join(qualification, "qualification-pipeline", "page-week.qualification-retry.json")));
 });
