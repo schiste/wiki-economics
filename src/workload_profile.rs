@@ -808,7 +808,11 @@ mod tests {
             ProfileSelectionMode::Automatic,
         );
         enwiki_candidate.ensure_compute_qualified_with(false)?;
-        assert!(enwiki_candidate.ensure_compute_qualified_with(true).is_err());
+        assert!(
+            enwiki_candidate
+                .ensure_compute_qualified_with(true)
+                .is_err()
+        );
         let unqualified_large = profile(
             "afwiki",
             WorkloadProfileName::Large,
