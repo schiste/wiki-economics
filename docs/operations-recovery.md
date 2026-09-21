@@ -33,6 +33,20 @@ for buckets in 256 512 1024; do
 done
 ```
 
+The enwiki candidate is a separate, publication-hidden qualification cell. Run
+it only against the frozen `2026-08` preparation and keep the one-job
+namespace reservation:
+
+```sh
+toolforge jobs run --image tool-wiki-economics/tool-wiki-economics:latest \
+  --command 'deploy/toolforge/run-capacity-benchmark.sh enwiki 2048' \
+  --filelog --mount all --mem 6Gi --cpu 1 wiki-econ-capacity-en-2048
+```
+
+The wrapper records logical bucket count `2048` and invokes the pinned `64 x
+32` primary/secondary layout. This is evidence for the isolated qualification
+stage only; it does not add enwiki to scheduled refresh or publication.
+
 The Rust report records every bucket's staged rows; reduction,
 reconciliation, and total duration; sampled/cgroup peak memory; scratch and
 combined scratch-plus-output peak; project storage before/after and estimated

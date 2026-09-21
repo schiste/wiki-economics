@@ -140,33 +140,23 @@ artifact SHA-256 values across at least two worker counts with topology held
 constant; see `wiki-econ determinism-verify` in
 [deterministic builds](deterministic-builds.md).
 
-## Proposed enwiki qualification profile
+## enwiki qualification candidate (publication-hidden)
 
-Begin capacity experiments—not production scheduling—with:
+Enwiki is registered as an isolated, qualification-only candidate. The
+capacity entry in `config/capacity-qualification.json` pins the frozen
+`2026-08` snapshot, a one-source window, one source worker, and the candidate
+64 x 32 page-week layout (2,048 logical buckets). It also records the observed
+source inventory and a 250 GiB persistent-storage reserve for rollover and
+retention checks.
 
-```text
-WIKI_ECON_MEMORY_CEILING_BYTES=17179869184
-WIKI_ECON_MEMORY_RESERVE_BYTES=4294967296
-WIKI_ECON_PERSISTENT_STORAGE_RESERVE_BYTES=268435456000
-WIKI_ECON_BOUNDED_SCRATCH_RESERVE_BYTES=34359738368
-WIKI_ECON_ROLLBACK_GENERATION_RESERVE_BYTES=68719476736
-WIKI_ECON_SOURCE_WORKERS=2
-WIKI_ECON_THREAD_LIMIT=4
-RAYON_NUM_THREADS=4
-POLARS_MAX_THREADS=4
-WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS=32
-WIKI_ECON_WEEKLY_PRIMARY_BUCKET_COUNT=64
-WIKI_ECON_WEEKLY_SECONDARY_BUCKET_COUNT=32
-```
-
-Benchmark `64 x 16`, `64 x 32`, `128 x 16`, and `128 x 32`, with a writer
-ceiling at least as large as the selected secondary count. Also test two and
-three source workers and three and four compute threads. Keep a combination
-only if the capacity report retains at least 25% sustained memory headroom and
-the measured storage peak stays inside quota plus reserve. `capacity-bench`
-accepts `--weekly-buckets <primary>` and
-`--weekly-secondary-buckets <secondary>` and records all three counts
-(primary, secondary, and logical) in report schema 5.
+The Toolforge envelope is binding: 6 GiB per job, one CPU, and the existing
+namespace quota. No future capacity increase is assumed; a larger-memory
+profile is not a valid fallback. Qualification must use
+`deploy/toolforge/run-qualify-wiki.sh enwiki` with
+`WIKI_ECON_PREPARE_SNAPSHOT=2026-08`, and the benchmark wrapper's `2048`
+variant expands to exactly `--weekly-buckets 64 --weekly-secondary-buckets 32`.
+The candidate remains publication-ineligible until the isolated fleet stage
+has passing capacity, correctness, recovery, and rollover evidence.
 
 ## Telemetry
 

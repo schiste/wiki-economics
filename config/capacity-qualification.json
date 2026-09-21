@@ -17,6 +17,28 @@
       "maximum_source_workers": 1,
       "required_bucket_counts": [256]
     },
+    "enwiki": {
+      "qualification_status": "candidate",
+      "publication_eligible": false,
+      "snapshot": "2026-08",
+      "source_window_size": 1,
+      "source_count": 309,
+      "compressed_source_bytes": 137887769478,
+      "maximum_source_bytes": 918570722,
+      "qualified_workload_profiles": ["large"],
+      "qualified_workload_bucket_counts": [2048],
+      "raw_transient_requirement_bytes": 1073741824,
+      "source_workers": 1,
+      "maximum_source_workers": 1,
+      "required_bucket_counts": [2048],
+      "weekly_layout": {
+        "primary_buckets": 64,
+        "secondary_buckets": 32,
+        "logical_buckets": 2048
+      },
+      "storage_reserve_bytes": 268435456000,
+      "provenance": "toolforge-admin:enwiki-qualification-freeze-2026-09-21"
+    },
     "itwiki": {
       "qualified_workload_profiles": ["small", "large"],
       "qualified_workload_bucket_counts": [256, 2048],

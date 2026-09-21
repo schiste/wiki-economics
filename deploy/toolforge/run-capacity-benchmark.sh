@@ -6,16 +6,28 @@ set -euo pipefail
 # snapshot pointers, merged metrics, or the published site.
 
 if [ "$#" -ne 2 ]; then
-  echo "Usage: run-capacity-benchmark.sh <wiki> <256|512|1024>" >&2
+  echo "Usage: run-capacity-benchmark.sh <wiki> <256|512|1024|2048>" >&2
   exit 2
 fi
 
 wiki=$1
 bucket_count=$2
+weekly_primary_buckets="$bucket_count"
+default_secondary_buckets=1
 case "$bucket_count" in
   256|512|1024) ;;
+  2048)
+    # The enwiki candidate is recorded by logical bucket count, while the
+    # benchmark binary needs the exact two-level 64 x 32 layout.
+    if [ "$wiki" != "enwiki" ]; then
+      echo "The 2048-bucket candidate layout is reserved for enwiki" >&2
+      exit 2
+    fi
+    weekly_primary_buckets=64
+    default_secondary_buckets=32
+    ;;
   *)
-    echo "Bucket count must be 256, 512, or 1024" >&2
+    echo "Bucket count must be 256, 512, 1024, or 2048" >&2
     exit 2
     ;;
 esac
@@ -55,6 +67,22 @@ process.stdout.write(String(entry.raw_transient_requirement_bytes));
   echo "Wiki/bucket combination is absent from capacity policy: $wiki/$bucket_count" >&2
   exit 2
 }
+storage_reserve_bytes="$(node -e '
+const fs = require("node:fs");
+const policy = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+const entry = policy.wikis?.[process.argv[2]];
+const reserve = entry?.storage_reserve_bytes ?? policy.minimum_storage_reserve_bytes;
+if (!Number.isSafeInteger(reserve) || reserve <= 0) process.exit(2);
+process.stdout.write(String(reserve));
+' "$policy" "$wiki")" || {
+  echo "Wiki has no valid storage reserve in capacity policy: $wiki" >&2
+  exit 2
+}
+weekly_secondary_buckets="${WIKI_ECON_WEEKLY_SECONDARY_BUCKETS:-$default_secondary_buckets}"
+if [ "$bucket_count" = "2048" ] && [ "$weekly_secondary_buckets" -ne 32 ]; then
+  echo "The enwiki 2048-bucket candidate requires weekly secondary buckets=32" >&2
+  exit 2
+fi
 run_id="capacity-$(date -u +%Y%m%dT%H%M%SZ)-c${requested_cpu}-t${qualification_threads}-w${weekly_workers}-b${bucket_count}-$$"
 output_dir="$capacity_root/output/$run_id"
 scratch_dir="$capacity_root/scratch/$run_id"
@@ -90,20 +118,20 @@ if [[ -n "${WIKI_ECON_NFS_QUOTA_BYTES:-}" ]]; then
   quota_args=(--nfs-quota-bytes "$WIKI_ECON_NFS_QUOTA_BYTES")
 fi
 
-echo "=== wiki-economics capacity benchmark start run_id=$run_id wiki=$wiki buckets=$bucket_count cpu=$requested_cpu threads=$qualification_threads weekly_workers=$weekly_workers ==="
+echo "=== wiki-economics capacity benchmark start run_id=$run_id wiki=$wiki buckets=$bucket_count layout=${weekly_primary_buckets}x${weekly_secondary_buckets} source_workers=${WIKI_ECON_SOURCE_WORKERS:-1} cpu=$requested_cpu threads=$qualification_threads weekly_workers=$weekly_workers ==="
 "$bin_path" \
   --data-dir "$data_dir" \
   --output-dir "$output_dir" \
   --run-id "$run_id" \
   capacity-bench "$wiki" \
-  --weekly-buckets "$bucket_count" \
-  --weekly-secondary-buckets "${WIKI_ECON_WEEKLY_SECONDARY_BUCKETS:-1}" \
+  --weekly-buckets "$weekly_primary_buckets" \
+  --weekly-secondary-buckets "$weekly_secondary_buckets" \
   --requested-cpu "$requested_cpu" \
   --scratch-dir "$scratch_dir" \
   --report "$report_path" \
   --raw-transient-bytes "${WIKI_ECON_CAPACITY_RAW_TRANSIENT_BYTES:-$raw_transient_bytes}" \
   ${quota_args[@]+"${quota_args[@]}"} \
-  --storage-reserve-bytes "${WIKI_ECON_CAPACITY_STORAGE_RESERVE_BYTES:-53687091200}" \
+  --storage-reserve-bytes "${WIKI_ECON_CAPACITY_STORAGE_RESERVE_BYTES:-$storage_reserve_bytes}" \
   --quota-root /data/project/wiki-economics \
   --minimum-memory-headroom-percent "${WIKI_ECON_CAPACITY_MIN_HEADROOM_PERCENT:-25}"
 echo "=== wiki-economics capacity benchmark end run_id=$run_id report=$report_path ==="

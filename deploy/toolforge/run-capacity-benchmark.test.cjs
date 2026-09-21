@@ -85,3 +85,19 @@ test("capacity wrapper accepts only the explicit CPU qualification matrix", () =
   assert.equal(rejected.status, 2);
   assert.match(rejected.stderr, /Unsupported qualification cell/);
 });
+
+test("enwiki candidate expands logical 2048 buckets to the pinned 64x32 layout", () => {
+  const root = path.join(fixtureRoot, "enwiki-layout");
+  const result = spawnSync("bash", [script, "enwiki", "2048"], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      WIKI_ECON_BIN: writeFakeBinary(path.join(root, "bin")),
+      WIKI_ECON_CAPACITY_ROOT: path.join(root, "capacity"),
+      WIKI_ECON_DATA_DIR: path.join(root, "data"),
+      WIKI_ECON_CAPACITY_POLICY: path.join(__dirname, "../../config/capacity-qualification.json"),
+    },
+  });
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.match(result.stdout, /wiki=enwiki buckets=2048 layout=64x32 source_workers=1/);
+});

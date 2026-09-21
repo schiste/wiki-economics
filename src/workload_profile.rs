@@ -136,6 +136,12 @@ struct WikiCapacityPolicy {
     qualified_workload_profiles: Vec<WorkloadProfileName>,
     qualified_workload_bucket_counts: Vec<usize>,
     maximum_source_workers: usize,
+    #[serde(default = "default_publication_eligible")]
+    publication_eligible: bool,
+}
+
+fn default_publication_eligible() -> bool {
+    true
 }
 
 pub(crate) fn profile_path(data_dir: &Path, wiki: &str, snapshot: &str) -> Result<PathBuf> {
@@ -324,6 +330,11 @@ impl WorkloadProfile {
             .wikis
             .get(&self.wiki)
             .with_context(|| format!("{} has no production capacity qualification", self.wiki))?;
+        ensure!(
+            wiki.publication_eligible,
+            "{} capacity profile is qualification-only and is not publication-eligible",
+            self.wiki
+        );
         ensure!(
             wiki.qualified_workload_profiles.contains(&self.profile),
             "workload profile {:?} has not completed production qualification for {}",
@@ -791,6 +802,13 @@ mod tests {
             ProfileSelectionMode::Automatic,
         );
         large.ensure_compute_qualified_with(true)?;
+        let enwiki_candidate = profile(
+            "enwiki",
+            WorkloadProfileName::Large,
+            ProfileSelectionMode::Automatic,
+        );
+        enwiki_candidate.ensure_compute_qualified_with(false)?;
+        assert!(enwiki_candidate.ensure_compute_qualified_with(true).is_err());
         let unqualified_large = profile(
             "afwiki",
             WorkloadProfileName::Large,
