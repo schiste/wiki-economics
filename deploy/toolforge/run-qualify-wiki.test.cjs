@@ -46,3 +46,43 @@ test("qualification wrapper rejects unsafe wiki identifiers before creating stat
   assert.equal(result.status, 2);
   assert.match(result.stderr, /Unsafe wiki identifier/);
 });
+
+test("enwiki qualification requires an explicit frozen snapshot and one-source window", () => {
+  const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-enwiki-freeze-"));
+  try {
+    const calls = path.join(fixture, "calls.txt");
+    const binary = path.join(fixture, "wiki-econ");
+    fs.writeFileSync(binary, `#!/bin/sh\nprintf '%s\\n' "$*" >> "${calls}"\n`, {mode: 0o755});
+    const qualificationRoot = path.join(fixture, "capacity", "qualifications");
+    const missingSnapshot = spawnSync("bash", [script, "enwiki"], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        WIKI_ECON_ROOT: fixture,
+        WIKI_ECON_BIN: binary,
+        WIKI_ECON_QUALIFICATION_ROOT: qualificationRoot,
+        WIKI_ECON_RUN_ID: "qualify-enwiki-missing-snapshot",
+      },
+    });
+    assert.notEqual(missingSnapshot.status, 0);
+    assert.match(missingSnapshot.stderr, /requires WIKI_ECON_PREPARE_SNAPSHOT/);
+
+    const pinned = spawnSync("bash", [script, "enwiki"], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        WIKI_ECON_ROOT: fixture,
+        WIKI_ECON_BIN: binary,
+        WIKI_ECON_QUALIFICATION_ROOT: qualificationRoot,
+        WIKI_ECON_RUN_ID: "qualify-enwiki-pinned",
+        WIKI_ECON_PREPARE_SNAPSHOT: "2026-08",
+      },
+    });
+    assert.equal(pinned.status, 0, pinned.stderr || pinned.stdout);
+    const invocations = fs.readFileSync(calls, "utf8");
+    assert.match(invocations, /qualify-wiki enwiki --version 2026-08/);
+    assert.match(invocations, /--source-window-size 1/);
+  } finally {
+    fs.rmSync(fixture, {recursive: true, force: true});
+  }
+});

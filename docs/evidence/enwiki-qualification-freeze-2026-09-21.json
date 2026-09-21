@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "status": "frozen",
+  "wiki": "enwiki",
+  "snapshot": "2026-08",
+  "selected_by": "snapshot-resolve",
+  "run_id": "enwiki-qualification-freeze-20260921",
+  "source_plan": "/data/project/wiki-economics/data/snapshots/enwiki/2026-08/source-plan.json",
+  "remote_inventory": "/data/project/wiki-economics/data/snapshots/enwiki/2026-08/remote-inventory.json",
+  "plan_sha256": "71da7100fc8affeff74d2bd213bfe71d9133dfdb70238358888466b4f5a29d21",
+  "source_count": 309,
+  "compressed_source_bytes": 137887769478,
+  "source_window_size": 1,
+  "max_concurrent_heavy_stages": 1,
+  "publication_eligible": false,
+  "storage_preflight": {
+    "minimum_free_bytes": 268435456000,
+    "observed_free_bytes": 1836762267648,
+    "observed_capacity_percent": 83,
+    "observed_at": "2026-09-21",
+    "host": "login.toolforge.org"
+  },
+  "qualification_only": true,
+  "notes": [
+    "No enwiki source bytes were downloaded by the freeze operation.",
+    "The selected snapshot is the latest completed snapshot returned by the Toolforge resolver; it is one month behind the resolver clock.",
+    "The candidate remains hidden until all capacity, correctness, recovery, and rollover gates pass."
+  ]
+}

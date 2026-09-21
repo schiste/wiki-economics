@@ -27,7 +27,15 @@ export WIKI_ECON_THREAD_LIMIT="${WIKI_ECON_THREAD_LIMIT:-1}"
 export WIKI_ECON_SOURCE_WORKERS="${WIKI_ECON_SOURCE_WORKERS:-1}"
 export WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS="${WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS:-16}"
 export WIKI_ECON_REQUIRE_QUALIFIED_PROFILE=1
-export WIKI_ECON_SOURCE_WINDOW_SIZE="${WIKI_ECON_SOURCE_WINDOW_SIZE:-2}"
+if [ "$wiki" = "enwiki" ]; then
+  # Enwiki qualification is deliberately frozen to the smallest source
+  # window.  A wider window would increase transient NFS pressure before the
+  # qualification receipt has proved that it is safe under the fixed
+  # Toolforge envelope.
+  export WIKI_ECON_SOURCE_WINDOW_SIZE=1
+else
+  export WIKI_ECON_SOURCE_WINDOW_SIZE="${WIKI_ECON_SOURCE_WINDOW_SIZE:-2}"
+fi
 export WIKI_ECON_MEMORY_CEILING_BYTES="${WIKI_ECON_MEMORY_CEILING_BYTES:-6442450944}"
 export WIKI_ECON_MEMORY_RESERVE_BYTES="${WIKI_ECON_MEMORY_RESERVE_BYTES:-1610612736}"
 export WIKI_ECON_PERSISTENT_STORAGE_RESERVE_BYTES="${WIKI_ECON_PERSISTENT_STORAGE_RESERVE_BYTES:-10737418240}"
