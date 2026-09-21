@@ -224,6 +224,16 @@ and higher resource envelope are being qualified.
 - `run-record.cjs` — the single atomic writer for live refresh status and the
   bounded terminal history. It folds Rust/site stage events together with
   cgroup, disk, deployment provenance, and publication-gate data.
+- `qualification-receipt.cjs` — the per-stage evidence writer used by the six
+  isolated qualification jobs. Each stage writes an immutable
+  `output/_qualification/<pipeline-id>/<stage>.json` after its final resource
+  sample and before the pipeline lease can be completed. The receipt joins the
+  authenticated Rust stage/artifact identities (rows, bytes, SHA-256 and
+  fingerprints) with wall/CPU time, cgroup memory peak, persistent and
+  scratch storage high-water marks, configured/observed bucket-size
+  distributions, and bounded warning, retry, recovery, and event evidence.
+  A temporary `.start.json` is retained only while the stage is running; a
+  missing or unfinalizable receipt makes a successful stage fail closed.
 - Each refresh writes `output/logs/refresh/<run-id>.log`, disables ANSI and
   Observable telemetry, and ends with structured per-stage/run JSON summaries.
   Logs and terminal history retain 104 weekly entries by default.

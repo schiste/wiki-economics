@@ -25,6 +25,7 @@ echo "==> node --check site/admin-server.cjs"
 node --check site/admin-server.cjs
 node --check site/machine-api.cjs
 node --check site/src/components/admin-console.js
+node --check deploy/toolforge/qualification-receipt.cjs
 
 echo "==> node --check site/freshness.cjs scripts/check-freshness.cjs"
 node --check site/freshness.cjs
@@ -83,6 +84,7 @@ node --test site/freshness.test.cjs
 
 echo "==> node --test deploy/toolforge/run-record.test.cjs"
 node --test deploy/toolforge/run-record.test.cjs
+node --test deploy/toolforge/qualification-receipt.test.cjs
 
 echo "==> node --test deploy/toolforge/run-refresh.test.cjs"
 node --test deploy/toolforge/run-refresh.test.cjs

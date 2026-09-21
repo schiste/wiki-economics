@@ -270,6 +270,14 @@ test("the staged ingest job records a resumable pipeline lease", () => {
   assert.equal(state.current_stage, null);
   assert.equal(state.stages.ingest.status, "succeeded");
   assert.equal(state.stages.metrics.status, "pending");
+  const qualificationReceipt = JSON.parse(fs.readFileSync(
+    path.join(fixture.output, "_qualification", "pipeline-ingest-run", "ingest.json"),
+    "utf8",
+  ));
+  assert.equal(qualificationReceipt.status, "succeeded");
+  assert.equal(qualificationReceipt.stage, "ingest");
+  assert.ok(qualificationReceipt.wall_time_ms >= 0);
+  assert.ok(qualificationReceipt.resources.cgroup);
 });
 
 test("the staged ingest job permits an explicitly registered qualification wiki", () => {

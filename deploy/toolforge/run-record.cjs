@@ -220,6 +220,39 @@ function publicationSummary(gate, runId) {
   };
 }
 
+function qualificationSummary(environment) {
+  const directory = environment.WIKI_ECON_QUALIFICATION_RECEIPT_DIR;
+  const pipelineId = environment.WIKI_ECON_PIPELINE_ID;
+  if (!directory || !pipelineId) return null;
+  const pipelineDirectory = path.join(directory, pipelineId);
+  const stages = ["ingest", "metrics", "lifecycle", "page-week", "patrol", "publish"];
+  const receipts = [];
+  for (const stage of stages) {
+    const file = path.join(pipelineDirectory, `${stage}.json`);
+    const value = readJson(file);
+    if (!value) continue;
+    receipts.push({
+      stage,
+      status: value.status || null,
+      path: path.relative(directory, file),
+      receiptSha256: value.receipt_sha256 || null,
+      wallTimeMs: value.wall_time_ms ?? null,
+      inputRows: value.input?.rows ?? null,
+      inputBytes: value.input?.bytes ?? null,
+      outputRows: value.output?.rows ?? null,
+      outputBytes: value.output?.bytes ?? null,
+      memoryPeakBytes: value.resources?.cgroup?.peak_bytes ?? null,
+      persistentStorageHighWaterBytes: value.resources?.storage?.persistent_filesystem?.high_water ?? null,
+      scratchStorageHighWaterBytes: value.resources?.storage?.scratch?.high_water ?? null,
+      warningCount: Array.isArray(value.warnings) ? value.warnings.length : null,
+      retryCount: Array.isArray(value.retries) ? value.retries.length : null,
+      recoveryCount: Array.isArray(value.recovery_events) ? value.recovery_events.length : null,
+      bucketDistributionAvailable: value.bucket_size_distribution?.available ?? null,
+    });
+  }
+  return {pipelineId, directory, receipts};
+}
+
 function parseWikis(value) {
   try {
     const parsed = JSON.parse(value || "[]");
@@ -253,6 +286,7 @@ function buildRecord(environment, finalExitCode = null) {
     ? Math.max(0, Math.floor(now.getTime() / 1000) - startedEpoch)
     : null;
   const publication = publicationSummary(readJson(environment.WIKI_ECON_RUN_PUBLICATION_FILE), runId);
+  const qualification = qualificationSummary(environment);
   const shellError = conciseError(environment.WIKI_ECON_RUN_ERROR);
   const failingStage = state === "failed"
     ? (events.failed?.stage || events.current?.stage || environment.WIKI_ECON_RUN_FAILING_STAGE || null)
@@ -295,6 +329,7 @@ function buildRecord(environment, finalExitCode = null) {
       siteSourceArchiveSha256: environment.WIKI_ECON_SITE_SOURCE_ARCHIVE_SHA256 || null,
     },
     publication,
+    qualification,
     memoryCurrentBytes: finiteCounter(path.join(cgroupRoot, "memory.current")),
     memoryPeakBytes: finiteCounter(path.join(cgroupRoot, "memory.peak")),
     memoryLimitBytes: finiteCounter(path.join(cgroupRoot, "memory.max")),
@@ -330,6 +365,7 @@ function compactHistoryEntry(record) {
     logFile: record.logFile,
     provenance: record.provenance,
     publication: record.publication,
+    qualification: record.qualification,
   };
 }
 
