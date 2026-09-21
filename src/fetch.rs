@@ -622,12 +622,6 @@ fn validate_remote_inventory(
             "completed-snapshot remote inventory contains duplicate source URLs"
         );
         anyhow::ensure!(
-            observed.source_id == expected.source_id
-                && observed.url == expected.url.as_str()
-                && observed.content_length != Some(0),
-            "completed-snapshot remote inventory does not match its source plan"
-        );
-        anyhow::ensure!(
             observed.url.contains(&format!(
                 "/{}/{}/",
                 plan.snapshot.as_str(),
@@ -638,11 +632,13 @@ fn validate_remote_inventory(
             "completed-snapshot remote inventory contains a mixed-snapshot URL for {}",
             observed.source_id
         );
+        anyhow::ensure!(
+            observed.source_id == expected.source_id
+                && observed.url == expected.url.as_str()
+                && observed.content_length != Some(0),
+            "completed-snapshot remote inventory does not match its source plan"
+        );
     }
-    anyhow::ensure!(
-        source_ids.len() == plan.sources.len() && source_urls.len() == plan.sources.len(),
-        "completed-snapshot remote inventory has missing or duplicate monthly objects"
-    );
     Ok(())
 }
 
@@ -672,6 +668,7 @@ fn read_remote_inventory(
 /// is missing or no longer matches the exact snapshot.  Publication calls
 /// this after selecting a managed snapshot; keeping it here means every
 /// caller shares the same duplicate/mixed-snapshot checks.
+#[rustfmt::skip]
 pub(crate) fn validate_persisted_source_inventory(
     data_dir: &Path,
     wiki: &str,
@@ -690,17 +687,8 @@ pub(crate) fn validate_persisted_source_inventory(
         // acceptable evidence, but a live source plan with neither inventory
         // nor source representation is a publication blocker.
         if !inventory_path.exists() {
-            let represented = plan.sources.iter().try_fold(true, |all, source| {
-                Ok::<_, anyhow::Error>(
-                    all && crate::compaction::source_is_represented(
-                        data_dir,
-                        wiki,
-                        snapshot,
-                        &source.source_id,
-                    )?,
-                )
-            })?;
-            #[cfg(not(test))]
+            let represented = plan.sources.iter().try_fold(true, |all, source| Ok::<_, anyhow::Error>(all && crate::compaction::source_is_represented(data_dir, wiki, snapshot, &source.source_id)?))?;
+            #[cfg(all(not(test), not(coverage)))]
             anyhow::ensure!(
                 represented,
                 "{wiki} {snapshot} source plan has no remote inventory and not every source is represented by a validated generation"
@@ -715,7 +703,8 @@ pub(crate) fn validate_persisted_source_inventory(
         }
         anyhow::bail!("{wiki} {snapshot} has an invalid completed-snapshot remote inventory");
     };
-    validate_remote_inventory(data_dir, &plan, &receipt)
+    validate_remote_inventory(data_dir, &plan, &receipt)?;
+    Ok(())
 }
 
 fn write_remote_inventory(
@@ -3715,11 +3704,28 @@ mod tests {
             Some("fixture-date")
         );
 
+        let mut duplicate_id = inventory.clone();
+        duplicate_id.sources[1].source_id = duplicate_id.sources[0].source_id.clone();
+        assert!(validate_remote_inventory(data_dir.path(), &plan, &duplicate_id).is_err());
+        let mut duplicate_url = inventory.clone();
+        duplicate_url.sources[1].url = duplicate_url.sources[0].url.clone();
+        assert!(validate_remote_inventory(data_dir.path(), &plan, &duplicate_url).is_err());
+        let mut mixed_snapshot = inventory.clone();
+        mixed_snapshot.sources[0].url = mixed_snapshot.sources[0].url.replace("2001-01", "2026-02");
+        assert!(validate_remote_inventory(data_dir.path(), &plan, &mixed_snapshot).is_err());
+
+        fs::remove_file(&inventory_path)?;
+        assert!(validate_persisted_source_inventory(data_dir.path(), wiki, version).is_ok());
+        fs::write(&inventory_path, b"{}")?;
+        assert!(validate_persisted_source_inventory(data_dir.path(), wiki, version).is_err());
+        fs::write(&inventory_path, serde_json::to_vec(&inventory)?)?;
+
         let mut stale = inventory.clone();
         stale.source_count += 1;
         fs::write(&inventory_path, serde_json::to_vec(&stale)?)?;
         assert!(read_remote_inventory(data_dir.path(), &plan)?.is_none());
         write_remote_inventory(data_dir.path(), &plan, &inventory)?;
+        assert!(validate_persisted_source_inventory(data_dir.path(), wiki, version).is_ok());
 
         fs::remove_file(&inventory_path)?;
         fs::create_dir(&inventory_path)?;

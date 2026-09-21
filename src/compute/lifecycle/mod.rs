@@ -1215,6 +1215,10 @@ mod tests {
         assert_eq!(format_period_key(20242, "quarter"), "2024-Q2");
         assert_eq!(format_period_key(2024, "year"), "2024");
         assert_eq!(format_period_key(202401, "week"), "202401");
+        assert_eq!(period_months_for_type("month"), 1);
+        assert_eq!(period_months_for_type("quarter"), 3);
+        assert_eq!(period_months_for_type("year"), 12);
+        assert_eq!(period_months_for_type("week"), 0);
         Ok(())
     }
 

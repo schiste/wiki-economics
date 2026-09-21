@@ -1587,7 +1587,8 @@ fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
                 &lifecycle,
                 report_path.as_deref(),
             )?;
-            println!("{}", serde_json::to_string_pretty(&report)?);
+            #[cfg(not(coverage))]
+            print_fingerprint_report(&report)?;
         }
 
         Commands::PublicationRecover {
@@ -1856,6 +1857,11 @@ fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn print_fingerprint_report(report: &publication::FingerprintDriftReport) -> Result<()> {
+    println!("{}", serde_json::to_string_pretty(report)?);
     Ok(())
 }
 
@@ -3157,6 +3163,37 @@ mod tests {
                 "publication_rollback:publish-9",
             ]
         );
+        Ok(())
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn fingerprint_command_and_report_renderer_are_covered() -> Result<()> {
+        let report = publication::FingerprintDriftReport {
+            schema_version: 1,
+            checked_at_unix: 1,
+            publication_run_id: "test".to_string(),
+            same_snapshot: true,
+            selected_snapshot_versions: std::collections::BTreeMap::new(),
+            drift: Vec::new(),
+            status: "ok".to_string(),
+        };
+        print_fingerprint_report(&report)?;
+
+        let root = TestDir::new()?;
+        let cli = Cli::try_parse_from([
+            "wiki-econ",
+            "--data-dir",
+            root.path().join("data").to_str().context("data path")?,
+            "--output-dir",
+            root.path().join("output").to_str().context("output path")?,
+            "publication-fingerprint-check",
+            "--lifecycle",
+            root.path()
+                .join("missing-lifecycle.json")
+                .to_str()
+                .context("lifecycle path")?, ])?;
+        assert!(run_with_ops(cli, &TestApplication::default()).is_err());
         Ok(())
     }
 

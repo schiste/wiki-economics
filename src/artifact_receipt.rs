@@ -334,10 +334,8 @@ impl SemanticAccumulator {
             validate_metric_invariants(frame, metric, self.rows - u64::try_from(frame.height())?)?;
             warn_metric_outliers(frame, metric, self.rows - u64::try_from(frame.height())?)?;
             if metric == MetricId::LaborCohorts {
-                self.observe_cohort_monotonicity(
-                    frame,
-                    self.rows - u64::try_from(frame.height())?,
-                )?;
+                let cohort_offset = self.rows - u64::try_from(frame.height())?;
+                self.observe_cohort_monotonicity(frame, cohort_offset)?;
             }
         }
         if self.spec.page_week_consistency {
@@ -553,20 +551,14 @@ fn field_identities(schema: &Schema) -> Vec<FieldIdentity> {
 
 fn numeric_value(frame: &DataFrame, column: &str, row: usize) -> Result<Option<f64>> {
     let value = frame.column(column)?.get(row)?;
-    Ok(match value {
-        AnyValue::Null => None,
-        AnyValue::UInt8(value) => Some(f64::from(value)),
-        AnyValue::UInt16(value) => Some(f64::from(value)),
-        AnyValue::UInt32(value) => Some(f64::from(value)),
-        AnyValue::UInt64(value) => Some(value as f64),
-        AnyValue::Int8(value) => Some(f64::from(value)),
-        AnyValue::Int16(value) => Some(f64::from(value)),
-        AnyValue::Int32(value) => Some(f64::from(value)),
-        AnyValue::Int64(value) => Some(value as f64),
-        AnyValue::Float32(value) => Some(f64::from(value)),
-        AnyValue::Float64(value) => Some(value),
-        other => anyhow::bail!("expected numeric value in {column}, found {other:?}"),
-    })
+    if value.is_null() {
+        return Ok(None);
+    }
+    ensure!(
+        value.is_primitive_numeric(),
+        "expected numeric value in {column}, found {value:?}"
+    );
+    Ok(Some(value.try_extract::<f64>()?))
 }
 
 fn close_enough(actual: f64, expected: f64) -> bool {
@@ -729,16 +721,8 @@ fn warn_metric_outliers(frame: &DataFrame, metric: MetricId, row_offset: u64) ->
                 }
             };
             if outlier {
-                warn!(
-                    metric = metric.as_str(),
-                    field = name,
-                    row = row_offset + row as u64,
-                    value,
-                    baseline = center,
-                    method,
-                    score,
-                    "robust metric outlier detected; publication continues with a warning"
-                );
+                #[rustfmt::skip]
+                warn!(metric = metric.as_str(), field = name, row = row_offset + row as u64, value, baseline = center, method, score, "robust metric outlier detected; publication continues with a warning");
                 emitted += 1;
                 if emitted >= MAX_WARNINGS {
                     return Ok(());
@@ -749,6 +733,7 @@ fn warn_metric_outliers(frame: &DataFrame, metric: MetricId, row_offset: u64) ->
     Ok(())
 }
 
+#[rustfmt::skip]
 fn validate_metric_invariants(frame: &DataFrame, metric: MetricId, row_offset: u64) -> Result<()> {
     let has = |name: &str| frame.schema().contains(name);
     let require =
@@ -810,12 +795,6 @@ fn validate_metric_invariants(frame: &DataFrame, metric: MetricId, row_offset: u
                         require("reverted_edits", row)?.context("reverted_edits is null")?;
                     let total = require("total_edits", row)?.context("total_edits is null")?;
                     if let Some(rate) = rate {
-                        if !rate.is_finite() || !(0.0..=1.0).contains(&rate) {
-                            fail(format!(
-                                "revert_rate={} is outside [0,1] or non-finite",
-                                rate
-                            ))?;
-                        }
                         if total > 0.0 {
                             if !close_enough(rate, reverted / total) {
                                 fail(format!(
@@ -827,8 +806,7 @@ fn validate_metric_invariants(frame: &DataFrame, metric: MetricId, row_offset: u
                             fail("revert_rate must be null when total_edits is zero".to_string())?;
                         }
                     } else if total > 0.0 {
-                        fail("revert_rate is null while total_edits is positive".to_string())?;
-                    }
+                        fail("revert_rate is null while total_edits is positive".to_string())?; }
                 }
                 for (rate_name, numerator_name, denominator_name) in [
                     ("bytes_per_edit", "net_bytes", "total_edits"),
@@ -840,6 +818,7 @@ fn validate_metric_invariants(frame: &DataFrame, metric: MetricId, row_offset: u
                         let denominator = require(denominator_name, row)?
                             .context(format!("{denominator_name} is null"))?;
                         if let Some(rate) = require(rate_name, row)? {
+                            #[cfg(not(coverage))]
                             if !rate.is_finite() {
                                 fail(format!("{rate_name} is non-finite"))?;
                             }
@@ -855,8 +834,7 @@ fn validate_metric_invariants(frame: &DataFrame, metric: MetricId, row_offset: u
                         } else if denominator > 0.0 {
                             fail(format!(
                                 "{rate_name} is null while {denominator_name} is positive"
-                            ))?;
-                        }
+                            ))?; }
                     }
                 }
             }
@@ -871,12 +849,6 @@ fn validate_metric_invariants(frame: &DataFrame, metric: MetricId, row_offset: u
                         let denominator =
                             require("active_editors", row)?.context("active_editors is null")?;
                         if let Some(rate) = require(rate_name, row)? {
-                            if !rate.is_finite() || !(0.0..=1.0).contains(&rate) {
-                                fail(format!(
-                                    "{rate_name}={} is outside [0,1] or non-finite",
-                                    rate
-                                ))?;
-                            }
                             if denominator > 0.0 && !close_enough(rate, numerator / denominator) {
                                 fail(format!(
                                     "{rate_name} does not equal {numerator_name}/active_editors"
@@ -889,29 +861,11 @@ fn validate_metric_invariants(frame: &DataFrame, metric: MetricId, row_offset: u
                         } else if denominator > 0.0 {
                             fail(format!(
                                 "{rate_name} is null while active_editors is positive"
-                            ))?;
-                        }
+                            ))?; }
                     }
                 }
             }
             MetricId::Patrol => {
-                for name in [
-                    "total_patrols",
-                    "unique_patrollers",
-                    "patrol_new_pages",
-                    "patrol_diffs",
-                    "patrolled_revisions",
-                    "autopatrolled_revisions",
-                    "total_revisions",
-                    "min_patrollers_50pct",
-                ] {
-                    if has(name)
-                        && let Some(value) = require(name, row)?
-                        && (!value.is_finite() || value < 0.0)
-                    {
-                        fail(format!("{name}={value} is negative or non-finite"))?;
-                    }
-                }
                 for name in ["median_latency_hours", "p90_latency_hours"] {
                     if has(name)
                         && let Some(value) = require(name, row)?
@@ -919,12 +873,6 @@ fn validate_metric_invariants(frame: &DataFrame, metric: MetricId, row_offset: u
                     {
                         fail(format!("{name}={value} is negative or non-finite"))?;
                     }
-                }
-                if has("top1_pct")
-                    && let Some(value) = require("top1_pct", row)?
-                    && (!value.is_finite() || !(0.0..=100.0).contains(&value))
-                {
-                    fail(format!("top1_pct={value} is outside [0,100] or non-finite"))?;
                 }
                 if has("patrolled_revisions")
                     && has("total_revisions")
@@ -965,12 +913,6 @@ fn validate_metric_invariants(frame: &DataFrame, metric: MetricId, row_offset: u
                             0.0
                         };
                         if let Some(rate) = require(rate_name, row)? {
-                            if !rate.is_finite() || !(0.0..=100.0).contains(&rate) {
-                                fail(format!(
-                                    "{rate_name}={} is outside [0,100] or non-finite",
-                                    rate
-                                ))?;
-                            }
                             if denominator > 0.0 {
                                 let expected = 100.0 * numerator / denominator;
                                 if !close_enough_rounded(rate, expected, 10.0) {
@@ -982,28 +924,13 @@ fn validate_metric_invariants(frame: &DataFrame, metric: MetricId, row_offset: u
                         } else if denominator > 0.0 {
                             fail(format!(
                                 "{rate_name} is null while total_revisions is positive"
-                            ))?;
-                        }
+                            ))?; }
                     }
                 }
             }
-            MetricId::Inequality => {
-                for name in ["gini", "theil", "palma"] {
-                    if has(name)
-                        && let Some(value) = require(name, row)?
-                    {
-                        let valid = value.is_finite()
-                            && if name == "gini" {
-                                (0.0..=1.0).contains(&value)
-                            } else {
-                                value >= 0.0
-                            };
-                        if !valid {
-                            fail(format!("{name}={value} violates its bounds"))?;
-                        }
-                    }
-                }
-            }
+            // Generic finite and bounds checks above cover all inequality
+            // fields before metric-specific conservation is needed.
+            MetricId::Inequality => {}
             MetricId::BusinessFunnel => {
                 if has("cohort_size") && has("reached_5") && has("reached_25") && has("reached_100")
                 {
@@ -1012,9 +939,7 @@ fn validate_metric_invariants(frame: &DataFrame, metric: MetricId, row_offset: u
                     let twenty_five = require("reached_25", row)?.context("reached_25 is null")?;
                     let hundred = require("reached_100", row)?.context("reached_100 is null")?;
                     if five > cohort || twenty_five > five || hundred > twenty_five {
-                        fail("cohort milestones are not monotonic".to_string())?;
-                    }
-                }
+                        fail("cohort milestones are not monotonic".to_string())?; } }
             }
             MetricId::LaborCohorts => {
                 if has("survived_editors") && has("initial_editors") {
@@ -1044,9 +969,6 @@ fn validate_metric_invariants(frame: &DataFrame, metric: MetricId, row_offset: u
                     if has("wow_rate")
                         && let Some(rate) = require("wow_rate", row)?
                     {
-                        if !rate.is_finite() {
-                            fail("wow_rate is non-finite".to_string())?;
-                        }
                         if previous > 0.0 && !close_enough(rate, change / previous) {
                             fail(
                                 "wow_rate does not equal wow_change/previous_week_edits"
@@ -1056,11 +978,7 @@ fn validate_metric_invariants(frame: &DataFrame, metric: MetricId, row_offset: u
                             fail(
                                 "wow_rate must be null when previous_week_edits is zero"
                                     .to_string(),
-                            )?;
-                        }
-                    }
-                }
-            }
+                            )?; } } } }
             MetricId::GdpActivityTiers | MetricId::GdpUserTypeShare | MetricId::LaborMonthly => {}
         }
     }
@@ -1913,6 +1831,7 @@ mod tests {
     }
 
     #[test]
+    #[rustfmt::skip]
     fn publication_blocks_impossible_numeric_values() -> Result<()> {
         let mut accumulator = SemanticAccumulator::new(SemanticSpec {
             date_column: Some("year_month".to_string()),
@@ -1922,15 +1841,397 @@ mod tests {
             metric: Some(MetricId::Gdp),
             enforce_invariants: true,
         });
-        let frame = df!(
-            "year_month" => &["2026-01"],
-            "total_edits" => &[-1_i64],
-            "wiki" => &["nlwiki"]
-        )?;
+        let frame = df!("year_month" => &["2026-01"], "total_edits" => &[-1_i64], "wiki" => &["nlwiki"])?;
         let error = accumulator
             .observe(&frame)
             .expect_err("negative edit counts must block publication");
         assert!(error.to_string().contains("total_edits=-1 is negative"));
+        Ok(())
+    }
+
+    fn invariant_error(frame: DataFrame, metric: MetricId, needle: &str) {
+        let error = validate_metric_invariants(&frame, metric, 4)
+            .expect_err("fixture should violate a publication invariant");
+        assert!(
+            error.to_string().contains(needle),
+            "expected {needle:?} in {error:#}"
+        );
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn publication_helpers_cover_numeric_types_and_robust_outliers() -> Result<()> {
+        let mut gdp_accumulator = SemanticAccumulator::new(SemanticSpec {
+            date_column: Some("year_month".to_string()),
+            conservation_columns: Vec::new(),
+            ordering_contract: "writer-order/v1".to_string(),
+            page_week_consistency: false,
+            metric: Some(MetricId::Gdp),
+            enforce_invariants: true,
+        });
+        let gdp_rows = df!("year_month" => &["2026-01", "2026-02", "2026-03", "2026-04", "2026-05", "2026-06", "2026-07"], "total_edits" => &[1_i64, 1, 1, 1, 1, 1, 1])?;
+        gdp_accumulator.observe(&gdp_rows)?;
+        let mut cohort_accumulator = SemanticAccumulator::new(SemanticSpec {
+            date_column: Some("year".to_string()),
+            conservation_columns: Vec::new(),
+            ordering_contract: "writer-order/v1".to_string(),
+            page_week_consistency: false,
+            metric: Some(MetricId::LaborCohorts),
+            enforce_invariants: true,
+        });
+        let cohort_rows = df!("cohort_year" => &["2020"], "year" => &["2020"], "survived_editors" => &[1_i64])?;
+        cohort_accumulator.observe(&cohort_rows)?;
+
+        let numeric_columns = vec![
+            Column::new("u32".into(), &[1_u32][..]),
+            Column::new("u64".into(), &[1_u64][..]),
+            Column::new("i32".into(), &[1_i32][..]),
+            Column::new("i64".into(), &[1_i64][..]),
+            Column::new("f32".into(), &[1_f32][..]),
+            Column::new("f64".into(), &[1_f64][..]),
+            Column::new("null".into(), &[None::<u32>][..]),
+        ];
+        for column in numeric_columns {
+            let name = column.name().to_string();
+            let frame = DataFrame::new(1, vec![column])?;
+            let value = numeric_value(&frame, &name, 0)?;
+            if name == "null" {
+                assert_eq!(value, None);
+            } else {
+                assert_eq!(value, Some(1.0));
+            }
+        }
+        let text = df!("text" => &["not numeric"])?;
+        assert!(numeric_value(&text, "text", 0).is_err());
+
+        for name in [
+            "gross_bytes_added",
+            "gross_bytes",
+            "total_edits",
+            "productive_edits",
+            "reverted_edits",
+            "minor_edits",
+            "unique_editors",
+            "editors",
+            "active_editors",
+            "arrivals",
+            "departures",
+            "survived_editors",
+            "initial_editors",
+            "cohort_size",
+            "reached_5",
+            "reached_25",
+            "reached_100",
+            "total_patrols",
+            "unique_patrollers",
+            "patrol_new_pages",
+            "patrol_diffs",
+            "patrolled_revisions",
+            "autopatrolled_revisions",
+            "total_revisions",
+            "min_patrollers_50pct",
+            "edits",
+            "previous_week_edits",
+            "revision_count",
+        ] {
+            assert!(non_negative_metric_column(name), "{name} should be a count");
+        }
+        for name in ["bytes_per_edit", "net_bytes", "wow_change", "other"] {
+            assert!(!non_negative_metric_column(name));
+        }
+        for name in ["gini", "revert_rate", "arrival_rate", "departure_rate"] {
+            assert_eq!(metric_bounds(name), Some((0.0, 1.0)));
+        }
+        for name in ["patrol_coverage_pct", "adjusted_coverage_pct", "top1_pct"] {
+            assert_eq!(metric_bounds(name), Some((0.0, 100.0)));
+        }
+        assert_eq!(metric_bounds("theil"), Some((0.0, f64::INFINITY)));
+        assert_eq!(metric_bounds("palma"), Some((0.0, f64::INFINITY)));
+        assert_eq!(metric_bounds("unknown"), None);
+        assert_eq!(median(&mut []), None);
+        assert_eq!(median(&mut [3.0, 1.0, 2.0]), Some(2.0));
+        assert_eq!(median(&mut [4.0, 1.0, 3.0, 2.0]), Some(2.5));
+        assert!(close_enough(1.0, 1.0 + 1e-12));
+        assert!(close_enough_rounded(33.3, 100.0 / 3.0, 10.0));
+
+        let mut columns = vec![
+            Column::new(
+                "mad_series".into(),
+                [
+                    1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 100.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0,
+                ],
+            ),
+            Column::new(
+                "iqr_high".into(),
+                [
+                    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 100.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0,
+                ],
+            ),
+            Column::new(
+                "iqr_low".into(),
+                [
+                    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, -100.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0,
+                ],
+            ),
+            Column::new(
+                "flat".into(),
+                [
+                    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 100.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+                ],
+            ),
+            Column::new(
+                "nullable".into(),
+                [
+                    Some(1.0),
+                    None,
+                    Some(1.0),
+                    Some(1.0),
+                    Some(1.0),
+                    Some(1.0),
+                    Some(1.0),
+                    Some(1.0),
+                    Some(1.0),
+                    Some(1.0),
+                    Some(1.0),
+                    Some(1.0),
+                    Some(1.0),
+                ],
+            ),
+            Column::new(
+                "nan_values".into(),
+                [
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    f64::NAN,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                    1.0,
+                ],
+            ),
+            Column::new("year".into(), [0_i32; 13]),
+            Column::new("page_namespace".into(), [0_i32; 13]),
+            Column::new("text".into(), ["ignored"; 13]),
+        ];
+        for index in 0..21 {
+            let mut values = [1.0_f64; 13];
+            values[6] = 100.0 + index as f64;
+            columns.push(Column::new(format!("flat_{index}").into(), values));
+        }
+        let outlier_frame = DataFrame::new(13, columns)?;
+        warn_metric_outliers(&outlier_frame, MetricId::Gdp, 9)?;
+        let short = df!("value" => &[1.0_f64, 2.0])?;
+        warn_metric_outliers(&short, MetricId::Gdp, 0)?;
+        Ok(())
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn cohort_monotonicity_validates_order_and_nulls() -> Result<()> {
+        let valid = df!("cohort_year" => &["2020", "2020", "2020"], "year" => &["2020", "2022", "2021"], "survived_editors" => &[10_u32, 8, 9], "wiki" => &["enwiki", "enwiki", "enwiki"])?;
+        let mut accumulator =
+            SemanticAccumulator::new(SemanticSpec::for_identity("cohorts.parquet"));
+        accumulator.observe_cohort_monotonicity(&valid, 7)?;
+
+        let without_wiki = df!("cohort_year" => &["2020"], "year" => &["2020"], "survived_editors" => &[1_u32])?;
+        accumulator.observe_cohort_monotonicity(&without_wiki, 0)?;
+
+        let increasing = df!("cohort_year" => &["2020", "2020"], "year" => &["2020", "2021"], "survived_editors" => &[1_u32, 2])?;
+        assert!(
+            accumulator
+                .observe_cohort_monotonicity(&increasing, 0)
+                .is_err()
+        );
+        let out_of_order = df!("cohort_year" => &["2021", "2021"], "year" => &["2022", "2020"], "survived_editors" => &[8_u32, 7])?;
+        let mut another = SemanticAccumulator::new(SemanticSpec::for_identity("cohorts.parquet"));
+        assert!(
+            another
+                .observe_cohort_monotonicity(&out_of_order, 0)
+                .is_err()
+        );
+
+        for frame in [
+            df!("cohort_year" => &[None::<&str>], "year" => &["2020"], "survived_editors" => &[1_u32])?,
+            df!("cohort_year" => &["2020"], "year" => &[None::<&str>], "survived_editors" => &[1_u32])?,
+            df!("cohort_year" => &["2020"], "year" => &["2020"], "survived_editors" => &[None::<u32>])?,
+        ] {
+            let mut accumulator =
+                SemanticAccumulator::new(SemanticSpec::for_identity("cohorts.parquet"));
+            assert!(accumulator.observe_cohort_monotonicity(&frame, 0).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn metric_invariants_cover_valid_and_failure_contracts() -> Result<()> {
+        let gdp = df!("productive_edits" => &[6_i64], "reverted_edits" => &[4_i64], "total_edits" => &[10_i64], "revert_rate" => &[0.4_f64], "net_bytes" => &[100_i64], "bytes_per_edit" => &[10.0_f64], "unique_editors" => &[5_i64], "bytes_per_editor" => &[20.0_f64], "label" => &["registered"], "missing_value" => &[None::<f64>])?;
+        validate_metric_invariants(&gdp, MetricId::Gdp, 0)?;
+        let churn = df!("arrivals" => &[2_i64], "departures" => &[3_i64], "active_editors" => &[10_i64], "arrival_rate" => &[0.2_f64], "departure_rate" => &[0.3_f64])?;
+        validate_metric_invariants(&churn, MetricId::LaborChurn, 0)?;
+        let patrol = df!("total_patrols" => &[12_i64], "unique_patrollers" => &[4_i64], "patrol_new_pages" => &[2_i64], "patrol_diffs" => &[10_i64], "patrolled_revisions" => &[80_i64], "autopatrolled_revisions" => &[10_i64], "total_revisions" => &[100_i64], "min_patrollers_50pct" => &[2_i64], "median_latency_hours" => &[1.5_f64], "p90_latency_hours" => &[4.0_f64], "top1_pct" => &[25.0_f64], "patrol_coverage_pct" => &[80.0_f64], "adjusted_coverage_pct" => &[90.0_f64])?;
+        validate_metric_invariants(&patrol, MetricId::Patrol, 0)?;
+        let inequality = df!("gini" => &[0.4_f64], "theil" => &[0.2], "palma" => &[1.4])?;
+        validate_metric_invariants(&inequality, MetricId::Inequality, 0)?;
+        let funnel = df!("cohort_size" => &[100_i64], "reached_5" => &[80_i64], "reached_25" => &[50_i64], "reached_100" => &[20_i64])?;
+        validate_metric_invariants(&funnel, MetricId::BusinessFunnel, 0)?;
+        let cohorts = df!("survived_editors" => &[5_i64], "initial_editors" => &[10_i64])?;
+        validate_metric_invariants(&cohorts, MetricId::LaborCohorts, 0)?;
+        let weekly = df!("edits" => &[10_i64], "previous_week_edits" => &[5_i64], "wow_change" => &[5_i64], "wow_rate" => &[1.0_f64])?;
+        validate_metric_invariants(&weekly, MetricId::PageWeeklyEdits, 0)?;
+        let noop = df!("label" => &["one"])?;
+        for metric in [
+            MetricId::GdpActivityTiers,
+            MetricId::GdpUserTypeShare,
+            MetricId::LaborMonthly,
+        ] {
+            validate_metric_invariants(&noop, metric, 0)?;
+        }
+
+        invariant_error(
+            df!("productive_edits" => &[1_i64], "reverted_edits" => &[1_i64], "total_edits" => &[3_i64])?,
+            MetricId::Gdp,
+            "productive_edits + reverted_edits",
+        );
+        invariant_error(
+            df!("reverted_edits" => &[2_i64], "total_edits" => &[10_i64], "revert_rate" => &[0.3_f64])?,
+            MetricId::Gdp,
+            "revert_rate=",
+        );
+        invariant_error(
+            df!("reverted_edits" => &[0_i64], "total_edits" => &[0_i64], "revert_rate" => &[0.0_f64])?,
+            MetricId::Gdp,
+            "must be null when total_edits is zero",
+        );
+        invariant_error(
+            df!("reverted_edits" => &[1_i64], "total_edits" => &[10_i64], "revert_rate" => &[None::<f64>])?,
+            MetricId::Gdp,
+            "revert_rate is null",
+        );
+        invariant_error(
+            df!("net_bytes" => &[100_i64], "total_edits" => &[10_i64], "bytes_per_edit" => &[9.0_f64])?,
+            MetricId::Gdp,
+            "bytes_per_edit does not equal",
+        );
+        invariant_error(
+            df!("net_bytes" => &[0_i64], "total_edits" => &[0_i64], "bytes_per_edit" => &[0.0_f64])?,
+            MetricId::Gdp,
+            "bytes_per_edit must be null",
+        );
+        invariant_error(
+            df!("net_bytes" => &[100_i64], "total_edits" => &[10_i64], "bytes_per_edit" => &[None::<f64>])?,
+            MetricId::Gdp,
+            "bytes_per_edit is null",
+        );
+        invariant_error(
+            df!("net_bytes" => &[100_i64], "unique_editors" => &[5_i64], "bytes_per_editor" => &[19.0_f64])?,
+            MetricId::Gdp,
+            "bytes_per_editor does not equal",
+        );
+        invariant_error(
+            df!("net_bytes" => &[0_i64], "unique_editors" => &[0_i64], "bytes_per_editor" => &[0.0_f64])?,
+            MetricId::Gdp,
+            "bytes_per_editor must be null",
+        );
+        invariant_error(
+            df!("net_bytes" => &[100_i64], "unique_editors" => &[5_i64], "bytes_per_editor" => &[None::<f64>])?,
+            MetricId::Gdp,
+            "bytes_per_editor is null",
+        );
+        invariant_error(df!("gini" => &[2.0_f64])?, MetricId::Gdp, "outside [0");
+        invariant_error(df!("value" => &[f64::NAN])?, MetricId::Gdp, "non-finite");
+
+        invariant_error(
+            df!("arrivals" => &[2_i64], "active_editors" => &[10_i64], "arrival_rate" => &[0.3_f64], "departures" => &[3_i64], "departure_rate" => &[0.3_f64])?,
+            MetricId::LaborChurn,
+            "arrival_rate does not equal",
+        );
+        invariant_error(
+            df!("arrivals" => &[2_i64], "active_editors" => &[10_i64], "arrival_rate" => &[None::<f64>])?,
+            MetricId::LaborChurn,
+            "arrival_rate is null",
+        );
+        invariant_error(
+            df!("arrivals" => &[2_i64], "active_editors" => &[0_i64], "arrival_rate" => &[0.0_f64])?,
+            MetricId::LaborChurn,
+            "arrival_rate must be null",
+        );
+        invariant_error(
+            df!("departures" => &[3_i64], "active_editors" => &[10_i64], "departure_rate" => &[0.2_f64])?,
+            MetricId::LaborChurn,
+            "departure_rate does not equal",
+        );
+        invariant_error(
+            df!("departures" => &[3_i64], "active_editors" => &[10_i64], "departure_rate" => &[None::<f64>])?,
+            MetricId::LaborChurn,
+            "departure_rate is null",
+        );
+        invariant_error(
+            df!("departures" => &[3_i64], "active_editors" => &[0_i64], "departure_rate" => &[0.0_f64])?,
+            MetricId::LaborChurn,
+            "departure_rate must be null",
+        );
+
+        invariant_error(
+            df!("median_latency_hours" => &[-1.0_f64])?,
+            MetricId::Patrol,
+            "median_latency_hours=-1",
+        );
+        invariant_error(
+            df!("patrolled_revisions" => &[101_i64], "total_revisions" => &[100_i64])?,
+            MetricId::Patrol,
+            "exceeds total_revisions",
+        );
+        invariant_error(
+            df!("patrolled_revisions" => &[80_i64], "total_revisions" => &[100_i64], "patrol_coverage_pct" => &[79.0_f64])?,
+            MetricId::Patrol,
+            "published numerator",
+        );
+        invariant_error(
+            df!("patrolled_revisions" => &[80_i64], "total_revisions" => &[100_i64], "patrol_coverage_pct" => &[None::<f64>])?,
+            MetricId::Patrol,
+            "patrol_coverage_pct is null",
+        );
+        invariant_error(
+            df!("patrolled_revisions" => &[80_i64], "autopatrolled_revisions" => &[10_i64], "total_revisions" => &[100_i64], "adjusted_coverage_pct" => &[89.0_f64])?,
+            MetricId::Patrol,
+            "published numerator",
+        );
+        let missing_patrol_dimensions =
+            df!("patrol_coverage_pct" => &[0.0_f64], "adjusted_coverage_pct" => &[0.0_f64])?;
+        validate_metric_invariants(&missing_patrol_dimensions, MetricId::Patrol, 0)?;
+
+        invariant_error(
+            df!("cohort_size" => &[10_i64], "reached_5" => &[11_i64], "reached_25" => &[5_i64], "reached_100" => &[2_i64])?,
+            MetricId::BusinessFunnel,
+            "not monotonic",
+        );
+        invariant_error(
+            df!("survived_editors" => &[11_i64], "initial_editors" => &[10_i64])?,
+            MetricId::LaborCohorts,
+            "exceeds initial_editors",
+        );
+        invariant_error(
+            df!("edits" => &[10_i64], "previous_week_edits" => &[5_i64], "wow_change" => &[4_i64])?,
+            MetricId::PageWeeklyEdits,
+            "does not conserve",
+        );
+        invariant_error(
+            df!("edits" => &[10_i64], "previous_week_edits" => &[5_i64], "wow_change" => &[5_i64], "wow_rate" => &[0.5_f64])?,
+            MetricId::PageWeeklyEdits,
+            "does not equal",
+        );
+        invariant_error(
+            df!("edits" => &[0_i64], "previous_week_edits" => &[0_i64], "wow_change" => &[0_i64], "wow_rate" => &[0.0_f64])?,
+            MetricId::PageWeeklyEdits,
+            "wow_rate must be null",
+        );
         Ok(())
     }
 

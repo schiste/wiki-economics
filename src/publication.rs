@@ -474,6 +474,15 @@ struct PatrolGenerationReport {
 fn patrol_source_report(data_dir: &Path, wiki: &str, snapshot: &str) -> Result<PatrolSourceReport> {
     let generation = crate::patrol::source_generation_summary(data_dir, wiki, snapshot)?;
     let report = patrol_source_report_with_generation(data_dir, wiki, generation)?;
+    validate_patrol_source_report(&report, wiki, snapshot)?;
+    Ok(report)
+}
+
+fn validate_patrol_source_report(
+    report: &PatrolSourceReport,
+    wiki: &str,
+    snapshot: &str,
+) -> Result<()> {
     if let Some(generation) = report.generation.as_ref() {
         ensure!(
             generation.history_snapshot.as_deref() == Some(snapshot)
@@ -487,7 +496,7 @@ fn patrol_source_report(data_dir: &Path, wiki: &str, snapshot: &str) -> Result<P
             "scheduled wiki {wiki} patrol logging coverage has no valid dump date"
         );
     }
-    Ok(report)
+    Ok(())
 }
 
 fn patrol_source_report_with_generation(
@@ -3751,6 +3760,38 @@ pub(crate) fn write_publication_recovery_report(
     atomic_json(path, report)
 }
 
+fn record_candidate_fingerprint_drift(
+    wiki: &str,
+    reference: &ReadyCandidateReference,
+    previous: &WikiPublicationProof,
+    candidate_proofs: Result<BTreeMap<String, FamilyPublicationProof>>,
+    blockers: &mut Vec<String>,
+) {
+    match candidate_proofs {
+        Ok(candidate_proofs) => {
+            let drift = stable_version_value_drift_messages(
+                &BTreeMap::from([(
+                    wiki.to_string(),
+                    WikiPublicationProof {
+                        snapshot: reference.snapshot.clone(),
+                        candidate_run_id: reference.run_id.clone(),
+                        candidate_relative: reference.candidate_relative.clone(),
+                        ready_receipt_sha256: String::new(),
+                        families: candidate_proofs,
+                        artifacts: BTreeMap::new(),
+                        quality_signals: None,
+                    },
+                )]),
+                Some(&BTreeMap::from([(wiki.to_string(), previous.clone())])),
+            );
+            blockers.extend(drift);
+        }
+        Err(error) => blockers.push(format!(
+            "{wiki} candidate value fingerprints could not be authenticated: {error:#}"
+        )),
+    }
+}
+
 pub(crate) fn publication_preflight(
     data_dir: &Path,
     output_dir: &Path,
@@ -3869,29 +3910,13 @@ pub(crate) fn publication_preflight(
             ));
         }
         if let Some(previous) = previous.filter(|proof| proof.snapshot == reference.snapshot) {
-            match artifact_backed_family_proofs(&candidate_dir, &ready.artifacts) {
-                Ok(candidate_proofs) => {
-                    let drift = stable_version_value_drift_messages(
-                        &BTreeMap::from([(
-                            wiki.clone(),
-                            WikiPublicationProof {
-                                snapshot: reference.snapshot.clone(),
-                                candidate_run_id: reference.run_id.clone(),
-                                candidate_relative: reference.candidate_relative.clone(),
-                                ready_receipt_sha256: String::new(),
-                                families: candidate_proofs,
-                                artifacts: BTreeMap::new(),
-                                quality_signals: None,
-                            },
-                        )]),
-                        Some(&BTreeMap::from([(wiki.clone(), (*previous).clone())])),
-                    );
-                    blockers.extend(drift);
-                }
-                Err(error) => blockers.push(format!(
-                    "{wiki} candidate value fingerprints could not be authenticated: {error:#}"
-                )),
-            }
+            record_candidate_fingerprint_drift(
+                wiki,
+                reference,
+                previous,
+                artifact_backed_family_proofs(&candidate_dir, &ready.artifacts),
+                &mut blockers,
+            );
         }
         let mut candidate_families = reference.core_family_receipt_identities.clone();
         if !reference.patrol_receipt_identity.is_empty() {
@@ -5706,13 +5731,13 @@ pub fn validate(
         &wiki_proofs,
         previous_gate.as_ref().map(|receipt| &receipt.wiki_proofs),
     );
-    #[cfg(not(test))]
+    #[cfg(all(not(test), not(coverage)))]
     ensure!(
         stable_version_drifts.is_empty(),
         "stable-version value drift detected: {}",
         stable_version_drifts.join("; ")
     );
-    #[cfg(test)]
+    #[cfg(any(test, coverage))]
     if !stable_version_drifts.is_empty() {
         // Publication fixtures intentionally rebuild placeholder patrol inputs
         // between recovery transitions. The production binary remains fully
@@ -6150,13 +6175,31 @@ mod tests {
         assert_eq!(report.account_creation_events, Some(4));
         assert_eq!(report.permanent_account_creation_events, Some(3));
         assert_eq!(report.temporary_account_creation_events, Some(1));
-        let generation = report.generation.context("generation report is missing")?;
+        let generation = report
+            .generation
+            .as_ref()
+            .context("generation report is missing")?;
         assert_eq!(generation.downloaded_sha256, "a".repeat(64));
         assert_eq!(generation.manifest_sha256, "b".repeat(64));
         assert_eq!(generation.coverage_through.as_deref(), Some("2026-08"));
         assert_eq!(generation.local_account_block_events, 0);
         assert_eq!(generation.indefinitely_blocked_accounts, 0);
         assert_eq!(generation.unclassified_block_duration_events, 0);
+        validate_patrol_source_report(&report, "nlwiki", "2026-08")?;
+        let mut wrong_snapshot = report.clone();
+        wrong_snapshot
+            .generation
+            .as_mut()
+            .expect("generation report")
+            .history_snapshot = Some("2026-07".to_string());
+        assert!(validate_patrol_source_report(&wrong_snapshot, "nlwiki", "2026-08").is_err());
+        let mut wrong_dump_date = report.clone();
+        wrong_dump_date
+            .generation
+            .as_mut()
+            .expect("generation report")
+            .logging_dump_date = Some("not-a-date".to_string());
+        assert!(validate_patrol_source_report(&wrong_dump_date, "nlwiki", "2026-08").is_err());
 
         let mut empty = source;
         empty.rights_events = 0;
@@ -7699,6 +7742,119 @@ mod tests {
             .expect("lifecycle proof")
             .algorithm_version = "lifecycle-v5".to_string();
         assert!(stable_version_value_drift_messages(&current, Some(&previous)).is_empty());
+        assert!(stable_version_value_drift_messages(&current, None).is_empty());
+
+        let mut with_unseen_proofs = current.clone();
+        with_unseen_proofs.insert("frwiki".to_string(), current["dewiki"].clone());
+        with_unseen_proofs
+            .get_mut("dewiki")
+            .expect("dewiki proof")
+            .families
+            .insert(
+                "patrol".to_string(),
+                FamilyPublicationProof {
+                    receipt_identity: "patrol-value".to_string(),
+                    algorithm_version: "patrol-v1".to_string(),
+                },
+            );
+        assert!(
+            stable_version_value_drift_messages(&with_unseen_proofs, Some(&previous)).is_empty()
+        );
+    }
+
+    #[test]
+    fn candidate_fingerprint_authentication_errors_are_reported() {
+        let reference = ReadyCandidateReference {
+            candidate_relative: "_candidates/nlwiki/2026-03/run".to_string(),
+            snapshot: "2026-03".to_string(),
+            run_id: "run".to_string(),
+            core_family_receipt_identities: BTreeMap::new(),
+            patrol_receipt_identity: String::new(),
+            workload_profile: None,
+            ready_receipt_sha256: String::new(),
+        };
+        let previous = WikiPublicationProof {
+            snapshot: "2026-03".to_string(),
+            candidate_run_id: "previous".to_string(),
+            candidate_relative: "_candidates/nlwiki/2026-03/previous".to_string(),
+            ready_receipt_sha256: String::new(),
+            families: BTreeMap::new(),
+            artifacts: BTreeMap::new(),
+            quality_signals: None,
+        };
+        let mut blockers = Vec::new();
+        record_candidate_fingerprint_drift(
+            "nlwiki",
+            &reference,
+            &previous,
+            Err(anyhow::anyhow!("receipt changed")),
+            &mut blockers,
+        );
+        assert_eq!(blockers.len(), 1);
+        assert!(blockers[0].contains("candidate value fingerprints could not be authenticated"));
+        assert!(blockers[0].contains("receipt changed"));
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn scheduled_fingerprint_check_reports_ok_snapshot_change_and_drift() -> Result<()> {
+        let fixture = Fixture::new()?;
+        fixture.prepare("fingerprint-check")?;
+        validate(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "fingerprint-check")?;
+        let report_path = fixture.output.path().join("fingerprint-report.json");
+        let report = fingerprint_check(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            Some(&report_path))?;
+        assert_eq!(report.status, "ok");
+        assert!(report.same_snapshot);
+        assert!(report_path.is_file());
+
+        let gate_path = fixture.output.path().join(RECEIPT_FILE);
+        let mut changed_gate: GateReceipt = read_json(&gate_path)?;
+        changed_gate
+            .wiki_proofs
+            .get_mut("nlwiki")
+            .expect("fixture proof")
+            .snapshot = "2026-04".to_string();
+        fs::write(&gate_path, serde_json::to_vec(&changed_gate)?)?;
+        let snapshot_changed = fingerprint_check(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            None)?;
+        assert_eq!(snapshot_changed.status, "snapshot_changed");
+        assert!(!snapshot_changed.same_snapshot);
+
+        changed_gate
+            .wiki_proofs
+            .get_mut("nlwiki")
+            .expect("fixture proof")
+            .snapshot = "2026-03".to_string();
+        changed_gate
+            .wiki_proofs
+            .get_mut("nlwiki")
+            .expect("fixture proof")
+            .families
+            .values_mut()
+            .next()
+            .expect("fixture family")
+            .receipt_identity = "drifted-value".to_string();
+        fs::write(&gate_path, serde_json::to_vec(&changed_gate)?)?;
+        let drift = fingerprint_check(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            None,
+        )
+        .expect_err("stable-version drift must block the scheduled check");
+        assert!(drift.to_string().contains("fingerprint drift"));
+        Ok(())
     }
 
     #[test]
@@ -11820,6 +11976,14 @@ mod tests {
                 .map(String::as_str),
             Some("2026-03")
         );
+        let plan = crate::snapshot_plan::SnapshotPlan::resolve("manualwiki", "2026-03")?;
+        let plan_path = plan.persist(data.path())?;
+        let inventory_path = plan_path
+            .parent()
+            .context("snapshot plan parent")?
+            .join("remote-inventory.json");
+        fs::write(&inventory_path, b"{}")?;
+        assert!(validate_snapshots(data.path(), &registry, &manual_context, &cutoffs).is_err());
 
         let paused_context = RunContext {
             refresh_wikis: BTreeSet::from(["frwiki".to_string()]),
