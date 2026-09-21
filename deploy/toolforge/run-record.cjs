@@ -227,12 +227,20 @@ function qualificationSummary(environment) {
   const pipelineDirectory = path.join(directory, pipelineId);
   const stages = ["ingest", "metrics", "lifecycle", "page-week", "patrol", "publish"];
   const receipts = [];
-  for (const stage of stages) {
-    const file = path.join(pipelineDirectory, `${stage}.json`);
+  let files = [];
+  try {
+    files = fs.readdirSync(pipelineDirectory)
+      .filter((name) => name.endsWith(".json") && !name.endsWith(".start.json"));
+  } catch {
+    files = [];
+  }
+  for (const fileName of files.sort()) {
+    const file = path.join(pipelineDirectory, fileName);
     const value = readJson(file);
-    if (!value) continue;
+    if (!value || !stages.includes(value.stage)) continue;
     receipts.push({
-      stage,
+      stage: value.stage,
+      runId: value.run_id || null,
       status: value.status || null,
       path: path.relative(directory, file),
       receiptSha256: value.receipt_sha256 || null,
@@ -250,6 +258,7 @@ function qualificationSummary(environment) {
       bucketDistributionAvailable: value.bucket_size_distribution?.available ?? null,
     });
   }
+  receipts.sort((left, right) => `${left.stage}:${left.runId || ""}:${left.path}`.localeCompare(`${right.stage}:${right.runId || ""}:${right.path}`));
   return {pipelineId, directory, receipts};
 }
 

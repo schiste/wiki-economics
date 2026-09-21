@@ -23,7 +23,7 @@ output/_stages/patrol_compute/<wiki>.json
 output/_stages/merge.json
 output/_stages/dashboard-defaults.json
 output/_stages/site.json
-output/_qualification/<pipeline-id>/<stage>.json
+output/_qualification/<pipeline-id>/<stage>.<run-id>.json
 ```
 
 Every Parquet emitted by compute, patrol compute, or merge also has an adjacent
@@ -53,7 +53,7 @@ fast validation index and is deliberately excluded from the fingerprint.
 
 The six isolated Toolforge stages (`ingest`, `metrics`, `lifecycle`,
 `page-week`, `patrol`, and `publish`) also emit a qualification receipt at
-`output/_qualification/<pipeline-id>/<stage>.json`. The receipt is an
+`output/_qualification/<pipeline-id>/<stage>.<run-id>.json`. The receipt is an
 operational evidence envelope, not a replacement for the Rust semantic stage
 receipt. It records the selected snapshot and run identity, authenticated
 input/output artifact inventories (rows, bytes, SHA-256 and artifact-receipt
@@ -66,7 +66,8 @@ and is periodically updated by the wrapper. It is removed only after the
 final receipt is atomically written. `run-refresh.sh` finalizes this receipt
 before calling `pipeline-state.cjs complete`; if finalization fails, the stage
 is marked failed and the incomplete evidence remains visible in the refresh
-log/status record.
+log/status record. The run ID is part of the filename, so a retry creates a
+new receipt and never overwrites the evidence from an earlier attempt.
 
 ## Reuse Rules
 

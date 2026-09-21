@@ -271,7 +271,7 @@ test("the staged ingest job records a resumable pipeline lease", () => {
   assert.equal(state.stages.ingest.status, "succeeded");
   assert.equal(state.stages.metrics.status, "pending");
   const qualificationReceipt = JSON.parse(fs.readFileSync(
-    path.join(fixture.output, "_qualification", "pipeline-ingest-run", "ingest.json"),
+    path.join(fixture.output, "_qualification", "pipeline-ingest-run", "ingest.pipeline-ingest-run.json"),
     "utf8",
   ));
   assert.equal(qualificationReceipt.status, "succeeded");

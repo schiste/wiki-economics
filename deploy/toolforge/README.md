@@ -226,7 +226,7 @@ and higher resource envelope are being qualified.
   cgroup, disk, deployment provenance, and publication-gate data.
 - `qualification-receipt.cjs` — the per-stage evidence writer used by the six
   isolated qualification jobs. Each stage writes an immutable
-  `output/_qualification/<pipeline-id>/<stage>.json` after its final resource
+  `output/_qualification/<pipeline-id>/<stage>.<run-id>.json` after its final resource
   sample and before the pipeline lease can be completed. The receipt joins the
   authenticated Rust stage/artifact identities (rows, bytes, SHA-256 and
   fingerprints) with wall/CPU time, cgroup memory peak, persistent and

@@ -203,12 +203,20 @@ function safePart(value) {
   return String(value || "unknown").replace(/[^A-Za-z0-9._-]/g, "_");
 }
 
+function receiptRunId() {
+  return safePart(process.env.WIKI_ECON_RUN_ID || required("WIKI_ECON_RUN_ID"));
+}
+
+function receiptFilename(suffix) {
+  return `${safePart(stage())}.${receiptRunId()}${suffix}`;
+}
+
 function startPath() {
-  return path.join(receiptRoot(), safePart(process.env.WIKI_ECON_PIPELINE_ID || required("WIKI_ECON_RUN_ID")), `${safePart(stage())}.start.json`);
+  return path.join(receiptRoot(), safePart(process.env.WIKI_ECON_PIPELINE_ID || required("WIKI_ECON_RUN_ID")), receiptFilename(".start.json"));
 }
 
 function finalPath() {
-  return path.join(receiptRoot(), safePart(process.env.WIKI_ECON_PIPELINE_ID || required("WIKI_ECON_RUN_ID")), `${safePart(stage())}.json`);
+  return path.join(receiptRoot(), safePart(process.env.WIKI_ECON_PIPELINE_ID || required("WIKI_ECON_RUN_ID")), receiptFilename(".json"));
 }
 
 function start() {
