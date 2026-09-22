@@ -1,10 +1,21 @@
 {
   "schema_version": 1,
-  "policy_version": "enwiki-correctness-recovery-v2",
+  "policy_version": "enwiki-correctness-recovery-v3",
   "wiki": "enwiki",
   "publication": "hidden",
   "refresh": "qualification",
   "publication_eligible": false,
+  "minimum_successful_runs": 2,
+  "required_run_kinds": ["initial_candidate", "rollover"],
+  "required_stage_receipts": [
+    "ingest",
+    "metrics",
+    "lifecycle",
+    "page-week",
+    "patrol",
+    "publish"
+  ],
+  "required_receipt_kinds": ["capacity", "run"],
   "required_stages": [
     "ingest",
     "metrics",
@@ -21,6 +32,7 @@
     "noop_same_snapshot",
     "interruption_resume",
     "patrol",
+    "two_successful_runs",
     "rollover_safety",
     "rollback_cleanup"
   ]

@@ -20,6 +20,19 @@
     "enwiki": {
       "qualification_status": "candidate",
       "publication_eligible": false,
+      "promotion_gate": {
+        "minimum_successful_runs": 2,
+        "required_run_kinds": ["initial_candidate", "rollover"],
+        "required_stage_receipts": [
+          "ingest",
+          "metrics",
+          "lifecycle",
+          "page-week",
+          "patrol",
+          "publish"
+        ],
+        "required_receipt_kinds": ["capacity", "run"]
+      },
       "snapshot": "2026-08",
       "source_window_size": 1,
       "source_count": 309,

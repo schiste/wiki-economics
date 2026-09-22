@@ -28,6 +28,7 @@ const CHECKS = [
   "noop_same_snapshot",
   "interruption_resume",
   "patrol",
+  "two_successful_runs",
   "rollover_safety",
   "rollback_cleanup",
 ];
@@ -128,6 +129,12 @@ function validatePolicy(policy, label = "qualification proof policy") {
   nonEmptyString(policy.wiki, `${label}.wiki`);
   exactOrderedArray(policy.required_stages, STAGES, `${label}.required_stages`);
   exactOrderedArray(policy.required_checks, CHECKS, `${label}.required_checks`);
+  if (!Number.isSafeInteger(policy.minimum_successful_runs) || policy.minimum_successful_runs < 2) {
+    fail(label, "minimum_successful_runs must be at least two");
+  }
+  exactOrderedArray(policy.required_run_kinds, ["initial_candidate", "rollover"], `${label}.required_run_kinds`);
+  exactOrderedArray(policy.required_stage_receipts, STAGES, `${label}.required_stage_receipts`);
+  exactOrderedArray(policy.required_receipt_kinds, ["capacity", "run"], `${label}.required_receipt_kinds`);
   if (policy.publication_eligible !== false) fail(label, "must keep publication_eligible=false");
   if (policy.publication !== "hidden" || policy.refresh !== "qualification") {
     fail(label, "must require publication=hidden and refresh=qualification");
@@ -293,6 +300,85 @@ function validatePatrol(check, label) {
   }
 }
 
+function validateRunStageReceipt(entry, expectedSnapshot, label) {
+  if (!isRecord(entry)) fail(label, "stage receipt entry is missing");
+  nonEmptyString(entry.stage, `${label}.stage`);
+  if (entry.status !== "succeeded") fail(label, "stage receipt status must be succeeded");
+  validateSnapshot(entry.snapshot, `${label}.snapshot`);
+  if (entry.snapshot !== expectedSnapshot) fail(label, "stage receipt snapshot does not match its run");
+  if (!isRecord(entry.receipt)) fail(label, "stage receipt reference is missing");
+  if (entry.receipt.kind !== "wiki-economics-qualification-stage-receipt") {
+    fail(label, "stage receipt has an unsupported kind");
+  }
+  nonEmptyString(entry.receipt.ref, `${label}.receipt.ref`);
+  validateHash(entry.receipt.sha256, `${label}.receipt.sha256`);
+}
+
+function validateSuccessfulRuns(check, document, policy, label) {
+  if (!Array.isArray(check.successful_runs)
+      || check.successful_runs.length < policy.minimum_successful_runs) {
+    fail(label, `must contain at least ${policy.minimum_successful_runs} successful runs`);
+  }
+  if (!Number.isSafeInteger(check.successful_runs_count)
+      || check.successful_runs_count !== check.successful_runs.length) {
+    fail(label, "successful_runs_count must match the recorded runs");
+  }
+  const seenRunIds = new Set();
+  const seenKinds = new Set();
+  check.successful_runs.forEach((run, index) => {
+    const prefix = `${label}.successful_runs[${index}]`;
+    if (!isRecord(run)) fail(prefix, "run is missing");
+    nonEmptyString(run.run_id, `${prefix}.run_id`);
+    if (seenRunIds.has(run.run_id)) fail(prefix, "run IDs must be distinct");
+    seenRunIds.add(run.run_id);
+    nonEmptyString(run.kind, `${prefix}.kind`);
+    if (!policy.required_run_kinds.includes(run.kind)) fail(prefix, "run kind is not required by policy");
+    seenKinds.add(run.kind);
+    if (run.status !== "passed") fail(prefix, "run status must be passed");
+    boolean(run.publication_eligible, `${prefix}.publication_eligible`);
+    if (run.publication_eligible) fail(prefix, "qualification runs must remain publication-ineligible");
+    boolean(run.receipt_contract_passed, `${prefix}.receipt_contract_passed`);
+    if (!run.receipt_contract_passed) fail(prefix, "receipt contract did not pass");
+    validateSnapshot(run.snapshot, `${prefix}.snapshot`);
+    let expectedSnapshot = run.snapshot;
+    if (run.kind === "initial_candidate") {
+      if (run.snapshot !== document.snapshot) fail(prefix, "initial candidate must use the proof snapshot");
+    }
+    if (run.kind === "rollover") {
+      validateSnapshot(run.baseline_snapshot, `${prefix}.baseline_snapshot`);
+      validateSnapshot(run.candidate_snapshot, `${prefix}.candidate_snapshot`);
+      if (run.baseline_snapshot !== document.snapshot || run.baseline_snapshot >= run.candidate_snapshot) {
+        fail(prefix, "rollover must advance from the proof snapshot");
+      }
+      if (run.snapshot !== run.candidate_snapshot) fail(prefix, "rollover run snapshot must be its candidate snapshot");
+      expectedSnapshot = run.candidate_snapshot;
+    }
+    if (!Array.isArray(run.stage_receipts)) fail(prefix, "stage receipts are missing");
+    exactOrderedArray(run.stage_receipts.map((receipt) => receipt?.stage), policy.required_stage_receipts,
+      `${prefix}.stage_receipts`);
+    run.stage_receipts.forEach((receipt, receiptIndex) => {
+      validateRunStageReceipt(receipt, expectedSnapshot, `${prefix}.stage_receipts[${receiptIndex}]`);
+    });
+    if (!Array.isArray(run.receipts)) fail(prefix, "run receipt bundle is missing");
+    const receiptKinds = new Set();
+    run.receipts.forEach((receipt, receiptIndex) => {
+      const receiptLabel = `${prefix}.receipts[${receiptIndex}]`;
+      validateEvidenceReference(receipt, receiptLabel);
+      if (receiptKinds.has(receipt.kind)) fail(receiptLabel, "receipt kinds must be unique");
+      receiptKinds.add(receipt.kind);
+    });
+    policy.required_receipt_kinds.forEach((kind) => {
+      if (!receiptKinds.has(kind)) fail(prefix, `missing required ${kind} receipt`);
+    });
+    for (const field of ["warnings", "retries", "recovery_events"]) {
+      if (!Array.isArray(run[field])) fail(prefix, `${field} must be recorded in the run receipt`);
+    }
+  });
+  policy.required_run_kinds.forEach((kind) => {
+    if (!seenKinds.has(kind)) fail(label, `missing successful run kind: ${kind}`);
+  });
+}
+
 function validateGeneration(check, expectedSnapshot, label, {candidate = false} = {}) {
   if (!isRecord(check)) fail(label, "generation evidence is missing");
   validateSnapshot(check.snapshot, `${label}.snapshot`);
@@ -406,6 +492,7 @@ function validateChecks(document, policy, label) {
       case "noop_same_snapshot": validateNoOp(check, document, prefix); break;
       case "interruption_resume": validateInterruptionResume(check, prefix); break;
       case "patrol": validatePatrol(check, prefix); break;
+      case "two_successful_runs": validateSuccessfulRuns(check, document, policy, prefix); break;
       case "rollover_safety": validateRolloverSafety(check, document, prefix); break;
       case "rollback_cleanup": validateRollbackCleanup(check, prefix); break;
       default: fail(prefix, `unsupported check ${check.check}`);

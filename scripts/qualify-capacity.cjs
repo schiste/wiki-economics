@@ -59,6 +59,21 @@ function validatePolicy(policy) {
       throw new Error(`invalid workload profile admission policy for ${wiki}`);
     }
   }
+  const enwiki = policy.wikis.enwiki;
+  if (enwiki) {
+    const gate = enwiki.promotion_gate;
+    if (enwiki.qualification_status !== "candidate" || enwiki.publication_eligible !== false
+        || !gate || !Number.isSafeInteger(gate.minimum_successful_runs) || gate.minimum_successful_runs < 2
+        || !Array.isArray(gate.required_run_kinds)
+        || JSON.stringify(gate.required_run_kinds) !== JSON.stringify(["initial_candidate", "rollover"])
+        || JSON.stringify(gate.required_stage_receipts) !== JSON.stringify([
+          "ingest", "metrics", "lifecycle", "page-week", "patrol", "publish",
+        ])
+        || !Array.isArray(gate.required_receipt_kinds)
+        || JSON.stringify(gate.required_receipt_kinds) !== JSON.stringify(["capacity", "run"])) {
+      throw new Error("invalid enwiki two-run promotion gate");
+    }
+  }
   return policy;
 }
 
