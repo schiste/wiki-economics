@@ -53,7 +53,7 @@
       "state": "pending",
       "resource_class": "isolated",
       "publication_eligible": false,
-      "required_evidence": ["capacity report", "25 percent memory headroom", "correctness and recovery proof", "rollover safety proof", "full recovery drill"]
+      "required_evidence": ["capacity report", "25 percent memory headroom", "two successful qualification runs", "six stage receipts per run", "correctness and recovery proof", "rollover safety proof", "full recovery drill"]
     },
     {
       "step": 7,

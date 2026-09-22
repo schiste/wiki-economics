@@ -68,6 +68,7 @@ test("captures complete immutable evidence for a page-week qualification stage",
   const environment = {
     WIKI_ECON_REFRESH_STAGE: "page-week",
     WIKI_ECON_RUN_ID: "qualification-run",
+    WIKI_ECON_QUALIFICATION_RUN_KIND: "initial_candidate",
     WIKI_ECON_PIPELINE_ID: "qualification-pipeline",
     WIKI_ECON_RUN_WIKIS_JSON: JSON.stringify(["enwiki"]),
     WIKI_ECON_RUN_SNAPSHOT_FILE: snapshotFile,
@@ -102,6 +103,7 @@ test("captures complete immutable evidence for a page-week qualification stage",
   const receipt = JSON.parse(fs.readFileSync(finalPath, "utf8"));
 
   assert.equal(receipt.status, "succeeded");
+  assert.equal(receipt.run_kind, "initial_candidate");
   assert.equal(receipt.exit_code, 0);
   assert.equal(receipt.snapshot, "2026-08");
   assert.equal(receipt.input.rows, 5);

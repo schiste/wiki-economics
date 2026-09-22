@@ -26,6 +26,40 @@ function evidenceRef(kind) {
   return [{kind, ref: `evidence/${kind}.json`, sha256: digest("a")}];
 }
 
+function successfulRun(kind, runId, snapshot = "2026-08") {
+  const stageReceipts = STAGES.map((stage, index) => ({
+    stage,
+    status: "succeeded",
+    snapshot,
+    receipt: {
+      kind: "wiki-economics-qualification-stage-receipt",
+      ref: `runs/${runId}/${stage}.json`,
+      sha256: digest(["7", "8", "9", "a", "b", "c"][index]),
+    },
+  }));
+  const run = {
+    run_id: runId,
+    kind,
+    status: "passed",
+    snapshot,
+    publication_eligible: false,
+    receipt_contract_passed: true,
+    stage_receipts: stageReceipts,
+    receipts: [
+      {kind: "capacity", ref: `runs/${runId}/capacity.json`, sha256: digest("d")},
+      {kind: "run", ref: `runs/${runId}/run-receipt.json`, sha256: digest("e")},
+    ],
+    warnings: [],
+    retries: [],
+    recovery_events: [],
+  };
+  if (kind === "rollover") {
+    run.baseline_snapshot = "2026-08";
+    run.candidate_snapshot = snapshot;
+  }
+  return run;
+}
+
 function validEvidence() {
   const stageReceipts = STAGES.map((stage, index) => ({
     stage,
@@ -125,6 +159,16 @@ function validEvidence() {
         applicability_reason: "FlaggedRevs is the applicable moderation mechanism for this wiki.",
         headline_ratios_null: true,
         agents_blocked_from_comparison: true,
+      },
+      {
+        check: "two_successful_runs",
+        status: "passed",
+        evidence: evidenceRef("two-successful-runs"),
+        successful_runs_count: 2,
+        successful_runs: [
+          successfulRun("initial_candidate", "enwiki-qualification-initial", "2026-08"),
+          successfulRun("rollover", "enwiki-qualification-rollover", "2026-09"),
+        ],
       },
       {
         check: "rollover_safety",
@@ -234,10 +278,18 @@ const rejectionCases = [
   ["rejects incomplete same-snapshot no-op", (proof) => { proof.checks[4].stage_results.pop(); }, /stage_results/],
   ["rejects an interruption without resume", (proof) => { proof.checks[5].stages.metrics.resumed = false; }, /interruption and resume/],
   ["rejects misleading patrol non-applicability", (proof) => { proof.checks[6].headline_ratios_null = false; }, /null ratios/],
-  ["rejects mixed rollover generations", (proof) => { proof.checks[7].no_mixed_generations = false; }, /generation inputs or outputs were mixed/],
-  ["rejects an unmeasured rollover peak", (proof) => { proof.checks[7].storage.combined_high_water_bytes = null; }, /combined_high_water_bytes/],
-  ["rejects rollover reserve exhaustion", (proof) => { proof.checks[7].storage.minimum_free_bytes = 1; }, /required storage reserve/],
-  ["rejects failed rollback cleanup", (proof) => { proof.checks[8].cleanup_verified = false; }, /rollback and cleanup/],
+  ["rejects incomplete second qualification run", (proof) => { proof.checks[7].successful_runs[1].stage_receipts.pop(); }, /stage_receipts/],
+  ["rejects duplicate qualification run IDs", (proof) => { proof.checks[7].successful_runs[1].run_id = proof.checks[7].successful_runs[0].run_id; }, /run IDs must be distinct/],
+  ["rejects a missing rollover qualification run", (proof) => {
+    const run = proof.checks[7].successful_runs[1];
+    run.kind = "initial_candidate";
+    run.snapshot = "2026-08";
+    run.stage_receipts.forEach((receipt) => { receipt.snapshot = "2026-08"; });
+  }, /missing successful run kind: rollover/],
+  ["rejects mixed rollover generations", (proof) => { proof.checks[8].no_mixed_generations = false; }, /generation inputs or outputs were mixed/],
+  ["rejects an unmeasured rollover peak", (proof) => { proof.checks[8].storage.combined_high_water_bytes = null; }, /combined_high_water_bytes/],
+  ["rejects rollover reserve exhaustion", (proof) => { proof.checks[8].storage.minimum_free_bytes = 1; }, /required storage reserve/],
+  ["rejects failed rollback cleanup", (proof) => { proof.checks[9].cleanup_verified = false; }, /rollback and cleanup/],
   ["rejects publication eligibility", (proof) => { proof.publication.publication_eligible = true; }, /publication-ineligible/],
   ["rejects asserted-only checks", (proof) => { proof.checks[0].evidence = []; }, /hashed evidence reference/],
   ["rejects a receipt for another snapshot", (proof) => { proof.stages[0].receipt.snapshot = "2026-07"; }, /receipt snapshot/],

@@ -56,6 +56,7 @@ The six isolated Toolforge stages (`ingest`, `metrics`, `lifecycle`,
 `output/_qualification/<pipeline-id>/<stage>.<run-id>.json`. The receipt is an
 operational evidence envelope, not a replacement for the Rust semantic stage
 receipt. It records the selected snapshot and run identity, authenticated
+qualification run kind (`initial_candidate` or `rollover` when supplied),
 input/output artifact inventories (rows, bytes, SHA-256 and artifact-receipt
 hashes), stage fingerprints, wall time, cgroup CPU deltas and memory peak,
 persistent/scratch storage high-water marks, the configured and observed
