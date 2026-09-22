@@ -24,7 +24,13 @@ warehouse and snapshot:
 6. classify patrol as `applicable`, `not_applicable`, or `unknown`, and require
    non-negative/plausible counts. Non-applicable patrol must publish null
    headline ratios and block agent comparisons;
-7. roll back to the previous identity, verify it is restored, and clean the
+7. process the next completed snapshot while the preceding generation remains
+   available. Record both immutable generation manifests, the before/after
+   snapshot pointers, cutoff advancement, conservation, and every measured
+   persistent/scratch/combined storage high-water mark. Reject any mixed
+   generation path or cross-generation reference, and require the configured
+   storage reserve after the peak;
+8. roll back to the previous identity, verify it is restored, and clean the
    candidate workspace idempotently.
 
 The checks must be recorded as hashed evidence references. A prose assertion,
@@ -58,8 +64,10 @@ and these checks:
 
 `source_inventory`, `snapshot_consistency`, `invariants`,
 `deterministic_same_warehouse`, `noop_same_snapshot`,
-`interruption_resume`, `patrol`, `rollback_cleanup`.
+`interruption_resume`, `patrol`, `rollover_safety`, `rollback_cleanup`.
 
 Only after the proof digest and the capacity/resource receipts have been
 reviewed may an operator consider a separate promotion decision. This proof
-does not promote, schedule, or publish enwiki.
+does not promote, schedule, or publish enwiki. The rollover check is the
+acceptance gate required before activation: it does not retire the preceding
+generation, so a failed activation can still serve the retained candidate.

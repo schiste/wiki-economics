@@ -365,6 +365,13 @@ new-snapshot run. These are scheduling assumptions, not an SLO or benchmark.
 6. Complete a second successful full run before changing enwiki from
    `qualifying` to `scheduled`.
 
+The machine-readable acceptance record for this phase is the
+[enwiki correctness and recovery proof](enwiki-qualification-proof.md). Its
+`rollover_safety` check is fail-closed: both generation manifests and snapshot
+pointers must be authenticated, the preceding generation must remain
+available, and the measured persistent/scratch/combined high-water marks must
+leave the configured reserve.
+
 ## Production acceptance gates
 
 Enwiki may be scheduled only when all of the following hold:

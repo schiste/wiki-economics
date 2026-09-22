@@ -28,6 +28,7 @@ const CHECKS = [
   "noop_same_snapshot",
   "interruption_resume",
   "patrol",
+  "rollover_safety",
   "rollback_cleanup",
 ];
 const INVARIANTS = [
@@ -292,6 +293,92 @@ function validatePatrol(check, label) {
   }
 }
 
+function validateGeneration(check, expectedSnapshot, label, {candidate = false} = {}) {
+  if (!isRecord(check)) fail(label, "generation evidence is missing");
+  validateSnapshot(check.snapshot, `${label}.snapshot`);
+  if (check.snapshot !== expectedSnapshot) fail(label, "generation snapshot does not match the rollover pair");
+  boolean(check.complete, `${label}.complete`);
+  boolean(check.validated, `${label}.validated`);
+  if (!check.complete || !check.validated) fail(label, "generation must be complete and validated");
+  if (!candidate) {
+    boolean(check.available_before, `${label}.available_before`);
+    boolean(check.retained_during_rollover, `${label}.retained_during_rollover`);
+    boolean(check.available_after, `${label}.available_after`);
+    if (!check.available_before || !check.retained_during_rollover || !check.available_after) {
+      fail(label, "the preceding generation must remain available throughout rollover");
+    }
+  } else {
+    boolean(check.available_after, `${label}.available_after`);
+    if (!check.available_after) fail(label, "the completed candidate generation is not available");
+  }
+  nonEmptyString(check.manifest_path, `${label}.manifest_path`);
+  validateHash(check.manifest_sha256, `${label}.manifest_sha256`);
+}
+
+function validateRolloverSafety(check, document, label) {
+  validateSnapshot(check.baseline_snapshot, `${label}.baseline_snapshot`);
+  validateSnapshot(check.candidate_snapshot, `${label}.candidate_snapshot`);
+  if (check.baseline_snapshot >= check.candidate_snapshot) {
+    fail(label, "rollover must advance from the older snapshot to the newer snapshot");
+  }
+  if (check.baseline_snapshot !== document.snapshot) {
+    fail(label, "rollover must retain the proof target as its preceding generation");
+  }
+  nonEmptyString(check.baseline_run_id, `${label}.baseline_run_id`);
+  nonEmptyString(check.candidate_run_id, `${label}.candidate_run_id`);
+  if (check.baseline_run_id === check.candidate_run_id) fail(label, "rollover runs must be distinct");
+  validateGeneration(check.baseline_generation, check.baseline_snapshot, `${label}.baseline_generation`);
+  validateGeneration(check.candidate_generation, check.candidate_snapshot, `${label}.candidate_generation`, {candidate: true});
+  validateSnapshot(check.snapshot_pointer_before, `${label}.snapshot_pointer_before`);
+  validateSnapshot(check.snapshot_pointer_after, `${label}.snapshot_pointer_after`);
+  if (check.snapshot_pointer_before !== check.baseline_snapshot
+      || check.snapshot_pointer_after !== check.candidate_snapshot) {
+    fail(label, "snapshot pointer did not advance exactly across the rollover pair");
+  }
+  validateSnapshot(check.publication_snapshot_before, `${label}.publication_snapshot_before`);
+  if (check.publication_snapshot_before !== check.baseline_snapshot) {
+    fail(label, "rollover must begin with the preceding generation published");
+  }
+  boolean(check.publication_unchanged_during_rollover, `${label}.publication_unchanged_during_rollover`);
+  if (!check.publication_unchanged_during_rollover) fail(label, "publication changed during candidate construction");
+  if (!Array.isArray(check.observed_generation_snapshots)) fail(label, "observed generation snapshots are missing");
+  exactOrderedArray(
+    check.observed_generation_snapshots,
+    [check.baseline_snapshot, check.candidate_snapshot],
+    `${label}.observed_generation_snapshots`,
+  );
+  boolean(check.no_mixed_generations, `${label}.no_mixed_generations`);
+  if (!check.no_mixed_generations) fail(label, "generation inputs or outputs were mixed");
+  for (const name of ["mixed_snapshot_paths", "cross_generation_references"]) {
+    if (!Array.isArray(check[name]) || check[name].length !== 0) fail(label, `${name} must be empty`);
+  }
+  boolean(check.cutoff_advanced, `${label}.cutoff_advanced`);
+  boolean(check.conservation_passed, `${label}.conservation_passed`);
+  boolean(check.previous_generation_available, `${label}.previous_generation_available`);
+  if (!check.cutoff_advanced || !check.conservation_passed || !check.previous_generation_available) {
+    fail(label, "rollover cutoff, conservation, and preceding-generation retention must pass");
+  }
+  if (!isRecord(check.storage)) fail(label, "rollover storage measurements are missing");
+  const storage = check.storage;
+  const capacity = safeNonNegativeInteger(storage.capacity_bytes, `${label}.storage.capacity_bytes`, {positive: true});
+  const reserve = safeNonNegativeInteger(storage.required_reserve_bytes, `${label}.storage.required_reserve_bytes`, {positive: true});
+  const initial = safeNonNegativeInteger(storage.persistent_initial_bytes, `${label}.storage.persistent_initial_bytes`);
+  const highWater = safeNonNegativeInteger(storage.persistent_high_water_bytes, `${label}.storage.persistent_high_water_bytes`);
+  const final = safeNonNegativeInteger(storage.persistent_final_bytes, `${label}.storage.persistent_final_bytes`);
+  const scratchHighWater = safeNonNegativeInteger(storage.scratch_high_water_bytes, `${label}.storage.scratch_high_water_bytes`);
+  const combinedHighWater = safeNonNegativeInteger(storage.combined_high_water_bytes, `${label}.storage.combined_high_water_bytes`);
+  const minimumFree = safeNonNegativeInteger(storage.minimum_free_bytes, `${label}.storage.minimum_free_bytes`);
+  if (highWater < initial || highWater < final) fail(label, "persistent high-water mark is inconsistent with before/after measurements");
+  if (combinedHighWater < highWater || combinedHighWater < scratchHighWater) {
+    fail(label, "combined rollover high-water mark is inconsistent with component measurements");
+  }
+  if (minimumFree < reserve || capacity < combinedHighWater + reserve) {
+    fail(label, "rollover peak does not preserve the required storage reserve");
+  }
+  boolean(storage.within_budget, `${label}.storage.within_budget`);
+  if (!storage.within_budget) fail(label, "rollover storage exceeded its budget");
+}
+
 function validateRollbackCleanup(check, label) {
   ["rollback_verified", "restored_previous_identity", "cleanup_verified", "publication_mutated"].forEach((name) => {
     boolean(check[name], `${label}.${name}`);
@@ -319,6 +406,7 @@ function validateChecks(document, policy, label) {
       case "noop_same_snapshot": validateNoOp(check, document, prefix); break;
       case "interruption_resume": validateInterruptionResume(check, prefix); break;
       case "patrol": validatePatrol(check, prefix); break;
+      case "rollover_safety": validateRolloverSafety(check, document, prefix); break;
       case "rollback_cleanup": validateRollbackCleanup(check, prefix); break;
       default: fail(prefix, `unsupported check ${check.check}`);
     }
