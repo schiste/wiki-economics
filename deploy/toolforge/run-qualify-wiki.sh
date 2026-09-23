@@ -48,6 +48,20 @@ if [ "$wiki" = "enwiki" ]; then
   : "${WIKI_ECON_PREPARE_SNAPSHOT:?enwiki qualification requires WIKI_ECON_PREPARE_SNAPSHOT to pin the frozen snapshot}"
   export WIKI_ECON_SOURCE_WINDOW_SIZE=1
   export WIKI_ECON_PERSISTENT_STORAGE_RESERVE_BYTES="${WIKI_ECON_PERSISTENT_STORAGE_RESERVE_BYTES:-268435456000}"
+  # A recovered page-week stage may have only the candidate inputs, without a
+  # persisted profile. Keep that fallback on enwiki's frozen 2,048-bucket
+  # layout instead of silently using the generic 256-bucket default.
+  if [ -n "${WIKI_ECON_WEEKLY_BUCKET_COUNT:-}" ]; then
+    echo "enwiki qualification requires the explicit 64x32 weekly bucket layout; unset WIKI_ECON_WEEKLY_BUCKET_COUNT" >&2
+    exit 2
+  fi
+  if [ "${WIKI_ECON_WEEKLY_PRIMARY_BUCKET_COUNT:-64}" != 64 ] \
+    || [ "${WIKI_ECON_WEEKLY_SECONDARY_BUCKET_COUNT:-32}" != 32 ]; then
+    echo "enwiki qualification requires WIKI_ECON_WEEKLY_PRIMARY_BUCKET_COUNT=64 and WIKI_ECON_WEEKLY_SECONDARY_BUCKET_COUNT=32" >&2
+    exit 2
+  fi
+  export WIKI_ECON_WEEKLY_PRIMARY_BUCKET_COUNT=64
+  export WIKI_ECON_WEEKLY_SECONDARY_BUCKET_COUNT=32
 else
   export WIKI_ECON_SOURCE_WINDOW_SIZE="${WIKI_ECON_SOURCE_WINDOW_SIZE:-2}"
   export WIKI_ECON_PERSISTENT_STORAGE_RESERVE_BYTES="${WIKI_ECON_PERSISTENT_STORAGE_RESERVE_BYTES:-53687091200}"
