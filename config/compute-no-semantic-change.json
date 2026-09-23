@@ -270,6 +270,12 @@
       "paths": ["src/compute/mod.rs"],
       "reason": "Add an activity-tier-only streaming branch; page-week computation semantics and artifact bytes are unchanged.",
       "base_commit": "517ee2f61e1c7724448751795dba86c4d33a608a"
+    },
+    {
+      "family": "page_week",
+      "paths": ["src/compute/weekly/mod.rs"],
+      "reason": "Release input Parquet page cache after each external contribution is durably staged and log partition-level memory progress; page-week rows, formulas, and artifact bytes are unchanged.",
+      "base_commit": "517ee2f61e1c7724448751795dba86c4d33a608a"
     }
   ]
 }

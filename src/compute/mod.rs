@@ -1959,6 +1959,88 @@ mod tests {
     }
 
     #[test]
+    fn streamed_activity_tiers_match_batched_periods_across_gaps_and_years() -> Result<()> {
+        let base = df!(
+            "year_month" => &[
+                "2024-01", "2024-02", "2024-04", "2024-11",
+                "2025-02", "2026-01", "2026-02",
+            ],
+            "year_month_key" => &[202401_i32, 202402, 202404, 202411, 202502, 202601, 202602],
+            "user_type" => &[
+                "registered", "bot", "registered", "registered",
+                "temporary", "registered", "registered",
+            ],
+            "event_user_id" => &[1_i64, 1, 2, 1, 3, 1, 1],
+            "revision_id" => &[10_i64, 11, 12, 13, 14, 15, 16],
+            "revision_text_bytes_diff" => &[5_i64, -2, 8, 3, -4, 10, 6],
+        )?;
+        let editor_months = gdp_editor_month_frame(&base)?;
+        let month_keys = [
+            202401_i32, 202402, 202403, 202404, 202411, 202502, 202512, 202601, 202602,
+        ];
+        let mut streamed = Vec::new();
+        let mut quarter_accumulator = None;
+        let mut year_accumulator = None;
+        let mut current_quarter_key = None;
+        let mut current_year = None;
+        for month_key in month_keys {
+            let month = editor_months
+                .clone()
+                .lazy()
+                .filter(col("year_month_key").eq(lit(month_key)))
+                .collect()?;
+            push_activity_month_stream(
+                month,
+                month_key,
+                &mut streamed,
+                &mut quarter_accumulator,
+                &mut year_accumulator,
+                &mut current_quarter_key,
+                &mut current_year,
+            )?;
+        }
+        finish_activity_stream(
+            &mut streamed,
+            &mut quarter_accumulator,
+            &mut year_accumulator,
+            &mut current_quarter_key,
+            &mut current_year,
+        )?;
+
+        let mut uncached_months = vec![editor_months.clone()];
+        let mut uncached_output = Vec::new();
+        let mut unused_digests = Vec::new();
+        finish_activity_year_cached(
+            &mut uncached_months,
+            &mut uncached_output,
+            &mut unused_digests,
+            None,
+        )?;
+
+        let mut batched = Vec::new();
+        for year in [2024_i32, 2025, 2026] {
+            let mut months = vec![
+                editor_months
+                    .clone()
+                    .lazy()
+                    .filter((col("year_month_key") / lit(100_i32)).eq(lit(year)))
+                    .collect()?,
+            ];
+            finish_activity_year(&mut months, &mut batched)?;
+        }
+        let actual = sort_frame(
+            concat_frames(streamed)?,
+            ["period", "user_type", "tier_rank"],
+        )?;
+        let expected = sort_frame(
+            concat_frames(batched)?,
+            ["period", "user_type", "tier_rank"],
+        )?;
+        assert!(expected.equals_missing(&actual));
+        Ok(())
+    }
+
+    #[test]
     fn activity_tier_incremental_compute_flushes_each_calendar_year() -> Result<()> {
         let data_dir = TestDir::new()?;
         let output_dir = TestDir::new()?;
