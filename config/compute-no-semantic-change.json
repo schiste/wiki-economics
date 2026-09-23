@@ -294,6 +294,12 @@
       "paths": ["src/compute/weekly/mod.rs"],
       "reason": "Share page titles across external-merge rows and build the same string column without per-row String clones; page-week values and artifact bytes are unchanged.",
       "base_commit": "983536c8aefffbcd1b4098a4927667464a2c6dfd"
+    },
+    {
+      "family": "page_week",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Select the configured disk-backed bucket path for large staged page-week work; metric formulas, rows, totals, schema, and artifact bytes are unchanged.",
+      "base_commit": "59c67ad91547e21c84f238bc033ce47c1fd6e1f3"
     }
   ]
 }
