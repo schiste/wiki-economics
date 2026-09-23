@@ -823,11 +823,7 @@ impl WeeklyFinalBatch {
         self.previous = previous;
         let mut page_titles = StringChunkedBuilder::new("page_title".into(), rows);
         for title in taken.page_title {
-            if let Some(title) = title {
-                page_titles.append_value(title.as_ref());
-            } else {
-                page_titles.append_null();
-            }
+            page_titles.append_option(title.as_deref());
         }
         DataFrame::new_infer_height(vec![
             Column::new("week_start".into(), taken.week_start),
