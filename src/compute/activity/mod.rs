@@ -444,6 +444,16 @@ fn merge_editor_month_accumulator(
             col("gross_bytes").sum().alias("gross_bytes"),
         ])
         .with_column(user_type_from_rank_expr())
+        .select([
+            col("year_month"),
+            col("year_month_key"),
+            col("editor_identity"),
+            col("user_type_rank"),
+            col("edits"),
+            col("net_bytes"),
+            col("gross_bytes"),
+            col("user_type"),
+        ])
         .collect()?;
     Ok(Some(reduced))
 }
