@@ -252,6 +252,24 @@
       "paths": ["src/compute/lifecycle/mod.rs"],
       "reason": "Extend lifecycle period-key regression coverage only; lifecycle computation semantics and artifact bytes are unchanged.",
       "base_commit": "c7fad6b17c24a92da058f4f4b8847558fc374aa4"
+    },
+    {
+      "family": "monthly",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Add an activity-tier-only streaming branch; monthly computation semantics and artifact bytes are unchanged.",
+      "base_commit": "517ee2f61e1c7724448751795dba86c4d33a608a"
+    },
+    {
+      "family": "lifecycle",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Add an activity-tier-only streaming branch; lifecycle computation semantics and artifact bytes are unchanged.",
+      "base_commit": "517ee2f61e1c7724448751795dba86c4d33a608a"
+    },
+    {
+      "family": "page_week",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Add an activity-tier-only streaming branch; page-week computation semantics and artifact bytes are unchanged.",
+      "base_commit": "517ee2f61e1c7724448751795dba86c4d33a608a"
     }
   ]
 }
