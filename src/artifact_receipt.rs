@@ -397,27 +397,25 @@ impl SemanticAccumulator {
         let edits = frame.column("edits")?.u32()?;
         let previous = frame.column("previous_week_edits")?.u32()?;
         for row in 0..frame.height() {
-            let current = PreviousPageWeek {
-                page_id: page_ids.get(row),
-                page_namespace: namespaces.get(row),
-                page_title: titles.get(row).map(str::to_string),
-                week: NaiveDate::parse_from_str(
-                    weeks
-                        .get(row)
-                        .context("null week_start in page-week output")?,
-                    "%Y-%m-%d",
-                )?,
-                edits: edits.get(row).context("null edits in page-week output")?,
-            };
+            let page_id = page_ids.get(row);
+            let page_namespace = namespaces.get(row);
+            let page_title = titles.get(row);
+            let week = NaiveDate::parse_from_str(
+                weeks
+                    .get(row)
+                    .context("null week_start in page-week output")?,
+                "%Y-%m-%d",
+            )?;
+            let current_edits = edits.get(row).context("null edits in page-week output")?;
+            let same_page = self.previous_page_week.as_ref().is_some_and(|prior| {
+                prior.page_id == page_id
+                    && prior.page_namespace == page_namespace
+                    && prior.page_title.as_deref() == page_title
+            });
             let expected_previous = self
                 .previous_page_week
                 .as_ref()
-                .filter(|prior| {
-                    prior.page_id == current.page_id
-                        && prior.page_namespace == current.page_namespace
-                        && prior.page_title == current.page_title
-                        && current.week.signed_duration_since(prior.week).num_days() == 7
-                })
+                .filter(|prior| same_page && week.signed_duration_since(prior.week).num_days() == 7)
                 .map_or(0, |prior| prior.edits);
             ensure!(
                 previous
@@ -427,17 +425,26 @@ impl SemanticAccumulator {
                 "page-week previous_week_edits is inconsistent at receipt row {}",
                 self.rows - u64::try_from(frame.height())? + u64::try_from(row)?
             );
-            if let Some(prior) = &self.previous_page_week
-                && prior.page_id == current.page_id
-                && prior.page_namespace == current.page_namespace
-                && prior.page_title == current.page_title
-            {
+            if same_page {
+                let prior = self
+                    .previous_page_week
+                    .as_mut()
+                    .context("page-week predecessor disappeared during validation")?;
                 ensure!(
-                    prior.week < current.week,
+                    prior.week < week,
                     "page-week output is not strictly ordered within a page"
                 );
+                prior.week = week;
+                prior.edits = current_edits;
+            } else {
+                self.previous_page_week = Some(PreviousPageWeek {
+                    page_id,
+                    page_namespace,
+                    page_title: page_title.map(str::to_string),
+                    week,
+                    edits: current_edits,
+                });
             }
-            self.previous_page_week = Some(current);
         }
         Ok(())
     }
@@ -658,6 +665,7 @@ fn warn_metric_outliers(frame: &DataFrame, metric: MetricId, row_offset: u64) ->
         "year",
     ];
     const RADIUS: usize = 6;
+    const MAX_NEIGHBORS: usize = RADIUS * 2;
     const MAX_WARNINGS: usize = 20;
     let mut emitted = 0;
     for column in frame.columns() {
@@ -672,34 +680,35 @@ fn warn_metric_outliers(frame: &DataFrame, metric: MetricId, row_offset: u64) ->
             let Some(value) = values[row] else {
                 continue;
             };
-            let mut neighbors = Vec::new();
+            let mut neighbors = [0.0; MAX_NEIGHBORS];
+            let mut neighbor_count = 0;
             let start = row.saturating_sub(RADIUS);
             let end = (row + RADIUS).min(frame.height() - 1);
-            for (index, candidate) in values.iter().enumerate().skip(start).take(end - start + 1) {
+            for (index, candidate) in values.iter().enumerate().take(end + 1).skip(start) {
                 if index != row
                     && let Some(candidate) = candidate
                     && candidate.is_finite()
                 {
-                    neighbors.push(*candidate);
+                    neighbors[neighbor_count] = *candidate;
+                    neighbor_count += 1;
                 }
             }
-            if neighbors.len() < 6 {
+            if neighbor_count < 6 {
                 continue;
             }
-            let center = median(&mut neighbors.clone()).context("outlier median is missing")?;
-            let mut deviations = neighbors
-                .iter()
-                .map(|candidate| (candidate - center).abs())
-                .collect::<Vec<_>>();
-            let mad = median(&mut deviations);
+            let neighbors = &mut neighbors[..neighbor_count];
+            let center = median(neighbors).context("outlier median is missing")?;
+            let mut deviations = [0.0; MAX_NEIGHBORS];
+            for (index, candidate) in neighbors.iter().enumerate() {
+                deviations[index] = (candidate - center).abs();
+            }
+            let mad = median(&mut deviations[..neighbor_count]);
             let (outlier, method, score) = if let Some(mad) = mad.filter(|value| *value > 0.0) {
                 let score = (value - center).abs() / (1.4826 * mad);
                 (score >= 6.0, "rolling_mad", score)
             } else {
-                let mut sorted = neighbors.clone();
-                sorted.sort_by(f64::total_cmp);
-                let q1 = sorted[(sorted.len() - 1) / 4];
-                let q3 = sorted[(sorted.len() - 1) * 3 / 4];
+                let q1 = neighbors[(neighbor_count - 1) / 4];
+                let q3 = neighbors[(neighbor_count - 1) * 3 / 4];
                 let iqr = q3 - q1;
                 if iqr > 0.0 {
                     let score = if value < q1 - 3.0 * iqr {
