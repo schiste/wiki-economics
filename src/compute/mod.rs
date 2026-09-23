@@ -1482,6 +1482,29 @@ pub(crate) fn compute_family_at_snapshot(
             });
         }
         lifecycle::compute_external(wiki, output_dir, &partitions, load_partition)?;
+    } else if family == MetricFamily::PageWeek
+        && external
+        && weekly_config.secondary_bucket_count > 1
+    {
+        let snapshot = snapshot
+            .as_deref()
+            .context("bucketed page-week computation requires a snapshot")?;
+        info!(
+            wiki,
+            snapshot,
+            primary_buckets = weekly_config.primary_bucket_count,
+            secondary_buckets = weekly_config.secondary_bucket_count,
+            "selecting disk-backed bucketed page-week computation for the configured layout"
+        );
+        compute_page_weekly_edits_for_snapshot_cached(
+            wiki,
+            data_dir,
+            output_dir,
+            &weekly_config,
+            Some(snapshot),
+            None,
+        )?
+        .context("bucketed page-week computation produced no output")?;
     } else if family == MetricFamily::PageWeek && external {
         let snapshot = snapshot
             .as_deref()
