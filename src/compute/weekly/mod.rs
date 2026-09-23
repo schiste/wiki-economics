@@ -879,6 +879,7 @@ pub(super) fn compute_page_weekly_external_qualification(
     let mut staged_rows = 0usize;
     let mut total_edits_before = 0i64;
     for (index, partition) in partitions.iter().enumerate() {
+        let partition_started = Instant::now();
         let input_digest = cross_snapshot
             .map(|cache| cache.month_digest(&partition.year_month))
             .transpose()?;
@@ -923,6 +924,24 @@ pub(super) fn compute_page_weekly_external_qualification(
         let path = runs.partition_path(index);
         write_weekly_contribution_run(&path, &mut contribution)?;
         contribution_paths.push(path);
+        drop(contribution);
+        for file in &partition.files {
+            storage::discard_path_cache(file);
+        }
+        let memory = MemorySnapshot::capture();
+        info!(
+            wiki,
+            partition = index + 1,
+            total_partitions = partitions.len(),
+            year_month = partition.year_month.as_str(),
+            staged_rows,
+            elapsed_ms = partition_started.elapsed().as_secs_f64() * 1_000.0,
+            rss_bytes = ?memory.rss_bytes,
+            cgroup_current_bytes = ?memory.cgroup_current_bytes,
+            cgroup_peak_bytes = ?memory.cgroup_peak_bytes,
+            cgroup_limit_bytes = ?memory.cgroup_limit_bytes,
+            "page_weekly_edits: reduced and staged external contribution"
+        );
     }
     let reduction_elapsed_ms = reduction_started.elapsed().as_millis() as u64;
     let scratch_peak_bytes = runs.size_bytes()?;

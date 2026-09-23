@@ -34,8 +34,8 @@ use activity::{
     gdp_activity_tiers_for_period,
 };
 use activity::{
-    activity_tiers_all_periods, finish_activity_year_cached, gdp_editor_month_frame,
-    write_activity_outputs,
+    ActivityTierStream, activity_tiers_all_periods, finish_activity_year_cached,
+    gdp_editor_month_frame, write_activity_outputs,
 };
 use lifecycle::{
     LifecycleCheckpoint, RegisteredState, lifecycle_full_digest, lifecycle_prefix_digest,
@@ -639,6 +639,7 @@ fn compute_all_incremental_cached(
     let mut gdp_editor_month_frames = Vec::new();
     let mut gdp_activity_month_digests = Vec::new();
     let mut gdp_activity_year = None;
+    let mut activity_stream = ActivityTierStream::default();
     let mut labor_monthly_frames = Vec::new();
     let lifecycle_input_digest = if plan.lifecycle.must_compute() {
         cross_snapshot
@@ -704,12 +705,16 @@ fn compute_all_incremental_cached(
                 "analytical partitions are not ordered chronologically"
             );
             if partition.year != current_year {
-                let finish_result = finish_activity_year_cached(
-                    &mut gdp_editor_month_frames,
-                    &mut gdp_tier_frames,
-                    &mut gdp_activity_month_digests,
-                    cross_snapshot,
-                );
+                let finish_result = if cross_snapshot.is_some() {
+                    finish_activity_year_cached(
+                        &mut gdp_editor_month_frames,
+                        &mut gdp_tier_frames,
+                        &mut gdp_activity_month_digests,
+                        cross_snapshot,
+                    )
+                } else {
+                    activity_stream.finish(&mut gdp_tier_frames)
+                };
                 finish_result?;
             }
         }
@@ -784,14 +789,19 @@ fn compute_all_incremental_cached(
             let editor_month = cached_or_compute(
                 cross_snapshot,
                 "editor_month",
-                activity::ALGORITHM_VERSION,
+                activity::EDITOR_MONTH_ALGORITHM_VERSION,
                 input_digest,
                 "editor_month",
                 || gdp_editor_month_frame(&base),
             );
-            gdp_editor_month_frames.push(editor_month?);
-            if let Some(input_digest) = input_digest {
-                gdp_activity_month_digests.push(input_digest.to_string());
+            let editor_month = editor_month?;
+            if cross_snapshot.is_some() {
+                gdp_editor_month_frames.push(editor_month);
+                if let Some(input_digest) = input_digest {
+                    gdp_activity_month_digests.push(input_digest.to_string());
+                }
+            } else {
+                activity_stream.push_month(&mut gdp_tier_frames, editor_month, year_month_key)?;
             }
         }
         if let Some(state) = registered_state.as_mut()
@@ -845,12 +855,16 @@ fn compute_all_incremental_cached(
         result.context("failed to write partitioned monthly-family outputs")?;
     }
     if plan.activity_tiers.must_compute() {
-        let finish_result = finish_activity_year_cached(
-            &mut gdp_editor_month_frames,
-            &mut gdp_tier_frames,
-            &mut gdp_activity_month_digests,
-            cross_snapshot,
-        );
+        let finish_result = if cross_snapshot.is_some() {
+            finish_activity_year_cached(
+                &mut gdp_editor_month_frames,
+                &mut gdp_tier_frames,
+                &mut gdp_activity_month_digests,
+                cross_snapshot,
+            )
+        } else {
+            activity_stream.finish(&mut gdp_tier_frames)
+        };
         finish_result?;
         write_activity_outputs(wiki, output_dir, gdp_tier_frames)?;
     }
@@ -1918,6 +1932,73 @@ mod tests {
         assert_eq!(monthly.column("editors")?.u32()?.sum(), Some(3));
         assert_eq!(yearly.column("editors")?.u32()?.sum(), Some(2));
         assert_eq!(yearly.column("total_edits")?.u32()?.sum(), Some(4));
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_activity_tiers_match_batched_periods_across_gaps_and_years() -> Result<()> {
+        let base = df!(
+            "year_month" => &[
+                "2024-01", "2024-02", "2024-04", "2024-11",
+                "2025-02", "2026-01", "2026-02",
+            ],
+            "year_month_key" => &[202401_i32, 202402, 202404, 202411, 202502, 202601, 202602],
+            "user_type" => &[
+                "registered", "bot", "registered", "registered",
+                "temporary", "registered", "registered",
+            ],
+            "event_user_id" => &[1_i64, 1, 2, 1, 3, 1, 1],
+            "revision_id" => &[10_i64, 11, 12, 13, 14, 15, 16],
+            "revision_text_bytes_diff" => &[5_i64, -2, 8, 3, -4, 10, 6],
+        )
+        .expect("activity streaming fixture should be valid");
+        let editor_months = gdp_editor_month_frame(&base)?;
+        let month_keys = [
+            202401_i32, 202402, 202403, 202404, 202411, 202502, 202512, 202601, 202602,
+        ];
+        let mut streamed = Vec::new();
+        let mut stream = ActivityTierStream::default();
+        for month_key in month_keys {
+            let month = editor_months
+                .clone()
+                .lazy()
+                .filter(col("year_month_key").eq(lit(month_key)))
+                .collect()?;
+            stream
+                .push_month(&mut streamed, month, month_key)
+                .expect("activity month should stream successfully");
+        }
+        stream
+            .finish(&mut streamed)
+            .expect("partial final year should flush successfully");
+
+        let mut uncached_months = vec![editor_months.clone()];
+        let mut uncached_output = Vec::new();
+        let mut unused_digests = Vec::new();
+        finish_activity_year_cached(
+            &mut uncached_months,
+            &mut uncached_output,
+            &mut unused_digests,
+            None,
+        )
+        .expect("uncached activity-year fallback should flush");
+
+        let mut batched = Vec::new();
+        for year in [2024_i32, 2025, 2026] {
+            let mut months = vec![
+                editor_months
+                    .clone()
+                    .lazy()
+                    .filter((col("year_month_key") / lit(100_i32)).eq(lit(year)))
+                    .collect()?,
+            ];
+            finish_activity_year(&mut months, &mut batched)?;
+        }
+        let streamed = concat_frames(streamed)?;
+        let actual = sort_frame(streamed, ["period", "user_type", "tier_rank"])?;
+        let batched = concat_frames(batched)?;
+        let expected = sort_frame(batched, ["period", "user_type", "tier_rank"])?;
+        assert!(expected.equals_missing(&actual));
         Ok(())
     }
 

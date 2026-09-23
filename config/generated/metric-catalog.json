@@ -212,7 +212,7 @@
     {
       "id": "gdp_activity_tiers",
       "family": "activity_tiers",
-      "algorithm_version": "activity-tiers-v5-exclusive-period-user-type",
+      "algorithm_version": "activity-tiers-v6-streamed-period-aggregation-exclusive-user-type",
       "schema": [
         {
           "name": "year_month",
@@ -309,7 +309,7 @@
       "fingerprint": {
         "artifact_identity": "gdp_activity_tiers.parquet",
         "family": "activity_tiers",
-        "algorithm_version": "activity-tiers-v5-exclusive-period-user-type"
+        "algorithm_version": "activity-tiers-v6-streamed-period-aggregation-exclusive-user-type"
       },
       "browser": {
         "partitioning": "per_wiki_and_global_year_shards",
