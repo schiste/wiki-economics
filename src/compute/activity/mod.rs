@@ -1,7 +1,10 @@
 //! Activity-tier computation, annual cache units, and output assembly.
 
 /// Semantic version for month-, quarter-, and year-scaled activity tiers.
-pub(crate) const ALGORITHM_VERSION: &str = "activity-tiers-v5-exclusive-period-user-type";
+pub(crate) const ALGORITHM_VERSION: &str =
+    "activity-tiers-v6-streamed-period-aggregation-exclusive-user-type";
+pub(crate) const EDITOR_MONTH_ALGORITHM_VERSION: &str =
+    "activity-tiers-v5-exclusive-period-user-type";
 
 use super::{
     add_wiki_column, concat_frames, editor_identity_available_expr, editor_identity_expr,
@@ -11,6 +14,7 @@ use super::{
 use anyhow::Result;
 use polars::prelude::*;
 use std::path::Path;
+use tracing::info;
 
 pub(super) fn gdp_editor_month_frame(base: &DataFrame) -> Result<DataFrame> {
     ensure_editor_identity_inputs(base)?
@@ -331,6 +335,117 @@ pub(super) fn finish_activity_year_cached(
         return Ok(());
     }
     finish_activity_year(editor_month_frames, output_frames)
+}
+
+/// Add one month to the low-memory activity-tier path. Monthly results are
+/// emitted immediately, while quarter and year accumulators retain one row
+/// per editor instead of keeping every editor-month frame alive until the end
+/// of the year.
+pub(super) fn push_activity_month_stream(
+    editor_month: DataFrame,
+    year_month_key: i32,
+    output_frames: &mut Vec<DataFrame>,
+    quarter_accumulator: &mut Option<DataFrame>,
+    year_accumulator: &mut Option<DataFrame>,
+    current_quarter_key: &mut Option<i32>,
+    current_year: &mut Option<i32>,
+) -> Result<()> {
+    let year = year_month_key / 100;
+    let month = year_month_key % 100;
+    anyhow::ensure!(
+        (1..=12).contains(&month),
+        "invalid activity month key {year_month_key}"
+    );
+    let quarter_key = year * 10 + (month - 1) / 3 + 1;
+
+    if current_year.is_some_and(|previous| previous != year) {
+        finish_activity_stream(
+            output_frames,
+            quarter_accumulator,
+            year_accumulator,
+            current_quarter_key,
+            current_year,
+        )?;
+    } else if current_quarter_key.is_some_and(|previous| previous != quarter_key) {
+        finish_activity_accumulator(quarter_accumulator, ActivityPeriod::Quarter, output_frames)?;
+        *current_quarter_key = None;
+    }
+
+    *current_year = Some(year);
+    *current_quarter_key = Some(quarter_key);
+    output_frames.push(gdp_activity_tiers_for_period(
+        &editor_month,
+        ActivityPeriod::Month,
+    )?);
+
+    if editor_month.height() > 0 {
+        *quarter_accumulator =
+            merge_editor_month_accumulator(quarter_accumulator.take(), editor_month.clone())?;
+        *year_accumulator = merge_editor_month_accumulator(year_accumulator.take(), editor_month)?;
+    }
+
+    if month % 3 == 0 {
+        finish_activity_accumulator(quarter_accumulator, ActivityPeriod::Quarter, output_frames)?;
+        *current_quarter_key = None;
+    }
+    if month == 12 {
+        finish_activity_accumulator(year_accumulator, ActivityPeriod::Year, output_frames)?;
+        *current_year = None;
+    }
+    info!(
+        stage = "compute_activity_tiers",
+        year_month_key, "completed streamed activity month"
+    );
+    Ok(())
+}
+
+pub(super) fn finish_activity_stream(
+    output_frames: &mut Vec<DataFrame>,
+    quarter_accumulator: &mut Option<DataFrame>,
+    year_accumulator: &mut Option<DataFrame>,
+    current_quarter_key: &mut Option<i32>,
+    current_year: &mut Option<i32>,
+) -> Result<()> {
+    finish_activity_accumulator(quarter_accumulator, ActivityPeriod::Quarter, output_frames)?;
+    finish_activity_accumulator(year_accumulator, ActivityPeriod::Year, output_frames)?;
+    *current_quarter_key = None;
+    *current_year = None;
+    Ok(())
+}
+
+fn finish_activity_accumulator(
+    accumulator: &mut Option<DataFrame>,
+    period: ActivityPeriod,
+    output_frames: &mut Vec<DataFrame>,
+) -> Result<()> {
+    if let Some(editor_period) = accumulator.take() {
+        output_frames.push(gdp_activity_tiers_for_period(&editor_period, period)?);
+    }
+    Ok(())
+}
+
+fn merge_editor_month_accumulator(
+    accumulator: Option<DataFrame>,
+    editor_month: DataFrame,
+) -> Result<Option<DataFrame>> {
+    let Some(accumulator) = accumulator else {
+        return Ok(Some(editor_month));
+    };
+    let combined = super::concat_frames(vec![accumulator, editor_month])?;
+    let reduced = combined
+        .lazy()
+        .group_by([col("editor_identity")])
+        .agg([
+            col("year_month").max().alias("year_month"),
+            col("year_month_key").max().alias("year_month_key"),
+            col("user_type_rank").max().alias("user_type_rank"),
+            col("edits").sum().alias("edits"),
+            col("net_bytes").sum().alias("net_bytes"),
+            col("gross_bytes").sum().alias("gross_bytes"),
+        ])
+        .with_column(user_type_from_rank_expr())
+        .collect()?;
+    Ok(Some(reduced))
 }
 
 pub(super) fn write_activity_outputs(
