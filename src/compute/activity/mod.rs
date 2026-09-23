@@ -377,10 +377,9 @@ impl ActivityTierStream {
         output_frames.push(monthly_tiers);
 
         if editor_month.height() > 0 {
-            self.quarter_accumulator = merge_editor_month_accumulator(
-                self.quarter_accumulator.take(),
-                editor_month.clone(),
-            )?;
+            let quarter = self.quarter_accumulator.take();
+            self.quarter_accumulator =
+                merge_editor_month_accumulator(quarter, editor_month.clone())?;
             self.year_accumulator =
                 merge_editor_month_accumulator(self.year_accumulator.take(), editor_month)?;
         }
