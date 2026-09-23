@@ -337,80 +337,86 @@ pub(super) fn finish_activity_year_cached(
     finish_activity_year(editor_month_frames, output_frames)
 }
 
-/// Add one month to the low-memory activity-tier path. Monthly results are
-/// emitted immediately, while quarter and year accumulators retain one row
-/// per editor instead of keeping every editor-month frame alive until the end
-/// of the year.
-pub(super) fn push_activity_month_stream(
-    editor_month: DataFrame,
-    year_month_key: i32,
-    output_frames: &mut Vec<DataFrame>,
-    quarter_accumulator: &mut Option<DataFrame>,
-    year_accumulator: &mut Option<DataFrame>,
-    current_quarter_key: &mut Option<i32>,
-    current_year: &mut Option<i32>,
-) -> Result<()> {
-    let year = year_month_key / 100;
-    let month = year_month_key % 100;
-    anyhow::ensure!(
-        (1..=12).contains(&month),
-        "invalid activity month key {year_month_key}"
-    );
-    let quarter_key = year * 10 + (month - 1) / 3 + 1;
-
-    if current_year.is_some_and(|previous| previous != year) {
-        finish_activity_stream(
-            output_frames,
-            quarter_accumulator,
-            year_accumulator,
-            current_quarter_key,
-            current_year,
-        )?;
-    } else if current_quarter_key.is_some_and(|previous| previous != quarter_key) {
-        finish_activity_accumulator(quarter_accumulator, ActivityPeriod::Quarter, output_frames)?;
-        *current_quarter_key = None;
-    }
-
-    *current_year = Some(year);
-    *current_quarter_key = Some(quarter_key);
-    output_frames.push(gdp_activity_tiers_for_period(
-        &editor_month,
-        ActivityPeriod::Month,
-    )?);
-
-    if editor_month.height() > 0 {
-        *quarter_accumulator =
-            merge_editor_month_accumulator(quarter_accumulator.take(), editor_month.clone())?;
-        *year_accumulator = merge_editor_month_accumulator(year_accumulator.take(), editor_month)?;
-    }
-
-    if month % 3 == 0 {
-        finish_activity_accumulator(quarter_accumulator, ActivityPeriod::Quarter, output_frames)?;
-        *current_quarter_key = None;
-    }
-    if month == 12 {
-        finish_activity_accumulator(year_accumulator, ActivityPeriod::Year, output_frames)?;
-        *current_year = None;
-    }
-    info!(
-        stage = "compute_activity_tiers",
-        year_month_key, "completed streamed activity month"
-    );
-    Ok(())
+/// Stateful low-memory activity-tier aggregation across chronological month partitions.
+#[derive(Default)]
+pub(super) struct ActivityTierStream {
+    quarter_accumulator: Option<DataFrame>,
+    year_accumulator: Option<DataFrame>,
+    current_quarter_key: Option<i32>,
+    current_year: Option<i32>,
 }
 
-pub(super) fn finish_activity_stream(
-    output_frames: &mut Vec<DataFrame>,
-    quarter_accumulator: &mut Option<DataFrame>,
-    year_accumulator: &mut Option<DataFrame>,
-    current_quarter_key: &mut Option<i32>,
-    current_year: &mut Option<i32>,
-) -> Result<()> {
-    finish_activity_accumulator(quarter_accumulator, ActivityPeriod::Quarter, output_frames)?;
-    finish_activity_accumulator(year_accumulator, ActivityPeriod::Year, output_frames)?;
-    *current_quarter_key = None;
-    *current_year = None;
-    Ok(())
+impl ActivityTierStream {
+    pub(super) fn push_month(
+        &mut self,
+        output_frames: &mut Vec<DataFrame>,
+        editor_month: DataFrame,
+        year_month_key: i32,
+    ) -> Result<()> {
+        let year = year_month_key / 100;
+        let month = year_month_key % 100;
+        anyhow::ensure!(
+            (1..=12).contains(&month),
+            "invalid activity month key {year_month_key}"
+        );
+        let quarter_key = year * 10 + (month - 1) / 3 + 1;
+
+        if self.current_year.is_some_and(|previous| previous != year) {
+            self.finish(output_frames)?;
+        } else if self
+            .current_quarter_key
+            .is_some_and(|previous| previous != quarter_key)
+        {
+            self.finish_quarter(output_frames)?;
+            self.current_quarter_key = None;
+        }
+
+        self.current_year = Some(year);
+        self.current_quarter_key = Some(quarter_key);
+        let monthly_tiers = gdp_activity_tiers_for_period(&editor_month, ActivityPeriod::Month)?;
+        output_frames.push(monthly_tiers);
+
+        if editor_month.height() > 0 {
+            self.quarter_accumulator = merge_editor_month_accumulator(
+                self.quarter_accumulator.take(),
+                editor_month.clone(),
+            )?;
+            self.year_accumulator =
+                merge_editor_month_accumulator(self.year_accumulator.take(), editor_month)?;
+        }
+
+        if month % 3 == 0 {
+            self.finish_quarter(output_frames)?;
+            self.current_quarter_key = None;
+        }
+        if month == 12 {
+            self.finish_year(output_frames)?;
+            self.current_year = None;
+        }
+        info!(
+            stage = "compute_activity_tiers",
+            year_month_key, "completed streamed activity month"
+        );
+        Ok(())
+    }
+
+    pub(super) fn finish(&mut self, output_frames: &mut Vec<DataFrame>) -> Result<()> {
+        self.finish_quarter(output_frames)?;
+        self.finish_year(output_frames)?;
+        self.current_quarter_key = None;
+        self.current_year = None;
+        Ok(())
+    }
+
+    fn finish_quarter(&mut self, output_frames: &mut Vec<DataFrame>) -> Result<()> {
+        let accumulator = &mut self.quarter_accumulator;
+        finish_activity_accumulator(accumulator, ActivityPeriod::Quarter, output_frames)
+    }
+
+    fn finish_year(&mut self, output_frames: &mut Vec<DataFrame>) -> Result<()> {
+        let accumulator = &mut self.year_accumulator;
+        finish_activity_accumulator(accumulator, ActivityPeriod::Year, output_frames)
+    }
 }
 
 fn finish_activity_accumulator(
