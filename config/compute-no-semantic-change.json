@@ -300,6 +300,24 @@
       "paths": ["src/compute/mod.rs"],
       "reason": "Select the configured disk-backed bucket path for large staged page-week work; metric formulas, rows, totals, schema, and artifact bytes are unchanged.",
       "base_commit": "59c67ad91547e21c84f238bc033ce47c1fd6e1f3"
+    },
+    {
+      "family": "monthly",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "The change only routes page-week work; monthly formulas, rows, totals, schema, and artifact bytes are unchanged.",
+      "base_commit": "59c67ad91547e21c84f238bc033ce47c1fd6e1f3"
+    },
+    {
+      "family": "activity_tiers",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "The change only routes page-week work; activity-tier formulas, rows, totals, schema, and artifact bytes are unchanged.",
+      "base_commit": "59c67ad91547e21c84f238bc033ce47c1fd6e1f3"
+    },
+    {
+      "family": "lifecycle",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "The change only routes page-week work; lifecycle formulas, rows, totals, schema, and artifact bytes are unchanged.",
+      "base_commit": "59c67ad91547e21c84f238bc033ce47c1fd6e1f3"
     }
   ]
 }
