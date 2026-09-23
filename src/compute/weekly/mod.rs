@@ -23,6 +23,7 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tracing::info;
 
@@ -674,7 +675,8 @@ pub(super) const WEEKLY_EXTERNAL_READ_ROWS: usize = 4_096;
 pub(super) struct WeeklyContributionRow {
     page_id: Option<i64>,
     page_namespace: Option<i32>,
-    page_title: Option<String>,
+    // Rows are cloned for cursor-order checks and output batching; share the title bytes.
+    page_title: Option<Arc<str>>,
     week_start: i32,
     edits: u32,
 }
@@ -732,7 +734,7 @@ impl WeeklyContributionCursor {
                         .column("page_title")?
                         .str()?
                         .get(self.row)
-                        .map(str::to_owned),
+                        .map(Arc::<str>::from),
                     week_start: batch
                         .column("week_start")?
                         .date()?
@@ -770,7 +772,7 @@ pub(super) struct WeeklyFinalBatch {
     iso_year: Vec<i32>,
     iso_week: Vec<i32>,
     page_id: Vec<Option<i64>>,
-    page_title: Vec<Option<String>>,
+    page_title: Vec<Option<Arc<str>>>,
     page_namespace: Vec<Option<i32>>,
     edits: Vec<u32>,
     previous_week_edits: Vec<u32>,
@@ -819,12 +821,16 @@ impl WeeklyFinalBatch {
         let previous = self.previous.clone();
         let taken = std::mem::take(self);
         self.previous = previous;
+        let mut page_titles = StringChunkedBuilder::new("page_title".into(), rows);
+        for title in taken.page_title {
+            page_titles.append_option(title.as_deref());
+        }
         DataFrame::new_infer_height(vec![
             Column::new("week_start".into(), taken.week_start),
             Column::new("iso_year".into(), taken.iso_year),
             Column::new("iso_week".into(), taken.iso_week),
             Column::new("page_id".into(), taken.page_id),
-            Column::new("page_title".into(), taken.page_title),
+            page_titles.finish().into_column(),
             Column::new("page_namespace".into(), taken.page_namespace),
             Column::new("edits".into(), taken.edits),
             Column::new("previous_week_edits".into(), taken.previous_week_edits),
