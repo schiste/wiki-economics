@@ -1838,13 +1838,19 @@ impl Drop for WeeklyRunDir {
 struct CacheEvictingOutputFile {
     file: File,
     bytes_since_eviction: u64,
+    eviction_interval_bytes: u64,
 }
 
 impl CacheEvictingOutputFile {
     fn new(file: File) -> Self {
+        Self::with_eviction_interval(file, WEEKLY_OUTPUT_CACHE_EVICT_BYTES)
+    }
+
+    fn with_eviction_interval(file: File, eviction_interval_bytes: u64) -> Self {
         Self {
             file,
             bytes_since_eviction: 0,
+            eviction_interval_bytes,
         }
     }
 }
@@ -1855,7 +1861,7 @@ impl Write for CacheEvictingOutputFile {
         self.bytes_since_eviction = self
             .bytes_since_eviction
             .saturating_add(u64::try_from(written).unwrap_or(u64::MAX));
-        if self.bytes_since_eviction >= WEEKLY_OUTPUT_CACHE_EVICT_BYTES {
+        if self.bytes_since_eviction >= self.eviction_interval_bytes {
             // The advice is best-effort. Sync first so completed file pages
             // are clean and eligible for eviction while later batches append.
             if self.file.sync_data().is_ok()
@@ -1964,4 +1970,28 @@ pub(crate) fn benchmark_page_weekly_edits(
     compute_page_weekly_edits(wiki, data_dir, output_dir, config)?.with_context(|| {
         format!("cannot benchmark page_weekly_edits: no warehouse partitions for {wiki}")
     })
+}
+
+#[cfg(test)]
+mod output_cache_tests {
+    use super::{CacheEvictingOutputFile, File};
+    use crate::test_support::TestDir;
+    use std::io::Write;
+
+    #[test]
+    fn syncs_and_evicts_completed_output_chunks() -> anyhow::Result<()> {
+        let directory = TestDir::new()?;
+        let path = directory.path().join("page-week.tmp");
+        let file = File::create(&path)?;
+        let mut output = CacheEvictingOutputFile::with_eviction_interval(file, 5);
+
+        output.write_all(b"first")?;
+        assert_eq!(output.bytes_since_eviction, 0);
+        output.write_all(b"next")?;
+        assert_eq!(output.bytes_since_eviction, 4);
+        output.flush()?;
+        assert_eq!(std::fs::read(path)?, b"firstnext");
+
+        Ok(())
+    }
 }
