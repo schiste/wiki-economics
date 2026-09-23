@@ -276,6 +276,12 @@
       "paths": ["src/compute/weekly/mod.rs"],
       "reason": "Release input Parquet page cache after each external contribution is durably staged and log partition-level memory progress; page-week rows, formulas, and artifact bytes are unchanged.",
       "base_commit": "517ee2f61e1c7724448751795dba86c4d33a608a"
+    },
+    {
+      "family": "page_week",
+      "paths": ["src/compute/weekly/mod.rs"],
+      "reason": "Evict each durable external page-week contribution run to bound qualification cgroup use; weekly grouping, rows, totals, and artifact bytes are unchanged.",
+      "base_commit": "21d4ed7dd0288ff9442d233802948aa864585baa"
     }
   ]
 }
