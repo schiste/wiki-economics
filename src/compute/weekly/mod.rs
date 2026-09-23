@@ -923,6 +923,10 @@ pub(super) fn compute_page_weekly_external_qualification(
             .context("external weekly contribution row overflow")?;
         let path = runs.partition_path(index);
         write_weekly_contribution_run(&path, &mut contribution)?;
+        // These runs are consumed only after all source months have been reduced.
+        // Drop their clean page-cache pages now so 309 writes do not accumulate
+        // in the job's cgroup before reconciliation begins.
+        storage::discard_path_cache(&path);
         contribution_paths.push(path);
         drop(contribution);
         for file in &partition.files {
