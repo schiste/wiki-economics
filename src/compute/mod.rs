@@ -34,8 +34,8 @@ use activity::{
     gdp_activity_tiers_for_period,
 };
 use activity::{
-    activity_tiers_all_periods, finish_activity_year_cached, gdp_editor_month_frame,
-    write_activity_outputs,
+    activity_tiers_all_periods, finish_activity_stream, finish_activity_year_cached,
+    gdp_editor_month_frame, push_activity_month_stream, write_activity_outputs,
 };
 use lifecycle::{
     LifecycleCheckpoint, RegisteredState, lifecycle_full_digest, lifecycle_prefix_digest,
@@ -639,6 +639,10 @@ fn compute_all_incremental_cached(
     let mut gdp_editor_month_frames = Vec::new();
     let mut gdp_activity_month_digests = Vec::new();
     let mut gdp_activity_year = None;
+    let mut activity_quarter_accumulator: Option<DataFrame> = None;
+    let mut activity_year_accumulator: Option<DataFrame> = None;
+    let mut activity_current_quarter_key: Option<i32> = None;
+    let mut activity_current_year: Option<i32> = None;
     let mut labor_monthly_frames = Vec::new();
     let lifecycle_input_digest = if plan.lifecycle.must_compute() {
         cross_snapshot
@@ -704,12 +708,22 @@ fn compute_all_incremental_cached(
                 "analytical partitions are not ordered chronologically"
             );
             if partition.year != current_year {
-                let finish_result = finish_activity_year_cached(
-                    &mut gdp_editor_month_frames,
-                    &mut gdp_tier_frames,
-                    &mut gdp_activity_month_digests,
-                    cross_snapshot,
-                );
+                let finish_result = if cross_snapshot.is_some() {
+                    finish_activity_year_cached(
+                        &mut gdp_editor_month_frames,
+                        &mut gdp_tier_frames,
+                        &mut gdp_activity_month_digests,
+                        cross_snapshot,
+                    )
+                } else {
+                    finish_activity_stream(
+                        &mut gdp_tier_frames,
+                        &mut activity_quarter_accumulator,
+                        &mut activity_year_accumulator,
+                        &mut activity_current_quarter_key,
+                        &mut activity_current_year,
+                    )
+                };
                 finish_result?;
             }
         }
@@ -784,14 +798,27 @@ fn compute_all_incremental_cached(
             let editor_month = cached_or_compute(
                 cross_snapshot,
                 "editor_month",
-                activity::ALGORITHM_VERSION,
+                activity::EDITOR_MONTH_ALGORITHM_VERSION,
                 input_digest,
                 "editor_month",
                 || gdp_editor_month_frame(&base),
             );
-            gdp_editor_month_frames.push(editor_month?);
-            if let Some(input_digest) = input_digest {
-                gdp_activity_month_digests.push(input_digest.to_string());
+            let editor_month = editor_month?;
+            if cross_snapshot.is_some() {
+                gdp_editor_month_frames.push(editor_month);
+                if let Some(input_digest) = input_digest {
+                    gdp_activity_month_digests.push(input_digest.to_string());
+                }
+            } else {
+                push_activity_month_stream(
+                    editor_month,
+                    year_month_key,
+                    &mut gdp_tier_frames,
+                    &mut activity_quarter_accumulator,
+                    &mut activity_year_accumulator,
+                    &mut activity_current_quarter_key,
+                    &mut activity_current_year,
+                )?;
             }
         }
         if let Some(state) = registered_state.as_mut()
@@ -845,12 +872,22 @@ fn compute_all_incremental_cached(
         result.context("failed to write partitioned monthly-family outputs")?;
     }
     if plan.activity_tiers.must_compute() {
-        let finish_result = finish_activity_year_cached(
-            &mut gdp_editor_month_frames,
-            &mut gdp_tier_frames,
-            &mut gdp_activity_month_digests,
-            cross_snapshot,
-        );
+        let finish_result = if cross_snapshot.is_some() {
+            finish_activity_year_cached(
+                &mut gdp_editor_month_frames,
+                &mut gdp_tier_frames,
+                &mut gdp_activity_month_digests,
+                cross_snapshot,
+            )
+        } else {
+            finish_activity_stream(
+                &mut gdp_tier_frames,
+                &mut activity_quarter_accumulator,
+                &mut activity_year_accumulator,
+                &mut activity_current_quarter_key,
+                &mut activity_current_year,
+            )
+        };
         finish_result?;
         write_activity_outputs(wiki, output_dir, gdp_tier_frames)?;
     }
