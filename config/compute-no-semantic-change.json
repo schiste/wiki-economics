@@ -288,6 +288,12 @@
       "paths": ["src/compute/weekly/mod.rs"],
       "reason": "Sync and evict completed page-week output chunks during final Parquet writes to bound qualification cgroup page cache; output rows, totals, and artifact bytes are unchanged.",
       "base_commit": "3eb99d568b19dd4ce7996e2cf3126fd2378de13a"
+    },
+    {
+      "family": "page_week",
+      "paths": ["src/compute/weekly/mod.rs"],
+      "reason": "Share page titles across external-merge rows and build the same string column without per-row String clones; page-week values and artifact bytes are unchanged.",
+      "base_commit": "983536c8aefffbcd1b4098a4927667464a2c6dfd"
     }
   ]
 }
