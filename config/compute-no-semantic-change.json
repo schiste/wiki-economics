@@ -282,6 +282,12 @@
       "paths": ["src/compute/weekly/mod.rs"],
       "reason": "Evict each durable external page-week contribution run to bound qualification cgroup use; weekly grouping, rows, totals, and artifact bytes are unchanged.",
       "base_commit": "21d4ed7dd0288ff9442d233802948aa864585baa"
+    },
+    {
+      "family": "page_week",
+      "paths": ["src/compute/weekly/mod.rs"],
+      "reason": "Sync and evict completed page-week output chunks during final Parquet writes to bound qualification cgroup page cache; output rows, totals, and artifact bytes are unchanged.",
+      "base_commit": "3eb99d568b19dd4ce7996e2cf3126fd2378de13a"
     }
   ]
 }

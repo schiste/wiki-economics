@@ -21,6 +21,7 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::{self, File};
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tracing::info;
@@ -33,6 +34,7 @@ pub(super) const WEEKLY_ROUTING_BATCH_ROWS: usize = 250_000;
 pub(super) const WEEKLY_BUCKET_MIN_MEMORY_BYTES: u64 = 64 * 1024 * 1024;
 pub(super) const WEEKLY_BUCKET_ESTIMATED_BYTES_PER_ROW: u64 = 256;
 pub(super) const WEEKLY_RESULT_ESTIMATED_BYTES_PER_ROW: u64 = 128;
+const WEEKLY_OUTPUT_CACHE_EVICT_BYTES: u64 = 64 * 1024 * 1024;
 pub(super) const SUPPORTED_PRIMARY_BUCKET_COUNTS: [usize; 6] = [32, 64, 128, 256, 512, 1024];
 #[cfg(test)]
 pub(super) const FLAT_BENCHMARK_BUCKET_COUNTS: [usize; 3] = [256, 512, 1024];
@@ -1831,9 +1833,55 @@ impl Drop for WeeklyRunDir {
     }
 }
 
+/// Write the final page-week Parquet in durable chunks so completed output
+/// pages can leave the Toolforge job's cgroup page cache as the file grows.
+struct CacheEvictingOutputFile {
+    file: File,
+    bytes_since_eviction: u64,
+    eviction_interval_bytes: u64,
+}
+
+impl CacheEvictingOutputFile {
+    fn new(file: File) -> Self {
+        Self::with_eviction_interval(file, WEEKLY_OUTPUT_CACHE_EVICT_BYTES)
+    }
+
+    fn with_eviction_interval(file: File, eviction_interval_bytes: u64) -> Self {
+        Self {
+            file,
+            bytes_since_eviction: 0,
+            eviction_interval_bytes,
+        }
+    }
+}
+
+impl Write for CacheEvictingOutputFile {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        let written = self.file.write(buffer)?;
+        self.bytes_since_eviction = self
+            .bytes_since_eviction
+            .saturating_add(u64::try_from(written).unwrap_or(u64::MAX));
+        if self.bytes_since_eviction >= self.eviction_interval_bytes {
+            // The advice is best-effort. Sync first so completed file pages
+            // are clean and eligible for eviction while later batches append.
+            if self.file.sync_data().is_ok()
+                && let Ok(metadata) = self.file.metadata()
+            {
+                storage::discard_file_cache(&self.file, 0, metadata.len());
+            }
+            self.bytes_since_eviction = 0;
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
 pub(super) struct AtomicBatchedParquetWriter {
     pending: PendingOutput,
-    writer: Option<BatchedWriter<File>>,
+    writer: Option<BatchedWriter<CacheEvictingOutputFile>>,
     semantics: crate::artifact_receipt::SemanticAccumulator,
 }
 
@@ -1845,7 +1893,7 @@ impl AtomicBatchedParquetWriter {
             .context("page_weekly_edits output has no UTF-8 filename")?
             .to_string();
         let pending = PendingOutput::new(final_path)?;
-        let file = File::create(&pending.temp_path)?;
+        let file = CacheEvictingOutputFile::new(File::create(&pending.temp_path)?);
         let writer = ParquetWriter::new(file)
             .with_compression(ParquetCompression::Zstd(None))
             .batched(schema)?;
@@ -1922,4 +1970,28 @@ pub(crate) fn benchmark_page_weekly_edits(
     compute_page_weekly_edits(wiki, data_dir, output_dir, config)?.with_context(|| {
         format!("cannot benchmark page_weekly_edits: no warehouse partitions for {wiki}")
     })
+}
+
+#[cfg(test)]
+mod output_cache_tests {
+    use super::{CacheEvictingOutputFile, File};
+    use crate::test_support::TestDir;
+    use std::io::Write;
+
+    #[test]
+    fn syncs_and_evicts_completed_output_chunks() -> anyhow::Result<()> {
+        let directory = TestDir::new()?;
+        let path = directory.path().join("page-week.tmp");
+        let file = File::create(&path)?;
+        let mut output = CacheEvictingOutputFile::with_eviction_interval(file, 5);
+
+        output.write_all(b"first")?;
+        assert_eq!(output.bytes_since_eviction, 0);
+        output.write_all(b"next")?;
+        assert_eq!(output.bytes_since_eviction, 4);
+        output.flush()?;
+        assert_eq!(std::fs::read(path)?, b"firstnext");
+
+        Ok(())
+    }
 }
