@@ -1286,11 +1286,10 @@ pub(super) fn compact_weekly_primary_buckets(
         }
         for (bucket, writer) in writers {
             writer.finish()?;
-            sync_and_discard_path_cache(
-                paths[bucket]
-                    .as_deref()
-                    .context("finished primary bucket has no output path")?,
-            )?;
+            let path = paths[bucket]
+                .as_deref()
+                .context("finished primary bucket has no output path")?;
+            sync_and_discard_path_cache(path)?;
         }
         // The staged partitions are read completely during compaction and
         // removed below. Drop their reclaimable pages before the next
@@ -1442,11 +1441,10 @@ pub(super) fn route_primary_to_secondary_buckets(
         );
         for (secondary, writer) in writers {
             writer.finish()?;
-            sync_and_discard_path_cache(
-                paths[secondary]
-                    .as_deref()
-                    .context("finished secondary bucket has no output path")?,
-            )?;
+            let path = paths[secondary]
+                .as_deref()
+                .context("finished secondary bucket has no output path")?;
+            sync_and_discard_path_cache(path)?;
         }
         // This primary bucket is reread once per writer-sized batch. Its
         // cache is no longer useful after the final batch has closed.
