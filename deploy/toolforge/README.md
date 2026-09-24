@@ -165,6 +165,12 @@ and higher resource envelope are being qualified.
   computation. Compatibility-cohort repairs also checkpoint successful members
   by deployed binary and snapshot. A later retry revalidates those candidates
   through the normal planner instead of forcing their complete rebuild again.
+  When retention has purged the selected snapshot's source inputs, the
+  audited compatibility cohort uses `migrate-retained-candidate` to create a
+  new immutable ready generation from the prior receipted candidate. It never
+  re-ingests into the selected snapshot; migration lineage preserves retention
+  authorization, and publication preflight rejects obsolete metric schemas
+  before merge work begins.
   The [Rust resource governor](../../docs/resource-governor.md) independently
   caps concurrency and admits each source against cgroup memory, filesystem
   reserve, scratch, and file-descriptor signals. Thus a window of four is an

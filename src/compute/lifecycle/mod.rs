@@ -47,7 +47,7 @@ fn format_period_key(period_key: i32, period_type: &str) -> String {
     }
 }
 
-fn period_months_for_type(period_type: &str) -> u32 {
+pub(crate) fn period_months_for_type(period_type: &str) -> u32 {
     match period_type {
         "month" => 1,
         "quarter" => 3,

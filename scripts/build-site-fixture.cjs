@@ -160,7 +160,7 @@ function buildFixture({dataDir, distDir, root = path.resolve(__dirname, ".."), r
       cwd: root,
       env: {
         ...process.env,
-        NODE_OPTIONS: `--require=${denyNetwork}${process.env.NODE_OPTIONS ? ` ${process.env.NODE_OPTIONS}` : ""}`,
+        NODE_OPTIONS: `--require=${JSON.stringify(denyNetwork)}${process.env.NODE_OPTIONS ? ` ${process.env.NODE_OPTIONS}` : ""}`,
         OBSERVABLE_TELEMETRY_DISABLE: "true",
         WIKI_ECON_SITE_SOURCE_DIR: sourceDir,
         WIKI_ECON_SITE_DIST_DIR: distDir,

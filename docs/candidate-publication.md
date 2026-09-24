@@ -146,6 +146,18 @@ covered by their own receipts, and one computed rollback candidate remains
 available. A future recomputation recreates the generation from the canonical
 source plan before any new candidate can become ready.
 
+A metric-schema upgrade can still be needed after retention has purged the
+source generation. In that case, do not re-download into the selected immutable
+snapshot or overwrite the ready candidate. The audited compatibility-cohort
+path creates a new candidate from the retention-authorized candidate and uses
+an explicit migration receipt that names its source ready receipt. For the
+lifecycle v3-to-v4 upgrade, it derives `period_months` from `period_type`,
+verifies every preserved churn column against the source Parquet, and leaves the
+original retention authorization in place. Candidate validation follows that
+receipt lineage, keeping the currently published and rollback candidates
+verifiable. Publication preflight checks every merged metric against its
+current schema and algorithm before it starts the expensive merge.
+
 ## Toolforge jobs
 
 The scheduled jobs are:

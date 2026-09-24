@@ -7,7 +7,7 @@ const path = require("node:path");
 const {spawnSync} = require("node:child_process");
 const test = require("node:test");
 
-test("compatibility cohort rebuilds exact wikis sequentially with bounded source windows", (t) => {
+test("compatibility cohort migrates exact retained wikis sequentially", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-cohort-"));
   t.after(() => fs.rmSync(root, {recursive: true, force: true}));
   const binary = path.join(root, "wiki-econ");
@@ -34,8 +34,8 @@ test("compatibility cohort rebuilds exact wikis sequentially with bounded source
   assert.equal(result.status, 0, result.stderr);
   const calls = fs.readFileSync(log, "utf8").trim().split("\n");
   assert.equal(calls.length, 2);
-  assert.match(calls[0], /--run-id compat-1-frwiki .*prepare-wiki frwiki --version 2026-08 --source-window-size 1 --rebuild/);
-  assert.match(calls[1], /--run-id compat-1-nlwiki .*prepare-wiki nlwiki --version 2026-08 --source-window-size 1 --rebuild/);
+  assert.match(calls[0], /--run-id compat-1-frwiki .*migrate-retained-candidate frwiki --version 2026-08/);
+  assert.match(calls[1], /--run-id compat-1-nlwiki .*migrate-retained-candidate nlwiki --version 2026-08/);
   assert.match(result.stdout, /wiki=frwiki .*cohort_index=1 cohort_total=2/);
   assert.match(result.stdout, /candidate ready wiki=nlwiki .*cohort_index=2 cohort_total=2/);
 
@@ -71,7 +71,7 @@ test("compatibility cohort retains successes and continues after one member fail
   fs.writeFileSync(binary, [
     "#!/bin/sh",
     'printf "%s\\n" "$*" >> "$COHORT_CALL_LOG"',
-    'case "$*" in *"prepare-wiki dewiki "*) exit 17 ;; esac',
+    'case "$*" in *"migrate-retained-candidate dewiki "*) exit 17 ;; esac',
     "exit 0",
     "",
   ].join("\n"));

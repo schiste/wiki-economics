@@ -13,6 +13,7 @@ pub mod weekly;
 use anyhow::{Context, Result};
 use polars::prelude::*;
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 #[cfg(test)]
 use std::collections::HashMap;
@@ -21,12 +22,14 @@ use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tracing::info;
 
+use crate::{
+    artifact_receipt, fingerprint, metric_registry::MetricFamily, storage, workload_profile,
+};
 #[cfg(test)]
 use crate::{
     determinism,
     resource_governor::{GovernorPaths, ResourceGovernor},
 };
-use crate::{fingerprint, metric_registry::MetricFamily, storage, workload_profile};
 
 #[cfg(test)]
 use activity::{
@@ -46,15 +49,15 @@ use lifecycle::{
 use lifecycle::{finalize_funnel, finalize_labor_cohorts};
 #[cfg(test)]
 pub(crate) use monthly::EditorIdentityCoveragePeriod;
+pub(crate) use monthly::editor_identity_report_path;
 #[cfg(test)]
 use monthly::write_editor_identity_coverage;
 pub(crate) use monthly::{
     EDITOR_IDENTITY_REPORT, EditorIdentityCoverageReport, read_editor_identity_coverage,
 };
 use monthly::{
-    MonthlyFrames, editor_identity_coverage_frame, editor_identity_report_path,
-    finish_inequality_year_cached, gdp_monthly_frame, gdp_type_share_frame, labor_monthly_frame,
-    write_monthly_outputs,
+    MonthlyFrames, editor_identity_coverage_frame, finish_inequality_year_cached,
+    gdp_monthly_frame, gdp_type_share_frame, labor_monthly_frame, write_monthly_outputs,
 };
 #[cfg(test)]
 use weekly::*;
@@ -1085,7 +1088,7 @@ fn legacy_compute_stage_receipt(output_dir: &Path, wiki: &str) -> PathBuf {
         .join(format!("{wiki}.json"))
 }
 
-fn family_stage_receipt(output_dir: &Path, wiki: &str, family: MetricFamily) -> PathBuf {
+pub(crate) fn family_stage_receipt(output_dir: &Path, wiki: &str, family: MetricFamily) -> PathBuf {
     output_dir
         .join("_stages")
         .join("compute")
@@ -1271,6 +1274,292 @@ pub(crate) fn candidate_receipts_current_without_inputs(
     Ok(true)
 }
 
+/// Migrate the receipt-covered lifecycle outputs from the previous schema
+/// after the exact source generation has been retention-purged. This path is
+/// deliberately narrow: all non-lifecycle families must already have current
+/// receipts, and the source lifecycle family must be the known v3 algorithm.
+/// The only data change is the lossless `period_months` projection from
+/// `period_type`; the prior ready candidate and its retention receipt provide
+/// the provenance boundary.
+pub(crate) fn migrate_retained_candidate_families(
+    wiki: &str,
+    snapshot: &str,
+    source_run_id: &str,
+    data_dir: &Path,
+    source_candidate_dir: &Path,
+    target_candidate_dir: &Path,
+) -> Result<()> {
+    storage::validate_snapshot_version(snapshot)?;
+    let profile = workload_profile::load(data_dir, wiki, snapshot)?
+        .context("retained candidate has no persisted workload profile")?;
+    profile.validate(wiki, snapshot)?;
+    let weekly_config = WeeklyAggregationConfig::from_workload_profile(&profile)?;
+
+    for family in MetricFamily::CORE {
+        if family == MetricFamily::Lifecycle {
+            continue;
+        }
+        let algorithm = family.algorithm_version(&weekly_config);
+        let receipt_path = family_stage_receipt(source_candidate_dir, wiki, family);
+        let outputs = family_outputs(family, wiki, source_candidate_dir);
+        #[rustfmt::skip]
+        let reusable = fingerprint::outputs_reusable(&receipt_path, family_stage_spec(family, wiki, Some(snapshot), &algorithm), &outputs)?;
+        anyhow::ensure!(
+            reusable,
+            "retained candidate {wiki} has an outdated or invalid {} family",
+            family.name()
+        );
+    }
+
+    const LEGACY_LIFECYCLE_ALGORITHM: &str =
+        "editor-lifecycle-v3-explicit-identified-registered-editors";
+    let source_receipt_path =
+        family_stage_receipt(source_candidate_dir, wiki, MetricFamily::Lifecycle);
+    let source_outputs = family_outputs(MetricFamily::Lifecycle, wiki, source_candidate_dir);
+    #[rustfmt::skip]
+    let lifecycle_receipts_reusable = fingerprint::outputs_reusable(&source_receipt_path, family_stage_spec(MetricFamily::Lifecycle, wiki, Some(snapshot), LEGACY_LIFECYCLE_ALGORITHM), &source_outputs)?;
+    anyhow::ensure!(
+        lifecycle_receipts_reusable,
+        "retained candidate {wiki} is not an authenticated lifecycle v3 candidate"
+    );
+    let source_stage_receipt = fingerprint::read_receipt(&source_receipt_path)?;
+    anyhow::ensure!(
+        source_stage_receipt.algorithm_version == LEGACY_LIFECYCLE_ALGORITHM,
+        "retained candidate {wiki} lifecycle receipt has an unsupported source algorithm"
+    );
+
+    let mut migration_digest = Sha256::new();
+    migration_digest.update(b"retained-lifecycle-v3-to-v4-period-months-v1\n");
+    migration_digest.update(source_stage_receipt.fingerprint.as_bytes());
+    let mut migration_inputs = vec![fingerprint::TrackedPath::new(
+        format!("retained-candidate/{wiki}/{snapshot}/{source_run_id}/lifecycle-stage-receipt"),
+        source_receipt_path.clone(),
+    )];
+    for metric in MetricFamily::Lifecycle.metrics() {
+        let source_path = source_candidate_dir
+            .join(wiki)
+            .join(format!("{metric}.parquet"));
+        let source_document = artifact_receipt::read(&source_path)?;
+        #[rustfmt::skip]
+        let source_document = artifact_receipt::verify(&source_path, &source_document.receipt.identity, Some(&source_document.receipt_sha256), artifact_receipt::VerificationMode::Fast)?;
+        anyhow::ensure!(
+            source_document.receipt.algorithm_version == LEGACY_LIFECYCLE_ALGORITHM,
+            "retained candidate {wiki} {metric} artifact is not on lifecycle v3"
+        );
+        migration_digest.update(source_document.receipt_sha256.as_bytes());
+        migration_inputs.push(fingerprint::TrackedPath::new(
+            format!("retained-candidate/{wiki}/{snapshot}/{source_run_id}/{metric}.parquet"),
+            source_path.clone(),
+        ));
+        migration_inputs.push(fingerprint::TrackedPath::new(
+            format!(
+                "retained-candidate/{wiki}/{snapshot}/{source_run_id}/{metric}.parquet.receipt.json"
+            ),
+            artifact_receipt::sidecar_path(&source_path)?,
+        ));
+    }
+    migration_inputs.sort_by(|left, right| left.identity.cmp(&right.identity));
+    let migration_input_fingerprint = hex::encode(migration_digest.finalize());
+
+    let churn_path = target_candidate_dir.join(wiki).join("labor_churn.parquet");
+    let churn_source_receipt =
+        artifact_receipt::read(&source_candidate_dir.join(wiki).join("labor_churn.parquet"))?;
+    let source_churn_schema = churn_source_receipt
+        .receipt
+        .parquet_schema
+        .iter()
+        .map(|field| (field.name.as_str(), field.data_type.as_str()))
+        .collect::<Vec<_>>();
+    anyhow::ensure!(
+        source_churn_schema
+            == [
+                ("period", "String"),
+                ("active_editors", "UInt32"),
+                ("arrivals", "UInt32"),
+                ("departures", "UInt32"),
+                ("period_type", "String"),
+                ("arrival_rate", "Float64"),
+                ("departure_rate", "Float64"),
+                ("wiki", "String"),
+            ],
+        "retained candidate {wiki} labor_churn schema is not the known v3 contract"
+    );
+
+    let source_churn = ParquetReader::new(File::open(&churn_path)?).finish()?;
+    let period_types = source_churn.column("period_type")?.str()?;
+    let period_months = (0..source_churn.height())
+        .map(|index| {
+            let period_type = period_types
+                .get(index)
+                .context("retained labor_churn contains a null period_type")?;
+            anyhow::ensure!(
+                matches!(period_type, "month" | "quarter" | "year"),
+                "retained labor_churn has unsupported period_type {period_type:?}"
+            );
+            Ok(lifecycle::period_months_for_type(period_type))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut migrated_columns = vec![
+        source_churn.column("period")?.clone(),
+        source_churn.column("active_editors")?.clone(),
+        source_churn.column("arrivals")?.clone(),
+        source_churn.column("departures")?.clone(),
+        source_churn.column("period_type")?.clone(),
+        Column::new("period_months".into(), period_months),
+        source_churn.column("arrival_rate")?.clone(),
+        source_churn.column("departure_rate")?.clone(),
+        source_churn.column("wiki")?.clone(),
+    ];
+    let mut migrated_churn = DataFrame::new_infer_height(std::mem::take(&mut migrated_columns))?;
+    let parent = churn_path
+        .parent()
+        .context("retained labor_churn output has no parent directory")?;
+    let temporary = parent.join(format!(".labor_churn.{}.migration.tmp", std::process::id()));
+    if temporary.exists() {
+        fs::remove_file(&temporary)?;
+    }
+    let migration_write = (|| -> Result<()> {
+        let mut file = File::create(&temporary)?;
+        ParquetWriter::new(&mut file)
+            .with_compression(ParquetCompression::Zstd(None))
+            .set_parallel(false)
+            .finish(&mut migrated_churn)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, &churn_path)?;
+        File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if migration_write.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    migration_write?;
+
+    for metric in MetricFamily::Lifecycle.metrics() {
+        let path = target_candidate_dir
+            .join(wiki)
+            .join(format!("{metric}.parquet"));
+        let source_path = source_candidate_dir
+            .join(wiki)
+            .join(format!("{metric}.parquet"));
+        let source_document = artifact_receipt::read(&source_path)?;
+        #[rustfmt::skip]
+        artifact_receipt::scan_and_write(&path, &source_document.receipt.identity, lifecycle::ALGORITHM_VERSION, &migration_input_fingerprint)?;
+    }
+    #[rustfmt::skip]
+    fingerprint::record(&family_stage_receipt(target_candidate_dir, wiki, MetricFamily::Lifecycle), family_stage_spec(MetricFamily::Lifecycle, wiki, Some(snapshot), lifecycle::ALGORITHM_VERSION), &migration_inputs, &family_outputs(MetricFamily::Lifecycle, wiki, target_candidate_dir))?;
+
+    #[rustfmt::skip]
+    let receipts_current = candidate_receipts_current_without_inputs(wiki, snapshot, target_candidate_dir, Some(&profile))?;
+    anyhow::ensure!(
+        receipts_current,
+        "migrated candidate {wiki} does not have a complete current compute receipt set"
+    );
+    Ok(())
+}
+
+/// Recheck the retained v3-to-v4 churn projection whenever a migrated ready
+/// candidate is authenticated. The source ready receipt anchors the original
+/// bytes; this check proves the only schema change is the documented mapping.
+pub(crate) fn validate_retained_lifecycle_migration(
+    wiki: &str,
+    source_candidate_dir: &Path,
+    target_candidate_dir: &Path,
+) -> Result<()> {
+    const LEGACY_LIFECYCLE_ALGORITHM: &str =
+        "editor-lifecycle-v3-explicit-identified-registered-editors";
+    let source_path = source_candidate_dir.join(wiki).join("labor_churn.parquet");
+    let target_path = target_candidate_dir.join(wiki).join("labor_churn.parquet");
+    let source_document = artifact_receipt::read(&source_path)?;
+    #[rustfmt::skip]
+    let source_document = artifact_receipt::verify(&source_path, &source_document.receipt.identity, Some(&source_document.receipt_sha256), artifact_receipt::VerificationMode::Fast)?;
+    let target_document = artifact_receipt::read(&target_path)?;
+    #[rustfmt::skip]
+    let target_document = artifact_receipt::verify(&target_path, &target_document.receipt.identity, Some(&target_document.receipt_sha256), artifact_receipt::VerificationMode::Fast)?;
+    anyhow::ensure!(
+        source_document.receipt.algorithm_version == LEGACY_LIFECYCLE_ALGORITHM
+            && target_document.receipt.algorithm_version == lifecycle::ALGORITHM_VERSION,
+        "retained lifecycle migration algorithm identities are invalid"
+    );
+    let expected_source_schema = [
+        ("period", "String"),
+        ("active_editors", "UInt32"),
+        ("arrivals", "UInt32"),
+        ("departures", "UInt32"),
+        ("period_type", "String"),
+        ("arrival_rate", "Float64"),
+        ("departure_rate", "Float64"),
+        ("wiki", "String"),
+    ];
+    anyhow::ensure!(
+        source_document
+            .receipt
+            .parquet_schema
+            .iter()
+            .map(|field| (field.name.as_str(), field.data_type.as_str()))
+            .collect::<Vec<_>>()
+            == expected_source_schema,
+        "retained lifecycle migration source schema is not the known v3 contract"
+    );
+    let expected_target_schema = crate::metric_registry::MetricId::LaborChurn
+        .definition()
+        .schema;
+    anyhow::ensure!(
+        target_document.receipt.parquet_schema.len() == expected_target_schema.len()
+            && expected_target_schema
+                .iter()
+                .zip(&target_document.receipt.parquet_schema)
+                .all(|((name, kind), observed)| {
+                    observed.name == *name && observed.data_type == kind.parquet_name()
+                }),
+        "retained lifecycle migration target schema is not the current labor_churn contract"
+    );
+
+    let source_frame = ParquetReader::new(File::open(&source_path)?).finish()?;
+    let target_frame = ParquetReader::new(File::open(&target_path)?).finish()?;
+    anyhow::ensure!(
+        source_frame.height() == target_frame.height(),
+        "retained lifecycle migration changed the labor_churn row count"
+    );
+    const PRESERVED_COLUMNS: [&str; 8] = [
+        "period",
+        "active_editors",
+        "arrivals",
+        "departures",
+        "period_type",
+        "arrival_rate",
+        "departure_rate",
+        "wiki",
+    ];
+    let source_columns = PRESERVED_COLUMNS
+        .iter()
+        .map(|name| source_frame.column(name).cloned())
+        .collect::<PolarsResult<Vec<_>>>()?;
+    let target_columns = PRESERVED_COLUMNS
+        .iter()
+        .map(|name| target_frame.column(name).cloned())
+        .collect::<PolarsResult<Vec<_>>>()?;
+    let source_preserved = DataFrame::new_infer_height(source_columns)?;
+    let target_preserved = DataFrame::new_infer_height(target_columns)?;
+    anyhow::ensure!(
+        source_preserved.equals_missing(&target_preserved),
+        "retained lifecycle migration changed a preexisting labor_churn column"
+    );
+    let period_types = source_frame.column("period_type")?.str()?;
+    let period_months = target_frame.column("period_months")?.u32()?;
+    for index in 0..source_frame.height() {
+        let period_type = period_types
+            .get(index)
+            .context("retained labor_churn has a null period_type")?;
+        anyhow::ensure!(
+            matches!(period_type, "month" | "quarter" | "year")
+                && period_months.get(index) == Some(lifecycle::period_months_for_type(period_type)),
+            "retained labor_churn period_months is not derived from period_type at row {index}"
+        );
+    }
+    Ok(())
+}
+
 fn compute_plan(
     wiki: &str,
     snapshot: Option<&str>,
@@ -1377,6 +1666,45 @@ pub(crate) fn record_candidate_fingerprint_for_test(
             &outputs,
         )?;
     }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn downgrade_lifecycle_candidate_to_v3_for_test(
+    wiki: &str,
+    snapshot: &str,
+    data_dir: &Path,
+    candidate_dir: &Path,
+) -> Result<()> {
+    const LEGACY_ALGORITHM: &str = "editor-lifecycle-v3-explicit-identified-registered-editors";
+    let churn_path = candidate_dir.join(wiki).join("labor_churn.parquet");
+    let mut churn = ParquetReader::new(File::open(&churn_path)?).finish()?;
+    churn.drop_in_place("period_months")?;
+    let temporary = churn_path.with_extension("parquet.v3-migration-fixture.tmp");
+    let write_result = (|| -> Result<()> {
+        let mut file = File::create(&temporary)?;
+        ParquetWriter::new(&mut file)
+            .with_compression(ParquetCompression::Zstd(None))
+            .set_parallel(false)
+            .finish(&mut churn)?;
+        file.sync_all()?;
+        drop(file);
+        fs::rename(&temporary, &churn_path)?;
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    write_result?;
+
+    for metric in MetricFamily::Lifecycle.metrics() {
+        let path = candidate_dir.join(wiki).join(format!("{metric}.parquet"));
+        #[rustfmt::skip]
+        artifact_receipt::scan_and_write(
+            &path, &format!("{wiki}/{metric}.parquet"), LEGACY_ALGORITHM, "retained-lifecycle-v3-test-fixture")?;
+    }
+    #[rustfmt::skip]
+    fingerprint::record(&family_stage_receipt(candidate_dir, wiki, MetricFamily::Lifecycle), family_stage_spec(MetricFamily::Lifecycle, wiki, Some(snapshot), LEGACY_ALGORITHM), &family_inputs(MetricFamily::Lifecycle, wiki, data_dir, Some(snapshot))?, &family_outputs(MetricFamily::Lifecycle, wiki, candidate_dir))?;
     Ok(())
 }
 
@@ -1732,6 +2060,65 @@ mod tests {
         assert!(snapshot_contains_complete_month("2026-07", "2026-07"));
         assert!(snapshot_contains_complete_month("2026-07", "2001-01"));
         assert!(!snapshot_contains_complete_month("2026-07", "2026-08"));
+    }
+
+    #[test]
+    fn retained_lifecycle_migration_verifies_period_months_and_preserves_columns() -> Result<()> {
+        const LEGACY_ALGORITHM: &str = "editor-lifecycle-v3-explicit-identified-registered-editors";
+
+        fn lifecycle_frame(period_months: Option<[u32; 3]>) -> Result<DataFrame> {
+            let mut columns = vec![
+                Column::new("period".into(), ["2026-01", "2026-Q1", "2025"]),
+                Column::new("active_editors".into(), [10_u32, 20, 30]),
+                Column::new("arrivals".into(), [2_u32, 4, 6]),
+                Column::new("departures".into(), [1_u32, 3, 5]),
+                Column::new("period_type".into(), ["month", "quarter", "year"]),
+            ];
+            if let Some(period_months) = period_months {
+                columns.push(Column::new("period_months".into(), period_months));
+            }
+            columns.extend([
+                Column::new("arrival_rate".into(), [0.2_f64, 0.2, 0.2]),
+                Column::new(
+                    "departure_rate".into(),
+                    [0.1_f64, 0.15, 0.16666666666666666],
+                ),
+                Column::new("wiki".into(), ["nlwiki", "nlwiki", "nlwiki"]),
+            ]);
+            DataFrame::new_infer_height(columns).map_err(Into::into)
+        }
+
+        let root = TestDir::new()?;
+        let source_candidate = root.path().join("source");
+        let target_candidate = root.path().join("target");
+        let source_wiki = source_candidate.join("nlwiki");
+        let target_wiki = target_candidate.join("nlwiki");
+        fs::create_dir_all(&source_wiki)?;
+        fs::create_dir_all(&target_wiki)?;
+
+        let source_path = source_wiki.join("labor_churn.parquet");
+        let mut source_frame = lifecycle_frame(None)?;
+        ParquetWriter::new(File::create(&source_path)?).finish(&mut source_frame)?;
+        #[rustfmt::skip]
+        artifact_receipt::scan_and_write(&source_path, "nlwiki/labor_churn.parquet", LEGACY_ALGORITHM, "retained-source-fixture")?;
+
+        let target_path = target_wiki.join("labor_churn.parquet");
+        let mut target_frame = lifecycle_frame(Some([1, 3, 12]))?;
+        ParquetWriter::new(File::create(&target_path)?).finish(&mut target_frame)?;
+        #[rustfmt::skip]
+        artifact_receipt::scan_and_write(&target_path, "nlwiki/labor_churn.parquet", lifecycle::ALGORITHM_VERSION, "retained-migration-fixture")?;
+
+        validate_retained_lifecycle_migration("nlwiki", &source_candidate, &target_candidate)?;
+
+        let mut invalid_target = lifecycle_frame(Some([1, 1, 12]))?;
+        ParquetWriter::new(File::create(&target_path)?).finish(&mut invalid_target)?;
+        #[rustfmt::skip]
+        artifact_receipt::scan_and_write(&target_path, "nlwiki/labor_churn.parquet", lifecycle::ALGORITHM_VERSION, "retained-migration-fixture-invalid-period-months")?;
+        assert!(
+            validate_retained_lifecycle_migration("nlwiki", &source_candidate, &target_candidate)
+                .is_err()
+        );
+        Ok(())
     }
 
     fn editor_months(edits: &[u32], month_keys: &[i32], user_ids: &[i64]) -> Result<DataFrame> {

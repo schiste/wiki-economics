@@ -116,7 +116,7 @@ pub(super) fn editor_identity_coverage_frame(base: &DataFrame) -> Result<DataFra
         .map_err(Into::into)
 }
 
-pub(super) fn editor_identity_report_path(output_dir: &Path, wiki: &str) -> PathBuf {
+pub(crate) fn editor_identity_report_path(output_dir: &Path, wiki: &str) -> PathBuf {
     output_dir.join(wiki).join(EDITOR_IDENTITY_REPORT)
 }
 

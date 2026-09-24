@@ -99,6 +99,8 @@ struct ReadyWikiCandidate {
     quality_signals: Option<CandidateQualitySignals>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     promoted_from_qualification: Option<QualificationPromotion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    migrated_from_retained_candidate: Option<RetainedCandidateMigration>,
     artifacts: Vec<PreparedArtifact>,
 }
 
@@ -107,6 +109,14 @@ struct QualificationPromotion {
     snapshot: String,
     run_id: String,
     receipt_sha256: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
+struct RetainedCandidateMigration {
+    schema_version: u8,
+    source_run_id: String,
+    source_ready_sha256: String,
+    migration: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
@@ -611,8 +621,12 @@ fn publication_patrol_source_report(
         "retention receipt does not authorize purged patrol inputs for {wiki}"
     );
     ensure!(
-        retention.authorized_ready_sha256 == current_proof.ready_receipt_sha256,
-        "retention receipt does not authorize the active ready candidate for {wiki}"
+        retention.authorized_ready_sha256
+            == current_proof
+                .retention_source_ready_sha256
+                .as_deref()
+                .unwrap_or(&current_proof.ready_receipt_sha256),
+        "retention receipt does not authorize the active ready candidate lineage for {wiki}"
     );
     let previous_gate = previous_gate.with_context(|| {
         format!("purged patrol source for {wiki} has no prior publication gate")
@@ -630,8 +644,10 @@ fn publication_patrol_source_report(
         .get(wiki)
         .with_context(|| format!("prior publication gate has no wiki proof for {wiki}"))?;
     ensure!(
-        previous_proof.ready_receipt_sha256 == current_proof.ready_receipt_sha256,
-        "prior patrol source report belongs to another ready candidate for {wiki}"
+        previous_proof.ready_receipt_sha256 == retention.authorized_ready_sha256
+            || previous_proof.retention_source_ready_sha256.as_deref()
+                == Some(retention.authorized_ready_sha256.as_str()),
+        "prior patrol source report is not tied to the retention-authorized ready candidate for {wiki}"
     );
     let report = previous_gate
         .patrol_sources
@@ -668,6 +684,8 @@ struct WikiPublicationProof {
     candidate_run_id: String,
     candidate_relative: String,
     ready_receipt_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retention_source_ready_sha256: Option<String>,
     families: BTreeMap<String, FamilyPublicationProof>,
     artifacts: BTreeMap<String, PreparedArtifact>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1272,6 +1290,7 @@ pub(crate) fn mark_wiki_candidate_ready(
         editor_identity_coverage,
         quality_signals: Some(quality_signals),
         promoted_from_qualification: None,
+        migrated_from_retained_candidate: None,
         artifacts,
     };
     let generation_state =
@@ -1304,6 +1323,285 @@ pub(crate) fn mark_wiki_candidate_ready(
     )?;
     info!(wiki, snapshot, run_id, path = %ready_path.display(), "wiki candidate is ready");
     Ok(ready_path)
+}
+
+/// Create a new immutable ready generation by applying the known lossless
+/// lifecycle schema migration to a retention-authorized candidate. No source
+/// snapshot files are recreated or modified; all copied outputs remain tied
+/// to the retained candidate and its receipts.
+pub(crate) fn migrate_retained_candidate(
+    data_dir: &Path,
+    output_dir: &Path,
+    lifecycle_path: &Path,
+    wiki: &str,
+    snapshot: &str,
+    run_id: &str,
+) -> Result<PathBuf> {
+    const MIGRATION_ID: &str = "retained-lifecycle-v3-to-v4-period-months-v1";
+    ensure!(valid_component(wiki), "unsafe retained candidate wiki");
+    ensure!(valid_component(run_id), "unsafe retained candidate run ID");
+    storage::validate_snapshot_version(snapshot)?;
+    ensure!(
+        storage::current_snapshot_version(data_dir, wiki)?.as_deref() == Some(snapshot),
+        "retained candidate migration requires the selected snapshot {snapshot}"
+    );
+    ensure!(
+        !storage::generation_manifest_path(data_dir, wiki, snapshot)?.is_file(),
+        "retained candidate migration is only allowed after source-generation retention"
+    );
+    let registry = load_lifecycle(lifecycle_path)?;
+    let lifecycle = registry
+        .wikis
+        .get(wiki)
+        .with_context(|| format!("candidate wiki {wiki} is not registered"))?;
+    ensure!(
+        lifecycle.publication == "published"
+            && matches!(lifecycle.refresh.as_str(), "scheduled" | "manual"),
+        "retained candidate migration requires a managed published wiki"
+    );
+    let retention = crate::retention::validate_purged_snapshot(data_dir, wiki, snapshot)?;
+    ensure!(
+        retention.state == crate::retention::RetentionState::Applied
+            && retention.history_input == crate::retention::InputRetention::PurgeAfterReady,
+        "retained candidate migration requires applied history-input retention"
+    );
+
+    let target_candidate = wiki_candidate_dir(output_dir, wiki, snapshot, run_id)?;
+    let target_ready_path = target_candidate.join("ready.json");
+    if target_ready_path.is_file() {
+        let ready: ReadyWikiCandidate = read_json(&target_ready_path)?;
+        ensure!(
+            ready.wiki == wiki
+                && ready.snapshot == snapshot
+                && ready.run_id == run_id
+                && ready
+                    .migrated_from_retained_candidate
+                    .as_ref()
+                    .is_some_and(|migration| {
+                        migration.schema_version == 1
+                            && migration.source_ready_sha256.len() == 64
+                            && migration.migration == MIGRATION_ID
+                    }),
+            "existing retained migration candidate has a different identity"
+        );
+        validate_retained_migration_payload(&target_candidate, &ready)?;
+        validate_ready_candidate(data_dir, &target_candidate, &ready)?;
+        reconcile_ready_generation_state(output_dir, &ready)?;
+        #[rustfmt::skip]
+        write_ready_index(data_dir, output_dir, wiki, &(ready, target_candidate.clone()))?;
+        return Ok(target_ready_path);
+    }
+
+    let (source_ready, source_candidate) =
+        indexed_latest_ready_candidate(data_dir, output_dir, wiki)?
+            .context("retained candidate migration has no indexed ready source")?;
+    ensure!(
+        source_ready.snapshot == snapshot && source_ready.run_id != run_id,
+        "retained migration source does not match the selected snapshot"
+    );
+    let source_ready_path = source_candidate.join("ready.json");
+    let (_, source_ready_sha256) = storage::sha256_file(&source_ready_path)?;
+    ensure!(
+        retention.authorized_ready_sha256 == source_ready_sha256,
+        "retention receipt does not authorize the indexed retained candidate"
+    );
+    validate_ready_candidate(data_dir, &source_candidate, &source_ready)?;
+    ensure!(
+        source_ready.workload_profile.is_some(),
+        "retained candidate migration requires a qualified workload profile"
+    );
+    let generation = CandidateGeneration::new(output_dir, wiki, snapshot, run_id);
+    if target_candidate.exists() {
+        ensure!(
+            !target_ready_path.exists(),
+            "retained migration target already has an unreadable ready receipt"
+        );
+        let state = crate::generation_lifecycle::load(output_dir, wiki, snapshot, run_id)?
+            .context("partial retained migration target has no generation state")?;
+        ensure!(
+            state.state == GState::Building,
+            "partial retained migration target is in {:?} state",
+            state.state
+        );
+    } else {
+        ensure!(
+            crate::generation_lifecycle::load(output_dir, wiki, snapshot, run_id)?.is_none(),
+            "retained migration target already has generation state"
+        );
+        #[rustfmt::skip]
+        generation.adopt(GState::Building, "receipt-backed retained candidate migration started")?;
+    }
+    fs::create_dir_all(&target_candidate)?;
+
+    let mut files = Vec::new();
+    for artifact in &source_ready.artifacts {
+        let path = source_candidate.join(&artifact.path);
+        files.push(path.clone());
+        files.push(artifact_receipt::sidecar_path(&path)?);
+    }
+    files.push(crate::compute::editor_identity_report_path(
+        &source_candidate,
+        wiki,
+    ));
+    for family in crate::metric_registry::MetricFamily::CORE {
+        files.push(crate::compute::family_stage_receipt(
+            &source_candidate,
+            wiki,
+            family,
+        ));
+    }
+    files.push(
+        source_candidate
+            .join("_stages")
+            .join("patrol_compute")
+            .join(format!("{wiki}.json")),
+    );
+    files.sort();
+    files.dedup();
+    copy_candidate_files(&source_candidate, &target_candidate, &files)?;
+
+    #[rustfmt::skip]
+    crate::compute::migrate_retained_candidate_families(wiki, snapshot, &source_ready.run_id, data_dir, &source_candidate, &target_candidate)?;
+    ensure!(
+        crate::patrol::candidate_receipt_current_without_inputs(wiki, snapshot, &target_candidate)?,
+        "retained candidate {wiki} patrol receipt is outdated or invalid"
+    );
+
+    let mut ready = source_ready.clone();
+    ready.run_id = run_id.to_string();
+    ready.ready_at_unix = now_unix()?;
+    ready.generating_commit = licensing::generating_commit();
+    ready.promoted_from_qualification = None;
+    ready.migrated_from_retained_candidate = Some(RetainedCandidateMigration {
+        schema_version: 1,
+        source_run_id: source_ready.run_id.clone(),
+        source_ready_sha256: source_ready_sha256.clone(),
+        migration: MIGRATION_ID.to_string(),
+    });
+    ready.artifacts = source_ready
+        .artifacts
+        .iter()
+        .map(|artifact| {
+            prepared_artifact(&target_candidate, &target_candidate.join(&artifact.path))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    validate_retained_migration_payload(&target_candidate, &ready)?;
+    atomic_json(&target_ready_path, &ready)?;
+    File::open(&target_candidate)?.sync_all()?;
+
+    validate_ready_candidate(data_dir, &target_candidate, &ready)?;
+    #[rustfmt::skip]
+    let state = generation.transition(GState::Validated, "retained candidate migration passed ready validation", None)?;
+    ensure!(
+        state.state == GState::Validated,
+        "retained migration generation did not reach validated state"
+    );
+    #[rustfmt::skip]
+    generation.transition(GState::Ready, "migrated ready receipt was durably published", None)?;
+    #[rustfmt::skip]
+    write_ready_index(data_dir, output_dir, wiki, &(ready, target_candidate.clone()))?;
+    info!(
+        wiki,
+        snapshot, run_id, "retained candidate migrated to current schema"
+    );
+    Ok(target_ready_path)
+}
+
+fn validate_retained_migration_payload(
+    candidate_dir: &Path,
+    ready: &ReadyWikiCandidate,
+) -> Result<()> {
+    ensure!(
+        ready.schema_version == 2
+            && candidate_dir.ends_with(
+                Path::new(&ready.wiki)
+                    .join(&ready.snapshot)
+                    .join(&ready.run_id)
+            ),
+        "retained migration ready identity does not match its candidate path"
+    );
+    if let Some(profile) = &ready.workload_profile {
+        profile.validate(&ready.wiki, &ready.snapshot)?;
+        profile.ensure_compute_qualified()?;
+    } else {
+        return Err(anyhow::anyhow!(
+            "retained migration candidate has no qualified workload profile"
+        ));
+    }
+    validate_snapshot_cutoff(&ready.wiki, &ready.snapshot, &ready.cutoff_date)?;
+    for artifact in &ready.artifacts {
+        validate_prepared_artifact(candidate_dir, artifact)?;
+        #[rustfmt::skip]
+        let _ = MetricId::from_artifact_identity(&artifact.path).map(|metric| validate_retained_migration_metric(candidate_dir, ready, artifact, metric)).transpose()?;
+    }
+    let contracts = ready_candidate_merge_contracts(candidate_dir, ready)?;
+    ensure!(
+        contracts.len()
+            == METRICS
+                .iter()
+                .filter(|metric| metric.publication_scope == PublicationScope::MergedAndPerWiki)
+                .count(),
+        "retained migration candidate does not cover every merged metric"
+    );
+    Ok(())
+}
+
+fn validate_retained_migration_metric(
+    candidate_dir: &Path,
+    ready: &ReadyWikiCandidate,
+    artifact: &PreparedArtifact,
+    metric: MetricId,
+) -> Result<()> {
+    #[rustfmt::skip]
+    let (rows, summary) = receipted_summary(&candidate_dir.join(&artifact.path), &artifact.receipt_identity, metric.definition())?;
+    ensure!(
+        rows == artifact.rows && summary.wiki_min == ready.wiki && summary.wiki_max == ready.wiki,
+        "retained migration artifact {} failed its semantic summary",
+        metric.as_str()
+    );
+    if metric == MetricId::GdpUserTypeShare {
+        #[rustfmt::skip]
+        validate_editor_identity_semantics(&candidate_dir.join(&artifact.path), ready.editor_identity_coverage.as_ref())?;
+    }
+    Ok(())
+}
+
+fn validate_retained_lifecycle_projection(
+    candidate_dir: &Path,
+    ready: &ReadyWikiCandidate,
+) -> Result<()> {
+    let Some(migration) = ready.migrated_from_retained_candidate.as_ref() else {
+        return Ok(());
+    };
+    ensure!(
+        migration.schema_version == 1
+            && migration.migration == "retained-lifecycle-v3-to-v4-period-months-v1"
+            && valid_component(&migration.source_run_id)
+            && migration.source_run_id != ready.run_id,
+        "retained lifecycle migration provenance is invalid"
+    );
+    let source_dir = candidate_dir
+        .parent()
+        .context("retained migration target has no snapshot parent")?
+        .join(&migration.source_run_id);
+    let source_ready_path = source_dir.join("ready.json");
+    let (_, source_ready_sha256) = storage::sha256_file(&source_ready_path)
+        .context("retained lifecycle migration source ready receipt is missing")?;
+    ensure!(
+        source_ready_sha256 == migration.source_ready_sha256,
+        "retained lifecycle migration source ready receipt changed"
+    );
+    let source_ready: ReadyWikiCandidate = read_json(&source_ready_path)?;
+    ensure!(
+        source_ready.wiki == ready.wiki
+            && source_ready.snapshot == ready.snapshot
+            && source_ready.run_id == migration.source_run_id,
+        "retained lifecycle migration source identity is invalid"
+    );
+    for artifact in &source_ready.artifacts {
+        validate_prepared_artifact(&source_dir, artifact)?;
+    }
+    crate::compute::validate_retained_lifecycle_migration(&ready.wiki, &source_dir, candidate_dir)
 }
 
 pub(crate) fn ensure_qualification_wiki(lifecycle_path: &Path, wiki: &str) -> Result<()> {
@@ -1617,6 +1915,7 @@ pub(crate) fn promote_wiki_qualification(
             editor_identity_coverage: qualification.editor_identity_coverage.clone(),
             quality_signals: qualification.quality_signals.clone(),
             promoted_from_qualification: Some(promotion.clone()),
+            migrated_from_retained_candidate: None,
             artifacts: qualification.artifacts.clone(),
         };
         atomic_json(&staging.join("ready.json"), &ready)?;
@@ -1732,15 +2031,20 @@ fn validate_ready_candidate_metadata(
     if storage::generation_manifest_path(data_dir, &ready.wiki, &ready.snapshot)?.is_file() {
         storage::ensure_generation_manifest(data_dir, &ready.wiki, &ready.snapshot)?;
     } else {
-        crate::retention::validate_purged_snapshot_for_ready(
+        let retention = crate::retention::validate_purged_snapshot(
             data_dir,
             &ready.wiki,
             &ready.snapshot,
-            &candidate_dir.join("ready.json"),
         )
         .context(
             "ready candidate input generation is absent without valid retention authorization",
         )?;
+        #[rustfmt::skip]
+        let authorized_lineage = retained_ready_lineage_matches(candidate_dir, ready, &retention.authorized_ready_sha256, 0)?;
+        ensure!(
+            authorized_lineage,
+            "ready candidate input generation is absent without valid retention authorization"
+        );
     }
     if let Some(profile) = &ready.workload_profile {
         profile.validate(&ready.wiki, &ready.snapshot)?;
@@ -1758,6 +2062,58 @@ fn validate_ready_candidate_metadata(
     validate_snapshot_cutoff(&ready.wiki, &ready.snapshot, &ready.cutoff_date)
 }
 
+fn retained_ready_lineage_matches(
+    candidate_dir: &Path,
+    ready: &ReadyWikiCandidate,
+    authorized_ready_sha256: &str,
+    depth: u8,
+) -> Result<bool> {
+    ensure!(
+        depth <= 16,
+        "retained candidate migration lineage is too deep"
+    );
+    let ready_path = candidate_dir.join("ready.json");
+    let (_, observed_sha256) = storage::sha256_file(&ready_path)?;
+    if observed_sha256 == authorized_ready_sha256 {
+        return Ok(true);
+    }
+    let Some(migration) = ready.migrated_from_retained_candidate.as_ref() else {
+        return Ok(false);
+    };
+    ensure!(
+        migration.schema_version == 1
+            && migration.migration == "retained-lifecycle-v3-to-v4-period-months-v1"
+            && migration.source_ready_sha256.len() == 64
+            && valid_component(&migration.source_run_id)
+            && migration.source_run_id != ready.run_id,
+        "retained candidate migration provenance is invalid"
+    );
+    let source_dir = candidate_dir
+        .parent()
+        .context("retained candidate has no snapshot parent")?
+        .join(&migration.source_run_id);
+    let source_ready_path = source_dir.join("ready.json");
+    let (_, source_sha256) = storage::sha256_file(&source_ready_path)
+        .context("retained migration source ready receipt is missing")?;
+    ensure!(
+        source_sha256 == migration.source_ready_sha256,
+        "retained migration source ready receipt changed"
+    );
+    let source_ready: ReadyWikiCandidate = read_json(&source_ready_path)?;
+    ensure!(
+        source_ready.wiki == ready.wiki
+            && source_ready.snapshot == ready.snapshot
+            && source_ready.run_id == migration.source_run_id,
+        "retained migration source candidate identity does not match its provenance"
+    );
+    retained_ready_lineage_matches(
+        &source_dir,
+        &source_ready,
+        authorized_ready_sha256,
+        depth + 1,
+    )
+}
+
 fn validate_ready_candidate(
     data_dir: &Path,
     candidate_dir: &Path,
@@ -1767,6 +2123,7 @@ fn validate_ready_candidate(
     for artifact in &ready.artifacts {
         validate_prepared_artifact(candidate_dir, artifact)?;
     }
+    validate_retained_lifecycle_projection(candidate_dir, ready)?;
     Ok(())
 }
 
@@ -2388,10 +2745,9 @@ fn ensure_artifact_fallback_authorized(
     );
     let receipt =
         crate::retention::validate_purged_snapshot(data_dir, &ready.wiki, &ready.snapshot)?;
-    let (_, ready_sha256) = storage::sha256_file(&candidate_dir.join("ready.json"))?;
     ensure!(
-        receipt.authorized_ready_sha256 == ready_sha256,
-        "retention receipt does not authorize this ready candidate"
+        retained_ready_lineage_matches(candidate_dir, ready, &receipt.authorized_ready_sha256, 0,)?,
+        "retention receipt does not authorize this ready candidate lineage"
     );
     Ok(())
 }
@@ -2495,6 +2851,7 @@ fn legacy_wiki_publication_proof(
         candidate_run_id: "legacy-import".to_string(),
         candidate_relative: wiki.to_string(),
         ready_receipt_sha256,
+        retention_source_ready_sha256: None,
         families,
         artifacts,
         quality_signals: None,
@@ -2572,6 +2929,10 @@ fn current_wiki_publication_proof(
         }
     };
     let quality_signals = ready.quality_signals.clone();
+    let retention_source_ready_sha256 = ready
+        .migrated_from_retained_candidate
+        .as_ref()
+        .map(|migration| migration.source_ready_sha256.clone());
     let mut artifacts = BTreeMap::new();
     for artifact in ready.artifacts {
         let metric = prepared_metric_name(&artifact)?;
@@ -2590,6 +2951,7 @@ fn current_wiki_publication_proof(
         candidate_run_id: ready.run_id,
         candidate_relative,
         ready_receipt_sha256,
+        retention_source_ready_sha256,
         families,
         artifacts,
         quality_signals,
@@ -3777,6 +4139,7 @@ fn record_candidate_fingerprint_drift(
                         candidate_run_id: reference.run_id.clone(),
                         candidate_relative: reference.candidate_relative.clone(),
                         ready_receipt_sha256: String::new(),
+                        retention_source_ready_sha256: None,
                         families: candidate_proofs,
                         artifacts: BTreeMap::new(),
                         quality_signals: None,
@@ -4024,6 +4387,7 @@ fn ready_candidate_merge_contracts(
     candidate_dir: &Path,
     ready: &ReadyWikiCandidate,
 ) -> Result<BTreeMap<MetricId, CandidateMergeContract>> {
+    validate_retained_lifecycle_projection(candidate_dir, ready)?;
     let mut contracts = BTreeMap::new();
     for artifact in &ready.artifacts {
         let Some(metric) = MetricId::from_artifact_identity(&artifact.path) else {
@@ -4046,6 +4410,24 @@ fn ready_candidate_merge_contracts(
                 && document.receipt.rows == artifact.rows,
             "{} artifact receipt disagrees with ready.json",
             metric.as_str()
+        );
+        let expected_schema = metric.definition().schema;
+        let observed_schema = &document.receipt.parquet_schema;
+        ensure!(
+            document.receipt.algorithm_version == metric.definition().algorithm_version
+                && observed_schema.len() == expected_schema.len()
+                && expected_schema.iter().zip(observed_schema).all(
+                    |((expected_name, expected_kind), observed)| {
+                        observed.name == *expected_name
+                            && observed.data_type == expected_kind.parquet_name()
+                    }
+                ),
+            "{} candidate receipt is obsolete or invalid: expected current algorithm {} and {} schema columns, observed algorithm {} and {} columns",
+            metric.as_str(),
+            metric.definition().algorithm_version,
+            expected_schema.len(),
+            document.receipt.algorithm_version,
+            observed_schema.len()
         );
         let replaced = contracts.insert(
             metric,
@@ -6393,6 +6775,26 @@ mod tests {
             )
         }
 
+        fn rewrite_candidate_lifecycle_to_v3(&self, run_id: &str) -> Result<PathBuf> {
+            let candidate = wiki_candidate_dir(self.output.path(), "nlwiki", "2026-03", run_id)?;
+            #[rustfmt::skip]
+        crate::compute::downgrade_lifecycle_candidate_to_v3_for_test("nlwiki", "2026-03", self.data.path(), &candidate)?;
+            let ready_path = candidate.join("ready.json");
+            let mut ready: ReadyWikiCandidate = read_json(&ready_path)?;
+            let lifecycle_artifacts: BTreeSet<_> = crate::metric_registry::MetricFamily::Lifecycle
+                .metrics()
+                .iter()
+                .map(|metric| format!("nlwiki/{metric}.parquet"))
+                .collect();
+            for artifact in &mut ready.artifacts {
+                if lifecycle_artifacts.contains(&artifact.path) {
+                    *artifact = prepared_artifact(&candidate, &candidate.join(&artifact.path))?;
+                }
+            }
+            atomic_json(&ready_path, &ready)?;
+            Ok(candidate)
+        }
+
         fn published_site(&self, run_id: &str) -> Result<(TestDir, PathBuf)> {
             self.prepare(run_id)?;
             validate(
@@ -7669,6 +8071,7 @@ mod tests {
                         candidate_run_id: format!("prepare-{wiki}"),
                         candidate_relative: format!("_candidates/{wiki}/2026-07/prepare-{wiki}"),
                         ready_receipt_sha256: format!("ready-{wiki}"),
+                        retention_source_ready_sha256: None,
                         families,
                         artifacts: BTreeMap::new(),
                         quality_signals: None,
@@ -7705,6 +8108,7 @@ mod tests {
                 candidate_run_id: "previous".to_string(),
                 candidate_relative: "_candidates/dewiki/2026-08/previous".to_string(),
                 ready_receipt_sha256: "ready-previous".to_string(),
+                retention_source_ready_sha256: None,
                 families: BTreeMap::from([(
                     "lifecycle".to_string(),
                     FamilyPublicationProof {
@@ -7778,6 +8182,7 @@ mod tests {
             candidate_run_id: "previous".to_string(),
             candidate_relative: "_candidates/nlwiki/2026-03/previous".to_string(),
             ready_receipt_sha256: String::new(),
+            retention_source_ready_sha256: None,
             families: BTreeMap::new(),
             artifacts: BTreeMap::new(),
             quality_signals: None,
@@ -8814,6 +9219,200 @@ mod tests {
     }
 
     #[test]
+    fn retained_v3_candidate_migration_reuses_receipted_outputs_without_reingest() -> Result<()> {
+        let fixture = Fixture::new()?;
+        fixture.ready_candidate("retained-v3-source")?;
+        prepare_ready_publication(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "retained-v3-initial-publication",
+        )
+        .expect("initial current-schema publication should prepare");
+        commit_ready_publication(
+            fixture.data.path(),
+            fixture.output.path(),
+            "retained-v3-initial-publication",
+        )
+        .expect("initial current-schema publication should commit");
+
+        #[rustfmt::skip]
+        let source_v4_candidate = wiki_candidate_dir(fixture.output.path(), "nlwiki", "2026-03", "retained-v3-source")?;
+        let failed_downgrade_temp = source_v4_candidate
+            .join("nlwiki/labor_churn.parquet")
+            .with_extension("parquet.v3-migration-fixture.tmp");
+        fs::create_dir(&failed_downgrade_temp)?;
+        let failed_downgrade = crate::compute::downgrade_lifecycle_candidate_to_v3_for_test(
+            "nlwiki",
+            "2026-03",
+            fixture.data.path(),
+            &source_v4_candidate,
+        );
+        fs::remove_dir(&failed_downgrade_temp)?;
+        assert!(failed_downgrade.is_err());
+
+        let source_candidate = fixture.rewrite_candidate_lifecycle_to_v3("retained-v3-source")?;
+        let source_ready_path = source_candidate.join("ready.json");
+        let source_ready: ReadyWikiCandidate = read_json(&source_ready_path)?;
+        let (_, authorized_source_sha256) = storage::sha256_file(&source_ready_path)?;
+        assert!(ready_candidate_merge_contracts(&source_candidate, &source_ready).is_err());
+
+        let migrate_families_to = |target_candidate: &Path| {
+            crate::compute::migrate_retained_candidate_families(
+                "nlwiki",
+                "2026-03",
+                &source_ready.run_id,
+                fixture.data.path(),
+                &source_candidate,
+                target_candidate,
+            )
+        };
+        for (family, expected_error) in [
+            (
+                crate::metric_registry::MetricFamily::Monthly,
+                "monthly family",
+            ),
+            (
+                crate::metric_registry::MetricFamily::Lifecycle,
+                "lifecycle v3 candidate",
+            ),
+        ] {
+            let receipt_path =
+                crate::compute::family_stage_receipt(&source_candidate, "nlwiki", family);
+            let original_receipt = fs::read(&receipt_path)?;
+            let mut altered_receipt: Value = serde_json::from_slice(&original_receipt)?;
+            altered_receipt["algorithm_version"] = json!("incompatible-test-algorithm");
+            atomic_json(&receipt_path, &altered_receipt)?;
+            let error = migrate_families_to(&source_candidate)
+                .expect_err("an incompatible family receipt must fail");
+            fs::write(&receipt_path, original_receipt)?;
+            assert!(error.to_string().contains(expected_error));
+        }
+
+        let write_failure_root = TestDir::new()?;
+        let write_failure_wiki = write_failure_root.path().join("nlwiki");
+        fs::create_dir_all(&write_failure_wiki)?;
+        #[rustfmt::skip]
+        fs::copy(source_candidate.join("nlwiki/labor_churn.parquet"), write_failure_wiki.join("labor_churn.parquet"))?;
+        fs::set_permissions(&write_failure_wiki, std::fs::Permissions::from_mode(0o555))?;
+        let write_failure = migrate_families_to(write_failure_root.path());
+        fs::set_permissions(&write_failure_wiki, std::fs::Permissions::from_mode(0o755))?;
+        assert!(write_failure.is_err());
+
+        for command in [
+            crate::Commands::RetentionAudit {
+                lifecycle: fixture.lifecycle_path.clone(),
+                wikis: vec!["nlwiki".to_string()],
+            },
+            crate::Commands::RetentionApply {
+                lifecycle: fixture.lifecycle_path.clone(),
+                wikis: vec!["nlwiki".to_string()],
+            },
+        ] {
+            crate::run_with_ops(
+                crate::Cli {
+                    data_dir: fixture.data.path().to_path_buf(),
+                    output_dir: fixture.output.path().to_path_buf(),
+                    run_id: None,
+                    command,
+                },
+                &crate::RealOps,
+            )
+            .expect("retention should authorize and purge the exact ready source");
+        }
+
+        #[rustfmt::skip]
+        crate::run_with_ops(crate::Cli {
+                data_dir: fixture.data.path().to_path_buf(),
+                output_dir: fixture.output.path().to_path_buf(),
+                run_id: Some("retained-v3-migrated".to_string()),
+                command: crate::Commands::MigrateRetainedCandidate {
+                    lifecycle: fixture.lifecycle_path.clone(),
+                    wiki: "nlwiki".to_string(),
+                    version: "2026-03".to_string(),
+                },
+            }, &crate::RealOps)?;
+        #[rustfmt::skip]
+        let migrated_ready_path = wiki_candidate_dir(fixture.output.path(), "nlwiki", "2026-03", "retained-v3-migrated")?.join("ready.json");
+        let migrated_candidate = migrated_ready_path
+            .parent()
+            .context("migrated ready receipt should have a candidate directory")?;
+        let migrated_ready: ReadyWikiCandidate = read_json(&migrated_ready_path)?;
+        let mut unqualified_ready = migrated_ready.clone();
+        unqualified_ready.workload_profile = None;
+        assert!(
+            validate_retained_migration_payload(migrated_candidate, &unqualified_ready).is_err()
+        );
+
+        let gdp_path = migrated_candidate.join("nlwiki/gdp.parquet");
+        let gdp_sidecar_path = artifact_receipt::sidecar_path(&gdp_path)?;
+        let original_gdp = fs::read(&gdp_path)?;
+        let original_gdp_receipt = fs::read(&gdp_sidecar_path)?;
+        let mut mislabeled_gdp = ParquetReader::new(File::open(&gdp_path)?).finish()?;
+        let wrong_wiki = Column::new("wiki".into(), vec!["dewiki"; mislabeled_gdp.height()]);
+        mislabeled_gdp.replace("wiki", wrong_wiki)?;
+        ParquetWriter::new(File::create(&gdp_path)?).finish(&mut mislabeled_gdp)?;
+        #[rustfmt::skip]
+        artifact_receipt::scan_and_write(&gdp_path, "nlwiki/gdp.parquet", crate::metric_registry::MetricId::Gdp.definition().algorithm_version, "retained-migration-semantic-summary-test")?;
+        let mut mislabeled_ready = migrated_ready.clone();
+        let gdp_artifact = mislabeled_ready
+            .artifacts
+            .iter_mut()
+            .find(|artifact| artifact.path == "nlwiki/gdp.parquet")
+            .context("migrated GDP artifact should exist")?;
+        *gdp_artifact = prepared_artifact(migrated_candidate, &gdp_path)?;
+        let semantic_error =
+            validate_retained_migration_payload(migrated_candidate, &mislabeled_ready);
+        fs::write(&gdp_path, original_gdp)?;
+        fs::write(&gdp_sidecar_path, original_gdp_receipt)?;
+        assert!(semantic_error.is_err());
+
+        let migration = migrated_ready
+            .migrated_from_retained_candidate
+            .as_ref()
+            .context("migration lineage should be recorded")?;
+        assert_eq!(migration.source_run_id, source_ready.run_id);
+        assert_eq!(migration.source_ready_sha256, authorized_source_sha256);
+        validate_ready_candidate(fixture.data.path(), migrated_candidate, &migrated_ready)?;
+
+        let source_churn_path = source_candidate.join("nlwiki/labor_churn.parquet");
+        let source_churn = ParquetReader::new(File::open(&source_churn_path)?).finish()?;
+        let migrated_churn_path = migrated_candidate.join("nlwiki/labor_churn.parquet");
+        let migrated_churn = ParquetReader::new(File::open(&migrated_churn_path)?).finish()?;
+        assert_eq!(source_churn.width(), 8);
+        assert_eq!(migrated_churn.width(), 9);
+        assert!(migrated_churn.column("period_months").is_ok());
+        assert!(
+            !storage::generation_manifest_path(fixture.data.path(), "nlwiki", "2026-03")?.is_file()
+        );
+
+        let (_, before_retry_sha256) = storage::sha256_file(&migrated_ready_path)?;
+        #[rustfmt::skip]
+        let retry_ready_path = migrate_retained_candidate(fixture.data.path(), fixture.output.path(), &fixture.lifecycle_path, "nlwiki", "2026-03", "retained-v3-migrated")?;
+        let (_, after_retry_sha256) = storage::sha256_file(&retry_ready_path)?;
+        assert_eq!(retry_ready_path, migrated_ready_path);
+        assert_eq!(before_retry_sha256, after_retry_sha256);
+
+        #[rustfmt::skip]
+        write_ready_index(fixture.data.path(), fixture.output.path(), "nlwiki", &(source_ready.clone(), source_candidate.clone()))?;
+        let partial_run_id = "retained-v3-partial-resume";
+        #[rustfmt::skip]
+        let partial_candidate = wiki_candidate_dir(fixture.output.path(), "nlwiki", "2026-03", partial_run_id)?;
+        fs::create_dir_all(partial_candidate.join("nlwiki"))?;
+        CandidateGeneration::new(fixture.output.path(), "nlwiki", "2026-03", partial_run_id)
+            .adopt(GState::Building, "test partial retained migration")?;
+        let migration_temp = partial_candidate
+            .join("nlwiki")
+            .join(format!(".labor_churn.{}.migration.tmp", std::process::id()));
+        fs::write(&migration_temp, b"stale migration temporary")?;
+        #[rustfmt::skip]
+        let partial_ready_path = migrate_retained_candidate(fixture.data.path(), fixture.output.path(), &fixture.lifecycle_path, "nlwiki", "2026-03", partial_run_id)?;
+        assert!(partial_ready_path.is_file());
+        assert!(!migration_temp.exists());
+        Ok(())
+    }
+
+    #[test]
     fn published_redownloadable_inputs_purge_without_breaking_noops() -> Result<()> {
         let fixture = Fixture::new()?;
         fixture.ready_candidate("retention-candidate")?;
@@ -8866,6 +9465,31 @@ mod tests {
                 .remove("nlwiki")
                 .context("fixture publication proof should exist")?;
         let gate: GateReceipt = read_json(&fixture.output.path().join(RECEIPT_FILE))?;
+
+        let authorized_ready_sha256 =
+            crate::retention::validate_purged_snapshot(fixture.data.path(), "nlwiki", "2026-03")?
+                .authorized_ready_sha256;
+        let mut migrated_current_proof = proof.clone();
+        migrated_current_proof.ready_receipt_sha256 = "e".repeat(64);
+        migrated_current_proof.retention_source_ready_sha256 =
+            Some(authorized_ready_sha256.clone());
+        let mut migrated_gate = gate.clone();
+        let migrated_previous_proof = migrated_gate
+            .wiki_proofs
+            .get_mut("nlwiki")
+            .context("fixture prior proof should exist")?;
+        migrated_previous_proof.ready_receipt_sha256 = "e".repeat(64);
+        migrated_previous_proof.retention_source_ready_sha256 = Some(authorized_ready_sha256);
+        assert!(
+            publication_patrol_source_report(
+                fixture.data.path(),
+                "nlwiki",
+                "2026-03",
+                Some(&migrated_gate),
+                &migrated_current_proof,
+            )
+            .is_ok()
+        );
         assert!(
             publication_patrol_source_report(
                 fixture.data.path(),

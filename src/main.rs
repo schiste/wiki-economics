@@ -307,6 +307,21 @@ enum Commands {
         lifecycle: PathBuf,
     },
 
+    /// Migrate an authenticated retained candidate into the current schema
+    #[command(hide = true)]
+    MigrateRetainedCandidate {
+        /// Wiki database name
+        wiki: String,
+
+        /// Exact retained snapshot to migrate
+        #[arg(long)]
+        version: String,
+
+        /// Wiki lifecycle and publication contract
+        #[arg(long, default_value = "config/wiki-lifecycle.json")]
+        lifecycle: PathBuf,
+    },
+
     /// Discover scheduled wikis and atomically enqueue independent preparation work
     FleetDiscover {
         /// Wiki lifecycle registry that defines the scheduled fleet
@@ -1368,6 +1383,22 @@ fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
                 },
             )?;
             println!("{}", ready.display());
+        }
+
+        Commands::MigrateRetainedCandidate {
+            wiki,
+            version,
+            lifecycle,
+        } => {
+            let migration_run_id = context
+                .run_id
+                .context("retained candidate migration requires --run-id")?;
+            #[rustfmt::skip]
+            let ready = publication::migrate_retained_candidate(&data_dir, &output_dir, &lifecycle, &wiki, &version, migration_run_id)?;
+            let display = ready.display().to_string();
+            let mut stdout = std::io::stdout().lock();
+            std::io::Write::write_all(&mut stdout, display.as_bytes())?;
+            std::io::Write::write_all(&mut stdout, b"\n")?;
         }
 
         Commands::FleetDiscover {

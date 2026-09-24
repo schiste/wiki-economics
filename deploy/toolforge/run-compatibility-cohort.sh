@@ -39,10 +39,8 @@ run_candidate() {
     --data-dir "$WIKI_ECON_DATA_DIR" \
     --output-dir "$WIKI_ECON_OUTPUT_DIR" \
     --run-id "$candidate_run_id" \
-    prepare-wiki "$candidate_wiki" \
+    migrate-retained-candidate "$candidate_wiki" \
     --version "$candidate_snapshot" \
-    --source-window-size 1 \
-    "$@" \
     --lifecycle "$lifecycle"
 }
 
@@ -78,19 +76,8 @@ for item in "$@"; do
       candidate_succeeded=1
     else
       exit_code=$?
-      if grep -qi "unchanged candidate is not the newest indexed ready candidate" "$candidate_capture"; then
-        echo "!!! RETAINED CANDIDATE STALE wiki=$wiki snapshot=$snapshot; forcing a complete rebuild so the ready index is repaired" >&2
-        rm -f -- "$candidate_capture"
-        candidate_capture=""
-        if run_candidate_logged "$wiki" "$snapshot" "$run_id" --rebuild; then
-          candidate_succeeded=1
-          exit_code=0
-        else
-          exit_code=$?
-        fi
-      fi
     fi
-  elif run_candidate_logged "$wiki" "$snapshot" "$run_id" --rebuild; then
+  elif run_candidate_logged "$wiki" "$snapshot" "$run_id"; then
     candidate_succeeded=1
   else
     exit_code=$?
