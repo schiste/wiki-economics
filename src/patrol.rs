@@ -36,7 +36,7 @@ const PATROL_DUMP_BASE: &str = "https://dumps.wikimedia.org";
 const PARQUET_BATCH_ROWS: usize = 50_000;
 const SUBSTANTIAL_LOGGING_DUMP_BYTES: u64 = 1024 * 1024;
 const SUBSTANTIAL_LOG_ITEMS: usize = 10_000;
-const PATROL_COMPUTE_ALGORITHM_VERSION: &str = "patrol-metrics-v5-complete-snapshot-months";
+const PATROL_COMPUTE_ALGORITHM_VERSION: &str = "patrol-metrics-v6-coverage-rounding-order";
 const PATROL_PARSER_VERSION: &str = "patrol-logging-pinned-plan-v6-typed-event-stream";
 const REVISION_COLUMNS: &[&str] = &[
     "revision_id",
@@ -3170,12 +3170,14 @@ impl PatrolRowMetrics {
         let patrol_coverage_pct = if total_revisions == 0 {
             0.0
         } else {
-            patrolled_revisions as f64 / total_revisions as f64 * 100.0
+            // Match the published-row invariant's multiplication-before-division order.
+            100.0 * patrolled_revisions as f64 / total_revisions as f64
         };
         let adjusted_coverage_pct = if total_revisions == 0 {
             0.0
         } else {
-            (patrolled_revisions + autopatrolled_revisions) as f64 / total_revisions as f64 * 100.0
+            100.0 * (patrolled_revisions as f64 + autopatrolled_revisions as f64)
+                / total_revisions as f64
         };
 
         Self {

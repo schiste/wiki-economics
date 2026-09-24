@@ -853,7 +853,7 @@
     {
       "id": "patrol",
       "family": "patrol",
-      "algorithm_version": "patrol-metrics-v5-complete-snapshot-months",
+      "algorithm_version": "patrol-metrics-v6-coverage-rounding-order",
       "schema": [
         {
           "name": "year_month",
@@ -988,7 +988,7 @@
       "fingerprint": {
         "artifact_identity": "patrol.parquet",
         "family": "patrol",
-        "algorithm_version": "patrol-metrics-v5-complete-snapshot-months"
+        "algorithm_version": "patrol-metrics-v6-coverage-rounding-order"
       },
       "browser": {
         "partitioning": "per_wiki_and_global_year_shards",
