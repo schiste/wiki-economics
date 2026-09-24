@@ -324,6 +324,30 @@
       "paths": ["src/compute/weekly/mod.rs"],
       "reason": "Flush and evict each completed monthly page-week staging Parquet so scratch page cache does not grow across all periods; formulas, rows, totals, schema, and artifact bytes are unchanged.",
       "base_commit": "17a03a466abf702c4b2ac508f59dee4fc27d1bdd"
+    },
+    {
+      "family": "monthly",
+      "paths": ["src/compute/mod.rs", "src/compute/monthly/mod.rs"],
+      "reason": "Add retained-candidate migration and expose the existing editor-identity report path; monthly formulas, rows, and artifact bytes are unchanged.",
+      "base_commit": "aa77415b27727cb2b83d3936b5beb652c3404805"
+    },
+    {
+      "family": "activity_tiers",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Add receipt-backed retained-candidate migration plumbing; activity-tier formulas, rows, schemas, and artifact bytes are unchanged.",
+      "base_commit": "aa77415b27727cb2b83d3936b5beb652c3404805"
+    },
+    {
+      "family": "lifecycle",
+      "paths": ["src/compute/mod.rs", "src/compute/lifecycle/mod.rs"],
+      "reason": "Add the explicit retained v3-to-v4 projection while leaving the already-versioned v4 compute formulas and outputs unchanged.",
+      "base_commit": "aa77415b27727cb2b83d3936b5beb652c3404805"
+    },
+    {
+      "family": "page_week",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Add receipt-backed retained-candidate migration plumbing; page-week formulas, rows, schemas, and artifact bytes are unchanged.",
+      "base_commit": "aa77415b27727cb2b83d3936b5beb652c3404805"
     }
   ]
 }

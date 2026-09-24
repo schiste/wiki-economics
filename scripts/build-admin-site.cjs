@@ -217,7 +217,7 @@ function buildAdminSite({root, siteDir, manifestPath, distDir, outputDir, runId,
       cwd: root,
       env: {
         ...process.env,
-        NODE_OPTIONS: `--require=${denyNetwork}${process.env.NODE_OPTIONS ? ` ${process.env.NODE_OPTIONS}` : ""}`,
+        NODE_OPTIONS: `--require=${JSON.stringify(denyNetwork)}${process.env.NODE_OPTIONS ? ` ${process.env.NODE_OPTIONS}` : ""}`,
         OBSERVABLE_TELEMETRY_DISABLE: "true",
         WIKI_ECON_ADMIN_STANDALONE: "1",
         WIKI_ECON_SITE_SOURCE_DIR: path.join(sourceDir, "src"),
