@@ -1081,6 +1081,13 @@ pub(super) fn stable_weekly_secondary_bucket(
         & (secondary_bucket_count - 1)
 }
 
+fn sync_and_discard_path_cache(path: &Path) -> Result<()> {
+    let file = File::options().read(true).write(true).open(path)?;
+    file.sync_all()?;
+    storage::discard_file_cache(&file, 0, file.metadata()?.len());
+    Ok(())
+}
+
 pub(super) fn format_epoch_day(day: i32) -> Option<String> {
     NaiveDate::from_ymd_opt(1970, 1, 1)?
         .checked_add_signed(Duration::days(i64::from(day)))
@@ -1134,6 +1141,10 @@ pub(super) fn stage_weekly_partition(
     writer
         .context("weekly partition produced no stable buckets")?
         .finish()?;
+    // The monthly partitions are all staged before compaction starts. Flush
+    // each completed file and advise Linux to evict it now so the scratch
+    // output cache does not grow with all 309 months in the job's cgroup.
+    sync_and_discard_path_cache(&path)?;
     Ok(path)
 }
 
@@ -1273,8 +1284,13 @@ pub(super) fn compact_weekly_primary_buckets(
                 "primary compaction range {start}..{end} lost or duplicated edits"
             );
         }
-        for writer in writers.into_values() {
+        for (bucket, writer) in writers {
             writer.finish()?;
+            sync_and_discard_path_cache(
+                paths[bucket]
+                    .as_deref()
+                    .context("finished primary bucket has no output path")?,
+            )?;
         }
         // The staged partitions are read completely during compaction and
         // removed below. Drop their reclaimable pages before the next
@@ -1424,8 +1440,13 @@ pub(super) fn route_primary_to_secondary_buckets(
             peak_active_writers,
             "page_weekly_edits: finished secondary writer batch"
         );
-        for writer in writers.into_values() {
+        for (secondary, writer) in writers {
             writer.finish()?;
+            sync_and_discard_path_cache(
+                paths[secondary]
+                    .as_deref()
+                    .context("finished secondary bucket has no output path")?,
+            )?;
         }
         // This primary bucket is reread once per writer-sized batch. Its
         // cache is no longer useful after the final batch has closed.

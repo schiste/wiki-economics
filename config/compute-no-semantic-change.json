@@ -318,6 +318,12 @@
       "paths": ["src/compute/mod.rs"],
       "reason": "The change only routes page-week work; lifecycle formulas, rows, totals, schema, and artifact bytes are unchanged.",
       "base_commit": "59c67ad91547e21c84f238bc033ce47c1fd6e1f3"
+    },
+    {
+      "family": "page_week",
+      "paths": ["src/compute/weekly/mod.rs"],
+      "reason": "Flush and evict each completed monthly page-week staging Parquet so scratch page cache does not grow across all periods; formulas, rows, totals, schema, and artifact bytes are unchanged.",
+      "base_commit": "17a03a466abf702c4b2ac508f59dee4fc27d1bdd"
     }
   ]
 }
