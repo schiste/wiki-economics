@@ -456,6 +456,14 @@ enum Commands {
         #[arg(long)]
         qualification_run_id: String,
 
+        /// SHA-256 of the qualification receipt selected by the admin
+        #[arg(long)]
+        qualification_sha256: Option<String>,
+
+        /// Root containing isolated qualification runs (wiki/run-id/output)
+        #[arg(long)]
+        qualification_root: Option<PathBuf>,
+
         /// Wiki lifecycle containing the hidden qualification entry
         #[arg(long, default_value = "config/wiki-lifecycle.json")]
         lifecycle: PathBuf,
@@ -1033,15 +1041,38 @@ impl CandidateOps for RealOps {
     }
 
     fn promote_qualification(&self, request: PromoteQualificationRequest<'_>) -> Result<PathBuf> {
-        publication::promote_wiki_qualification(
-            request.data_dir,
-            request.output_dir,
-            request.lifecycle,
-            request.wiki,
-            request.version,
-            request.qualification_run_id,
-            request.promotion_run_id,
-        )
+        match (
+            request.qualification_root,
+            request.qualification_receipt_sha256,
+        ) {
+            (Some(_), None) => anyhow::bail!(
+                "isolated qualification promotion requires the selected receipt SHA-256"
+            ),
+            (qualification_root, Some(qualification_receipt_sha256)) => {
+                publication::promote_wiki_qualification_with_expected_receipt(
+                    publication::QualificationPromotionRequest {
+                        data_dir: request.data_dir,
+                        output_dir: request.output_dir,
+                        qualification_root,
+                        lifecycle_path: request.lifecycle,
+                        wiki: request.wiki,
+                        snapshot: request.version,
+                        qualification_run_id: request.qualification_run_id,
+                        promotion_run_id: request.promotion_run_id,
+                        expected_receipt_sha256: Some(qualification_receipt_sha256),
+                    },
+                )
+            }
+            (None, None) => publication::promote_wiki_qualification(
+                request.data_dir,
+                request.output_dir,
+                request.lifecycle,
+                request.wiki,
+                request.version,
+                request.qualification_run_id,
+                request.promotion_run_id,
+            ),
+        }
     }
 
     fn retire_candidate(&self, request: RetireCandidateRequest<'_>) -> Result<PathBuf> {
@@ -1501,6 +1532,8 @@ fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
             wiki,
             version,
             qualification_run_id,
+            qualification_sha256,
+            qualification_root,
             lifecycle,
         } => {
             let promotion_run_id = context
@@ -1509,6 +1542,8 @@ fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
             let ready = ops.promote_qualification(PromoteQualificationRequest {
                 data_dir: &data_dir,
                 output_dir: &output_dir,
+                qualification_root: qualification_root.as_deref(),
+                qualification_receipt_sha256: qualification_sha256.as_deref(),
                 lifecycle: &lifecycle,
                 wiki: &wiki,
                 version: &version,
@@ -3295,11 +3330,45 @@ mod tests {
                 .promote_qualification(PromoteQualificationRequest {
                     data_dir: data.path(),
                     output_dir: output.path(),
+                    qualification_root: None,
+                    qualification_receipt_sha256: None,
                     lifecycle: &data.path().join("missing-lifecycle.json"),
                     wiki: "nlwiki",
                     version: "2026-08",
                     qualification_run_id: "qualified-1",
                     promotion_run_id: "promoted-1",
+                })
+                .is_err()
+        );
+        let lifecycle_path = data.path().join("missing-lifecycle.json");
+        let isolated_root = TestDir::new().expect("isolated qualification root should initialize");
+        assert!(
+            RealOps
+                .promote_qualification(PromoteQualificationRequest {
+                    data_dir: data.path(),
+                    output_dir: output.path(),
+                    qualification_root: Some(isolated_root.path()),
+                    qualification_receipt_sha256: None,
+                    lifecycle: &lifecycle_path,
+                    wiki: "nlwiki",
+                    version: "2026-08",
+                    qualification_run_id: "qualified-1",
+                    promotion_run_id: "promoted-missing-digest",
+                })
+                .is_err()
+        );
+        assert!(
+            RealOps
+                .promote_qualification(PromoteQualificationRequest {
+                    data_dir: data.path(),
+                    output_dir: output.path(),
+                    qualification_root: Some(isolated_root.path()),
+                    qualification_receipt_sha256: Some("invalid"),
+                    lifecycle: &lifecycle_path,
+                    wiki: "nlwiki",
+                    version: "2026-08",
+                    qualification_run_id: "qualified-1",
+                    promotion_run_id: "promoted-invalid-digest",
                 })
                 .is_err()
         );

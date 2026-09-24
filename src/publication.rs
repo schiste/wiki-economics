@@ -1811,6 +1811,20 @@ fn validate_qualification_receipt(
     Ok(())
 }
 
+/// All identities and roots needed to promote one exact admin-selected qualification.
+#[derive(Clone, Copy)]
+pub(crate) struct QualificationPromotionRequest<'a> {
+    pub(crate) data_dir: &'a Path,
+    pub(crate) output_dir: &'a Path,
+    pub(crate) qualification_root: Option<&'a Path>,
+    pub(crate) lifecycle_path: &'a Path,
+    pub(crate) wiki: &'a str,
+    pub(crate) snapshot: &'a str,
+    pub(crate) qualification_run_id: &'a str,
+    pub(crate) promotion_run_id: &'a str,
+    pub(crate) expected_receipt_sha256: Option<&'a str>,
+}
+
 /// Convert one exact, authenticated qualification into an immutable ready
 /// candidate without recomputing or mutating the qualification evidence.
 ///
@@ -1827,6 +1841,94 @@ pub(crate) fn promote_wiki_qualification(
     qualification_run_id: &str,
     promotion_run_id: &str,
 ) -> Result<PathBuf> {
+    let request = QualificationPromotionRequest {
+        data_dir,
+        output_dir,
+        qualification_root: None,
+        lifecycle_path,
+        wiki,
+        snapshot,
+        qualification_run_id,
+        promotion_run_id,
+        expected_receipt_sha256: None,
+    };
+    promote_wiki_qualification_from_dirs(request, data_dir, output_dir)
+}
+
+/// Promote the receipt selected by the authenticated admin after checking its
+/// digest, optionally reading the qualification from its isolated Toolforge root.
+pub(crate) fn promote_wiki_qualification_with_expected_receipt(
+    request: QualificationPromotionRequest<'_>,
+) -> Result<PathBuf> {
+    let expected_receipt_sha256 = request
+        .expected_receipt_sha256
+        .context("admin-selected qualification receipt SHA-256 is required")?;
+    ensure!(
+        expected_receipt_sha256.len() == 64
+            && expected_receipt_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()),
+        "invalid expected qualification receipt SHA-256"
+    );
+    match request.qualification_root {
+        Some(_) => promote_wiki_qualification_from_root(request),
+        None => promote_wiki_qualification_from_dirs(request, request.data_dir, request.output_dir),
+    }
+}
+
+fn promote_wiki_qualification_from_root(
+    request: QualificationPromotionRequest<'_>,
+) -> Result<PathBuf> {
+    let qualification_root = request
+        .qualification_root
+        .context("isolated qualification root is required")?;
+    ensure!(valid_component(request.wiki), "unsafe promotion wiki");
+    ensure!(
+        valid_component(request.qualification_run_id),
+        "unsafe qualification run ID"
+    );
+    let run_root = qualification_root
+        .join(request.wiki)
+        .join(request.qualification_run_id);
+    let run_data_dir = run_root.join("data");
+    let run_output_dir = run_root.join("output");
+    for directory in [
+        qualification_root,
+        run_root.as_path(),
+        run_data_dir.as_path(),
+        run_output_dir.as_path(),
+    ] {
+        let metadata = fs::symlink_metadata(directory).with_context(|| {
+            format!(
+                "isolated qualification directory {} is unavailable",
+                directory.display()
+            )
+        })?;
+        ensure!(
+            metadata.file_type().is_dir(),
+            "isolated qualification path {} is not a regular directory",
+            directory.display()
+        );
+    }
+    promote_wiki_qualification_from_dirs(request, &run_data_dir, &run_output_dir)
+}
+
+fn promote_wiki_qualification_from_dirs(
+    request: QualificationPromotionRequest<'_>,
+    qualification_data_dir: &Path,
+    qualification_output_dir: &Path,
+) -> Result<PathBuf> {
+    let QualificationPromotionRequest {
+        data_dir,
+        output_dir,
+        lifecycle_path,
+        wiki,
+        snapshot,
+        qualification_run_id,
+        promotion_run_id,
+        expected_receipt_sha256,
+        ..
+    } = request;
     ensure!(valid_component(wiki), "unsafe promotion wiki");
     storage::validate_snapshot_version(snapshot)?;
     ensure!(
@@ -1844,12 +1946,40 @@ pub(crate) fn promote_wiki_qualification(
         "qualification promotion requires a hidden/qualification lifecycle"
     );
 
-    let qualification_dir =
-        wiki_qualification_dir(output_dir, wiki, snapshot, qualification_run_id)?;
+    let qualification_dir = qualification_output_dir
+        .join("_qualifications")
+        .join(wiki)
+        .join(snapshot)
+        .join(qualification_run_id);
+    let mut checked_dir = qualification_output_dir.to_path_buf();
+    for component in ["_qualifications", wiki, snapshot, qualification_run_id] {
+        checked_dir.push(component);
+        let metadata = fs::symlink_metadata(&checked_dir).with_context(|| {
+            format!(
+                "qualification directory {} is unavailable",
+                checked_dir.display()
+            )
+        })?;
+        ensure!(
+            metadata.file_type().is_dir(),
+            "qualification path {} is not a regular directory",
+            checked_dir.display()
+        );
+    }
+    ensure!(
+        checked_dir == qualification_dir,
+        "qualification directory did not resolve to its checked identity path"
+    );
     let qualification_path = qualification_dir.join("qualification.json");
+    let receipt_metadata = fs::symlink_metadata(&qualification_path)
+        .context("qualification receipt is unavailable")?;
+    ensure!(
+        receipt_metadata.file_type().is_file(),
+        "qualification receipt is not a regular file"
+    );
     let qualification: QualificationReceipt = read_json(&qualification_path)?;
     validate_qualification_receipt(
-        data_dir,
+        qualification_data_dir,
         &qualification_dir,
         &qualification,
         wiki,
@@ -1857,6 +1987,12 @@ pub(crate) fn promote_wiki_qualification(
         qualification_run_id,
     )?;
     let (_, qualification_sha256) = storage::sha256_file(&qualification_path)?;
+    if let Some(expected_sha256) = expected_receipt_sha256 {
+        ensure!(
+            qualification_sha256 == expected_sha256,
+            "qualification receipt changed after it was selected by the admin"
+        );
+    }
     let promotion = QualificationPromotion {
         snapshot: snapshot.to_string(),
         run_id: qualification_run_id.to_string(),
@@ -10403,6 +10539,165 @@ mod tests {
     }
 
     #[test]
+    fn isolated_qualification_promotion_reads_capacity_root_and_preserves_evidence() -> Result<()> {
+        let fixture = Fixture::new().expect("promotion fixture should initialize");
+        let qualification_run_id = "qualification-isolated";
+        prepare_hidden_qualification_fixture(&fixture, qualification_run_id);
+        let qualification_path = mark_wiki_qualification_ready(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "nlwiki",
+            "2026-03",
+            qualification_run_id,
+        )
+        .expect("qualification receipt should become ready");
+
+        let qualification_root = TestDir::new().expect("isolated root should initialize");
+        let run_root = qualification_root
+            .path()
+            .join("nlwiki")
+            .join(qualification_run_id);
+        let isolated_data = run_root.join("data");
+        fs::create_dir_all(&isolated_data).expect("isolated data root should initialize");
+        let mut data_files = Vec::new();
+        collect_promotion_files(fixture.data.path(), fixture.data.path(), &mut data_files)
+            .expect("fixture data files should be enumerated");
+        copy_candidate_files(fixture.data.path(), &isolated_data, &data_files)
+            .expect("fixture data should copy to the isolated run");
+
+        let isolated_output = run_root.join("output");
+        fs::create_dir_all(&isolated_output).expect("isolated output root should initialize");
+        let isolated_qualification_dir =
+            wiki_qualification_dir(&isolated_output, "nlwiki", "2026-03", qualification_run_id)
+                .expect("isolated qualification path should resolve");
+        let source_qualification_dir = qualification_path
+            .parent()
+            .expect("source qualification receipt should have a parent");
+        let mut qualification_files = Vec::new();
+        collect_promotion_files(
+            source_qualification_dir,
+            source_qualification_dir,
+            &mut qualification_files,
+        )
+        .expect("isolated qualification files should be enumerated");
+        copy_candidate_files(
+            source_qualification_dir,
+            &isolated_qualification_dir,
+            &qualification_files,
+        )
+        .expect("qualification artifacts should copy into the isolated root");
+        fs::copy(
+            &qualification_path,
+            isolated_qualification_dir.join("qualification.json"),
+        )
+        .expect("qualification receipt should copy into the isolated root");
+        fs::remove_dir_all(source_qualification_dir)
+            .expect("production qualification copy should be removed for the test");
+
+        let isolated_receipt = isolated_qualification_dir.join("qualification.json");
+        let expected_sha256 = storage::sha256_file(&isolated_receipt)
+            .expect("isolated qualification should hash")
+            .1;
+        let missing_root = TestDir::new().expect("missing isolated root should initialize");
+        let missing_root_error =
+            promote_wiki_qualification_with_expected_receipt(QualificationPromotionRequest {
+                data_dir: fixture.data.path(),
+                output_dir: fixture.output.path(),
+                qualification_root: Some(missing_root.path()),
+                lifecycle_path: &fixture.lifecycle_path,
+                wiki: "nlwiki",
+                snapshot: "2026-03",
+                qualification_run_id,
+                promotion_run_id: "missing-isolated-root",
+                expected_receipt_sha256: Some(&expected_sha256),
+            })
+            .expect_err("missing isolated evidence should fail closed");
+        assert!(
+            format!("{missing_root_error:#}").contains("isolated qualification directory"),
+            "unexpected missing-root error: {missing_root_error:#}"
+        );
+        let not_directory_root = qualification_root.path().join("not-a-directory");
+        fs::write(&not_directory_root, b"not a directory")
+            .expect("non-directory root fixture should write");
+        let not_directory_error =
+            promote_wiki_qualification_with_expected_receipt(QualificationPromotionRequest {
+                data_dir: fixture.data.path(),
+                output_dir: fixture.output.path(),
+                qualification_root: Some(&not_directory_root),
+                lifecycle_path: &fixture.lifecycle_path,
+                wiki: "nlwiki",
+                snapshot: "2026-03",
+                qualification_run_id,
+                promotion_run_id: "non-directory-isolated-root",
+                expected_receipt_sha256: Some(&expected_sha256),
+            })
+            .expect_err("non-directory isolated root should fail closed");
+        assert!(
+            format!("{not_directory_error:#}").contains("is not a regular directory"),
+            "unexpected non-directory-root error: {not_directory_error:#}"
+        );
+
+        let wrong_receipt_hash = "f".repeat(64);
+        assert!(
+            promote_wiki_qualification_with_expected_receipt(QualificationPromotionRequest {
+                data_dir: fixture.data.path(),
+                output_dir: fixture.output.path(),
+                qualification_root: Some(qualification_root.path()),
+                lifecycle_path: &fixture.lifecycle_path,
+                wiki: "nlwiki",
+                snapshot: "2026-03",
+                qualification_run_id,
+                promotion_run_id: "isolated-promotion-1",
+                expected_receipt_sha256: Some(&wrong_receipt_hash),
+            },)
+            .is_err()
+        );
+        let ready_path =
+            promote_wiki_qualification_with_expected_receipt(QualificationPromotionRequest {
+                data_dir: fixture.data.path(),
+                output_dir: fixture.output.path(),
+                qualification_root: Some(qualification_root.path()),
+                lifecycle_path: &fixture.lifecycle_path,
+                wiki: "nlwiki",
+                snapshot: "2026-03",
+                qualification_run_id,
+                promotion_run_id: "isolated-promotion-1",
+                expected_receipt_sha256: Some(&expected_sha256),
+            })
+            .expect("isolated qualification should promote into production output");
+        let ready: ReadyWikiCandidate = read_json(&ready_path).expect("ready receipt should parse");
+        assert_eq!(
+            ready
+                .promoted_from_qualification
+                .as_ref()
+                .expect("promotion identity should be recorded")
+                .receipt_sha256,
+            expected_sha256
+        );
+        assert!(
+            isolated_receipt.is_file(),
+            "promotion must preserve isolated evidence"
+        );
+        assert!(
+            !qualification_path.exists(),
+            "promotion must not recreate qualification data under production output"
+        );
+        assert_eq!(
+            ready_path,
+            wiki_candidate_dir(
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                "isolated-promotion-1",
+            )
+            .expect("promotion candidate path should resolve")
+            .join("ready.json")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn qualification_promotion_survives_release_metadata_changes() {
         let fixture = Fixture::new().expect("promotion fixture should initialize");
         let qualification_run_id = "qualification-prior-release";
@@ -10430,16 +10725,66 @@ mod tests {
         atomic_json(&stage_receipt_path, &stage_receipt)
             .expect("prior release metadata should persist");
 
-        let ready_path = promote_wiki_qualification(
-            fixture.data.path(),
-            fixture.output.path(),
-            &fixture.lifecycle_path,
-            "nlwiki",
-            "2026-03",
-            qualification_run_id,
-            "promotion-after-release",
+        let (_, qualification_receipt_sha256) =
+            storage::sha256_file(&qualification_path).expect("qualification receipt should hash");
+        let ready_path =
+            promote_wiki_qualification_with_expected_receipt(QualificationPromotionRequest {
+                data_dir: fixture.data.path(),
+                output_dir: fixture.output.path(),
+                qualification_root: None,
+                lifecycle_path: &fixture.lifecycle_path,
+                wiki: "nlwiki",
+                snapshot: "2026-03",
+                qualification_run_id,
+                promotion_run_id: "promotion-after-release",
+                expected_receipt_sha256: Some(&qualification_receipt_sha256),
+            })
+            .expect("prior-release qualification should promote");
+
+        let missing_output =
+            TestDir::new().expect("missing qualification output should initialize");
+        let missing_output_error =
+            promote_wiki_qualification_with_expected_receipt(QualificationPromotionRequest {
+                data_dir: fixture.data.path(),
+                output_dir: missing_output.path(),
+                qualification_root: None,
+                lifecycle_path: &fixture.lifecycle_path,
+                wiki: "nlwiki",
+                snapshot: "2026-03",
+                qualification_run_id,
+                promotion_run_id: "missing-qualification-output",
+                expected_receipt_sha256: Some(&qualification_receipt_sha256),
+            })
+            .expect_err("missing production qualification should fail closed");
+        assert!(
+            format!("{missing_output_error:#}").contains("qualification directory"),
+            "unexpected missing-output error: {missing_output_error:#}"
+        );
+
+        let non_directory_output =
+            TestDir::new().expect("non-directory qualification output should initialize");
+        fs::write(
+            non_directory_output.path().join("_qualifications"),
+            b"not a directory",
         )
-        .expect("prior-release qualification should promote");
+        .expect("non-directory qualification path fixture should write");
+        let non_directory_output_error =
+            promote_wiki_qualification_with_expected_receipt(QualificationPromotionRequest {
+                data_dir: fixture.data.path(),
+                output_dir: non_directory_output.path(),
+                qualification_root: None,
+                lifecycle_path: &fixture.lifecycle_path,
+                wiki: "nlwiki",
+                snapshot: "2026-03",
+                qualification_run_id,
+                promotion_run_id: "non-directory-qualification-output",
+                expected_receipt_sha256: Some(&qualification_receipt_sha256),
+            })
+            .expect_err("non-directory production qualification should fail closed");
+        assert!(
+            format!("{non_directory_output_error:#}").contains("not a regular directory"),
+            "unexpected non-directory-output error: {non_directory_output_error:#}"
+        );
         assert!(ready_path.is_file());
         let index: ReadyCandidateIndex =
             read_json(&ready_index_path(fixture.output.path(), "nlwiki"))
