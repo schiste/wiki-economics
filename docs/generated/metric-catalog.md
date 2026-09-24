@@ -19,7 +19,7 @@ Population scopes are part of the public contract: values with different scopes 
 | `labor_cohorts` | `lifecycle` / `editor-lifecycle-v4-explicit-identified-registered-editors-external-merge` | `wiki_cohort_year_followup_year` | merged + per-wiki | date: year; order: wiki-major/v1; conserve: — | `labor_cohorts.parquet` | per-wiki files + global year shards |
 | `labor_monthly` | `monthly` / `monthly-stateless-v5-exact-period-inequality` | `wiki_month_namespace_user_type` | merged + per-wiki | date: year_month; order: wiki-major/v1; conserve: total_edits | `labor_monthly.parquet` | per-wiki files + global year shards |
 | `page_weekly_edits` | `page_week` / `page-week-v2-governed-parallel-buckets` | `wiki_page_namespace_week` | per-wiki only | date: week_start; order: stable-page-hash-bucket/page-key/week/v1; conserve: edits | `page_weekly_edits.parquet` | Rust defaults only |
-| `patrol` | `patrol` / `patrol-metrics-v5-complete-snapshot-months` | `wiki_month_namespace_user_type` | merged + per-wiki | date: year_month; order: wiki-major/v1; conserve: total_patrols | `patrol.parquet` | per-wiki files + global year shards |
+| `patrol` | `patrol` / `patrol-metrics-v6-coverage-rounding-order` | `wiki_month_namespace_user_type` | merged + per-wiki | date: year_month; order: wiki-major/v1; conserve: total_patrols | `patrol.parquet` | per-wiki files + global year shards |
 
 ## Schemas and aggregation semantics
 
