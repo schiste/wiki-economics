@@ -113,6 +113,7 @@ toolforge envvars create WIKI_ECON_ADMIN_EXECUTION_MODE queue
 toolforge envvars create WIKI_ECON_ADMIN_OPERATION_DIR /data/project/wiki-economics/output/_admin/operations
 toolforge envvars create WIKI_ECON_ADMIN_DIST_DIR /data/project/wiki-economics/admin-dist
 toolforge envvars create WIKI_ECON_WIKI_LIFECYCLE_FILE /data/project/wiki-economics/config/wiki-lifecycle.json
+toolforge envvars create WIKI_ECON_QUALIFICATION_ROOT /data/project/wiki-economics/capacity/qualifications
 
 echo "==> Restarting wiki-econ-admin webservice"
 toolforge webservice restart

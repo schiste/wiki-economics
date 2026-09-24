@@ -57,6 +57,8 @@ test("hidden qualifications and shared blockers have explicit human states", () 
   assert.match(source, /Qualification ready/);
   assert.match(source, /Qualification completed and remains hidden/);
   assert.match(source, /passed \$\{qualification\?\.artifactCount/);
+  assert.match(source, /Evidence location/);
+  assert.match(source, /Isolated Toolforge run/);
   assert.match(source, /One setup constraint affects/);
   assert.match(source, /not \$\{blocker\.affectedWikis\?\.length \|\| 0\} separate data failures/);
   assert.match(source, /Automatic retry is disabled because unchanged inputs would fail again/);

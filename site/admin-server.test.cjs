@@ -36,6 +36,7 @@ function loadAdminServer(envOverrides, wikiLifecycle = {
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-admin-test-"));
   const dataDir = path.join(tempRoot, "data");
   const outputDir = path.join(tempRoot, "output");
+  const qualificationRoot = path.join(tempRoot, "capacity", "qualifications");
   const distDir = path.join(tempRoot, "dist");
   fs.mkdirSync(dataDir, { recursive: true });
   fs.mkdirSync(outputDir, { recursive: true });
@@ -47,11 +48,12 @@ function loadAdminServer(envOverrides, wikiLifecycle = {
     "<!doctype html><html><body><h1>Admin Test Page</h1></body></html>",
     "utf8",
   );
-  if (setup) setup({ tempRoot, dataDir, outputDir, distDir });
+  if (setup) setup({ tempRoot, dataDir, outputDir, qualificationRoot, distDir });
 
   const env = {
     WIKI_ECON_DATA_DIR: dataDir,
     WIKI_ECON_OUTPUT_DIR: outputDir,
+    WIKI_ECON_QUALIFICATION_ROOT: qualificationRoot,
     WIKI_ECON_SITE_DIST_DIR: distDir,
     WIKI_ECON_WIKI_LIFECYCLE_FILE: lifecyclePath,
     ...envOverrides,
@@ -72,11 +74,11 @@ function loadAdminServer(envOverrides, wikiLifecycle = {
     else process.env[key] = oldValue;
   }
 
-  return { module, tempRoot };
+  return { module, tempRoot, qualificationRoot };
 }
 
 async function startServer(t, envOverrides, wikiLifecycle, setup) {
-  const { module, tempRoot } = loadAdminServer(envOverrides, wikiLifecycle, setup);
+  const { module, tempRoot, qualificationRoot } = loadAdminServer(envOverrides, wikiLifecycle, setup);
   t.after(() => {
     delete require.cache[SERVER_MODULE_PATH];
     fs.rmSync(tempRoot, { recursive: true, force: true });
@@ -87,6 +89,7 @@ async function startServer(t, envOverrides, wikiLifecycle, setup) {
     tempRoot,
     distDir: path.join(tempRoot, "dist"),
     outputDir: path.join(tempRoot, "output"),
+    qualificationRoot,
   };
 }
 
@@ -909,7 +912,7 @@ test("operators can pause, resume, and configure lifecycle with revision protect
   assert.equal(fs.readdirSync(auditDir).length, 6);
 });
 
-test("qualification promotion is queued with exact candidate and lifecycle identities", async (t) => {
+test("isolated qualification promotion is queued with exact candidate and lifecycle identities", async (t) => {
   const lifecycle = {
     schema_version: 1,
     publication_contract: {datasets: {}},
@@ -922,11 +925,20 @@ test("qualification promotion is queued with exact candidate and lifecycle ident
       },
     },
   };
-  const {module, host, outputDir} = await startServer(t, {
+  const {module, host, outputDir, qualificationRoot} = await startServer(t, {
     ...LOCAL_ENV,
     WIKI_ECON_ADMIN_EXECUTION_MODE: "queue",
-  }, lifecycle, ({outputDir: fixtureOutput}) => {
-    const candidate = path.join(fixtureOutput, "_qualifications", "dewiki", "2026-08", "qualification-1");
+  }, lifecycle, ({qualificationRoot: fixtureRoot}) => {
+    const candidate = path.join(
+      fixtureRoot,
+      "dewiki",
+      "qualification-1",
+      "output",
+      "_qualifications",
+      "dewiki",
+      "2026-08",
+      "qualification-1",
+    );
     fs.mkdirSync(candidate, {recursive: true});
     fs.writeFileSync(path.join(candidate, "qualification.json"), JSON.stringify({
       schema_version: 2,
@@ -942,6 +954,7 @@ test("qualification promotion is queued with exact candidate and lifecycle ident
   });
   const status = JSON.parse((await invoke(module, {url: "/api/status", headers: {host}})).text());
   assert.equal(status.qualifications.dewiki[0].structurallyValid, true);
+  assert.equal(status.qualifications.dewiki[0].source, "isolated");
   const response = await invoke(module, {
     method: "POST",
     url: "/api/promote-qualification",
@@ -959,9 +972,15 @@ test("qualification promotion is queued with exact candidate and lifecycle ident
   assert.equal(response.statusCode, 202, response.text());
   const body = JSON.parse(response.text());
   assert.equal(body.operation.qualificationRunId, "qualification-1");
+  assert.equal(body.operation.qualificationSource, "isolated");
+  assert.equal(body.operation.qualificationReceiptSha256, status.qualifications.dewiki[0].receiptSha256);
   assert.equal(body.operation.lifecycleMutation.action, "promote");
   assert.equal(body.operation.lifecycleRevision, status.lifecycleRevision);
-  assert.equal(fs.readdirSync(path.join(outputDir, "_admin", "lifecycle-audit")).length, 1);
+  const auditDir = path.join(outputDir, "_admin", "lifecycle-audit");
+  const audit = JSON.parse(fs.readFileSync(path.join(auditDir, fs.readdirSync(auditDir)[0]), "utf8"));
+  assert.equal(audit.qualification.source, "isolated");
+  assert.equal(audit.qualification.receiptSha256, body.operation.qualificationReceiptSha256);
+  assert.equal(fs.readdirSync(auditDir).length, 1);
 });
 
 test("candidate retirement and isolated rebuild require exact identities", async (t) => {
@@ -1429,12 +1448,49 @@ test("admin dispatcher maps fail-closed operational controls to typed commands",
     wiki: "dewiki",
     version: "2026-08",
     qualificationRunId: "qualification-1",
+    qualificationReceiptSha256: "a".repeat(64),
     runId: "promote-1",
   });
   assert.deepEqual(
-    promote.args.slice(-7),
-    ["dewiki", "--version", "2026-08", "--qualification-run-id", "qualification-1", "--lifecycle", promote.args.at(-1)],
+    promote.args.slice(-9),
+    ["dewiki", "--version", "2026-08", "--qualification-run-id", "qualification-1", "--qualification-sha256", "a".repeat(64), "--lifecycle", promote.args.at(-1)],
   );
+  const isolatedPromote = dispatcher.commandFor({
+    action: "promote-qualification",
+    wiki: "dewiki",
+    version: "2026-08",
+    qualificationRunId: "qualification-1",
+    qualificationSource: "isolated",
+    qualificationReceiptSha256: "b".repeat(64),
+    runId: "promote-isolated-1",
+  });
+  assert.deepEqual(isolatedPromote.args.slice(-2), [
+    "--qualification-root",
+    process.env.WIKI_ECON_QUALIFICATION_ROOT || path.resolve(__dirname, "../capacity/qualifications"),
+  ]);
+  assert.throws(() => dispatcher.validateRequest({
+    schemaVersion: 1,
+    requestId: "promote-invalid-source",
+    action: "promote-qualification",
+    wiki: "dewiki",
+    version: "2026-08",
+    qualificationRunId: "qualification-1",
+    qualificationSource: "unexpected",
+    qualificationReceiptSha256: "c".repeat(64),
+    lifecycleMutation: {action: "promote", wiki: "dewiki"},
+    lifecycleRevision: "a".repeat(64),
+  }), /invalid source root/);
+  assert.throws(() => dispatcher.validateRequest({
+    schemaVersion: 1,
+    requestId: "promote-isolated-without-digest",
+    action: "promote-qualification",
+    wiki: "dewiki",
+    version: "2026-08",
+    qualificationRunId: "qualification-1",
+    qualificationSource: "isolated",
+    lifecycleMutation: {action: "promote", wiki: "dewiki"},
+    lifecycleRevision: "a".repeat(64),
+  }), /bound to its receipt digest/);
   const retire = dispatcher.commandFor({
     action: "retire-candidate",
     wiki: "dewiki",

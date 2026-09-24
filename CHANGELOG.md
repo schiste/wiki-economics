@@ -16,3 +16,5 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and snapshot.
 - Quote the offline network-guard path so deterministic site builds work from
   local checkout paths that contain spaces.
+- Discover isolated Toolforge qualification receipts in the authenticated
+  admin and promote their validated artifacts into production ready candidates.

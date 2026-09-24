@@ -923,6 +923,7 @@ function promoteQualification(name, qualification, options = {}) {
     facts: [
       ["Qualification", qualification.runId],
       ["Snapshot", qualification.snapshot],
+      ["Evidence location", qualification.source === "isolated" ? "Isolated Toolforge run" : "Production output"],
       ["Future updates", refresh === "scheduled" ? "Scheduled" : "Manual"],
       ["Worker class", resourceClass.replaceAll("_", " / ")],
       ["Freshness SLA", `${freshnessSlaDays} days`],
@@ -1927,6 +1928,7 @@ function lifecycleControls(name, lifecycle, direct) {
         <div class="admin-lifecycle-evidence">
           <div><span>Qualified snapshot</span><strong>${qualification.snapshot}</strong></div>
           <div><span>Candidate identity</span><code>${qualification.runId}</code></div>
+          <div><span>Evidence location</span><strong>${qualification.source === "isolated" ? "Isolated Toolforge run" : "Production output"}</strong></div>
           <div><span>Artifacts</span><strong>${qualification.artifactCount}</strong></div>
           <div><span>Cutoff</span><strong>${qualification.cutoffDate || "not reported"}</strong></div>
         </div>
