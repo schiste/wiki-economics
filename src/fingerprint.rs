@@ -794,6 +794,17 @@ fn atomic_write_receipt(receipt_path: &Path, receipt: &StageReceipt) -> Result<(
     write_result
 }
 
+#[cfg(test)]
+pub(crate) fn set_computation_version_for_test(
+    receipt_path: &Path,
+    computation_version: &str,
+) -> Result<()> {
+    let mut receipt = read_receipt(receipt_path)?;
+    receipt.computation_version = computation_version.to_string();
+    receipt.fingerprint = receipt_fingerprint(&receipt)?;
+    atomic_write_receipt(receipt_path, &receipt)
+}
+
 fn site_selected_snapshot_versions(output_dir: &Path) -> Result<Vec<(String, String)>> {
     let gate_bytes = fs::read(output_dir.join(crate::publication::RECEIPT_FILE))?;
     let gate: serde_json::Value = serde_json::from_slice(&gate_bytes)?;
@@ -1285,6 +1296,47 @@ mod tests {
             )
             .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn retained_stage_receipts_accept_older_package_versions_only_for_exact_outputs() -> Result<()>
+    {
+        let dir = TestDir::new()?;
+        let output = dir.path().join("output.txt");
+        let receipt_path = dir.path().join("retained-stage.json");
+        fs::write(&output, "retained output")?;
+        let outputs = [TrackedPath::new("output/metric", &output)];
+        let spec = StageSpec {
+            stage: "compute_monthly",
+            scope: "testwiki",
+            selected_snapshot: Some("2026-08"),
+            algorithm_version: "monthly-v5",
+        };
+
+        assert!(!retained_outputs_reusable(
+            &dir.path().join("missing.json"),
+            spec,
+            &outputs,
+        )?);
+        record(&receipt_path, spec, &[], &outputs)?;
+        set_computation_version_for_test(&receipt_path, "0.1.1")?;
+
+        assert!(!outputs_reusable(&receipt_path, spec, &outputs)?);
+        assert!(retained_outputs_reusable(&receipt_path, spec, &outputs)?);
+        assert!(!retained_outputs_reusable(
+            &receipt_path,
+            StageSpec {
+                algorithm_version: "monthly-v6",
+                ..spec
+            },
+            &outputs,
+        )?);
+
+        fs::write(&output, "changed output")?;
+        assert!(!retained_outputs_reusable(&receipt_path, spec, &outputs)?);
+        fs::write(&receipt_path, "not-json")?;
+        assert!(!retained_outputs_reusable(&receipt_path, spec, &outputs)?);
         Ok(())
     }
 

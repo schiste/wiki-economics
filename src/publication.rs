@@ -9474,6 +9474,37 @@ mod tests {
             .expect("retention should authorize and purge the exact ready source");
         }
 
+        for family in crate::metric_registry::MetricFamily::CORE {
+            let receipt_path =
+                crate::compute::family_stage_receipt(&source_candidate, "nlwiki", family);
+            crate::fingerprint::set_computation_version_for_test(&receipt_path, "0.1.1")?;
+        }
+        let patrol_receipt = source_candidate
+            .join("_stages")
+            .join("patrol_compute")
+            .join("nlwiki.json");
+        crate::fingerprint::set_computation_version_for_test(&patrol_receipt, "0.1.1")?;
+        let patrol_output = crate::fingerprint::TrackedPath::new(
+            "output/nlwiki/patrol.parquet",
+            source_candidate.join("nlwiki/patrol.parquet"),
+        );
+        let patrol_spec = crate::fingerprint::StageSpec {
+            stage: "patrol_compute",
+            scope: "nlwiki",
+            selected_snapshot: Some("2026-03"),
+            algorithm_version: crate::patrol::algorithm_version(),
+        };
+        assert!(!crate::fingerprint::outputs_reusable(
+            &patrol_receipt,
+            patrol_spec,
+            std::slice::from_ref(&patrol_output),
+        )?);
+        assert!(crate::fingerprint::retained_outputs_reusable(
+            &patrol_receipt,
+            patrol_spec,
+            &[patrol_output],
+        )?);
+
         #[rustfmt::skip]
         crate::run_with_ops(crate::Cli {
                 data_dir: fixture.data.path().to_path_buf(),
