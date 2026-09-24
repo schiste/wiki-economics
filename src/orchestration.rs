@@ -53,6 +53,8 @@ pub(crate) struct PrepareSourceRequest<'a> {
 pub(crate) struct PromoteQualificationRequest<'a> {
     pub(crate) data_dir: &'a Path,
     pub(crate) output_dir: &'a Path,
+    pub(crate) qualification_root: Option<&'a Path>,
+    pub(crate) qualification_receipt_sha256: Option<&'a str>,
     pub(crate) lifecycle: &'a Path,
     pub(crate) wiki: &'a str,
     pub(crate) version: &'a str,

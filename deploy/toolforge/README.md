@@ -473,6 +473,14 @@ production snapshot pointer, ready-candidate set, merged artifact, or site
 symlink. Inspect `qualification.json` and the isolated run status before
 starting capacity variants or considering lifecycle promotion.
 
+The authenticated admin reads completed receipts from
+`/data/project/wiki-economics/capacity/qualifications` through
+`WIKI_ECON_QUALIFICATION_ROOT`. Select the exact wiki, snapshot, and run ID in
+the admin page; the queued promotion validates that isolated receipt and
+copies its receipted artifacts into production `output/_candidates` while
+preserving the qualification run. `rebuild-image.sh` configures this root on
+the webservice after an image update.
+
 To measure the changed-one-wiki `publication_prepare` SLO independently from
 a full migration or no-op, use an on-demand 6 GiB/1-vCPU job:
 

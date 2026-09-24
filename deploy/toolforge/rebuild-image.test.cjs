@@ -51,6 +51,7 @@ esac
     assert.match(invocations, /envvars create WIKI_ECON_ADMIN_EXECUTION_MODE queue/);
     assert.match(invocations, /envvars create WIKI_ECON_ADMIN_OPERATION_DIR \/data\/project\/wiki-economics\/output\/_admin\/operations/);
     assert.match(invocations, /envvars create WIKI_ECON_WIKI_LIFECYCLE_FILE \/data\/project\/wiki-economics\/config\/wiki-lifecycle.json/);
+    assert.match(invocations, /envvars create WIKI_ECON_QUALIFICATION_ROOT \/data\/project\/wiki-economics\/capacity\/qualifications/);
     assert.match(invocations, /webservice restart/);
   } finally {
     fs.rmSync(fixture, {recursive: true, force: true});

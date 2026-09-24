@@ -16,6 +16,9 @@ const {
 const ROOT = path.resolve(__dirname, "../..");
 const DATA_DIR = path.resolve(process.env.WIKI_ECON_DATA_DIR || path.join(ROOT, "data"));
 const OUTPUT_DIR = path.resolve(process.env.WIKI_ECON_OUTPUT_DIR || path.join(ROOT, "output"));
+const QUALIFICATION_ROOT = path.resolve(
+  process.env.WIKI_ECON_QUALIFICATION_ROOT || path.join(ROOT, "capacity", "qualifications"),
+);
 const LIFECYCLE_PATH = path.resolve(
   process.env.WIKI_ECON_WIKI_LIFECYCLE_FILE || path.join(ROOT, "config", "wiki-lifecycle.json"),
 );
@@ -97,13 +100,20 @@ function commandFor(request) {
     case "qualify":
       return {program: BIN, args: [...common, "qualify-wiki", wiki, ...version, "--lifecycle", LIFECYCLE_PATH]};
     case "promote-qualification":
-      return {program: BIN, args: [
+      const promotionArgs = [
         ...common,
         "promote-qualification", wiki,
         ...version,
         "--qualification-run-id", request.qualificationRunId,
+        ...(request.qualificationReceiptSha256
+          ? ["--qualification-sha256", request.qualificationReceiptSha256]
+          : []),
         "--lifecycle", LIFECYCLE_PATH,
-      ]};
+      ];
+      if (request.qualificationSource === "isolated") {
+        promotionArgs.push("--qualification-root", QUALIFICATION_ROOT);
+      }
+      return {program: BIN, args: promotionArgs};
     case "retire-candidate":
       return {program: BIN, args: [
         "--data-dir", DATA_DIR,
@@ -193,6 +203,17 @@ function validateRequest(request) {
       || request.lifecycleMutation?.wiki !== request.wiki
       || !/^[a-f0-9]{64}$/.test(request.lifecycleRevision || "")) {
       throw new Error("Qualification promotion has no authenticated lifecycle transition");
+    }
+    if (request.qualificationSource != null
+      && !new Set(["production", "isolated"]).has(request.qualificationSource)) {
+      throw new Error("Qualification promotion has an invalid source root");
+    }
+    if (request.qualificationReceiptSha256 != null
+      && !/^[a-f0-9]{64}$/.test(request.qualificationReceiptSha256)) {
+      throw new Error("Qualification promotion has an invalid receipt digest");
+    }
+    if (request.qualificationSource === "isolated" && !request.qualificationReceiptSha256) {
+      throw new Error("Isolated qualification promotion must be bound to its receipt digest");
     }
   }
   if (request.action === "retire-candidate"

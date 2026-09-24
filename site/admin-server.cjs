@@ -46,6 +46,10 @@ const BIND_HOST = process.env.WIKI_ECON_ADMIN_BIND_HOST || "127.0.0.1";
 const SITE_PORT = Number.parseInt(process.env.WIKI_ECON_SITE_PORT || "3000", 10);
 const DATA_DIR = resolveConfiguredPath("WIKI_ECON_DATA_DIR", "data");
 const OUTPUT_DIR = resolveConfiguredPath("WIKI_ECON_OUTPUT_DIR", "output");
+const QUALIFICATION_ROOT = resolveConfiguredPath(
+  "WIKI_ECON_QUALIFICATION_ROOT",
+  path.join("capacity", "qualifications"),
+);
 const GENERATOR_DIR = resolveConfiguredPath("WIKI_ECON_GENERATOR_DIR", path.join("site", "data-build"));
 const SITE_DIST_DIR = resolveConfiguredPath("WIKI_ECON_SITE_DIST_DIR", path.join("site", "dist"));
 const ADMIN_DIST_DIR = resolveConfiguredPath("WIKI_ECON_ADMIN_DIST_DIR", SITE_DIST_DIR);
@@ -1018,6 +1022,8 @@ function queueAdminOperation({
   version,
   taskId = null,
   qualificationRunId = null,
+  qualificationSource = null,
+  qualificationReceiptSha256 = null,
   candidateRunId = null,
   lifecycleMutation = null,
   lifecycleRevision = null,
@@ -1073,6 +1079,8 @@ function queueAdminOperation({
     version: version || null,
     taskId: taskId || null,
     qualificationRunId: qualificationRunId || null,
+    qualificationSource: qualificationSource || null,
+    qualificationReceiptSha256: qualificationReceiptSha256 || null,
     candidateRunId: candidateRunId || null,
     lifecycleMutation,
     lifecycleRevision,
@@ -1891,7 +1899,7 @@ function buildStatusPayload(req, session) {
       }
     : lastJob;
   const manifest = refreshManifestSafely() || { error: "Manifest unavailable" };
-  const qualifications = qualificationCandidates(OUTPUT_DIR);
+  const qualifications = qualificationCandidates(OUTPUT_DIR, 10, QUALIFICATION_ROOT);
   const operationalTruth = buildOperationalTruth({
     root: ROOT,
     dataDir: DATA_DIR,
@@ -2300,6 +2308,8 @@ async function handleRequest(req, res) {
       }
 
       let requestedLifecycleMutation = null;
+      let requestedQualificationSource = null;
+      let requestedQualificationReceiptSha256 = null;
       let requestedCompatibilityCohort = null;
       if (action === "rebuild-compatibility-cohort") {
         try {
@@ -2311,7 +2321,7 @@ async function handleRequest(req, res) {
       }
       if (action === "promote-qualification") {
         const qualificationRunId = String(params.qualificationRunId || "");
-        const qualification = (qualificationCandidates(OUTPUT_DIR)[wiki] || []).find((entry) => (
+        const qualification = (qualificationCandidates(OUTPUT_DIR, 10, QUALIFICATION_ROOT)[wiki] || []).find((entry) => (
           entry.snapshot === version && entry.runId === qualificationRunId
         ));
         if (!qualification || !qualification.structurallyValid) {
@@ -2336,6 +2346,8 @@ async function handleRequest(req, res) {
           resourceClass: String(params.resourceClass || lifecycle.fleet_resource_class || "medium_large"),
           ...(params.freshnessSlaDays != null ? {freshnessSlaDays: params.freshnessSlaDays} : {}),
         };
+        requestedQualificationSource = qualification.source || "production";
+        requestedQualificationReceiptSha256 = qualification.receiptSha256;
         immutableAuditEvent(ADMIN_LIFECYCLE_AUDIT_DIR, {
           requestId: runId,
           phase: "requested",
@@ -2347,6 +2359,7 @@ async function handleRequest(req, res) {
           qualification: {
             snapshot: qualification.snapshot,
             runId: qualification.runId,
+            source: qualification.source,
             receiptSha256: qualification.receiptSha256,
           },
           requestedLifecycle: requestedLifecycleMutation,
@@ -2397,6 +2410,8 @@ async function handleRequest(req, res) {
             version,
             taskId: params.taskId || null,
             qualificationRunId: params.qualificationRunId || null,
+            qualificationSource: requestedQualificationSource,
+            qualificationReceiptSha256: requestedQualificationReceiptSha256,
             candidateRunId: params.candidateRunId || null,
             lifecycleMutation: requestedLifecycleMutation,
             lifecycleRevision: params.lifecycleRevision || null,

@@ -209,6 +209,16 @@ authenticates one exact qualification receipt, copies its receipted artifacts
 into an immutable ready candidate, and only then commits the reviewed
 lifecycle transition.
 
+The authenticated admin discovers receipts in production
+`output/_qualifications` and in the isolated Toolforge tree configured by
+`WIKI_ECON_QUALIFICATION_ROOT` (normally
+`capacity/qualifications/<wiki>/<run-id>/output/_qualifications`). It records
+which root supplied the selected receipt in the queued operation. Promotion
+validates the receipt and artifacts in that isolated run, copies them into the
+production ready-candidate tree, and leaves the qualification evidence intact.
+The admin image rebuild sets the root explicitly so the webservice and its
+dispatcher use the same Toolforge path.
+
 Promotion remains valid if the application is deployed between qualification
 and approval. In that case the ready index is composed from the immutable
 qualification receipt and per-artifact receipts instead of requiring the old

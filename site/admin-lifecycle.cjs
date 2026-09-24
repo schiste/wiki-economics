@@ -131,74 +131,130 @@ function readAuditTrail(auditDir, limit = 104) {
   return {events: events.slice(0, limit), invalid};
 }
 
-function qualificationCandidates(outputDir, limitPerWiki = 10) {
-  const root = path.join(outputDir, "_qualifications");
-  const byWiki = {};
-  let wikis = [];
-  try {
-    wikis = fs.readdirSync(root).sort();
-  } catch (error) {
-    if (error.code === "ENOENT") return byWiki;
-    throw error;
+function qualificationCandidates(outputDir, limitPerWiki = 10, isolatedQualificationRoot = null) {
+  const candidates = new Map();
+
+  function directoryNames(root) {
+    try {
+      const rootStat = fs.lstatSync(root);
+      if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) return [];
+      return fs.readdirSync(root, {withFileTypes: true})
+        .filter((entry) => entry.isDirectory() && !entry.isSymbolicLink())
+        .map((entry) => entry.name)
+        .sort();
+    } catch (error) {
+      if (error.code === "ENOENT") return [];
+      throw error;
+    }
   }
-  for (const wiki of wikis) {
+
+  function addCandidate({wiki, snapshot, runId, receiptPath, source}) {
+    if (!/^[a-z0-9_]+wiki$/.test(wiki) || !YEAR_MONTH.test(snapshot)
+      || !/^[a-zA-Z0-9_.-]+$/.test(runId)) return;
+    let entry;
+    try {
+      const stat = fs.lstatSync(receiptPath);
+      if (!stat.isFile() || stat.isSymbolicLink()) {
+        throw new Error("qualification receipt is not a regular file");
+      }
+      const bytes = fs.readFileSync(receiptPath);
+      const receipt = JSON.parse(bytes.toString("utf8"));
+      const valid = receipt.schema_version === 2
+        && receipt.publication_eligible === false
+        && receipt.wiki === wiki
+        && receipt.snapshot === snapshot
+        && receipt.run_id === runId
+        && Array.isArray(receipt.artifacts)
+        && receipt.artifacts.length > 0;
+      entry = {
+        wiki,
+        snapshot,
+        runId,
+        source,
+        qualifiedAtUnix: receipt.qualified_at_unix ?? null,
+        cutoffDate: receipt.cutoff_date ?? null,
+        artifactCount: receipt.artifacts?.length ?? 0,
+        artifactBytes: (receipt.artifacts || []).reduce((total, artifact) => total + Number(artifact?.bytes || 0), 0),
+        artifactRows: (receipt.artifacts || []).reduce((total, artifact) => total + Number(artifact?.rows || 0), 0),
+        metricIds: (receipt.artifacts || [])
+          .map((artifact) => path.basename(String(artifact?.path || ""), ".parquet"))
+          .filter(Boolean)
+          .sort(),
+        workloadProfile: receipt.workload_profile?.profile ?? null,
+        resourceClass: receipt.workload_profile?.resource_class ?? null,
+        receiptSha256: sha256(bytes),
+        structurallyValid: valid,
+        error: valid ? null : "qualification receipt identity or schema mismatch",
+      };
+    } catch (error) {
+      if (error.code === "ENOENT") return;
+      entry = {wiki, snapshot, runId, source, structurallyValid: false, error: error.message};
+    }
+
+    const identity = `${wiki}\0${snapshot}\0${runId}`;
+    const previous = candidates.get(identity);
+    if (!previous) {
+      candidates.set(identity, entry);
+      return;
+    }
+    if (previous.receiptSha256 && previous.receiptSha256 === entry.receiptSha256) {
+      if (entry.source === "production") candidates.set(identity, entry);
+      return;
+    }
+    previous.structurallyValid = false;
+    previous.error = "qualification receipt identity exists in both production and isolated roots with different content";
+  }
+
+  const productionRoot = path.join(outputDir, "_qualifications");
+  for (const wiki of directoryNames(productionRoot)) {
     if (!/^[a-z0-9_]+wiki$/.test(wiki)) continue;
-    const wikiRoot = path.join(root, wiki);
-    let snapshots = [];
-    try { snapshots = fs.readdirSync(wikiRoot).sort().reverse(); } catch { continue; }
-    const entries = [];
-    for (const snapshot of snapshots) {
+    const wikiRoot = path.join(productionRoot, wiki);
+    for (const snapshot of directoryNames(wikiRoot).sort().reverse()) {
       if (!YEAR_MONTH.test(snapshot)) continue;
       const snapshotRoot = path.join(wikiRoot, snapshot);
-      let runs = [];
-      try { runs = fs.readdirSync(snapshotRoot).sort().reverse(); } catch { continue; }
-      for (const runId of runs) {
-        const receiptPath = path.join(snapshotRoot, runId, "qualification.json");
-        try {
-          const bytes = fs.readFileSync(receiptPath);
-          const receipt = JSON.parse(bytes.toString("utf8"));
-          const valid = receipt.schema_version === 2
-            && receipt.publication_eligible === false
-            && receipt.wiki === wiki
-            && receipt.snapshot === snapshot
-            && receipt.run_id === runId
-            && Array.isArray(receipt.artifacts)
-            && receipt.artifacts.length > 0;
-          entries.push({
+      for (const runId of directoryNames(snapshotRoot).sort().reverse()) {
+        addCandidate({
+          wiki,
+          snapshot,
+          runId,
+          receiptPath: path.join(snapshotRoot, runId, "qualification.json"),
+          source: "production",
+        });
+      }
+    }
+  }
+
+  if (isolatedQualificationRoot) {
+    for (const wiki of directoryNames(isolatedQualificationRoot)) {
+      if (!/^[a-z0-9_]+wiki$/.test(wiki)) continue;
+      const wikiRoot = path.join(isolatedQualificationRoot, wiki);
+      for (const runId of directoryNames(wikiRoot).sort().reverse()) {
+        if (!/^[a-zA-Z0-9_.-]+$/.test(runId)) continue;
+        const isolatedQualifications = path.join(wikiRoot, runId, "output", "_qualifications", wiki);
+        for (const snapshot of directoryNames(isolatedQualifications).sort().reverse()) {
+          if (!YEAR_MONTH.test(snapshot)) continue;
+          addCandidate({
             wiki,
             snapshot,
             runId,
-            qualifiedAtUnix: receipt.qualified_at_unix ?? null,
-            cutoffDate: receipt.cutoff_date ?? null,
-            artifactCount: receipt.artifacts?.length ?? 0,
-            artifactBytes: (receipt.artifacts || []).reduce((total, artifact) => total + Number(artifact?.bytes || 0), 0),
-            artifactRows: (receipt.artifacts || []).reduce((total, artifact) => total + Number(artifact?.rows || 0), 0),
-            metricIds: (receipt.artifacts || [])
-              .map((artifact) => path.basename(String(artifact?.path || ""), ".parquet"))
-              .filter(Boolean)
-              .sort(),
-            workloadProfile: receipt.workload_profile?.profile ?? null,
-            resourceClass: receipt.workload_profile?.resource_class ?? null,
-            receiptSha256: sha256(bytes),
-            structurallyValid: valid,
-            error: valid ? null : "qualification receipt identity or schema mismatch",
-          });
-        } catch (error) {
-          if (error.code !== "ENOENT") entries.push({
-            wiki,
-            snapshot,
-            runId,
-            structurallyValid: false,
-            error: error.message,
+            receiptPath: path.join(isolatedQualifications, snapshot, runId, "qualification.json"),
+            source: "isolated",
           });
         }
       }
     }
-    entries.sort((left, right) => (right.snapshot || "").localeCompare(left.snapshot || "")
-      || Number(right.qualifiedAtUnix || 0) - Number(left.qualifiedAtUnix || 0)
-      || (right.runId || "").localeCompare(left.runId || ""));
-    if (entries.length > 0) byWiki[wiki] = entries.slice(0, limitPerWiki);
   }
+
+  const byWiki = {};
+  const entries = [...candidates.values()];
+  entries.sort((left, right) => (left.wiki || "").localeCompare(right.wiki || "")
+    || (right.snapshot || "").localeCompare(left.snapshot || "")
+    || Number(right.qualifiedAtUnix || 0) - Number(left.qualifiedAtUnix || 0)
+    || (right.runId || "").localeCompare(left.runId || ""));
+  for (const entry of entries) {
+    (byWiki[entry.wiki] ||= []).push(entry);
+  }
+  for (const wiki of Object.keys(byWiki)) byWiki[wiki] = byWiki[wiki].slice(0, limitPerWiki);
   return byWiki;
 }
 

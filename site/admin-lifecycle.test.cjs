@@ -138,10 +138,22 @@ test("lifecycle writes use optimistic revisions and immutable authenticated audi
 test("qualification discovery validates identities and keeps malformed receipts visible", (t) => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-qualifications-"));
   t.after(() => fs.rmSync(root, {recursive: true, force: true}));
+  const isolatedRoot = path.join(root, "capacity", "qualifications");
   const validDir = path.join(root, "_qualifications", "dewiki", "2026-08", "qualified-1");
   const invalidDir = path.join(root, "_qualifications", "dewiki", "2026-07", "broken-1");
+  const isolatedDir = path.join(
+    isolatedRoot,
+    "dewiki",
+    "isolated-qualification-1",
+    "output",
+    "_qualifications",
+    "dewiki",
+    "2026-09",
+    "isolated-qualification-1",
+  );
   fs.mkdirSync(validDir, {recursive: true});
   fs.mkdirSync(invalidDir, {recursive: true});
+  fs.mkdirSync(isolatedDir, {recursive: true});
   fs.writeFileSync(path.join(validDir, "qualification.json"), JSON.stringify({
     schema_version: 2,
     publication_eligible: false,
@@ -154,17 +166,31 @@ test("qualification discovery validates identities and keeps malformed receipts 
     workload_profile: {profile: "small", resource_class: "medium_large"},
   }));
   fs.writeFileSync(path.join(invalidDir, "qualification.json"), "{truncated");
+  fs.writeFileSync(path.join(isolatedDir, "qualification.json"), JSON.stringify({
+    schema_version: 2,
+    publication_eligible: false,
+    wiki: "dewiki",
+    snapshot: "2026-09",
+    run_id: "isolated-qualification-1",
+    qualified_at_unix: 1_789_000_000,
+    artifacts: [{path: "dewiki/gdp.parquet", bytes: 256, rows: 84}],
+  }));
 
-  const candidates = qualificationCandidates(root);
-  assert.equal(candidates.dewiki.length, 2);
-  assert.equal(candidates.dewiki[0].runId, "qualified-1");
+  const candidates = qualificationCandidates(root, 10, isolatedRoot);
+  assert.equal(candidates.dewiki.length, 3);
+  assert.equal(candidates.dewiki[0].runId, "isolated-qualification-1");
+  assert.equal(candidates.dewiki[0].source, "isolated");
   assert.equal(candidates.dewiki[0].structurallyValid, true);
-  assert.equal(candidates.dewiki[0].artifactBytes, 128);
-  assert.equal(candidates.dewiki[0].artifactRows, 42);
-  assert.deepEqual(candidates.dewiki[0].metricIds, ["gdp"]);
-  assert.equal(candidates.dewiki[0].workloadProfile, "small");
-  assert.match(candidates.dewiki[0].receiptSha256, /^[a-f0-9]{64}$/);
-  assert.equal(candidates.dewiki[1].structurallyValid, false);
+  assert.equal(candidates.dewiki[0].artifactBytes, 256);
+  assert.equal(candidates.dewiki[1].runId, "qualified-1");
+  assert.equal(candidates.dewiki[1].source, "production");
+  assert.equal(candidates.dewiki[1].structurallyValid, true);
+  assert.equal(candidates.dewiki[1].artifactBytes, 128);
+  assert.equal(candidates.dewiki[1].artifactRows, 42);
+  assert.deepEqual(candidates.dewiki[1].metricIds, ["gdp"]);
+  assert.equal(candidates.dewiki[1].workloadProfile, "small");
+  assert.match(candidates.dewiki[1].receiptSha256, /^[a-f0-9]{64}$/);
+  assert.equal(candidates.dewiki[2].structurallyValid, false);
 });
 
 test("immutable audit writes are idempotent and never overwrite another payload", (t) => {
