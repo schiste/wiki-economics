@@ -63,6 +63,11 @@ and higher resource envelope are being qualified.
   `SHA256SUMS`, and `release-provenance.json`, tying all identities to exact
   Node, npm, Rust, browser-package, lockfile, OS, and shared-library versions
   observed by CI.
+  `deploy-binary.sh` also updates the tool-wide `WIKI_ECON_SOURCE_COMMIT` and
+  `WIKI_ECON_BINARY_SHA256` values from the verified release before restarting
+  the webservice, so runtime provenance guards follow `app/current`. The
+  independently verified image identity remains unchanged by a binary-only
+  deployment.
   `prune-releases.sh` verifies checksums and smoke tests before retaining the
   live release plus two known-good rollback releases. It also removes exact-SHA
   interrupted uploads after 24 hours. Both limits are configurable with
