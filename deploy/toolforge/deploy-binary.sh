@@ -79,6 +79,16 @@ case "$file_description" in
   *ELF*64-bit*x86-64*) ;;
   *) echo "Expected a 64-bit x86-64 ELF binary, got: $file_description" >&2; exit 1 ;;
 esac
+if command -v sha256sum >/dev/null 2>&1; then
+  binary_checksum="$(sha256sum "$local_extract/wiki-econ" | awk '{print $1}')"
+else
+  binary_checksum="$(shasum -a 256 "$local_extract/wiki-econ" | awk '{print $1}')"
+fi
+provenance_binary_checksum="$(jq -er '.binary.sha256' "$local_extract/release-provenance.json")"
+[[ "$binary_checksum" =~ ^[0-9a-f]{64}$ ]] && [ "$binary_checksum" = "$provenance_binary_checksum" ] || {
+  echo "Release binary checksum does not match its provenance" >&2
+  exit 1
+}
 
 # Verify GitHub's Sigstore-backed attestation against the repository identity
 # and exact archive digest before any SSH upload. An explicitly downloaded
@@ -108,6 +118,10 @@ fi
 stable_binary="$app_root/current/wiki-econ"
 ssh -o BatchMode=yes "$ssh_target" \
   "become $tool_account toolforge envvars create WIKI_ECON_BIN '$stable_binary'"
+ssh -o BatchMode=yes "$ssh_target" \
+  "become $tool_account toolforge envvars create WIKI_ECON_SOURCE_COMMIT '$release_sha'"
+ssh -o BatchMode=yes "$ssh_target" \
+  "become $tool_account toolforge envvars create WIKI_ECON_BINARY_SHA256 '$binary_checksum'"
 ssh -o BatchMode=yes "$ssh_target" \
   "become $tool_account toolforge webservice restart"
 
