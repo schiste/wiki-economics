@@ -1462,8 +1462,25 @@ pub(crate) fn migrate_retained_candidate(
 
     #[rustfmt::skip]
     crate::compute::migrate_retained_candidate_families(wiki, snapshot, &source_ready.run_id, data_dir, &source_candidate, &target_candidate)?;
+    let patrol_output = crate::fingerprint::TrackedPath::new(
+        format!("output/{wiki}/patrol.parquet"),
+        target_candidate.join(wiki).join("patrol.parquet"),
+    );
+    let patrol_receipt = target_candidate
+        .join("_stages")
+        .join("patrol_compute")
+        .join(format!("{wiki}.json"));
     ensure!(
-        crate::patrol::candidate_receipt_current_without_inputs(wiki, snapshot, &target_candidate)?,
+        crate::fingerprint::retained_outputs_reusable(
+            &patrol_receipt,
+            crate::fingerprint::StageSpec {
+                stage: "patrol_compute",
+                scope: wiki,
+                selected_snapshot: Some(snapshot),
+                algorithm_version: crate::patrol::algorithm_version(),
+            },
+            &[patrol_output],
+        )?,
         "retained candidate {wiki} patrol receipt is outdated or invalid"
     );
 

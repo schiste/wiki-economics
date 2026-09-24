@@ -571,6 +571,15 @@ fn receipt_matches_spec(receipt: &StageReceipt, spec: StageSpec<'_>) -> Result<b
         && receipt_fingerprint(receipt)? == receipt.fingerprint)
 }
 
+fn receipt_matches_algorithm_spec(receipt: &StageReceipt, spec: StageSpec<'_>) -> Result<bool> {
+    Ok(receipt.schema_version == RECEIPT_SCHEMA_VERSION
+        && receipt.stage == spec.stage
+        && receipt.scope == spec.scope
+        && receipt.selected_snapshot.as_deref() == spec.selected_snapshot
+        && receipt.algorithm_version == spec.algorithm_version
+        && receipt_fingerprint(receipt)? == receipt.fingerprint)
+}
+
 /// Read and authenticate only the receipt envelope. Artifact identities in the
 /// returned document are safe to use as expected values, but callers must still
 /// validate whichever concrete paths they consume with `artifact_matches`.
@@ -616,6 +625,28 @@ pub fn outputs_reusable(
         }
     };
     Ok(receipt_matches_spec(&receipt, spec)? && paths_match(&receipt.outputs, outputs)?)
+}
+
+/// Verify output files from a retention-authorized candidate by their recorded
+/// stage algorithm. This intentionally permits an older crate version because
+/// the source inputs may have been purged; ordinary reuse must continue to use
+/// `outputs_reusable` and its stricter package-version check.
+pub(crate) fn retained_outputs_reusable(
+    receipt_path: &Path,
+    spec: StageSpec<'_>,
+    outputs: &[TrackedPath],
+) -> Result<bool> {
+    if !receipt_path.is_file() {
+        return Ok(false);
+    }
+    let receipt = match read_receipt(receipt_path) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            warn!(path = %receipt_path.display(), error = %error, "ignoring invalid retained stage receipt");
+            return Ok(false);
+        }
+    };
+    Ok(receipt_matches_algorithm_spec(&receipt, spec)? && paths_match(&receipt.outputs, outputs)?)
 }
 
 pub fn record(

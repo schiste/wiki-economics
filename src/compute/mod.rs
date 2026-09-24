@@ -1303,7 +1303,7 @@ pub(crate) fn migrate_retained_candidate_families(
         let receipt_path = family_stage_receipt(source_candidate_dir, wiki, family);
         let outputs = family_outputs(family, wiki, source_candidate_dir);
         #[rustfmt::skip]
-        let reusable = fingerprint::outputs_reusable(&receipt_path, family_stage_spec(family, wiki, Some(snapshot), &algorithm), &outputs)?;
+        let reusable = fingerprint::retained_outputs_reusable(&receipt_path, family_stage_spec(family, wiki, Some(snapshot), &algorithm), &outputs)?;
         anyhow::ensure!(
             reusable,
             "retained candidate {wiki} has an outdated or invalid {} family",
@@ -1317,7 +1317,7 @@ pub(crate) fn migrate_retained_candidate_families(
         family_stage_receipt(source_candidate_dir, wiki, MetricFamily::Lifecycle);
     let source_outputs = family_outputs(MetricFamily::Lifecycle, wiki, source_candidate_dir);
     #[rustfmt::skip]
-    let lifecycle_receipts_reusable = fingerprint::outputs_reusable(&source_receipt_path, family_stage_spec(MetricFamily::Lifecycle, wiki, Some(snapshot), LEGACY_LIFECYCLE_ALGORITHM), &source_outputs)?;
+    let lifecycle_receipts_reusable = fingerprint::retained_outputs_reusable(&source_receipt_path, family_stage_spec(MetricFamily::Lifecycle, wiki, Some(snapshot), LEGACY_LIFECYCLE_ALGORITHM), &source_outputs)?;
     anyhow::ensure!(
         lifecycle_receipts_reusable,
         "retained candidate {wiki} is not an authenticated lifecycle v3 candidate"
