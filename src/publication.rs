@@ -7071,6 +7071,50 @@ mod tests {
             Ok(candidate)
         }
 
+        fn rewrite_candidate_activity_tiers_to_v5(&self, run_id: &str) -> Result<PathBuf> {
+            let candidate = wiki_candidate_dir(self.output.path(), "nlwiki", "2026-03", run_id)?;
+            const LEGACY_ALGORITHM: &str = "activity-tiers-v5-exclusive-period-user-type";
+            let family = crate::metric_registry::MetricFamily::ActivityTiers;
+            let inputs =
+                crate::compute::compute_stage_inputs("nlwiki", self.data.path(), Some("2026-03"))?;
+            let outputs = family
+                .metrics()
+                .iter()
+                .map(|metric| {
+                    crate::fingerprint::TrackedPath::new(
+                        format!("output/nlwiki/{metric}.parquet"),
+                        candidate.join("nlwiki").join(format!("{metric}.parquet")),
+                    )
+                })
+                .collect::<Vec<_>>();
+            crate::fingerprint::record(
+                &crate::compute::family_stage_receipt(&candidate, "nlwiki", family),
+                crate::fingerprint::StageSpec {
+                    stage: "compute_activity_tiers",
+                    scope: "nlwiki",
+                    selected_snapshot: Some("2026-03"),
+                    algorithm_version: LEGACY_ALGORITHM,
+                },
+                &inputs,
+                &outputs,
+            )?;
+            let ready_path = candidate.join("ready.json");
+            let mut ready: ReadyWikiCandidate = read_json(&ready_path)?;
+            let activity_artifacts: BTreeSet<_> =
+                crate::metric_registry::MetricFamily::ActivityTiers
+                    .metrics()
+                    .iter()
+                    .map(|metric| format!("nlwiki/{metric}.parquet"))
+                    .collect();
+            for artifact in &mut ready.artifacts {
+                if activity_artifacts.contains(&artifact.path) {
+                    *artifact = prepared_artifact(&candidate, &candidate.join(&artifact.path))?;
+                }
+            }
+            atomic_json(&ready_path, &ready)?;
+            Ok(candidate)
+        }
+
         fn published_site(&self, run_id: &str) -> Result<(TestDir, PathBuf)> {
             self.prepare(run_id)?;
             validate(
@@ -9528,9 +9572,15 @@ mod tests {
         assert!(failed_downgrade.is_err());
 
         let source_candidate = fixture.rewrite_candidate_lifecycle_to_v3("retained-v3-source")?;
+        assert!(
+            !crate::retained_activity_migration::activity_tier_migration_required(
+                "nlwiki",
+                "2026-03",
+                &source_candidate,
+            )?
+        );
         let source_ready_path = source_candidate.join("ready.json");
         let source_ready: ReadyWikiCandidate = read_json(&source_ready_path)?;
-        let (_, authorized_source_sha256) = storage::sha256_file(&source_ready_path)?;
         assert!(ready_candidate_merge_contracts(&source_candidate, &source_ready).is_err());
 
         let migrate_families_to = |target_candidate: &Path| {
@@ -9574,6 +9624,11 @@ mod tests {
         let write_failure = migrate_families_to(write_failure_root.path());
         fs::set_permissions(&write_failure_wiki, std::fs::Permissions::from_mode(0o755))?;
         assert!(write_failure.is_err());
+
+        let source_candidate =
+            fixture.rewrite_candidate_activity_tiers_to_v5("retained-v3-source")?;
+        let source_ready: ReadyWikiCandidate = read_json(&source_ready_path)?;
+        let (_, authorized_source_sha256) = storage::sha256_file(&source_ready_path)?;
 
         for command in [
             crate::Commands::RetentionAudit {
@@ -9697,6 +9752,10 @@ mod tests {
             .context("migration lineage should be recorded")?;
         assert_eq!(migration.source_run_id, source_ready.run_id);
         assert_eq!(migration.source_ready_sha256, authorized_source_sha256);
+        assert_eq!(
+            migration.migration,
+            RETAINED_LIFECYCLE_AND_ACTIVITY_MIGRATION_ID
+        );
         validate_ready_candidate(fixture.data.path(), migrated_candidate, &migrated_ready)?;
         let repeated_plan_result = plan_wiki_preparation(
             fixture.data.path(),
