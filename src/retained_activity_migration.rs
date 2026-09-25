@@ -161,17 +161,7 @@ pub(crate) fn stage_activity_tier_receipts(
         artifact_receipt::scan_and_write(&staged_path, &source_document.receipt.identity, crate::compute::activity::ALGORITHM_VERSION, &migration_fingerprint)?;
     }
     #[rustfmt::skip]
-    fingerprint::record(
-        &family_receipt_path(staged_candidate_dir, wiki, MetricFamily::ActivityTiers),
-        family_spec(
-            wiki,
-            snapshot,
-            MetricFamily::ActivityTiers,
-            crate::compute::activity::ALGORITHM_VERSION,
-        ),
-        &inputs,
-        &family_outputs(staged_candidate_dir, wiki, MetricFamily::ActivityTiers),
-    )?;
+    fingerprint::record(&family_receipt_path(staged_candidate_dir, wiki, MetricFamily::ActivityTiers), family_spec(wiki, snapshot, MetricFamily::ActivityTiers, crate::compute::activity::ALGORITHM_VERSION), &inputs, &family_outputs(staged_candidate_dir, wiki, MetricFamily::ActivityTiers))?;
     #[rustfmt::skip]
     let current = fingerprint::retained_outputs_reusable(&family_receipt_path(staged_candidate_dir, wiki, MetricFamily::ActivityTiers), family_spec(wiki, snapshot, MetricFamily::ActivityTiers, crate::compute::activity::ALGORITHM_VERSION), &family_outputs(staged_candidate_dir, wiki, MetricFamily::ActivityTiers))?;
     #[rustfmt::skip]
@@ -203,17 +193,7 @@ pub(crate) fn rebind_lifecycle_receipts(
         artifact_receipt::scan_and_write(&target_path, &source_document.receipt.identity, crate::compute::lifecycle::ALGORITHM_VERSION, &migration_fingerprint)?;
     }
     #[rustfmt::skip]
-    fingerprint::record(
-        &family_receipt_path(target_candidate_dir, wiki, MetricFamily::Lifecycle),
-        family_spec(
-            wiki,
-            snapshot,
-            MetricFamily::Lifecycle,
-            crate::compute::lifecycle::ALGORITHM_VERSION,
-        ),
-        &inputs,
-        &family_outputs(target_candidate_dir, wiki, MetricFamily::Lifecycle),
-    )?;
+    fingerprint::record(&family_receipt_path(target_candidate_dir, wiki, MetricFamily::Lifecycle), family_spec(wiki, snapshot, MetricFamily::Lifecycle, crate::compute::lifecycle::ALGORITHM_VERSION), &inputs, &family_outputs(target_candidate_dir, wiki, MetricFamily::Lifecycle))?;
     #[rustfmt::skip]
     let current = fingerprint::retained_outputs_reusable(&family_receipt_path(target_candidate_dir, wiki, MetricFamily::Lifecycle), family_spec(wiki, snapshot, MetricFamily::Lifecycle, crate::compute::lifecycle::ALGORITHM_VERSION), &family_outputs(target_candidate_dir, wiki, MetricFamily::Lifecycle))?;
     #[rustfmt::skip]

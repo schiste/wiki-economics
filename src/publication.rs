@@ -9605,12 +9605,11 @@ mod tests {
             .first()
             .context("activity-tier fixture has no output metrics")?;
         let staged_metric = staged_wiki.join(format!("{first_activity_metric}.parquet"));
-        fs::copy(
-            source_candidate
-                .join("nlwiki")
-                .join(format!("{first_activity_metric}.parquet")),
-            &staged_metric,
-        )?;
+        let source_metric = source_candidate
+            .join("nlwiki")
+            .join(format!("{first_activity_metric}.parquet"));
+        #[rustfmt::skip]
+        fs::copy(&source_metric, &staged_metric).expect("source activity artifact should copy into the staging fixture");
         fs::write(&staged_metric, b"tampered retained migration staging copy")?;
         let staging_error = crate::retained_activity_migration::stage_activity_tier_receipts(
             "nlwiki",
@@ -9867,26 +9866,21 @@ mod tests {
             .expect("retention should authorize the current activity receipt source");
         }
 
-        crate::run_with_ops(
-            crate::Cli {
-                data_dir: fixture.data.path().to_path_buf(),
-                output_dir: fixture.output.path().to_path_buf(),
-                run_id: Some("retained-v3-current-migrated".to_string()),
-                command: crate::Commands::MigrateRetainedCandidate {
-                    lifecycle: fixture.lifecycle_path.clone(),
-                    wiki: "nlwiki".to_string(),
-                    version: "2026-03".to_string(),
-                },
+        let current_migration_cli = crate::Cli {
+            data_dir: fixture.data.path().to_path_buf(),
+            output_dir: fixture.output.path().to_path_buf(),
+            run_id: Some("retained-v3-current-migrated".to_string()),
+            command: crate::Commands::MigrateRetainedCandidate {
+                lifecycle: fixture.lifecycle_path.clone(),
+                wiki: "nlwiki".to_string(),
+                version: "2026-03".to_string(),
             },
-            &crate::RealOps,
-        )?;
-        let migrated_ready_path = wiki_candidate_dir(
-            fixture.output.path(),
-            "nlwiki",
-            "2026-03",
-            "retained-v3-current-migrated",
-        )?
-        .join("ready.json");
+        };
+        #[rustfmt::skip]
+        crate::run_with_ops(current_migration_cli, &crate::RealOps).expect("current retained migration should complete");
+        #[rustfmt::skip]
+        let migrated_candidate_dir = wiki_candidate_dir(fixture.output.path(), "nlwiki", "2026-03", "retained-v3-current-migrated").expect("current retained migration candidate path should resolve");
+        let migrated_ready_path = migrated_candidate_dir.join("ready.json");
         let migrated_candidate = migrated_ready_path
             .parent()
             .context("current retained migration ready receipt should have a candidate")?;
