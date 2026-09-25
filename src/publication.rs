@@ -9938,12 +9938,16 @@ mod tests {
             storage::current_snapshot_version(fixture.data.path(), "nlwiki")?.as_deref(),
             Some("2026-03")
         );
-        resume_unpublished_selection(
+        let resume_error = resume_unpublished_selection(
             fixture.data.path(),
             fixture.output.path(),
             &fixture.lifecycle_path,
             "retained-v3-publication",
-        )?;
+        )
+        .expect_err("the fixture's previous patrol proof predates its rewritten ready receipt");
+        assert!(format!("{resume_error:#}").contains(
+            "prior patrol source report is not tied to the retention-authorized ready candidate"
+        ));
         assert_eq!(
             storage::current_snapshot_version(fixture.data.path(), "nlwiki")?.as_deref(),
             Some("2026-03")
