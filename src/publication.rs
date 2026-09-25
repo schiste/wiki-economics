@@ -2379,7 +2379,6 @@ fn set_current_snapshot_for_ready_candidate(
         ready.wiki == wiki && ready.snapshot == snapshot,
         "retained candidate identity does not match snapshot activation"
     );
-    validate_ready_candidate_metadata(data_dir, &candidate_dir, &ready)?;
     let retention = crate::retention::validate_purged_snapshot(data_dir, wiki, snapshot)?;
     let retained_ready_path = retained_ready_lineage_origin(
         &candidate_dir,
@@ -2388,6 +2387,7 @@ fn set_current_snapshot_for_ready_candidate(
         0,
     )?
     .context("retention receipt does not authorize this ready candidate lineage")?;
+    validate_ready_candidate_metadata(data_dir, &candidate_dir, &ready)?;
     storage::restore_retained_current_snapshot(data_dir, wiki, snapshot, &retained_ready_path)
 }
 
