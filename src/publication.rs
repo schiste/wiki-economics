@@ -9926,6 +9926,50 @@ mod tests {
         let partial_ready_path = migrate_retained_candidate(fixture.data.path(), fixture.output.path(), &fixture.lifecycle_path, "nlwiki", "2026-03", partial_run_id)?;
         assert!(partial_ready_path.is_file());
         assert!(!migration_temp.exists());
+
+        let selection = activate_ready_candidates(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "retained-v3-publication",
+        )?;
+        assert_eq!(selection.entries.len(), 1);
+        assert_eq!(
+            storage::current_snapshot_version(fixture.data.path(), "nlwiki")?.as_deref(),
+            Some("2026-03")
+        );
+        resume_unpublished_selection(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "retained-v3-publication",
+        )?;
+        assert_eq!(
+            storage::current_snapshot_version(fixture.data.path(), "nlwiki")?.as_deref(),
+            Some("2026-03")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn snapshot_activation_without_manifest_or_retention_fails_closed() -> Result<()> {
+        let fixture = Fixture::new()?;
+        assert!(
+            !storage::generation_manifest_path(fixture.data.path(), "nlwiki", "2026-03")?.is_file()
+        );
+        assert!(
+            !crate::retention::receipt_path(fixture.data.path(), "nlwiki", "2026-03")?.is_file()
+        );
+
+        let error = set_current_snapshot_for_ready_candidate(
+            fixture.data.path(),
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            "_candidates/nlwiki/2026-03/missing-candidate",
+        )
+        .expect_err("snapshot activation without a manifest or retention proof must fail");
+        assert!(format!("{error:#}").contains("valid generation manifest"));
         Ok(())
     }
 
