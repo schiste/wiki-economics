@@ -2460,20 +2460,57 @@ pub(crate) fn plan_wiki_preparation(
     let purged_snapshot = crate::retention::receipt_path(data_dir, wiki, snapshot)?.is_file();
     let purged_compute_current = match (purged_snapshot, candidates.last()) {
         (true, Some((ready, candidate_dir))) => {
-            let current = crate::compute::candidate_receipts_current_without_inputs(
-                wiki,
-                snapshot,
-                candidate_dir,
-                ready.workload_profile.as_ref(),
-            );
+            let current = if ready.migrated_from_retained_candidate.is_some() {
+                crate::compute::retained_candidate_receipts_current_without_inputs(
+                    wiki,
+                    snapshot,
+                    candidate_dir,
+                    ready.workload_profile.as_ref(),
+                )
+            } else {
+                crate::compute::candidate_receipts_current_without_inputs(
+                    wiki,
+                    snapshot,
+                    candidate_dir,
+                    ready.workload_profile.as_ref(),
+                )
+            };
             current?
         }
         _ => false,
     };
-    if purged_compute_current
-        && let Some((_, candidate_dir)) = candidates.last()
-        && crate::patrol::candidate_receipt_current_without_inputs(wiki, snapshot, candidate_dir)?
-    {
+    let purged_patrol_current = match (purged_snapshot, candidates.last()) {
+        (true, Some((ready, candidate_dir))) => {
+            if ready.migrated_from_retained_candidate.is_some() {
+                let patrol_output = crate::fingerprint::TrackedPath::new(
+                    format!("output/{wiki}/patrol.parquet"),
+                    candidate_dir.join(wiki).join("patrol.parquet"),
+                );
+                let patrol_receipt = candidate_dir
+                    .join("_stages")
+                    .join("patrol_compute")
+                    .join(format!("{wiki}.json"));
+                crate::fingerprint::retained_outputs_reusable(
+                    &patrol_receipt,
+                    crate::fingerprint::StageSpec {
+                        stage: "patrol_compute",
+                        scope: wiki,
+                        selected_snapshot: Some(snapshot),
+                        algorithm_version: crate::patrol::algorithm_version(),
+                    },
+                    &[patrol_output],
+                )?
+            } else {
+                crate::patrol::candidate_receipt_current_without_inputs(
+                    wiki,
+                    snapshot,
+                    candidate_dir,
+                )?
+            }
+        }
+        _ => false,
+    };
+    if purged_compute_current && purged_patrol_current {
         let indexed = indexed_latest_ready_candidate(data_dir, output_dir, wiki)?
             .context("purged unchanged candidate has no recoverable ready index")?;
         ensure!(
@@ -9558,6 +9595,17 @@ mod tests {
         assert_eq!(migration.source_run_id, source_ready.run_id);
         assert_eq!(migration.source_ready_sha256, authorized_source_sha256);
         validate_ready_candidate(fixture.data.path(), migrated_candidate, &migrated_ready)?;
+        let repeated_plan = plan_wiki_preparation(
+            fixture.data.path(),
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            "retained-v3-repeat",
+        )?;
+        assert!(matches!(
+            repeated_plan,
+            WikiPreparationPlan::NoOp { ready_path } if ready_path == migrated_ready_path
+        ));
 
         let source_churn_path = source_candidate.join("nlwiki/labor_churn.parquet");
         let source_churn = ParquetReader::new(File::open(&source_churn_path)?).finish()?;
