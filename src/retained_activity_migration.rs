@@ -413,10 +413,10 @@ impl Drop for TemporaryCandidateDirectory {
         }
         if let Err(error) = std::fs::remove_dir_all(&self.path) {
             tracing::warn!(path = %self.path.display(), %error, "failed to remove temporary retained migration source");
-        } else if let Some(parent) = self.path.parent() {
-            if let Ok(directory) = std::fs::File::open(parent) {
-                let _ = directory.sync_all();
-            }
+        } else if let Some(parent) = self.path.parent()
+            && let Ok(directory) = std::fs::File::open(parent)
+        {
+            let _ = directory.sync_all();
         }
     }
 }
