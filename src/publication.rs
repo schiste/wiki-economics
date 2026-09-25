@@ -2380,13 +2380,9 @@ fn set_current_snapshot_for_ready_candidate(
         "retained candidate identity does not match snapshot activation"
     );
     let retention = crate::retention::validate_purged_snapshot(data_dir, wiki, snapshot)?;
-    let retained_ready_path = retained_ready_lineage_origin(
-        &candidate_dir,
-        &ready,
-        &retention.authorized_ready_sha256,
-        0,
-    )?
-    .context("retention receipt does not authorize this ready candidate lineage")?;
+    #[rustfmt::skip]
+    let retained_ready_path = retained_ready_lineage_origin(&candidate_dir, &ready, &retention.authorized_ready_sha256, 0)?
+        .context("retention receipt does not authorize this ready candidate lineage")?;
     validate_ready_candidate_metadata(data_dir, &candidate_dir, &ready)?;
     storage::restore_retained_current_snapshot(data_dir, wiki, snapshot, &retained_ready_path)
 }
@@ -5052,13 +5048,8 @@ fn rollback_selection_files(
                     .previous_candidate_relative
                     .as_deref()
                     .context("retained rollback snapshot has no previous candidate")?;
-                set_current_snapshot_for_ready_candidate(
-                    data_dir,
-                    output_dir,
-                    &entry.wiki,
-                    previous_snapshot,
-                    previous,
-                )?;
+                #[rustfmt::skip]
+                set_current_snapshot_for_ready_candidate(data_dir, output_dir, &entry.wiki, previous_snapshot, previous)?;
             }
         } else {
             storage::restore_current_snapshot(data_dir, &entry.wiki, None)?;
@@ -5245,13 +5236,8 @@ where
             );
             link_result?;
             fs::rename(&temporary, &active)?;
-            set_current_snapshot_for_ready_candidate(
-                data_dir,
-                output_dir,
-                &entry.wiki,
-                &entry.snapshot,
-                &entry.candidate_relative,
-            )?;
+            #[rustfmt::skip]
+            set_current_snapshot_for_ready_candidate(data_dir, output_dir, &entry.wiki, &entry.snapshot, &entry.candidate_relative)?;
         }
         Ok(())
     })();
@@ -5687,13 +5673,8 @@ fn resume_unpublished_selection(
             std::os::unix::fs::symlink(&selected_target, &temporary)?;
             fs::rename(&temporary, &active)?;
         }
-        set_current_snapshot_for_ready_candidate(
-            data_dir,
-            output_dir,
-            &entry.wiki,
-            &entry.snapshot,
-            &entry.candidate_relative,
-        )?;
+        #[rustfmt::skip]
+        set_current_snapshot_for_ready_candidate(data_dir, output_dir, &entry.wiki, &entry.snapshot, &entry.candidate_relative)?;
     }
     let snapshots = selection
         .entries
@@ -9927,12 +9908,8 @@ mod tests {
         assert!(partial_ready_path.is_file());
         assert!(!migration_temp.exists());
 
-        let selection = activate_ready_candidates(
-            fixture.data.path(),
-            fixture.output.path(),
-            &fixture.lifecycle_path,
-            "retained-v3-publication",
-        )?;
+        #[rustfmt::skip]
+        let selection = activate_ready_candidates(fixture.data.path(), fixture.output.path(), &fixture.lifecycle_path, "retained-v3-publication")?;
         assert_eq!(selection.entries.len(), 1);
         assert_eq!(
             storage::current_snapshot_version(fixture.data.path(), "nlwiki")?.as_deref(),
