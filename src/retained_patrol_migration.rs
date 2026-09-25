@@ -962,7 +962,8 @@ mod tests {
             &source,
             &missing_sidecar_target,
             true,
-        )?;
+        )
+        .expect("migration with a missing target sidecar must validate successfully");
 
         let source = write_legacy_source(root.path(), wiki, snapshot, "stage-write-source")?;
         let stage_target = root
