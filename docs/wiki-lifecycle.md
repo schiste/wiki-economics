@@ -61,6 +61,13 @@ marks the receipt applied. Interrupted cleanup is idempotent. A same-snapshot
 run authenticates current algorithms and output receipts as a no-op; a
 semantic algorithm change redownloads and rebuilds the input.
 
+Retained candidates have one explicit output-equivalent activity-tier receipt
+migration: v5 receipts may be reissued as v6 only while migrating a
+retention-authorized candidate, after source receipts are authenticated and
+the copied Parquet bytes are verified unchanged. The migrated ready receipt
+records this path separately. Other stale family algorithms still require
+their source inputs to be rebuilt.
+
 ## Runtime behavior
 
 `scripts/wiki-lifecycle.cjs` validates the registry and provides the canonical

@@ -30,6 +30,7 @@ mod parity_tests;
 mod patrol;
 mod publication;
 mod resource_governor;
+mod retained_activity_migration;
 mod retention;
 mod schema;
 mod schema_benchmark;

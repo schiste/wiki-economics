@@ -21,6 +21,15 @@ pub(crate) const READY_INDEX_SCHEMA_VERSION: u8 = 2;
 const PUBLICATION_CONTRACT_VERSION: &str =
     "ready-candidate-publication-v3-incremental-receipt-composition";
 pub const RECEIPT_FILE: &str = "publication-gate.json";
+const RETAINED_LIFECYCLE_MIGRATION_ID: &str = "retained-lifecycle-v3-to-v4-period-months-v1";
+const RETAINED_LIFECYCLE_AND_ACTIVITY_MIGRATION_ID: &str =
+    "retained-lifecycle-v3-to-v4-period-months-and-activity-tiers-v5-to-v6-receipt-v1";
+
+fn supported_retained_migration_id(migration: &str) -> bool {
+    migration == RETAINED_LIFECYCLE_MIGRATION_ID
+        || migration == RETAINED_LIFECYCLE_AND_ACTIVITY_MIGRATION_ID
+}
+
 const JSON_ARTIFACTS: [&str; 14] = [
     crate::browser_data::INDEX_FILENAME,
     "defaults_business.json",
@@ -1337,7 +1346,6 @@ pub(crate) fn migrate_retained_candidate(
     snapshot: &str,
     run_id: &str,
 ) -> Result<PathBuf> {
-    const MIGRATION_ID: &str = "retained-lifecycle-v3-to-v4-period-months-v1";
     ensure!(valid_component(wiki), "unsafe retained candidate wiki");
     ensure!(valid_component(run_id), "unsafe retained candidate run ID");
     storage::validate_snapshot_version(snapshot)?;
@@ -1380,7 +1388,7 @@ pub(crate) fn migrate_retained_candidate(
                     .is_some_and(|migration| {
                         migration.schema_version == 1
                             && migration.source_ready_sha256.len() == 64
-                            && migration.migration == MIGRATION_ID
+                            && supported_retained_migration_id(&migration.migration)
                     }),
             "existing retained migration candidate has a different identity"
         );
@@ -1458,10 +1466,67 @@ pub(crate) fn migrate_retained_candidate(
     );
     files.sort();
     files.dedup();
-    copy_candidate_files(&source_candidate, &target_candidate, &files)?;
+    let activity_tier_receipt_migrated =
+        crate::retained_activity_migration::activity_tier_migration_required(
+            wiki,
+            snapshot,
+            &source_candidate,
+        )?;
+    let staged_migration_source = if activity_tier_receipt_migrated {
+        let staging_path = target_candidate
+            .parent()
+            .context("retained migration target has no snapshot directory")?
+            .join(format!(".{run_id}.retained-source.{}", std::process::id()));
+        let staged =
+            crate::retained_activity_migration::TemporaryCandidateDirectory::create(staging_path)?;
+        copy_candidate_files(&source_candidate, staged.path(), &files)?;
+        crate::retained_activity_migration::stage_activity_tier_receipts(
+            wiki,
+            snapshot,
+            &source_ready.run_id,
+            &source_candidate,
+            staged.path(),
+        )?;
+        Some(staged)
+    } else {
+        None
+    };
+    let migration_source_candidate = staged_migration_source
+        .as_ref()
+        .map(|staged| staged.path())
+        .unwrap_or(&source_candidate);
+    let migration_source_files = files
+        .iter()
+        .map(|path| {
+            let relative = path
+                .strip_prefix(&source_candidate)
+                .context("retained migration input escaped its source candidate")?;
+            Ok(migration_source_candidate.join(relative))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    copy_candidate_files(
+        migration_source_candidate,
+        &target_candidate,
+        &migration_source_files,
+    )?;
 
-    #[rustfmt::skip]
-    crate::compute::migrate_retained_candidate_families(wiki, snapshot, &source_ready.run_id, data_dir, &source_candidate, &target_candidate)?;
+    crate::compute::migrate_retained_candidate_families(
+        wiki,
+        snapshot,
+        &source_ready.run_id,
+        data_dir,
+        migration_source_candidate,
+        &target_candidate,
+    )?;
+    if activity_tier_receipt_migrated {
+        crate::retained_activity_migration::rebind_lifecycle_receipts(
+            wiki,
+            snapshot,
+            &source_ready.run_id,
+            &source_candidate,
+            &target_candidate,
+        )?;
+    }
     let patrol_output = crate::fingerprint::TrackedPath::new(
         format!("output/{wiki}/patrol.parquet"),
         target_candidate.join(wiki).join("patrol.parquet"),
@@ -1495,7 +1560,11 @@ pub(crate) fn migrate_retained_candidate(
         schema_version: 1,
         source_run_id: source_ready.run_id.clone(),
         source_ready_sha256: source_ready_sha256.clone(),
-        migration: MIGRATION_ID.to_string(),
+        migration: if activity_tier_receipt_migrated {
+            RETAINED_LIFECYCLE_AND_ACTIVITY_MIGRATION_ID.to_string()
+        } else {
+            RETAINED_LIFECYCLE_MIGRATION_ID.to_string()
+        },
     });
     ready.artifacts = source_ready
         .artifacts
@@ -1594,10 +1663,10 @@ fn validate_retained_lifecycle_projection(
     };
     ensure!(
         migration.schema_version == 1
-            && migration.migration == "retained-lifecycle-v3-to-v4-period-months-v1"
+            && supported_retained_migration_id(&migration.migration)
             && valid_component(&migration.source_run_id)
             && migration.source_run_id != ready.run_id,
-        "retained lifecycle migration provenance is invalid"
+        "retained candidate migration provenance is invalid"
     );
     let source_dir = candidate_dir
         .parent()
@@ -1620,7 +1689,17 @@ fn validate_retained_lifecycle_projection(
     for artifact in &source_ready.artifacts {
         validate_prepared_artifact(&source_dir, artifact)?;
     }
-    crate::compute::validate_retained_lifecycle_migration(&ready.wiki, &source_dir, candidate_dir)
+    crate::compute::validate_retained_lifecycle_migration(&ready.wiki, &source_dir, candidate_dir)?;
+    if migration.migration == RETAINED_LIFECYCLE_AND_ACTIVITY_MIGRATION_ID {
+        crate::retained_activity_migration::validate_activity_tier_migration(
+            &ready.wiki,
+            &ready.snapshot,
+            &migration.source_run_id,
+            &source_dir,
+            candidate_dir,
+        )?;
+    }
+    Ok(())
 }
 
 pub(crate) fn ensure_qualification_wiki(lifecycle_path: &Path, wiki: &str) -> Result<()> {
@@ -2237,7 +2316,7 @@ fn retained_ready_lineage_matches(
     };
     ensure!(
         migration.schema_version == 1
-            && migration.migration == "retained-lifecycle-v3-to-v4-period-months-v1"
+            && supported_retained_migration_id(&migration.migration)
             && migration.source_ready_sha256.len() == 64
             && valid_component(&migration.source_run_id)
             && migration.source_run_id != ready.run_id,

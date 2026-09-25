@@ -7,6 +7,15 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-09-25
+
+### Fixed
+
+- Migrate authenticated retained activity-tier v5 receipts to v6 only when the
+  Parquet bytes and semantic summaries remain unchanged.
+
+## [0.1.2] - 2026-09-25
+
 ### Fixed
 
 - Allow retention-authorized candidate migrations to verify immutable output
