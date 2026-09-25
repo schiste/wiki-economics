@@ -1466,12 +1466,8 @@ pub(crate) fn migrate_retained_candidate(
     );
     files.sort();
     files.dedup();
-    let activity_tier_receipt_migrated =
-        crate::retained_activity_migration::activity_tier_migration_required(
-            wiki,
-            snapshot,
-            &source_candidate,
-        )?;
+    #[rustfmt::skip]
+    let activity_tier_receipt_migrated = crate::retained_activity_migration::activity_tier_migration_required(wiki, snapshot, &source_candidate)?;
     let staged_migration_source = if activity_tier_receipt_migrated {
         let staging_path = target_candidate
             .parent()
@@ -1480,13 +1476,8 @@ pub(crate) fn migrate_retained_candidate(
         let staged =
             crate::retained_activity_migration::TemporaryCandidateDirectory::create(staging_path)?;
         copy_candidate_files(&source_candidate, staged.path(), &files)?;
-        crate::retained_activity_migration::stage_activity_tier_receipts(
-            wiki,
-            snapshot,
-            &source_ready.run_id,
-            &source_candidate,
-            staged.path(),
-        )?;
+        #[rustfmt::skip]
+        crate::retained_activity_migration::stage_activity_tier_receipts(wiki, snapshot, &source_ready.run_id, &source_candidate, staged.path())?;
         Some(staged)
     } else {
         None
@@ -1504,28 +1495,14 @@ pub(crate) fn migrate_retained_candidate(
             Ok(migration_source_candidate.join(relative))
         })
         .collect::<Result<Vec<_>>>()?;
-    copy_candidate_files(
-        migration_source_candidate,
-        &target_candidate,
-        &migration_source_files,
-    )?;
+    #[rustfmt::skip]
+    copy_candidate_files(migration_source_candidate, &target_candidate, &migration_source_files)?;
 
-    crate::compute::migrate_retained_candidate_families(
-        wiki,
-        snapshot,
-        &source_ready.run_id,
-        data_dir,
-        migration_source_candidate,
-        &target_candidate,
-    )?;
+    #[rustfmt::skip]
+    crate::compute::migrate_retained_candidate_families(wiki, snapshot, &source_ready.run_id, data_dir, migration_source_candidate, &target_candidate)?;
     if activity_tier_receipt_migrated {
-        crate::retained_activity_migration::rebind_lifecycle_receipts(
-            wiki,
-            snapshot,
-            &source_ready.run_id,
-            &source_candidate,
-            &target_candidate,
-        )?;
+        #[rustfmt::skip]
+        crate::retained_activity_migration::rebind_lifecycle_receipts(wiki, snapshot, &source_ready.run_id, &source_candidate, &target_candidate)?;
     }
     let patrol_output = crate::fingerprint::TrackedPath::new(
         format!("output/{wiki}/patrol.parquet"),
@@ -1691,13 +1668,8 @@ fn validate_retained_lifecycle_projection(
     }
     crate::compute::validate_retained_lifecycle_migration(&ready.wiki, &source_dir, candidate_dir)?;
     if migration.migration == RETAINED_LIFECYCLE_AND_ACTIVITY_MIGRATION_ID {
-        crate::retained_activity_migration::validate_activity_tier_migration(
-            &ready.wiki,
-            &ready.snapshot,
-            &migration.source_run_id,
-            &source_dir,
-            candidate_dir,
-        )?;
+        #[rustfmt::skip]
+        crate::retained_activity_migration::validate_activity_tier_migration(&ready.wiki, &ready.snapshot, &migration.source_run_id, &source_dir, candidate_dir)?;
     }
     Ok(())
 }
@@ -7087,9 +7059,8 @@ mod tests {
                     )
                 })
                 .collect::<Vec<_>>();
-            crate::fingerprint::record(
-                &crate::compute::family_stage_receipt(&candidate, "nlwiki", family),
-                crate::fingerprint::StageSpec {
+            #[rustfmt::skip]
+            crate::fingerprint::record(&crate::compute::family_stage_receipt(&candidate, "nlwiki", family), crate::fingerprint::StageSpec {
                     stage: "compute_activity_tiers",
                     scope: "nlwiki",
                     selected_snapshot: Some("2026-03"),
@@ -7097,7 +7068,7 @@ mod tests {
                 },
                 &inputs,
                 &outputs,
-            )?;
+            ).expect("legacy activity tier receipts should be writable");
             let ready_path = candidate.join("ready.json");
             let mut ready: ReadyWikiCandidate = read_json(&ready_path)?;
             let activity_artifacts: BTreeSet<_> =
@@ -9572,13 +9543,8 @@ mod tests {
         assert!(failed_downgrade.is_err());
 
         let source_candidate = fixture.rewrite_candidate_lifecycle_to_v3("retained-v3-source")?;
-        assert!(
-            !crate::retained_activity_migration::activity_tier_migration_required(
-                "nlwiki",
-                "2026-03",
-                &source_candidate,
-            )?
-        );
+        #[rustfmt::skip]
+        assert!(!crate::retained_activity_migration::activity_tier_migration_required("nlwiki", "2026-03", &source_candidate).expect("current activity tier receipts should remain current"));
         let source_ready_path = source_candidate.join("ready.json");
         let source_ready: ReadyWikiCandidate = read_json(&source_ready_path)?;
         assert!(ready_candidate_merge_contracts(&source_candidate, &source_ready).is_err());
@@ -9629,6 +9595,59 @@ mod tests {
             fixture.rewrite_candidate_activity_tiers_to_v5("retained-v3-source")?;
         let source_ready: ReadyWikiCandidate = read_json(&source_ready_path)?;
         let (_, authorized_source_sha256) = storage::sha256_file(&source_ready_path)?;
+
+        let staged_root = TestDir::new()?;
+        let staged_candidate = staged_root.path().join("candidate");
+        let staged_wiki = staged_candidate.join("nlwiki");
+        fs::create_dir_all(&staged_wiki)?;
+        let first_activity_metric = crate::metric_registry::MetricFamily::ActivityTiers
+            .metrics()
+            .first()
+            .context("activity-tier fixture has no output metrics")?;
+        let staged_metric = staged_wiki.join(format!("{first_activity_metric}.parquet"));
+        fs::copy(
+            source_candidate
+                .join("nlwiki")
+                .join(format!("{first_activity_metric}.parquet")),
+            &staged_metric,
+        )?;
+        fs::write(&staged_metric, b"tampered retained migration staging copy")?;
+        let staging_error = crate::retained_activity_migration::stage_activity_tier_receipts(
+            "nlwiki",
+            "2026-03",
+            &source_ready.run_id,
+            &source_candidate,
+            &staged_candidate,
+        )
+        .expect_err("changed staging bytes should fail closed");
+        assert!(staging_error.to_string().contains("staging copy differs"));
+
+        let activity_stage_receipt = crate::compute::family_stage_receipt(
+            &source_candidate,
+            "nlwiki",
+            crate::metric_registry::MetricFamily::ActivityTiers,
+        );
+        let original_activity_stage_receipt = fs::read(&activity_stage_receipt)?;
+        let mut invalid_activity_stage_receipt: Value =
+            serde_json::from_slice(&original_activity_stage_receipt)?;
+        invalid_activity_stage_receipt["algorithm_version"] =
+            json!("unsupported-retained-activity-fixture");
+        atomic_json(&activity_stage_receipt, &invalid_activity_stage_receipt)?;
+        let invalid_source_error =
+            crate::retained_activity_migration::stage_activity_tier_receipts(
+                "nlwiki",
+                "2026-03",
+                &source_ready.run_id,
+                &source_candidate,
+                &staged_candidate,
+            )
+            .expect_err("unsupported retained activity receipts should fail closed");
+        fs::write(&activity_stage_receipt, &original_activity_stage_receipt)?;
+        assert!(
+            invalid_source_error
+                .to_string()
+                .contains("not an authenticated")
+        );
 
         for command in [
             crate::Commands::RetentionAudit {
@@ -9804,6 +9823,81 @@ mod tests {
         let partial_ready_path = migrate_retained_candidate(fixture.data.path(), fixture.output.path(), &fixture.lifecycle_path, "nlwiki", "2026-03", partial_run_id)?;
         assert!(partial_ready_path.is_file());
         assert!(!migration_temp.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn retained_v3_candidate_migration_keeps_current_activity_receipts() -> Result<()> {
+        let fixture = Fixture::new()?;
+        fixture.ready_candidate("retained-v3-current-source")?;
+        prepare_ready_publication(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "retained-v3-current-publication",
+        )
+        .expect("current activity candidate publication should prepare");
+        commit_ready_publication(
+            fixture.data.path(),
+            fixture.output.path(),
+            "retained-v3-current-publication",
+        )
+        .expect("current activity candidate publication should commit");
+
+        fixture.rewrite_candidate_lifecycle_to_v3("retained-v3-current-source")?;
+        for command in [
+            crate::Commands::RetentionAudit {
+                lifecycle: fixture.lifecycle_path.clone(),
+                wikis: vec!["nlwiki".to_string()],
+            },
+            crate::Commands::RetentionApply {
+                lifecycle: fixture.lifecycle_path.clone(),
+                wikis: vec!["nlwiki".to_string()],
+            },
+        ] {
+            crate::run_with_ops(
+                crate::Cli {
+                    data_dir: fixture.data.path().to_path_buf(),
+                    output_dir: fixture.output.path().to_path_buf(),
+                    run_id: None,
+                    command,
+                },
+                &crate::RealOps,
+            )
+            .expect("retention should authorize the current activity receipt source");
+        }
+
+        crate::run_with_ops(
+            crate::Cli {
+                data_dir: fixture.data.path().to_path_buf(),
+                output_dir: fixture.output.path().to_path_buf(),
+                run_id: Some("retained-v3-current-migrated".to_string()),
+                command: crate::Commands::MigrateRetainedCandidate {
+                    lifecycle: fixture.lifecycle_path.clone(),
+                    wiki: "nlwiki".to_string(),
+                    version: "2026-03".to_string(),
+                },
+            },
+            &crate::RealOps,
+        )?;
+        let migrated_ready_path = wiki_candidate_dir(
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            "retained-v3-current-migrated",
+        )?
+        .join("ready.json");
+        let migrated_candidate = migrated_ready_path
+            .parent()
+            .context("current retained migration ready receipt should have a candidate")?;
+        let migrated_ready: ReadyWikiCandidate = read_json(&migrated_ready_path)?;
+        let migration = migrated_ready
+            .migrated_from_retained_candidate
+            .as_ref()
+            .context("current retained migration lineage should be recorded")?;
+        assert_eq!(migration.source_run_id, "retained-v3-current-source");
+        assert_eq!(migration.migration, RETAINED_LIFECYCLE_MIGRATION_ID);
+        validate_ready_candidate(fixture.data.path(), migrated_candidate, &migrated_ready)?;
         Ok(())
     }
 

@@ -44,12 +44,10 @@ fn family_spec<'a>(
     family: MetricFamily,
     algorithm_version: &'a str,
 ) -> fingerprint::StageSpec<'a> {
+    #[rustfmt::skip]
+    let stage = match family { MetricFamily::ActivityTiers => "compute_activity_tiers", MetricFamily::Lifecycle => "compute_lifecycle", _ => unreachable!("only retained activity and lifecycle migrations are supported") };
     fingerprint::StageSpec {
-        stage: match family {
-            MetricFamily::ActivityTiers => "compute_activity_tiers",
-            MetricFamily::Lifecycle => "compute_lifecycle",
-            _ => unreachable!("only retained activity and lifecycle migrations are supported"),
-        },
+        stage,
         scope: wiki,
         selected_snapshot: Some(snapshot),
         algorithm_version,
@@ -67,22 +65,11 @@ fn migration_inputs(
 ) -> Result<(Vec<fingerprint::TrackedPath>, String)> {
     let source_receipt_path = family_receipt_path(source_candidate_dir, wiki, family);
     let source_outputs = family_outputs(source_candidate_dir, wiki, family);
-    let source_reusable = fingerprint::retained_outputs_reusable(
-        &source_receipt_path,
-        family_spec(wiki, snapshot, family, source_algorithm),
-        &source_outputs,
-    )?;
-    ensure!(
-        source_reusable,
-        "retained candidate {wiki} is not an authenticated {} candidate",
-        family.name()
-    );
+    #[rustfmt::skip]
+    let source_reusable = fingerprint::retained_outputs_reusable(&source_receipt_path, family_spec(wiki, snapshot, family, source_algorithm), &source_outputs)?;
+    #[rustfmt::skip]
+    ensure!(source_reusable, "retained candidate {wiki} is not an authenticated {} candidate", family.name());
     let source_stage_receipt = fingerprint::read_receipt(&source_receipt_path)?;
-    ensure!(
-        source_stage_receipt.algorithm_version == source_algorithm,
-        "retained candidate {wiki} {} receipt has an unsupported source algorithm",
-        family.name()
-    );
 
     let mut migration_digest = Sha256::new();
     migration_digest.update(format!("{migration_id}\n").as_bytes());
@@ -99,16 +86,10 @@ fn migration_inputs(
             .join(wiki)
             .join(format!("{metric}.parquet"));
         let source_document = artifact_receipt::read(&source_path)?;
-        let source_document = artifact_receipt::verify(
-            &source_path,
-            &source_document.receipt.identity,
-            Some(&source_document.receipt_sha256),
-            artifact_receipt::VerificationMode::Fast,
-        )?;
-        ensure!(
-            source_document.receipt.algorithm_version == source_algorithm,
-            "retained candidate {wiki} {metric} artifact is not on the expected source algorithm"
-        );
+        #[rustfmt::skip]
+        let source_document = artifact_receipt::verify(&source_path, &source_document.receipt.identity, Some(&source_document.receipt_sha256), artifact_receipt::VerificationMode::Fast)?;
+        #[rustfmt::skip]
+        ensure!(source_document.receipt.algorithm_version == source_algorithm, "retained candidate {wiki} {metric} artifact is not on the expected source algorithm");
         let (source_bytes, source_sha256) = storage::sha256_file(&source_path)?;
         ensure!(
             source_bytes == source_document.receipt.bytes
@@ -139,29 +120,13 @@ pub(crate) fn activity_tier_migration_required(
     let source_receipt_path =
         family_receipt_path(source_candidate_dir, wiki, MetricFamily::ActivityTiers);
     let outputs = family_outputs(source_candidate_dir, wiki, MetricFamily::ActivityTiers);
-    let current = fingerprint::retained_outputs_reusable(
-        &source_receipt_path,
-        family_spec(
-            wiki,
-            snapshot,
-            MetricFamily::ActivityTiers,
-            crate::compute::activity::ALGORITHM_VERSION,
-        ),
-        &outputs,
-    )?;
+    #[rustfmt::skip]
+    let current = fingerprint::retained_outputs_reusable(&source_receipt_path, family_spec(wiki, snapshot, MetricFamily::ActivityTiers, crate::compute::activity::ALGORITHM_VERSION), &outputs)?;
     if current {
         return Ok(false);
     }
-    let legacy = fingerprint::retained_outputs_reusable(
-        &source_receipt_path,
-        family_spec(
-            wiki,
-            snapshot,
-            MetricFamily::ActivityTiers,
-            LEGACY_ACTIVITY_TIER_ALGORITHM,
-        ),
-        &outputs,
-    )?;
+    #[rustfmt::skip]
+    let legacy = fingerprint::retained_outputs_reusable(&source_receipt_path, family_spec(wiki, snapshot, MetricFamily::ActivityTiers, LEGACY_ACTIVITY_TIER_ALGORITHM), &outputs)?;
     ensure!(
         legacy,
         "retained candidate {wiki} has an outdated or invalid activity_tiers family"
@@ -176,15 +141,8 @@ pub(crate) fn stage_activity_tier_receipts(
     source_candidate_dir: &Path,
     staged_candidate_dir: &Path,
 ) -> Result<()> {
-    let (inputs, migration_fingerprint) = migration_inputs(
-        wiki,
-        snapshot,
-        source_run_id,
-        source_candidate_dir,
-        MetricFamily::ActivityTiers,
-        LEGACY_ACTIVITY_TIER_ALGORITHM,
-        ACTIVITY_TIER_MIGRATION_ID,
-    )?;
+    #[rustfmt::skip]
+    let (inputs, migration_fingerprint) = migration_inputs(wiki, snapshot, source_run_id, source_candidate_dir, MetricFamily::ActivityTiers, LEGACY_ACTIVITY_TIER_ALGORITHM, ACTIVITY_TIER_MIGRATION_ID)?;
     for metric in MetricFamily::ActivityTiers.metrics() {
         let source_path = source_candidate_dir
             .join(wiki)
@@ -199,13 +157,10 @@ pub(crate) fn stage_activity_tier_receipts(
                 && staged_sha256 == source_document.receipt.artifact_sha256,
             "retained candidate {wiki} {metric} staging copy differs from its authenticated source"
         );
-        artifact_receipt::scan_and_write(
-            &staged_path,
-            &source_document.receipt.identity,
-            crate::compute::activity::ALGORITHM_VERSION,
-            &migration_fingerprint,
-        )?;
+        #[rustfmt::skip]
+        artifact_receipt::scan_and_write(&staged_path, &source_document.receipt.identity, crate::compute::activity::ALGORITHM_VERSION, &migration_fingerprint)?;
     }
+    #[rustfmt::skip]
     fingerprint::record(
         &family_receipt_path(staged_candidate_dir, wiki, MetricFamily::ActivityTiers),
         family_spec(
@@ -217,20 +172,10 @@ pub(crate) fn stage_activity_tier_receipts(
         &inputs,
         &family_outputs(staged_candidate_dir, wiki, MetricFamily::ActivityTiers),
     )?;
-    let current = fingerprint::retained_outputs_reusable(
-        &family_receipt_path(staged_candidate_dir, wiki, MetricFamily::ActivityTiers),
-        family_spec(
-            wiki,
-            snapshot,
-            MetricFamily::ActivityTiers,
-            crate::compute::activity::ALGORITHM_VERSION,
-        ),
-        &family_outputs(staged_candidate_dir, wiki, MetricFamily::ActivityTiers),
-    )?;
-    ensure!(
-        current,
-        "retained activity-tier migration for {wiki} did not produce a current v6 receipt"
-    );
+    #[rustfmt::skip]
+    let current = fingerprint::retained_outputs_reusable(&family_receipt_path(staged_candidate_dir, wiki, MetricFamily::ActivityTiers), family_spec(wiki, snapshot, MetricFamily::ActivityTiers, crate::compute::activity::ALGORITHM_VERSION), &family_outputs(staged_candidate_dir, wiki, MetricFamily::ActivityTiers))?;
+    #[rustfmt::skip]
+    ensure!(current, "retained activity-tier migration for {wiki} did not produce a current v6 receipt");
     Ok(())
 }
 
@@ -244,15 +189,8 @@ pub(crate) fn rebind_lifecycle_receipts(
     source_candidate_dir: &Path,
     target_candidate_dir: &Path,
 ) -> Result<()> {
-    let (inputs, migration_fingerprint) = migration_inputs(
-        wiki,
-        snapshot,
-        source_run_id,
-        source_candidate_dir,
-        MetricFamily::Lifecycle,
-        LEGACY_LIFECYCLE_ALGORITHM,
-        LIFECYCLE_MIGRATION_ID,
-    )?;
+    #[rustfmt::skip]
+    let (inputs, migration_fingerprint) = migration_inputs(wiki, snapshot, source_run_id, source_candidate_dir, MetricFamily::Lifecycle, LEGACY_LIFECYCLE_ALGORITHM, LIFECYCLE_MIGRATION_ID)?;
     for metric in MetricFamily::Lifecycle.metrics() {
         let source_path = source_candidate_dir
             .join(wiki)
@@ -261,13 +199,10 @@ pub(crate) fn rebind_lifecycle_receipts(
             .join(wiki)
             .join(format!("{metric}.parquet"));
         let source_document = artifact_receipt::read(&source_path)?;
-        artifact_receipt::scan_and_write(
-            &target_path,
-            &source_document.receipt.identity,
-            crate::compute::lifecycle::ALGORITHM_VERSION,
-            &migration_fingerprint,
-        )?;
+        #[rustfmt::skip]
+        artifact_receipt::scan_and_write(&target_path, &source_document.receipt.identity, crate::compute::lifecycle::ALGORITHM_VERSION, &migration_fingerprint)?;
     }
+    #[rustfmt::skip]
     fingerprint::record(
         &family_receipt_path(target_candidate_dir, wiki, MetricFamily::Lifecycle),
         family_spec(
@@ -279,20 +214,10 @@ pub(crate) fn rebind_lifecycle_receipts(
         &inputs,
         &family_outputs(target_candidate_dir, wiki, MetricFamily::Lifecycle),
     )?;
-    let current = fingerprint::retained_outputs_reusable(
-        &family_receipt_path(target_candidate_dir, wiki, MetricFamily::Lifecycle),
-        family_spec(
-            wiki,
-            snapshot,
-            MetricFamily::Lifecycle,
-            crate::compute::lifecycle::ALGORITHM_VERSION,
-        ),
-        &family_outputs(target_candidate_dir, wiki, MetricFamily::Lifecycle),
-    )?;
-    ensure!(
-        current,
-        "retained lifecycle migration for {wiki} lost its authenticated source receipt"
-    );
+    #[rustfmt::skip]
+    let current = fingerprint::retained_outputs_reusable(&family_receipt_path(target_candidate_dir, wiki, MetricFamily::Lifecycle), family_spec(wiki, snapshot, MetricFamily::Lifecycle, crate::compute::lifecycle::ALGORITHM_VERSION), &family_outputs(target_candidate_dir, wiki, MetricFamily::Lifecycle))?;
+    #[rustfmt::skip]
+    ensure!(current, "retained lifecycle migration for {wiki} lost its authenticated source receipt");
     Ok(())
 }
 
@@ -303,31 +228,14 @@ pub(crate) fn validate_activity_tier_migration(
     source_candidate_dir: &Path,
     target_candidate_dir: &Path,
 ) -> Result<()> {
-    let (expected_inputs, _) = migration_inputs(
-        wiki,
-        snapshot,
-        source_run_id,
-        source_candidate_dir,
-        MetricFamily::ActivityTiers,
-        LEGACY_ACTIVITY_TIER_ALGORITHM,
-        ACTIVITY_TIER_MIGRATION_ID,
-    )?;
+    #[rustfmt::skip]
+    let (expected_inputs, _) = migration_inputs(wiki, snapshot, source_run_id, source_candidate_dir, MetricFamily::ActivityTiers, LEGACY_ACTIVITY_TIER_ALGORITHM, ACTIVITY_TIER_MIGRATION_ID)?;
     let target_receipt_path =
         family_receipt_path(target_candidate_dir, wiki, MetricFamily::ActivityTiers);
-    let target_reusable = fingerprint::retained_outputs_reusable(
-        &target_receipt_path,
-        family_spec(
-            wiki,
-            snapshot,
-            MetricFamily::ActivityTiers,
-            crate::compute::activity::ALGORITHM_VERSION,
-        ),
-        &family_outputs(target_candidate_dir, wiki, MetricFamily::ActivityTiers),
-    )?;
-    ensure!(
-        target_reusable,
-        "retained candidate {wiki} activity-tier v6 receipt is invalid"
-    );
+    #[rustfmt::skip]
+    let target_reusable = fingerprint::retained_outputs_reusable(&target_receipt_path, family_spec(wiki, snapshot, MetricFamily::ActivityTiers, crate::compute::activity::ALGORITHM_VERSION), &family_outputs(target_candidate_dir, wiki, MetricFamily::ActivityTiers))?;
+    #[rustfmt::skip]
+    ensure!(target_reusable, "retained candidate {wiki} activity-tier v6 receipt is invalid");
     let target_stage_receipt = fingerprint::read_receipt(&target_receipt_path)?;
     ensure!(
         target_stage_receipt.inputs.len() == expected_inputs.len(),
@@ -349,18 +257,10 @@ pub(crate) fn validate_activity_tier_migration(
             .join(format!("{metric}.parquet"));
         let source_document = artifact_receipt::read(&source_path)?;
         let target_document = artifact_receipt::read(&target_path)?;
-        let source_document = artifact_receipt::verify(
-            &source_path,
-            &source_document.receipt.identity,
-            Some(&source_document.receipt_sha256),
-            artifact_receipt::VerificationMode::Fast,
-        )?;
-        let target_document = artifact_receipt::verify(
-            &target_path,
-            &target_document.receipt.identity,
-            Some(&target_document.receipt_sha256),
-            artifact_receipt::VerificationMode::Fast,
-        )?;
+        #[rustfmt::skip]
+        let source_document = artifact_receipt::verify(&source_path, &source_document.receipt.identity, Some(&source_document.receipt_sha256), artifact_receipt::VerificationMode::Fast)?;
+        #[rustfmt::skip]
+        let target_document = artifact_receipt::verify(&target_path, &target_document.receipt.identity, Some(&target_document.receipt_sha256), artifact_receipt::VerificationMode::Fast)?;
         let source = source_document.receipt;
         let target = target_document.receipt;
         ensure!(
@@ -418,5 +318,54 @@ impl Drop for TemporaryCandidateDirectory {
         {
             let _ = directory.sync_all();
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::test_support::TestDir;
+    use std::fs;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn temporary_candidate_directory_fails_closed_during_cleanup() -> Result<()> {
+        let root = TestDir::new()?;
+        let missing_parent = root.path().join("missing-parent").join("staging");
+        assert!(TemporaryCandidateDirectory::create(missing_parent).is_err());
+
+        let vanished_path = root.path().join("vanished");
+        let vanished = TemporaryCandidateDirectory::create(vanished_path.clone())?;
+        fs::remove_dir(&vanished_path)?;
+        drop(vanished);
+
+        let file_path = root.path().join("not-a-directory");
+        fs::write(&file_path, b"retained")?;
+        drop(TemporaryCandidateDirectory {
+            path: file_path.clone(),
+        });
+        assert!(file_path.is_file());
+        fs::remove_file(&file_path)?;
+
+        let symlink_path = root.path().join("staging-link");
+        let target_path = root.path().join("staging-target");
+        let staged = TemporaryCandidateDirectory::create(symlink_path.clone())?;
+        fs::rename(&symlink_path, &target_path)?;
+        symlink(&target_path, &symlink_path)?;
+        drop(staged);
+        assert!(target_path.is_dir());
+        fs::remove_file(&symlink_path)?;
+        fs::remove_dir(&target_path)?;
+
+        let locked_parent = root.path().join("locked-parent");
+        fs::create_dir(&locked_parent)?;
+        let locked_path = locked_parent.join("staging");
+        let locked = TemporaryCandidateDirectory::create(locked_path.clone())?;
+        fs::set_permissions(&locked_parent, fs::Permissions::from_mode(0o555))?;
+        drop(locked);
+        fs::set_permissions(&locked_parent, fs::Permissions::from_mode(0o755))?;
+        assert!(locked_path.is_dir());
+        fs::remove_dir_all(locked_parent)?;
+        Ok(())
     }
 }
