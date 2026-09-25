@@ -24,10 +24,24 @@ pub const RECEIPT_FILE: &str = "publication-gate.json";
 const RETAINED_LIFECYCLE_MIGRATION_ID: &str = "retained-lifecycle-v3-to-v4-period-months-v1";
 const RETAINED_LIFECYCLE_AND_ACTIVITY_MIGRATION_ID: &str =
     "retained-lifecycle-v3-to-v4-period-months-and-activity-tiers-v5-to-v6-receipt-v1";
+const RETAINED_LIFECYCLE_AND_PATROL_MIGRATION_ID: &str =
+    "retained-lifecycle-v3-to-v4-period-months-and-patrol-v5-to-v6-coverage-rounding-v1";
+const RETAINED_LIFECYCLE_ACTIVITY_AND_PATROL_MIGRATION_ID: &str = "retained-lifecycle-v3-to-v4-period-months-and-activity-tiers-v5-to-v6-receipt-and-patrol-v5-to-v6-coverage-rounding-v1";
+
+fn retained_migration_id(activity_tier: bool, patrol: bool) -> &'static str {
+    match (activity_tier, patrol) {
+        (false, false) => RETAINED_LIFECYCLE_MIGRATION_ID,
+        (true, false) => RETAINED_LIFECYCLE_AND_ACTIVITY_MIGRATION_ID,
+        (false, true) => RETAINED_LIFECYCLE_AND_PATROL_MIGRATION_ID,
+        (true, true) => RETAINED_LIFECYCLE_ACTIVITY_AND_PATROL_MIGRATION_ID,
+    }
+}
 
 fn supported_retained_migration_id(migration: &str) -> bool {
     migration == RETAINED_LIFECYCLE_MIGRATION_ID
         || migration == RETAINED_LIFECYCLE_AND_ACTIVITY_MIGRATION_ID
+        || migration == RETAINED_LIFECYCLE_AND_PATROL_MIGRATION_ID
+        || migration == RETAINED_LIFECYCLE_ACTIVITY_AND_PATROL_MIGRATION_ID
 }
 
 const JSON_ARTIFACTS: [&str; 14] = [
@@ -1458,6 +1472,9 @@ pub(crate) fn migrate_retained_candidate(
             family,
         ));
     }
+    let source_patrol_output = source_candidate.join(wiki).join("patrol.parquet");
+    files.push(source_patrol_output.clone());
+    files.push(artifact_receipt::sidecar_path(&source_patrol_output)?);
     files.push(
         source_candidate
             .join("_stages")
@@ -1504,6 +1521,8 @@ pub(crate) fn migrate_retained_candidate(
         #[rustfmt::skip]
         crate::retained_activity_migration::rebind_lifecycle_receipts(wiki, snapshot, &source_ready.run_id, &source_candidate, &target_candidate)?;
     }
+    #[rustfmt::skip]
+    let patrol_receipt_migrated = crate::retained_patrol_migration::migrate_if_required(wiki, snapshot, &source_ready.run_id, &source_candidate, &target_candidate)?;
     let patrol_output = crate::fingerprint::TrackedPath::new(
         format!("output/{wiki}/patrol.parquet"),
         target_candidate.join(wiki).join("patrol.parquet"),
@@ -1537,11 +1556,8 @@ pub(crate) fn migrate_retained_candidate(
         schema_version: 1,
         source_run_id: source_ready.run_id.clone(),
         source_ready_sha256: source_ready_sha256.clone(),
-        migration: if activity_tier_receipt_migrated {
-            RETAINED_LIFECYCLE_AND_ACTIVITY_MIGRATION_ID.to_string()
-        } else {
-            RETAINED_LIFECYCLE_MIGRATION_ID.to_string()
-        },
+        migration: retained_migration_id(activity_tier_receipt_migrated, patrol_receipt_migrated)
+            .to_string(),
     });
     ready.artifacts = source_ready
         .artifacts
@@ -1667,10 +1683,17 @@ fn validate_retained_lifecycle_projection(
         validate_prepared_artifact(&source_dir, artifact)?;
     }
     crate::compute::validate_retained_lifecycle_migration(&ready.wiki, &source_dir, candidate_dir)?;
-    if migration.migration == RETAINED_LIFECYCLE_AND_ACTIVITY_MIGRATION_ID {
+    if migration.migration == RETAINED_LIFECYCLE_AND_ACTIVITY_MIGRATION_ID
+        || migration.migration == RETAINED_LIFECYCLE_ACTIVITY_AND_PATROL_MIGRATION_ID
+    {
         #[rustfmt::skip]
         crate::retained_activity_migration::validate_activity_tier_migration(&ready.wiki, &ready.snapshot, &migration.source_run_id, &source_dir, candidate_dir)?;
     }
+    let patrol_migration_expected = migration.migration
+        == RETAINED_LIFECYCLE_AND_PATROL_MIGRATION_ID
+        || migration.migration == RETAINED_LIFECYCLE_ACTIVITY_AND_PATROL_MIGRATION_ID;
+    #[rustfmt::skip]
+    crate::retained_patrol_migration::validate_migration(&ready.wiki, &ready.snapshot, &migration.source_run_id, &source_dir, candidate_dir, patrol_migration_expected)?;
     Ok(())
 }
 
@@ -6757,6 +6780,26 @@ mod tests {
     use serde_json::{Value, json};
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::path::PathBuf;
+
+    #[test]
+    fn retained_migration_ids_cover_patrol_combinations() {
+        let cases = [
+            (false, false, RETAINED_LIFECYCLE_MIGRATION_ID),
+            (true, false, RETAINED_LIFECYCLE_AND_ACTIVITY_MIGRATION_ID),
+            (false, true, RETAINED_LIFECYCLE_AND_PATROL_MIGRATION_ID),
+            (
+                true,
+                true,
+                RETAINED_LIFECYCLE_ACTIVITY_AND_PATROL_MIGRATION_ID,
+            ),
+        ];
+        for (activity_tier, patrol, expected) in cases {
+            let migration = retained_migration_id(activity_tier, patrol);
+            assert_eq!(migration, expected);
+            assert!(supported_retained_migration_id(migration));
+        }
+        assert!(!supported_retained_migration_id("unknown-migration"));
+    }
 
     fn reuse_success() -> std::io::Result<()> {
         std::fs::metadata(".").map(|_| ())

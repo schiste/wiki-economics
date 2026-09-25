@@ -61,12 +61,14 @@ marks the receipt applied. Interrupted cleanup is idempotent. A same-snapshot
 run authenticates current algorithms and output receipts as a no-op; a
 semantic algorithm change redownloads and rebuilds the input.
 
-Retained candidates have one explicit output-equivalent activity-tier receipt
-migration: v5 receipts may be reissued as v6 only while migrating a
-retention-authorized candidate, after source receipts are authenticated and
-the copied Parquet bytes are verified unchanged. The migrated ready receipt
-records this path separately. Other stale family algorithms still require
-their source inputs to be rebuilt.
+Retained candidates support receipt-backed migrations only while migrating
+a retention-authorized candidate. Activity-tier v5 receipts may be reissued as
+v6 after source receipts are authenticated and copied Parquet bytes are verified
+unchanged. Patrol v5-to-v6 migration recalculates only the two coverage
+percentages from authenticated retained integer counts, preserves every other
+column, and binds the new stage receipt to the authenticated source output and
+receipts. The migrated ready receipt records each migration path. Other stale
+family algorithms still require their source inputs to be rebuilt.
 
 ## Runtime behavior
 
