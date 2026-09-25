@@ -2510,7 +2510,10 @@ pub(crate) fn plan_wiki_preparation(
         }
         _ => false,
     };
-    if purged_compute_current && purged_patrol_current {
+    if purged_compute_current
+        && purged_patrol_current
+        && let Some((_, candidate_dir)) = candidates.last()
+    {
         let indexed = indexed_latest_ready_candidate(data_dir, output_dir, wiki)?
             .context("purged unchanged candidate has no recoverable ready index")?;
         ensure!(
