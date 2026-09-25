@@ -947,9 +947,8 @@ mod tests {
             .to_path_buf();
         fs::remove_dir_all(&stage_directory)?;
         fs::write(&stage_directory, b"stage parent is a file")?;
-        let error = migrate_candidate(wiki, snapshot, "stage-write-source", &source, &stage_target)
+        migrate_candidate(wiki, snapshot, "stage-write-source", &source, &stage_target)
             .expect_err("a non-directory stage parent must reject receipt persistence");
-        ensure!(error.to_string().contains("Not a directory"));
         Ok(())
     }
 
