@@ -350,11 +350,7 @@ fn non_null_i64_values(frame: &DataFrame, name: &str) -> Result<Vec<i64>> {
     column
         .i64()?
         .iter()
-        .map(|value| {
-            value
-                .copied()
-                .with_context(|| format!("patrol {name} contains a null count"))
-        })
+        .map(|value| value.with_context(|| format!("patrol {name} contains a null count")))
         .collect()
 }
 
@@ -391,11 +387,8 @@ fn calculated_coverage(frame: &DataFrame) -> Result<(Vec<f64>, Vec<f64>)> {
 fn rewrite_coverage_columns(path: &Path) -> Result<()> {
     let mut frame = ParquetReader::new(File::open(path)?).finish()?;
     let (patrol_coverage, adjusted_coverage) = calculated_coverage(&frame)?;
-    frame.with_column(Series::new("patrol_coverage_pct".into(), patrol_coverage));
-    frame.with_column(Series::new(
-        "adjusted_coverage_pct".into(),
-        adjusted_coverage,
-    ));
+    frame.with_column(Series::new("patrol_coverage_pct".into(), patrol_coverage).into())?;
+    frame.with_column(Series::new("adjusted_coverage_pct".into(), adjusted_coverage).into())?;
 
     let parent = path.parent().context("patrol artifact has no parent")?;
     let temporary = parent.join(format!(".patrol-migration-{}.tmp", std::process::id()));
