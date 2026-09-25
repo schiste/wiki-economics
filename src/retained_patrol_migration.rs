@@ -229,12 +229,14 @@ pub(crate) fn migrate_candidate(
         &inputs,
         &[patrol_output_tracked(target_candidate_dir, wiki)],
     )?;
+    let current_receipt_reusable = fingerprint::retained_outputs_reusable(
+        &patrol_stage_receipt(target_candidate_dir, wiki),
+        patrol_spec(wiki, snapshot, crate::patrol::algorithm_version()),
+        &[patrol_output_tracked(target_candidate_dir, wiki)],
+    )
+    .unwrap_or(false);
     ensure!(
-        fingerprint::retained_outputs_reusable(
-            &patrol_stage_receipt(target_candidate_dir, wiki),
-            patrol_spec(wiki, snapshot, crate::patrol::algorithm_version()),
-            &[patrol_output_tracked(target_candidate_dir, wiki)],
-        )?,
+        current_receipt_reusable,
         "retained patrol migration for {wiki} did not produce a current v6 receipt"
     );
     Ok(())
@@ -932,6 +934,35 @@ mod tests {
         let error = migrate_candidate(wiki, snapshot, "sidecar-source", &source, &sidecar_target)
             .expect_err("a receipt directory cannot be removed as a sidecar file");
         ensure!(error.to_string().contains("directory"));
+
+        let source = write_legacy_source(root.path(), wiki, snapshot, "missing-sidecar-source")?;
+        let missing_sidecar_target = root
+            .path()
+            .join("_candidates")
+            .join(wiki)
+            .join(snapshot)
+            .join("missing-sidecar-target");
+        copy_legacy_candidate(&source, &missing_sidecar_target, wiki)?;
+        fs::remove_file(artifact_receipt::sidecar_path(&patrol_output(
+            &missing_sidecar_target,
+            wiki,
+        ))?)?;
+        migrate_candidate(
+            wiki,
+            snapshot,
+            "missing-sidecar-source",
+            &source,
+            &missing_sidecar_target,
+        )
+        .expect("migration can issue a current receipt when the target sidecar is absent");
+        validate_migration(
+            wiki,
+            snapshot,
+            "missing-sidecar-source",
+            &source,
+            &missing_sidecar_target,
+            true,
+        )?;
 
         let source = write_legacy_source(root.path(), wiki, snapshot, "stage-write-source")?;
         let stage_target = root
