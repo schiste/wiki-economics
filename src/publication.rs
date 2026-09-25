@@ -2297,6 +2297,18 @@ fn retained_ready_lineage_matches(
     authorized_ready_sha256: &str,
     depth: u8,
 ) -> Result<bool> {
+    Ok(
+        retained_ready_lineage_origin(candidate_dir, ready, authorized_ready_sha256, depth)?
+            .is_some(),
+    )
+}
+
+fn retained_ready_lineage_origin(
+    candidate_dir: &Path,
+    ready: &ReadyWikiCandidate,
+    authorized_ready_sha256: &str,
+    depth: u8,
+) -> Result<Option<PathBuf>> {
     ensure!(
         depth <= 16,
         "retained candidate migration lineage is too deep"
@@ -2304,10 +2316,10 @@ fn retained_ready_lineage_matches(
     let ready_path = candidate_dir.join("ready.json");
     let (_, observed_sha256) = storage::sha256_file(&ready_path)?;
     if observed_sha256 == authorized_ready_sha256 {
-        return Ok(true);
+        return Ok(Some(ready_path));
     }
     let Some(migration) = ready.migrated_from_retained_candidate.as_ref() else {
-        return Ok(false);
+        return Ok(None);
     };
     ensure!(
         migration.schema_version == 1
@@ -2335,12 +2347,48 @@ fn retained_ready_lineage_matches(
             && source_ready.run_id == migration.source_run_id,
         "retained migration source candidate identity does not match its provenance"
     );
-    retained_ready_lineage_matches(
+    retained_ready_lineage_origin(
         &source_dir,
         &source_ready,
         authorized_ready_sha256,
         depth + 1,
     )
+}
+
+fn set_current_snapshot_for_ready_candidate(
+    data_dir: &Path,
+    output_dir: &Path,
+    wiki: &str,
+    snapshot: &str,
+    candidate_relative: &str,
+) -> Result<()> {
+    let manifest_path = storage::generation_manifest_path(data_dir, wiki, snapshot)?;
+    if manifest_path.is_file() {
+        return storage::publish_current_snapshot(data_dir, wiki, snapshot);
+    }
+
+    let retention_path = crate::retention::receipt_path(data_dir, wiki, snapshot)?;
+    if !retention_path.is_file() {
+        return storage::publish_current_snapshot(data_dir, wiki, snapshot);
+    }
+
+    let candidate_dir = output_dir.join(candidate_relative);
+    let ready_path = candidate_dir.join("ready.json");
+    let ready: ReadyWikiCandidate = read_json(&ready_path)?;
+    ensure!(
+        ready.wiki == wiki && ready.snapshot == snapshot,
+        "retained candidate identity does not match snapshot activation"
+    );
+    validate_ready_candidate_metadata(data_dir, &candidate_dir, &ready)?;
+    let retention = crate::retention::validate_purged_snapshot(data_dir, wiki, snapshot)?;
+    let retained_ready_path = retained_ready_lineage_origin(
+        &candidate_dir,
+        &ready,
+        &retention.authorized_ready_sha256,
+        0,
+    )?
+    .context("retention receipt does not authorize this ready candidate lineage")?;
+    storage::restore_retained_current_snapshot(data_dir, wiki, snapshot, &retained_ready_path)
 }
 
 fn validate_ready_candidate(
@@ -5004,11 +5052,12 @@ fn rollback_selection_files(
                     .previous_candidate_relative
                     .as_deref()
                     .context("retained rollback snapshot has no previous candidate")?;
-                storage::restore_retained_current_snapshot(
+                set_current_snapshot_for_ready_candidate(
                     data_dir,
+                    output_dir,
                     &entry.wiki,
                     previous_snapshot,
-                    &output_dir.join(previous).join("ready.json"),
+                    previous,
                 )?;
             }
         } else {
@@ -5196,7 +5245,13 @@ where
             );
             link_result?;
             fs::rename(&temporary, &active)?;
-            storage::publish_current_snapshot(data_dir, &entry.wiki, &entry.snapshot)?;
+            set_current_snapshot_for_ready_candidate(
+                data_dir,
+                output_dir,
+                &entry.wiki,
+                &entry.snapshot,
+                &entry.candidate_relative,
+            )?;
         }
         Ok(())
     })();
@@ -5632,7 +5687,13 @@ fn resume_unpublished_selection(
             std::os::unix::fs::symlink(&selected_target, &temporary)?;
             fs::rename(&temporary, &active)?;
         }
-        storage::publish_current_snapshot(data_dir, &entry.wiki, &entry.snapshot)?;
+        set_current_snapshot_for_ready_candidate(
+            data_dir,
+            output_dir,
+            &entry.wiki,
+            &entry.snapshot,
+            &entry.candidate_relative,
+        )?;
     }
     let snapshots = selection
         .entries
