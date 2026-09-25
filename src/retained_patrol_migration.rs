@@ -349,8 +349,12 @@ fn non_null_i64_values(frame: &DataFrame, name: &str) -> Result<Vec<i64>> {
     let column = frame.column(name)?.cast(&DataType::Int64)?;
     column
         .i64()?
-        .into_iter()
-        .map(|value| value.with_context(|| format!("patrol {name} contains a null count")))
+        .iter()
+        .map(|value| {
+            value
+                .copied()
+                .with_context(|| format!("patrol {name} contains a null count"))
+        })
         .collect()
 }
 
@@ -387,11 +391,11 @@ fn calculated_coverage(frame: &DataFrame) -> Result<(Vec<f64>, Vec<f64>)> {
 fn rewrite_coverage_columns(path: &Path) -> Result<()> {
     let mut frame = ParquetReader::new(File::open(path)?).finish()?;
     let (patrol_coverage, adjusted_coverage) = calculated_coverage(&frame)?;
-    frame.with_column(Series::new("patrol_coverage_pct".into(), patrol_coverage))?;
+    frame.with_column(Series::new("patrol_coverage_pct".into(), patrol_coverage));
     frame.with_column(Series::new(
         "adjusted_coverage_pct".into(),
         adjusted_coverage,
-    ))?;
+    ));
 
     let parent = path.parent().context("patrol artifact has no parent")?;
     let temporary = parent.join(format!(".patrol-migration-{}.tmp", std::process::id()));
@@ -436,6 +440,7 @@ fn validate_coverage_columns(frame: &DataFrame) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestDir;
     use anyhow::Result;
 
     fn write_legacy_source(
@@ -524,7 +529,7 @@ mod tests {
 
     #[test]
     fn retained_patrol_v5_migration_recalculates_ratios_and_preserves_source() -> Result<()> {
-        let root = tempfile::tempdir()?;
+        let root = TestDir::new()?;
         let wiki = "nlwiki";
         let snapshot = "2026-03";
         let source = write_legacy_source(root.path(), wiki, snapshot, "legacy-source")?;
@@ -579,7 +584,7 @@ mod tests {
 
     #[test]
     fn retained_patrol_migration_rejects_unsafe_identity_and_bad_counts() -> Result<()> {
-        let root = tempfile::tempdir()?;
+        let root = TestDir::new()?;
         ensure!(migration_required("../unsafe", "2026-03", "source", root.path()).is_err());
         ensure!(migration_required("", "2026-03", "source", root.path()).is_err());
 
@@ -612,7 +617,7 @@ mod tests {
     fn failed_patrol_migration_write_cleans_up_temporary_file() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
 
-        let root = tempfile::tempdir()?;
+        let root = TestDir::new()?;
         let candidate = write_legacy_source(root.path(), "nlwiki", "2026-03", "legacy")?;
         let output = patrol_output(&candidate, "nlwiki");
         let parent = output.parent().context("patrol output has no parent")?;
@@ -630,7 +635,7 @@ mod tests {
 
     #[test]
     fn retained_patrol_v5_migration_rejects_tampering_and_unknown_algorithm() -> Result<()> {
-        let root = tempfile::tempdir()?;
+        let root = TestDir::new()?;
         let wiki = "nlwiki";
         let snapshot = "2026-03";
         let source = write_legacy_source(root.path(), wiki, snapshot, "legacy-source")?;
