@@ -348,6 +348,30 @@
       "paths": ["src/compute/mod.rs"],
       "reason": "Add receipt-backed retained-candidate migration plumbing; page-week formulas, rows, schemas, and artifact bytes are unchanged.",
       "base_commit": "aa77415b27727cb2b83d3936b5beb652c3404805"
+    },
+    {
+      "family": "monthly",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Permit receipt-validated older package versions during retained migration; monthly formulas, schema, and output bytes are unchanged.",
+      "base_commit": "f4d1fad41f9d1cd04c17c8e3835da249a6247e50"
+    },
+    {
+      "family": "activity_tiers",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Permit receipt-validated older package versions during retained migration; activity-tier formulas, schema, and output bytes are unchanged.",
+      "base_commit": "f4d1fad41f9d1cd04c17c8e3835da249a6247e50"
+    },
+    {
+      "family": "lifecycle",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Permit receipt-validated older package versions during retained migration; lifecycle formulas, schema, and output bytes are unchanged.",
+      "base_commit": "f4d1fad41f9d1cd04c17c8e3835da249a6247e50"
+    },
+    {
+      "family": "page_week",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Permit receipt-validated older package versions during retained migration; page-week formulas, schema, and output bytes are unchanged.",
+      "base_commit": "f4d1fad41f9d1cd04c17c8e3835da249a6247e50"
     }
   ]
 }

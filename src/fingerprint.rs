@@ -571,6 +571,15 @@ fn receipt_matches_spec(receipt: &StageReceipt, spec: StageSpec<'_>) -> Result<b
         && receipt_fingerprint(receipt)? == receipt.fingerprint)
 }
 
+fn receipt_matches_algorithm_spec(receipt: &StageReceipt, spec: StageSpec<'_>) -> Result<bool> {
+    Ok(receipt.schema_version == RECEIPT_SCHEMA_VERSION
+        && receipt.stage == spec.stage
+        && receipt.scope == spec.scope
+        && receipt.selected_snapshot.as_deref() == spec.selected_snapshot
+        && receipt.algorithm_version == spec.algorithm_version
+        && receipt_fingerprint(receipt)? == receipt.fingerprint)
+}
+
 /// Read and authenticate only the receipt envelope. Artifact identities in the
 /// returned document are safe to use as expected values, but callers must still
 /// validate whichever concrete paths they consume with `artifact_matches`.
@@ -616,6 +625,28 @@ pub fn outputs_reusable(
         }
     };
     Ok(receipt_matches_spec(&receipt, spec)? && paths_match(&receipt.outputs, outputs)?)
+}
+
+/// Verify output files from a retention-authorized candidate by their recorded
+/// stage algorithm. This intentionally permits an older crate version because
+/// the source inputs may have been purged; ordinary reuse must continue to use
+/// `outputs_reusable` and its stricter package-version check.
+pub(crate) fn retained_outputs_reusable(
+    receipt_path: &Path,
+    spec: StageSpec<'_>,
+    outputs: &[TrackedPath],
+) -> Result<bool> {
+    if !receipt_path.is_file() {
+        return Ok(false);
+    }
+    let receipt = match read_receipt(receipt_path) {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            warn!(path = %receipt_path.display(), error = %error, "ignoring invalid retained stage receipt");
+            return Ok(false);
+        }
+    };
+    Ok(receipt_matches_algorithm_spec(&receipt, spec)? && paths_match(&receipt.outputs, outputs)?)
 }
 
 pub fn record(
@@ -761,6 +792,17 @@ fn atomic_write_receipt(receipt_path: &Path, receipt: &StageReceipt) -> Result<(
         let _ = fs::remove_file(&temp);
     }
     write_result
+}
+
+#[cfg(test)]
+pub(crate) fn set_computation_version_for_test(
+    receipt_path: &Path,
+    computation_version: &str,
+) -> Result<()> {
+    let mut receipt = read_receipt(receipt_path)?;
+    receipt.computation_version = computation_version.to_string();
+    receipt.fingerprint = receipt_fingerprint(&receipt)?;
+    atomic_write_receipt(receipt_path, &receipt)
 }
 
 fn site_selected_snapshot_versions(output_dir: &Path) -> Result<Vec<(String, String)>> {
@@ -1254,6 +1296,46 @@ mod tests {
             )
             .is_err()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn retained_stage_receipts_accept_older_package_versions_only_for_exact_outputs() -> Result<()>
+    {
+        let dir = TestDir::new()?;
+        let output = dir.path().join("output.txt");
+        let receipt_path = dir.path().join("retained-stage.json");
+        fs::write(&output, "retained output")?;
+        let outputs = [TrackedPath::new("output/metric", &output)];
+        let spec = StageSpec {
+            stage: "compute_monthly",
+            scope: "testwiki",
+            selected_snapshot: Some("2026-08"),
+            algorithm_version: "monthly-v5",
+        };
+
+        let missing_receipt_reusable =
+            retained_outputs_reusable(&dir.path().join("missing.json"), spec, &outputs);
+        let missing_receipt_reusable = missing_receipt_reusable?;
+        assert!(!missing_receipt_reusable);
+        record(&receipt_path, spec, &[], &outputs)?;
+        set_computation_version_for_test(&receipt_path, "0.1.1")?;
+
+        assert!(!outputs_reusable(&receipt_path, spec, &outputs)?);
+        assert!(retained_outputs_reusable(&receipt_path, spec, &outputs)?);
+        let incompatible_algorithm_spec = StageSpec {
+            algorithm_version: "monthly-v6",
+            ..spec
+        };
+        let incompatible_algorithm_reusable =
+            retained_outputs_reusable(&receipt_path, incompatible_algorithm_spec, &outputs);
+        let incompatible_algorithm_reusable = incompatible_algorithm_reusable?;
+        assert!(!incompatible_algorithm_reusable);
+
+        fs::write(&output, "changed output")?;
+        assert!(!retained_outputs_reusable(&receipt_path, spec, &outputs)?);
+        fs::write(&receipt_path, "not-json")?;
+        assert!(!retained_outputs_reusable(&receipt_path, spec, &outputs)?);
         Ok(())
     }
 

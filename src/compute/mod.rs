@@ -1253,6 +1253,40 @@ pub(crate) fn candidate_receipts_current_without_inputs(
     candidate_dir: &Path,
     profile: Option<&workload_profile::WorkloadProfile>,
 ) -> Result<bool> {
+    candidate_receipts_current_without_inputs_with_retained_versions(
+        wiki,
+        snapshot,
+        candidate_dir,
+        profile,
+        false,
+    )
+}
+
+/// Authenticate compute outputs on a retention-authorized migrated candidate.
+/// The retained receipt envelope and concrete outputs are still checked; only
+/// the package version may predate the migration binary.
+pub(crate) fn retained_candidate_receipts_current_without_inputs(
+    wiki: &str,
+    snapshot: &str,
+    candidate_dir: &Path,
+    profile: Option<&workload_profile::WorkloadProfile>,
+) -> Result<bool> {
+    candidate_receipts_current_without_inputs_with_retained_versions(
+        wiki,
+        snapshot,
+        candidate_dir,
+        profile,
+        true,
+    )
+}
+
+fn candidate_receipts_current_without_inputs_with_retained_versions(
+    wiki: &str,
+    snapshot: &str,
+    candidate_dir: &Path,
+    profile: Option<&workload_profile::WorkloadProfile>,
+    allow_retained_package_version: bool,
+) -> Result<bool> {
     storage::validate_snapshot_version(snapshot)?;
     let Some(profile) = profile else {
         return Ok(false);
@@ -1262,11 +1296,13 @@ pub(crate) fn candidate_receipts_current_without_inputs(
     for family in MetricFamily::CORE {
         let algorithm = family.algorithm_version(&weekly_config);
         let outputs = family_outputs(family, wiki, candidate_dir);
-        let outputs_reusable = fingerprint::outputs_reusable(
-            &family_stage_receipt(candidate_dir, wiki, family),
-            family_stage_spec(family, wiki, Some(snapshot), &algorithm),
-            &outputs,
-        );
+        let receipt_path = family_stage_receipt(candidate_dir, wiki, family);
+        let spec = family_stage_spec(family, wiki, Some(snapshot), &algorithm);
+        let outputs_reusable = if allow_retained_package_version {
+            fingerprint::retained_outputs_reusable(&receipt_path, spec, &outputs)
+        } else {
+            fingerprint::outputs_reusable(&receipt_path, spec, &outputs)
+        };
         if !outputs_reusable? {
             return Ok(false);
         }
@@ -1303,7 +1339,7 @@ pub(crate) fn migrate_retained_candidate_families(
         let receipt_path = family_stage_receipt(source_candidate_dir, wiki, family);
         let outputs = family_outputs(family, wiki, source_candidate_dir);
         #[rustfmt::skip]
-        let reusable = fingerprint::outputs_reusable(&receipt_path, family_stage_spec(family, wiki, Some(snapshot), &algorithm), &outputs)?;
+        let reusable = fingerprint::retained_outputs_reusable(&receipt_path, family_stage_spec(family, wiki, Some(snapshot), &algorithm), &outputs)?;
         anyhow::ensure!(
             reusable,
             "retained candidate {wiki} has an outdated or invalid {} family",
@@ -1317,7 +1353,7 @@ pub(crate) fn migrate_retained_candidate_families(
         family_stage_receipt(source_candidate_dir, wiki, MetricFamily::Lifecycle);
     let source_outputs = family_outputs(MetricFamily::Lifecycle, wiki, source_candidate_dir);
     #[rustfmt::skip]
-    let lifecycle_receipts_reusable = fingerprint::outputs_reusable(&source_receipt_path, family_stage_spec(MetricFamily::Lifecycle, wiki, Some(snapshot), LEGACY_LIFECYCLE_ALGORITHM), &source_outputs)?;
+    let lifecycle_receipts_reusable = fingerprint::retained_outputs_reusable(&source_receipt_path, family_stage_spec(MetricFamily::Lifecycle, wiki, Some(snapshot), LEGACY_LIFECYCLE_ALGORITHM), &source_outputs)?;
     anyhow::ensure!(
         lifecycle_receipts_reusable,
         "retained candidate {wiki} is not an authenticated lifecycle v3 candidate"
@@ -1449,8 +1485,13 @@ pub(crate) fn migrate_retained_candidate_families(
     #[rustfmt::skip]
     fingerprint::record(&family_stage_receipt(target_candidate_dir, wiki, MetricFamily::Lifecycle), family_stage_spec(MetricFamily::Lifecycle, wiki, Some(snapshot), lifecycle::ALGORITHM_VERSION), &migration_inputs, &family_outputs(MetricFamily::Lifecycle, wiki, target_candidate_dir))?;
 
-    #[rustfmt::skip]
-    let receipts_current = candidate_receipts_current_without_inputs(wiki, snapshot, target_candidate_dir, Some(&profile))?;
+    let receipt_check = retained_candidate_receipts_current_without_inputs(
+        wiki,
+        snapshot,
+        target_candidate_dir,
+        Some(&profile),
+    );
+    let receipts_current = receipt_check?;
     anyhow::ensure!(
         receipts_current,
         "migrated candidate {wiki} does not have a complete current compute receipt set"
