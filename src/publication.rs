@@ -1470,17 +1470,19 @@ pub(crate) fn migrate_retained_candidate(
         .join("_stages")
         .join("patrol_compute")
         .join(format!("{wiki}.json"));
+    let patrol_receipt_check = crate::fingerprint::retained_outputs_reusable(
+        &patrol_receipt,
+        crate::fingerprint::StageSpec {
+            stage: "patrol_compute",
+            scope: wiki,
+            selected_snapshot: Some(snapshot),
+            algorithm_version: crate::patrol::algorithm_version(),
+        },
+        &[patrol_output],
+    );
+    let patrol_receipt_current = patrol_receipt_check?;
     ensure!(
-        crate::fingerprint::retained_outputs_reusable(
-            &patrol_receipt,
-            crate::fingerprint::StageSpec {
-                stage: "patrol_compute",
-                scope: wiki,
-                selected_snapshot: Some(snapshot),
-                algorithm_version: crate::patrol::algorithm_version(),
-            },
-            &[patrol_output],
-        )?,
+        patrol_receipt_current,
         "retained candidate {wiki} patrol receipt is outdated or invalid"
     );
 
@@ -2490,7 +2492,7 @@ pub(crate) fn plan_wiki_preparation(
                     .join("_stages")
                     .join("patrol_compute")
                     .join(format!("{wiki}.json"));
-                crate::fingerprint::retained_outputs_reusable(
+                let patrol_receipt_check = crate::fingerprint::retained_outputs_reusable(
                     &patrol_receipt,
                     crate::fingerprint::StageSpec {
                         stage: "patrol_compute",
@@ -2499,13 +2501,15 @@ pub(crate) fn plan_wiki_preparation(
                         algorithm_version: crate::patrol::algorithm_version(),
                     },
                     &[patrol_output],
-                )?
+                );
+                patrol_receipt_check?
             } else {
-                crate::patrol::candidate_receipt_current_without_inputs(
+                let patrol_receipt_check = crate::patrol::candidate_receipt_current_without_inputs(
                     wiki,
                     snapshot,
                     candidate_dir,
-                )?
+                );
+                patrol_receipt_check?
             }
         }
         _ => false,
@@ -9514,6 +9518,19 @@ mod tests {
             .expect("retention should authorize and purge the exact ready source");
         }
 
+        let pre_migration_plan_result = plan_wiki_preparation(
+            fixture.data.path(),
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            "retained-v3-pre-migration",
+        );
+        let pre_migration_plan = pre_migration_plan_result?;
+        assert!(!matches!(
+            pre_migration_plan,
+            WikiPreparationPlan::NoOp { .. }
+        ));
+
         for family in crate::metric_registry::MetricFamily::CORE {
             let receipt_path =
                 crate::compute::family_stage_receipt(&source_candidate, "nlwiki", family);
@@ -9534,16 +9551,20 @@ mod tests {
             selected_snapshot: Some("2026-03"),
             algorithm_version: crate::patrol::algorithm_version(),
         };
-        assert!(!crate::fingerprint::outputs_reusable(
+        let strict_patrol_receipt_check = crate::fingerprint::outputs_reusable(
             &patrol_receipt,
             patrol_spec,
             std::slice::from_ref(&patrol_output),
-        )?);
-        assert!(crate::fingerprint::retained_outputs_reusable(
+        );
+        let strict_patrol_receipt_current = strict_patrol_receipt_check?;
+        assert!(!strict_patrol_receipt_current);
+        let retained_patrol_receipt_check = crate::fingerprint::retained_outputs_reusable(
             &patrol_receipt,
             patrol_spec,
             &[patrol_output],
-        )?);
+        );
+        let retained_patrol_receipt_current = retained_patrol_receipt_check?;
+        assert!(retained_patrol_receipt_current);
 
         #[rustfmt::skip]
         crate::run_with_ops(crate::Cli {
@@ -9598,13 +9619,14 @@ mod tests {
         assert_eq!(migration.source_run_id, source_ready.run_id);
         assert_eq!(migration.source_ready_sha256, authorized_source_sha256);
         validate_ready_candidate(fixture.data.path(), migrated_candidate, &migrated_ready)?;
-        let repeated_plan = plan_wiki_preparation(
+        let repeated_plan_result = plan_wiki_preparation(
             fixture.data.path(),
             fixture.output.path(),
             "nlwiki",
             "2026-03",
             "retained-v3-repeat",
-        )?;
+        );
+        let repeated_plan = repeated_plan_result?;
         assert!(matches!(
             repeated_plan,
             WikiPreparationPlan::NoOp { ready_path } if ready_path == migrated_ready_path

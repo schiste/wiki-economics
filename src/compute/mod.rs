@@ -1485,13 +1485,13 @@ pub(crate) fn migrate_retained_candidate_families(
     #[rustfmt::skip]
     fingerprint::record(&family_stage_receipt(target_candidate_dir, wiki, MetricFamily::Lifecycle), family_stage_spec(MetricFamily::Lifecycle, wiki, Some(snapshot), lifecycle::ALGORITHM_VERSION), &migration_inputs, &family_outputs(MetricFamily::Lifecycle, wiki, target_candidate_dir))?;
 
-    #[rustfmt::skip]
-    let receipts_current = retained_candidate_receipts_current_without_inputs(
+    let receipt_check = retained_candidate_receipts_current_without_inputs(
         wiki,
         snapshot,
         target_candidate_dir,
         Some(&profile),
-    )?;
+    );
+    let receipts_current = receipt_check?;
     anyhow::ensure!(
         receipts_current,
         "migrated candidate {wiki} does not have a complete current compute receipt set"

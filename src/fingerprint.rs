@@ -1314,24 +1314,23 @@ mod tests {
             algorithm_version: "monthly-v5",
         };
 
-        assert!(!retained_outputs_reusable(
-            &dir.path().join("missing.json"),
-            spec,
-            &outputs,
-        )?);
+        let missing_receipt_reusable =
+            retained_outputs_reusable(&dir.path().join("missing.json"), spec, &outputs);
+        let missing_receipt_reusable = missing_receipt_reusable?;
+        assert!(!missing_receipt_reusable);
         record(&receipt_path, spec, &[], &outputs)?;
         set_computation_version_for_test(&receipt_path, "0.1.1")?;
 
         assert!(!outputs_reusable(&receipt_path, spec, &outputs)?);
         assert!(retained_outputs_reusable(&receipt_path, spec, &outputs)?);
-        assert!(!retained_outputs_reusable(
-            &receipt_path,
-            StageSpec {
-                algorithm_version: "monthly-v6",
-                ..spec
-            },
-            &outputs,
-        )?);
+        let incompatible_algorithm_spec = StageSpec {
+            algorithm_version: "monthly-v6",
+            ..spec
+        };
+        let incompatible_algorithm_reusable =
+            retained_outputs_reusable(&receipt_path, incompatible_algorithm_spec, &outputs);
+        let incompatible_algorithm_reusable = incompatible_algorithm_reusable?;
+        assert!(!incompatible_algorithm_reusable);
 
         fs::write(&output, "changed output")?;
         assert!(!retained_outputs_reusable(&receipt_path, spec, &outputs)?);
