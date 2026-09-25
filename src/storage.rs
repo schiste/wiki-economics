@@ -925,12 +925,8 @@ pub(crate) fn restore_retained_current_snapshot(
     snapshot_version: &str,
     ready_path: &Path,
 ) -> Result<()> {
-    crate::retention::validate_purged_snapshot_for_ready(
-        data_dir,
-        wiki,
-        snapshot_version,
-        ready_path,
-    )?;
+    #[rustfmt::skip]
+    crate::retention::validate_purged_snapshot_for_ready(data_dir, wiki, snapshot_version, ready_path)?;
     write_current_snapshot_pointer(data_dir, wiki, snapshot_version)
 }
 
