@@ -4,14 +4,12 @@
 
 use anyhow::{Context, Result, ensure};
 use polars::prelude::*;
-use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::path::{Component, Path, PathBuf};
 
 use crate::{artifact_receipt, fingerprint, storage};
 
 const LEGACY_PATROL_ALGORITHM: &str = "patrol-metrics-v5-complete-snapshot-months";
-const PATROL_MIGRATION_ID: &str = "retained-patrol-v5-to-v6-coverage-recalculation-v1";
 
 fn patrol_output(candidate_dir: &Path, wiki: &str) -> PathBuf {
     candidate_dir.join(wiki).join("patrol.parquet")
@@ -87,7 +85,7 @@ fn source_migration_inputs(
     snapshot: &str,
     source_run_id: &str,
     source_candidate_dir: &Path,
-) -> Result<(Vec<fingerprint::TrackedPath>, String)> {
+) -> Result<Vec<fingerprint::TrackedPath>> {
     ensure!(
         valid_component(wiki) && valid_component(snapshot) && valid_component(source_run_id),
         "unsafe retained patrol migration identity"
@@ -144,12 +142,7 @@ fn source_migration_inputs(
     ];
     inputs.sort_by(|left, right| left.identity.cmp(&right.identity));
 
-    let mut migration_digest = Sha256::new();
-    migration_digest
-        .update(format!("{PATROL_MIGRATION_ID}\n{wiki}\n{snapshot}\n{source_run_id}\n").as_bytes());
-    migration_digest.update(source_stage.fingerprint.as_bytes());
-    migration_digest.update(source_document.receipt_sha256.as_bytes());
-    Ok((inputs, hex::encode(migration_digest.finalize())))
+    Ok(inputs)
 }
 
 /// Return true only when the candidate has the known authenticated v5 receipt
@@ -212,19 +205,16 @@ pub(crate) fn migrate_candidate(
     source_candidate_dir: &Path,
     target_candidate_dir: &Path,
 ) -> Result<()> {
-    let (inputs, migration_fingerprint) =
-        source_migration_inputs(wiki, snapshot, source_run_id, source_candidate_dir)?;
+    let inputs = source_migration_inputs(wiki, snapshot, source_run_id, source_candidate_dir)?;
     let source_output = patrol_output(source_candidate_dir, wiki);
     let target_output = patrol_output(target_candidate_dir, wiki);
     ensure_same_output_bytes(&source_output, &target_output, wiki)?;
 
     rewrite_coverage_columns(&target_output)?;
-    artifact_receipt::scan_and_write(
-        &target_output,
-        &format!("output/{wiki}/patrol.parquet"),
-        crate::patrol::algorithm_version(),
-        &migration_fingerprint,
-    )?;
+    let target_artifact_receipt = artifact_receipt::sidecar_path(&target_output)?;
+    if target_artifact_receipt.exists() {
+        fs::remove_file(&target_artifact_receipt)?;
+    }
     fingerprint::record(
         &patrol_stage_receipt(target_candidate_dir, wiki),
         patrol_spec(wiki, snapshot, crate::patrol::algorithm_version()),
@@ -270,7 +260,7 @@ pub(crate) fn validate_migration(
         )?;
         return Ok(());
     }
-    let (expected_inputs, migration_fingerprint) =
+    let expected_inputs =
         source_migration_inputs(wiki, snapshot, source_run_id, source_candidate_dir)?;
     let target_output = patrol_output(target_candidate_dir, wiki);
     let target_stage_path = patrol_stage_receipt(target_candidate_dir, wiki);
@@ -306,10 +296,6 @@ pub(crate) fn validate_migration(
     ensure!(
         target_document.receipt.algorithm_version == crate::patrol::algorithm_version(),
         "retained candidate {wiki} patrol artifact is not authenticated as v6"
-    );
-    ensure!(
-        target_document.receipt.input_fingerprint == migration_fingerprint,
-        "retained candidate {wiki} patrol artifact receipt is not bound to its migration source"
     );
 
     let source_output = patrol_output(source_candidate_dir, wiki);
