@@ -72,6 +72,14 @@ fn patrol_spec<'a>(
     }
 }
 
+fn migrated_receipt_reusable(candidate_dir: &Path, wiki: &str, snapshot: &str) -> Result<bool> {
+    fingerprint::retained_outputs_reusable(
+        &patrol_stage_receipt(candidate_dir, wiki),
+        patrol_spec(wiki, snapshot, crate::patrol::algorithm_version()),
+        &[patrol_output_tracked(candidate_dir, wiki)],
+    )
+}
+
 fn valid_component(value: &str) -> bool {
     if value.is_empty() {
         return false;
@@ -264,13 +272,8 @@ pub(crate) fn validate_migration(
         source_migration_inputs(wiki, snapshot, source_run_id, source_candidate_dir)?;
     let target_output = patrol_output(target_candidate_dir, wiki);
     let target_stage_path = patrol_stage_receipt(target_candidate_dir, wiki);
-    let target_outputs = [patrol_output_tracked(target_candidate_dir, wiki)];
     ensure!(
-        fingerprint::retained_outputs_reusable(
-            &target_stage_path,
-            patrol_spec(wiki, snapshot, crate::patrol::algorithm_version()),
-            &target_outputs,
-        )?,
+        migrated_receipt_reusable(target_candidate_dir, wiki, snapshot)?,
         "retained candidate {wiki} patrol v6 receipt is invalid"
     );
 
@@ -485,7 +488,8 @@ mod tests {
             ),
             Column::new("top1_pct".into(), vec![100.0_f64, 0.0]),
             Column::new("min_patrollers_50pct".into(), vec![1_i32, 0]),
-        ])?;
+        ])
+        .expect("legacy patrol fixture columns have matching lengths");
         ParquetWriter::new(File::create(&path)?)
             .with_compression(ParquetCompression::Zstd(None))
             .finish(&mut frame)?;
@@ -500,7 +504,8 @@ mod tests {
                 source_input,
             )],
             &[patrol_output_tracked(&candidate, wiki)],
-        )?;
+        )
+        .expect("legacy patrol fixture receipt can be recorded");
         Ok(candidate)
     }
 
@@ -509,20 +514,190 @@ mod tests {
         fs::create_dir_all(
             patrol_stage_receipt(target, wiki)
                 .parent()
-                .context("target stage receipt has no parent")?,
-        )?;
+                .expect("target stage receipt has a parent"),
+        )
+        .expect("target stage receipt directory can be created");
         let source_output = patrol_output(source, wiki);
         let target_output = patrol_output(target, wiki);
-        fs::copy(&source_output, &target_output)?;
+        fs::copy(&source_output, &target_output).expect("legacy patrol output can be copied");
         fs::copy(
             artifact_receipt::sidecar_path(&source_output)?,
             artifact_receipt::sidecar_path(&target_output)?,
-        )?;
+        )
+        .expect("legacy patrol artifact receipt can be copied");
         fs::copy(
             patrol_stage_receipt(source, wiki),
             patrol_stage_receipt(target, wiki),
-        )?;
+        )
+        .expect("legacy patrol stage receipt can be copied");
         Ok(())
+    }
+
+    fn write_current_candidate(root: &Path, wiki: &str, snapshot: &str, run_id: &str) -> PathBuf {
+        let candidate = write_legacy_source(root, wiki, snapshot, run_id)
+            .expect("legacy patrol fixture can be written");
+        let output = patrol_output(&candidate, wiki);
+        rewrite_coverage_columns(&output).expect("current patrol coverage can be written");
+        fs::remove_file(artifact_receipt::sidecar_path(&output).expect("receipt path is valid"))
+            .expect("legacy artifact receipt can be removed before recording v6");
+        fingerprint::record(
+            &patrol_stage_receipt(&candidate, wiki),
+            patrol_spec(wiki, snapshot, crate::patrol::algorithm_version()),
+            &[],
+            &[patrol_output_tracked(&candidate, wiki)],
+        )
+        .expect("current patrol fixture receipt can be recorded");
+        candidate
+    }
+
+    fn set_artifact_receipt_identity(
+        candidate: &Path,
+        wiki: &str,
+        snapshot: &str,
+        algorithm_version: &str,
+        inputs: &[fingerprint::TrackedPath],
+    ) {
+        let output = patrol_output(candidate, wiki);
+        let receipt_path = patrol_stage_receipt(candidate, wiki);
+        let output_path = [patrol_output_tracked(candidate, wiki)];
+        fingerprint::record(
+            &receipt_path,
+            patrol_spec(wiki, snapshot, algorithm_version),
+            inputs,
+            &output_path,
+        )
+        .expect("stage receipt can be normalized before changing artifact identity");
+        let document =
+            artifact_receipt::read(&output).expect("normalized artifact receipt can be read");
+        artifact_receipt::scan_and_write(
+            &output,
+            "wrong-patrol.parquet",
+            algorithm_version,
+            &document.receipt.input_fingerprint,
+        )
+        .expect("test artifact receipt can be reissued with a valid but wrong identity");
+        fingerprint::record(
+            &receipt_path,
+            patrol_spec(wiki, snapshot, algorithm_version),
+            inputs,
+            &output_path,
+        )
+        .expect("stage receipt can authenticate the altered artifact receipt");
+    }
+
+    fn set_unreceipted_pre_epoch_output(candidate: &Path, wiki: &str) {
+        use sha2::Digest;
+
+        #[derive(serde::Serialize)]
+        struct DeterministicArtifact<'a> {
+            identity: &'a str,
+            bytes: u64,
+            sha256: &'a str,
+            output_schema: &'a [String],
+            rows: Option<u64>,
+            minimum_date: Option<&'a str>,
+            maximum_date: Option<&'a str>,
+            artifact_receipt_sha256: Option<&'a str>,
+            conservation_totals: &'a std::collections::BTreeMap<String, i128>,
+            minimum_wiki: &'a str,
+            maximum_wiki: &'a str,
+        }
+
+        #[derive(serde::Serialize)]
+        struct FingerprintSeed<'a> {
+            schema_version: u32,
+            stage: &'a str,
+            scope: &'a str,
+            selected_snapshot: Option<&'a str>,
+            algorithm_version: &'a str,
+            computation_version: &'a str,
+            inputs: Vec<DeterministicArtifact<'a>>,
+            outputs: Vec<DeterministicArtifact<'a>>,
+        }
+
+        fn deterministic_artifact(
+            record: &fingerprint::ArtifactIdentity,
+        ) -> DeterministicArtifact<'_> {
+            DeterministicArtifact {
+                identity: &record.identity,
+                bytes: record.bytes,
+                sha256: &record.sha256,
+                output_schema: &record.output_schema,
+                rows: record.rows,
+                minimum_date: record.minimum_date.as_deref(),
+                maximum_date: record.maximum_date.as_deref(),
+                artifact_receipt_sha256: record.artifact_receipt_sha256.as_deref(),
+                conservation_totals: &record.conservation_totals,
+                minimum_wiki: &record.minimum_wiki,
+                maximum_wiki: &record.maximum_wiki,
+            }
+        }
+
+        let receipt_path = patrol_stage_receipt(candidate, wiki);
+        let mut receipt = fingerprint::read_receipt(&receipt_path)
+            .expect("current fixture stage receipt can be read");
+        let output = receipt
+            .outputs
+            .iter_mut()
+            .find(|output| output.identity == format!("output/{wiki}/patrol.parquet"))
+            .expect("current fixture receipt includes its patrol output");
+        output.artifact_receipt_sha256 = None;
+        let seed = FingerprintSeed {
+            schema_version: receipt.schema_version,
+            stage: &receipt.stage,
+            scope: &receipt.scope,
+            selected_snapshot: receipt.selected_snapshot.as_deref(),
+            algorithm_version: &receipt.algorithm_version,
+            computation_version: &receipt.computation_version,
+            inputs: receipt.inputs.iter().map(deterministic_artifact).collect(),
+            outputs: receipt.outputs.iter().map(deterministic_artifact).collect(),
+        };
+        let serialized_seed =
+            serde_json::to_vec(&seed).expect("stage receipt fingerprint seed can be serialized");
+        receipt.fingerprint = hex::encode(sha2::Sha256::digest(serialized_seed));
+        fs::write(
+            &receipt_path,
+            serde_json::to_vec_pretty(&receipt).expect("stage receipt can be serialized"),
+        )
+        .expect("stage receipt can be rewritten for the failure case");
+
+        let output_path = patrol_output(candidate, wiki);
+        fs::remove_file(
+            artifact_receipt::sidecar_path(&output_path).expect("receipt path is valid"),
+        )
+        .expect("artifact receipt can be removed for the failure case");
+        let before_epoch = std::time::UNIX_EPOCH
+            .checked_sub(std::time::Duration::from_secs(1))
+            .expect("one second before the epoch is representable");
+        File::open(output_path)
+            .expect("patrol output can be opened")
+            .set_times(std::fs::FileTimes::new().set_modified(before_epoch))
+            .expect("patrol output can receive a pre-epoch modification time");
+    }
+
+    fn update_current_candidate(candidate: &Path, wiki: &str, snapshot: &str) {
+        let output = patrol_output(candidate, wiki);
+        fs::remove_file(artifact_receipt::sidecar_path(&output).expect("receipt path is valid"))
+            .expect("old patrol receipt can be removed before updating the fixture");
+        let mut frame =
+            ParquetReader::new(File::open(&output).expect("patrol output can be opened"))
+                .finish()
+                .expect("patrol fixture can be read");
+        frame
+            .with_column(Series::new("patrol_diffs".into(), vec![2_i64, 0]).into())
+            .expect("patrol fixture column can be changed");
+        ParquetWriter::new(File::create(&output).expect("patrol output can be replaced"))
+            .with_compression(ParquetCompression::Zstd(None))
+            .finish(&mut frame)
+            .expect("changed patrol fixture can be written");
+        rewrite_coverage_columns(&output).expect("changed patrol coverage can be written");
+        fingerprint::record(
+            &patrol_stage_receipt(candidate, wiki),
+            patrol_spec(wiki, snapshot, crate::patrol::algorithm_version()),
+            &[],
+            &[patrol_output_tracked(candidate, wiki)],
+        )
+        .expect("changed current patrol receipt can be recorded");
     }
 
     #[test]
@@ -546,24 +721,20 @@ mod tests {
 
         let source_output = patrol_output(&source, wiki);
         let (_, source_sha256_before) = storage::sha256_file(&source_output)?;
-        ensure!(migration_required(
-            wiki,
-            snapshot,
-            "legacy-source",
-            &source
-        )?);
-        ensure!(migrate_if_required(
-            wiki,
-            snapshot,
-            "legacy-source",
-            &source,
-            &target
-        )?);
+        ensure!(
+            migration_required(wiki, snapshot, "legacy-source", &source)
+                .expect("legacy source should require migration")
+        );
+        ensure!(
+            migrate_if_required(wiki, snapshot, "legacy-source", &source, &target)
+                .expect("legacy source should migrate")
+        );
         validate_migration(wiki, snapshot, "legacy-source", &source, &target, true)?;
         ensure!(!migration_required(wiki, snapshot, "migrated", &target)?);
-        ensure!(!migrate_if_required(
-            wiki, snapshot, "migrated", &target, &target
-        )?);
+        ensure!(
+            !migrate_if_required(wiki, snapshot, "migrated", &target, &target)
+                .expect("current patrol should be reusable without migration")
+        );
         validate_migration(wiki, snapshot, "migrated", &target, &target, false)?;
 
         let (_, source_sha256_after) = storage::sha256_file(&source_output)?;
@@ -590,13 +761,15 @@ mod tests {
             Column::new("patrolled_revisions".into(), vec![-1_i64]),
             Column::new("autopatrolled_revisions".into(), vec![0_i64]),
             Column::new("total_revisions".into(), vec![1_i64]),
-        ])?;
+        ])
+        .expect("negative count fixture columns have matching lengths");
         ensure!(calculated_coverage(&negative_counts).is_err());
         let null_counts = DataFrame::new_infer_height(vec![
             Column::new("patrolled_revisions".into(), vec![None::<i64>]),
             Column::new("autopatrolled_revisions".into(), vec![Some(0_i64)]),
             Column::new("total_revisions".into(), vec![Some(1_i64)]),
-        ])?;
+        ])
+        .expect("null count fixture columns have matching lengths");
         ensure!(calculated_coverage(&null_counts).is_err());
 
         let incorrect_coverage = DataFrame::new_infer_height(vec![
@@ -605,7 +778,8 @@ mod tests {
             Column::new("total_revisions".into(), vec![2_i64]),
             Column::new("patrol_coverage_pct".into(), vec![0.0_f64]),
             Column::new("adjusted_coverage_pct".into(), vec![0.0_f64]),
-        ])?;
+        ])
+        .expect("coverage validation fixture columns have matching lengths");
         ensure!(validate_coverage_columns(&incorrect_coverage).is_err());
         Ok(())
     }
@@ -648,6 +822,9 @@ mod tests {
         let error = migrate_candidate(wiki, snapshot, "legacy-source", &source, &target)
             .expect_err("a staging copy that differs from its source must fail closed");
         ensure!(error.to_string().contains("staging copy differs"));
+        let error = migrate_if_required(wiki, snapshot, "legacy-source", &source, &target)
+            .expect_err("the migration dispatcher must propagate a staging-copy failure");
+        ensure!(error.to_string().contains("staging copy differs"));
 
         let unsupported_root = root.path().join("unsupported");
         fs::create_dir_all(&unsupported_root)?;
@@ -661,6 +838,171 @@ mod tests {
         let error = migration_required(wiki, snapshot, "legacy-source", &unsupported_candidate)
             .expect_err("an unknown source algorithm must fail closed");
         ensure!(error.to_string().contains("authenticated patrol v5"));
+        Ok(())
+    }
+
+    #[test]
+    fn current_patrol_receipts_fail_closed_on_timestamp_and_identity_errors() -> Result<()> {
+        let root = TestDir::new()?;
+        let wiki = "nlwiki";
+        let snapshot = "2026-03";
+        let current = write_current_candidate(root.path(), wiki, snapshot, "current-time-error");
+        set_unreceipted_pre_epoch_output(&current, wiki);
+        let error = migration_required(wiki, snapshot, "current-time-error", &current)
+            .expect_err("a current receipt with an invalid output timestamp must fail closed");
+        ensure!(error.to_string().contains("pre-epoch"));
+
+        let current =
+            write_current_candidate(root.path(), wiki, snapshot, "current-identity-error");
+        set_artifact_receipt_identity(
+            &current,
+            wiki,
+            snapshot,
+            crate::patrol::algorithm_version(),
+            &[],
+        );
+        let error = migration_required(wiki, snapshot, "current-identity-error", &current)
+            .expect_err("a current artifact with the wrong identity must fail closed");
+        ensure!(error.to_string().contains("identity mismatch"));
+        Ok(())
+    }
+
+    #[test]
+    fn legacy_patrol_source_receipts_fail_closed_on_timestamp_and_identity_errors() -> Result<()> {
+        let root = TestDir::new()?;
+        let wiki = "nlwiki";
+        let snapshot = "2026-03";
+        let timestamp_source =
+            write_legacy_source(root.path(), wiki, snapshot, "legacy-time-error")?;
+        set_unreceipted_pre_epoch_output(&timestamp_source, wiki);
+        let error = migration_required(wiki, snapshot, "legacy-time-error", &timestamp_source)
+            .expect_err("a v5 source with an invalid output timestamp must fail closed");
+        ensure!(error.to_string().contains("pre-epoch"));
+
+        let identity_source =
+            write_legacy_source(root.path(), wiki, snapshot, "legacy-identity-error")?;
+        set_artifact_receipt_identity(
+            &identity_source,
+            wiki,
+            snapshot,
+            LEGACY_PATROL_ALGORITHM,
+            &[],
+        );
+        let error = migration_required(wiki, snapshot, "legacy-identity-error", &identity_source)
+            .expect_err("a v5 source artifact with the wrong identity must fail closed");
+        ensure!(error.to_string().contains("identity mismatch"));
+        Ok(())
+    }
+
+    #[test]
+    fn current_patrol_candidates_must_match_for_noop_migration_and_validation() -> Result<()> {
+        let root = TestDir::new()?;
+        let wiki = "nlwiki";
+        let snapshot = "2026-03";
+        let source = write_current_candidate(root.path(), wiki, snapshot, "current-source");
+        let target = write_current_candidate(root.path(), wiki, snapshot, "current-target");
+        update_current_candidate(&target, wiki, snapshot);
+
+        let error = migrate_if_required(wiki, snapshot, "current-source", &source, &target)
+            .expect_err("a current candidate copy with different bytes must fail closed");
+        ensure!(error.to_string().contains("staging copy differs"));
+        let error = validate_migration(wiki, snapshot, "current-source", &source, &target, false)
+            .expect_err("no-op migration validation must compare both candidate outputs");
+        ensure!(error.to_string().contains("staging copy differs"));
+        Ok(())
+    }
+
+    #[test]
+    fn patrol_migration_reports_receipt_removal_and_stage_write_failures() -> Result<()> {
+        let root = TestDir::new()?;
+        let wiki = "nlwiki";
+        let snapshot = "2026-03";
+
+        let source = write_legacy_source(root.path(), wiki, snapshot, "sidecar-source")?;
+        let sidecar_target = root
+            .path()
+            .join("_candidates")
+            .join(wiki)
+            .join(snapshot)
+            .join("sidecar-target");
+        copy_legacy_candidate(&source, &sidecar_target, wiki)?;
+        let sidecar = artifact_receipt::sidecar_path(&patrol_output(&sidecar_target, wiki))?;
+        fs::remove_file(&sidecar)?;
+        fs::create_dir(&sidecar)?;
+        let error = migrate_candidate(wiki, snapshot, "sidecar-source", &source, &sidecar_target)
+            .expect_err("a receipt directory cannot be removed as a sidecar file");
+        ensure!(error.to_string().contains("directory"));
+
+        let source = write_legacy_source(root.path(), wiki, snapshot, "stage-write-source")?;
+        let stage_target = root
+            .path()
+            .join("_candidates")
+            .join(wiki)
+            .join(snapshot)
+            .join("stage-write-target");
+        copy_legacy_candidate(&source, &stage_target, wiki)?;
+        let stage_directory = patrol_stage_receipt(&stage_target, wiki)
+            .parent()
+            .context("target stage receipt has no parent")?
+            .to_path_buf();
+        fs::remove_dir_all(&stage_directory)?;
+        fs::write(&stage_directory, b"stage parent is a file")?;
+        let error = migrate_candidate(wiki, snapshot, "stage-write-source", &source, &stage_target)
+            .expect_err("a non-directory stage parent must reject receipt persistence");
+        ensure!(error.to_string().contains("Not a directory"));
+        Ok(())
+    }
+
+    #[test]
+    fn migrated_receipt_reuse_and_validation_fail_closed_on_timestamp_errors() -> Result<()> {
+        let root = TestDir::new()?;
+        let wiki = "nlwiki";
+        let snapshot = "2026-03";
+        let current = write_current_candidate(root.path(), wiki, snapshot, "current-reuse-error");
+        set_unreceipted_pre_epoch_output(&current, wiki);
+        ensure!(migrated_receipt_reusable(&current, wiki, snapshot).is_err());
+
+        let source = write_legacy_source(root.path(), wiki, snapshot, "validate-source")?;
+        let target = root
+            .path()
+            .join("_candidates")
+            .join(wiki)
+            .join(snapshot)
+            .join("validate-target");
+        copy_legacy_candidate(&source, &target, wiki)?;
+        migrate_candidate(wiki, snapshot, "validate-source", &source, &target)?;
+        set_unreceipted_pre_epoch_output(&target, wiki);
+        ensure!(
+            validate_migration(wiki, snapshot, "validate-source", &source, &target, true).is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn migrated_patrol_validation_rejects_an_authenticated_wrong_artifact_identity() -> Result<()> {
+        let root = TestDir::new()?;
+        let wiki = "nlwiki";
+        let snapshot = "2026-03";
+        let source = write_legacy_source(root.path(), wiki, snapshot, "identity-source")?;
+        let target = root
+            .path()
+            .join("_candidates")
+            .join(wiki)
+            .join(snapshot)
+            .join("identity-target");
+        copy_legacy_candidate(&source, &target, wiki)?;
+        migrate_candidate(wiki, snapshot, "identity-source", &source, &target)?;
+        let inputs = source_migration_inputs(wiki, snapshot, "identity-source", &source)?;
+        set_artifact_receipt_identity(
+            &target,
+            wiki,
+            snapshot,
+            crate::patrol::algorithm_version(),
+            &inputs,
+        );
+        let error = validate_migration(wiki, snapshot, "identity-source", &source, &target, true)
+            .expect_err("migration validation must enforce the canonical patrol artifact identity");
+        ensure!(error.to_string().contains("identity mismatch"));
         Ok(())
     }
 }
