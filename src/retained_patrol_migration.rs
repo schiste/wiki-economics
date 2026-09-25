@@ -386,9 +386,11 @@ fn calculated_coverage(frame: &DataFrame) -> Result<(Vec<f64>, Vec<f64>)> {
             patrol_coverage.push(0.0);
             adjusted_coverage.push(0.0);
         } else {
-            patrol_coverage.push(100.0 * patrolled as f64 / total as f64);
-            adjusted_coverage
-                .push(100.0 * (patrolled as f64 + autopatrolled as f64) / total as f64);
+            let patrol_percentage = 100.0 * patrolled as f64 / total as f64;
+            let adjusted_percentage =
+                100.0 * (patrolled as f64 + autopatrolled as f64) / total as f64;
+            patrol_coverage.push((patrol_percentage * 10.0).round() / 10.0);
+            adjusted_coverage.push((adjusted_percentage * 10.0).round() / 10.0);
         }
     }
     Ok((patrol_coverage, adjusted_coverage))
