@@ -2244,7 +2244,6 @@ mod governed_routing_tests {
     use super::*;
     use crate::resource_governor::GovernorPaths;
     use crate::test_support::TestDir;
-    use polars::prelude::*;
 
     fn budget() -> ResourceBudget {
         ResourceBudget {
@@ -2270,7 +2269,7 @@ mod governed_routing_tests {
     }
 
     fn primary_bucket_frame(page_id: i64) -> Result<DataFrame> {
-        let mut frame = df!(
+        let frame = df!(
             "page_id" => [Some(page_id)],
             "page_namespace" => [Some(0_i32)],
             "page_title" => [Some(format!("Page-{page_id}"))],
@@ -2362,6 +2361,44 @@ mod governed_routing_tests {
         assert_eq!(output_rows, 2);
         assert_eq!(bucket_rows.iter().sum::<usize>(), 2);
         assert!(output.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn reconciliation_admission_retries_a_smaller_wave() -> Result<()> {
+        let output_dir = TestDir::new()?;
+        let wiki = "testwiki";
+        let runs = WeeklyRunDir::new(output_dir.path(), wiki, None)?;
+        let governor = ResourceGovernor::new(
+            budget(),
+            GovernorPaths::new(output_dir.path().to_path_buf(), None),
+        )
+        .with_persistent_available_sequence([u64::MAX, 0, u64::MAX]);
+        let mut prepared = Vec::new();
+
+        for logical_bucket in 0..2 {
+            let page_id = page_id_for_primary(logical_bucket, 32);
+            let staged_path = runs.secondary_path(0, logical_bucket);
+            let mut frame = primary_bucket_frame(page_id)?;
+            ParquetWriter::new(File::create(&staged_path)?).finish(&mut frame)?;
+            prepared.push(PreparedWeeklyBucket {
+                logical_bucket,
+                primary_bucket: 0,
+                secondary_bucket: logical_bucket,
+                staged_rows: 1,
+                staged_path: Some(staged_path),
+            });
+        }
+
+        let results = reconcile_weekly_bucket_batch(&runs, &[], prepared, wiki, &governor)?;
+        assert_eq!(
+            results
+                .iter()
+                .map(|result| result.logical_bucket)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(results.iter().map(|result| result.edits).sum::<i64>(), 2);
         Ok(())
     }
 
