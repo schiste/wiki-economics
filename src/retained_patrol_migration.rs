@@ -5,6 +5,7 @@
 use anyhow::{Context, Result, ensure};
 use polars::prelude::*;
 use std::fs::{self, File};
+use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
 use crate::{artifact_receipt, fingerprint, storage};
@@ -938,8 +939,7 @@ mod tests {
         let expected_fs_error = error.chain().any(|cause| {
             cause.downcast_ref::<std::io::Error>().is_some_and(|cause| {
                 let kind = cause.kind();
-                kind == std::io::ErrorKind::IsADirectory
-                    || kind == std::io::ErrorKind::PermissionDenied
+                matches!(kind, ErrorKind::IsADirectory | ErrorKind::PermissionDenied)
             })
         });
         ensure!(expected_fs_error, "{error:#}");
