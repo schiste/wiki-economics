@@ -2632,7 +2632,7 @@ mod governed_routing_tests {
         let output_dir = TestDir::new().expect("weekly output directory should be writable");
         let wiki = "testwiki";
         write_single_warehouse_partition(&data_dir, wiki);
-        let config = WeeklyAggregationConfig::new_two_level(32, 2, None)
+        let config = WeeklyAggregationConfig::new_two_level(32, 8, None)
             .expect("two-level fixture layout should be valid");
         let scratch_root = output_dir.path().join(wiki);
         fs::create_dir_all(&scratch_root).expect("weekly scratch directory should be writable");
