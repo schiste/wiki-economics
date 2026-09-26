@@ -11,6 +11,15 @@ case "$wiki" in
 esac
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+if [ "${WIKI_ECON_CAPACITY_ADMITTED:-0}" != "1" ]; then
+  if [ "$wiki" = "enwiki" ]; then
+    qualification_resource_class=qualification
+  else
+    qualification_resource_class=isolated
+  fi
+  exec node "$ROOT/deploy/toolforge/capacity-admission.cjs" \
+    --resource-class "$qualification_resource_class" -- "$0" "$@"
+fi
 : "${WIKI_ECON_BIN:?Toolforge qualification requires WIKI_ECON_BIN}"
 qualification_root="${WIKI_ECON_QUALIFICATION_ROOT:-/data/project/wiki-economics/capacity/qualifications}"
 case "$qualification_root" in
@@ -36,17 +45,61 @@ case "$WIKI_ECON_QUALIFICATION_RUN_KIND" in
   initial_candidate|rollover) ;;
   *) echo "Unsupported qualification run kind: $WIKI_ECON_QUALIFICATION_RUN_KIND" >&2; exit 2 ;;
 esac
-export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-1}"
-export POLARS_MAX_THREADS="${POLARS_MAX_THREADS:-1}"
-export WIKI_ECON_THREAD_LIMIT="${WIKI_ECON_THREAD_LIMIT:-1}"
-export WIKI_ECON_SOURCE_WORKERS="${WIKI_ECON_SOURCE_WORKERS:-1}"
-export WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS="${WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS:-16}"
+
+detect_cpu_limit_cores() {
+  local quota="" period="" cores
+  if [ -r /sys/fs/cgroup/cpu.max ]; then
+    read -r quota period < /sys/fs/cgroup/cpu.max || true
+  elif [ -r /sys/fs/cgroup/cpu/cpu.cfs_quota_us ] && [ -r /sys/fs/cgroup/cpu/cpu.cfs_period_us ]; then
+    quota="$(< /sys/fs/cgroup/cpu/cpu.cfs_quota_us)"
+    period="$(< /sys/fs/cgroup/cpu/cpu.cfs_period_us)"
+  fi
+  if [[ "$quota" =~ ^[0-9]+$ && "$period" =~ ^[0-9]+$ ]] && [ "$quota" -gt 0 ] && [ "$period" -gt 0 ]; then
+    cores=$((quota / period))
+    [ "$cores" -ge 1 ] || cores=1
+    [ "$cores" -le 4 ] || cores=4
+    printf '%s\n' "$cores"
+    return
+  fi
+  # Unbounded local/dev cgroups do not prove any Toolforge CPU allocation.
+  printf '1\n'
+}
+
+qualification_cpu_cores="${WIKI_ECON_REQUESTED_CPU_CORES:-$(detect_cpu_limit_cores)}"
+if [[ ! "$qualification_cpu_cores" =~ ^[1-4]$ ]]; then
+  echo "WIKI_ECON_REQUESTED_CPU_CORES must match the current 1–4 CPU Toolforge envelope (got: $qualification_cpu_cores)" >&2
+  exit 2
+fi
+export WIKI_ECON_REQUESTED_CPU_CORES="$qualification_cpu_cores"
+
+validate_worker_pool() {
+  local name=$1 value=$2 ceiling=$3
+  if [[ ! "$value" =~ ^[1-4]$ ]] || [ "$value" -gt "$ceiling" ]; then
+    echo "$name must be between 1 and $ceiling for this Toolforge pod (got: $value)" >&2
+    exit 2
+  fi
+}
+
 export WIKI_ECON_REQUIRE_QUALIFIED_PROFILE=0
 if [ "$wiki" = "enwiki" ]; then
+  # Use the pod's CPU quota, capped at Toolforge's current four-CPU job limit.
+  # The governor shrinks worker waves further when memory, scratch, disk, or
+  # file handles are tight.
+  export WIKI_ECON_THREAD_LIMIT="${WIKI_ECON_THREAD_LIMIT:-$qualification_cpu_cores}"
+  export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-$WIKI_ECON_THREAD_LIMIT}"
+  export POLARS_MAX_THREADS="${POLARS_MAX_THREADS:-$WIKI_ECON_THREAD_LIMIT}"
+  export WIKI_ECON_SOURCE_WORKERS="${WIKI_ECON_SOURCE_WORKERS:-$WIKI_ECON_THREAD_LIMIT}"
+  export WIKI_ECON_WEEKLY_WORKERS="${WIKI_ECON_WEEKLY_WORKERS:-$WIKI_ECON_THREAD_LIMIT}"
+  export WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS="${WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS:-32}"
+  validate_worker_pool WIKI_ECON_THREAD_LIMIT "$WIKI_ECON_THREAD_LIMIT" "$qualification_cpu_cores"
+  validate_worker_pool RAYON_NUM_THREADS "$RAYON_NUM_THREADS" "$WIKI_ECON_THREAD_LIMIT"
+  validate_worker_pool POLARS_MAX_THREADS "$POLARS_MAX_THREADS" "$WIKI_ECON_THREAD_LIMIT"
+  validate_worker_pool WIKI_ECON_SOURCE_WORKERS "$WIKI_ECON_SOURCE_WORKERS" "$WIKI_ECON_THREAD_LIMIT"
+  validate_worker_pool WIKI_ECON_WEEKLY_WORKERS "$WIKI_ECON_WEEKLY_WORKERS" "$WIKI_ECON_THREAD_LIMIT"
   # Enwiki qualification must consume the explicitly frozen snapshot. Never
   # silently advance to a newer dump while a qualification run is pending.
   : "${WIKI_ECON_PREPARE_SNAPSHOT:?enwiki qualification requires WIKI_ECON_PREPARE_SNAPSHOT to pin the frozen snapshot}"
-  export WIKI_ECON_SOURCE_WINDOW_SIZE=1
+  export WIKI_ECON_SOURCE_WINDOW_SIZE="${WIKI_ECON_SOURCE_WINDOW_SIZE:-$WIKI_ECON_SOURCE_WORKERS}"
   export WIKI_ECON_PERSISTENT_STORAGE_RESERVE_BYTES="${WIKI_ECON_PERSISTENT_STORAGE_RESERVE_BYTES:-268435456000}"
   # A recovered page-week stage may have only the candidate inputs, without a
   # persisted profile. Keep that fallback on enwiki's frozen 2,048-bucket
@@ -63,6 +116,13 @@ if [ "$wiki" = "enwiki" ]; then
   export WIKI_ECON_WEEKLY_PRIMARY_BUCKET_COUNT=64
   export WIKI_ECON_WEEKLY_SECONDARY_BUCKET_COUNT=32
 else
+  export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-1}"
+  export POLARS_MAX_THREADS="${POLARS_MAX_THREADS:-1}"
+  export WIKI_ECON_THREAD_LIMIT="${WIKI_ECON_THREAD_LIMIT:-1}"
+  export WIKI_ECON_SOURCE_WORKERS="${WIKI_ECON_SOURCE_WORKERS:-1}"
+  export WIKI_ECON_WEEKLY_WORKERS="${WIKI_ECON_WEEKLY_WORKERS:-1}"
+  export WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS="${WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS:-16}"
+  export WIKI_ECON_REQUESTED_CPU_CORES="${WIKI_ECON_REQUESTED_CPU_CORES:-1}"
   export WIKI_ECON_SOURCE_WINDOW_SIZE="${WIKI_ECON_SOURCE_WINDOW_SIZE:-2}"
   export WIKI_ECON_PERSISTENT_STORAGE_RESERVE_BYTES="${WIKI_ECON_PERSISTENT_STORAGE_RESERVE_BYTES:-53687091200}"
 fi

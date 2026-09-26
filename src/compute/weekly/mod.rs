@@ -10,7 +10,7 @@ use super::{PendingOutput, cached_or_compute, sort_frame, warehouse_lazyframe};
 use crate::{
     determinism,
     observability::MemorySnapshot,
-    resource_governor::{GovernorPaths, ResourceGovernor, ResourceObservation},
+    resource_governor::{BucketPermit, GovernorPaths, ResourceGovernor, ResourceObservation},
     storage, workload_profile,
 };
 use anyhow::{Context, Result};
@@ -218,6 +218,13 @@ impl ResourcePeak {
         self.cgroup_current_bytes =
             max_option(self.cgroup_current_bytes, snapshot.cgroup_current_bytes);
         self.scratch_bytes = max_option(self.scratch_bytes, scratch_bytes);
+    }
+
+    pub(super) fn merge(&mut self, other: Self) {
+        self.rss_bytes = max_option(self.rss_bytes, other.rss_bytes);
+        self.cgroup_current_bytes =
+            max_option(self.cgroup_current_bytes, other.cgroup_current_bytes);
+        self.scratch_bytes = max_option(self.scratch_bytes, other.scratch_bytes);
     }
 }
 
@@ -515,88 +522,25 @@ pub(super) fn compute_page_weekly_edits_for_snapshot_cached(
             append?;
         }
     } else {
-        for primary_bucket in 0..config.primary_bucket_count {
-            if primary_bucket_rows[primary_bucket] == 0 {
-                continue;
-            }
-            let primary_path = primary_paths[primary_bucket]
-                .as_ref()
-                .with_context(|| format!("missing non-empty primary bucket {primary_bucket}"))?;
-            let routing = route_primary_to_secondary_buckets(
-                &runs,
-                primary_path,
-                primary_bucket,
-                config,
-                BucketTotals {
-                    rows: primary_bucket_rows[primary_bucket],
-                    edits: primary_bucket_edits[primary_bucket],
-                },
-                &governor,
-                &mut reconciliation_peak,
-            );
-            let routed = routing?;
-            anyhow::ensure!(
-                routed.peak_active_writers <= governor.budget().max_active_parquet_writers,
-                "secondary routing reported a writer peak above its governed limit"
-            );
-            scratch_peak_bytes = scratch_peak_bytes.max(runs.size_bytes()?);
-            working_storage_peak_bytes = working_storage_peak_bytes.max(scratch_peak_bytes);
-            fs::remove_file(primary_path)?;
-            for (secondary, &rows) in routed.rows.iter().enumerate() {
-                bucket_rows[primary_bucket * config.secondary_bucket_count + secondary] = rows;
-            }
-            for secondary_start in
-                (0..config.secondary_bucket_count).step_by(governor.budget().weekly_worker_limit)
-            {
-                let secondary_end = (secondary_start + governor.budget().weekly_worker_limit)
-                    .min(config.secondary_bucket_count);
-                let prepared = (secondary_start..secondary_end)
-                    .filter_map(|secondary_bucket| {
-                        let logical_bucket =
-                            primary_bucket * config.secondary_bucket_count + secondary_bucket;
-                        let staged_rows = bucket_rows[logical_bucket];
-                        (staged_rows > 0).then(|| {
-                            routed.paths[secondary_bucket].clone().map(|staged_path| {
-                                PreparedWeeklyBucket {
-                                    logical_bucket,
-                                    primary_bucket,
-                                    secondary_bucket,
-                                    staged_rows,
-                                    staged_path: Some(staged_path),
-                                }
-                            })
-                        })?
-                    })
-                    .collect::<Vec<_>>();
-                anyhow::ensure!(
-                    prepared.len()
-                        == (secondary_start..secondary_end)
-                            .filter(|&secondary_bucket| {
-                                bucket_rows[primary_bucket * config.secondary_bucket_count
-                                    + secondary_bucket]
-                                    > 0
-                            })
-                            .count(),
-                    "missing non-empty secondary bucket path"
-                );
-                let results =
-                    reconcile_weekly_bucket_batch(&runs, &staged_paths, prepared, wiki, &governor)?;
-                let append = append_weekly_bucket_results(
-                    &runs,
-                    results,
-                    &final_path,
-                    &mut output,
-                    &mut total_edits_after,
-                    &mut output_rows,
-                    &mut min_week_start,
-                    &mut max_week_start,
-                    &mut scratch_peak_bytes,
-                    &mut working_storage_peak_bytes,
-                    &mut reconciliation_peak,
-                );
-                append?;
-            }
-        }
+        route_and_reconcile_weekly_buckets(
+            &runs,
+            &primary_paths,
+            &primary_bucket_rows,
+            &primary_bucket_edits,
+            config,
+            wiki,
+            &governor,
+            &mut bucket_rows,
+            &final_path,
+            &mut output,
+            &mut total_edits_after,
+            &mut output_rows,
+            &mut min_week_start,
+            &mut max_week_start,
+            &mut scratch_peak_bytes,
+            &mut working_storage_peak_bytes,
+            &mut reconciliation_peak,
+        )?;
     }
 
     anyhow::ensure!(
@@ -1322,6 +1266,247 @@ pub(super) struct SecondaryRouting {
     pub(super) peak_active_writers: usize,
 }
 
+struct WeeklyPrimaryRouteJob {
+    primary_bucket: usize,
+    primary_path: PathBuf,
+    expected: BucketTotals,
+    permit: BucketPermit,
+}
+
+fn weekly_route_memory_estimate(writer_limit: usize) -> Result<u64> {
+    let batch_bytes = u64::try_from(WEEKLY_ROUTING_BATCH_ROWS)?
+        .checked_mul(WEEKLY_BUCKET_ESTIMATED_BYTES_PER_ROW)
+        .context("weekly route batch memory estimate overflow")?;
+    let writer_bytes = u64::try_from(writer_limit)?
+        .checked_mul(1024 * 1024)
+        .context("weekly route writer memory estimate overflow")?;
+    batch_bytes
+        .checked_add(writer_bytes)
+        .context("weekly route memory estimate overflow")
+}
+
+fn weekly_route_worker_limit(governor: &ResourceGovernor, writer_limit: usize) -> Result<usize> {
+    let budget = governor.budget();
+    let sample = governor.sample()?;
+    // One routing worker can hold a batch reader, every writer in its current
+    // writer batch, and a few temporary files. Include all of those handles
+    // before sizing the concurrent route wave; the governor then reserves its
+    // own per-worker descriptor allowance as a second gate.
+    let descriptors_per_worker = writer_limit
+        .checked_add(6)
+        .context("weekly routing descriptor estimate overflow")?;
+    let descriptor_workers = match sample.open_file_descriptors {
+        Some(open) => budget
+            .max_open_files
+            .saturating_sub(open)
+            .checked_div(descriptors_per_worker)
+            .unwrap_or(0),
+        None => budget.weekly_worker_limit,
+    };
+    anyhow::ensure!(
+        descriptor_workers > 0,
+        "weekly routing cannot admit one worker within the {}-descriptor limit",
+        budget.max_open_files
+    );
+    Ok(budget.weekly_worker_limit.min(descriptor_workers))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn route_and_reconcile_weekly_buckets(
+    runs: &WeeklyRunDir,
+    primary_paths: &[Option<PathBuf>],
+    primary_bucket_rows: &[usize],
+    primary_bucket_edits: &[i64],
+    config: &WeeklyAggregationConfig,
+    wiki: &str,
+    governor: &ResourceGovernor,
+    bucket_rows: &mut [usize],
+    final_path: &Path,
+    output: &mut Option<AtomicBatchedParquetWriter>,
+    total_edits_after: &mut i64,
+    output_rows: &mut usize,
+    min_week_start: &mut Option<i32>,
+    max_week_start: &mut Option<i32>,
+    scratch_peak_bytes: &mut u64,
+    working_storage_peak_bytes: &mut u64,
+    reconciliation_peak: &mut ResourcePeak,
+) -> Result<()> {
+    anyhow::ensure!(
+        primary_paths.len() == primary_bucket_rows.len()
+            && primary_bucket_rows.len() == primary_bucket_edits.len(),
+        "weekly primary bucket inventory changed before routing"
+    );
+    anyhow::ensure!(
+        bucket_rows.len() == config.logical_bucket_count(),
+        "weekly logical bucket inventory changed before routing"
+    );
+    let writer_limit = governor.budget().max_active_parquet_writers;
+    anyhow::ensure!(
+        writer_limit > 0,
+        "weekly routing writer limit must be positive"
+    );
+    let worker_limit = weekly_route_worker_limit(governor, writer_limit)?;
+    let estimated_memory_bytes = weekly_route_memory_estimate(writer_limit)?;
+    let candidates = (0..config.primary_bucket_count)
+        .filter(|&primary| primary_bucket_rows[primary] > 0)
+        .map(|primary| {
+            let path = primary_paths[primary]
+                .clone()
+                .with_context(|| format!("missing non-empty primary bucket {primary}"))?;
+            Ok((
+                primary,
+                path,
+                BucketTotals {
+                    rows: primary_bucket_rows[primary],
+                    edits: primary_bucket_edits[primary],
+                },
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut next = 0;
+    while next < candidates.len() {
+        let mut width = worker_limit.min(candidates.len() - next);
+        let (jobs, width) = loop {
+            let mut jobs = Vec::with_capacity(width);
+            let mut admission_error = None;
+            for (primary_bucket, primary_path, expected) in &candidates[next..next + width] {
+                let estimated_scratch_bytes = primary_path.metadata()?.len();
+                match governor.admit_bucket(estimated_memory_bytes, estimated_scratch_bytes) {
+                    Ok(permit) => jobs.push(WeeklyPrimaryRouteJob {
+                        primary_bucket: *primary_bucket,
+                        primary_path: primary_path.clone(),
+                        expected: *expected,
+                        permit,
+                    }),
+                    Err(error) => {
+                        admission_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            if let Some(error) = admission_error {
+                drop(jobs);
+                if width == 1 {
+                    return Err(
+                        error.context("resource governor could not admit one weekly route worker")
+                    );
+                }
+                width -= 1;
+            } else {
+                break (jobs, width);
+            }
+        };
+
+        let routed = std::thread::scope(|scope| -> Result<Vec<_>> {
+            let handles = jobs
+                .into_iter()
+                .map(|job| {
+                    scope.spawn(move || {
+                        let WeeklyPrimaryRouteJob {
+                            primary_bucket,
+                            primary_path,
+                            expected,
+                            permit,
+                        } = job;
+                        let _permit = permit;
+                        let mut peak = ResourcePeak::default();
+                        let routing = route_primary_to_secondary_buckets(
+                            runs,
+                            &primary_path,
+                            primary_bucket,
+                            config,
+                            expected,
+                            governor,
+                            &mut peak,
+                        )?;
+                        anyhow::ensure!(
+                            routing.peak_active_writers <= writer_limit,
+                            "secondary routing reported a writer peak above its governed limit"
+                        );
+                        Ok((primary_bucket, primary_path, routing, peak))
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut routed = Vec::with_capacity(handles.len());
+            let mut failure = None;
+            for handle in handles {
+                match handle.join() {
+                    Ok(Ok(result)) => routed.push(result),
+                    Ok(Err(error)) => {
+                        if failure.is_none() {
+                            failure = Some(error);
+                        }
+                    }
+                    Err(_) => {
+                        if failure.is_none() {
+                            failure =
+                                Some(anyhow::anyhow!("weekly primary routing worker panicked"));
+                        }
+                    }
+                }
+            }
+            failure.map_or(Ok(routed), Err)
+        })?;
+
+        // Account for the transient overlap of immutable primary inputs and
+        // routed secondary files before removing the primary files.
+        *scratch_peak_bytes = (*scratch_peak_bytes).max(runs.size_bytes()?);
+        *working_storage_peak_bytes = (*working_storage_peak_bytes).max(*scratch_peak_bytes);
+        let mut routed = routed;
+        routed.sort_by_key(|(primary, _, _, _)| *primary);
+        let mut prepared = Vec::new();
+        for (primary_bucket, primary_path, routing, route_peak) in routed {
+            reconciliation_peak.merge(route_peak);
+            for (secondary_bucket, (rows, path)) in routing
+                .rows
+                .into_iter()
+                .zip(routing.paths.into_iter())
+                .enumerate()
+            {
+                let logical_bucket =
+                    primary_bucket * config.secondary_bucket_count + secondary_bucket;
+                bucket_rows[logical_bucket] = rows;
+                if rows == 0 {
+                    continue;
+                }
+                let staged_path = path.with_context(|| {
+                    format!(
+                        "missing non-empty secondary bucket {primary_bucket}/{secondary_bucket}"
+                    )
+                })?;
+                prepared.push(PreparedWeeklyBucket {
+                    logical_bucket,
+                    primary_bucket,
+                    secondary_bucket,
+                    staged_rows: rows,
+                    staged_path: Some(staged_path),
+                });
+            }
+            fs::remove_file(primary_path)?;
+        }
+        prepared.sort_by_key(|bucket| bucket.logical_bucket);
+        for batch in prepared.chunks(governor.budget().weekly_worker_limit) {
+            let results = reconcile_weekly_bucket_batch(runs, &[], batch.to_vec(), wiki, governor)?;
+            append_weekly_bucket_results(
+                runs,
+                results,
+                final_path,
+                output,
+                total_edits_after,
+                output_rows,
+                min_week_start,
+                max_week_start,
+                scratch_peak_bytes,
+                working_storage_peak_bytes,
+                reconciliation_peak,
+            )?;
+        }
+        next += width;
+    }
+    Ok(())
+}
+
 pub(super) fn parquet_paths_row_count(paths: &[PathBuf]) -> Result<u64> {
     paths.iter().try_fold(0u64, |total, path| {
         let rows = ParquetReader::new(File::open(path)?).num_rows()?;
@@ -1514,35 +1699,71 @@ pub(super) fn reconcile_weekly_bucket_batch(
         prepared.len() <= governor.budget().weekly_worker_limit,
         "weekly bucket batch exceeds the governed worker limit"
     );
-    let mut results = std::thread::scope(|scope| -> Result<Vec<WeeklyBucketResult>> {
-        let handles = prepared
-            .into_iter()
-            .map(|bucket| {
-                scope.spawn(move || {
-                    reconcile_weekly_bucket(runs, staged_paths, bucket, wiki, governor)
+    let mut offset = 0;
+    let mut results = Vec::with_capacity(prepared.len());
+    while offset < prepared.len() {
+        let mut width = (prepared.len() - offset).min(governor.budget().weekly_worker_limit);
+        let (admitted, width) = loop {
+            let mut admitted = Vec::with_capacity(width);
+            let mut admission_error = None;
+            for bucket in &prepared[offset..offset + width] {
+                let (memory_bytes, scratch_bytes) = weekly_bucket_resource_estimates(bucket)?;
+                match governor.admit_bucket(memory_bytes, scratch_bytes) {
+                    Ok(permit) => admitted.push((bucket.clone(), permit)),
+                    Err(error) => {
+                        admission_error = Some(error);
+                        break;
+                    }
+                }
+            }
+            if let Some(error) = admission_error {
+                drop(admitted);
+                if width == 1 {
+                    return Err(
+                        error.context("resource governor could not admit one weekly bucket")
+                    );
+                }
+                width -= 1;
+            } else {
+                break (admitted, width);
+            }
+        };
+        let wave = std::thread::scope(|scope| -> Result<Vec<WeeklyBucketResult>> {
+            let handles = admitted
+                .into_iter()
+                .map(|(bucket, permit)| {
+                    scope.spawn(move || {
+                        reconcile_weekly_bucket(runs, staged_paths, bucket, wiki, governor, permit)
+                    })
                 })
-            })
-            .collect::<Vec<_>>();
-        handles
-            .into_iter()
-            .map(|handle| {
-                handle
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("weekly bucket worker panicked"))?
-            })
-            .collect()
-    })?;
+                .collect::<Vec<_>>();
+            let mut wave = Vec::with_capacity(handles.len());
+            let mut failure = None;
+            for handle in handles {
+                match handle.join() {
+                    Ok(Ok(result)) => wave.push(result),
+                    Ok(Err(error)) => {
+                        if failure.is_none() {
+                            failure = Some(error);
+                        }
+                    }
+                    Err(_) => {
+                        if failure.is_none() {
+                            failure = Some(anyhow::anyhow!("weekly bucket worker panicked"));
+                        }
+                    }
+                }
+            }
+            failure.map_or(Ok(wave), Err)
+        })?;
+        results.extend(wave);
+        offset += width;
+    }
     results.sort_by_key(|result| result.logical_bucket);
     Ok(results)
 }
 
-pub(super) fn reconcile_weekly_bucket(
-    runs: &WeeklyRunDir,
-    staged_paths: &[PathBuf],
-    bucket: PreparedWeeklyBucket,
-    wiki: &str,
-    governor: &ResourceGovernor,
-) -> Result<WeeklyBucketResult> {
+fn weekly_bucket_resource_estimates(bucket: &PreparedWeeklyBucket) -> Result<(u64, u64)> {
     let estimated_rows = u64::try_from(bucket.staged_rows)?;
     let estimated_memory_bytes = estimated_rows
         .checked_mul(WEEKLY_BUCKET_ESTIMATED_BYTES_PER_ROW)
@@ -1551,7 +1772,17 @@ pub(super) fn reconcile_weekly_bucket(
     let estimated_scratch_bytes = estimated_rows
         .checked_mul(WEEKLY_RESULT_ESTIMATED_BYTES_PER_ROW)
         .context("weekly bucket scratch estimate overflow")?;
-    let _permit = governor.admit_bucket(estimated_memory_bytes, estimated_scratch_bytes)?;
+    Ok((estimated_memory_bytes, estimated_scratch_bytes))
+}
+
+pub(super) fn reconcile_weekly_bucket(
+    runs: &WeeklyRunDir,
+    staged_paths: &[PathBuf],
+    bucket: PreparedWeeklyBucket,
+    wiki: &str,
+    governor: &ResourceGovernor,
+    _permit: BucketPermit,
+) -> Result<WeeklyBucketResult> {
     let started = Instant::now();
     let staged = match bucket.staged_path.as_deref() {
         Some(path) => ParquetReader::new(File::open(path)?).finish()?,

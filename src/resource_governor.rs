@@ -30,6 +30,7 @@ const DEFAULT_SCRATCH_LIMIT_BYTES: u64 = 64 * GIB;
 const DEFAULT_MAX_OPEN_FILES: usize = 512;
 const DEFAULT_MAX_LOGICAL_PARTITION_BYTES: u64 = 8 * GIB;
 const DEFAULT_MAX_ACTIVE_PARQUET_WRITERS: usize = 16;
+const MAX_SOURCE_WORKER_MEMORY_RESERVATION_BYTES: u64 = 512 * 1024 * 1024;
 const SOURCE_FD_ALLOWANCE: usize = 8;
 const BUCKET_FD_ALLOWANCE: usize = 4;
 
@@ -83,7 +84,8 @@ impl ResourceBudget {
             max_open_files: parse_usize_env(MAX_OPEN_FILES_ENV)?.unwrap_or(DEFAULT_MAX_OPEN_FILES),
             source_worker_limit: parse_usize_env(SOURCE_WORKERS_ENV)?
                 .unwrap_or(profile_source_workers)
-                .min(profile_source_workers),
+                .min(profile_source_workers)
+                .min(thread_limit),
             thread_limit,
             max_logical_partition_bytes: parse_u64_env(MAX_LOGICAL_PARTITION_ENV)?
                 .unwrap_or(DEFAULT_MAX_LOGICAL_PARTITION_BYTES),
@@ -116,6 +118,10 @@ impl ResourceBudget {
         anyhow::ensure!(
             self.source_worker_limit > 0,
             "source worker limit must be positive"
+        );
+        anyhow::ensure!(
+            self.source_worker_limit <= self.thread_limit,
+            "source worker limit must not exceed the governed thread limit"
         );
         anyhow::ensure!(self.thread_limit > 0, "thread limit must be positive");
         anyhow::ensure!(
@@ -158,6 +164,15 @@ impl ResourceBudget {
 
     pub(crate) fn memory_admission_bytes(&self) -> u64 {
         self.memory_ceiling_bytes - self.memory_reserve_bytes
+    }
+
+    fn source_worker_memory_reservation_bytes(&self) -> u64 {
+        let concurrent_reservations = u64::try_from(self.source_worker_limit)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(2)
+            .max(1);
+        (self.memory_admission_bytes() / concurrent_reservations)
+            .min(MAX_SOURCE_WORKER_MEMORY_RESERVATION_BYTES)
     }
 
     fn persistent_admission_reserve_bytes(&self) -> Result<u64> {
@@ -332,9 +347,9 @@ impl ResourceGovernor {
         let total_source_bytes = checked_sum(source_bytes.iter().flatten().copied())?;
         let mut ordered = source_bytes.iter().flatten().copied().collect::<Vec<_>>();
         ordered.sort_unstable_by(|left, right| right.cmp(left));
-        // Source-window execution may retain the source currently being
-        // ingested plus one download-ahead source. Account for the complete
-        // configured window independently of the HTTP worker count.
+        // Each source worker downloads and ingests its own source. Bound raw
+        // file admission by concurrently active workers, rather than the
+        // configured upper window, so preflight matches actual overlap.
         let window_limit = maximum_window_sources;
         let window_bytes = checked_sum(ordered.into_iter().take(window_limit))?;
         let estimated_additional = total_source_bytes
@@ -381,17 +396,60 @@ impl ResourceGovernor {
         );
         let sample = self.sample_with_state(&state)?;
         state.observe(&sample);
+        if let Some(open) = sample.open_file_descriptors {
+            let reserved_files = state
+                .active_source_workers
+                .saturating_add(1)
+                .saturating_mul(SOURCE_FD_ALLOWANCE);
+            let required_files = open.saturating_add(reserved_files);
+            anyhow::ensure!(
+                required_files <= self.budget.max_open_files,
+                "resource governor source file-descriptor gate closed at {required_files}; limit is {}",
+                self.budget.max_open_files
+            );
+        }
+        let reserved_memory_bytes = self.budget.source_worker_memory_reservation_bytes();
+        let current_memory = sample
+            .memory
+            .cgroup_current_bytes
+            .or(sample.memory.rss_bytes);
+        #[cfg(target_os = "linux")]
+        let current_memory = current_memory.context(
+            "resource governor requires current cgroup or RSS memory for source admission",
+        )?;
+        #[cfg(not(target_os = "linux"))]
+        let current_memory = current_memory.unwrap_or(0);
+        let admitted_memory = current_memory
+            .checked_add(state.reserved_bucket_memory_bytes)
+            .and_then(|value| value.checked_add(reserved_memory_bytes))
+            .and_then(|value| value.checked_add(self.budget.memory_reserve_bytes))
+            .context("source memory admission overflow")?;
+        anyhow::ensure!(
+            admitted_memory <= self.budget.memory_ceiling_bytes,
+            "resource governor source memory gate closed: {admitted_memory} bytes including reserve exceeds {} bytes",
+            self.budget.memory_ceiling_bytes
+        );
         let additional_bytes = state
             .reserved_persistent_bytes
             .checked_add(expected_raw_bytes)
             .context("source storage reservation overflow")?;
+        let reserved_work_memory_bytes = state
+            .reserved_bucket_memory_bytes
+            .checked_add(reserved_memory_bytes)
+            .context("source memory reservation overflow")?;
         self.validate_sample(&sample, additional_bytes)?;
         state.active_source_workers += 1;
         state.reserved_persistent_bytes = additional_bytes;
-        info!(sample = %serde_json::to_string(&sample)?, "resource governor admitted source");
+        state.reserved_bucket_memory_bytes = reserved_work_memory_bytes;
+        info!(
+            reserved_memory_bytes,
+            sample = %serde_json::to_string(&sample)?,
+            "resource governor admitted source"
+        );
         Ok(SourcePermit {
             governor: self.clone(),
             reserved_persistent_bytes: expected_raw_bytes,
+            reserved_memory_bytes,
             started: Instant::now(),
             completed: false,
         })
@@ -724,6 +782,7 @@ impl GovernorState {
 pub(crate) struct SourcePermit {
     governor: ResourceGovernor,
     reserved_persistent_bytes: u64,
+    reserved_memory_bytes: u64,
     started: Instant,
     completed: bool,
 }
@@ -774,11 +833,16 @@ impl Drop for SourcePermit {
         state.reserved_persistent_bytes = state
             .reserved_persistent_bytes
             .saturating_sub(self.reserved_persistent_bytes);
+        state.reserved_bucket_memory_bytes = state
+            .reserved_bucket_memory_bytes
+            .saturating_sub(self.reserved_memory_bytes);
         info!(
             elapsed_ms = self.started.elapsed().as_millis() as u64,
             completed = self.completed,
             active_source_workers = state.active_source_workers,
             reserved_persistent_bytes = state.reserved_persistent_bytes,
+            reserved_memory_bytes = self.reserved_memory_bytes,
+            reserved_work_memory_bytes = state.reserved_bucket_memory_bytes,
             "resource governor released source"
         );
     }
