@@ -1458,11 +1458,8 @@ fn route_and_reconcile_weekly_buckets(
         let mut prepared = Vec::new();
         for (primary_bucket, primary_path, routing, route_peak) in routed {
             reconciliation_peak.merge(route_peak);
-            for (secondary_bucket, (rows, path)) in routing
-                .rows
-                .into_iter()
-                .zip(routing.paths.into_iter())
-                .enumerate()
+            for (secondary_bucket, (rows, path)) in
+                routing.rows.into_iter().zip(routing.paths).enumerate()
             {
                 let logical_bucket =
                     primary_bucket * config.secondary_bucket_count + secondary_bucket;
