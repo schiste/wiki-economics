@@ -23,6 +23,7 @@ scheduled_jobs=(
   wiki-econ-admin-dispatcher
   wiki-econ-publish-ready
   wiki-econ-artifact-scrub
+  wiki-econ-fingerprint-check
 )
 on_demand_jobs=(
   wiki-econ-prepare-nlwiki

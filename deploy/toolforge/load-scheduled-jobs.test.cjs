@@ -76,6 +76,7 @@ esac
       `jobs load --job wiki-econ-admin-dispatcher ${manifest}`,
       `jobs load --job wiki-econ-publish-ready ${manifest}`,
       `jobs load --job wiki-econ-artifact-scrub ${manifest}`,
+      `jobs load --job wiki-econ-fingerprint-check ${manifest}`,
     ]);
     for (const name of [
       "wiki-econ-prepare-nlwiki", "wiki-econ-prepare-ptwiki", "wiki-econ-prepare-frwiki",
