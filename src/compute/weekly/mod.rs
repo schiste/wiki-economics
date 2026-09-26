@@ -477,7 +477,7 @@ fn compute_page_weekly_edits_for_snapshot_with_governor(
                 edits: &primary_bucket_edits,
             },
             governor.budget().max_active_parquet_writers,
-            &governor,
+            governor,
             &mut scratch_peak_bytes,
             &mut reduction_peak,
         );
@@ -530,7 +530,7 @@ fn compute_page_weekly_edits_for_snapshot_with_governor(
                 })
                 .collect::<Vec<_>>();
             let results =
-                reconcile_weekly_bucket_batch(&runs, &staged_paths, prepared, wiki, &governor)?;
+                reconcile_weekly_bucket_batch(&runs, &staged_paths, prepared, wiki, governor)?;
             let append = append_weekly_bucket_results(
                 &runs,
                 results,
@@ -554,7 +554,7 @@ fn compute_page_weekly_edits_for_snapshot_with_governor(
             &primary_bucket_edits,
             config,
             wiki,
-            &governor,
+            governor,
             &mut bucket_rows,
             &final_path,
             &mut output,
