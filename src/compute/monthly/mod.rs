@@ -6,7 +6,7 @@ pub(super) mod inequality;
 ///
 /// Increment this when GDP, GDP user-type share, inequality, or monthly labor
 /// semantics change. Physical scan scheduling alone does not require a bump.
-pub(crate) const ALGORITHM_VERSION: &str = "monthly-stateless-v5-exact-period-inequality";
+pub(crate) const ALGORITHM_VERSION: &str = "monthly-stateless-v6-null-zero-denominator-ratios";
 
 use super::{
     PendingOutput, add_wiki_column, concat_frames, editor_identity_available_expr,
@@ -44,6 +44,13 @@ pub(crate) struct EditorIdentityCoverageReport {
     pub(crate) periods: Vec<EditorIdentityCoveragePeriod>,
 }
 
+fn ratio_or_null(numerator: &'static str, denominator: &'static str) -> Expr {
+    let denominator_value = col(denominator).cast(DataType::Float64);
+    when(denominator_value.clone().gt(lit(0.0_f64)))
+        .then(col(numerator).cast(DataType::Float64) / denominator_value)
+        .otherwise(lit(NULL).cast(DataType::Float64))
+}
+
 pub(super) fn gdp_monthly_frame(base: &DataFrame) -> Result<DataFrame> {
     ensure_editor_identity_inputs(base)?
         .lazy()
@@ -71,14 +78,9 @@ pub(super) fn gdp_monthly_frame(base: &DataFrame) -> Result<DataFrame> {
                 .alias("minor_edits"),
         ])
         .with_columns([
-            (col("net_bytes").cast(DataType::Float64) / col("total_edits").cast(DataType::Float64))
-                .alias("bytes_per_edit"),
-            (col("net_bytes").cast(DataType::Float64)
-                / col("unique_editors").cast(DataType::Float64))
-            .alias("bytes_per_editor"),
-            (col("reverted_edits").cast(DataType::Float64)
-                / col("total_edits").cast(DataType::Float64))
-            .alias("revert_rate"),
+            ratio_or_null("net_bytes", "total_edits").alias("bytes_per_edit"),
+            ratio_or_null("net_bytes", "unique_editors").alias("bytes_per_editor"),
+            ratio_or_null("reverted_edits", "total_edits").alias("revert_rate"),
         ])
         .collect()
         .map_err(Into::into)
@@ -355,4 +357,41 @@ pub(super) fn write_monthly_outputs(
     )?;
     add_wiki_column(&mut labor_monthly_out, wiki)?;
     write_output(&mut labor_monthly_out, wiki, "labor_monthly", output_dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gdp_monthly_zero_identified_editors_produces_null_ratio() -> Result<()> {
+        let base = df!(
+            "year_month" => &["2026-08", "2026-08"],
+            "page_namespace" => &[0_i32, 0],
+            "user_type" => &["unregistered", "registered"],
+            "revision_text_bytes_diff" => &[0_i64, 100],
+            "revision_id" => &[1_i64, 2],
+            "is_reverted" => &[false, false],
+            "is_minor" => &[false, false],
+            "event_user_id" => &[None::<i64>, Some(7_i64)],
+        )?;
+        let result = gdp_monthly_frame(&base)?;
+        let user_types = result.column("user_type")?.str()?;
+        let unregistered = (0..result.height())
+            .find(|row| user_types.get(*row) == Some("unregistered"))
+            .context("unregistered GDP row should be present")?;
+        let registered = (0..result.height())
+            .find(|row| user_types.get(*row) == Some("registered"))
+            .context("registered GDP row should be present")?;
+
+        assert_eq!(
+            result.column("bytes_per_editor")?.f64()?.get(unregistered),
+            None
+        );
+        assert_eq!(
+            result.column("bytes_per_editor")?.f64()?.get(registered),
+            Some(100.0)
+        );
+        Ok(())
+    }
 }

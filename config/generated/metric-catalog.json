@@ -71,7 +71,7 @@
     {
       "id": "gdp",
       "family": "monthly",
-      "algorithm_version": "monthly-stateless-v5-exact-period-inequality",
+      "algorithm_version": "monthly-stateless-v6-null-zero-denominator-ratios",
       "schema": [
         {
           "name": "year_month",
@@ -200,7 +200,7 @@
       "fingerprint": {
         "artifact_identity": "gdp.parquet",
         "family": "monthly",
-        "algorithm_version": "monthly-stateless-v5-exact-period-inequality"
+        "algorithm_version": "monthly-stateless-v6-null-zero-denominator-ratios"
       },
       "browser": {
         "partitioning": "per_wiki_and_global_year_shards",
@@ -321,7 +321,7 @@
     {
       "id": "gdp_user_type_share",
       "family": "monthly",
-      "algorithm_version": "monthly-stateless-v5-exact-period-inequality",
+      "algorithm_version": "monthly-stateless-v6-null-zero-denominator-ratios",
       "schema": [
         {
           "name": "year_month",
@@ -383,7 +383,7 @@
       "fingerprint": {
         "artifact_identity": "gdp_user_type_share.parquet",
         "family": "monthly",
-        "algorithm_version": "monthly-stateless-v5-exact-period-inequality"
+        "algorithm_version": "monthly-stateless-v6-null-zero-denominator-ratios"
       },
       "browser": {
         "partitioning": "per_wiki_and_global_year_shards",
@@ -395,7 +395,7 @@
     {
       "id": "inequality",
       "family": "monthly",
-      "algorithm_version": "monthly-stateless-v5-exact-period-inequality",
+      "algorithm_version": "monthly-stateless-v6-null-zero-denominator-ratios",
       "schema": [
         {
           "name": "year_month",
@@ -506,7 +506,7 @@
       "fingerprint": {
         "artifact_identity": "inequality.parquet",
         "family": "monthly",
-        "algorithm_version": "monthly-stateless-v5-exact-period-inequality"
+        "algorithm_version": "monthly-stateless-v6-null-zero-denominator-ratios"
       },
       "browser": {
         "partitioning": "per_wiki_and_global_year_shards",
@@ -679,7 +679,7 @@
     {
       "id": "labor_monthly",
       "family": "monthly",
-      "algorithm_version": "monthly-stateless-v5-exact-period-inequality",
+      "algorithm_version": "monthly-stateless-v6-null-zero-denominator-ratios",
       "schema": [
         {
           "name": "year_month",
@@ -751,7 +751,7 @@
       "fingerprint": {
         "artifact_identity": "labor_monthly.parquet",
         "family": "monthly",
-        "algorithm_version": "monthly-stateless-v5-exact-period-inequality"
+        "algorithm_version": "monthly-stateless-v6-null-zero-denominator-ratios"
       },
       "browser": {
         "partitioning": "per_wiki_and_global_year_shards",

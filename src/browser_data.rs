@@ -17,7 +17,7 @@ pub const INDEX_SCHEMA_VERSION: u32 = 3;
 pub const CACHE_SCHEMA_VERSION: u32 = 3;
 const GLOBAL_WIKI: &str = "all";
 const GLOBAL_ROOT: &str = "_browser-global";
-const GLOBAL_AGGREGATION_VERSION: &str = "global-browser-aggregate-v2-semantic-composition";
+const GLOBAL_AGGREGATION_VERSION: &str = "global-browser-aggregate-v3-null-zero-denominator-ratios";
 
 pub(crate) fn browser_metrics() -> impl Iterator<Item = &'static MetricDefinition> {
     metric_registry::definitions().filter(|definition| {
@@ -488,9 +488,10 @@ fn aggregate_sums(frame: DataFrame, keys: &[&str], sums: &[&str]) -> Result<Data
 }
 
 fn safe_ratio(numerator: &'static str, denominator: &'static str, output: &'static str) -> Expr {
-    when(col(denominator).neq(lit(0_i64)))
-        .then(col(numerator).cast(DataType::Float64) / col(denominator).cast(DataType::Float64))
-        .otherwise(lit(0.0_f64))
+    let denominator_value = col(denominator).cast(DataType::Float64);
+    when(denominator_value.clone().gt(lit(0.0_f64)))
+        .then(col(numerator).cast(DataType::Float64) / denominator_value)
+        .otherwise(lit(NULL).cast(DataType::Float64))
         .alias(output)
 }
 
@@ -1086,6 +1087,28 @@ mod tests {
     }
 
     #[test]
+    fn global_gdp_zero_editor_denominator_produces_null_ratio() -> Result<()> {
+        let source = df!(
+            "wiki" => &["enwiki"],
+            "year_month" => &["2026-08"],
+            "page_namespace" => &[0_i32],
+            "user_type" => &["unregistered"],
+            "gross_bytes_added" => &[0_i64],
+            "net_bytes" => &[0_i64],
+            "total_edits" => &[2_i64],
+            "productive_edits" => &[2_i64],
+            "reverted_edits" => &[0_i64],
+            "unique_editors" => &[0_i64],
+            "minor_edits" => &[0_i64],
+        )
+        .expect("zero-editor GDP fixture should be valid");
+        let result = aggregate_global_metric("gdp", source)?;
+        assert_eq!(result.height(), 1);
+        assert_eq!(result.column("bytes_per_editor")?.f64()?.get(0), None);
+        Ok(())
+    }
+
+    #[test]
     fn global_patrol_keeps_only_additive_statistics() -> Result<()> {
         let source = df!(
             "wiki" => &["nlwiki", "ptwiki"],
@@ -1211,14 +1234,8 @@ mod tests {
             global_gdp.column("gross_bytes_added")?.i64()?.get(0),
             Some(200)
         );
-        assert_eq!(
-            global_gdp.column("bytes_per_edit")?.f64()?.get(0),
-            Some(0.0)
-        );
-        assert_eq!(
-            global_gdp.column("bytes_per_editor")?.f64()?.get(0),
-            Some(0.0)
-        );
+        assert_eq!(global_gdp.column("bytes_per_edit")?.f64()?.get(0), None);
+        assert_eq!(global_gdp.column("bytes_per_editor")?.f64()?.get(0), None);
         assert_eq!(global_gdp.column("wiki")?.str()?.get(0), Some(GLOBAL_WIKI));
         Ok(())
     }
