@@ -4632,15 +4632,12 @@ mod tests {
         source.expected_size = Some(u64::MAX);
         let transport = FakeTransport::default();
 
-        let preflight_result = (|| -> Result<()> {
-            check_source_window_disk_headroom(
-                &transport,
-                "testwiki",
-                std::slice::from_ref(&source),
-                data_dir.path(),
-            )?;
-            Ok(())
-        })();
+        let preflight_result = check_source_window_disk_headroom(
+            &transport,
+            "testwiki",
+            std::slice::from_ref(&source),
+            data_dir.path(),
+        );
         assert!(
             preflight_result.is_err(),
             "impossible size must fail headroom"
