@@ -1302,11 +1302,9 @@ pub(crate) fn retained_candidate_non_monthly_families_current(
         let algorithm = family.algorithm_version(&weekly_config);
         let receipt_path = family_stage_receipt(candidate_dir, wiki, family);
         let outputs = family_outputs(family, wiki, candidate_dir);
-        if !fingerprint::retained_outputs_reusable(
-            &receipt_path,
-            family_stage_spec(family, wiki, Some(snapshot), &algorithm),
-            &outputs,
-        )? {
+        #[rustfmt::skip]
+        let outputs_reusable = fingerprint::retained_outputs_reusable(&receipt_path, family_stage_spec(family, wiki, Some(snapshot), &algorithm), &outputs)?;
+        if !outputs_reusable {
             return Ok(false);
         }
     }

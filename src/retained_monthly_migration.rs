@@ -77,10 +77,8 @@ fn validate_report(
     snapshot: &str,
     algorithm: &str,
 ) -> Result<crate::compute::EditorIdentityCoverageReport> {
-    let report: crate::compute::EditorIdentityCoverageReport = serde_json::from_slice(
-        &fs::read(report_path(candidate_dir, wiki))
-            .with_context(|| format!("missing {wiki} editor identity coverage report"))?,
-    )?;
+    #[rustfmt::skip]
+    let report: crate::compute::EditorIdentityCoverageReport = serde_json::from_slice(&fs::read(report_path(candidate_dir, wiki)).with_context(|| format!("missing {wiki} editor identity coverage report"))?)?;
     let mut previous: Option<(&str, &str)> = None;
     let mut totals = (0_u64, 0_u64, 0_u64);
     for period in &report.periods {
@@ -121,12 +119,8 @@ fn validate_report(
 fn verify_artifact(path: &Path, wiki: &str, metric: &str, algorithm: &str) -> Result<()> {
     let expected_identity = format!("output/{wiki}/{metric}.parquet");
     let document = artifact_receipt::read(path)?;
-    let document = artifact_receipt::verify(
-        path,
-        &expected_identity,
-        Some(&document.receipt_sha256),
-        artifact_receipt::VerificationMode::Fast,
-    )?;
+    #[rustfmt::skip]
+    let document = artifact_receipt::verify(path, &expected_identity, Some(&document.receipt_sha256), artifact_receipt::VerificationMode::Fast)?;
     ensure!(
         document.receipt.algorithm_version == algorithm,
         "retained candidate {wiki} {metric} artifact is not authenticated as {algorithm}"
@@ -136,20 +130,14 @@ fn verify_artifact(path: &Path, wiki: &str, metric: &str, algorithm: &str) -> Re
 
 fn current_receipt_valid(candidate_dir: &Path, wiki: &str, snapshot: &str) -> Result<bool> {
     let receipt_path = stage_receipt(candidate_dir, wiki);
-    if !fingerprint::retained_outputs_reusable(
-        &receipt_path,
-        stage_spec(wiki, snapshot, CURRENT_ALGORITHM),
-        &tracked_outputs(candidate_dir, wiki),
-    )? {
+    #[rustfmt::skip]
+    let outputs_reusable = fingerprint::retained_outputs_reusable(&receipt_path, stage_spec(wiki, snapshot, CURRENT_ALGORITHM), &tracked_outputs(candidate_dir, wiki))?;
+    if !outputs_reusable {
         return Ok(false);
     }
     for metric in MetricFamily::Monthly.metrics() {
-        verify_artifact(
-            &output(candidate_dir, wiki, metric),
-            wiki,
-            metric,
-            CURRENT_ALGORITHM,
-        )?;
+        #[rustfmt::skip]
+        verify_artifact(&output(candidate_dir, wiki, metric), wiki, metric, CURRENT_ALGORITHM)?;
     }
     let _ = validate_report(candidate_dir, wiki, snapshot, CURRENT_ALGORITHM)?;
     Ok(true)
@@ -167,12 +155,10 @@ fn source_migration_inputs(
     );
     storage::validate_snapshot_version(snapshot)?;
     let receipt_path = stage_receipt(source_candidate_dir, wiki);
+    #[rustfmt::skip]
+    let source_receipt_reusable = fingerprint::retained_outputs_reusable(&receipt_path, stage_spec(wiki, snapshot, LEGACY_ALGORITHM), &tracked_outputs(source_candidate_dir, wiki))?;
     ensure!(
-        fingerprint::retained_outputs_reusable(
-            &receipt_path,
-            stage_spec(wiki, snapshot, LEGACY_ALGORITHM),
-            &tracked_outputs(source_candidate_dir, wiki),
-        )?,
+        source_receipt_reusable,
         "retained candidate {wiki} does not have an authenticated monthly v5 receipt"
     );
     let stage = fingerprint::read_receipt(&receipt_path)?;
@@ -254,29 +240,18 @@ pub(crate) fn migrate_candidate(
             metric,
         )?;
     }
-    ensure_same_bytes(
-        &report_path(source_candidate_dir, wiki),
-        &report_path(target_candidate_dir, wiki),
-        wiki,
-        "editor_identity_coverage.json",
-    )?;
+    #[rustfmt::skip]
+    ensure_same_bytes(&report_path(source_candidate_dir, wiki), &report_path(target_candidate_dir, wiki), wiki, "editor_identity_coverage.json")?;
 
-    rewrite_gdp_ratios(
-        &output(target_candidate_dir, wiki, "gdp"),
-        wiki,
-        target_candidate_dir,
-    )?;
+    #[rustfmt::skip]
+    rewrite_gdp_ratios(&output(target_candidate_dir, wiki, "gdp"), wiki, target_candidate_dir)?;
     let mut report = validate_report(target_candidate_dir, wiki, snapshot, LEGACY_ALGORITHM)?;
     report.algorithm_version = CURRENT_ALGORITHM.to_string();
     write_json_atomic(&report_path(target_candidate_dir, wiki), &report)?;
 
     let outputs = tracked_outputs(target_candidate_dir, wiki);
-    fingerprint::record(
-        &stage_receipt(target_candidate_dir, wiki),
-        stage_spec(wiki, snapshot, CURRENT_ALGORITHM),
-        &inputs,
-        &outputs,
-    )?;
+    #[rustfmt::skip]
+    fingerprint::record(&stage_receipt(target_candidate_dir, wiki), stage_spec(wiki, snapshot, CURRENT_ALGORITHM), &inputs, &outputs)?;
     ensure!(
         current_receipt_valid(target_candidate_dir, wiki, snapshot)?,
         "retained monthly migration for {wiki} did not produce a current v6 receipt"
@@ -316,17 +291,11 @@ pub(crate) fn validate_migration(
     }
 
     for metric in ["gdp_user_type_share", "inequality", "labor_monthly"] {
-        ensure_same_bytes(
-            &output(source_candidate_dir, wiki, metric),
-            &output(target_candidate_dir, wiki, metric),
-            wiki,
-            metric,
-        )?;
+        #[rustfmt::skip]
+        ensure_same_bytes(&output(source_candidate_dir, wiki, metric), &output(target_candidate_dir, wiki, metric), wiki, metric)?;
     }
-    validate_gdp_projection(
-        &output(source_candidate_dir, wiki, "gdp"),
-        &output(target_candidate_dir, wiki, "gdp"),
-    )?;
+    #[rustfmt::skip]
+    validate_gdp_projection(&output(source_candidate_dir, wiki, "gdp"), &output(target_candidate_dir, wiki, "gdp"))?;
     let mut expected_report =
         validate_report(source_candidate_dir, wiki, snapshot, LEGACY_ALGORITHM)?;
     expected_report.algorithm_version = CURRENT_ALGORITHM.to_string();
@@ -463,15 +432,14 @@ mod tests {
     #[test]
     fn failed_atomic_report_write_returns_an_error() -> Result<()> {
         let root = TestDir::new()?;
-        let blocked_parent = root.path().join("blocked-parent");
-        fs::write(&blocked_parent, b"not a directory")?;
-        assert!(
-            write_json_atomic(
-                &blocked_parent.join("editor_identity_coverage.json"),
-                &serde_json::json!({"schema_version": 1}),
-            )
-            .is_err()
-        );
+        let target = root.path().join("editor_identity_coverage.json");
+        fs::create_dir(&target)?;
+        assert!(write_json_atomic(&target, &serde_json::json!({"schema_version": 1})).is_err());
+        let temporary = root.path().join(format!(
+            ".editor_identity_coverage.json.{}.tmp",
+            std::process::id()
+        ));
+        assert!(!temporary.exists());
         Ok(())
     }
 }
