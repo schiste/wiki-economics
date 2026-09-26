@@ -447,6 +447,7 @@ mod tests {
     use super::*;
     use crate::test_support::TestDir;
     use anyhow::Result;
+    use std::io::ErrorKind;
 
     fn write_legacy_source(
         root: &Path,
@@ -935,7 +936,13 @@ mod tests {
         fs::create_dir(&sidecar)?;
         let error = migrate_candidate(wiki, snapshot, "sidecar-source", &source, &sidecar_target)
             .expect_err("a receipt directory cannot be removed as a sidecar file");
-        ensure!(error.to_string().contains("directory"));
+        let expected_fs_error = error.chain().any(|cause| {
+            cause.downcast_ref::<std::io::Error>().is_some_and(|cause| {
+                let kind = cause.kind();
+                matches!(kind, ErrorKind::IsADirectory | ErrorKind::PermissionDenied)
+            })
+        });
+        ensure!(expected_fs_error, "{error:#}");
 
         let source = write_legacy_source(root.path(), wiki, snapshot, "missing-sidecar-source")?;
         let missing_sidecar_target = root
