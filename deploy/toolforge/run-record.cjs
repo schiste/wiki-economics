@@ -417,18 +417,24 @@ function writeRunRecord(environment, finalExitCode = null) {
         && environment.WIKI_ECON_RUN_STATUS_FILE
         && path.basename(historyFile) === ".refresh-history.jsonl") {
       atomicWriteJson(
-        path.join(path.dirname(environment.WIKI_ECON_RUN_STATUS_FILE), ".last-successful-refresh.json"),
+        path.join(path.dirname(historyFile), ".last-successful-refresh.json"),
         compactHistoryEntry(record),
       );
       if (record.publication) {
         atomicWriteJson(
-          path.join(path.dirname(environment.WIKI_ECON_RUN_STATUS_FILE), ".last-successful-publication.json"),
+          path.join(path.dirname(historyFile), ".last-successful-publication.json"),
           compactHistoryEntry(record),
         );
       }
     }
   }
   atomicWriteJson(environment.WIKI_ECON_RUN_STATUS_FILE, record);
+  if (
+    environment.WIKI_ECON_RUN_STATUS_MIRROR_FILE &&
+    path.resolve(environment.WIKI_ECON_RUN_STATUS_MIRROR_FILE) !== path.resolve(environment.WIKI_ECON_RUN_STATUS_FILE)
+  ) {
+    atomicWriteJson(environment.WIKI_ECON_RUN_STATUS_MIRROR_FILE, record);
+  }
   return record;
 }
 

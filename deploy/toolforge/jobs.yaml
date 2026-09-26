@@ -179,11 +179,12 @@
   cpu: "1"
 
 # Enwiki/large-wiki low-memory pipeline. These jobs intentionally have no
-# schedule: an operator starts exactly one stage at a time, and the shared
-# pipeline state file refuses out-of-order or overlapping execution. Every
-# stage is capped at the live 6 GiB per-job memory limit; compute stages may
-# use the live 4-CPU per-job ceiling without increasing thread concurrency
-# until the stage-specific qualification evidence permits it.
+# schedule. Ingest runs first; after it succeeds, the state coordinator admits
+# independent compute stages in parallel up to the capacity-derived limit.
+# The shared capacity ledger also counts fleet-worker leases before each 4-CPU
+# / 6-GiB pipeline pod starts. Publish waits for metrics, lifecycle, page-week,
+# and patrol receipts; service, admin dispatcher, and publisher reserves remain
+# available while workers run.
 - name: wiki-econ-pipeline-ingest
   image: tool-wiki-economics/tool-wiki-economics:latest
   command: deploy/toolforge/run-refresh-pipeline-ingest.sh

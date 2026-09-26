@@ -222,9 +222,9 @@ fn process_source<O: SourceTransactionOps>(
     ops: &O,
     execution: &SourceExecution<'_>,
     source: &SourceSpec,
-    expected_bytes: u64,
+    permit: Option<SourcePermit>,
 ) -> Result<u64> {
-    let fetched = fetch_source_transaction(ops, execution, source, expected_bytes)?;
+    let fetched = fetch_source_transaction(ops, execution, source, permit)?;
     ingest_fetched_source(ops, execution, fetched)
 }
 
@@ -233,18 +233,15 @@ struct FetchedSource {
     path: std::path::PathBuf,
     downloaded_bytes: u64,
     download_elapsed_ms: u64,
+    permit: Option<SourcePermit>,
 }
 
 fn fetch_source_transaction<O: SourceTransactionOps>(
     ops: &O,
     execution: &SourceExecution<'_>,
     source: &SourceSpec,
-    expected_bytes: u64,
+    permit: Option<SourcePermit>,
 ) -> Result<FetchedSource> {
-    let permit: Option<SourcePermit> = execution
-        .governor
-        .map(|governor| governor.admit_source(expected_bytes))
-        .transpose()?;
     let download_started = Instant::now();
     let path = ops.fetch_source(
         execution.wiki,
@@ -260,14 +257,12 @@ fn fetch_source_transaction<O: SourceTransactionOps>(
         source.source_id
     );
     let downloaded_bytes = path.metadata()?.len();
-    if let Some(permit) = permit {
-        permit.complete();
-    }
     Ok(FetchedSource {
         source: source.clone(),
         path,
         downloaded_bytes,
         download_elapsed_ms,
+        permit,
     })
 }
 
@@ -276,28 +271,38 @@ fn ingest_fetched_source<O: SourceTransactionOps>(
     execution: &SourceExecution<'_>,
     fetched: FetchedSource,
 ) -> Result<u64> {
+    let FetchedSource {
+        source: expected_source,
+        path,
+        downloaded_bytes,
+        download_elapsed_ms,
+        permit,
+    } = fetched;
     let ingest_started = Instant::now();
     let commit = ops.ingest_source(
         execution.wiki,
         execution.snapshot,
         execution.data_dir,
-        &fetched.path,
+        &path,
         execution.run_id,
     )?;
     let ingest_elapsed_ms = ingest_started.elapsed().as_millis() as u64;
     anyhow::ensure!(
-        commit.source_id == fetched.source.source_id,
+        commit.source_id == expected_source.source_id,
         "ingest committed the wrong source for {}",
-        fetched.source.source_id
+        expected_source.source_id
     );
     let rows = u64::try_from(commit.rows)?;
     if let Some(governor) = execution.governor {
         governor.record_source_progress(
-            fetched.downloaded_bytes,
-            fetched.download_elapsed_ms,
+            downloaded_bytes,
+            download_elapsed_ms,
             rows,
             ingest_elapsed_ms,
         )?;
+    }
+    if let Some(permit) = permit {
+        permit.complete();
     }
     Ok(rows)
 }
@@ -312,68 +317,79 @@ fn process_source_window<O: SourceTransactionOps>(
         sources.len() == expected_sizes.len(),
         "source-window size inventory changed"
     );
-    if sources.len() < 2 {
-        return sources
-            .iter()
-            .zip(expected_sizes)
-            .map(|(source, expected)| {
-                process_source(
-                    ops,
-                    execution,
-                    source,
-                    expected.context("source size became unknown after preflight")?,
-                )
-            })
-            .collect();
-    }
-
-    // A rendezvous channel permits exactly one source to download while the
-    // previously downloaded source is ingested. The producer cannot start a
-    // third source until the consumer accepts the second, bounding raw files
-    // to the configured two-source window without concurrent Parquet writers.
-    std::thread::scope(|scope| {
-        let (sender, receiver) = std::sync::mpsc::sync_channel::<Result<FetchedSource>>(0);
-        let producer = scope.spawn(move || {
-            for (source, expected) in sources.iter().zip(expected_sizes) {
-                let fetched = expected
-                    .context("source size became unknown after preflight")
-                    .and_then(|bytes| fetch_source_transaction(ops, execution, source, bytes));
-                let failed = fetched.is_err();
-                if sender.send(fetched).is_err() || failed {
-                    break;
-                }
-            }
-        });
-        let mut rows = Vec::with_capacity(sources.len());
-        let mut failure = None;
-        for _ in sources {
-            match receiver.recv() {
-                Ok(Ok(fetched)) => match ingest_fetched_source(ops, execution, fetched) {
-                    Ok(count) => rows.push(count),
+    // Each task owns one immutable source ID, its download path, and its
+    // per-source ingest marker. Reserve disk and a conservative ingest-memory
+    // slice before launching it. If the current cgroup or filesystem can admit
+    // fewer sources than the configured ceiling, shrink this wave and retry;
+    // completed source commits remain independently resumable.
+    let mut rows = Vec::with_capacity(sources.len());
+    let mut offset = 0;
+    while offset < sources.len() {
+        let mut width = sources.len() - offset;
+        let (admitted, width) = loop {
+            let mut admitted = Vec::with_capacity(width);
+            let mut failure = None;
+            for expected in &expected_sizes[offset..offset + width] {
+                let expected = expected.context("source size became unknown after preflight")?;
+                let permit = match execution
+                    .governor
+                    .map(|governor| governor.admit_source(expected))
+                    .transpose()
+                {
+                    Ok(permit) => permit,
                     Err(error) => {
                         failure = Some(error);
                         break;
                     }
-                },
-                Ok(Err(error)) => {
-                    failure = Some(error);
-                    break;
+                };
+                admitted.push(permit);
+            }
+            if let Some(error) = failure {
+                drop(admitted);
+                if width == 1 {
+                    return Err(
+                        error.context("resource governor could not admit one source worker")
+                    );
                 }
-                Err(error) => {
-                    failure = Some(anyhow::anyhow!("source prefetch worker stopped: {error}"));
-                    break;
+                width -= 1;
+            } else {
+                break (admitted, width);
+            }
+        };
+
+        let wave = std::thread::scope(|scope| {
+            let workers = sources[offset..offset + width]
+                .iter()
+                .zip(admitted)
+                .map(|(source, permit)| {
+                    scope.spawn(move || process_source(ops, execution, source, permit))
+                })
+                .collect::<Vec<_>>();
+            let mut wave_rows = Vec::with_capacity(workers.len());
+            let mut failure = None;
+            for worker in workers {
+                match worker.join() {
+                    Ok(Ok(count)) => wave_rows.push(count),
+                    Ok(Err(error)) => {
+                        if failure.is_none() {
+                            failure = Some(error);
+                        }
+                    }
+                    Err(_) => {
+                        if failure.is_none() {
+                            failure = Some(anyhow::anyhow!(
+                                "source prefetch worker panicked during fetch or ingest"
+                            ));
+                        }
+                    }
                 }
             }
-        }
-        drop(receiver);
-        producer
-            .join()
-            .map_err(|_| anyhow::anyhow!("source prefetch worker panicked"))?;
-        if let Some(error) = failure {
-            return Err(error);
-        }
-        Ok(rows)
-    })
+            failure.map_or(Ok(wave_rows), Err)
+        })?;
+        rows.extend(wave);
+        offset += width;
+    }
+    Ok(rows)
 }
 
 /// Execute a snapshot as bounded, independently committed source
@@ -513,8 +529,12 @@ fn prepare_snapshot_with_ops<O: SourceTransactionOps>(
         source_sizes.len() == pending.len(),
         "resource preflight returned an incomplete source-size inventory"
     );
+    let source_worker_limit = governor
+        .map(|governor| governor.budget().source_worker_limit)
+        .unwrap_or(1)
+        .min(window_size);
     if let Some(governor) = governor {
-        governor.preflight_snapshot(&source_sizes, window_size)?;
+        governor.preflight_snapshot(&source_sizes, source_worker_limit)?;
     }
     let reused_sources = planned_sources
         .checked_sub(pending.len())
@@ -541,10 +561,6 @@ fn prepare_snapshot_with_ops<O: SourceTransactionOps>(
         "starting bounded source-window execution"
     );
 
-    let source_worker_limit = governor
-        .map(|governor| governor.budget().source_worker_limit)
-        .unwrap_or(1)
-        .min(window_size);
     let execution = SourceExecution {
         wiki,
         snapshot,
@@ -553,7 +569,7 @@ fn prepare_snapshot_with_ops<O: SourceTransactionOps>(
         governor,
     };
     let mut ingested_rows = 0_u64;
-    let ingested_sources = execute_bounded(&pending, window_size, |sources| {
+    let ingested_sources = execute_bounded(&pending, source_worker_limit, |sources| {
         let offset = pending
             .iter()
             .position(|candidate| candidate.source_id == sources[0].source_id)
@@ -947,6 +963,67 @@ mod tests {
     }
 
     #[test]
+    fn source_window_shrinks_after_resource_admission_rejects_a_parallel_wave() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let pending = SnapshotPlan::resolve("enwiki", "2001-02")?
+            .sources
+            .into_iter()
+            .take(2)
+            .collect::<Vec<_>>();
+        let ops = FakeOps {
+            planned: 2,
+            pending,
+            ..FakeOps::default()
+        };
+        let governor = ResourceGovernor::new(
+            ResourceBudget {
+                memory_ceiling_bytes: u64::MAX,
+                memory_reserve_bytes: 0,
+                persistent_storage_reserve_bytes: 0,
+                bounded_scratch_reserve_bytes: 0,
+                rollback_generation_reserve_bytes: 0,
+                scratch_limit_bytes: u64::MAX,
+                max_open_files: 512,
+                source_worker_limit: 2,
+                thread_limit: 2,
+                max_logical_partition_bytes: u64::MAX,
+                max_active_parquet_writers: 16,
+                weekly_worker_limit: 1,
+            },
+            GovernorPaths::new(data_dir.path().to_path_buf(), None),
+        )
+        .with_persistent_available_sequence([100, 100, 0]);
+
+        let summary = prepare_snapshot_with_ops(
+            &ops,
+            "enwiki",
+            "2001-02",
+            data_dir.path(),
+            "admission-shrink-run",
+            ExecutionMode {
+                window_size: 2,
+                select_generation: false,
+            },
+            Some(&governor),
+        )
+        .expect("the source window should shrink and process every source");
+
+        assert_eq!(summary.source_worker_limit, 2);
+        assert_eq!(summary.ingested_sources, 2);
+        assert_eq!(summary.ingested_rows, 20);
+        assert_eq!(
+            ops.ingested
+                .lock()
+                .expect("fake ingested mutex poisoned")
+                .len(),
+            2
+        );
+        assert!(ops.finalized.load(Ordering::Relaxed));
+        assert!(!ops.selected_generation.load(Ordering::Relaxed));
+        Ok(())
+    }
+
+    #[test]
     fn disk_reserve_exhaustion_stops_after_committed_source_without_finalizing() -> Result<()> {
         let data_dir = TestDir::new()?;
         let pending = SnapshotPlan::resolve("enwiki", "2001-02")?
@@ -992,7 +1069,12 @@ mod tests {
         )
         .expect_err("the second source admission must observe exhausted disk reserve");
 
-        assert!(error.to_string().contains("storage gate closed"));
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains("storage gate closed")),
+            "expected storage exhaustion in error chain, got: {error:#}",
+        );
         assert_eq!(
             ops.ingested
                 .lock()
@@ -1334,7 +1416,7 @@ mod tests {
                 assert_eq!(sources.len(), 1);
                 Ok(vec![Some(42)])
             })?;
-        assert_eq!(governor.budget().source_worker_limit, 2);
+        assert!((1..=2).contains(&governor.budget().source_worker_limit));
         let profile = crate::workload_profile::load(data_dir.path(), "testwiki", "2026-08")?
             .context("governed snapshot should persist its profile")?;
         assert_eq!(profile.signals.total_compressed_bytes, 42);

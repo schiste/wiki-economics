@@ -49,7 +49,7 @@ impl WorkloadProfileName {
                 secondary_buckets: 8,
             },
             Self::Large => WorkloadParameters {
-                source_workers: 3,
+                source_workers: 4,
                 primary_buckets: 64,
                 secondary_buckets: 32,
             },

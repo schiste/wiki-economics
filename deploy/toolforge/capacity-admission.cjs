@@ -210,10 +210,10 @@ async function run() {
   const separator = process.argv.indexOf("--");
   const classIndex = process.argv.indexOf("--resource-class");
   if (separator < 0 || classIndex < 0 || classIndex + 1 >= separator || separator + 1 >= process.argv.length) {
-    throw new Error("Usage: capacity-admission.cjs --resource-class <small|medium_large> -- <command> [args...]");
+    throw new Error("Usage: capacity-admission.cjs --resource-class <small|medium_large|isolated|pipeline|qualification> -- <command> [args...]");
   }
   const resourceClass = process.argv[classIndex + 1];
-  if (!new Set(["small", "medium_large"]).has(resourceClass)) throw new Error(`Unsupported capacity class ${resourceClass}`);
+  if (!new Set(["small", "medium_large", "isolated", "pipeline", "qualification"]).has(resourceClass)) throw new Error(`Unsupported capacity class ${resourceClass}`);
   const outputDir = path.resolve(process.env.WIKI_ECON_OUTPUT_DIR || path.join(ROOT, "output"));
   const leaseRoot = path.resolve(process.env.WIKI_ECON_CAPACITY_LEASE_DIR || path.join(outputDir, "_capacity-admission"));
   const configFile = path.resolve(process.env.WIKI_ECON_CAPACITY_CONFIG || DEFAULT_CONFIG);

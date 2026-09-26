@@ -2,6 +2,12 @@
   "schema_version": 1,
   "declarations": [
     {
+      "family": "page_week",
+      "paths": ["src/compute/weekly/mod.rs"],
+      "reason": "Run primary page-week routing concurrently under governor permits while preserving ascending bucket reduction order; formulas, rows, totals, schemas, and artifact bytes remain unchanged.",
+      "base_commit": "aab14bd7f86fe0a92a35e7b3f9eb441e2a032b98"
+    },
+    {
       "family": "monthly",
       "paths": ["src/compute/mod.rs"],
       "reason": "Add ordered family-stage orchestration and receipt recording without changing monthly formulas or artifact bytes.",

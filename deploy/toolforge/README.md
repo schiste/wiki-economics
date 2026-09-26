@@ -138,12 +138,13 @@ and higher resource envelope are being qualified.
   a clean hidden sibling directory, then the stable `site-dist` symlink is
   atomically switched and the prior site release is removed. Raw `.bz2` dump
   cleanup happens inside the pipeline itself, not in this script. `wiki-econ
-  run` processes `WIKI_ECON_SOURCE_WINDOW_SIZE` planned sources at a time
-  (Toolforge defaults to one and rejects values outside 1–4). With that
-  default, one source is downloaded and ingested at a time; operators may
-  raise the window only after checking NFS headroom. The zero-capacity handoff
-  bounds raw staging to the selected window and keeps a single active Parquet
-  ingestion writer. Each source is downloaded to
+  run` processes up to `WIKI_ECON_SOURCE_WINDOW_SIZE` planned source IDs at a
+  time (Toolforge accepts 1–4). The scheduled one-CPU refresh defaults to one;
+  the publication-invisible enwiki qualification defaults to four on its
+  existing 4-CPU / 6-GiB job. Each source task reserves its expected raw bytes
+  and a bounded memory slice through download and ingest. If live disk or
+  memory headroom admits fewer tasks, the worker shrinks the next wave. Source
+  IDs write independent Parquet parts and durable markers. Each source is downloaded to
   pipeline-owned staging, stream-ingested, validated, committed
   with an atomic strict marker, and immediately deleted. This bounds compressed
   raw storage to the selected window instead of retaining the whole wiki dump.
@@ -222,12 +223,16 @@ and higher resource envelope are being qualified.
   or malformed status raises a public freshness alert and blocks later
   publication until a successful scrub. This job does not deploy or republish
   data.
-  Production Toolforge jobs still default `RAYON_NUM_THREADS` and
-  `POLARS_MAX_THREADS` to `1`, because the container currently sees eight host
-  CPUs regardless of its cgroup quota. Sequential raw/hash/ingest I/O uses Linux
-  cache-discard hints after durable writes or completed reads so reproducible
-  dump files do not consume the 6 GiB memory limit as retained page cache.
-  `WIKI_ECON_WEEKLY_WORKERS` likewise defaults to `1`. T436614-1 raised the
+  Scheduled production refresh still defaults `RAYON_NUM_THREADS` and
+  `POLARS_MAX_THREADS` to `1`, matching its one-CPU request. The isolated
+  four-CPU pipeline wrappers set both pools and the governor thread ceiling to
+  four. The enwiki page-week stage routes stable page-ID buckets in bounded
+  parallel waves, then merges them in bucket order through one output writer;
+  memory, scratch, and open-file reservations can reduce each wave below four.
+  Sequential raw/hash I/O uses Linux cache-discard hints after completed reads
+  so source files do not accumulate in the 6-GiB cgroup as page cache.
+  `WIKI_ECON_WEEKLY_WORKERS` stays at `1` for the scheduled refresh and is set
+  to the stage's four-CPU ceiling for the page-week pipeline job. T436614-1 raised the
   per-job ceiling from 3 to 4 CPUs, so the separate publication-invisible CPU
   matrix in `cpu-qualification-jobs.yaml` can now measure all 1/2/4-CPU
   profiles for nlwiki, ptwiki, and frwiki before any production default
@@ -265,21 +270,30 @@ two writers for the same wiki or two public release switches.
 See [the candidate publication runbook](../../docs/candidate-publication.md)
 for transaction state, rollback, and inspection commands.
 
-### Legacy refresh single-flight lock
+### Refresh admission locks
 
 Every scheduled or manual Toolforge refresh must enter through
-`deploy/toolforge/run-refresh.sh`. The wrapper acquires an atomic NFS
-directory lock at `$WIKI_ECON_OUTPUT_DIR/.refresh-lock` before it resolves or
-downloads a snapshot. A second refresh exits with status `75`; importantly,
-that rejected run does not replace `.refresh-status.json`, so monitoring keeps
-reporting the last pipeline run that actually owned the publication path.
+`deploy/toolforge/run-refresh.sh`. Scheduled and monolithic refreshes hold the
+atomic NFS directory lock `$WIKI_ECON_OUTPUT_DIR/.refresh-lock`. Pipeline
+stages hold `.refresh-lock-<stage>` locks. A short `.refresh-admission-lock`
+serializes refresh-mode admission: a full refresh refuses to start while any
+pipeline stage owns a lock, and pipeline stages refuse to start while a full
+refresh owns its lock. Each pipeline stage also holds a live `pipeline` lease
+in `_capacity-admission`, shared with fleet workers. Independent pipeline
+stages can overlap within both the static capacity limit and live remaining
+capacity; the coordinator rejects duplicates and keeps publish as a join
+barrier. Monolithic/compatibility refreshes take an `isolated` lease, site-only
+jobs take a `small` lease, and enwiki qualification takes the `qualification`
+four-CPU lease.
 
-The lock's `owner.json` records the run ID, UTC start time, PID, Toolforge job
-identity, pod/process identity, selected snapshot, owner token, and heartbeat.
-Snapshot resolution happens once after acquisition, and the resulting version
-is written into the lock before the pipeline is invoked with an explicit
-`--version`. This makes both the lock record and the whole refresh refer to the
-same immutable input generation.
+A rejected run exits with status `75` and does not replace
+`.refresh-status.json`, so monitoring continues to report the last run that
+owned the publication path.
+
+Each long-lived lock's `owner.json` records the run ID, UTC start time, PID,
+Toolforge job identity, pod/process identity, selected snapshot, owner token,
+and heartbeat. A staged ingest resolves the snapshot once; later stages read
+that immutable snapshot and wiki set from `.pipeline-state.json`.
 
 The heartbeat is updated every 60 seconds. A lock from another pod is eligible
 for recovery only after six hours without a heartbeat, is observed stale a
@@ -296,9 +310,15 @@ The safety windows can be tuned with
 `WIKI_ECON_REFRESH_LOCK_HEARTBEAT_SECS`,
 `WIKI_ECON_REFRESH_LOCK_STALE_SECS`, and
 `WIKI_ECON_REFRESH_LOCK_RECHECK_SECS`. `WIKI_ECON_REFRESH_LOCK_DIR` is useful
-only for isolated tests; production runs should share the default path.
+only for isolated tests; leave it unset in production so the admission protocol
+can distinguish pipeline stages from full refreshes.
 `WIKI_ECON_JOB_IDENTITY` may provide a human-readable job label, while
 `WIKI_ECON_PROCESS_IDENTITY` should remain unique to a pod or host if set.
+
+Pipeline stage records live under `$WIKI_ECON_OUTPUT_DIR/.pipeline-status/`,
+with per-stage histories under `.pipeline-history/`. The publish join mirrors
+its record to the normal `.refresh-status.json` and updates successful
+publication markers.
 
 The same heartbeat publishes a schema-versioned live run record immediately
 after lock acquisition, including current stage, resource/provenance data, and
@@ -307,16 +327,25 @@ context, and the published site generation; 104 compact weekly entries are
 retained by default. See the [refresh run record](../../docs/run-record.md) for
 the field contract and operator checks.
 
-### Sequential low-memory pipeline
+### Low-memory pipeline with parallel compute stages
 
-For a large wiki such as enwiki, start the six unscheduled Jobs in this order:
+For a large wiki such as enwiki, start ingest first. After it succeeds, the
+metrics, lifecycle, page-week, and patrol stages can run independently. The
+pipeline state coordinator derives the concurrent stage limit from
+`config/toolforge-capacity.json`; with the current 16-CPU / 24-GiB namespace,
+6-GiB job ceiling, and reserved service/admin/publisher resources, it admits two
+compute stages at once. Each stage also takes a four-CPU/six-GiB lease in the
+shared capacity ledger used by fleet workers, so active fleet jobs can reduce
+that live limit below two. If admission returns status 75, no stage receipt is
+created; retry after a worker lease is released. Run the remaining stages after
+a slot becomes available. Publish is a join barrier and is rejected until all
+four compute-stage receipts have succeeded:
 
 1. `wiki-econ-pipeline-ingest` — fetch, ingest, and source cleanup.
-2. `wiki-econ-pipeline-metrics` — monthly and activity-tier metrics.
-3. `wiki-econ-pipeline-lifecycle` — external, sorted-run lifecycle metrics.
-4. `wiki-econ-pipeline-page-week` — external page-week aggregation.
-5. `wiki-econ-pipeline-patrol` — patrol computation and per-wiki validation.
-6. `wiki-econ-pipeline-publish` — merge, publication validation, site build,
+2. Any two of `wiki-econ-pipeline-metrics`, `wiki-econ-pipeline-lifecycle`,
+   `wiki-econ-pipeline-page-week`, and `wiki-econ-pipeline-patrol`.
+3. The remaining compute stages after a worker slot frees.
+4. `wiki-econ-pipeline-publish` — merge, publication validation, site build,
    and snapshot finalization.
 
 Qualification wikis are hidden from the scheduled resolver. Before starting
@@ -337,10 +366,13 @@ fleet should remain unchanged. Later stages read the wiki set from
 The Jobs Framework has no dependency primitive, so `pipeline-state.cjs` is the
 NFS-backed dependency gate. Ingest records the selected snapshot and wiki set;
 each later job reads that exact state and refuses a different snapshot, wiki
-set, overlap, or out-of-order start. A failed stage can be retried after the
-same stage's receipt is inspected. A lease older than
+set, unmet prerequisite, duplicate stage, or capacity overrun. A failed stage
+can be retried after the same stage's receipt is inspected and all active
+compute jobs have stopped. Each active stage refreshes its state heartbeat alongside the refresh-lock
+heartbeat. Only a lease with no heartbeat for
 `WIKI_ECON_PIPELINE_STALE_SECS` (six hours by default) is marked failed before
-retry, which makes pod eviction recoverable without manually editing state.
+retry, which makes pod eviction recoverable without treating a long healthy job
+as stale.
 
 Inspect the coordinator from the tool account with:
 
@@ -368,11 +400,13 @@ become wiki-economics toolforge jobs run \
   wiki-econ-site
 ```
 
-All refresh jobs still serialize through `run-refresh.sh`'s single shared
-`.refresh-lock` (see below), so a stage cannot race a scheduled refresh or a
-second stage. Each stage also publishes its own live `.refresh-status.json`
-record; the shared `.pipeline-state.json` links those six records into one
-ingest→publish generation.
+A short admission lock prevents pipeline stages from racing scheduled refreshes.
+Independent compute stages may overlap within the capacity limit, while the
+coordinator rejects duplicate work and holds publication until all receipts are
+complete. Ingest owns stale-artifact and release cleanup before fan-out. Each
+stage writes a separate record below `.pipeline-status/`; `.pipeline-state.json`
+ties its receipts to one ingest→publish generation. Publish mirrors its final
+record to `.refresh-status.json` for existing monitoring.
 
 ## Runbook
 
@@ -466,6 +500,12 @@ toolforge jobs run --image tool-wiki-economics/tool-wiki-economics:latest \
   --command 'deploy/toolforge/run-qualify-wiki.sh itwiki' \
   --filelog --mount all --mem 6Gi --cpu 1 wiki-econ-qualify-itwiki
 ```
+
+For the frozen enwiki qualification, request its full current pod ceiling with
+`--mem 6Gi --cpu 4`. The wrapper reads the cgroup CPU quota and defaults
+Rayon, Polars, source, and page-week workers to that allocation; it rejects
+pool settings above the job's quota. The resource governor can still reduce
+concurrent waves when memory, disk, scratch, or file-descriptor headroom is low.
 
 The wrapper writes only below
 `/data/project/wiki-economics/capacity/qualifications`; it does not change a

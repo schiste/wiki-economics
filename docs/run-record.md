@@ -1,10 +1,12 @@
 # Refresh run record
 
-Toolforge refresh health is published atomically to
+The current full-refresh or publication run is published atomically to
 `output/.refresh-status.json`. Unlike the original exit-only marker, schema
-version 2 is created immediately after the single-flight lock is acquired and
-is refreshed for the lifetime of the job. A previous success therefore cannot
-masquerade as the current state of a hung or failed refresh.
+version 2 is created immediately after refresh admission and is refreshed for
+the lifetime of the job. Pipeline compute stages write independent records to
+`output/.pipeline-status/<stage>.json`; the publish join mirrors its record to
+the site-wide status. A previous success therefore cannot masquerade as the
+current state of a hung or failed publication.
 
 ## State and heartbeat
 
@@ -16,12 +18,14 @@ seconds. `heartbeatAt`, `currentStage`, `currentWiki`, `startedAt`, and
 exited.
 
 The wrapper stops that background writer before emitting the terminal record.
-This gives `.refresh-status.json` one writer at a time and prevents a late
-heartbeat from replacing `succeeded` or `failed` with `running`. Every update
-uses a temporary sibling plus an atomic rename on the shared NFS filesystem.
-If either lock or status heartbeat publication fails, the wrapper terminates
-the refresh rather than continuing without trustworthy single-flight and
-health evidence.
+Full refresh and publish each have one writer for `.refresh-status.json`;
+independent compute stages write different status files. Within each run, the
+wrapper stops its background writer before emitting the terminal record, so a
+late heartbeat cannot replace `succeeded` or `failed` with `running`. Every
+update uses a temporary sibling plus an atomic rename on the shared NFS
+filesystem. If lock or status heartbeat publication fails, the wrapper
+terminates rather than continuing without trustworthy admission and health
+evidence.
 
 ## Recorded data
 
@@ -72,9 +76,11 @@ heartbeat and becomes visible on its next pass.
 
 ## History and operator checks
 
-Only terminal records enter `output/.refresh-history.jsonl`. The writer keeps
-104 compact, deduplicated entries—two years at the weekly schedule—and rewrites
-the bounded file atomically. Set `WIKI_ECON_REFRESH_HISTORY_LIMIT` to a value
+Only terminal full-refresh and publish records enter
+`output/.refresh-history.jsonl`. Pipeline compute stages keep separate
+histories in `output/.pipeline-history/<stage>.jsonl`. Each history keeps 104
+compact, deduplicated entries—two years at the weekly schedule—and rewrites its
+bounded file atomically. Set `WIKI_ECON_REFRESH_HISTORY_LIMIT` to a value
 from 52 through 104 to retain between one and two years; out-of-range values
 are clamped.
 

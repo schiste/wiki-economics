@@ -177,7 +177,8 @@ test("an active refresh owns metadata, rejects overlap, and releases cleanly", a
   assert.equal(owner.job_identity, "test-toolforge-job");
   assert.equal(owner.process_identity, "test-toolforge-process");
   assert.equal(owner.selected_snapshot, "2026-07");
-  assert.equal(owner.pid, first.pid);
+  assert.ok(Number.isSafeInteger(owner.pid) && owner.pid > 0);
+  assert.doesNotThrow(() => process.kill(owner.pid, 0));
   assert.match(owner.started_at, /^\d{4}-\d{2}-\d{2}T/);
 
   const liveStatus = await waitForStatus(

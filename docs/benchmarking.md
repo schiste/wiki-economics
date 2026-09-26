@@ -155,6 +155,15 @@ therefore run. Production remains at one thread until the complete matrix
 selects a deterministic profile with at least 15% aggregate wall-time speedup
 and at least 25% memory headroom.
 
+The isolated enwiki qualification is a separate, publication-invisible
+workflow pinned to the frozen 2026-08 snapshot. Its existing job requests four
+CPUs and 6 GiB, so qualification now uses a four-thread ceiling, up to four
+source-ID workers, and up to four weekly bucket workers. The resource governor
+admits workers against current cgroup memory, raw-file disk reservations,
+scratch space, and file descriptors, and reduces a wave when fewer workers
+fit. The candidate remains publication-ineligible until both required run
+kinds and all stage receipts pass.
+
 ```sh
 toolforge jobs load --job wiki-econ-cpu-nl-c1-t1-w1 \
   deploy/toolforge/cpu-qualification-jobs.yaml

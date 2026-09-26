@@ -35,40 +35,9 @@ export CARGO_TERM_COLOR=never
 export NO_COLOR=1
 export OBSERVABLE_TELEMETRY_DISABLE=true
 export WIKI_ECON_LOG_ANSI=0
-# The job requests one CPU, but Toolforge's container cpuset currently exposes
-# eight host CPUs. Match data-parallel pools to the real quota by default.
-export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-1}"
-export POLARS_MAX_THREADS="${POLARS_MAX_THREADS:-1}"
-# Fail before a source transaction or logical partition can consume the
-# reserves required to finish already-admitted work. These defaults describe
-# the current maximum 6 GiB Toolforge job. If Toolforge grants a different
-# per-job ceiling later, change these values only with a matching qualification
-# receipt; the pipeline must not assume an unavailable 16 GiB profile.
-export WIKI_ECON_MEMORY_CEILING_BYTES="${WIKI_ECON_MEMORY_CEILING_BYTES:-6442450944}"
-export WIKI_ECON_MEMORY_RESERVE_BYTES="${WIKI_ECON_MEMORY_RESERVE_BYTES:-1610612736}"
-export WIKI_ECON_PERSISTENT_STORAGE_RESERVE_BYTES="${WIKI_ECON_PERSISTENT_STORAGE_RESERVE_BYTES:-10737418240}"
-export WIKI_ECON_BOUNDED_SCRATCH_RESERVE_BYTES="${WIKI_ECON_BOUNDED_SCRATCH_RESERVE_BYTES:-8589934592}"
-export WIKI_ECON_ROLLBACK_GENERATION_RESERVE_BYTES="${WIKI_ECON_ROLLBACK_GENERATION_RESERVE_BYTES:-8589934592}"
-export WIKI_ECON_SCRATCH_LIMIT_BYTES="${WIKI_ECON_SCRATCH_LIMIT_BYTES:-68719476736}"
-export WIKI_ECON_MAX_OPEN_FILES="${WIKI_ECON_MAX_OPEN_FILES:-512}"
-export WIKI_ECON_SOURCE_WORKERS="${WIKI_ECON_SOURCE_WORKERS:-1}"
-export WIKI_ECON_REQUIRE_QUALIFIED_PROFILE=1
-export WIKI_ECON_THREAD_LIMIT="${WIKI_ECON_THREAD_LIMIT:-1}"
-export WIKI_ECON_MAX_LOGICAL_PARTITION_BYTES="${WIKI_ECON_MAX_LOGICAL_PARTITION_BYTES:-8589934592}"
-export WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS="${WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS:-16}"
-# Keep raw history storage bounded. Operators may raise this to 2–4 after
-# checking NFS headroom; one source is the fail-safe Toolforge default.
-WIKI_ECON_SOURCE_WINDOW_SIZE="${WIKI_ECON_SOURCE_WINDOW_SIZE:-1}"
-if [[ ! "$WIKI_ECON_SOURCE_WINDOW_SIZE" =~ ^[1-4]$ ]]; then
-  echo "Toolforge refresh requires WIKI_ECON_SOURCE_WINDOW_SIZE between 1 and 4 (got: $WIKI_ECON_SOURCE_WINDOW_SIZE)" >&2
-  exit 2
-fi
-export WIKI_ECON_SOURCE_WINDOW_SIZE
-# Rust owns the weekly layout and rejects configurations absent from the
-# checked-in capacity qualification registry before expensive work starts.
-# Which portion of the pipeline to run. `all` (the weekly scheduled job) runs
-# everything; the six named stages are resumable on-demand jobs. `compute` and
-# `site` remain compatibility entry points for the older monolithic workflow.
+# Stage-specific wrappers request four CPUs for the resumable large-wiki
+# pipeline. Keep the scheduled one-CPU refresh on one thread, while using the
+# full declared quota inside each isolated pipeline job.
 REFRESH_STAGE="${WIKI_ECON_REFRESH_STAGE:-all}"
 case "$REFRESH_STAGE" in
   all|ingest|metrics|lifecycle|page-week|patrol|publish|compute|site) ;;
@@ -83,6 +52,78 @@ if [ "$PIPELINE_MODE" != "0" ] && [ "$PIPELINE_MODE" != "1" ]; then
   exit 2
 fi
 if [ "$PIPELINE_MODE" = "1" ]; then
+  export WIKI_ECON_THREAD_LIMIT="${WIKI_ECON_THREAD_LIMIT:-4}"
+  export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-$WIKI_ECON_THREAD_LIMIT}"
+  export POLARS_MAX_THREADS="${POLARS_MAX_THREADS:-$WIKI_ECON_THREAD_LIMIT}"
+  case "$REFRESH_STAGE" in
+    ingest)
+      export WIKI_ECON_SOURCE_WORKERS="${WIKI_ECON_SOURCE_WORKERS:-$WIKI_ECON_THREAD_LIMIT}"
+      export WIKI_ECON_SOURCE_WINDOW_SIZE="${WIKI_ECON_SOURCE_WINDOW_SIZE:-4}"
+      export WIKI_ECON_WEEKLY_WORKERS="${WIKI_ECON_WEEKLY_WORKERS:-1}"
+      export WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS="${WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS:-16}"
+      ;;
+    page-week)
+      export WIKI_ECON_SOURCE_WORKERS="${WIKI_ECON_SOURCE_WORKERS:-1}"
+      export WIKI_ECON_SOURCE_WINDOW_SIZE="${WIKI_ECON_SOURCE_WINDOW_SIZE:-1}"
+      export WIKI_ECON_WEEKLY_WORKERS="${WIKI_ECON_WEEKLY_WORKERS:-$WIKI_ECON_THREAD_LIMIT}"
+      export WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS="${WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS:-32}"
+      ;;
+    *)
+      export WIKI_ECON_SOURCE_WORKERS="${WIKI_ECON_SOURCE_WORKERS:-1}"
+      export WIKI_ECON_SOURCE_WINDOW_SIZE="${WIKI_ECON_SOURCE_WINDOW_SIZE:-1}"
+      export WIKI_ECON_WEEKLY_WORKERS="${WIKI_ECON_WEEKLY_WORKERS:-1}"
+      export WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS="${WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS:-16}"
+      ;;
+  esac
+else
+  export RAYON_NUM_THREADS="${RAYON_NUM_THREADS:-1}"
+  export POLARS_MAX_THREADS="${POLARS_MAX_THREADS:-1}"
+  export WIKI_ECON_THREAD_LIMIT="${WIKI_ECON_THREAD_LIMIT:-1}"
+  export WIKI_ECON_SOURCE_WORKERS="${WIKI_ECON_SOURCE_WORKERS:-1}"
+  export WIKI_ECON_SOURCE_WINDOW_SIZE="${WIKI_ECON_SOURCE_WINDOW_SIZE:-1}"
+  export WIKI_ECON_WEEKLY_WORKERS="${WIKI_ECON_WEEKLY_WORKERS:-1}"
+  export WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS="${WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS:-16}"
+fi
+if [ "${WIKI_ECON_CAPACITY_ADMITTED:-0}" != "1" ]; then
+  if [ "$PIPELINE_MODE" = "1" ]; then
+    case "$REFRESH_STAGE" in
+      ingest|metrics|lifecycle|page-week|patrol|publish)
+        REFRESH_RESOURCE_CLASS=pipeline
+        ;;
+      *)
+        REFRESH_RESOURCE_CLASS=isolated
+        ;;
+    esac
+  elif [ "$REFRESH_STAGE" = "site" ]; then
+    REFRESH_RESOURCE_CLASS=small
+  else
+    REFRESH_RESOURCE_CLASS=isolated
+  fi
+  exec node "$ROOT/deploy/toolforge/capacity-admission.cjs" \
+    --resource-class "$REFRESH_RESOURCE_CLASS" -- "$0" "$@"
+fi
+# Fail before a source transaction or logical partition can consume the
+# reserves required to finish already-admitted work. These defaults describe
+# the current maximum 6 GiB Toolforge job. If Toolforge grants a different
+# per-job ceiling later, change these values only with a matching qualification
+# receipt; the pipeline must not assume an unavailable 16 GiB profile.
+export WIKI_ECON_MEMORY_CEILING_BYTES="${WIKI_ECON_MEMORY_CEILING_BYTES:-6442450944}"
+export WIKI_ECON_MEMORY_RESERVE_BYTES="${WIKI_ECON_MEMORY_RESERVE_BYTES:-1610612736}"
+export WIKI_ECON_PERSISTENT_STORAGE_RESERVE_BYTES="${WIKI_ECON_PERSISTENT_STORAGE_RESERVE_BYTES:-10737418240}"
+export WIKI_ECON_BOUNDED_SCRATCH_RESERVE_BYTES="${WIKI_ECON_BOUNDED_SCRATCH_RESERVE_BYTES:-8589934592}"
+export WIKI_ECON_ROLLBACK_GENERATION_RESERVE_BYTES="${WIKI_ECON_ROLLBACK_GENERATION_RESERVE_BYTES:-8589934592}"
+export WIKI_ECON_SCRATCH_LIMIT_BYTES="${WIKI_ECON_SCRATCH_LIMIT_BYTES:-68719476736}"
+export WIKI_ECON_MAX_OPEN_FILES="${WIKI_ECON_MAX_OPEN_FILES:-512}"
+export WIKI_ECON_REQUIRE_QUALIFIED_PROFILE=1
+export WIKI_ECON_MAX_LOGICAL_PARTITION_BYTES="${WIKI_ECON_MAX_LOGICAL_PARTITION_BYTES:-8589934592}"
+if [[ ! "$WIKI_ECON_SOURCE_WINDOW_SIZE" =~ ^[1-4]$ ]]; then
+  echo "Toolforge refresh requires WIKI_ECON_SOURCE_WINDOW_SIZE between 1 and 4 (got: $WIKI_ECON_SOURCE_WINDOW_SIZE)" >&2
+  exit 2
+fi
+export WIKI_ECON_SOURCE_WINDOW_SIZE
+# Rust owns the weekly layout and rejects configurations absent from the
+# checked-in capacity qualification registry before expensive work starts.
+if [ "$PIPELINE_MODE" = "1" ]; then
   # The isolated qualification jobs are admitted at the existing 4-vCPU
   # Toolforge limit. Keep the receipt explicit about the requested contract;
   # operators can override this only when the job manifest changes with it.
@@ -90,6 +131,7 @@ if [ "$PIPELINE_MODE" = "1" ]; then
 fi
 PIPELINE_STAGE_ACTIVE=0
 PIPELINE_STATE_HELPER="$ROOT/deploy/toolforge/pipeline-state.cjs"
+export PIPELINE_STATE_HELPER
 PIPELINE_STATE_FILE="${WIKI_ECON_PIPELINE_STATE_FILE:-}"
 PIPELINE_ID=""
 QUALIFICATION_RECEIPT_HELPER="$ROOT/deploy/toolforge/qualification-receipt.cjs"
@@ -238,22 +280,147 @@ start_refresh_lock_heartbeat() {
         kill -TERM "$$"
         exit 1
       fi
+      if [ -f pipeline-stage-active ] &&
+         ! node "$PIPELINE_STATE_HELPER" heartbeat \
+           --state "$PIPELINE_STATE_FILE" \
+           --stage "$WIKI_ECON_REFRESH_STAGE" \
+           --run-id "$WIKI_ECON_RUN_ID" >/dev/null; then
+        echo "Pipeline state heartbeat failed; terminating run $WIKI_ECON_RUN_ID" >&2
+        kill -TERM "$$"
+        exit 1
+      fi
     done
   ) &
   REFRESH_LOCK_HEARTBEAT_PID=$!
 }
 
+refresh_admission_lock_is_stale() {
+  node - "$1" <<'NODE'
+const fs = require("node:fs");
+try {
+  process.exit(Date.now() - fs.statSync(process.argv[2]).mtimeMs > 120_000 ? 0 : 1);
+} catch {
+  process.exit(0);
+}
+NODE
+}
+
+acquire_refresh_admission_lock() {
+  local admission_lock="$WIKI_ECON_OUTPUT_DIR/.refresh-admission-lock"
+  local deadline=$(( $(date +%s) + 30 ))
+  REFRESH_ADMISSION_LOCK_OWNED=0
+  while true; do
+    if mkdir "$admission_lock" 2>/dev/null; then
+      if ! printf '%s\n' "$REFRESH_LOCK_TOKEN" > "$admission_lock/owner-token"; then
+        rm -rf "$admission_lock"
+        return 1
+      fi
+      REFRESH_ADMISSION_LOCK_OWNED=1
+      return 0
+    fi
+    if refresh_admission_lock_is_stale "$admission_lock"; then
+      local stale_dir="${admission_lock}.stale.$$.$RANDOM"
+      if mv "$admission_lock" "$stale_dir" 2>/dev/null; then
+        rm -rf "$stale_dir"
+        continue
+      fi
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      echo "Timed out acquiring refresh admission lock: $admission_lock" >&2
+      return 1
+    fi
+    sleep 0.1
+  done
+}
+
+release_refresh_admission_lock() {
+  local admission_lock="$WIKI_ECON_OUTPUT_DIR/.refresh-admission-lock"
+  if [ "${REFRESH_ADMISSION_LOCK_OWNED:-0}" -eq 1 ] &&
+     [ -f "$admission_lock/owner-token" ] &&
+     [ "$(<"$admission_lock/owner-token")" = "$REFRESH_LOCK_TOKEN" ]; then
+    rm -rf "$admission_lock"
+  fi
+  REFRESH_ADMISSION_LOCK_OWNED=0
+}
+
 acquire_refresh_lock() {
-  local attempt stale_dir token_before token_after
+  local attempt stale_dir token_before token_after default_lock candidate incompatible_lock own_lock
   validate_lock_integer WIKI_ECON_REFRESH_LOCK_HEARTBEAT_SECS "$REFRESH_LOCK_HEARTBEAT_SECS"
   validate_lock_integer WIKI_ECON_REFRESH_LOCK_STALE_SECS "$REFRESH_LOCK_STALE_SECS"
   validate_lock_integer WIKI_ECON_REFRESH_LOCK_RECHECK_SECS "$REFRESH_LOCK_RECHECK_SECS" 1
 
-  REFRESH_LOCK_DIR="${WIKI_ECON_REFRESH_LOCK_DIR:-$WIKI_ECON_OUTPUT_DIR/.refresh-lock}"
+  if pipeline_stage_enabled; then
+    default_lock="$WIKI_ECON_OUTPUT_DIR/.refresh-lock-$REFRESH_STAGE"
+  else
+    default_lock="$WIKI_ECON_OUTPUT_DIR/.refresh-lock"
+  fi
+  REFRESH_LOCK_DIR="${WIKI_ECON_REFRESH_LOCK_DIR:-$default_lock}"
   mkdir -p "$(dirname "$REFRESH_LOCK_DIR")"
 
   for attempt in 1 2 3; do
+    if ! acquire_refresh_admission_lock; then
+      return 75
+    fi
+    incompatible_lock=""
+    if pipeline_stage_enabled; then
+      for candidate in "$WIKI_ECON_OUTPUT_DIR/.refresh-lock" "${WIKI_ECON_REFRESH_LOCK_DIR:-}"; do
+        [ -n "$candidate" ] || continue
+        if [ "$candidate" != "$REFRESH_LOCK_DIR" ] && [ -d "$candidate" ]; then
+          incompatible_lock="$candidate"
+          break
+        fi
+      done
+      if [ -z "$incompatible_lock" ]; then
+        if [ "$REFRESH_STAGE" = "ingest" ]; then
+          for candidate in \
+            "$WIKI_ECON_OUTPUT_DIR/.refresh-lock-metrics" \
+            "$WIKI_ECON_OUTPUT_DIR/.refresh-lock-lifecycle" \
+            "$WIKI_ECON_OUTPUT_DIR/.refresh-lock-page-week" \
+            "$WIKI_ECON_OUTPUT_DIR/.refresh-lock-patrol" \
+            "$WIKI_ECON_OUTPUT_DIR/.refresh-lock-publish"; do
+            if [ -d "$candidate" ]; then
+              incompatible_lock="$candidate"
+              break
+            fi
+          done
+        else
+          candidate="$WIKI_ECON_OUTPUT_DIR/.refresh-lock-ingest"
+          if [ "$candidate" != "$REFRESH_LOCK_DIR" ] && [ -d "$candidate" ]; then
+            incompatible_lock="$candidate"
+          fi
+        fi
+      fi
+    else
+      for candidate in "$WIKI_ECON_OUTPUT_DIR"/.refresh-lock-*; do
+        [ -d "$candidate" ] || continue
+        [ "$candidate" != "$REFRESH_LOCK_DIR" ] || continue
+        incompatible_lock="$candidate"
+        break
+      done
+    fi
+    if [ -n "$incompatible_lock" ] && refresh_lock_is_stale "$incompatible_lock"; then
+      token_before="$(cat "$incompatible_lock/owner-token" 2>/dev/null || true)"
+      sleep "$WIKI_ECON_REFRESH_LOCK_RECHECK_SECS"
+      token_after="$(cat "$incompatible_lock/owner-token" 2>/dev/null || true)"
+      if [ "$token_before" = "$token_after" ] && refresh_lock_is_stale "$incompatible_lock"; then
+        stale_dir="${incompatible_lock}.stale.${REFRESH_START_EPOCH}.$$.$attempt"
+        if mv "$incompatible_lock" "$stale_dir" 2>/dev/null; then
+          echo "==> Recovered demonstrably stale incompatible refresh lock: $token_after" >&2
+          rm -rf "$stale_dir"
+          incompatible_lock=""
+        fi
+      fi
+    fi
+    if [ -n "$incompatible_lock" ]; then
+      own_lock="$REFRESH_LOCK_DIR"
+      REFRESH_LOCK_DIR="$incompatible_lock"
+      report_refresh_lock_owner
+      REFRESH_LOCK_DIR="$own_lock"
+      release_refresh_admission_lock
+      return 75
+    fi
     if mkdir "$REFRESH_LOCK_DIR" 2>/dev/null; then
+      release_refresh_admission_lock
       chmod 700 "$REFRESH_LOCK_DIR"
       printf '%s\n' "$REFRESH_LOCK_TOKEN" > "$REFRESH_LOCK_DIR/owner-token"
       if ! (
@@ -267,6 +434,7 @@ acquire_refresh_lock() {
       echo "==> Acquired refresh lock: $REFRESH_LOCK_DIR"
       return 0
     fi
+    release_refresh_admission_lock
 
     if ! refresh_lock_is_stale "$REFRESH_LOCK_DIR"; then
       report_refresh_lock_owner
@@ -362,8 +530,22 @@ initialize_refresh_run_record() {
   WIKI_ECON_RUN_RECORD_HELPER="$RUN_RECORD_HELPER"
   WIKI_ECON_RUN_STATE_FILE="$REFRESH_LOCK_DIR/run-state"
   WIKI_ECON_RUN_SNAPSHOT_FILE="$REFRESH_LOCK_DIR/selected-snapshot"
-  WIKI_ECON_RUN_STATUS_FILE="$WIKI_ECON_OUTPUT_DIR/.refresh-status.json"
-  WIKI_ECON_RUN_HISTORY_FILE="$WIKI_ECON_OUTPUT_DIR/.refresh-history.jsonl"
+  WIKI_ECON_RUN_STATUS_MIRROR_FILE=""
+  if pipeline_stage_enabled; then
+    local pipeline_status_dir="$WIKI_ECON_OUTPUT_DIR/.pipeline-status"
+    mkdir -p "$pipeline_status_dir"
+    WIKI_ECON_RUN_STATUS_FILE="$pipeline_status_dir/$REFRESH_STAGE.json"
+    if [ "$REFRESH_STAGE" = "publish" ]; then
+      # The publish join updates the site-wide status and successful publication markers.
+      WIKI_ECON_RUN_STATUS_MIRROR_FILE="$WIKI_ECON_OUTPUT_DIR/.refresh-status.json"
+      WIKI_ECON_RUN_HISTORY_FILE="$WIKI_ECON_OUTPUT_DIR/.refresh-history.jsonl"
+    else
+      WIKI_ECON_RUN_HISTORY_FILE="$WIKI_ECON_OUTPUT_DIR/.pipeline-history/$REFRESH_STAGE.jsonl"
+    fi
+  else
+    WIKI_ECON_RUN_STATUS_FILE="$WIKI_ECON_OUTPUT_DIR/.refresh-status.json"
+    WIKI_ECON_RUN_HISTORY_FILE="$WIKI_ECON_OUTPUT_DIR/.refresh-history.jsonl"
+  fi
   WIKI_ECON_RUN_PUBLICATION_FILE="$WIKI_ECON_OUTPUT_DIR/publication-gate.json"
   WIKI_ECON_RUN_STARTED_AT="$REFRESH_STARTED_AT"
   WIKI_ECON_RUN_START_EPOCH="$REFRESH_START_EPOCH"
@@ -374,6 +556,7 @@ initialize_refresh_run_record() {
   export WIKI_ECON_RUN_EVENTS_FILE WIKI_ECON_RUN_RECORD_HELPER WIKI_ECON_RUN_STATE_FILE
   export WIKI_ECON_RUN_SNAPSHOT_FILE WIKI_ECON_RUN_STATUS_FILE
   export WIKI_ECON_RUN_HISTORY_FILE WIKI_ECON_RUN_PUBLICATION_FILE
+  export WIKI_ECON_RUN_STATUS_MIRROR_FILE
   export WIKI_ECON_RUN_STARTED_AT WIKI_ECON_RUN_START_EPOCH WIKI_ECON_RUN_WIKIS_JSON
   export WIKI_ECON_SOURCE_COMMIT WIKI_ECON_BINARY_SOURCE_COMMIT WIKI_ECON_BINARY_SHA256
   export WIKI_ECON_IMAGE_SOURCE_REF WIKI_ECON_IMAGE_SOURCE_COMMIT WIKI_ECON_IMAGE_DIGEST
@@ -511,6 +694,7 @@ begin_pipeline_stage() {
   ')"
   export WIKI_ECON_PIPELINE_ID="$PIPELINE_ID"
   export WIKI_ECON_PIPELINE_STATE_FILE="$PIPELINE_STATE_FILE"
+  : > "$REFRESH_LOCK_DIR/pipeline-stage-active"
   PIPELINE_STAGE_ACTIVE=1
   echo "==> Pipeline lease acquired: pipeline_id=$PIPELINE_ID stage=$REFRESH_STAGE snapshot=$SELECTED_SNAPSHOT"
 }
@@ -590,7 +774,7 @@ finish_refresh() {
     fi
   fi
   if [ "$exit_code" -ne 0 ]; then
-    echo "!!! REFRESH FAILED run_id=$WIKI_ECON_RUN_ID stage=${REFRESH_FAILURE_STAGE:-unknown} exit_code=$exit_code error=${REFRESH_FAILURE_ERROR:-unknown refresh failure} log_file=${REFRESH_LOG_FILE:-unknown} status_file=$WIKI_ECON_OUTPUT_DIR/.refresh-status.json" >&2
+    echo "!!! REFRESH FAILED run_id=$WIKI_ECON_RUN_ID stage=${REFRESH_FAILURE_STAGE:-unknown} exit_code=$exit_code error=${REFRESH_FAILURE_ERROR:-unknown refresh failure} log_file=${REFRESH_LOG_FILE:-unknown} status_file=${WIKI_ECON_RUN_STATUS_FILE:-$WIKI_ECON_OUTPUT_DIR/.refresh-status.json}" >&2
   fi
   echo "=== wiki-economics refresh end run_id=$WIKI_ECON_RUN_ID exit_code=$exit_code at=$(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
   release_refresh_lock
@@ -672,6 +856,7 @@ if [ -z "${WIKI_ECON_BIN:-}" ]; then
   echo "Toolforge refresh requires WIKI_ECON_BIN for snapshot resolution" >&2
   exit 1
 fi
+if ! pipeline_stage_enabled || [ "$REFRESH_STAGE" = "ingest" ]; then
 CLEANUP_STARTED_EPOCH="$(date +%s)"
 wiki_econ_record_stage_event started cleanup_stale
 declare -a cleanup_cmd=(
@@ -710,6 +895,9 @@ wiki_econ_record_stage_event completed cleanup_stale "" \
   "$(( ($(date +%s) - CLEANUP_STARTED_EPOCH) * 1000 ))"
 echo "==> Abandoned artifact cleanup: $cleanup_summary"
 echo "==> Binary release cleanup: $release_cleanup_summary"
+else
+  echo "==> Skipping stale artifact and release cleanup; ingest owns pipeline cleanup"
+fi
 refresh_driver="${WIKI_ECON_REFRESH_DRIVER:-$ROOT/scripts/refresh.sh}"
 declare -a refresh_driver_cmd=()
 if [ "$REFRESH_STAGE" = "site" ]; then
