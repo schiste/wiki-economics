@@ -99,7 +99,7 @@ if [ "${WIKI_ECON_CAPACITY_ADMITTED:-0}" != "1" ]; then
   else
     REFRESH_RESOURCE_CLASS=isolated
   fi
-  exec node "$ROOT/deploy/toolforge/capacity-admission.cjs" \\
+  exec node "$ROOT/deploy/toolforge/capacity-admission.cjs" \
     --resource-class "$REFRESH_RESOURCE_CLASS" -- "$0" "$@"
 fi
 # Fail before a source transaction or logical partition can consume the
@@ -281,9 +281,9 @@ start_refresh_lock_heartbeat() {
         exit 1
       fi
       if [ -f pipeline-stage-active ] &&
-         ! node "$PIPELINE_STATE_HELPER" heartbeat \\
-           --state "$PIPELINE_STATE_FILE" \\
-           --stage "$WIKI_ECON_REFRESH_STAGE" \\
+         ! node "$PIPELINE_STATE_HELPER" heartbeat \
+           --state "$PIPELINE_STATE_FILE" \
+           --stage "$WIKI_ECON_REFRESH_STAGE" \
            --run-id "$WIKI_ECON_RUN_ID" >/dev/null; then
         echo "Pipeline state heartbeat failed; terminating run $WIKI_ECON_RUN_ID" >&2
         kill -TERM "$$"
