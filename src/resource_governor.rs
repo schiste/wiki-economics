@@ -395,6 +395,15 @@ impl ResourceGovernor {
             "resource governor source-worker limit reached"
         );
         let sample = self.sample_with_state(&state)?;
+        self.admit_source_with_sample(&mut state, expected_raw_bytes, sample)
+    }
+
+    fn admit_source_with_sample(
+        &self,
+        state: &mut GovernorState,
+        expected_raw_bytes: u64,
+        sample: ResourceSample,
+    ) -> Result<SourcePermit> {
         state.observe(&sample);
         if let Some(open) = sample.open_file_descriptors {
             let reserved_files = state
@@ -1244,6 +1253,65 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(root.path().join("one"), root.path().join("ignored-link"))?;
         assert_eq!(directory_bytes(root.path())?, 7);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn source_admission_sample(
+        memory: MemorySnapshot,
+        open_file_descriptors: Option<usize>,
+    ) -> ResourceSample {
+        ResourceSample {
+            sampled_at_epoch_ms: 0,
+            memory,
+            cpu: CpuSnapshot::default(),
+            page_cache_bytes: None,
+            io: IoSnapshot::default(),
+            scratch_bytes: 0,
+            persistent_filesystem_used_bytes: Some(0),
+            persistent_available_bytes: Some(1_000_000),
+            open_file_descriptors,
+            active_source_workers: 0,
+            active_bucket_workers: 0,
+            reserved_persistent_bytes: 0,
+            reserved_bucket_memory_bytes: 0,
+            reserved_bucket_scratch_bytes: 0,
+            downloaded_bytes: 0,
+            ingested_rows: 0,
+            download_elapsed_ms: 0,
+            ingest_elapsed_ms: 0,
+            download_bytes_per_second: None,
+            ingest_rows_per_second: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_admission_handles_missing_fd_and_memory_telemetry() -> Result<()> {
+        let root = TestDir::new()?;
+        let governor = ResourceGovernor::new(
+            budget(),
+            GovernorPaths::new(root.path().to_path_buf(), None),
+        );
+        let mut state = GovernorState::default();
+
+        let error = match governor.admit_source_with_sample(
+            &mut state,
+            1,
+            source_admission_sample(MemorySnapshot::default(), None),
+        ) {
+            Ok(permit) => {
+                drop(permit);
+                anyhow::bail!("source admission accepted missing memory telemetry");
+            }
+            Err(error) => error,
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("requires current cgroup or RSS memory"),
+            "unexpected missing-memory error: {error:#}"
+        );
         Ok(())
     }
 

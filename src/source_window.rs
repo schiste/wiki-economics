@@ -963,6 +963,66 @@ mod tests {
     }
 
     #[test]
+    fn source_window_shrinks_after_resource_admission_rejects_a_parallel_wave() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let pending = SnapshotPlan::resolve("enwiki", "2001-02")?
+            .sources
+            .into_iter()
+            .take(2)
+            .collect::<Vec<_>>();
+        let ops = FakeOps {
+            planned: 2,
+            pending,
+            ..FakeOps::default()
+        };
+        let governor = ResourceGovernor::new(
+            ResourceBudget {
+                memory_ceiling_bytes: u64::MAX,
+                memory_reserve_bytes: 0,
+                persistent_storage_reserve_bytes: 0,
+                bounded_scratch_reserve_bytes: 0,
+                rollback_generation_reserve_bytes: 0,
+                scratch_limit_bytes: u64::MAX,
+                max_open_files: 512,
+                source_worker_limit: 2,
+                thread_limit: 2,
+                max_logical_partition_bytes: u64::MAX,
+                max_active_parquet_writers: 16,
+                weekly_worker_limit: 1,
+            },
+            GovernorPaths::new(data_dir.path().to_path_buf(), None),
+        )
+        .with_persistent_available_sequence([100, 100, 0]);
+
+        let summary = prepare_snapshot_with_ops(
+            &ops,
+            "enwiki",
+            "2001-02",
+            data_dir.path(),
+            "admission-shrink-run",
+            ExecutionMode {
+                window_size: 2,
+                select_generation: false,
+            },
+            Some(&governor),
+        )?;
+
+        assert_eq!(summary.source_worker_limit, 2);
+        assert_eq!(summary.ingested_sources, 2);
+        assert_eq!(summary.ingested_rows, 20);
+        assert_eq!(
+            ops.ingested
+                .lock()
+                .expect("fake ingested mutex poisoned")
+                .len(),
+            2
+        );
+        assert!(ops.finalized.load(Ordering::Relaxed));
+        assert!(!ops.selected_generation.load(Ordering::Relaxed));
+        Ok(())
+    }
+
+    #[test]
     fn disk_reserve_exhaustion_stops_after_committed_source_without_finalizing() -> Result<()> {
         let data_dir = TestDir::new()?;
         let pending = SnapshotPlan::resolve("enwiki", "2001-02")?
