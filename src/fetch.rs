@@ -44,6 +44,11 @@ const FETCH_MAX_BACKOFF_MS: u64 = 30_000;
 /// slow/misconfigured server value can't stall a retry loop indefinitely.
 const FETCH_RETRY_AFTER_MAX_SECS: u64 = 30;
 const FETCH_MAX_PARALLELISM_ENV: &str = "WIKI_ECON_FETCH_MAX_PARALLELISM";
+/// Source-window workers may ingest concurrently, but dumps.wikimedia.org
+/// applies rate limits across requests from the whole process. Keep the full
+/// preflight + download transaction under one process-wide gate so workers do
+/// not create a synchronized HEAD/GET retry herd.
+static SOURCE_WINDOW_DOWNLOAD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 const SNAPSHOT_MAX_LAG_ENV: &str = "WIKI_ECON_MAX_SNAPSHOT_LAG_MONTHS";
 const DEFAULT_SNAPSHOT_MAX_LAG_MONTHS: u32 = 2;
 const REMOTE_INVENTORY_SCHEMA_VERSION: u32 = 1;
@@ -2050,6 +2055,63 @@ fn fetch_snapshot_source_window_with_transport<T: HttpTransport>(
     run_id: &str,
     sources: &[SourceSpec],
 ) -> Result<Vec<PathBuf>> {
+    fetch_snapshot_source_window_with_preflight(
+        transport,
+        wiki,
+        version,
+        data_dir,
+        run_id,
+        sources,
+        check_source_window_disk_headroom,
+    )
+}
+
+#[cfg(test)]
+fn fetch_snapshot_source_window_with_available<T, F>(
+    transport: &T,
+    wiki: &str,
+    version: &str,
+    data_dir: &Path,
+    run_id: &str,
+    sources: &[SourceSpec],
+    available_space: F,
+) -> Result<Vec<PathBuf>>
+where
+    T: HttpTransport,
+    F: FnOnce(&Path) -> std::io::Result<u64>,
+{
+    fetch_snapshot_source_window_with_preflight(
+        transport,
+        wiki,
+        version,
+        data_dir,
+        run_id,
+        sources,
+        move |transport, wiki, sources, data_dir| {
+            check_source_window_disk_headroom_with_available(
+                transport,
+                wiki,
+                sources,
+                data_dir,
+                available_space,
+            )
+        },
+    )
+}
+
+fn fetch_snapshot_source_window_with_preflight<T, F>(
+    transport: &T,
+    wiki: &str,
+    version: &str,
+    data_dir: &Path,
+    run_id: &str,
+    sources: &[SourceSpec],
+    disk_preflight: F,
+) -> Result<Vec<PathBuf>>
+where
+    T: HttpTransport,
+    F: FnOnce(&T, &str, &[SourceSpec], &Path) -> Result<()>,
+{
     let (plan, _) = SnapshotPlan::load_or_resolve(data_dir, wiki, version)?;
     anyhow::ensure!(!sources.is_empty(), "source window must not be empty");
     for source in sources {
@@ -2059,7 +2121,15 @@ fn fetch_snapshot_source_window_with_transport<T: HttpTransport>(
             source.source_id
         );
     }
-    check_source_window_disk_headroom(transport, wiki, sources, data_dir)?;
+
+    // Source-window callers run on separate worker threads, so the ordinary
+    // per-fetch parallelism setting cannot protect the shared dump server.
+    // Serialize only network fetch transactions; once a source is downloaded,
+    // its worker can ingest it while the next worker fetches its source.
+    let _download_guard = SOURCE_WINDOW_DOWNLOAD_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    disk_preflight(transport, wiki, sources, data_dir)?;
 
     let mut paths = Vec::with_capacity(sources.len());
     for source in sources {
@@ -2145,6 +2215,61 @@ fn fetch_wiki_with_transport<T: HttpTransport>(
     version: &str,
     data_dir: &Path,
 ) -> Result<Vec<PathBuf>> {
+    fetch_wiki_with_preflight(
+        transport,
+        base_url,
+        wiki,
+        version,
+        data_dir,
+        check_disk_headroom,
+    )
+}
+
+#[cfg(test)]
+fn fetch_wiki_with_available<T, F>(
+    transport: &T,
+    base_url: &str,
+    wiki: &str,
+    version: &str,
+    data_dir: &Path,
+    available_space: F,
+) -> Result<Vec<PathBuf>>
+where
+    T: HttpTransport,
+    F: FnOnce(&Path) -> std::io::Result<u64>,
+{
+    fetch_wiki_with_preflight(
+        transport,
+        base_url,
+        wiki,
+        version,
+        data_dir,
+        move |transport, base_url, wiki, version, files, data_dir| {
+            check_disk_headroom_with_available(
+                transport,
+                base_url,
+                wiki,
+                version,
+                files,
+                data_dir,
+                available_space,
+            )
+        },
+    )
+}
+
+fn fetch_wiki_with_preflight<T, F>(
+    transport: &T,
+    base_url: &str,
+    wiki: &str,
+    version: &str,
+    data_dir: &Path,
+    disk_preflight: F,
+) -> Result<Vec<PathBuf>>
+where
+    T: HttpTransport,
+    F: FnOnce(&T, &str, &str, &str, &[String], &Path) -> Result<()>,
+{
     let (plan, plan_path) = SnapshotPlan::load_or_resolve(data_dir, wiki, version)?;
     let expected = plan.filenames()?;
     let mut files = Vec::new();
@@ -2174,7 +2299,7 @@ fn fetch_wiki_with_transport<T: HttpTransport>(
         record_fetch_stage(data_dir, wiki, version, &plan_path, &expected)?;
         return Ok(Vec::new());
     }
-    check_disk_headroom(transport, base_url, wiki, version, &files, data_dir)?;
+    disk_preflight(transport, base_url, wiki, version, &files, data_dir)?;
     let parallelism = fetch_parallelism(files.len());
     fetch_wiki_from_base_with_transport_at_parallelism(
         transport,
@@ -2270,6 +2395,7 @@ mod tests {
     use std::collections::VecDeque;
     use std::io::{BufRead, BufReader, Cursor, ErrorKind};
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::Instant;
@@ -2308,6 +2434,67 @@ mod tests {
     #[derive(Clone, Default)]
     struct FakeTransport {
         state: Arc<Mutex<FakeTransportState>>,
+    }
+
+    #[derive(Clone, Default)]
+    struct ConcurrencyTrackingTransport {
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+    }
+
+    struct TrackedBody {
+        cursor: Cursor<Vec<u8>>,
+        active: Arc<AtomicUsize>,
+    }
+
+    impl Read for TrackedBody {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            thread::sleep(Duration::from_millis(10));
+            self.cursor.read(buffer)
+        }
+    }
+
+    impl Drop for TrackedBody {
+        fn drop(&mut self) {
+            self.active.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    impl ConcurrencyTrackingTransport {
+        fn begin_request(&self) {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_active.fetch_max(active, Ordering::SeqCst);
+        }
+    }
+
+    impl HttpTransport for ConcurrencyTrackingTransport {
+        fn head(&self, _url: &str) -> Result<TransportHead> {
+            self.begin_request();
+            thread::sleep(Duration::from_millis(10));
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(TransportHead {
+                status: StatusCode::OK,
+                content_length: Some(13),
+                accepts_ranges: true,
+                retry_after: None,
+                etag: None,
+                last_modified: None,
+            })
+        }
+
+        fn get(&self, _url: &str, _range_start: Option<u64>) -> Result<TransportResponse> {
+            self.begin_request();
+            let body = b"BZhpayload-by".to_vec();
+            Ok(TransportResponse {
+                status: StatusCode::OK,
+                content_length: Some(body.len() as u64),
+                retry_after: None,
+                body: Box::new(TrackedBody {
+                    cursor: Cursor::new(body),
+                    active: Arc::clone(&self.active),
+                }),
+            })
+        }
     }
 
     struct FlakyReader {
@@ -3595,12 +3782,13 @@ mod tests {
             ],
         );
 
-        let paths = fetch_wiki_with_transport(
+        let paths = fetch_wiki_with_available(
             &transport,
             "http://example.invalid",
             wiki,
             version,
             data_dir.path(),
+            |_| Ok(FETCH_DISK_HEADROOM_MARGIN_BYTES + 26),
         )
         .expect("monthly plan fetch should succeed");
 
@@ -4193,13 +4381,14 @@ mod tests {
             [ok_get(payload, true)],
         );
 
-        let paths = fetch_snapshot_source_window_with_transport(
+        let paths = fetch_snapshot_source_window_with_available(
             &transport,
             "testwiki",
             "2026-08",
             data_dir.path(),
             "run-123",
             std::slice::from_ref(&source),
+            |_| Ok(FETCH_DISK_HEADROOM_MARGIN_BYTES + 13),
         )
         .expect("source-window fixture should download");
 
@@ -4212,6 +4401,47 @@ mod tests {
         assert_eq!(transport.requested_ranges(), vec![None]);
         let staging = source_window_staging_dir(data_dir.path(), "testwiki");
         assert_eq!(fs::read_dir(staging)?.count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn source_window_serializes_remote_requests_across_workers() -> Result<()> {
+        init_test_tracing();
+        let data_dir = TestDir::new()?;
+        let (plan, _) = SnapshotPlan::load_or_resolve(data_dir.path(), "enwiki", "2026-08")?;
+        let sources = plan.sources.iter().take(2).cloned().collect::<Vec<_>>();
+        assert_eq!(sources.len(), 2, "enwiki plan should have multiple sources");
+
+        let transport = ConcurrencyTrackingTransport::default();
+        let workers = sources
+            .into_iter()
+            .map(|source| {
+                let transport = transport.clone();
+                let data_dir = data_dir.path().to_path_buf();
+                thread::spawn(move || {
+                    fetch_snapshot_source_window_with_available(
+                        &transport,
+                        "enwiki",
+                        "2026-08",
+                        &data_dir,
+                        "concurrency-test",
+                        std::slice::from_ref(&source),
+                        |_| Ok(FETCH_DISK_HEADROOM_MARGIN_BYTES + 13),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for worker in workers {
+            worker
+                .join()
+                .expect("source-window worker should not panic")?;
+        }
+        assert_eq!(
+            transport.max_active.load(Ordering::SeqCst),
+            1,
+            "source-window workers must not overlap remote requests"
+        );
         Ok(())
     }
 
@@ -4234,13 +4464,14 @@ mod tests {
             [ok_get(payload, true)],
         );
 
-        let paths = fetch_snapshot_source_window_with_transport(
+        let paths = fetch_snapshot_source_window_with_available(
             &transport,
             "testwiki",
             "2026-08",
             data_dir.path(),
             "new-run",
             std::slice::from_ref(&source),
+            |_| Ok(FETCH_DISK_HEADROOM_MARGIN_BYTES + 13),
         )
         .expect("abandoned source should resume");
 
@@ -4390,6 +4621,30 @@ mod tests {
             source_window_available_space,
         )
         .expect("unknown source size should remain a best-effort lower bound");
+        Ok(())
+    }
+
+    #[test]
+    fn source_window_disk_preflight_propagates_real_space_failures() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let (plan, _) = SnapshotPlan::load_or_resolve(data_dir.path(), "testwiki", "2026-08")?;
+        let mut source = plan.sources[0].clone();
+        source.expected_size = Some(u64::MAX);
+        let transport = FakeTransport::default();
+
+        let preflight_result = check_source_window_disk_headroom(
+            &transport,
+            "testwiki",
+            std::slice::from_ref(&source),
+            data_dir.path(),
+        );
+        assert!(
+            preflight_result.is_err(),
+            "impossible size must fail headroom"
+        );
+        let _available_bytes = source_window_available_space(data_dir.path())?;
+
+        assert_eq!(transport.head_requests(), 0);
         Ok(())
     }
 
