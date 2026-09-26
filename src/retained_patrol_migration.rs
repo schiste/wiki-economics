@@ -5,7 +5,6 @@
 use anyhow::{Context, Result, ensure};
 use polars::prelude::*;
 use std::fs::{self, File};
-use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
 use crate::{artifact_receipt, fingerprint, storage};
@@ -448,6 +447,7 @@ mod tests {
     use super::*;
     use crate::test_support::TestDir;
     use anyhow::Result;
+    use std::io::ErrorKind;
 
     fn write_legacy_source(
         root: &Path,
