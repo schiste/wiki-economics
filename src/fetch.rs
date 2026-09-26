@@ -4625,6 +4625,25 @@ mod tests {
     }
 
     #[test]
+    fn source_window_disk_preflight_uses_the_real_space_probe_for_unknown_sizes() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let (plan, _) = SnapshotPlan::load_or_resolve(data_dir.path(), "testwiki", "2026-08")?;
+        let source = plan.sources[0].clone();
+        let transport = FakeTransport::with_head_outcomes([ok_head(None, false)]);
+
+        check_source_window_disk_headroom(
+            &transport,
+            "testwiki",
+            std::slice::from_ref(&source),
+            data_dir.path(),
+        )?;
+        let _available_bytes = source_window_available_space(data_dir.path())?;
+
+        assert_eq!(transport.head_requests(), 1);
+        Ok(())
+    }
+
+    #[test]
     fn snapshot_source_size_inventory_combines_pinned_and_probed_sizes() -> Result<()> {
         let mut sources = SnapshotPlan::resolve("enwiki", "2001-02")?.sources;
         sources.truncate(2);
