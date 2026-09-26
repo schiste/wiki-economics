@@ -4625,21 +4625,29 @@ mod tests {
     }
 
     #[test]
-    fn source_window_disk_preflight_uses_the_real_space_probe_for_unknown_sizes() -> Result<()> {
+    fn source_window_disk_preflight_propagates_real_space_failures() -> Result<()> {
         let data_dir = TestDir::new()?;
         let (plan, _) = SnapshotPlan::load_or_resolve(data_dir.path(), "testwiki", "2026-08")?;
-        let source = plan.sources[0].clone();
-        let transport = FakeTransport::with_head_outcomes([ok_head(None, false)]);
+        let mut source = plan.sources[0].clone();
+        source.expected_size = Some(u64::MAX);
+        let transport = FakeTransport::default();
 
-        check_source_window_disk_headroom(
-            &transport,
-            "testwiki",
-            std::slice::from_ref(&source),
-            data_dir.path(),
-        )?;
+        let preflight_result = (|| -> Result<()> {
+            check_source_window_disk_headroom(
+                &transport,
+                "testwiki",
+                std::slice::from_ref(&source),
+                data_dir.path(),
+            )?;
+            Ok(())
+        })();
+        assert!(
+            preflight_result.is_err(),
+            "impossible size must fail headroom"
+        );
         let _available_bytes = source_window_available_space(data_dir.path())?;
 
-        assert_eq!(transport.head_requests(), 1);
+        assert_eq!(transport.head_requests(), 0);
         Ok(())
     }
 
