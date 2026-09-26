@@ -372,6 +372,30 @@
       "paths": ["src/compute/mod.rs"],
       "reason": "Permit receipt-validated older package versions during retained migration; page-week formulas, schema, and output bytes are unchanged.",
       "base_commit": "f4d1fad41f9d1cd04c17c8e3835da249a6247e50"
+    },
+    {
+      "family": "lifecycle",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Add retained receipt validation only; lifecycle computation formulas and artifact bytes are unchanged.",
+      "base_commit": "5722d3bdd69da6e5fbaef37870da524b8f77f22b"
+    },
+    {
+      "family": "page_week",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Add retained receipt validation only; page-week aggregation formulas and artifact bytes are unchanged.",
+      "base_commit": "5722d3bdd69da6e5fbaef37870da524b8f77f22b"
+    },
+    {
+      "family": "monthly",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Add retained receipt validation only; monthly computation formulas and artifact bytes are unchanged.",
+      "base_commit": "5722d3bdd69da6e5fbaef37870da524b8f77f22b"
+    },
+    {
+      "family": "activity_tiers",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Add retained receipt validation only; activity-tier computation formulas and artifact bytes are unchanged.",
+      "base_commit": "5722d3bdd69da6e5fbaef37870da524b8f77f22b"
     }
   ]
 }

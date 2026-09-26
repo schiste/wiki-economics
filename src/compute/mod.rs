@@ -1280,6 +1280,37 @@ pub(crate) fn retained_candidate_receipts_current_without_inputs(
     )
 }
 
+/// Check the retained core families other than monthly. This supports the
+/// narrow monthly v5-to-v6 migration when the candidate already has current
+/// activity, lifecycle, and page-week outputs.
+pub(crate) fn retained_candidate_non_monthly_families_current(
+    wiki: &str,
+    snapshot: &str,
+    candidate_dir: &Path,
+    profile: Option<&workload_profile::WorkloadProfile>,
+) -> Result<bool> {
+    storage::validate_snapshot_version(snapshot)?;
+    let Some(profile) = profile else {
+        return Ok(false);
+    };
+    profile.validate(wiki, snapshot)?;
+    let weekly_config = WeeklyAggregationConfig::from_workload_profile(profile)?;
+    for family in MetricFamily::CORE {
+        if family == MetricFamily::Monthly {
+            continue;
+        }
+        let algorithm = family.algorithm_version(&weekly_config);
+        let receipt_path = family_stage_receipt(candidate_dir, wiki, family);
+        let outputs = family_outputs(family, wiki, candidate_dir);
+        #[rustfmt::skip]
+        let outputs_reusable = fingerprint::retained_outputs_reusable(&receipt_path, family_stage_spec(family, wiki, Some(snapshot), &algorithm), &outputs)?;
+        if !outputs_reusable {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 fn candidate_receipts_current_without_inputs_with_retained_versions(
     wiki: &str,
     snapshot: &str,

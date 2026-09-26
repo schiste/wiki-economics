@@ -31,6 +31,7 @@ mod patrol;
 mod publication;
 mod resource_governor;
 mod retained_activity_migration;
+mod retained_monthly_migration;
 mod retained_patrol_migration;
 mod retention;
 mod schema;
