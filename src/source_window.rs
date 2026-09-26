@@ -1005,7 +1005,8 @@ mod tests {
                 select_generation: false,
             },
             Some(&governor),
-        )?;
+        )
+        .expect("the source window should shrink and process every source");
 
         assert_eq!(summary.source_worker_limit, 2);
         assert_eq!(summary.ingested_sources, 2);

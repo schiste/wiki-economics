@@ -1295,17 +1295,14 @@ mod tests {
         );
         let mut state = GovernorState::default();
 
-        let error = match governor.admit_source_with_sample(
-            &mut state,
-            1,
-            source_admission_sample(MemorySnapshot::default(), None),
-        ) {
-            Ok(permit) => {
-                drop(permit);
-                anyhow::bail!("source admission accepted missing memory telemetry");
-            }
-            Err(error) => error,
-        };
+        let error = governor
+            .admit_source_with_sample(
+                &mut state,
+                1,
+                source_admission_sample(MemorySnapshot::default(), None),
+            )
+            .err()
+            .expect("source admission must require current memory telemetry");
         assert!(
             error
                 .to_string()
