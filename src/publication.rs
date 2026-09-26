@@ -7273,6 +7273,76 @@ mod tests {
             Ok(candidate)
         }
 
+        fn rewrite_candidate_monthly_to_v5(&self, run_id: &str) -> Result<PathBuf> {
+            const LEGACY_ALGORITHM: &str = "monthly-stateless-v5-exact-period-inequality";
+            let candidate = wiki_candidate_dir(self.output.path(), "nlwiki", "2026-03", run_id)?;
+            let gdp_path = candidate.join("nlwiki/gdp.parquet");
+            let mut gdp = ParquetReader::new(File::open(&gdp_path)?).finish()?;
+            let edits_type = gdp.column("total_edits")?.dtype().clone();
+            let zero_edits = Series::new("total_edits".into(), [0_i64]).cast(&edits_type)?;
+            gdp.replace("total_edits", zero_edits.into())?;
+            ParquetWriter::new(File::create(&gdp_path)?).finish(&mut gdp)?;
+
+            let family = crate::metric_registry::MetricFamily::Monthly;
+            for metric in family.metrics() {
+                let path = candidate.join("nlwiki").join(format!("{metric}.parquet"));
+                let document = artifact_receipt::read(&path)?;
+                artifact_receipt::scan_and_write(
+                    &path,
+                    &document.receipt.identity,
+                    LEGACY_ALGORITHM,
+                    "retained-monthly-v5-migration-fixture",
+                )?;
+            }
+            let report_path = crate::compute::editor_identity_report_path(&candidate, "nlwiki");
+            let mut report: crate::compute::EditorIdentityCoverageReport = read_json(&report_path)?;
+            report.algorithm_version = LEGACY_ALGORITHM.to_string();
+            atomic_json(&report_path, &report)?;
+
+            let inputs =
+                crate::compute::compute_stage_inputs("nlwiki", self.data.path(), Some("2026-03"))?;
+            let mut outputs = family
+                .metrics()
+                .iter()
+                .map(|metric| {
+                    crate::fingerprint::TrackedPath::new(
+                        format!("output/nlwiki/{metric}.parquet"),
+                        candidate.join("nlwiki").join(format!("{metric}.parquet")),
+                    )
+                })
+                .collect::<Vec<_>>();
+            outputs.push(crate::fingerprint::TrackedPath::new(
+                format!("output/nlwiki/{}", crate::compute::EDITOR_IDENTITY_REPORT),
+                report_path,
+            ));
+            crate::fingerprint::record(
+                &crate::compute::family_stage_receipt(&candidate, "nlwiki", family),
+                crate::fingerprint::StageSpec {
+                    stage: "compute_monthly",
+                    scope: "nlwiki",
+                    selected_snapshot: Some("2026-03"),
+                    algorithm_version: LEGACY_ALGORITHM,
+                },
+                &inputs,
+                &outputs,
+            )?;
+
+            let ready_path = candidate.join("ready.json");
+            let mut ready: ReadyWikiCandidate = read_json(&ready_path)?;
+            for artifact in &mut ready.artifacts {
+                if family
+                    .metrics()
+                    .iter()
+                    .any(|metric| artifact.path == format!("nlwiki/{metric}.parquet"))
+                {
+                    *artifact = prepared_artifact(&candidate, &candidate.join(&artifact.path))?;
+                }
+            }
+            ready.editor_identity_coverage = Some(report);
+            atomic_json(&ready_path, &ready)?;
+            Ok(candidate)
+        }
+
         fn published_site(&self, run_id: &str) -> Result<(TestDir, PathBuf)> {
             self.prepare(run_id)?;
             validate(
@@ -9692,6 +9762,160 @@ mod tests {
             .context("published candidate state should exist")?
             .state,
             crate::generation_lifecycle::GenerationState::Published
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retained_monthly_v5_candidate_migrates_only_the_monthly_family() -> Result<()> {
+        let fixture = Fixture::new()?;
+        fixture.ready_candidate("retained-monthly-v5-source")?;
+        prepare_ready_publication(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "retained-monthly-v5-initial-publication",
+        )
+        .expect("initial current-schema publication should prepare");
+        commit_ready_publication(
+            fixture.data.path(),
+            fixture.output.path(),
+            "retained-monthly-v5-initial-publication",
+        )
+        .expect("initial current-schema publication should commit");
+
+        let source_candidate =
+            fixture.rewrite_candidate_monthly_to_v5("retained-monthly-v5-source")?;
+        let source_ready_path = source_candidate.join("ready.json");
+        let source_ready: ReadyWikiCandidate = read_json(&source_ready_path)?;
+        let (_, authorized_source_sha256) = storage::sha256_file(&source_ready_path)?;
+        assert!(crate::retained_monthly_migration::migration_required(
+            "nlwiki",
+            "2026-03",
+            &source_ready.run_id,
+            &source_candidate,
+        )?);
+        assert!(
+            !crate::compute::retained_candidate_non_monthly_families_current(
+                "nlwiki",
+                "2026-03",
+                &source_candidate,
+                None,
+            )?
+        );
+        let activity_receipt = crate::compute::family_stage_receipt(
+            &source_candidate,
+            "nlwiki",
+            crate::metric_registry::MetricFamily::ActivityTiers,
+        );
+        let activity_receipt_bytes = fs::read(&activity_receipt)?;
+        fs::remove_file(&activity_receipt)?;
+        let missing_activity_receipt_is_current =
+            crate::compute::retained_candidate_non_monthly_families_current(
+                "nlwiki",
+                "2026-03",
+                &source_candidate,
+                source_ready.workload_profile.as_ref(),
+            );
+        fs::write(&activity_receipt, activity_receipt_bytes)?;
+        assert!(!missing_activity_receipt_is_current?);
+        assert!(
+            crate::retained_monthly_migration::migration_required(
+                "",
+                "2026-03",
+                &source_ready.run_id,
+                &source_candidate,
+            )
+            .is_err()
+        );
+        assert!(
+            crate::retained_monthly_migration::migration_required(
+                "nlwiki",
+                "2026-13",
+                &source_ready.run_id,
+                &source_candidate,
+            )
+            .is_err()
+        );
+
+        let incomplete_target = TestDir::new()?;
+        assert!(
+            crate::retained_monthly_migration::migrate_candidate(
+                "nlwiki",
+                "2026-03",
+                &source_ready.run_id,
+                &source_candidate,
+                incomplete_target.path(),
+            )
+            .is_err()
+        );
+
+        for command in [
+            crate::Commands::RetentionAudit {
+                lifecycle: fixture.lifecycle_path.clone(),
+                wikis: vec!["nlwiki".to_string()],
+            },
+            crate::Commands::RetentionApply {
+                lifecycle: fixture.lifecycle_path.clone(),
+                wikis: vec!["nlwiki".to_string()],
+            },
+        ] {
+            crate::run_with_ops(
+                crate::Cli {
+                    data_dir: fixture.data.path().to_path_buf(),
+                    output_dir: fixture.output.path().to_path_buf(),
+                    run_id: None,
+                    command,
+                },
+                &crate::RealOps,
+            )
+            .expect("retention should authorize and purge the exact ready source");
+        }
+
+        let migrated_ready_path = migrate_retained_candidate(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "nlwiki",
+            "2026-03",
+            "retained-monthly-v6-migrated",
+        )?;
+        let migrated_candidate = migrated_ready_path
+            .parent()
+            .context("migrated ready receipt should have a candidate directory")?;
+        let migrated_ready: ReadyWikiCandidate = read_json(&migrated_ready_path)?;
+        let migration = migrated_ready
+            .migrated_from_retained_candidate
+            .as_ref()
+            .context("monthly migration lineage should be recorded")?;
+        assert_eq!(migration.source_run_id, source_ready.run_id);
+        assert_eq!(migration.source_ready_sha256, authorized_source_sha256);
+        assert_eq!(
+            migration.migration,
+            crate::retained_monthly_migration::MIGRATION_ID
+        );
+        crate::retained_monthly_migration::validate_migration(
+            "nlwiki",
+            "2026-03",
+            &source_ready.run_id,
+            &source_candidate,
+            migrated_candidate,
+        )?;
+        validate_ready_candidate(fixture.data.path(), migrated_candidate, &migrated_ready)?;
+        assert!(!crate::retained_monthly_migration::migration_required(
+            "nlwiki",
+            "2026-03",
+            &migrated_ready.run_id,
+            migrated_candidate,
+        )?);
+
+        let gdp = ParquetReader::new(File::open(migrated_candidate.join("nlwiki/gdp.parquet"))?)
+            .finish()?;
+        assert_eq!(gdp.column("bytes_per_edit")?.f64()?.get(0), None);
+        assert_eq!(gdp.column("bytes_per_editor")?.f64()?.get(0), Some(1.0));
+        assert_eq!(gdp.column("revert_rate")?.f64()?.get(0), None);
+        assert!(
+            !storage::generation_manifest_path(fixture.data.path(), "nlwiki", "2026-03")?.is_file()
         );
         Ok(())
     }

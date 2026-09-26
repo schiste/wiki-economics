@@ -454,3 +454,24 @@ fn write_json_atomic<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> 
     }
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TestDir;
+
+    #[test]
+    fn failed_atomic_report_write_returns_an_error() -> Result<()> {
+        let root = TestDir::new()?;
+        let blocked_parent = root.path().join("blocked-parent");
+        fs::write(&blocked_parent, b"not a directory")?;
+        assert!(
+            write_json_atomic(
+                &blocked_parent.join("editor_identity_coverage.json"),
+                &serde_json::json!({"schema_version": 1}),
+            )
+            .is_err()
+        );
+        Ok(())
+    }
+}
