@@ -374,7 +374,8 @@ mod tests {
             "is_reverted" => &[false, false],
             "is_minor" => &[false, false],
             "event_user_id" => &[None::<i64>, Some(7_i64)],
-        )?;
+        )
+        .expect("valid GDP fixture");
         let result = gdp_monthly_frame(&base)?;
         let user_types = result.column("user_type")?.str()?;
         let unregistered = (0..result.height())

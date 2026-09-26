@@ -937,10 +937,9 @@ mod tests {
             .expect_err("a receipt directory cannot be removed as a sidecar file");
         let expected_fs_error = error.chain().any(|cause| {
             cause.downcast_ref::<std::io::Error>().is_some_and(|cause| {
-                matches!(
-                    cause.kind(),
-                    std::io::ErrorKind::IsADirectory | std::io::ErrorKind::PermissionDenied
-                )
+                let kind = cause.kind();
+                kind == std::io::ErrorKind::IsADirectory
+                    || kind == std::io::ErrorKind::PermissionDenied
             })
         });
         ensure!(expected_fs_error, "{error:#}");
