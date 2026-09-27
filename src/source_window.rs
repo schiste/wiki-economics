@@ -1553,9 +1553,8 @@ mod tests {
             2,
             |sources| Ok(vec![Some(42); sources.len()]),
         );
-        let error = result
-            .err()
-            .expect("an unqualified source fetch limit must fail before resource setup");
+        let error =
+            result.expect_err("an unqualified source fetch limit must fail before resource setup");
         assert!(error.to_string().contains("maximum of 1 for nlwiki"));
         Ok(())
     }
