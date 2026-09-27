@@ -9,9 +9,11 @@ use std::path::{Path, PathBuf};
 use crate::snapshot_plan::SnapshotPlan;
 use crate::storage::{self, GenerationLayer};
 
-const PROFILE_SCHEMA_VERSION: u32 = 2;
+const PROFILE_SCHEMA_VERSION: u32 = 3;
+const PREVIOUS_PROFILE_SCHEMA_VERSION: u32 = 2;
 const LEGACY_PROFILE_SCHEMA_VERSION: u32 = 1;
-const SELECTION_ALGORITHM_VERSION: &str = "adaptive-workload-profile-v2-measured";
+const SELECTION_ALGORITHM_VERSION: &str = "adaptive-workload-profile-v3-capacity";
+const PREVIOUS_SELECTION_ALGORITHM_VERSION: &str = "adaptive-workload-profile-v2-measured";
 const LEGACY_SELECTION_ALGORITHM_VERSION: &str = "adaptive-workload-profile-v1";
 const PROFILE_OVERRIDE_ENV: &str = "WIKI_ECON_WORKLOAD_PROFILE";
 const REQUIRE_QUALIFIED_ENV: &str = "WIKI_ECON_REQUIRE_QUALIFIED_PROFILE";
@@ -53,6 +55,20 @@ impl WorkloadProfileName {
                 primary_buckets: 64,
                 secondary_buckets: 32,
             },
+        }
+    }
+
+    fn parameters_for_schema(self, schema_version: u32) -> Option<WorkloadParameters> {
+        match schema_version {
+            PROFILE_SCHEMA_VERSION => Some(self.parameters()),
+            PREVIOUS_PROFILE_SCHEMA_VERSION | LEGACY_PROFILE_SCHEMA_VERSION => {
+                let mut parameters = self.parameters();
+                if self == Self::Large {
+                    parameters.source_workers = 3;
+                }
+                Some(parameters)
+            }
+            _ => None,
         }
     }
 
@@ -271,8 +287,12 @@ fn select_automatic(signals: &WorkloadSignals) -> WorkloadProfileName {
 
 impl WorkloadProfile {
     pub(crate) fn validate(&self, wiki: &str, snapshot: &str) -> Result<()> {
-        let supported_schema = self.schema_version == PROFILE_SCHEMA_VERSION
-            || self.schema_version == LEGACY_PROFILE_SCHEMA_VERSION;
+        let supported_schema = matches!(
+            self.schema_version,
+            PROFILE_SCHEMA_VERSION
+                | PREVIOUS_PROFILE_SCHEMA_VERSION
+                | LEGACY_PROFILE_SCHEMA_VERSION
+        );
         ensure!(
             supported_schema,
             "unsupported workload profile schema {}",
@@ -281,6 +301,8 @@ impl WorkloadProfile {
         ensure!(
             (self.schema_version == PROFILE_SCHEMA_VERSION
                 && self.selection_algorithm_version == SELECTION_ALGORITHM_VERSION)
+                || (self.schema_version == PREVIOUS_PROFILE_SCHEMA_VERSION
+                    && self.selection_algorithm_version == PREVIOUS_SELECTION_ALGORITHM_VERSION)
                 || (self.schema_version == LEGACY_PROFILE_SCHEMA_VERSION
                     && self.selection_algorithm_version == LEGACY_SELECTION_ALGORITHM_VERSION),
             "unsupported workload profile selection algorithm"
@@ -297,8 +319,12 @@ impl WorkloadProfile {
             self.signals.total_compressed_bytes > 0,
             "workload compressed byte total is zero"
         );
+        let expected_parameters = self
+            .profile
+            .parameters_for_schema(self.schema_version)
+            .context("unsupported workload profile schema")?;
         ensure!(
-            self.parameters == self.profile.parameters(),
+            self.parameters == expected_parameters,
             "workload profile parameters do not match the named profile"
         );
         if self.selection_mode == ProfileSelectionMode::Automatic
@@ -639,7 +665,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_profiles_remain_readable_during_schema_two_rollout() -> Result<()> {
+    fn legacy_profiles_remain_readable_after_schema_bump() -> Result<()> {
         let root = TestDir::new()?;
         let mut legacy = profile(
             "testwiki",
@@ -655,6 +681,45 @@ mod tests {
         let path = profile_path(root.path(), "testwiki", "2026-08")?;
         write_atomic(&path, &legacy)?;
         assert_eq!(load(root.path(), "testwiki", "2026-08")?, Some(legacy));
+        Ok(())
+    }
+
+    #[test]
+    fn prior_large_profiles_keep_their_three_worker_parameters_after_capacity_tuning() -> Result<()>
+    {
+        let root = TestDir::new()?;
+        let path = profile_path(root.path(), "testwiki", "2026-08")?;
+
+        for (schema_version, algorithm_version) in [
+            (
+                PREVIOUS_PROFILE_SCHEMA_VERSION,
+                PREVIOUS_SELECTION_ALGORITHM_VERSION,
+            ),
+            (
+                LEGACY_PROFILE_SCHEMA_VERSION,
+                LEGACY_SELECTION_ALGORITHM_VERSION,
+            ),
+        ] {
+            let mut previous = profile(
+                "testwiki",
+                WorkloadProfileName::Large,
+                ProfileSelectionMode::Automatic,
+            );
+            previous.schema_version = schema_version;
+            previous.selection_algorithm_version = algorithm_version.to_string();
+            previous.parameters.source_workers = 3;
+            write_atomic(&path, &previous)?;
+
+            assert_eq!(load(root.path(), "testwiki", "2026-08")?, Some(previous));
+        }
+
+        let current = profile(
+            "testwiki",
+            WorkloadProfileName::Large,
+            ProfileSelectionMode::Automatic,
+        );
+        assert_eq!(current.schema_version, PROFILE_SCHEMA_VERSION);
+        assert_eq!(current.parameters.source_workers, 4);
         Ok(())
     }
 
@@ -779,10 +844,9 @@ mod tests {
         );
         selected.validate("nlwiki", "2026-08")?;
         assert!(selected.parameters.logical_buckets()? == 256);
-        assert!(
-            selected
-                .algorithm_version()?
-                .contains("adaptive-workload-profile-v2-measured-small")
+        assert_eq!(
+            selected.algorithm_version()?,
+            format!("{SELECTION_ALGORITHM_VERSION}-small")
         );
         selected.ensure_compute_qualified_with(false)?;
         selected.ensure_compute_qualified_with(true)?;
