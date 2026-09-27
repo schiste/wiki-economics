@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "recorded_at": "2026-09-27T04:27:35Z",
+  "status": "publication_invisible_candidate_trial",
+  "wiki": "enwiki",
+  "snapshot": "2026-08",
+  "run_id": "qualify-enwiki-202608-max-capacity-c5c9543",
+  "source_commit": "e76c837403e95954e40ee8bcb98c60f3ace10ee7",
+  "observation": {
+    "stage": "source_window",
+    "elapsed_seconds": 700,
+    "source_workers": 4,
+    "cpu_thread_limit": 4,
+    "requested_cpu_cores": 4,
+    "memory_limit_bytes": 6442450944,
+    "cgroup_peak_bytes": 1162035200,
+    "cpu_usage_usec": 1022882742,
+    "downloaded_bytes": 3730394360,
+    "ingested_rows": 37475143,
+    "active_source_workers": 4,
+    "active_bucket_workers": 0,
+    "fetch_parallelism": 1,
+    "runtime_errors": 0,
+    "rate_limit_retries": 0
+  },
+  "decision": {
+    "maximum_source_fetches": 2,
+    "default_source_fetches": 1,
+    "rollback_source_fetches": 1,
+    "scope": "enwiki qualification only",
+    "reason": "The source-window gate serialized HTTP requests while the four-worker candidate used about 1.1 GiB peak memory and 1.46 CPU cores on average. Two concurrent requests are an isolated throughput trial. Earlier four-stream runs received 429 responses, so the gate remains hard-capped at two and retains bounded retry and Retry-After handling.",
+    "publication_eligible": false
+  }
+}

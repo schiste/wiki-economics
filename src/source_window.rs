@@ -477,6 +477,9 @@ where
         source_sizes[index] = size;
     }
     let profile = workload_profile::load_or_select(data_dir, &plan, &source_sizes)?;
+    profile.ensure_source_fetches_qualified(
+        fetch::source_window_fetch_parallelism_from_environment()?,
+    )?;
     let scratch_root = std::env::var_os("WIKI_ECON_SCRATCH_DIR").map(Into::into);
     let paths = GovernorPaths::new(data_dir.to_path_buf(), scratch_root);
     let source_workers = profile.parameters.source_workers;

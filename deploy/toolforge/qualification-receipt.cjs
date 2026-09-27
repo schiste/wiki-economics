@@ -481,6 +481,7 @@ function contract() {
     memory_limit_bytes: number("WIKI_ECON_MEMORY_CEILING_BYTES"),
     requested_cpu_cores: number("WIKI_ECON_REQUESTED_CPU_CORES") || number("WIKI_ECON_CPU_LIMIT_CORES"),
     source_workers: number("WIKI_ECON_SOURCE_WORKERS"),
+    source_fetch_parallelism: number("WIKI_ECON_FETCH_MAX_PARALLELISM"),
     thread_limit: number("WIKI_ECON_THREAD_LIMIT"),
     active_parquet_writers: number("WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS"),
     source_window_size: number("WIKI_ECON_SOURCE_WINDOW_SIZE"),

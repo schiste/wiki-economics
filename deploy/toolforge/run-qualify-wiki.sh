@@ -91,11 +91,16 @@ if [ "$wiki" = "enwiki" ]; then
   export WIKI_ECON_SOURCE_WORKERS="${WIKI_ECON_SOURCE_WORKERS:-$WIKI_ECON_THREAD_LIMIT}"
   export WIKI_ECON_WEEKLY_WORKERS="${WIKI_ECON_WEEKLY_WORKERS:-$WIKI_ECON_THREAD_LIMIT}"
   export WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS="${WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS:-32}"
+  export WIKI_ECON_FETCH_MAX_PARALLELISM="${WIKI_ECON_FETCH_MAX_PARALLELISM:-2}"
   validate_worker_pool WIKI_ECON_THREAD_LIMIT "$WIKI_ECON_THREAD_LIMIT" "$qualification_cpu_cores"
   validate_worker_pool RAYON_NUM_THREADS "$RAYON_NUM_THREADS" "$WIKI_ECON_THREAD_LIMIT"
   validate_worker_pool POLARS_MAX_THREADS "$POLARS_MAX_THREADS" "$WIKI_ECON_THREAD_LIMIT"
   validate_worker_pool WIKI_ECON_SOURCE_WORKERS "$WIKI_ECON_SOURCE_WORKERS" "$WIKI_ECON_THREAD_LIMIT"
   validate_worker_pool WIKI_ECON_WEEKLY_WORKERS "$WIKI_ECON_WEEKLY_WORKERS" "$WIKI_ECON_THREAD_LIMIT"
+  if [[ ! "$WIKI_ECON_FETCH_MAX_PARALLELISM" =~ ^[1-2]$ ]]; then
+    echo "WIKI_ECON_FETCH_MAX_PARALLELISM must be 1 or 2 for enwiki qualification (got: $WIKI_ECON_FETCH_MAX_PARALLELISM)" >&2
+    exit 2
+  fi
   # Enwiki qualification must consume the explicitly frozen snapshot. Never
   # silently advance to a newer dump while a qualification run is pending.
   : "${WIKI_ECON_PREPARE_SNAPSHOT:?enwiki qualification requires WIKI_ECON_PREPARE_SNAPSHOT to pin the frozen snapshot}"

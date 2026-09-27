@@ -12,6 +12,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{debug, info, warn};
 
@@ -28,6 +29,7 @@ const USER_AGENT: &str = "wiki-econ/0.1 (Wikipedia economic analysis research to
 /// so retries (below) get a real chance to land in a quiet window instead of
 /// every worker re-triggering the same rate limit at once.
 const FETCH_MAX_PARALLELISM: usize = 1;
+const MAX_SOURCE_WINDOW_FETCH_PARALLELISM: usize = 2;
 const FETCH_MAX_RETRIES: usize = 6;
 const FETCH_RETRY_BACKOFF_MS: u64 = 500;
 /// Backoff base for 429 (rate-limited) retries when the server didn't send
@@ -45,10 +47,11 @@ const FETCH_MAX_BACKOFF_MS: u64 = 30_000;
 const FETCH_RETRY_AFTER_MAX_SECS: u64 = 30;
 const FETCH_MAX_PARALLELISM_ENV: &str = "WIKI_ECON_FETCH_MAX_PARALLELISM";
 /// Source-window workers may ingest concurrently, but dumps.wikimedia.org
-/// applies rate limits across requests from the whole process. Keep the full
-/// preflight + download transaction under one process-wide gate so workers do
-/// not create a synchronized HEAD/GET retry herd.
-static SOURCE_WINDOW_DOWNLOAD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// applies rate limits across requests from the whole process. Keep preflight
+/// and downloads under one process-wide bounded gate. The default stays at
+/// one after four simultaneous request streams triggered repeated 429s; an
+/// isolated qualification may opt into two and retains bounded retry/backoff.
+static SOURCE_WINDOW_DOWNLOAD_GATE: OnceLock<SourceWindowDownloadGate> = OnceLock::new();
 const SNAPSHOT_MAX_LAG_ENV: &str = "WIKI_ECON_MAX_SNAPSHOT_LAG_MONTHS";
 const DEFAULT_SNAPSHOT_MAX_LAG_MONTHS: u32 = 2;
 const REMOTE_INVENTORY_SCHEMA_VERSION: u32 = 1;
@@ -62,6 +65,84 @@ const SOURCE_WINDOW_DOWNLOAD_SUFFIX: &str = ".download";
 /// transient estimate on Toolforge) rather than discovering it after
 /// downloading most of the dump.
 const FETCH_DISK_HEADROOM_MARGIN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+struct SourceWindowDownloadGate {
+    limit: usize,
+    active: Mutex<usize>,
+    available: Condvar,
+}
+
+impl SourceWindowDownloadGate {
+    fn new(limit: usize) -> Self {
+        assert!((1..=MAX_SOURCE_WINDOW_FETCH_PARALLELISM).contains(&limit));
+        Self {
+            limit,
+            active: Mutex::new(0),
+            available: Condvar::new(),
+        }
+    }
+
+    fn acquire(&self) -> SourceWindowDownloadPermit<'_> {
+        let mut active = self
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        while *active >= self.limit {
+            active = self
+                .available
+                .wait(active)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *active += 1;
+        SourceWindowDownloadPermit { gate: self }
+    }
+}
+
+struct SourceWindowDownloadPermit<'a> {
+    gate: &'a SourceWindowDownloadGate,
+}
+
+impl Drop for SourceWindowDownloadPermit<'_> {
+    fn drop(&mut self) {
+        let mut active = self
+            .gate
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *active = active.saturating_sub(1);
+        self.gate.available.notify_one();
+    }
+}
+
+fn source_window_fetch_parallelism(raw: Option<&OsStr>) -> Result<usize> {
+    let Some(raw) = raw else {
+        return Ok(FETCH_MAX_PARALLELISM);
+    };
+    let value = raw
+        .to_str()
+        .context("fetch parallelism override is not UTF-8")?
+        .parse::<usize>()
+        .context("fetch parallelism override is not an integer")?;
+    anyhow::ensure!(
+        (1..=MAX_SOURCE_WINDOW_FETCH_PARALLELISM).contains(&value),
+        "source-window fetch parallelism must be between 1 and {MAX_SOURCE_WINDOW_FETCH_PARALLELISM}, got {value}"
+    );
+    Ok(value)
+}
+
+pub(crate) fn source_window_fetch_parallelism_from_environment() -> Result<usize> {
+    source_window_fetch_parallelism(std::env::var_os(FETCH_MAX_PARALLELISM_ENV).as_deref())
+}
+
+fn source_window_download_gate() -> Result<&'static SourceWindowDownloadGate> {
+    let requested = source_window_fetch_parallelism_from_environment()?;
+    let gate = SOURCE_WINDOW_DOWNLOAD_GATE.get_or_init(|| SourceWindowDownloadGate::new(requested));
+    anyhow::ensure!(
+        gate.limit == requested,
+        "source-window fetch parallelism changed after the process-wide gate was initialized"
+    );
+    Ok(gate)
+}
 /// Bzip2 magic bytes ("BZh"). Every valid bz2 file begins with these three
 /// bytes before the version digit. Used to surface CDN corruption / truncation
 /// at fetch time, before the file is moved into the ingest pipeline. Note: the
@@ -2099,6 +2180,41 @@ where
     )
 }
 
+#[cfg(test)]
+fn fetch_snapshot_source_window_with_available_and_gate<T, F>(
+    transport: &T,
+    wiki: &str,
+    version: &str,
+    data_dir: &Path,
+    run_id: &str,
+    sources: &[SourceSpec],
+    gate: &SourceWindowDownloadGate,
+    available_space: F,
+) -> Result<Vec<PathBuf>>
+where
+    T: HttpTransport,
+    F: FnOnce(&Path) -> std::io::Result<u64>,
+{
+    fetch_snapshot_source_window_with_gate(
+        transport,
+        wiki,
+        version,
+        data_dir,
+        run_id,
+        sources,
+        gate,
+        move |transport, wiki, sources, data_dir| {
+            check_source_window_disk_headroom_with_available(
+                transport,
+                wiki,
+                sources,
+                data_dir,
+                available_space,
+            )
+        },
+    )
+}
+
 fn fetch_snapshot_source_window_with_preflight<T, F>(
     transport: &T,
     wiki: &str,
@@ -2106,6 +2222,33 @@ fn fetch_snapshot_source_window_with_preflight<T, F>(
     data_dir: &Path,
     run_id: &str,
     sources: &[SourceSpec],
+    disk_preflight: F,
+) -> Result<Vec<PathBuf>>
+where
+    T: HttpTransport,
+    F: FnOnce(&T, &str, &[SourceSpec], &Path) -> Result<()>,
+{
+    let gate = source_window_download_gate()?;
+    fetch_snapshot_source_window_with_gate(
+        transport,
+        wiki,
+        version,
+        data_dir,
+        run_id,
+        sources,
+        gate,
+        disk_preflight,
+    )
+}
+
+fn fetch_snapshot_source_window_with_gate<T, F>(
+    transport: &T,
+    wiki: &str,
+    version: &str,
+    data_dir: &Path,
+    run_id: &str,
+    sources: &[SourceSpec],
+    gate: &SourceWindowDownloadGate,
     disk_preflight: F,
 ) -> Result<Vec<PathBuf>>
 where
@@ -2122,13 +2265,10 @@ where
         );
     }
 
-    // Source-window callers run on separate worker threads, so the ordinary
-    // per-fetch parallelism setting cannot protect the shared dump server.
-    // Serialize only network fetch transactions; once a source is downloaded,
-    // its worker can ingest it while the next worker fetches its source.
-    let _download_guard = SOURCE_WINDOW_DOWNLOAD_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Source-window callers run on separate worker threads. Bound their
+    // complete preflight + download transactions process-wide; once a source
+    // is downloaded, its worker can ingest it while another worker fetches.
+    let _download_permit = gate.acquire();
     disk_preflight(transport, wiki, sources, data_dir)?;
 
     let mut paths = Vec::with_capacity(sources.len());
@@ -3734,6 +3874,16 @@ mod tests {
     }
 
     #[test]
+    fn source_window_fetch_parallelism_is_bounded_and_defaults_to_serial() -> Result<()> {
+        assert_eq!(source_window_fetch_parallelism(None)?, 1);
+        assert_eq!(source_window_fetch_parallelism(Some(OsStr::new("2")))?, 2);
+        assert!(source_window_fetch_parallelism(Some(OsStr::new("0"))).is_err());
+        assert!(source_window_fetch_parallelism(Some(OsStr::new("3"))).is_err());
+        assert!(source_window_fetch_parallelism(Some(OsStr::new("bad"))).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn fetch_wiki_downloads_multiple_yearly_files() -> Result<()> {
         init_test_tracing();
         let data_dir = TestDir::new()?;
@@ -4413,19 +4563,22 @@ mod tests {
         assert_eq!(sources.len(), 2, "enwiki plan should have multiple sources");
 
         let transport = ConcurrencyTrackingTransport::default();
+        let gate = Arc::new(SourceWindowDownloadGate::new(1));
         let workers = sources
             .into_iter()
             .map(|source| {
                 let transport = transport.clone();
                 let data_dir = data_dir.path().to_path_buf();
+                let gate = Arc::clone(&gate);
                 thread::spawn(move || {
-                    fetch_snapshot_source_window_with_available(
+                    fetch_snapshot_source_window_with_available_and_gate(
                         &transport,
                         "enwiki",
                         "2026-08",
                         &data_dir,
                         "concurrency-test",
                         std::slice::from_ref(&source),
+                        gate.as_ref(),
                         |_| Ok(FETCH_DISK_HEADROOM_MARGIN_BYTES + 13),
                     )
                 })
@@ -4441,6 +4594,50 @@ mod tests {
             transport.max_active.load(Ordering::SeqCst),
             1,
             "source-window workers must not overlap remote requests"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn source_window_can_bound_remote_requests_at_two() -> Result<()> {
+        init_test_tracing();
+        let data_dir = TestDir::new()?;
+        let (plan, _) = SnapshotPlan::load_or_resolve(data_dir.path(), "enwiki", "2026-08")?;
+        let sources = plan.sources.iter().take(2).cloned().collect::<Vec<_>>();
+        assert_eq!(sources.len(), 2, "enwiki plan should have multiple sources");
+
+        let transport = ConcurrencyTrackingTransport::default();
+        let gate = Arc::new(SourceWindowDownloadGate::new(2));
+        let workers = sources
+            .into_iter()
+            .map(|source| {
+                let transport = transport.clone();
+                let data_dir = data_dir.path().to_path_buf();
+                let gate = Arc::clone(&gate);
+                thread::spawn(move || {
+                    fetch_snapshot_source_window_with_available_and_gate(
+                        &transport,
+                        "enwiki",
+                        "2026-08",
+                        &data_dir,
+                        "concurrency-test-two",
+                        std::slice::from_ref(&source),
+                        gate.as_ref(),
+                        |_| Ok(FETCH_DISK_HEADROOM_MARGIN_BYTES + 13),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+
+        for worker in workers {
+            worker
+                .join()
+                .expect("source-window worker should not panic")?;
+        }
+        assert_eq!(
+            transport.max_active.load(Ordering::SeqCst),
+            2,
+            "the source-window gate should allow two overlapping request streams"
         );
         Ok(())
     }

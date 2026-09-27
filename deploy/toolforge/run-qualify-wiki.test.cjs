@@ -14,7 +14,7 @@ test("qualification wrapper confines data, output, status, and locks to its isol
   try {
     const calls = path.join(fixture, "calls.txt");
     const binary = path.join(fixture, "wiki-econ");
-    fs.writeFileSync(binary, `#!/bin/sh\nprintf '%s\\n' "$*" >> "${calls}"\ncase " $* " in\n  *" snapshot-resolve "*) printf '2026-07\\n' ;;\nesac\n`, {mode: 0o755});
+    fs.writeFileSync(binary, `#!/bin/sh\nprintf '%s\\n' "$*" >> "${calls}"\nprintf 'fetch-parallelism=%s\\n' "$WIKI_ECON_FETCH_MAX_PARALLELISM" >> "${calls}"\ncase " $* " in\n  *" snapshot-resolve "*) printf '2026-07\\n' ;;\nesac\n`, {mode: 0o755});
     const qualificationRoot = path.join(fixture, "capacity", "qualifications");
     const result = spawnSync("bash", [script, "itwiki"], {
       encoding: "utf8",
@@ -47,7 +47,7 @@ test("qualification wrapper rejects unsafe wiki identifiers before creating stat
   assert.match(result.stderr, /Unsafe wiki identifier/);
 });
 
-test("enwiki qualification requires an explicit frozen snapshot and one-source window", () => {
+test("enwiki qualification requires an explicit frozen snapshot and bounded fetch concurrency", () => {
   const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-enwiki-freeze-"));
   try {
     const calls = path.join(fixture, "calls.txt");
@@ -82,6 +82,22 @@ test("enwiki qualification requires an explicit frozen snapshot and one-source w
     const invocations = fs.readFileSync(calls, "utf8");
     assert.match(invocations, /qualify-wiki enwiki --version 2026-08/);
     assert.match(invocations, /--source-window-size 1/);
+    assert.match(fs.readFileSync(script, "utf8"), /WIKI_ECON_FETCH_MAX_PARALLELISM:-2/);
+
+    const excessiveFetches = spawnSync("bash", [script, "enwiki"], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        WIKI_ECON_ROOT: fixture,
+        WIKI_ECON_BIN: binary,
+        WIKI_ECON_QUALIFICATION_ROOT: qualificationRoot,
+        WIKI_ECON_RUN_ID: "qualify-enwiki-excessive-fetches",
+        WIKI_ECON_PREPARE_SNAPSHOT: "2026-08",
+        WIKI_ECON_FETCH_MAX_PARALLELISM: "3",
+      },
+    });
+    assert.equal(excessiveFetches.status, 2);
+    assert.match(excessiveFetches.stderr, /must be 1 or 2/);
   } finally {
     fs.rmSync(fixture, {recursive: true, force: true});
   }

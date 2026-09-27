@@ -83,6 +83,7 @@ test("captures complete immutable evidence for a page-week qualification stage",
     WIKI_ECON_MEMORY_CEILING_BYTES: "6442450944",
     WIKI_ECON_REQUESTED_CPU_CORES: "4",
     WIKI_ECON_SOURCE_WORKERS: "1",
+    WIKI_ECON_FETCH_MAX_PARALLELISM: "2",
     WIKI_ECON_THREAD_LIMIT: "1",
     WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS: "16",
     WIKI_ECON_SOURCE_WINDOW_SIZE: "1",
@@ -117,6 +118,7 @@ test("captures complete immutable evidence for a page-week qualification stage",
   assert.equal(receipt.resources.cpu.nr_throttled, 1);
   assert.equal(receipt.resources.cgroup.peak_bytes, 500);
   assert.equal(receipt.resources.cgroup.limit_bytes, 6442450944);
+  assert.equal(receipt.contract.source_fetch_parallelism, 2);
   assert.ok(receipt.wall_time_ms >= 0);
   assert.ok(receipt.resources.storage.persistent_data.high_water != null);
   assert.ok(receipt.resources.storage.scratch.high_water != null);

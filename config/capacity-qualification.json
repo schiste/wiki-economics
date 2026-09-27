@@ -43,6 +43,7 @@
       "raw_transient_requirement_bytes": 3674282888,
       "source_workers": 4,
       "maximum_source_workers": 4,
+      "maximum_source_fetches": 2,
       "required_bucket_counts": [2048],
       "weekly_layout": {
         "primary_buckets": 64,
