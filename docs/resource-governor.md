@@ -32,8 +32,11 @@ Each source then executes as an independent transaction: admit, download,
 validate, ingest immutable fragments, commit its strict marker, and release its
 reservation. Admission is serialized. The storage check includes reservations
 held by other workers, preventing concurrent workers from all claiming the same
-free bytes. If a runtime gate closes, no new source starts; already-admitted
-transactions finish normally.
+free bytes. A bounded dynamic queue refills a worker slot as soon as a source
+finishes instead of waiting for the slowest source in a fixed batch. If a
+runtime gate temporarily closes, dispatch pauses while admitted transactions
+finish, then retries; if one source still cannot be admitted with no work
+in flight, the run fails closed.
 
 Weekly page aggregation validates every logical month before collecting it.
 The production `256 x 1` layout writes stable primary-bucket row groups through
@@ -143,15 +146,16 @@ constant; see `wiki-econ determinism-verify` in
 ## enwiki qualification candidate (publication-hidden)
 
 Enwiki is registered as an isolated, qualification-only candidate. The
-capacity entry in `config/capacity-qualification.json` pins the frozen
-`2026-08` snapshot, a one-source window, one source worker, and the candidate
+capacity entry in config/capacity-qualification.json pins the frozen
+2026-08 snapshot, a four-source worker/window ceiling, and the candidate
 64 x 32 page-week layout (2,048 logical buckets). It also records the observed
 source inventory and a 250 GiB persistent-storage reserve for rollover and
-retention checks.
+retention checks. Source admission can reduce the concurrent count when live
+memory or disk headroom requires it.
 
-The Toolforge envelope is binding: 6 GiB per job, one CPU, and the existing
-namespace quota. No future capacity increase is assumed; a larger-memory
-profile is not a valid fallback. Qualification must use
+The Toolforge envelope is binding: 6 GiB and 4 vCPU per job, within the
+existing 24 GiB/16-vCPU namespace quota. No future capacity increase is
+assumed; a larger-memory profile is not a valid fallback. Qualification must use
 `deploy/toolforge/run-qualify-wiki.sh enwiki` with
 `WIKI_ECON_PREPARE_SNAPSHOT=2026-08`, and the benchmark wrapper's `2048`
 variant expands to exactly `--weekly-buckets 64 --weekly-secondary-buckets 32`.
