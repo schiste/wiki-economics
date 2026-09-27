@@ -2180,14 +2180,18 @@ where
     )
 }
 
+struct SourceWindowFetchRequest<'a> {
+    wiki: &'a str,
+    version: &'a str,
+    data_dir: &'a Path,
+    run_id: &'a str,
+    sources: &'a [SourceSpec],
+}
+
 #[cfg(test)]
 fn fetch_snapshot_source_window_with_available_and_gate<T, F>(
     transport: &T,
-    wiki: &str,
-    version: &str,
-    data_dir: &Path,
-    run_id: &str,
-    sources: &[SourceSpec],
+    request: SourceWindowFetchRequest<'_>,
     gate: &SourceWindowDownloadGate,
     available_space: F,
 ) -> Result<Vec<PathBuf>>
@@ -2197,11 +2201,7 @@ where
 {
     fetch_snapshot_source_window_with_gate(
         transport,
-        wiki,
-        version,
-        data_dir,
-        run_id,
-        sources,
+        request,
         gate,
         move |transport, wiki, sources, data_dir| {
             check_source_window_disk_headroom_with_available(
@@ -2231,11 +2231,13 @@ where
     let gate = source_window_download_gate()?;
     fetch_snapshot_source_window_with_gate(
         transport,
-        wiki,
-        version,
-        data_dir,
-        run_id,
-        sources,
+        SourceWindowFetchRequest {
+            wiki,
+            version,
+            data_dir,
+            run_id,
+            sources,
+        },
         gate,
         disk_preflight,
     )
@@ -2243,11 +2245,7 @@ where
 
 fn fetch_snapshot_source_window_with_gate<T, F>(
     transport: &T,
-    wiki: &str,
-    version: &str,
-    data_dir: &Path,
-    run_id: &str,
-    sources: &[SourceSpec],
+    request: SourceWindowFetchRequest<'_>,
     gate: &SourceWindowDownloadGate,
     disk_preflight: F,
 ) -> Result<Vec<PathBuf>>
@@ -2255,6 +2253,13 @@ where
     T: HttpTransport,
     F: FnOnce(&T, &str, &[SourceSpec], &Path) -> Result<()>,
 {
+    let SourceWindowFetchRequest {
+        wiki,
+        version,
+        data_dir,
+        run_id,
+        sources,
+    } = request;
     let (plan, _) = SnapshotPlan::load_or_resolve(data_dir, wiki, version)?;
     anyhow::ensure!(!sources.is_empty(), "source window must not be empty");
     for source in sources {
@@ -4573,11 +4578,13 @@ mod tests {
                 thread::spawn(move || {
                     fetch_snapshot_source_window_with_available_and_gate(
                         &transport,
-                        "enwiki",
-                        "2026-08",
-                        &data_dir,
-                        "concurrency-test",
-                        std::slice::from_ref(&source),
+                        SourceWindowFetchRequest {
+                            wiki: "enwiki",
+                            version: "2026-08",
+                            data_dir: &data_dir,
+                            run_id: "concurrency-test",
+                            sources: std::slice::from_ref(&source),
+                        },
                         gate.as_ref(),
                         |_| Ok(FETCH_DISK_HEADROOM_MARGIN_BYTES + 13),
                     )
@@ -4617,11 +4624,13 @@ mod tests {
                 thread::spawn(move || {
                     fetch_snapshot_source_window_with_available_and_gate(
                         &transport,
-                        "enwiki",
-                        "2026-08",
-                        &data_dir,
-                        "concurrency-test-two",
-                        std::slice::from_ref(&source),
+                        SourceWindowFetchRequest {
+                            wiki: "enwiki",
+                            version: "2026-08",
+                            data_dir: &data_dir,
+                            run_id: "concurrency-test-two",
+                            sources: std::slice::from_ref(&source),
+                        },
                         gate.as_ref(),
                         |_| Ok(FETCH_DISK_HEADROOM_MARGIN_BYTES + 13),
                     )

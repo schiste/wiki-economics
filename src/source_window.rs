@@ -452,6 +452,28 @@ fn governed_snapshot_with_sizes<F>(
 where
     F: FnOnce(&[SourceSpec]) -> Result<Vec<Option<u64>>>,
 {
+    let effective_source_fetches = fetch::source_window_fetch_parallelism_from_environment()?;
+    governed_snapshot_with_fetch_limit(
+        data_dir,
+        wiki,
+        snapshot,
+        window_size,
+        effective_source_fetches,
+        resolve_sizes,
+    )
+}
+
+fn governed_snapshot_with_fetch_limit<F>(
+    data_dir: &Path,
+    wiki: &str,
+    snapshot: &str,
+    window_size: usize,
+    effective_source_fetches: usize,
+    resolve_sizes: F,
+) -> Result<ResourceGovernor>
+where
+    F: FnOnce(&[SourceSpec]) -> Result<Vec<Option<u64>>>,
+{
     let (plan, _) = SnapshotPlan::load_or_resolve(data_dir, wiki, snapshot)?;
     let analytical = crate::storage::snapshot_analytical_wiki_dir(data_dir, wiki, snapshot)?;
     let mut source_sizes = vec![None; plan.sources.len()];
@@ -477,9 +499,7 @@ where
         source_sizes[index] = size;
     }
     let profile = workload_profile::load_or_select(data_dir, &plan, &source_sizes)?;
-    profile.ensure_source_fetches_qualified(
-        fetch::source_window_fetch_parallelism_from_environment()?,
-    )?;
+    profile.ensure_source_fetches_qualified(effective_source_fetches)?;
     let scratch_root = std::env::var_os("WIKI_ECON_SCRATCH_DIR").map(Into::into);
     let paths = GovernorPaths::new(data_dir.to_path_buf(), scratch_root);
     let source_workers = profile.parameters.source_workers;
@@ -1517,6 +1537,26 @@ mod tests {
         assert!(
             !crate::storage::generation_manifest_path(data_dir.path(), wiki, candidate)?.exists()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn source_fetch_parallelism_is_qualified_before_resource_creation() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        SnapshotPlan::load_or_resolve(data_dir.path(), "nlwiki", "2026-08")?;
+
+        let result = governed_snapshot_with_fetch_limit(
+            data_dir.path(),
+            "nlwiki",
+            "2026-08",
+            1,
+            2,
+            |sources| Ok(vec![Some(42); sources.len()]),
+        );
+        let error = result
+            .err()
+            .expect("an unqualified source fetch limit must fail before resource setup");
+        assert!(error.to_string().contains("maximum of 1 for nlwiki"));
         Ok(())
     }
 
