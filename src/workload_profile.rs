@@ -72,6 +72,22 @@ impl WorkloadProfileName {
         }
     }
 
+    fn parameters_match_schema(self, schema_version: u32, parameters: &WorkloadParameters) -> bool {
+        let Some(expected) = self.parameters_for_schema(schema_version) else {
+            return false;
+        };
+        if parameters == &expected {
+            return true;
+        }
+
+        // Schema v2 profiles were persisted both before and after the Large
+        // source-worker increase reached Toolforge. Accept both durable forms
+        // while schema v3 gives the new capacity profile its own version.
+        schema_version == PREVIOUS_PROFILE_SCHEMA_VERSION
+            && self == Self::Large
+            && parameters == &self.parameters()
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             Self::Small => "small",
@@ -319,12 +335,9 @@ impl WorkloadProfile {
             self.signals.total_compressed_bytes > 0,
             "workload compressed byte total is zero"
         );
-        let expected_parameters = self
-            .profile
-            .parameters_for_schema(self.schema_version)
-            .context("unsupported workload profile schema")?;
         ensure!(
-            self.parameters == expected_parameters,
+            self.profile
+                .parameters_match_schema(self.schema_version, &self.parameters),
             "workload profile parameters do not match the named profile"
         );
         if self.selection_mode == ProfileSelectionMode::Automatic
@@ -597,9 +610,14 @@ mod tests {
 
     #[test]
     fn unsupported_profile_schema_has_no_parameter_set() {
+        let parameters = WorkloadProfileName::Large.parameters();
         assert_eq!(
             WorkloadProfileName::Large.parameters_for_schema(PROFILE_SCHEMA_VERSION + 1),
             None
+        );
+        assert!(
+            !WorkloadProfileName::Large
+                .parameters_match_schema(PROFILE_SCHEMA_VERSION + 1, &parameters)
         );
     }
 
@@ -693,8 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn prior_large_profiles_keep_their_three_worker_parameters_after_capacity_tuning() -> Result<()>
-    {
+    fn prior_large_profiles_keep_their_parameters_after_capacity_tuning() -> Result<()> {
         let root = TestDir::new()?;
         let path = profile_path(root.path(), "testwiki", "2026-08")?;
 
@@ -720,6 +737,21 @@ mod tests {
 
             assert_eq!(load(root.path(), "testwiki", "2026-08")?, Some(previous));
         }
+
+        let mut capacity_tuned = profile(
+            "testwiki",
+            WorkloadProfileName::Large,
+            ProfileSelectionMode::Automatic,
+        );
+        capacity_tuned.schema_version = PREVIOUS_PROFILE_SCHEMA_VERSION;
+        capacity_tuned.selection_algorithm_version =
+            PREVIOUS_SELECTION_ALGORITHM_VERSION.to_string();
+        capacity_tuned.parameters.source_workers = 4;
+        write_atomic(&path, &capacity_tuned)?;
+        assert_eq!(
+            load(root.path(), "testwiki", "2026-08")?,
+            Some(capacity_tuned)
+        );
 
         let current = profile(
             "testwiki",
