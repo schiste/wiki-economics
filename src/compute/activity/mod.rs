@@ -110,6 +110,31 @@ impl ActivityPeriod {
     }
 }
 
+#[derive(Clone, Copy)]
+struct ActivityTierColumns {
+    period: ActivityPeriod,
+    user_type_rank: &'static str,
+    edits: &'static str,
+    net_bytes: &'static str,
+    gross_bytes: &'static str,
+}
+
+const QUARTER_ACTIVITY_TIER_COLUMNS: ActivityTierColumns = ActivityTierColumns {
+    period: ActivityPeriod::Quarter,
+    user_type_rank: "quarter_user_type_rank",
+    edits: "quarter_edits",
+    net_bytes: "quarter_net_bytes",
+    gross_bytes: "quarter_gross_bytes",
+};
+
+const YEAR_ACTIVITY_TIER_COLUMNS: ActivityTierColumns = ActivityTierColumns {
+    period: ActivityPeriod::Year,
+    user_type_rank: "year_user_type_rank",
+    edits: "year_edits",
+    net_bytes: "year_net_bytes",
+    gross_bytes: "year_gross_bytes",
+};
+
 pub(super) fn activity_tier_labels(months: u32) -> [String; 5] {
     let first = if months == 1 {
         "1 edit".to_string()
@@ -153,41 +178,53 @@ pub(super) fn gdp_activity_tiers_for_period(
 ) -> Result<DataFrame> {
     gdp_activity_tiers_for_period_columns(
         editor_months,
-        period,
-        "user_type_rank",
-        "edits",
-        "net_bytes",
-        "gross_bytes",
+        ActivityTierColumns {
+            period,
+            user_type_rank: "user_type_rank",
+            edits: "edits",
+            net_bytes: "net_bytes",
+            gross_bytes: "gross_bytes",
+        },
     )
+}
+
+fn aggregate_stream_period(
+    accumulator: &DataFrame,
+    columns: ActivityTierColumns,
+) -> Result<DataFrame> {
+    gdp_activity_tiers_for_period_columns(accumulator, columns)
 }
 
 fn gdp_activity_tiers_for_period_columns(
     editor_months: &DataFrame,
-    period: ActivityPeriod,
-    user_type_rank_column: &str,
-    edits_column: &str,
-    net_bytes_column: &str,
-    gross_bytes_column: &str,
+    columns: ActivityTierColumns,
 ) -> Result<DataFrame> {
+    let ActivityTierColumns {
+        period,
+        user_type_rank,
+        edits,
+        net_bytes,
+        gross_bytes,
+    } = columns;
     let editor_months = ensure_editor_identity_key(editor_months)?;
     let months = period.months();
     let labels = activity_tier_labels(months);
     let input_edits = editor_months
-        .column(edits_column)?
+        .column(edits)?
         .cast(&DataType::Int64)?
         .i64()?
         .sum()
         .unwrap_or(0);
     let mut frame = editor_months
         .lazy()
-        .filter(col(edits_column).gt(lit(0_u32)))
+        .filter(col(edits).gt(lit(0_u32)))
         .with_column(period.key_expr().alias("period_key"))
         .group_by([col("period_key"), col("editor_identity")])
         .agg([
-            col(user_type_rank_column).max().alias("user_type_rank"),
-            col(edits_column).sum().alias("edits"),
-            col(net_bytes_column).sum().alias("net_bytes"),
-            col(gross_bytes_column).sum().alias("gross_bytes"),
+            col(user_type_rank).max().alias("user_type_rank"),
+            col(edits).sum().alias("edits"),
+            col(net_bytes).sum().alias("net_bytes"),
+            col(gross_bytes).sum().alias("gross_bytes"),
         ])
         .with_columns([
             user_type_from_rank_expr(),
@@ -397,10 +434,8 @@ impl ActivityTierStream {
         output_frames.push(monthly_tiers);
 
         if editor_month.height() > 0 {
-            self.accumulator = Some(merge_activity_accumulator(
-                self.accumulator.take(),
-                editor_month,
-            )?);
+            let accumulator = merge_activity_accumulator(self.accumulator.take(), editor_month)?;
+            self.accumulator = Some(accumulator);
         }
 
         if month % 3 == 0 {
@@ -430,39 +465,27 @@ impl ActivityTierStream {
         let Some(mut accumulator) = self.accumulator.take() else {
             return Ok(());
         };
-        output_frames.push(gdp_activity_tiers_for_period_columns(
-            &accumulator,
-            ActivityPeriod::Quarter,
-            "quarter_user_type_rank",
-            "quarter_edits",
-            "quarter_net_bytes",
-            "quarter_gross_bytes",
-        )?);
+        let quarter_tiers = aggregate_stream_period(&accumulator, QUARTER_ACTIVITY_TIER_COLUMNS)?;
+        output_frames.push(quarter_tiers);
         let height = accumulator.height();
-        accumulator.with_column(Column::new(
-            "quarter_user_type_rank".into(),
-            vec![0_i32; height],
-        ))?;
+        let quarter_user_type_rank = vec![0_i32; height];
+        let q_rank = Column::new("quarter_user_type_rank".into(), quarter_user_type_rank);
+        accumulator.with_column(q_rank)?;
         accumulator.with_column(Column::new("quarter_edits".into(), vec![0_u32; height]))?;
-        accumulator.with_column(Column::new("quarter_net_bytes".into(), vec![0_i64; height]))?;
-        accumulator.with_column(Column::new(
-            "quarter_gross_bytes".into(),
-            vec![0_i64; height],
-        ))?;
+        let quarter_net_bytes = vec![0_i64; height];
+        let q_net_bytes = Column::new("quarter_net_bytes".into(), quarter_net_bytes);
+        accumulator.with_column(q_net_bytes)?;
+        let quarter_gross_bytes = vec![0_i64; height];
+        let q_gross_bytes = Column::new("quarter_gross_bytes".into(), quarter_gross_bytes);
+        accumulator.with_column(q_gross_bytes)?;
         self.accumulator = Some(accumulator);
         Ok(())
     }
 
     fn finish_year(&mut self, output_frames: &mut Vec<DataFrame>) -> Result<()> {
         if let Some(accumulator) = self.accumulator.take() {
-            output_frames.push(gdp_activity_tiers_for_period_columns(
-                &accumulator,
-                ActivityPeriod::Year,
-                "year_user_type_rank",
-                "year_edits",
-                "year_net_bytes",
-                "year_gross_bytes",
-            )?);
+            let year_tiers = aggregate_stream_period(&accumulator, YEAR_ACTIVITY_TIER_COLUMNS)?;
+            output_frames.push(year_tiers);
         }
         Ok(())
     }
