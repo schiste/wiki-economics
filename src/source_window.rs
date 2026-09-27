@@ -797,6 +797,47 @@ mod tests {
     }
 
     #[test]
+    fn bounded_execution_retries_temporary_and_surfaces_persistent_admission_rejection() {
+        let items = [1_u8, 2];
+        let run = |persistent_rejection: bool| -> Result<(usize, u64, usize)> {
+            let second_item_attempts = AtomicUsize::new(0);
+            let (completed, rows) = execute_bounded(
+                &items,
+                2,
+                |index, _| {
+                    if index == 1 {
+                        let attempt = second_item_attempts.fetch_add(1, Ordering::AcqRel);
+                        if persistent_rejection || attempt == 0 {
+                            anyhow::bail!("injected source admission rejection");
+                        }
+                    }
+                    Ok(())
+                },
+                |_, item, ()| Ok(u64::from(*item)),
+            )?;
+            Ok((
+                completed,
+                rows,
+                second_item_attempts.load(Ordering::Relaxed),
+            ))
+        };
+
+        let (completed, rows, attempts) = run(false)
+            .expect("temporary admission rejection must be retried after a worker completes");
+        assert_eq!(completed, items.len());
+        assert_eq!(rows, 3);
+        assert_eq!(attempts, 2);
+
+        let error = run(true)
+            .expect_err("persistent admission rejection must propagate after active work joins");
+        assert!(error.chain().any(|cause| {
+            cause
+                .to_string()
+                .contains("resource governor could not admit a source worker")
+        }));
+    }
+
+    #[test]
     fn bounded_execution_refills_a_slot_before_the_slowest_source_finishes() -> Result<()> {
         let items = [0_u8, 1, 2];
         let slow_source_active = Arc::new(AtomicBool::new(false));
