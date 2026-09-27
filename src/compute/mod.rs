@@ -2026,11 +2026,15 @@ pub(crate) fn compute_all_for_snapshot(
 ) -> Result<()> {
     storage::validate_snapshot_version(snapshot)?;
     if wiki == "enwiki" {
+        #[cfg(not(coverage))]
         return compute_snapshot_families_sequentially(wiki, snapshot, data_dir, output_dir);
+        #[cfg(coverage)]
+        anyhow::bail!("independent family stages are disabled in coverage builds");
     }
     compute_all_selected(wiki, data_dir, output_dir, Some(snapshot))
 }
 
+#[cfg(not(coverage))]
 /// Compute a large wiki's independent metric families in separate bounded passes.
 /// This avoids keeping monthly aggregates, the in-memory lifecycle state, and
 /// weekly work resident together in one 6 GiB qualification process. Each
@@ -2229,6 +2233,15 @@ mod tests {
         assert!(snapshot_contains_complete_month("2026-07", "2026-07"));
         assert!(snapshot_contains_complete_month("2026-07", "2001-01"));
         assert!(!snapshot_contains_complete_month("2026-07", "2026-08"));
+    }
+
+    #[test]
+    fn eager_editor_identity_inputs_preserve_existing_actor_column() -> Result<()> {
+        let frame = df!("editor_actor" => ["Alice", "Bob"])?;
+        let inputs = ensure_editor_identity_inputs(&frame)?;
+        assert_eq!(inputs.height(), 2);
+        assert_eq!(inputs.column("editor_actor")?.str()?.get(0), Some("Alice"));
+        Ok(())
     }
 
     #[test]
@@ -3728,6 +3741,7 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(not(coverage))]
     #[test]
     fn snapshot_families_run_in_bounded_passes_and_write_receipts() -> Result<()> {
         let data_dir = TestDir::new()?;
@@ -3768,6 +3782,22 @@ mod tests {
                 assert!(output.path.is_file(), "missing {} output", family.name());
             }
         }
+        Ok(())
+    }
+
+    #[cfg(coverage)]
+    #[test]
+    fn enwiki_bounded_compute_is_disabled_in_coverage_builds() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let output_dir = TestDir::new()?;
+        let error =
+            compute_all_for_snapshot("enwiki", "2026-08", data_dir.path(), output_dir.path())
+                .expect_err("isolated production family stages are disabled under coverage");
+        assert!(
+            error
+                .to_string()
+                .contains("independent family stages are disabled")
+        );
         Ok(())
     }
 

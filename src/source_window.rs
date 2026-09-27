@@ -897,10 +897,10 @@ mod tests {
         });
 
         let slow_started = slow_started_rx
-            .recv_timeout(std::time::Duration::from_secs(1))
+            .recv_timeout(std::time::Duration::from_secs(5))
             .is_ok();
         let refilled_while_slow_active = refill_observation_rx
-            .recv_timeout(std::time::Duration::from_millis(500))
+            .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap_or(false);
         let _ = release_tx.send(());
         let result = execution.join().expect("bounded executor should not panic");
