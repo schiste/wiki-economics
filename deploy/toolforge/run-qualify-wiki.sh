@@ -90,7 +90,10 @@ if [ "$wiki" = "enwiki" ]; then
   export POLARS_MAX_THREADS="${POLARS_MAX_THREADS:-$WIKI_ECON_THREAD_LIMIT}"
   export WIKI_ECON_SOURCE_WORKERS="${WIKI_ECON_SOURCE_WORKERS:-$WIKI_ECON_THREAD_LIMIT}"
   export WIKI_ECON_WEEKLY_WORKERS="${WIKI_ECON_WEEKLY_WORKERS:-$WIKI_ECON_THREAD_LIMIT}"
-  export WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS="${WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS:-32}"
+  # Enwiki's 6 GiB pod reached its cgroup limit with 32 simultaneous bucket
+  # writers during page-week compaction. Keep the writer batch bounded while
+  # retaining the four-CPU worker pool for weekly routing and reconciliation.
+  export WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS="${WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS:-8}"
   export WIKI_ECON_FETCH_MAX_PARALLELISM="${WIKI_ECON_FETCH_MAX_PARALLELISM:-2}"
   validate_worker_pool WIKI_ECON_THREAD_LIMIT "$WIKI_ECON_THREAD_LIMIT" "$qualification_cpu_cores"
   validate_worker_pool RAYON_NUM_THREADS "$RAYON_NUM_THREADS" "$WIKI_ECON_THREAD_LIMIT"

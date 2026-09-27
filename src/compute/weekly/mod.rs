@@ -573,6 +573,10 @@ fn compute_page_weekly_edits_for_snapshot_with_governor(
         "page_weekly_edits lost or duplicated data for {wiki}: {total_edits_before} edits before merge, {total_edits_after} after"
     );
     let output = output.context("page_weekly_edits produced no rows from non-empty partitions")?;
+    info!(
+        path = %final_path.display(),
+        "page_weekly_edits: finalizing output"
+    );
     let bytes = output.finish()?;
     working_storage_peak_bytes = working_storage_peak_bytes.max(bytes);
     let reconciliation_elapsed_ms = reconciliation_started.elapsed().as_millis() as u64;
@@ -1888,8 +1892,22 @@ pub(super) fn append_weekly_bucket_results(
     working_storage_peak_bytes: &mut u64,
     reconciliation_peak: &mut ResourcePeak,
 ) -> Result<()> {
+    info!(
+        scratch_dir = %runs.path().display(),
+        final_output = %final_path.display(),
+        result_count = results.len(),
+        "page_weekly_edits: appending reconciled bucket batch"
+    );
     *scratch_peak_bytes = (*scratch_peak_bytes).max(runs.size_bytes()?);
     for result in results {
+        info!(
+            logical_bucket = result.logical_bucket,
+            primary_bucket = result.primary_bucket,
+            secondary_bucket = result.secondary_bucket,
+            result_path = %result.result_path.display(),
+            final_output = %final_path.display(),
+            "page_weekly_edits: opening reconciled bucket"
+        );
         let mut frame = ParquetReader::new(File::open(&result.result_path)?).finish()?;
         anyhow::ensure!(
             frame.height() == result.output_rows,
