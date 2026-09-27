@@ -82,3 +82,61 @@ test("capacity admission accounts for leases written before CPU accounting was a
   assert.equal(admission.admittedBytes, 6 * 1024 ** 3);
   assert.equal(admission.admittedMillicores, 1_000);
 });
+
+test("capacity admission archives stale leases once and ignores archived files", (t) => {
+  const options = fixture(t);
+  fs.mkdirSync(options.root, {recursive: true});
+  fs.writeFileSync(path.join(options.root, "expired.json"), JSON.stringify({
+    schemaVersion: 1,
+    identity: "expired",
+    resourceClass: "small",
+    requestedBytes: 2 * 1024 ** 3,
+    requestedMillicores: 1_000,
+    heartbeatAt: "2000-01-01T00:00:00.000Z",
+  }));
+
+  const first = acquire({...options, resourceClass: "small", identity: "new-1"});
+  assert.equal(first.admitted, true);
+  const archived = fs.readdirSync(options.root).filter((name) => name.startsWith(".stale-"));
+  assert.equal(archived.length, 1);
+
+  const second = acquire({...options, resourceClass: "small", identity: "new-2"});
+  assert.equal(second.admitted, true);
+  assert.equal(second.active, 1);
+  assert.deepEqual(fs.readdirSync(options.root).filter((name) => name.startsWith(".stale-")), archived);
+});
+
+test("capacity admission tolerates a stale lease disappearing before it is archived", (t) => {
+  const options = fixture(t);
+  fs.mkdirSync(options.root, {recursive: true});
+  const expiredFile = path.join(options.root, "expired.json");
+  fs.writeFileSync(expiredFile, JSON.stringify({
+    schemaVersion: 1,
+    identity: "expired",
+    resourceClass: "small",
+    requestedBytes: 2 * 1024 ** 3,
+    requestedMillicores: 1_000,
+    heartbeatAt: "2000-01-01T00:00:00.000Z",
+  }));
+
+  const originalRenameSync = fs.renameSync;
+  let removedConcurrently = false;
+  fs.renameSync = (source, destination) => {
+    if (source === expiredFile && !removedConcurrently) {
+      fs.unlinkSync(source);
+      removedConcurrently = true;
+      const error = new Error("lease disappeared during stale cleanup");
+      error.code = "ENOENT";
+      throw error;
+    }
+    return originalRenameSync(source, destination);
+  };
+  try {
+    const admission = acquire({...options, resourceClass: "small", identity: "new-1"});
+    assert.equal(removedConcurrently, true);
+    assert.equal(admission.admitted, true);
+    assert.equal(admission.active, 0);
+  } finally {
+    fs.renameSync = originalRenameSync;
+  }
+});
