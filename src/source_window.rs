@@ -193,21 +193,102 @@ fn configured_window_size_from(
     Ok(value)
 }
 
-fn execute_bounded<T, F>(items: &[T], window_size: usize, mut process: F) -> Result<usize>
+fn execute_bounded<T, P, A, F>(
+    items: &[T],
+    worker_limit: usize,
+    mut admit: A,
+    process: F,
+) -> Result<(usize, u64)>
 where
-    F: FnMut(&[T]) -> Result<usize>,
+    T: Sync,
+    P: Send,
+    A: FnMut(usize, &T) -> Result<P>,
+    F: Fn(usize, &T, P) -> Result<u64> + Sync,
 {
     anyhow::ensure!(
-        (1..=MAX_SOURCE_WINDOW_SIZE).contains(&window_size),
-        "source-window size must be between 1 and {MAX_SOURCE_WINDOW_SIZE}, got {window_size}"
+        (1..=MAX_SOURCE_WINDOW_SIZE).contains(&worker_limit),
+        "source-worker limit must be between 1 and {MAX_SOURCE_WINDOW_SIZE}, got {worker_limit}"
     );
-    let mut completed = 0_usize;
-    for window in items.chunks(window_size) {
-        completed = completed
-            .checked_add(process(window)?)
-            .context("completed source count overflow")?;
-    }
-    Ok(completed)
+
+    std::thread::scope(|scope| {
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel::<(usize, Result<u64>)>();
+        let mut next_item = 0;
+        let mut active_workers = 0;
+        let mut completed_items = 0_usize;
+        let mut ingested_rows = 0_u64;
+        let mut first_error: Option<anyhow::Error> = None;
+
+        // Refill a worker slot as soon as any source finishes. Fixed-size
+        // waves leave idle tails while the slowest source in each wave ingests.
+        while next_item < items.len() || active_workers > 0 {
+            while first_error.is_none() && next_item < items.len() && active_workers < worker_limit
+            {
+                let index = next_item;
+                let permit = match admit(index, &items[index]) {
+                    Ok(permit) => permit,
+                    Err(_error) if active_workers > 0 => {
+                        // A concurrent task may release the headroom this
+                        // source needs. Wait for one completion, then retry.
+                        break;
+                    }
+                    Err(error) => {
+                        return Err(
+                            error.context("resource governor could not admit a source worker")
+                        );
+                    }
+                };
+                let item = &items[index];
+                let process = &process;
+                let completed_tx = completed_tx.clone();
+                scope.spawn(move || {
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        process(index, item, permit)
+                    }))
+                    .unwrap_or_else(|_| {
+                        Err(anyhow::anyhow!(
+                            "source prefetch worker panicked during fetch or ingest"
+                        ))
+                    });
+                    let _ = completed_tx.send((index, outcome));
+                });
+                next_item += 1;
+                active_workers += 1;
+            }
+
+            if active_workers == 0 {
+                if first_error.is_some() || next_item == items.len() {
+                    break;
+                }
+                continue;
+            }
+
+            let (index, outcome) = completed_rx
+                .recv()
+                .context("source worker completion channel closed unexpectedly")?;
+            active_workers -= 1;
+            match outcome {
+                Ok(rows) if first_error.is_none() => {
+                    completed_items = completed_items
+                        .checked_add(1)
+                        .context("completed source count overflow")?;
+                    ingested_rows = ingested_rows
+                        .checked_add(rows)
+                        .context("snapshot ingest row count overflow")?;
+                }
+                Ok(_) => {}
+                Err(error) if first_error.is_none() => {
+                    first_error =
+                        Some(error.context(format!("source worker failed for item {index}")));
+                }
+                Err(_) => {}
+            }
+        }
+
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok((completed_items, ingested_rows)),
+        }
+    })
 }
 
 struct SourceExecution<'a> {
@@ -303,91 +384,6 @@ fn ingest_fetched_source<O: SourceTransactionOps>(
     }
     if let Some(permit) = permit {
         permit.complete();
-    }
-    Ok(rows)
-}
-
-fn process_source_window<O: SourceTransactionOps>(
-    ops: &O,
-    execution: &SourceExecution<'_>,
-    sources: &[SourceSpec],
-    expected_sizes: &[Option<u64>],
-) -> Result<Vec<u64>> {
-    anyhow::ensure!(
-        sources.len() == expected_sizes.len(),
-        "source-window size inventory changed"
-    );
-    // Each task owns one immutable source ID, its download path, and its
-    // per-source ingest marker. Reserve disk and a conservative ingest-memory
-    // slice before launching it. If the current cgroup or filesystem can admit
-    // fewer sources than the configured ceiling, shrink this wave and retry;
-    // completed source commits remain independently resumable.
-    let mut rows = Vec::with_capacity(sources.len());
-    let mut offset = 0;
-    while offset < sources.len() {
-        let mut width = sources.len() - offset;
-        let (admitted, width) = loop {
-            let mut admitted = Vec::with_capacity(width);
-            let mut failure = None;
-            for expected in &expected_sizes[offset..offset + width] {
-                let expected = expected.context("source size became unknown after preflight")?;
-                let permit = match execution
-                    .governor
-                    .map(|governor| governor.admit_source(expected))
-                    .transpose()
-                {
-                    Ok(permit) => permit,
-                    Err(error) => {
-                        failure = Some(error);
-                        break;
-                    }
-                };
-                admitted.push(permit);
-            }
-            if let Some(error) = failure {
-                drop(admitted);
-                if width == 1 {
-                    return Err(
-                        error.context("resource governor could not admit one source worker")
-                    );
-                }
-                width -= 1;
-            } else {
-                break (admitted, width);
-            }
-        };
-
-        let wave = std::thread::scope(|scope| {
-            let workers = sources[offset..offset + width]
-                .iter()
-                .zip(admitted)
-                .map(|(source, permit)| {
-                    scope.spawn(move || process_source(ops, execution, source, permit))
-                })
-                .collect::<Vec<_>>();
-            let mut wave_rows = Vec::with_capacity(workers.len());
-            let mut failure = None;
-            for worker in workers {
-                match worker.join() {
-                    Ok(Ok(count)) => wave_rows.push(count),
-                    Ok(Err(error)) => {
-                        if failure.is_none() {
-                            failure = Some(error);
-                        }
-                    }
-                    Err(_) => {
-                        if failure.is_none() {
-                            failure = Some(anyhow::anyhow!(
-                                "source prefetch worker panicked during fetch or ingest"
-                            ));
-                        }
-                    }
-                }
-            }
-            failure.map_or(Ok(wave_rows), Err)
-        })?;
-        rows.extend(wave);
-        offset += width;
     }
     Ok(rows)
 }
@@ -568,28 +564,23 @@ fn prepare_snapshot_with_ops<O: SourceTransactionOps>(
         run_id,
         governor,
     };
-    let mut ingested_rows = 0_u64;
-    let ingested_sources = execute_bounded(&pending, source_worker_limit, |sources| {
-        let offset = pending
-            .iter()
-            .position(|candidate| candidate.source_id == sources[0].source_id)
-            .context("source window is not part of pending inventory")?;
-        let rows = process_source_window(
-            ops,
-            &execution,
-            sources,
-            &source_sizes[offset..offset + sources.len()],
-        )?;
-        let rows = rows.into_iter().try_fold(0_u64, |total, rows| {
-            total
-                .checked_add(rows)
-                .context("source-window row count overflow")
-        })?;
-        ingested_rows = ingested_rows
-            .checked_add(rows)
-            .context("snapshot ingest row count overflow")?;
-        Ok(sources.len())
-    })?;
+    let (ingested_sources, ingested_rows) = execute_bounded(
+        &pending,
+        source_worker_limit,
+        |index, _source| {
+            let expected_size =
+                source_sizes[index].context("source size became unknown after preflight")?;
+            governor
+                .map(|governor| governor.admit_source(expected_size))
+                .transpose()
+        },
+        |_, source, permit| process_source(ops, &execution, source, permit),
+    )?;
+    anyhow::ensure!(
+        ingested_sources == pending.len(),
+        "bounded source executor completed {ingested_sources} of {} pending sources",
+        pending.len()
+    );
 
     ops.finalize(wiki, snapshot, data_dir, select_generation)?;
     if let Some(governor) = governor {
@@ -639,8 +630,8 @@ mod tests {
     use super::*;
     use crate::resource_governor::{GovernorPaths, ResourceBudget};
     use crate::test_support::TestDir;
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, mpsc};
 
     #[derive(Default)]
     struct FakeOps {
@@ -776,39 +767,114 @@ mod tests {
     }
 
     #[test]
-    fn bounded_execution_never_exceeds_the_window_and_keeps_commits() -> Result<()> {
+    fn bounded_execution_never_exceeds_worker_limit_and_keeps_commits() -> Result<()> {
         let items = [1_u8, 2, 3, 4, 5, 6, 7];
-        let mut windows = Vec::new();
-        let completed = execute_bounded(&items, 3, |window| {
-            windows.push(window.to_vec());
-            Ok(window.len())
-        })?;
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum_active = Arc::new(AtomicUsize::new(0));
+        let (completed, rows) = execute_bounded(
+            &items,
+            3,
+            |_, _| Ok(()),
+            |_, item, ()| {
+                let current = active.fetch_add(1, Ordering::AcqRel) + 1;
+                maximum_active.fetch_max(current, Ordering::Relaxed);
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                active.fetch_sub(1, Ordering::AcqRel);
+                Ok(u64::from(*item))
+            },
+        )?;
+
         assert_eq!(completed, items.len());
-        assert_eq!(windows, vec![vec![1, 2, 3], vec![4, 5, 6], vec![7]]);
+        assert_eq!(rows, items.iter().map(|item| u64::from(*item)).sum::<u64>());
+        assert!(maximum_active.load(Ordering::Relaxed) > 1);
+        assert!(maximum_active.load(Ordering::Relaxed) <= 3);
         Ok(())
     }
 
     #[test]
-    fn bounded_execution_stops_at_the_failed_window() {
+    fn bounded_execution_refills_a_slot_before_the_slowest_source_finishes() -> Result<()> {
+        let items = [0_u8, 1, 2];
+        let slow_source_active = Arc::new(AtomicBool::new(false));
+        let (release_tx, release_rx_original) = mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx_original));
+        let (slow_started_tx, slow_started_rx) = mpsc::channel();
+        let (refill_observation_tx, refill_observation_rx) = mpsc::channel();
+        let active_flag = Arc::clone(&slow_source_active);
+        let execution = std::thread::spawn(move || {
+            execute_bounded(
+                &items,
+                2,
+                |_, _| Ok(()),
+                |_, item, ()| match *item {
+                    0 => {
+                        active_flag.store(true, Ordering::Release);
+                        let _ = slow_started_tx.send(());
+                        release_rx
+                            .lock()
+                            .expect("release receiver mutex poisoned")
+                            .recv()
+                            .context("slow source release channel closed")?;
+                        active_flag.store(false, Ordering::Release);
+                        Ok(1)
+                    }
+                    1 => Ok(1),
+                    2 => {
+                        let slow_source_was_active = active_flag.load(Ordering::Acquire);
+                        let _ = refill_observation_tx.send(slow_source_was_active);
+                        Ok(1)
+                    }
+                    _ => unreachable!("fixture source ID is in range"),
+                },
+            )
+        });
+
+        let slow_started = slow_started_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .is_ok();
+        let refilled_while_slow_active = refill_observation_rx
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .unwrap_or(false);
+        let _ = release_tx.send(());
+        let result = execution.join().expect("bounded executor should not panic");
+
+        assert!(slow_started, "the first source should start");
+        assert!(
+            refilled_while_slow_active,
+            "the next source should start before the slow source finishes"
+        );
+        assert_eq!(result?, (3, 3));
+        Ok(())
+    }
+
+    #[test]
+    fn bounded_execution_stops_dispatching_after_a_worker_error() {
         let items = [1_u8, 2, 3, 4, 5];
-        let mut windows = Vec::new();
-        let error = execute_bounded(&items, 2, |window| {
-            windows.push(window.to_vec());
-            anyhow::ensure!(window[0] != 3, "interrupted");
-            Ok(window.len())
-        })
-        .expect_err("second window must fail");
-        assert!(error.to_string().contains("interrupted"));
-        assert_eq!(windows, vec![vec![1, 2], vec![3, 4]]);
+        let error = execute_bounded(
+            &items,
+            2,
+            |_, _| Ok(()),
+            |_, item, ()| {
+                anyhow::ensure!(*item != 3, "injected worker failure");
+                Ok(1)
+            },
+        )
+        .expect_err("the worker failure must stop source execution");
+        assert!(
+            error
+                .chain()
+                .any(|cause| cause.to_string().contains("injected worker failure")),
+            "expected injected worker failure in chain, got: {error:#}"
+        );
     }
 
     #[test]
     fn bounded_execution_rejects_an_invalid_window() {
-        assert!(execute_bounded(&[1_u8], 0, |_| Ok(1)).is_err());
+        assert!(execute_bounded(&[1_u8], 0, |_, _| Ok(()), |_, _, ()| Ok(1)).is_err());
     }
 
     #[test]
-    fn snapshot_preparation_batches_pending_sources_and_reports_reuse() -> Result<()> {
+    fn snapshot_preparation_processes_pending_sources_with_bounded_workers_and_reports_reuse()
+    -> Result<()> {
         let data_dir = TestDir::new()?;
         let pending = SnapshotPlan::resolve("enwiki", "2001-03")?
             .sources
@@ -963,7 +1029,7 @@ mod tests {
     }
 
     #[test]
-    fn source_window_shrinks_after_resource_admission_rejects_a_parallel_wave() -> Result<()> {
+    fn source_scheduler_retries_admission_after_in_flight_work_releases_resources() -> Result<()> {
         let data_dir = TestDir::new()?;
         let pending = SnapshotPlan::resolve("enwiki", "2001-02")?
             .sources
@@ -1111,8 +1177,8 @@ mod tests {
                 None,
             )
             .unwrap_err()
-            .to_string()
-            .contains("incomplete path set")
+            .chain()
+            .any(|cause| cause.to_string().contains("incomplete path set"))
         );
 
         let wrong_commit = FakeOps {
@@ -1135,8 +1201,8 @@ mod tests {
                 None,
             )
             .unwrap_err()
-            .to_string()
-            .contains("wrong source")
+            .chain()
+            .any(|cause| cause.to_string().contains("wrong source"))
         );
 
         let wrong_path = FakeOps {
@@ -1159,8 +1225,8 @@ mod tests {
                 None,
             )
             .unwrap_err()
-            .to_string()
-            .contains("wrong path")
+            .chain()
+            .any(|cause| cause.to_string().contains("wrong path"))
         );
         let ingest_error = FakeOps {
             planned: 1,
@@ -1182,8 +1248,8 @@ mod tests {
                 None,
             )
             .unwrap_err()
-            .to_string()
-            .contains("injected ingest failure")
+            .chain()
+            .any(|cause| cause.to_string().contains("injected ingest failure"))
         );
         Ok(())
     }
@@ -1239,11 +1305,11 @@ mod tests {
         };
         let error = run(&panic, panic_root.path(), "panic")
             .expect_err("a producer panic must become a normal pipeline error");
-        assert!(
-            error
+        assert!(error.chain().any(|cause| {
+            cause
                 .to_string()
                 .contains("source prefetch worker panicked")
-        );
+        }));
         assert!(!panic.finalized.load(Ordering::Relaxed));
         Ok(())
     }

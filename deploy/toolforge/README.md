@@ -142,9 +142,12 @@ and higher resource envelope are being qualified.
   time (Toolforge accepts 1–4). The scheduled one-CPU refresh defaults to one;
   the publication-invisible enwiki qualification defaults to four on its
   existing 4-CPU / 6-GiB job. Each source task reserves its expected raw bytes
-  and a bounded memory slice through download and ingest. If live disk or
-  memory headroom admits fewer tasks, the worker shrinks the next wave. Source
-  IDs write independent Parquet parts and durable markers. Each source is downloaded to
+  and a bounded memory slice through download and ingest. A dynamic bounded
+  queue refills a slot as soon as one source completes, while the dump-server
+  download lock prevents parallel request bursts. If live disk or memory
+  headroom temporarily blocks admission, dispatch waits for active work to
+  release its reservations and retries. Source IDs write independent Parquet
+  parts and durable markers. Each source is downloaded to
   pipeline-owned staging, stream-ingested, validated, committed
   with an atomic strict marker, and immediately deleted. This bounds compressed
   raw storage to the selected window instead of retaining the whole wiki dump.
