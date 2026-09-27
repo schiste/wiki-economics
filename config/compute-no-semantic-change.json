@@ -450,6 +450,12 @@
       "paths": ["src/compute/mod.rs"],
       "reason": "Run enwiki metric families in bounded sequential passes; page-week partitioning, aggregation formulas, rows, and schema are unchanged.",
       "base_commit": "dd195929dbfbc2537e6aa1c19d7210cc3cbd5eaf"
+    },
+    {
+      "family": "page_week",
+      "paths": ["src/compute/weekly/mod.rs"],
+      "reason": "Add page-week merge breadcrumbs with scratch, bucket, and output paths; aggregation logic, schemas, rows, and bytes remain unchanged.",
+      "base_commit": "16abdc681e4baa5abffbd951ba8e97ab4f0e9eec"
     }
   ]
 }

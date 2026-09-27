@@ -52,7 +52,7 @@ test("enwiki qualification requires an explicit frozen snapshot and bounded fetc
   try {
     const calls = path.join(fixture, "calls.txt");
     const binary = path.join(fixture, "wiki-econ");
-    fs.writeFileSync(binary, `#!/bin/sh\nprintf '%s\\n' "$*" >> "${calls}"\n`, {mode: 0o755});
+    fs.writeFileSync(binary, `#!/bin/sh\nprintf '%s\\n' "$*" >> "${calls}"\nprintf 'max-writers=%s\\n' "$WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS" >> "${calls}"\n`, {mode: 0o755});
     const qualificationRoot = path.join(fixture, "capacity", "qualifications");
     const missingSnapshot = spawnSync("bash", [script, "enwiki"], {
       encoding: "utf8",
@@ -82,6 +82,7 @@ test("enwiki qualification requires an explicit frozen snapshot and bounded fetc
     const invocations = fs.readFileSync(calls, "utf8");
     assert.match(invocations, /qualify-wiki enwiki --version 2026-08/);
     assert.match(invocations, /--source-window-size 1/);
+    assert.match(invocations, /max-writers=8/);
     assert.match(fs.readFileSync(script, "utf8"), /WIKI_ECON_FETCH_MAX_PARALLELISM:-2/);
 
     const excessiveFetches = spawnSync("bash", [script, "enwiki"], {
