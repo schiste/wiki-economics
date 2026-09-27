@@ -610,9 +610,14 @@ mod tests {
 
     #[test]
     fn unsupported_profile_schema_has_no_parameter_set() {
+        let parameters = WorkloadProfileName::Large.parameters();
         assert_eq!(
             WorkloadProfileName::Large.parameters_for_schema(PROFILE_SCHEMA_VERSION + 1),
             None
+        );
+        assert!(
+            !WorkloadProfileName::Large
+                .parameters_match_schema(PROFILE_SCHEMA_VERSION + 1, &parameters)
         );
     }
 
