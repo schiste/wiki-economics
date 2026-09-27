@@ -168,8 +168,14 @@ struct WikiCapacityPolicy {
     qualified_workload_profiles: Vec<WorkloadProfileName>,
     qualified_workload_bucket_counts: Vec<usize>,
     maximum_source_workers: usize,
+    #[serde(default = "default_maximum_source_fetches")]
+    maximum_source_fetches: usize,
     #[serde(default = "default_publication_eligible")]
     publication_eligible: bool,
+}
+
+fn default_maximum_source_fetches() -> usize {
+    1
 }
 
 fn default_publication_eligible() -> bool {
@@ -414,6 +420,23 @@ impl WorkloadProfile {
             effective_source_workers <= wiki.maximum_source_workers,
             "effective source concurrency {effective_source_workers} exceeds the qualified maximum of {} for {}",
             wiki.maximum_source_workers,
+            self.wiki
+        );
+        Ok(())
+    }
+
+    pub(crate) fn ensure_source_fetches_qualified(
+        &self,
+        effective_source_fetches: usize,
+    ) -> Result<()> {
+        let policy: CapacityPolicy = serde_json::from_str(CAPACITY_POLICY)?;
+        let Some(wiki) = policy.wikis.get(&self.wiki) else {
+            return Ok(());
+        };
+        ensure!(
+            effective_source_fetches > 0 && effective_source_fetches <= wiki.maximum_source_fetches,
+            "effective source fetch concurrency {effective_source_fetches} exceeds the configured maximum of {} for {}",
+            wiki.maximum_source_fetches,
             self.wiki
         );
         Ok(())
@@ -892,6 +915,8 @@ mod tests {
         selected.ensure_compute_qualified_with(true)?;
         selected.ensure_source_qualified_with(1, true)?;
         assert!(selected.ensure_source_qualified_with(2, true).is_err());
+        selected.ensure_source_fetches_qualified(1)?;
+        assert!(selected.ensure_source_fetches_qualified(2).is_err());
 
         let manual = profile(
             "nlwiki",
@@ -912,6 +937,8 @@ mod tests {
             ProfileSelectionMode::Automatic,
         );
         enwiki_candidate.ensure_compute_qualified_with(false)?;
+        enwiki_candidate.ensure_source_fetches_qualified(2)?;
+        assert!(enwiki_candidate.ensure_source_fetches_qualified(3).is_err());
         assert!(
             enwiki_candidate
                 .ensure_compute_qualified_with(true)

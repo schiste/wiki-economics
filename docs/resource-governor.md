@@ -69,6 +69,7 @@ All byte values are integer bytes.
 | `WIKI_ECON_SCRATCH_LIMIT_BYTES` | Maximum pipeline-owned scratch bytes | 64 GiB |
 | `WIKI_ECON_MAX_OPEN_FILES` | File-descriptor admission ceiling | 512 |
 | `WIKI_ECON_SOURCE_WORKERS` | Concurrent source transactions | 1 |
+| `WIKI_ECON_FETCH_MAX_PARALLELISM` | Concurrent source-window HTTP transactions; defaults to one and is policy-capped | 1 |
 | `WIKI_ECON_THREAD_LIMIT` | Upper bound for Rayon and Polars pools | configured pool size, otherwise 1 |
 | `WIKI_ECON_MAX_LOGICAL_PARTITION_BYTES` | Largest month accepted by compute | 8 GiB |
 | `WIKI_ECON_MAX_ACTIVE_PARQUET_WRITERS` | Parquet writers allowed at once | 16 |
@@ -147,11 +148,15 @@ constant; see `wiki-econ determinism-verify` in
 
 Enwiki is registered as an isolated, qualification-only candidate. The
 capacity entry in config/capacity-qualification.json pins the frozen
-2026-08 snapshot, a four-source worker/window ceiling, and the candidate
-64 x 32 page-week layout (2,048 logical buckets). It also records the observed
-source inventory and a 250 GiB persistent-storage reserve for rollover and
-retention checks. Source admission can reduce the concurrent count when live
-memory or disk headroom requires it.
+2026-08 snapshot, a four-source worker/window ceiling, at most two concurrent
+source-window HTTP transactions, and the candidate 64 x 32 page-week layout
+(2,048 logical buckets). It also records the observed source inventory and a
+250 GiB persistent-storage reserve for rollover and retention checks. Source
+admission can reduce the concurrent count when live memory or disk headroom
+requires it. The default fetch gate stays at one after earlier four-stream
+runs received 429 responses; enwiki's isolated candidate opts into two with
+the same bounded retry and `Retry-After` handling. Its receipt records that
+fetch limit, and setting it back to one is the rollback.
 
 The Toolforge envelope is binding: 6 GiB and 4 vCPU per job, within the
 existing 24 GiB/16-vCPU namespace quota. No future capacity increase is
