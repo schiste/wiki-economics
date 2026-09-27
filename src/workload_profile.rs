@@ -596,6 +596,14 @@ mod tests {
     }
 
     #[test]
+    fn unsupported_profile_schema_has_no_parameter_set() {
+        assert_eq!(
+            WorkloadProfileName::Large.parameters_for_schema(PROFILE_SCHEMA_VERSION + 1),
+            None
+        );
+    }
+
+    #[test]
     fn automatic_selection_uses_every_sizing_signal() {
         assert_eq!(
             select_automatic(&signals(
