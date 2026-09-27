@@ -120,12 +120,17 @@ function reservedCapacity(config) {
 function activeLeases(root, now = Date.now()) {
   const leases = [];
   for (const name of fs.readdirSync(root, {withFileTypes: true})) {
-    if (!name.isFile() || !name.name.endsWith(".json")) continue;
+    if (!name.isFile() || name.name.startsWith(".stale-") || !name.name.endsWith(".json")) continue;
     const file = path.join(root, name.name);
     const lease = readJson(file);
     const heartbeat = Date.parse(lease?.heartbeatAt || 0);
     if (lease?.schemaVersion !== 1 || !Number.isFinite(heartbeat) || now - heartbeat > LEASE_STALE_MS) {
-      fs.renameSync(file, path.join(root, `.stale-${Date.now()}-${name.name}`));
+      const archived = path.join(root, `.stale-${Date.now()}-${name.name}`);
+      try {
+        fs.renameSync(file, archived);
+      } catch (error) {
+        if (error.code !== "ENOENT") throw error;
+      }
       continue;
     }
     leases.push({...lease, file});
