@@ -739,6 +739,7 @@ fn compute_all_incremental_cached(
                 year * 100 + month
             })
             .context("invalid partition year_month format")?;
+        let mut streamed_editor_month = None;
 
         if plan.monthly.must_compute() {
             let input_digest = cross_snapshot
@@ -804,7 +805,7 @@ fn compute_all_incremental_cached(
                     gdp_activity_month_digests.push(input_digest.to_string());
                 }
             } else {
-                activity_stream.push_month(&mut gdp_tier_frames, editor_month, year_month_key)?;
+                streamed_editor_month = Some(editor_month);
             }
         }
         if let Some(state) = registered_state.as_mut()
@@ -831,8 +832,15 @@ fn compute_all_incremental_cached(
             );
             checkpoint_result?;
         }
+        // Activity-tier aggregation only needs the compact editor-month frame.
+        // Release the much larger source partition and its page cache before
+        // merging that frame into the quarter/year identity accumulator.
+        drop(base);
         for file in &partition.files {
             storage::discard_path_cache(file);
+        }
+        if let Some(editor_month) = streamed_editor_month {
+            activity_stream.push_month(&mut gdp_tier_frames, editor_month, year_month_key)?;
         }
     }
     if plan.monthly.must_compute() {

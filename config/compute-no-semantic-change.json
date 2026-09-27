@@ -402,6 +402,30 @@
       "paths": ["src/compute/mod.rs"],
       "reason": "Add retained receipt validation only; activity-tier computation formulas and artifact bytes are unchanged.",
       "base_commit": "5722d3bdd69da6e5fbaef37870da524b8f77f22b"
+    },
+    {
+      "family": "activity_tiers",
+      "paths": ["src/compute/activity/mod.rs", "src/compute/mod.rs"],
+      "reason": "Share editor identity state between quarter and year aggregation and release source partitions before merges; activity-tier output formulas, rows, schemas, and bytes are unchanged.",
+      "base_commit": "1a67cf996ead8708f0efe90212194f3f0235b086"
+    },
+    {
+      "family": "monthly",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Release the source partition only after monthly metrics have been computed; monthly output formulas, rows, schemas, and bytes are unchanged.",
+      "base_commit": "1a67cf996ead8708f0efe90212194f3f0235b086"
+    },
+    {
+      "family": "lifecycle",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Defer activity-tier accumulator merging until lifecycle has consumed the source partition; lifecycle output formulas, rows, schemas, and bytes are unchanged.",
+      "base_commit": "1a67cf996ead8708f0efe90212194f3f0235b086"
+    },
+    {
+      "family": "page_week",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Defer activity-tier accumulator merging until after each source partition is released; page-week output formulas, rows, schemas, and bytes are unchanged.",
+      "base_commit": "1a67cf996ead8708f0efe90212194f3f0235b086"
     }
   ]
 }
