@@ -151,24 +151,43 @@ pub(super) fn gdp_activity_tiers_for_period(
     editor_months: &DataFrame,
     period: ActivityPeriod,
 ) -> Result<DataFrame> {
+    gdp_activity_tiers_for_period_columns(
+        editor_months,
+        period,
+        "user_type_rank",
+        "edits",
+        "net_bytes",
+        "gross_bytes",
+    )
+}
+
+fn gdp_activity_tiers_for_period_columns(
+    editor_months: &DataFrame,
+    period: ActivityPeriod,
+    user_type_rank_column: &str,
+    edits_column: &str,
+    net_bytes_column: &str,
+    gross_bytes_column: &str,
+) -> Result<DataFrame> {
     let editor_months = ensure_editor_identity_key(editor_months)?;
     let months = period.months();
     let labels = activity_tier_labels(months);
     let input_edits = editor_months
-        .column("edits")?
+        .column(edits_column)?
         .cast(&DataType::Int64)?
         .i64()?
         .sum()
         .unwrap_or(0);
     let mut frame = editor_months
         .lazy()
+        .filter(col(edits_column).gt(lit(0_u32)))
         .with_column(period.key_expr().alias("period_key"))
         .group_by([col("period_key"), col("editor_identity")])
         .agg([
-            col("user_type_rank").max().alias("user_type_rank"),
-            col("edits").sum().alias("edits"),
-            col("net_bytes").sum().alias("net_bytes"),
-            col("gross_bytes").sum().alias("gross_bytes"),
+            col(user_type_rank_column).max().alias("user_type_rank"),
+            col(edits_column).sum().alias("edits"),
+            col(net_bytes_column).sum().alias("net_bytes"),
+            col(gross_bytes_column).sum().alias("gross_bytes"),
         ])
         .with_columns([
             user_type_from_rank_expr(),
@@ -338,10 +357,11 @@ pub(super) fn finish_activity_year_cached(
 }
 
 /// Stateful low-memory activity-tier aggregation across chronological month partitions.
+/// Quarter and year totals share one editor-identity table so identities are
+/// not retained in two parallel accumulators for the full calendar year.
 #[derive(Default)]
 pub(super) struct ActivityTierStream {
-    quarter_accumulator: Option<DataFrame>,
-    year_accumulator: Option<DataFrame>,
+    accumulator: Option<DataFrame>,
     current_quarter_key: Option<i32>,
     current_year: Option<i32>,
 }
@@ -377,11 +397,10 @@ impl ActivityTierStream {
         output_frames.push(monthly_tiers);
 
         if editor_month.height() > 0 {
-            let quarter = self.quarter_accumulator.take();
-            self.quarter_accumulator =
-                merge_editor_month_accumulator(quarter, editor_month.clone())?;
-            self.year_accumulator =
-                merge_editor_month_accumulator(self.year_accumulator.take(), editor_month)?;
+            self.accumulator = Some(merge_activity_accumulator(
+                self.accumulator.take(),
+                editor_month,
+            )?);
         }
 
         if month % 3 == 0 {
@@ -408,33 +427,69 @@ impl ActivityTierStream {
     }
 
     fn finish_quarter(&mut self, output_frames: &mut Vec<DataFrame>) -> Result<()> {
-        let accumulator = &mut self.quarter_accumulator;
-        finish_activity_accumulator(accumulator, ActivityPeriod::Quarter, output_frames)
+        let Some(mut accumulator) = self.accumulator.take() else {
+            return Ok(());
+        };
+        output_frames.push(gdp_activity_tiers_for_period_columns(
+            &accumulator,
+            ActivityPeriod::Quarter,
+            "quarter_user_type_rank",
+            "quarter_edits",
+            "quarter_net_bytes",
+            "quarter_gross_bytes",
+        )?);
+        let height = accumulator.height();
+        accumulator.with_column(Column::new(
+            "quarter_user_type_rank".into(),
+            vec![0_i32; height],
+        ))?;
+        accumulator.with_column(Column::new("quarter_edits".into(), vec![0_u32; height]))?;
+        accumulator.with_column(Column::new("quarter_net_bytes".into(), vec![0_i64; height]))?;
+        accumulator.with_column(Column::new(
+            "quarter_gross_bytes".into(),
+            vec![0_i64; height],
+        ))?;
+        self.accumulator = Some(accumulator);
+        Ok(())
     }
 
     fn finish_year(&mut self, output_frames: &mut Vec<DataFrame>) -> Result<()> {
-        let accumulator = &mut self.year_accumulator;
-        finish_activity_accumulator(accumulator, ActivityPeriod::Year, output_frames)
+        if let Some(accumulator) = self.accumulator.take() {
+            output_frames.push(gdp_activity_tiers_for_period_columns(
+                &accumulator,
+                ActivityPeriod::Year,
+                "year_user_type_rank",
+                "year_edits",
+                "year_net_bytes",
+                "year_gross_bytes",
+            )?);
+        }
+        Ok(())
     }
 }
 
-fn finish_activity_accumulator(
-    accumulator: &mut Option<DataFrame>,
-    period: ActivityPeriod,
-    output_frames: &mut Vec<DataFrame>,
-) -> Result<()> {
-    if let Some(editor_period) = accumulator.take() {
-        output_frames.push(gdp_activity_tiers_for_period(&editor_period, period)?);
-    }
-    Ok(())
-}
-
-fn merge_editor_month_accumulator(
+fn merge_activity_accumulator(
     accumulator: Option<DataFrame>,
     editor_month: DataFrame,
-) -> Result<Option<DataFrame>> {
+) -> Result<DataFrame> {
+    let editor_month = editor_month
+        .lazy()
+        .select([
+            col("year_month"),
+            col("year_month_key"),
+            col("editor_identity"),
+            col("user_type_rank").alias("quarter_user_type_rank"),
+            col("edits").alias("quarter_edits"),
+            col("net_bytes").alias("quarter_net_bytes"),
+            col("gross_bytes").alias("quarter_gross_bytes"),
+            col("user_type_rank").alias("year_user_type_rank"),
+            col("edits").alias("year_edits"),
+            col("net_bytes").alias("year_net_bytes"),
+            col("gross_bytes").alias("year_gross_bytes"),
+        ])
+        .collect()?;
     let Some(accumulator) = accumulator else {
-        return Ok(Some(editor_month));
+        return Ok(editor_month);
     };
     let combined = super::concat_frames(vec![accumulator, editor_month])?;
     let reduced = combined
@@ -443,24 +498,36 @@ fn merge_editor_month_accumulator(
         .agg([
             col("year_month").max().alias("year_month"),
             col("year_month_key").max().alias("year_month_key"),
-            col("user_type_rank").max().alias("user_type_rank"),
-            col("edits").sum().alias("edits"),
-            col("net_bytes").sum().alias("net_bytes"),
-            col("gross_bytes").sum().alias("gross_bytes"),
+            col("quarter_user_type_rank")
+                .max()
+                .alias("quarter_user_type_rank"),
+            col("quarter_edits").sum().alias("quarter_edits"),
+            col("quarter_net_bytes").sum().alias("quarter_net_bytes"),
+            col("quarter_gross_bytes")
+                .sum()
+                .alias("quarter_gross_bytes"),
+            col("year_user_type_rank")
+                .max()
+                .alias("year_user_type_rank"),
+            col("year_edits").sum().alias("year_edits"),
+            col("year_net_bytes").sum().alias("year_net_bytes"),
+            col("year_gross_bytes").sum().alias("year_gross_bytes"),
         ])
-        .with_column(user_type_from_rank_expr())
         .select([
             col("year_month"),
             col("year_month_key"),
             col("editor_identity"),
-            col("user_type_rank"),
-            col("edits"),
-            col("net_bytes"),
-            col("gross_bytes"),
-            col("user_type"),
+            col("quarter_user_type_rank"),
+            col("quarter_edits"),
+            col("quarter_net_bytes"),
+            col("quarter_gross_bytes"),
+            col("year_user_type_rank"),
+            col("year_edits"),
+            col("year_net_bytes"),
+            col("year_gross_bytes"),
         ])
         .collect()?;
-    Ok(Some(reduced))
+    Ok(reduced)
 }
 
 pub(super) fn write_activity_outputs(
