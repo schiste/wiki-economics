@@ -4,7 +4,7 @@
 pub(crate) const ALGORITHM_VERSION: &str =
     "editor-lifecycle-v4-explicit-identified-registered-editors-external-merge";
 
-use super::{add_wiki_column, concat_frames, write_output};
+use super::{add_wiki_column, collect_streaming, concat_frames, write_output};
 use crate::{metric_registry::MetricFamily, storage};
 use anyhow::Result;
 use polars::prelude::*;
@@ -169,13 +169,23 @@ impl RegisteredState {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn observe_partition(
         &mut self,
         base: &DataFrame,
         year: i32,
         year_month_key: i32,
     ) -> Result<()> {
-        let partial = registered_editor_totals(base)?;
+        self.observe_partition_lazy(base.clone().lazy(), year, year_month_key)
+    }
+
+    pub(super) fn observe_partition_lazy(
+        &mut self,
+        base: LazyFrame,
+        year: i32,
+        year_month_key: i32,
+    ) -> Result<()> {
+        let partial = registered_editor_totals_lazy(base)?;
         let user_ids = partial.column("event_user_id")?.i64()?;
         let total_edits = partial.column("total_edits")?.u32()?;
         let cohort_years = partial.column("cohort_year")?.i32()?;
@@ -421,10 +431,9 @@ pub(super) fn store_lifecycle_outputs(
     Ok(())
 }
 
-fn registered_editor_totals(base: &DataFrame) -> Result<DataFrame> {
-    base.clone()
-        .lazy()
-        .filter(
+fn registered_editor_totals_lazy(base: LazyFrame) -> Result<DataFrame> {
+    collect_streaming(
+        base.filter(
             col("user_type")
                 .eq(lit("registered"))
                 .and(col("event_user_id").is_not_null()),
@@ -433,9 +442,8 @@ fn registered_editor_totals(base: &DataFrame) -> Result<DataFrame> {
         .agg([
             col("revision_id").count().alias("total_edits"),
             col("year").min().cast(DataType::Int32).alias("cohort_year"),
-        ])
-        .collect()
-        .map_err(Into::into)
+        ]),
+    )
 }
 
 fn build_cohort_output(editor_spans: &DataFrame, all_years: &[i32]) -> Result<DataFrame> {
@@ -605,7 +613,7 @@ mod external {
         mut load_partition: F,
     ) -> Result<usize>
     where
-        F: FnMut(&[PathBuf]) -> Result<DataFrame>,
+        F: FnMut(&[PathBuf]) -> Result<LazyFrame>,
     {
         anyhow::ensure!(
             !partitions.is_empty(),
@@ -626,22 +634,23 @@ mod external {
                 .parse()
                 .map_err(|error| anyhow::anyhow!("invalid lifecycle partition month: {error}"))?;
             let year_month_key = year * 100 + month;
-            let mut partial = registered_editor_totals(&base)?
-                .lazy()
-                .with_columns([
-                    lit(partition.year).cast(DataType::Int32).alias("year"),
-                    lit(year_month_key)
-                        .cast(DataType::Int32)
-                        .alias("year_month_key"),
-                ])
-                .select([
-                    col("event_user_id"),
-                    col("year"),
-                    col("year_month_key"),
-                    col("cohort_year"),
-                    col("total_edits"),
-                ])
-                .collect()?;
+            let mut partial = collect_streaming(
+                registered_editor_totals_lazy(base)?
+                    .lazy()
+                    .with_columns([
+                        lit(partition.year).cast(DataType::Int32).alias("year"),
+                        lit(year_month_key)
+                            .cast(DataType::Int32)
+                            .alias("year_month_key"),
+                    ])
+                    .select([
+                        col("event_user_id"),
+                        col("year"),
+                        col("year_month_key"),
+                        col("cohort_year"),
+                        col("total_edits"),
+                    ]),
+            )?;
             if partial.height() == 0 {
                 for file in &partition.files {
                     storage::discard_path_cache(file);
@@ -1168,7 +1177,7 @@ pub(super) fn compute_external<F>(
     _load_partition: F,
 ) -> Result<usize>
 where
-    F: FnMut(&[std::path::PathBuf]) -> Result<DataFrame>,
+    F: FnMut(&[std::path::PathBuf]) -> Result<LazyFrame>,
 {
     anyhow::bail!("external lifecycle computation is disabled in coverage builds")
 }
@@ -1274,7 +1283,9 @@ mod tests {
             Column::new("year".into(), [2025_i32; 8]),
         ])?;
         let mut frames = vec![jan, next_year];
-        compute_external(wiki, &root, &partitions, move |_| Ok(frames.remove(0)))?;
+        compute_external(wiki, &root, &partitions, move |_| {
+            Ok(frames.remove(0).lazy())
+        })?;
 
         let funnel =
             ParquetReader::new(File::open(root.join(wiki).join("business_funnel.parquet"))?)

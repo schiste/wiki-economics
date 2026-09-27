@@ -1256,7 +1256,6 @@ mod tests {
         Ok(())
     }
 
-    #[cfg(target_os = "linux")]
     fn source_admission_sample(
         memory: MemorySnapshot,
         open_file_descriptors: Option<usize>,
@@ -1309,6 +1308,36 @@ mod tests {
                 .contains("requires current cgroup or RSS memory"),
             "unexpected missing-memory error: {error:#}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn source_admission_reserves_file_descriptor_headroom() -> Result<()> {
+        let root = TestDir::new()?;
+        let mut constrained = budget();
+        constrained.max_open_files = SOURCE_FD_ALLOWANCE + 1;
+        let governor = ResourceGovernor::new(
+            constrained,
+            GovernorPaths::new(root.path().to_path_buf(), None),
+        );
+        let mut state = GovernorState::default();
+        let memory = MemorySnapshot {
+            rss_bytes: Some(1),
+            cgroup_current_bytes: Some(1),
+            cgroup_peak_bytes: Some(1),
+            cgroup_limit_bytes: Some(1_000_000_000),
+        };
+
+        let error = governor
+            .admit_source_with_sample(&mut state, 1, source_admission_sample(memory, Some(2)))
+            .err()
+            .expect("open descriptors plus worker reservation must respect the limit");
+        assert!(error.to_string().contains("file-descriptor gate closed"));
+
+        let permit = governor
+            .admit_source_with_sample(&mut state, 1, source_admission_sample(memory, Some(1)))
+            .expect("file descriptor headroom should admit the source");
+        drop(permit);
         Ok(())
     }
 

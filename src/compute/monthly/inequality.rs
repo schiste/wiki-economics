@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 
 use super::super::{
     activity::ActivityPeriod, editor_identity_available_expr, editor_identity_expr,
-    ensure_editor_identity_inputs, user_type_from_rank_expr, user_type_rank_expr,
+    ensure_editor_identity_inputs_lazy, user_type_from_rank_expr, user_type_rank_expr,
 };
 
 type InequalityRow = (
@@ -99,7 +99,16 @@ fn min_editors_50pct(sorted_desc: &[f64]) -> usize {
 }
 
 pub(in crate::compute) fn editor_month_frame(base: &DataFrame) -> Result<DataFrame> {
-    let month_key = if base.column("year_month_key").is_ok() {
+    editor_month_frame_lazy(base.clone().lazy())
+}
+
+pub(in crate::compute) fn editor_month_frame_lazy(base: LazyFrame) -> Result<DataFrame> {
+    let has_month_key = base
+        .clone()
+        .collect_schema()?
+        .get("year_month_key")
+        .is_some();
+    let month_key = if has_month_key {
         col("year_month_key")
     } else {
         col("year_month")
@@ -112,8 +121,7 @@ pub(in crate::compute) fn editor_month_frame(base: &DataFrame) -> Result<DataFra
                 .slice(lit(5), lit(2))
                 .cast(DataType::Int32)
     };
-    ensure_editor_identity_inputs(base)?
-        .lazy()
+    ensure_editor_identity_inputs_lazy(base)?
         .filter(
             editor_identity_available_expr()
                 .and(col("year_month").is_not_null())
@@ -130,7 +138,8 @@ pub(in crate::compute) fn editor_month_frame(base: &DataFrame) -> Result<DataFra
             col("revision_id").count().alias("edits"),
         ])
         .with_column(user_type_from_rank_expr())
-        .collect()
+        .collect_with_engine(Engine::Streaming)
+        .map(|result| result.unwrap_single())
         .map_err(Into::into)
 }
 

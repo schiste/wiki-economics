@@ -10,7 +10,7 @@ pub(crate) const ALGORITHM_VERSION: &str = "monthly-stateless-v6-null-zero-denom
 
 use super::{
     PendingOutput, add_wiki_column, concat_frames, editor_identity_available_expr,
-    ensure_editor_identity_inputs, sort_frame, unique_identified_editors_expr, write_output,
+    ensure_editor_identity_inputs_lazy, sort_frame, unique_identified_editors_expr, write_output,
 };
 use crate::storage;
 use anyhow::{Context, Result};
@@ -52,8 +52,11 @@ fn ratio_or_null(numerator: &'static str, denominator: &'static str) -> Expr {
 }
 
 pub(super) fn gdp_monthly_frame(base: &DataFrame) -> Result<DataFrame> {
-    ensure_editor_identity_inputs(base)?
-        .lazy()
+    gdp_monthly_frame_lazy(base.clone().lazy())
+}
+
+pub(super) fn gdp_monthly_frame_lazy(base: LazyFrame) -> Result<DataFrame> {
+    ensure_editor_identity_inputs_lazy(base)?
         .group_by([col("year_month"), col("page_namespace"), col("user_type")])
         .agg([
             col("revision_text_bytes_diff")
@@ -82,26 +85,34 @@ pub(super) fn gdp_monthly_frame(base: &DataFrame) -> Result<DataFrame> {
             ratio_or_null("net_bytes", "unique_editors").alias("bytes_per_editor"),
             ratio_or_null("reverted_edits", "total_edits").alias("revert_rate"),
         ])
-        .collect()
+        .collect_with_engine(Engine::Streaming)
+        .map(|result| result.unwrap_single())
         .map_err(Into::into)
 }
 
 pub(super) fn gdp_type_share_frame(base: &DataFrame) -> Result<DataFrame> {
-    ensure_editor_identity_inputs(base)?
-        .lazy()
+    gdp_type_share_frame_lazy(base.clone().lazy())
+}
+
+pub(super) fn gdp_type_share_frame_lazy(base: LazyFrame) -> Result<DataFrame> {
+    ensure_editor_identity_inputs_lazy(base)?
         .group_by([col("year_month"), col("user_type")])
         .agg([
             col("revision_id").count().alias("edits"),
             col("revision_text_bytes_diff").sum().alias("net_bytes"),
             unique_identified_editors_expr().alias("editors"),
         ])
-        .collect()
+        .collect_with_engine(Engine::Streaming)
+        .map(|result| result.unwrap_single())
         .map_err(Into::into)
 }
 
 pub(super) fn editor_identity_coverage_frame(base: &DataFrame) -> Result<DataFrame> {
-    ensure_editor_identity_inputs(base)?
-        .lazy()
+    editor_identity_coverage_frame_lazy(base.clone().lazy())
+}
+
+pub(super) fn editor_identity_coverage_frame_lazy(base: LazyFrame) -> Result<DataFrame> {
+    ensure_editor_identity_inputs_lazy(base)?
         .group_by([col("year_month"), col("user_type")])
         .agg([
             col("revision_id").count().alias("total_edits"),
@@ -114,7 +125,8 @@ pub(super) fn editor_identity_coverage_frame(base: &DataFrame) -> Result<DataFra
                 .count()
                 .alias("excluded_edits"),
         ])
-        .collect()
+        .collect_with_engine(Engine::Streaming)
+        .map(|result| result.unwrap_single())
         .map_err(Into::into)
 }
 
@@ -251,8 +263,11 @@ pub(crate) fn read_editor_identity_coverage(
 }
 
 pub(super) fn labor_monthly_frame(base: &DataFrame) -> Result<DataFrame> {
-    ensure_editor_identity_inputs(base)?
-        .lazy()
+    labor_monthly_frame_lazy(base.clone().lazy())
+}
+
+pub(super) fn labor_monthly_frame_lazy(base: LazyFrame) -> Result<DataFrame> {
+    ensure_editor_identity_inputs_lazy(base)?
         .group_by([col("year_month"), col("page_namespace"), col("user_type")])
         .agg([
             unique_identified_editors_expr().alias("unique_editors"),
@@ -263,7 +278,8 @@ pub(super) fn labor_monthly_frame(base: &DataFrame) -> Result<DataFrame> {
                 .sum()
                 .alias("reverted_edits"),
         ])
-        .collect()
+        .collect_with_engine(Engine::Streaming)
+        .map(|result| result.unwrap_single())
         .map_err(Into::into)
 }
 

@@ -32,13 +32,15 @@ use crate::{
 };
 
 #[cfg(test)]
+use activity::gdp_editor_month_frame;
+#[cfg(test)]
 use activity::{
     ACTIVITY_TIER_OUTPUT_COLUMNS, ActivityPeriod, activity_tier_labels, finish_activity_year,
     gdp_activity_tiers_for_period,
 };
 use activity::{
     ActivityTierStream, activity_tiers_all_periods, finish_activity_year_cached,
-    gdp_editor_month_frame, write_activity_outputs,
+    write_activity_outputs,
 };
 use lifecycle::{
     LifecycleCheckpoint, RegisteredState, lifecycle_full_digest, lifecycle_prefix_digest,
@@ -191,7 +193,7 @@ fn analytical_lazyframe(wiki: &str, data_dir: &Path) -> Result<LazyFrame> {
     LazyFrame::scan_parquet_sources(ScanSources::Paths(parquet_files), args).map_err(Into::into)
 }
 
-fn analytical_projection(df: LazyFrame, schema: &Schema) -> Result<DataFrame> {
+fn analytical_projection_lazy(df: LazyFrame, schema: &Schema) -> Result<LazyFrame> {
     let has_year_month = schema.get("year_month").is_some();
     let has_year = schema.get("year").is_some();
     let has_year_month_key = schema.get("year_month_key").is_some();
@@ -251,43 +253,52 @@ fn analytical_projection(df: LazyFrame, schema: &Schema) -> Result<DataFrame> {
     }
     .alias(EDITOR_ACTOR_COLUMN);
 
-    let projected = df
-        .select([
-            if has_year_month {
-                col("year_month")
-            } else {
-                year_month_col()
-            },
-            if has_year { col("year") } else { year_col() },
-            if has_year_month_key {
-                col("year_month_key")
-            } else {
-                year_month_key_col()
-            },
-            user_type,
-            col("event_user_id"),
-            editor_actor,
-            col("page_namespace"),
-            col("revision_id"),
-            col("revision_text_bytes_diff"),
-            if has_is_reverted {
-                col("is_reverted")
-            } else {
-                bool_flag_expr(
-                    "revision_is_identity_reverted",
-                    schema.get("revision_is_identity_reverted"),
-                )
-                .alias("is_reverted")
-            },
-            if has_is_minor {
-                col("is_minor")
-            } else {
-                bool_flag_expr("revision_minor_edit", schema.get("revision_minor_edit"))
-                    .alias("is_minor")
-            },
-        ])
-        .collect()?;
+    let projected = df.select([
+        if has_year_month {
+            col("year_month")
+        } else {
+            year_month_col()
+        },
+        if has_year { col("year") } else { year_col() },
+        if has_year_month_key {
+            col("year_month_key")
+        } else {
+            year_month_key_col()
+        },
+        user_type,
+        col("event_user_id"),
+        editor_actor,
+        col("page_namespace"),
+        col("revision_id"),
+        col("revision_text_bytes_diff"),
+        if has_is_reverted {
+            col("is_reverted")
+        } else {
+            bool_flag_expr(
+                "revision_is_identity_reverted",
+                schema.get("revision_is_identity_reverted"),
+            )
+            .alias("is_reverted")
+        },
+        if has_is_minor {
+            col("is_minor")
+        } else {
+            bool_flag_expr("revision_minor_edit", schema.get("revision_minor_edit"))
+                .alias("is_minor")
+        },
+    ]);
     Ok(projected)
+}
+
+fn collect_streaming(frame: LazyFrame) -> Result<DataFrame> {
+    frame
+        .collect_with_engine(Engine::Streaming)
+        .map(|result| result.unwrap_single())
+        .map_err(Into::into)
+}
+
+fn analytical_projection(df: LazyFrame, schema: &Schema) -> Result<DataFrame> {
+    collect_streaming(analytical_projection_lazy(df, schema)?)
 }
 
 /// A MediaWiki editor identity is either a user-table ID (permanent,
@@ -310,6 +321,18 @@ fn unique_identified_editors_expr() -> Expr {
     editor_identity_expr()
         .filter(editor_identity_available_expr())
         .n_unique()
+}
+
+pub(super) fn ensure_editor_identity_inputs_lazy(frame: LazyFrame) -> Result<LazyFrame> {
+    if frame
+        .clone()
+        .collect_schema()?
+        .get(EDITOR_ACTOR_COLUMN)
+        .is_some()
+    {
+        return Ok(frame);
+    }
+    Ok(frame.with_column(lit(NULL).cast(DataType::String).alias(EDITOR_ACTOR_COLUMN)))
 }
 
 pub(super) fn ensure_editor_identity_inputs(frame: &DataFrame) -> Result<DataFrame> {
@@ -355,6 +378,7 @@ pub fn load_wiki(wiki: &str, data_dir: &Path) -> Result<DataFrame> {
     Ok(df)
 }
 
+#[cfg(test)]
 fn load_partition(files: &[PathBuf]) -> Result<DataFrame> {
     let args = ScanArgsParquet {
         cache: true,
@@ -368,6 +392,21 @@ fn load_partition(files: &[PathBuf]) -> Result<DataFrame> {
     let df = LazyFrame::scan_parquet_sources(ScanSources::Paths(parquet_files), args)?;
     let schema = df.clone().collect_schema()?;
     analytical_projection(df, &schema)
+}
+
+fn load_partition_lazy(files: &[PathBuf]) -> Result<LazyFrame> {
+    let args = ScanArgsParquet {
+        cache: true,
+        ..Default::default()
+    };
+    let file_names: Vec<String> = files
+        .iter()
+        .map(|file| file.to_string_lossy().to_string())
+        .collect();
+    let parquet_files = file_names.iter().map(|file| file.as_str().into()).collect();
+    let frame = LazyFrame::scan_parquet_sources(ScanSources::Paths(parquet_files), args)?;
+    let schema = frame.clone().collect_schema()?;
+    analytical_projection_lazy(frame, &schema)
 }
 
 fn warehouse_lazyframe(files: &[PathBuf]) -> Result<LazyFrame> {
@@ -724,7 +763,7 @@ fn compute_all_incremental_cached(
         if plan.activity_tiers.must_compute() {
             gdp_activity_year = Some(partition.year);
         }
-        let base = load_partition(&partition.files)?;
+        let base = load_partition_lazy(&partition.files)?;
         if plan.lifecycle.must_compute()
             && let Some(cache) = cross_snapshot
         {
@@ -751,7 +790,7 @@ fn compute_all_incremental_cached(
                 monthly::ALGORITHM_VERSION,
                 input_digest,
                 "editor_month",
-                || monthly::inequality::editor_month_frame(&base),
+                || monthly::inequality::editor_month_frame_lazy(base.clone()),
             );
             inequality_editor_month_frames.push(inequality_editor_month?);
             if let Some(input_digest) = input_digest {
@@ -763,7 +802,7 @@ fn compute_all_incremental_cached(
                 monthly::ALGORITHM_VERSION,
                 input_digest,
                 "gdp",
-                || gdp_monthly_frame(&base),
+                || monthly::gdp_monthly_frame_lazy(base.clone()),
             );
             gdp_frames.push(gdp?);
             let gdp_type = cached_or_compute(
@@ -772,17 +811,18 @@ fn compute_all_incremental_cached(
                 monthly::ALGORITHM_VERSION,
                 input_digest,
                 "gdp_user_type_share",
-                || gdp_type_share_frame(&base),
+                || monthly::gdp_type_share_frame_lazy(base.clone()),
             );
             gdp_type_frames.push(gdp_type?);
-            identity_coverage_frames.push(editor_identity_coverage_frame(&base)?);
+            identity_coverage_frames
+                .push(monthly::editor_identity_coverage_frame_lazy(base.clone())?);
             let labor_monthly = cached_or_compute(
                 cross_snapshot,
                 "monthly",
                 monthly::ALGORITHM_VERSION,
                 input_digest,
                 "labor_monthly",
-                || labor_monthly_frame(&base),
+                || monthly::labor_monthly_frame_lazy(base.clone()),
             );
             labor_monthly_frames.push(labor_monthly?);
         }
@@ -796,7 +836,7 @@ fn compute_all_incremental_cached(
                 activity::EDITOR_MONTH_ALGORITHM_VERSION,
                 input_digest,
                 "editor_month",
-                || gdp_editor_month_frame(&base),
+                || activity::gdp_editor_month_frame_lazy(base.clone()),
             );
             let editor_month = editor_month?;
             if cross_snapshot.is_some() {
@@ -813,7 +853,7 @@ fn compute_all_incremental_cached(
                 .as_deref()
                 .is_none_or(|through| partition.year_month.as_str() > through)
         {
-            state.observe_partition(&base, partition.year, year_month_key)?;
+            state.observe_partition_lazy(base.clone(), partition.year, year_month_key)?;
         }
         if partition.year_month.ends_with("-12")
             && lifecycle_resume_through
@@ -832,9 +872,9 @@ fn compute_all_incremental_cached(
             );
             checkpoint_result?;
         }
-        // Activity-tier aggregation only needs the compact editor-month frame.
-        // Release the much larger source partition and its page cache before
-        // merging that frame into the quarter/year identity accumulator.
+        // Every metric family consumed this lazy scan through a streaming
+        // aggregation. Release the scan plan and completed Parquet page cache
+        // before merging the compact editor-month frame into period state.
         drop(base);
         for file in &partition.files {
             storage::discard_path_cache(file);
@@ -1889,7 +1929,7 @@ pub(crate) fn compute_family_at_snapshot(
                 snapshot_contains_complete_month(snapshot, &partition.year_month)
             });
         }
-        lifecycle::compute_external(wiki, output_dir, &partitions, load_partition)?;
+        lifecycle::compute_external(wiki, output_dir, &partitions, load_partition_lazy)?;
     } else if family == MetricFamily::PageWeek
         && external
         && weekly_config.secondary_bucket_count > 1
@@ -1985,7 +2025,60 @@ pub(crate) fn compute_all_for_snapshot(
     output_dir: &Path,
 ) -> Result<()> {
     storage::validate_snapshot_version(snapshot)?;
+    if wiki == "enwiki" {
+        #[cfg(not(coverage))]
+        return compute_snapshot_families_sequentially(wiki, snapshot, data_dir, output_dir);
+        #[cfg(coverage)]
+        anyhow::bail!("independent family stages are disabled in coverage builds");
+    }
     compute_all_selected(wiki, data_dir, output_dir, Some(snapshot))
+}
+
+#[cfg(not(coverage))]
+/// Compute a large wiki's independent metric families in separate bounded passes.
+/// This avoids keeping monthly aggregates, the in-memory lifecycle state, and
+/// weekly work resident together in one 6 GiB qualification process. Each
+/// family writes its own receipt, so an interrupted run resumes at the next
+/// unfinished family.
+fn compute_snapshot_families_sequentially(
+    wiki: &str,
+    snapshot: &str,
+    data_dir: &Path,
+    output_dir: &Path,
+) -> Result<()> {
+    anyhow::ensure!(
+        !output_dir.join("ready.json").exists() && !output_dir.join("qualification.json").exists(),
+        "refusing to modify an immutable ready candidate"
+    );
+    let weekly_config = WeeklyAggregationConfig::for_snapshot(data_dir, wiki, Some(snapshot))?;
+    migrate_legacy_compute_receipt(wiki, snapshot, data_dir, output_dir, &weekly_config)?;
+    let plan = compute_plan(wiki, Some(snapshot), data_dir, output_dir, &weekly_config)?;
+    let started = Instant::now();
+
+    for family in MetricFamily::CORE {
+        if !plan.invalidation(family).must_compute() {
+            crate::observability::record_stage_reused(
+                &format!("compute_{}", family.name()),
+                Some(wiki),
+            );
+            continue;
+        }
+        info!(
+            wiki,
+            snapshot,
+            family = family.name(),
+            "starting isolated enwiki compute family"
+        );
+        compute_family_at_snapshot(wiki, data_dir, output_dir, family, true, Some(snapshot))?;
+        info!(
+            wiki,
+            snapshot,
+            family = family.name(),
+            elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0,
+            "finished isolated enwiki compute family"
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn compute_cross_snapshot_qualification_build(
@@ -2140,6 +2233,15 @@ mod tests {
         assert!(snapshot_contains_complete_month("2026-07", "2026-07"));
         assert!(snapshot_contains_complete_month("2026-07", "2001-01"));
         assert!(!snapshot_contains_complete_month("2026-07", "2026-08"));
+    }
+
+    #[test]
+    fn eager_editor_identity_inputs_preserve_existing_actor_column() -> Result<()> {
+        let frame = df!("editor_actor" => ["Alice", "Bob"])?;
+        let inputs = ensure_editor_identity_inputs(&frame)?;
+        assert_eq!(inputs.height(), 2);
+        assert_eq!(inputs.column("editor_actor")?.str()?.get(0), Some("Alice"));
+        Ok(())
     }
 
     #[test]
@@ -3635,6 +3737,66 @@ mod tests {
         assert!(output_dir.path().join(wiki).join("gdp.parquet").is_file());
         assert!(
             compute_all_for_snapshot(wiki, "invalid", data_dir.path(), output_dir.path()).is_err()
+        );
+        Ok(())
+    }
+
+    #[cfg(not(coverage))]
+    #[test]
+    fn snapshot_families_run_in_bounded_passes_and_write_receipts() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let output_dir = TestDir::new()?;
+        let wiki = "boundedwiki";
+        let version = "2026-08";
+        write_partitioned_base_parquet(&data_dir, wiki)?;
+        write_partitioned_warehouse_parquet(&data_dir, wiki)?;
+
+        for (source, destination) in [
+            (
+                storage::analytical_wiki_dir(data_dir.path(), wiki),
+                storage::snapshot_analytical_wiki_dir(data_dir.path(), wiki, version)?,
+            ),
+            (
+                storage::warehouse_wiki_dir(data_dir.path(), wiki),
+                storage::snapshot_warehouse_wiki_dir(data_dir.path(), wiki, version)?,
+            ),
+        ] {
+            for path in storage::collect_parquet_files(&source)? {
+                let target = destination.join(path.strip_prefix(&source)?);
+                target.parent().map(fs::create_dir_all).transpose()?;
+                fs::copy(path, target)?;
+            }
+        }
+        storage::write_test_generation_manifest_from_files(data_dir.path(), wiki, version)?;
+        storage::publish_test_snapshot_pointer(data_dir.path(), wiki, version)?;
+        let (snapshot_plan, _) =
+            crate::snapshot_plan::SnapshotPlan::load_or_resolve(data_dir.path(), wiki, version)?;
+        let source_sizes = vec![Some(1); snapshot_plan.sources.len()];
+        workload_profile::load_or_select(data_dir.path(), &snapshot_plan, &source_sizes)?;
+
+        compute_snapshot_families_sequentially(wiki, version, data_dir.path(), output_dir.path())?;
+
+        for family in MetricFamily::CORE {
+            assert!(family_stage_receipt(output_dir.path(), wiki, family).is_file());
+            for output in family_outputs(family, wiki, output_dir.path()) {
+                assert!(output.path.is_file(), "missing {} output", family.name());
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(coverage)]
+    #[test]
+    fn enwiki_bounded_compute_is_disabled_in_coverage_builds() -> Result<()> {
+        let data_dir = TestDir::new()?;
+        let output_dir = TestDir::new()?;
+        let error =
+            compute_all_for_snapshot("enwiki", "2026-08", data_dir.path(), output_dir.path())
+                .expect_err("isolated production family stages are disabled under coverage");
+        assert!(
+            error
+                .to_string()
+                .contains("independent family stages are disabled")
         );
         Ok(())
     }

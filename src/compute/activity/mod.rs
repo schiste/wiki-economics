@@ -8,7 +8,7 @@ pub(crate) const EDITOR_MONTH_ALGORITHM_VERSION: &str =
 
 use super::{
     add_wiki_column, concat_frames, editor_identity_available_expr, editor_identity_expr,
-    ensure_editor_identity_inputs, ensure_editor_identity_key, sort_frame,
+    ensure_editor_identity_inputs_lazy, ensure_editor_identity_key, sort_frame,
     user_type_from_rank_expr, user_type_rank_expr, write_output,
 };
 use anyhow::Result;
@@ -17,8 +17,11 @@ use std::path::Path;
 use tracing::info;
 
 pub(super) fn gdp_editor_month_frame(base: &DataFrame) -> Result<DataFrame> {
-    ensure_editor_identity_inputs(base)?
-        .lazy()
+    gdp_editor_month_frame_lazy(base.clone().lazy())
+}
+
+pub(super) fn gdp_editor_month_frame_lazy(base: LazyFrame) -> Result<DataFrame> {
+    ensure_editor_identity_inputs_lazy(base)?
         .filter(editor_identity_available_expr())
         .group_by([
             col("year_month"),
@@ -35,7 +38,8 @@ pub(super) fn gdp_editor_month_frame(base: &DataFrame) -> Result<DataFrame> {
                 .alias("gross_bytes"),
         ])
         .with_column(user_type_from_rank_expr())
-        .collect()
+        .collect_with_engine(Engine::Streaming)
+        .map(|result| result.unwrap_single())
         .map_err(Into::into)
 }
 
