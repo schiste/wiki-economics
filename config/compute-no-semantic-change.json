@@ -426,6 +426,30 @@
       "paths": ["src/compute/mod.rs"],
       "reason": "Defer activity-tier accumulator merging until after each source partition is released; page-week output formulas, rows, schemas, and bytes are unchanged.",
       "base_commit": "1a67cf996ead8708f0efe90212194f3f0235b086"
+    },
+    {
+      "family": "monthly",
+      "paths": ["src/compute/mod.rs", "src/compute/monthly/inequality.rs", "src/compute/monthly/mod.rs"],
+      "reason": "Move monthly inputs to lazy Parquet scans and Polars streaming aggregation while retaining the existing grouping, filters, and formulas; monthly metric semantics and schemas are unchanged.",
+      "base_commit": "dd195929dbfbc2537e6aa1c19d7210cc3cbd5eaf"
+    },
+    {
+      "family": "activity_tiers",
+      "paths": ["src/compute/activity/mod.rs", "src/compute/mod.rs"],
+      "reason": "Move activity editor-month aggregation to lazy Parquet scans and Polars streaming collection; the existing grouping, filters, formulas, rows, and schema are unchanged.",
+      "base_commit": "dd195929dbfbc2537e6aa1c19d7210cc3cbd5eaf"
+    },
+    {
+      "family": "lifecycle",
+      "paths": ["src/compute/lifecycle/mod.rs", "src/compute/mod.rs"],
+      "reason": "Feed lazy Parquet partitions through Polars streaming into the existing registered-editor cohort aggregation; lifecycle keys, formulas, rows, and schema are unchanged.",
+      "base_commit": "dd195929dbfbc2537e6aa1c19d7210cc3cbd5eaf"
+    },
+    {
+      "family": "page_week",
+      "paths": ["src/compute/mod.rs"],
+      "reason": "Run enwiki metric families in bounded sequential passes; page-week partitioning, aggregation formulas, rows, and schema are unchanged.",
+      "base_commit": "dd195929dbfbc2537e6aa1c19d7210cc3cbd5eaf"
     }
   ]
 }
