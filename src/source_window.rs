@@ -216,13 +216,11 @@ where
         let mut active_workers = 0;
         let mut completed_items = 0_usize;
         let mut ingested_rows = 0_u64;
-        let mut first_error: Option<anyhow::Error> = None;
 
         // Refill a worker slot as soon as any source finishes. Fixed-size
         // waves leave idle tails while the slowest source in each wave ingests.
         while next_item < items.len() || active_workers > 0 {
-            while first_error.is_none() && next_item < items.len() && active_workers < worker_limit
-            {
+            while next_item < items.len() && active_workers < worker_limit {
                 let index = next_item;
                 let permit = match admit(index, &items[index]) {
                     Ok(permit) => permit,
@@ -255,19 +253,12 @@ where
                 active_workers += 1;
             }
 
-            if active_workers == 0 {
-                if first_error.is_some() || next_item == items.len() {
-                    break;
-                }
-                continue;
-            }
-
             let (index, outcome) = completed_rx
                 .recv()
                 .context("source worker completion channel closed unexpectedly")?;
             active_workers -= 1;
             match outcome {
-                Ok(rows) if first_error.is_none() => {
+                Ok(rows) => {
                     completed_items = completed_items
                         .checked_add(1)
                         .context("completed source count overflow")?;
@@ -275,20 +266,25 @@ where
                         .checked_add(rows)
                         .context("snapshot ingest row count overflow")?;
                 }
-                Ok(_) => {}
-                Err(error) if first_error.is_none() => {
-                    first_error =
-                        Some(error.context(format!("source worker failed for item {index}")));
+                Err(error) => {
+                    // Returning exits dispatch immediately. Scoped threads are
+                    // still joined, dropping their permits before this error
+                    // reaches the pipeline.
+                    return Err(error.context(format!("source worker failed for item {index}")));
                 }
-                Err(_) => {}
             }
         }
 
-        match first_error {
-            Some(error) => Err(error),
-            None => Ok((completed_items, ingested_rows)),
-        }
+        Ok((completed_items, ingested_rows))
     })
+}
+
+fn ensure_pending_sources_completed(completed: usize, expected: usize) -> Result<()> {
+    anyhow::ensure!(
+        completed == expected,
+        "bounded source executor completed {completed} of {expected} pending sources"
+    );
+    Ok(())
 }
 
 struct SourceExecution<'a> {
@@ -576,11 +572,7 @@ fn prepare_snapshot_with_ops<O: SourceTransactionOps>(
         },
         |_, source, permit| process_source(ops, &execution, source, permit),
     )?;
-    anyhow::ensure!(
-        ingested_sources == pending.len(),
-        "bounded source executor completed {ingested_sources} of {} pending sources",
-        pending.len()
-    );
+    ensure_pending_sources_completed(ingested_sources, pending.len())?;
 
     ops.finalize(wiki, snapshot, data_dir, select_generation)?;
     if let Some(governor) = governor {
@@ -782,13 +774,26 @@ mod tests {
                 active.fetch_sub(1, Ordering::AcqRel);
                 Ok(u64::from(*item))
             },
-        )?;
+        )
+        .expect("bounded worker execution should complete");
 
         assert_eq!(completed, items.len());
         assert_eq!(rows, items.iter().map(|item| u64::from(*item)).sum::<u64>());
         assert!(maximum_active.load(Ordering::Relaxed) > 1);
         assert!(maximum_active.load(Ordering::Relaxed) <= 3);
         Ok(())
+    }
+
+    #[test]
+    fn source_completion_count_must_match_pending_inventory() {
+        assert!(ensure_pending_sources_completed(3, 3).is_ok());
+        let error = ensure_pending_sources_completed(2, 3)
+            .expect_err("an incomplete source inventory must fail closed");
+        assert!(
+            error
+                .to_string()
+                .contains("bounded source executor completed 2 of 3 pending sources")
+        );
     }
 
     #[test]
@@ -818,12 +823,11 @@ mod tests {
                         Ok(1)
                     }
                     1 => Ok(1),
-                    2 => {
+                    _ => {
                         let slow_source_was_active = active_flag.load(Ordering::Acquire);
                         let _ = refill_observation_tx.send(slow_source_was_active);
                         Ok(1)
                     }
-                    _ => unreachable!("fixture source ID is in range"),
                 },
             )
         });
