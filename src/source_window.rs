@@ -797,6 +797,28 @@ mod tests {
     }
 
     #[test]
+    fn bounded_execution_retries_admission_after_temporary_rejection() -> Result<()> {
+        let items = [1_u8, 2];
+        let second_item_attempts = AtomicUsize::new(0);
+        let (completed, rows) = execute_bounded(
+            &items,
+            2,
+            |index, _| {
+                if index == 1 && second_item_attempts.fetch_add(1, Ordering::AcqRel) == 0 {
+                    anyhow::bail!("temporary source admission rejection");
+                }
+                Ok(())
+            },
+            |_, item, ()| Ok(u64::from(*item)),
+        )?;
+
+        assert_eq!(completed, items.len());
+        assert_eq!(rows, 3);
+        assert_eq!(second_item_attempts.load(Ordering::Relaxed), 2);
+        Ok(())
+    }
+
+    #[test]
     fn bounded_execution_refills_a_slot_before_the_slowest_source_finishes() -> Result<()> {
         let items = [0_u8, 1, 2];
         let slow_source_active = Arc::new(AtomicBool::new(false));
