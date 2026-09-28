@@ -30,6 +30,7 @@ const RETAINED_LIFECYCLE_AND_ACTIVITY_MIGRATION_ID: &str =
 const RETAINED_LIFECYCLE_AND_PATROL_MIGRATION_ID: &str =
     "retained-lifecycle-v3-to-v4-period-months-and-patrol-v5-to-v6-coverage-rounding-v1";
 const RETAINED_LIFECYCLE_ACTIVITY_AND_PATROL_MIGRATION_ID: &str = "retained-lifecycle-v3-to-v4-period-months-and-activity-tiers-v5-to-v6-receipt-and-patrol-v5-to-v6-coverage-rounding-v1";
+const RETAINED_FAMILY_COMPOSITION_MIGRATION_ID: &str = "retained-candidate-family-composition-v1";
 
 fn retained_migration_id(activity_tier: bool, patrol: bool) -> &'static str {
     match (activity_tier, patrol) {
@@ -46,6 +47,75 @@ fn supported_retained_migration_id(migration: &str) -> bool {
         || migration == RETAINED_LIFECYCLE_AND_PATROL_MIGRATION_ID
         || migration == RETAINED_LIFECYCLE_ACTIVITY_AND_PATROL_MIGRATION_ID
         || migration == crate::retained_monthly_migration::MIGRATION_ID
+        || migration == RETAINED_FAMILY_COMPOSITION_MIGRATION_ID
+}
+
+fn retained_migration_families(migration: &RetainedCandidateMigration) -> Result<BTreeSet<String>> {
+    let families = match migration.migration.as_str() {
+        RETAINED_LIFECYCLE_MIGRATION_ID => ["lifecycle".to_string()].into_iter().collect(),
+        RETAINED_LIFECYCLE_AND_ACTIVITY_MIGRATION_ID => {
+            ["activity_tiers".to_string(), "lifecycle".to_string()]
+                .into_iter()
+                .collect()
+        }
+        RETAINED_LIFECYCLE_AND_PATROL_MIGRATION_ID => {
+            ["lifecycle".to_string(), "patrol".to_string()]
+                .into_iter()
+                .collect()
+        }
+        RETAINED_LIFECYCLE_ACTIVITY_AND_PATROL_MIGRATION_ID => [
+            "activity_tiers".to_string(),
+            "lifecycle".to_string(),
+            "patrol".to_string(),
+        ]
+        .into_iter()
+        .collect(),
+        crate::retained_monthly_migration::MIGRATION_ID => {
+            ["monthly".to_string()].into_iter().collect()
+        }
+        RETAINED_FAMILY_COMPOSITION_MIGRATION_ID => {
+            let allowed = ["activity_tiers", "lifecycle", "monthly", "patrol"];
+            ensure!(
+                !migration.migrated_families.is_empty()
+                    && migration
+                        .migrated_families
+                        .iter()
+                        .all(|family| allowed.contains(&family.as_str())),
+                "retained candidate migration family composition is invalid"
+            );
+            let families = migration
+                .migrated_families
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            ensure!(
+                families.len() == migration.migrated_families.len()
+                    && families.iter().cloned().collect::<Vec<_>>() == migration.migrated_families,
+                "retained candidate migration families are not unique and canonical"
+            );
+            return Ok(families);
+        }
+        _ => anyhow::bail!("unsupported retained candidate migration"),
+    };
+    ensure!(
+        migration.migrated_families.is_empty(),
+        "legacy retained candidate migration unexpectedly contains composed families"
+    );
+    Ok(families)
+}
+
+fn retained_migration_id_for_families(families: &[String]) -> String {
+    if families.len() == 1 && families[0] == "monthly" {
+        return crate::retained_monthly_migration::MIGRATION_ID.to_string();
+    }
+    if !families.contains(&"monthly".to_string()) && families.contains(&"lifecycle".to_string()) {
+        return retained_migration_id(
+            families.contains(&"activity_tiers".to_string()),
+            families.contains(&"patrol".to_string()),
+        )
+        .to_string();
+    }
+    RETAINED_FAMILY_COMPOSITION_MIGRATION_ID.to_string()
 }
 
 const JSON_ARTIFACTS: [&str; 14] = [
@@ -146,6 +216,8 @@ struct RetainedCandidateMigration {
     source_run_id: String,
     source_ready_sha256: String,
     migration: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    migrated_families: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
@@ -1496,10 +1568,14 @@ pub(crate) fn migrate_retained_candidate(
     #[rustfmt::skip]
     let activity_tier_receipt_migrated = crate::retained_activity_migration::activity_tier_migration_required(wiki, snapshot, &source_candidate)?;
     #[rustfmt::skip]
+    let lifecycle_receipt_migrated = crate::retained_activity_migration::lifecycle_migration_required(wiki, snapshot, &source_candidate)?;
+    #[rustfmt::skip]
     let patrol_receipt_migration_required = crate::retained_patrol_migration::migration_required(wiki, snapshot, &source_ready.run_id, &source_candidate)?;
     #[rustfmt::skip]
     let monthly_only_migration = monthly_receipt_migrated && crate::compute::retained_candidate_non_monthly_families_current(wiki, snapshot, &source_candidate, source_ready.workload_profile.as_ref())? && !activity_tier_receipt_migrated && !patrol_receipt_migration_required;
-    let staged_migration_source = if activity_tier_receipt_migrated {
+    let staged_migration_source = if !monthly_only_migration
+        && (monthly_receipt_migrated || activity_tier_receipt_migrated)
+    {
         let staging_path = target_candidate
             .parent()
             .context("retained migration target has no snapshot directory")?
@@ -1507,8 +1583,14 @@ pub(crate) fn migrate_retained_candidate(
         let staged =
             crate::retained_activity_migration::TemporaryCandidateDirectory::create(staging_path)?;
         copy_candidate_files(&source_candidate, staged.path(), &files)?;
-        #[rustfmt::skip]
-        crate::retained_activity_migration::stage_activity_tier_receipts(wiki, snapshot, &source_ready.run_id, &source_candidate, staged.path())?;
+        if monthly_receipt_migrated {
+            #[rustfmt::skip]
+            crate::retained_monthly_migration::migrate_candidate(wiki, snapshot, &source_ready.run_id, &source_candidate, staged.path())?;
+        }
+        if activity_tier_receipt_migrated {
+            #[rustfmt::skip]
+            crate::retained_activity_migration::stage_activity_tier_receipts(wiki, snapshot, &source_ready.run_id, &source_candidate, staged.path())?;
+        }
         Some(staged)
     } else {
         None
@@ -1529,21 +1611,39 @@ pub(crate) fn migrate_retained_candidate(
     #[rustfmt::skip]
     copy_candidate_files(migration_source_candidate, &target_candidate, &migration_source_files)?;
 
-    let patrol_receipt_migrated = if monthly_only_migration {
+    if monthly_only_migration {
         #[rustfmt::skip]
         crate::retained_monthly_migration::migrate_candidate(wiki, snapshot, &source_ready.run_id, &source_candidate, &target_candidate)?;
-        false
     } else {
-        #[rustfmt::skip]
-        crate::compute::migrate_retained_candidate_families(wiki, snapshot, &source_ready.run_id, data_dir, migration_source_candidate, &target_candidate)?;
-        if activity_tier_receipt_migrated {
+        if lifecycle_receipt_migrated {
             #[rustfmt::skip]
-            crate::retained_activity_migration::rebind_lifecycle_receipts(wiki, snapshot, &source_ready.run_id, &source_candidate, &target_candidate)?;
+            crate::compute::migrate_retained_candidate_families(wiki, snapshot, &source_ready.run_id, data_dir, migration_source_candidate, &target_candidate)?;
+            if activity_tier_receipt_migrated {
+                #[rustfmt::skip]
+                crate::retained_activity_migration::rebind_lifecycle_receipts(wiki, snapshot, &source_ready.run_id, &source_candidate, &target_candidate)?;
+            }
         }
-        #[rustfmt::skip]
-        let patrol_receipt_migrated = crate::retained_patrol_migration::migrate_if_required(wiki, snapshot, &source_ready.run_id, &source_candidate, &target_candidate)?;
-        patrol_receipt_migrated
-    };
+    }
+    let patrol_receipt_migrated = crate::retained_patrol_migration::migrate_if_required(
+        wiki,
+        snapshot,
+        &source_ready.run_id,
+        &source_candidate,
+        &target_candidate,
+    )?;
+    ensure!(
+        patrol_receipt_migrated == patrol_receipt_migration_required,
+        "retained candidate {wiki} patrol migration state changed during staging"
+    );
+    ensure!(
+        crate::compute::retained_candidate_receipts_current_without_inputs(
+            wiki,
+            snapshot,
+            &target_candidate,
+            source_ready.workload_profile.as_ref(),
+        )?,
+        "retained candidate {wiki} does not have a complete current core receipt set"
+    );
     let patrol_output = crate::fingerprint::TrackedPath::new(
         format!("output/{wiki}/patrol.parquet"),
         target_candidate.join(wiki).join("patrol.parquet"),
@@ -1573,18 +1673,38 @@ pub(crate) fn migrate_retained_candidate(
     ready.ready_at_unix = now_unix()?;
     ready.generating_commit = licensing::generating_commit();
     ready.promoted_from_qualification = None;
+    let mut migrated_families = Vec::new();
+    if activity_tier_receipt_migrated {
+        migrated_families.push("activity_tiers".to_string());
+    }
+    if lifecycle_receipt_migrated {
+        migrated_families.push("lifecycle".to_string());
+    }
+    if monthly_receipt_migrated {
+        migrated_families.push("monthly".to_string());
+    }
+    if patrol_receipt_migrated {
+        migrated_families.push("patrol".to_string());
+    }
+    migrated_families.sort();
+    ensure!(
+        !migrated_families.is_empty(),
+        "retained candidate migration did not update any family"
+    );
+    let migration_id = retained_migration_id_for_families(&migrated_families);
+    let composed_families = if migration_id == RETAINED_FAMILY_COMPOSITION_MIGRATION_ID {
+        migrated_families
+    } else {
+        Vec::new()
+    };
     ready.migrated_from_retained_candidate = Some(RetainedCandidateMigration {
         schema_version: 1,
         source_run_id: source_ready.run_id.clone(),
         source_ready_sha256: source_ready_sha256.clone(),
-        migration: if monthly_only_migration {
-            crate::retained_monthly_migration::MIGRATION_ID.to_string()
-        } else {
-            retained_migration_id(activity_tier_receipt_migrated, patrol_receipt_migrated)
-                .to_string()
-        },
+        migration: migration_id,
+        migrated_families: composed_families,
     });
-    if monthly_only_migration {
+    if monthly_receipt_migrated {
         ready.editor_identity_coverage =
             crate::compute::read_editor_identity_coverage(&target_candidate, wiki)?;
     }
@@ -1711,56 +1831,67 @@ fn validate_retained_lifecycle_projection(
     for artifact in &source_ready.artifacts {
         validate_prepared_artifact(&source_dir, artifact)?;
     }
-    if migration.migration == crate::retained_monthly_migration::MIGRATION_ID {
+    let migrated_families = retained_migration_families(migration)?;
+    let mut changed_artifacts = BTreeSet::new();
+    if migrated_families.contains("monthly") {
         #[rustfmt::skip]
         crate::retained_monthly_migration::validate_migration(&ready.wiki, &ready.snapshot, &migration.source_run_id, &source_dir, candidate_dir)?;
-        let migrated_gdp = format!("{}/gdp.parquet", ready.wiki);
-        for artifact in &ready.artifacts {
-            if artifact.path == migrated_gdp {
-                continue;
-            }
-            let source_path = source_dir.join(&artifact.path);
-            let target_path = candidate_dir.join(&artifact.path);
-            let (source_bytes, source_sha256) = storage::sha256_file(&source_path)?;
-            let (target_bytes, target_sha256) = storage::sha256_file(&target_path)?;
-            ensure!(
-                source_bytes == target_bytes && source_sha256 == target_sha256,
-                "retained candidate {} monthly migration changed unrelated artifact {}",
-                ready.wiki,
-                artifact.path
-            );
-        }
+        changed_artifacts.insert(format!("{}/gdp.parquet", ready.wiki));
         ensure!(
             ready.editor_identity_coverage
                 == crate::compute::read_editor_identity_coverage(candidate_dir, &ready.wiki)?,
             "retained candidate {} monthly migration identity coverage differs from its ready receipt",
             ready.wiki
         );
-        #[rustfmt::skip]
-        let source_non_monthly_families_current = crate::compute::retained_candidate_non_monthly_families_current(&ready.wiki, &ready.snapshot, &source_dir, source_ready.workload_profile.as_ref())?;
-        #[rustfmt::skip]
-        let target_non_monthly_families_current = crate::compute::retained_candidate_non_monthly_families_current(&ready.wiki, &ready.snapshot, candidate_dir, ready.workload_profile.as_ref())?;
+    } else {
         ensure!(
-            source_non_monthly_families_current && target_non_monthly_families_current,
-            "retained candidate {} monthly migration has an outdated non-monthly family",
+            ready.editor_identity_coverage == source_ready.editor_identity_coverage,
+            "retained candidate {} migration changed editor identity coverage without a monthly migration",
             ready.wiki
         );
-        #[rustfmt::skip]
-        crate::retained_patrol_migration::validate_migration(&ready.wiki, &ready.snapshot, &migration.source_run_id, &source_dir, candidate_dir, false)?;
-        return Ok(());
     }
-    crate::compute::validate_retained_lifecycle_migration(&ready.wiki, &source_dir, candidate_dir)?;
-    if migration.migration == RETAINED_LIFECYCLE_AND_ACTIVITY_MIGRATION_ID
-        || migration.migration == RETAINED_LIFECYCLE_ACTIVITY_AND_PATROL_MIGRATION_ID
-    {
+    if migrated_families.contains("lifecycle") {
+        crate::compute::validate_retained_lifecycle_migration(
+            &ready.wiki,
+            &source_dir,
+            candidate_dir,
+        )?;
+        changed_artifacts.insert(format!("{}/labor_churn.parquet", ready.wiki));
+    }
+    if migrated_families.contains("activity_tiers") {
         #[rustfmt::skip]
         crate::retained_activity_migration::validate_activity_tier_migration(&ready.wiki, &ready.snapshot, &migration.source_run_id, &source_dir, candidate_dir)?;
     }
-    let patrol_migration_expected = migration.migration
-        == RETAINED_LIFECYCLE_AND_PATROL_MIGRATION_ID
-        || migration.migration == RETAINED_LIFECYCLE_ACTIVITY_AND_PATROL_MIGRATION_ID;
     #[rustfmt::skip]
-    crate::retained_patrol_migration::validate_migration(&ready.wiki, &ready.snapshot, &migration.source_run_id, &source_dir, candidate_dir, patrol_migration_expected)?;
+    crate::retained_patrol_migration::validate_migration(&ready.wiki, &ready.snapshot, &migration.source_run_id, &source_dir, candidate_dir, migrated_families.contains("patrol"))?;
+    if migrated_families.contains("patrol") {
+        changed_artifacts.insert(format!("{}/patrol.parquet", ready.wiki));
+    }
+    for artifact in &ready.artifacts {
+        if changed_artifacts.contains(&artifact.path) {
+            continue;
+        }
+        let source_path = source_dir.join(&artifact.path);
+        let target_path = candidate_dir.join(&artifact.path);
+        let (source_bytes, source_sha256) = storage::sha256_file(&source_path)?;
+        let (target_bytes, target_sha256) = storage::sha256_file(&target_path)?;
+        ensure!(
+            source_bytes == target_bytes && source_sha256 == target_sha256,
+            "retained candidate {} migration changed unrelated artifact {}",
+            ready.wiki,
+            artifact.path
+        );
+    }
+    ensure!(
+        crate::compute::retained_candidate_receipts_current_without_inputs(
+            &ready.wiki,
+            &ready.snapshot,
+            candidate_dir,
+            ready.workload_profile.as_ref(),
+        )?,
+        "retained candidate {} migration has an outdated core family receipt",
+        ready.wiki
+    );
     Ok(())
 }
 
@@ -7013,23 +7144,100 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn retained_migration_ids_cover_patrol_combinations() {
+    fn retained_migration_ids_cover_patrol_combinations() -> Result<()> {
         let cases = [
-            (false, false, RETAINED_LIFECYCLE_MIGRATION_ID),
-            (true, false, RETAINED_LIFECYCLE_AND_ACTIVITY_MIGRATION_ID),
-            (false, true, RETAINED_LIFECYCLE_AND_PATROL_MIGRATION_ID),
+            (
+                false,
+                false,
+                RETAINED_LIFECYCLE_MIGRATION_ID,
+                &["lifecycle"][..],
+            ),
+            (
+                true,
+                false,
+                RETAINED_LIFECYCLE_AND_ACTIVITY_MIGRATION_ID,
+                &["activity_tiers", "lifecycle"][..],
+            ),
+            (
+                false,
+                true,
+                RETAINED_LIFECYCLE_AND_PATROL_MIGRATION_ID,
+                &["lifecycle", "patrol"][..],
+            ),
             (
                 true,
                 true,
                 RETAINED_LIFECYCLE_ACTIVITY_AND_PATROL_MIGRATION_ID,
+                &["activity_tiers", "lifecycle", "patrol"][..],
             ),
         ];
-        for (activity_tier, patrol, expected) in cases {
+        for (activity_tier, patrol, expected, expected_families) in cases {
             let migration = retained_migration_id(activity_tier, patrol);
             assert_eq!(migration, expected);
             assert!(supported_retained_migration_id(migration));
+            let provenance = RetainedCandidateMigration {
+                schema_version: 1,
+                source_run_id: "source".to_string(),
+                source_ready_sha256: "0".repeat(64),
+                migration: migration.to_string(),
+                migrated_families: Vec::new(),
+            };
+            let observed_families = retained_migration_families(&provenance)?;
+            assert_eq!(
+                observed_families,
+                expected_families
+                    .into_iter()
+                    .map(|family| (*family).to_string())
+                    .collect::<BTreeSet<_>>()
+            );
         }
         assert!(!supported_retained_migration_id("unknown-migration"));
+
+        let composed = RetainedCandidateMigration {
+            schema_version: 1,
+            source_run_id: "source".to_string(),
+            source_ready_sha256: "0".repeat(64),
+            migration: RETAINED_FAMILY_COMPOSITION_MIGRATION_ID.to_string(),
+            migrated_families: vec![
+                "activity_tiers".to_string(),
+                "lifecycle".to_string(),
+                "monthly".to_string(),
+                "patrol".to_string(),
+            ],
+        };
+        assert!(supported_retained_migration_id(&composed.migration));
+        assert_eq!(
+            retained_migration_families(&composed)?,
+            [
+                "activity_tiers".to_string(),
+                "lifecycle".to_string(),
+                "monthly".to_string(),
+                "patrol".to_string(),
+            ]
+            .into_iter()
+            .collect()
+        );
+        assert_eq!(
+            retained_migration_id_for_families(&["activity_tiers".to_string()]),
+            RETAINED_FAMILY_COMPOSITION_MIGRATION_ID
+        );
+        let mut noncanonical = composed.clone();
+        noncanonical.migrated_families.reverse();
+        assert!(retained_migration_families(&noncanonical).is_err());
+        noncanonical.migrated_families = vec!["monthly".to_string(), "unknown".to_string()];
+        assert!(retained_migration_families(&noncanonical).is_err());
+        noncanonical.migrated_families.clear();
+        assert!(retained_migration_families(&noncanonical).is_err());
+        let mut invalid_legacy = RetainedCandidateMigration {
+            migration: RETAINED_LIFECYCLE_MIGRATION_ID.to_string(),
+            migrated_families: vec!["lifecycle".to_string()],
+            ..composed
+        };
+        assert!(retained_migration_families(&invalid_legacy).is_err());
+        invalid_legacy.migration = "unknown-migration".to_string();
+        invalid_legacy.migrated_families.clear();
+        assert!(retained_migration_families(&invalid_legacy).is_err());
+        Ok(())
     }
 
     fn reuse_success() -> std::io::Result<()> {
@@ -7420,6 +7628,33 @@ mod tests {
                 }
             }
             ready.editor_identity_coverage = Some(report);
+            atomic_json(&ready_path, &ready)?;
+            Ok(candidate)
+        }
+
+        fn rewrite_candidate_patrol_to_v5(&self, run_id: &str) -> Result<PathBuf> {
+            const LEGACY_ALGORITHM: &str = "patrol-metrics-v5-complete-snapshot-months";
+            let candidate = wiki_candidate_dir(self.output.path(), "nlwiki", "2026-03", run_id)?;
+            let output = candidate.join("nlwiki/patrol.parquet");
+            #[rustfmt::skip]
+            artifact_receipt::scan_and_write(&output, "output/nlwiki/patrol.parquet", LEGACY_ALGORITHM, "retained-patrol-v5-migration-fixture")?;
+            let tracked_output =
+                crate::fingerprint::TrackedPath::new("output/nlwiki/patrol.parquet", &output);
+            #[rustfmt::skip]
+            crate::fingerprint::record(&candidate.join("_stages/patrol_compute/nlwiki.json"), crate::fingerprint::StageSpec {
+                stage: "patrol_compute",
+                scope: "nlwiki",
+                selected_snapshot: Some("2026-03"),
+                algorithm_version: LEGACY_ALGORITHM,
+            }, &[], &[tracked_output])?;
+
+            let ready_path = candidate.join("ready.json");
+            let mut ready: ReadyWikiCandidate = read_json(&ready_path)?;
+            for artifact in &mut ready.artifacts {
+                if artifact.path == "nlwiki/patrol.parquet" {
+                    *artifact = prepared_artifact(&candidate, &output)?;
+                }
+            }
             atomic_json(&ready_path, &ready)?;
             Ok(candidate)
         }
@@ -9973,6 +10208,87 @@ mod tests {
         assert_eq!(gdp.column("bytes_per_edit")?.f64()?.get(0), None);
         assert_eq!(gdp.column("bytes_per_editor")?.f64()?.get(0), Some(1.0));
         assert_eq!(gdp.column("revert_rate")?.f64()?.get(0), None);
+        assert!(
+            !storage::generation_manifest_path(fixture.data.path(), "nlwiki", "2026-03")?.is_file()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn retained_candidate_composes_monthly_activity_lifecycle_and_patrol_repairs() -> Result<()> {
+        let fixture = Fixture::new()?;
+        fixture.ready_candidate("retained-family-composition-source")?;
+        prepare_ready_publication(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "retained-family-composition-initial-publication",
+        )
+        .expect("initial publication should prepare");
+        commit_ready_publication(
+            fixture.data.path(),
+            fixture.output.path(),
+            "retained-family-composition-initial-publication",
+        )
+        .expect("initial publication should commit");
+
+        fixture.rewrite_candidate_monthly_to_v5("retained-family-composition-source")?;
+        fixture.rewrite_candidate_lifecycle_to_v3("retained-family-composition-source")?;
+        fixture.rewrite_candidate_activity_tiers_to_v5("retained-family-composition-source")?;
+        let source_candidate =
+            fixture.rewrite_candidate_patrol_to_v5("retained-family-composition-source")?;
+        let source_ready: ReadyWikiCandidate = read_json(&source_candidate.join("ready.json"))?;
+
+        for command in [
+            crate::Commands::RetentionAudit {
+                lifecycle: fixture.lifecycle_path.clone(),
+                wikis: vec!["nlwiki".to_string()],
+            },
+            crate::Commands::RetentionApply {
+                lifecycle: fixture.lifecycle_path.clone(),
+                wikis: vec!["nlwiki".to_string()],
+            },
+        ] {
+            crate::run_with_ops(
+                crate::Cli {
+                    data_dir: fixture.data.path().to_path_buf(),
+                    output_dir: fixture.output.path().to_path_buf(),
+                    run_id: None,
+                    command,
+                },
+                &crate::RealOps,
+            )
+            .expect("retention should authorize and purge the exact migrated source");
+        }
+
+        let migrated_ready_path = migrate_retained_candidate(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "nlwiki",
+            "2026-03",
+            "retained-family-composition-migrated",
+        )?;
+        let migrated_candidate = migrated_ready_path
+            .parent()
+            .context("composed migration ready receipt should have a candidate directory")?;
+        let migrated_ready: ReadyWikiCandidate = read_json(&migrated_ready_path)?;
+        let migration = migrated_ready
+            .migrated_from_retained_candidate
+            .as_ref()
+            .context("composed retained migration should record its lineage")?;
+        assert_eq!(migration.source_run_id, source_ready.run_id);
+        assert_eq!(
+            migration.migration,
+            RETAINED_FAMILY_COMPOSITION_MIGRATION_ID
+        );
+        assert_eq!(
+            migration.migrated_families,
+            ["activity_tiers", "lifecycle", "monthly", "patrol"]
+                .map(str::to_string)
+                .to_vec()
+        );
+        validate_ready_candidate(fixture.data.path(), migrated_candidate, &migrated_ready)?;
         assert!(
             !storage::generation_manifest_path(fixture.data.path(), "nlwiki", "2026-03")?.is_file()
         );
