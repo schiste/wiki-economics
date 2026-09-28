@@ -13,6 +13,45 @@ const LEGACY_LIFECYCLE_ALGORITHM: &str =
     "editor-lifecycle-v3-explicit-identified-registered-editors";
 const LIFECYCLE_MIGRATION_ID: &str = "retained-lifecycle-v3-to-v4-period-months-v1";
 
+/// Return true only when the retained lifecycle outputs carry the known v3
+/// receipt and can be upgraded to the current v4 projection.
+pub(crate) fn lifecycle_migration_required(
+    wiki: &str,
+    snapshot: &str,
+    source_candidate_dir: &Path,
+) -> Result<bool> {
+    let receipt_path = family_receipt_path(source_candidate_dir, wiki, MetricFamily::Lifecycle);
+    let outputs = family_outputs(source_candidate_dir, wiki, MetricFamily::Lifecycle);
+    let current = fingerprint::retained_outputs_reusable(
+        &receipt_path,
+        family_spec(
+            wiki,
+            snapshot,
+            MetricFamily::Lifecycle,
+            crate::compute::lifecycle::ALGORITHM_VERSION,
+        ),
+        &outputs,
+    )?;
+    if current {
+        return Ok(false);
+    }
+    let legacy = fingerprint::retained_outputs_reusable(
+        &receipt_path,
+        family_spec(
+            wiki,
+            snapshot,
+            MetricFamily::Lifecycle,
+            LEGACY_LIFECYCLE_ALGORITHM,
+        ),
+        &outputs,
+    )?;
+    ensure!(
+        legacy,
+        "retained candidate {wiki} has an outdated or invalid lifecycle family"
+    );
+    Ok(true)
+}
+
 fn family_receipt_path(candidate_dir: &Path, wiki: &str, family: MetricFamily) -> PathBuf {
     candidate_dir
         .join("_stages")

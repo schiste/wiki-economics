@@ -7,6 +7,12 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Compose receipt-backed retained-candidate migrations when multiple metric
+  families need schema upgrades at once, while preserving the source candidate
+  and validating every changed family before publication.
+
 ## [0.1.3] - 2026-09-25
 
 ### Fixed
