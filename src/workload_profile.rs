@@ -211,6 +211,34 @@ pub(crate) fn load(data_dir: &Path, wiki: &str, snapshot: &str) -> Result<Option
     Ok(Some(profile))
 }
 
+/// Persist the exact profile carried by an authenticated qualification.
+///
+/// Qualification promotion runs in an isolated data root. Its page-week stage
+/// receipt fingerprints this file, so promotion must materialize the same
+/// validated profile in production before candidate-family reuse can succeed.
+pub(crate) fn persist_qualified(data_dir: &Path, profile: &WorkloadProfile) -> Result<()> {
+    profile.validate(&profile.wiki, &profile.snapshot)?;
+    profile.ensure_compute_qualified()?;
+    let path = profile_path(data_dir, &profile.wiki, &profile.snapshot)?;
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            ensure!(
+                metadata.file_type().is_file(),
+                "persisted workload profile is not a regular file"
+            );
+            let existing = load(data_dir, &profile.wiki, &profile.snapshot)?
+                .context("persisted workload profile disappeared")?;
+            ensure!(
+                &existing == profile,
+                "persisted workload profile conflicts with the qualified candidate"
+            );
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => write_atomic(&path, profile),
+        Err(error) => Err(error.into()),
+    }
+}
+
 pub(crate) fn load_or_select(
     data_dir: &Path,
     plan: &SnapshotPlan,

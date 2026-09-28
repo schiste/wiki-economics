@@ -2301,6 +2301,11 @@ fn promote_wiki_qualification_from_dirs(
             "existing promoted candidate has a different identity"
         );
         validate_ready_candidate(data_dir, &target, &ready)?;
+        let profile = ready
+            .workload_profile
+            .as_ref()
+            .context("promoted qualification has no workload profile")?;
+        crate::workload_profile::persist_qualified(data_dir, profile)?;
         reconcile_ready_generation_state(output_dir, &ready)?;
         write_ready_index(data_dir, output_dir, wiki, &(ready, target.clone()))?;
         return Ok(ready_path);
@@ -2376,6 +2381,11 @@ fn promote_wiki_qualification_from_dirs(
         GState::Ready,
         "authenticated qualification promoted to ready candidate",
     )?;
+    let profile = ready
+        .workload_profile
+        .as_ref()
+        .context("promoted qualification has no workload profile")?;
+    crate::workload_profile::persist_qualified(data_dir, profile)?;
     write_ready_index(data_dir, output_dir, wiki, &(ready, target))?;
     info!(
         wiki,
@@ -2476,23 +2486,32 @@ fn validate_ready_candidate_metadata(
     if qualification_lineage {
         validate_promoted_qualification_lineage(candidate_dir, ready)?;
     }
-    if storage::generation_manifest_path(data_dir, &ready.wiki, &ready.snapshot)?.is_file() {
-        storage::ensure_generation_manifest(data_dir, &ready.wiki, &ready.snapshot)?;
-    } else if !qualification_lineage {
-        let retention = crate::retention::validate_purged_snapshot(
-            data_dir,
-            &ready.wiki,
-            &ready.snapshot,
-        )
-        .context(
-            "ready candidate input generation is absent without valid retention authorization",
-        )?;
-        #[rustfmt::skip]
-        let authorized_lineage = retained_ready_lineage_matches(candidate_dir, ready, &retention.authorized_ready_sha256, 0)?;
-        ensure!(
-            authorized_lineage,
-            "ready candidate input generation is absent without valid retention authorization"
-        );
+    if !qualification_lineage {
+        let manifest_path =
+            storage::generation_manifest_path(data_dir, &ready.wiki, &ready.snapshot)?;
+        let manifest_validation = if manifest_path.is_file() {
+            storage::ensure_generation_manifest(data_dir, &ready.wiki, &ready.snapshot).map(|_| ())
+        } else {
+            Err(anyhow::anyhow!("snapshot generation manifest is missing"))
+        };
+        if let Err(manifest_error) = manifest_validation {
+            let retention = crate::retention::validate_purged_snapshot(
+                data_dir,
+                &ready.wiki,
+                &ready.snapshot,
+            )
+            .with_context(|| {
+                format!(
+                    "ready candidate generation manifest failed validation ({manifest_error:#}) and no valid retention authorization was found"
+                )
+            })?;
+            #[rustfmt::skip]
+            let authorized_lineage = retained_ready_lineage_matches(candidate_dir, ready, &retention.authorized_ready_sha256, 0)?;
+            ensure!(
+                authorized_lineage,
+                "ready candidate generation manifest failed validation and retention does not authorize this candidate"
+            );
+        }
     }
     if let Some(profile) = &ready.workload_profile {
         profile.validate(&ready.wiki, &ready.snapshot)?;
@@ -10138,6 +10157,9 @@ mod tests {
             .is_err()
         );
 
+        let generation_manifest_path =
+            storage::generation_manifest_path(fixture.data.path(), "nlwiki", "2026-03")?;
+        let stale_generation_manifest = fs::read(&generation_manifest_path)?;
         for command in [
             crate::Commands::RetentionAudit {
                 lifecycle: fixture.lifecycle_path.clone(),
@@ -10159,6 +10181,12 @@ mod tests {
             )
             .expect("retention should authorize and purge the exact ready source");
         }
+        assert!(!generation_manifest_path.is_file());
+        fs::write(&generation_manifest_path, stale_generation_manifest)?;
+        assert!(
+            storage::ensure_generation_manifest(fixture.data.path(), "nlwiki", "2026-03").is_err(),
+            "the retained snapshot's stale manifest should lack its purged marker inventory"
+        );
 
         #[rustfmt::skip]
         let migrated_ready_path = migrate_retained_candidate(fixture.data.path(), fixture.output.path(), &fixture.lifecycle_path, "nlwiki", "2026-03", "retained-monthly-v6-migrated")?;
@@ -10188,8 +10216,9 @@ mod tests {
         assert_eq!(gdp.column("bytes_per_edit")?.f64()?.get(0), None);
         assert_eq!(gdp.column("bytes_per_editor")?.f64()?.get(0), Some(1.0));
         assert_eq!(gdp.column("revert_rate")?.f64()?.get(0), None);
+        assert!(generation_manifest_path.is_file());
         assert!(
-            !storage::generation_manifest_path(fixture.data.path(), "nlwiki", "2026-03")?.is_file()
+            storage::ensure_generation_manifest(fixture.data.path(), "nlwiki", "2026-03").is_err()
         );
         Ok(())
     }
@@ -11750,6 +11779,11 @@ mod tests {
             &qualification_files,
         )
         .expect("qualification artifacts should copy into the isolated root");
+        let production_profile_path =
+            crate::workload_profile::profile_path(fixture.data.path(), "nlwiki", "2026-03")?;
+        assert!(production_profile_path.is_file());
+        fs::remove_file(&production_profile_path)
+            .expect("production workload profile should be absent before isolated promotion");
         fs::copy(
             &qualification_path,
             isolated_qualification_dir.join("qualification.json"),
@@ -11858,6 +11892,11 @@ mod tests {
             })
             .expect("isolated qualification should promote into production output");
         let ready: ReadyWikiCandidate = read_json(&ready_path).expect("ready receipt should parse");
+        assert_eq!(
+            crate::workload_profile::load(fixture.data.path(), "nlwiki", "2026-03")?,
+            ready.workload_profile,
+            "qualification promotion must persist the exact profile used by its page-week receipt"
+        );
         assert_eq!(
             ready
                 .promoted_from_qualification
