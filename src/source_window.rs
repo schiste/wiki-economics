@@ -646,7 +646,7 @@ mod tests {
     use crate::resource_governor::{GovernorPaths, ResourceBudget};
     use crate::test_support::TestDir;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex, mpsc};
+    use std::sync::{Arc, Barrier, Mutex, mpsc};
 
     #[derive(Default)]
     struct FakeOps {
@@ -868,6 +868,9 @@ mod tests {
         let release_rx = Arc::new(Mutex::new(release_rx_original));
         let (slow_started_tx, slow_started_rx) = mpsc::channel();
         let (refill_observation_tx, refill_observation_rx) = mpsc::channel();
+        let start_barrier = Arc::new(Barrier::new(2));
+        let slow_barrier = Arc::clone(&start_barrier);
+        let quick_barrier = Arc::clone(&start_barrier);
         let active_flag = Arc::clone(&slow_source_active);
         let execution = std::thread::spawn(move || {
             execute_bounded(
@@ -878,6 +881,7 @@ mod tests {
                     0 => {
                         active_flag.store(true, Ordering::Release);
                         let _ = slow_started_tx.send(());
+                        slow_barrier.wait();
                         release_rx
                             .lock()
                             .expect("release receiver mutex poisoned")
@@ -886,7 +890,10 @@ mod tests {
                         active_flag.store(false, Ordering::Release);
                         Ok(1)
                     }
-                    1 => Ok(1),
+                    1 => {
+                        quick_barrier.wait();
+                        Ok(1)
+                    }
                     _ => {
                         let slow_source_was_active = active_flag.load(Ordering::Acquire);
                         let _ = refill_observation_tx.send(slow_source_was_active);
