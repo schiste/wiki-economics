@@ -10182,11 +10182,6 @@ mod tests {
             .expect("retention should authorize and purge the exact ready source");
         }
         assert!(!generation_manifest_path.is_file());
-        fs::write(&generation_manifest_path, stale_generation_manifest)?;
-        assert!(
-            storage::ensure_generation_manifest(fixture.data.path(), "nlwiki", "2026-03").is_err(),
-            "the retained snapshot's stale manifest should lack its purged marker inventory"
-        );
 
         #[rustfmt::skip]
         let migrated_ready_path = migrate_retained_candidate(fixture.data.path(), fixture.output.path(), &fixture.lifecycle_path, "nlwiki", "2026-03", "retained-monthly-v6-migrated")?;
@@ -10203,6 +10198,11 @@ mod tests {
         assert_eq!(
             migration.migration,
             crate::retained_monthly_migration::MIGRATION_ID
+        );
+        fs::write(&generation_manifest_path, stale_generation_manifest)?;
+        assert!(
+            storage::ensure_generation_manifest(fixture.data.path(), "nlwiki", "2026-03").is_err(),
+            "the retained snapshot's stale manifest should lack its purged marker inventory"
         );
         #[rustfmt::skip]
         crate::retained_monthly_migration::validate_migration("nlwiki", "2026-03", &source_ready.run_id, &source_candidate, migrated_candidate)?;
