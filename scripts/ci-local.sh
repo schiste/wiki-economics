@@ -4,7 +4,39 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 SITE_FIXTURE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/wiki-econ-site-ci.XXXXXX")"
-trap 'rm -rf -- "$SITE_FIXTURE_ROOT"' EXIT
+
+# cargo-llvm-cov builds a full instrumented copy of the workspace (3-11 GB).
+# Share one copy across every checkout of this repo instead of one per
+# worktree. Runs serialize on a lock because llvm-cov deletes *.profraw in its
+# target dir at start, so concurrent runs would corrupt each other's coverage.
+export CARGO_LLVM_COV_TARGET_DIR="${CARGO_LLVM_COV_TARGET_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/wiki-economics/llvm-cov-target}"
+LLVM_COV_LOCK="$CARGO_LLVM_COV_TARGET_DIR.lock"
+LLVM_COV_LOCK_HELD=0
+
+acquire_llvm_cov_lock() {
+  mkdir -p "$(dirname "$LLVM_COV_LOCK")"
+  while ! mkdir "$LLVM_COV_LOCK" 2>/dev/null; do
+    holder="$(cat "$LLVM_COV_LOCK/pid" 2>/dev/null || true)"
+    if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
+      echo "==> removing stale llvm-cov lock left by exited pid $holder"
+      rm -rf -- "$LLVM_COV_LOCK"
+      continue
+    fi
+    echo "==> waiting for llvm-cov lock $LLVM_COV_LOCK (pid ${holder:-starting})"
+    sleep 10
+  done
+  echo "$$" > "$LLVM_COV_LOCK/pid"
+  LLVM_COV_LOCK_HELD=1
+}
+
+release_llvm_cov_lock() {
+  if [ "$LLVM_COV_LOCK_HELD" = 1 ]; then
+    rm -rf -- "$LLVM_COV_LOCK"
+    LLVM_COV_LOCK_HELD=0
+  fi
+}
+
+trap 'release_llvm_cov_lock; rm -rf -- "$SITE_FIXTURE_ROOT"' EXIT
 
 echo "==> node scripts/verify-runtime.cjs"
 node scripts/verify-runtime.cjs
@@ -190,7 +222,11 @@ echo "==> cargo doc --locked --no-deps"
 cargo doc --locked --no-deps
 
 echo "==> cargo llvm-cov --locked --workspace --all-features --all-targets --lcov --output-path target/llvm-cov.info"
+echo "    (shared target dir: $CARGO_LLVM_COV_TARGET_DIR)"
+mkdir -p target
+acquire_llvm_cov_lock
 cargo llvm-cov --locked --workspace --all-features --all-targets --lcov --output-path target/llvm-cov.info
+release_llvm_cov_lock
 
 echo "==> python3 scripts/check_lcov.py target/llvm-cov.info"
 python3 scripts/check_lcov.py target/llvm-cov.info
