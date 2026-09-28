@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use chrono::{Duration, NaiveDate};
 use polars::prelude::*;
+use rayon::prelude::*;
 use serde_json::{Value, json};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -12,6 +13,7 @@ use std::path::Path;
 use crate::{licensing, storage};
 
 const LARGE_METRIC_BATCH_ROWS: usize = 250_000;
+const VARIATION_SCAN_CHUNK_ROWS: usize = 16_384;
 const ALL_WIKIS_SCOPE: &str = "all";
 const INEQUALITY_DEFAULT_START_MONTH: &str = "2001-06";
 pub(crate) const ACCOUNT_CREATION_STAGING_PATH: &str = "_staging/account-creations/svwiki.json";
@@ -362,8 +364,8 @@ fn string(df: &DataFrame, column: &str, row: usize) -> Result<Option<String>> {
     }
 }
 
-fn integer(df: &DataFrame, column: &str, row: usize) -> Result<Option<i64>> {
-    let value = match df.column(column)?.get(row)? {
+fn integer_value(value: AnyValue<'_>, column: &str) -> Result<Option<i64>> {
+    let value = match value {
         AnyValue::Null => return Ok(None),
         AnyValue::UInt32(value) => i64::from(value),
         AnyValue::Int32(value) => i64::from(value),
@@ -373,8 +375,12 @@ fn integer(df: &DataFrame, column: &str, row: usize) -> Result<Option<i64>> {
     Ok(Some(value))
 }
 
-fn float(df: &DataFrame, column: &str, row: usize) -> Result<Option<f64>> {
-    let value = match df.column(column)?.get(row)? {
+fn integer(df: &DataFrame, column: &str, row: usize) -> Result<Option<i64>> {
+    integer_value(df.column(column)?.get(row)?, column)
+}
+
+fn float_value(value: AnyValue<'_>, column: &str) -> Result<Option<f64>> {
+    let value = match value {
         AnyValue::Null => return Ok(None),
         AnyValue::Float64(value) => value,
         AnyValue::UInt32(value) => f64::from(value),
@@ -383,6 +389,10 @@ fn float(df: &DataFrame, column: &str, row: usize) -> Result<Option<f64>> {
         value => bail!("expected number in {column}, found {value:?}"),
     };
     Ok(Some(value))
+}
+
+fn float(df: &DataFrame, column: &str, row: usize) -> Result<Option<f64>> {
+    float_value(df.column(column)?.get(row)?, column)
 }
 
 fn number(value: f64) -> Value {
@@ -1316,7 +1326,101 @@ impl VariationScope {
     }
 }
 
+struct VariationColumns<'a> {
+    wiki: &'a StringChunked,
+    namespace: &'a Column,
+    week: &'a StringChunked,
+    title: &'a StringChunked,
+    previous_week_edits: &'a Column,
+    edits: &'a Column,
+    wow_change: &'a Column,
+    wow_rate: &'a Column,
+}
+
+impl<'a> VariationColumns<'a> {
+    fn new(batch: &'a DataFrame) -> Result<Self> {
+        Ok(Self {
+            wiki: batch.column("wiki")?.str()?,
+            namespace: batch.column("page_namespace")?,
+            week: batch.column("week_start")?.str()?,
+            title: batch.column("page_title")?.str()?,
+            previous_week_edits: batch.column("previous_week_edits")?,
+            edits: batch.column("edits")?,
+            wow_change: batch.column("wow_change")?,
+            wow_rate: batch.column("wow_rate")?,
+        })
+    }
+
+    fn accumulate_row(
+        &self,
+        scope: &mut VariationScope,
+        expected_wiki: &str,
+        path: &Path,
+        row: usize,
+    ) -> Result<()> {
+        let wiki = self.wiki.get(row).context("variation wiki is null")?;
+        ensure!(
+            wiki == expected_wiki,
+            "{} contains rows for unexpected wiki {wiki}",
+            path.display()
+        );
+        if integer_value(self.namespace.get(row)?, "page_namespace")? != Some(0) {
+            return Ok(());
+        }
+        scope.matching_rows = scope
+            .matching_rows
+            .checked_add(1)
+            .context("page-week dashboard matching row count overflow")?;
+        let week = self.week.get(row).context("variation week is null")?;
+        if scope
+            .min_week
+            .as_deref()
+            .is_none_or(|minimum| week < minimum)
+        {
+            scope.min_week = Some(week.to_string());
+        }
+        if scope
+            .max_week
+            .as_deref()
+            .is_none_or(|maximum| week > maximum)
+        {
+            scope.max_week = Some(week.to_string());
+        }
+        let previous_week_edits =
+            integer_value(self.previous_week_edits.get(row)?, "previous_week_edits")?
+                .unwrap_or_default();
+        if previous_week_edits <= 0 {
+            return Ok(());
+        }
+        retain_top_variation(
+            &mut scope.top,
+            VariationRow {
+                wiki: wiki.to_string(),
+                week: week.to_string(),
+                title: self
+                    .title
+                    .get(row)
+                    .context("variation title is null")?
+                    .to_string(),
+                previous_week_edits,
+                edits: integer_value(self.edits.get(row)?, "edits")?,
+                wow_change: integer_value(self.wow_change.get(row)?, "wow_change")?,
+                wow_rate: float_value(self.wow_rate.get(row)?, "wow_rate")?,
+            },
+        );
+        Ok(())
+    }
+}
+
 fn scan_variation_partition(output_dir: &Path, expected_wiki: &str) -> Result<VariationScope> {
+    scan_variation_partition_with_batch_rows(output_dir, expected_wiki, LARGE_METRIC_BATCH_ROWS)
+}
+
+fn scan_variation_partition_with_batch_rows(
+    output_dir: &Path,
+    expected_wiki: &str,
+    batch_rows: usize,
+) -> Result<VariationScope> {
     let path = output_dir
         .join(expected_wiki)
         .join("page_weekly_edits.parquet");
@@ -1335,8 +1439,7 @@ fn scan_variation_partition(output_dir: &Path, expected_wiki: &str) -> Result<Va
         .map(str::to_string)
         .collect(),
     );
-    let mut reader =
-        storage::SequentialParquetReader::new(&path, columns, LARGE_METRIC_BATCH_ROWS)?;
+    let mut reader = storage::SequentialParquetReader::new(&path, columns, batch_rows)?;
     let rows = reader.rows();
     ensure!(rows > 0, "page_weekly_edits.parquet is empty");
     let mut scope = VariationScope {
@@ -1344,55 +1447,42 @@ fn scan_variation_partition(output_dir: &Path, expected_wiki: &str) -> Result<Va
         ..VariationScope::default()
     };
     let mut observed_rows = 0_usize;
+    let mut batch_count = 0_usize;
     while let Some(batch) = reader.next_batch()? {
+        batch_count = batch_count
+            .checked_add(1)
+            .context("page-week dashboard batch count overflow")?;
         observed_rows = observed_rows
             .checked_add(batch.height())
             .context("page-week dashboard row count overflow")?;
-        for row in 0..batch.height() {
-            let wiki = string(&batch, "wiki", row)?.context("variation wiki is null")?;
-            ensure!(
-                wiki == expected_wiki,
-                "{} contains rows for unexpected wiki {wiki}",
-                path.display()
-            );
-            if integer(&batch, "page_namespace", row)? != Some(0) {
-                continue;
-            }
-            scope.matching_rows = scope
-                .matching_rows
-                .checked_add(1)
-                .context("page-week dashboard matching row count overflow")?;
-            let week = string(&batch, "week_start", row)?.context("variation week is null")?;
-            if scope
-                .min_week
-                .as_deref()
-                .is_none_or(|minimum| week.as_str() < minimum)
-            {
-                scope.min_week = Some(week.clone());
-            }
-            if scope
-                .max_week
-                .as_deref()
-                .is_none_or(|maximum| week.as_str() > maximum)
-            {
-                scope.max_week = Some(week.clone());
-            }
-            let previous_week_edits =
-                integer(&batch, "previous_week_edits", row)?.unwrap_or_default();
-            if previous_week_edits <= 0 {
-                continue;
-            }
-            retain_top_variation(
-                &mut scope.top,
-                VariationRow {
-                    wiki,
-                    week,
-                    title: string(&batch, "page_title", row)?.context("variation title is null")?,
-                    previous_week_edits,
-                    edits: integer(&batch, "edits", row)?,
-                    wow_change: integer(&batch, "wow_change", row)?,
-                    wow_rate: float(&batch, "wow_rate", row)?,
-                },
+        let columns = VariationColumns::new(&batch)?;
+        let chunk_scopes = (0..batch.height())
+            .step_by(VARIATION_SCAN_CHUNK_ROWS)
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|start| -> Result<VariationScope> {
+                let end = (start + VARIATION_SCAN_CHUNK_ROWS).min(batch.height());
+                let mut chunk_scope = VariationScope {
+                    top: Vec::with_capacity(20),
+                    ..VariationScope::default()
+                };
+                for row in start..end {
+                    columns.accumulate_row(&mut chunk_scope, expected_wiki, &path, row)?;
+                }
+                Ok(chunk_scope)
+            })
+            .collect::<Vec<_>>();
+        for chunk_scope in chunk_scopes {
+            let chunk_scope = chunk_scope?;
+            scope.merge(&chunk_scope)?;
+        }
+        if batch_count == 1 || batch_count.is_multiple_of(100) {
+            tracing::info!(
+                wiki = expected_wiki,
+                scanned_rows = observed_rows,
+                total_rows = rows,
+                batches = batch_count,
+                "scanning page-week dashboard partition"
             );
         }
     }
@@ -1401,6 +1491,13 @@ fn scan_variation_partition(output_dir: &Path, expected_wiki: &str) -> Result<Va
         "page-week dashboard row conservation failed: footer {rows}, scanned {observed_rows}"
     );
     scope.top.sort_by(variation_order);
+    tracing::info!(
+        wiki = expected_wiki,
+        scanned_rows = observed_rows,
+        matching_rows = scope.matching_rows,
+        batches = batch_count,
+        "finished page-week dashboard partition"
+    );
     Ok(scope)
 }
 
@@ -2353,6 +2450,64 @@ mod tests {
             ),
             Ordering::Greater
         );
+    }
+
+    #[test]
+    fn variation_partition_scan_parallelizes_chunks_without_changing_tie_order() -> Result<()> {
+        let row_count = VARIATION_SCAN_CHUNK_ROWS * 2 + 32;
+        let output = TestDir::new()?;
+        let partition = output.path().join("nlwiki");
+        fs::create_dir_all(&partition)?;
+        let frame = df!(
+            "wiki" => vec!["nlwiki"; row_count],
+            "page_namespace" => vec![0_i32; row_count],
+            "week_start" => vec!["2026-01-01"; row_count],
+            "page_title" => vec!["Same"; row_count],
+            "previous_week_edits" => (1..=i64::try_from(row_count)?).collect::<Vec<_>>(),
+            "edits" => vec![7_i64; row_count],
+            "wow_change" => vec![5_i64; row_count],
+            "wow_rate" => (0..row_count).map(|row| row as f64).collect::<Vec<_>>(),
+        )
+        .expect("variation scan fixture columns have equal lengths");
+        write_parquet(&partition, "page_weekly_edits", frame)?;
+
+        let scope = scan_variation_partition(output.path(), "nlwiki")?;
+
+        assert_eq!(scope.matching_rows, i64::try_from(row_count)?);
+        assert_eq!(scope.min_week.as_deref(), Some("2026-01-01"));
+        assert_eq!(scope.max_week.as_deref(), Some("2026-01-01"));
+        assert_eq!(scope.top.len(), 20);
+        for (index, row) in scope.top.iter().enumerate() {
+            assert_eq!(row.previous_week_edits, (index + 1) as i64);
+            assert_eq!(row.wow_rate, Some(index as f64));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn variation_partition_scan_logs_progress_on_the_hundredth_batch() -> Result<()> {
+        let row_count = 100;
+        let output = TestDir::new()?;
+        let partition = output.path().join("nlwiki");
+        fs::create_dir_all(&partition)?;
+        let frame = df!(
+            "wiki" => vec!["nlwiki"; row_count],
+            "page_namespace" => vec![0_i32; row_count],
+            "week_start" => vec!["2026-01-01"; row_count],
+            "page_title" => vec!["Same"; row_count],
+            "previous_week_edits" => vec![1_i64; row_count],
+            "edits" => vec![7_i64; row_count],
+            "wow_change" => vec![5_i64; row_count],
+            "wow_rate" => vec![1.0_f64; row_count],
+        )
+        .expect("variation scan progress fixture columns have equal lengths");
+        write_parquet(&partition, "page_weekly_edits", frame)?;
+
+        let scope = scan_variation_partition_with_batch_rows(output.path(), "nlwiki", 1)?;
+
+        assert_eq!(scope.matching_rows, i64::try_from(row_count)?);
+        assert_eq!(scope.top.len(), 20);
+        Ok(())
     }
 
     #[test]
