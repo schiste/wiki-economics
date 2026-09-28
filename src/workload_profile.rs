@@ -211,6 +211,34 @@ pub(crate) fn load(data_dir: &Path, wiki: &str, snapshot: &str) -> Result<Option
     Ok(Some(profile))
 }
 
+/// Persist the exact profile carried by an authenticated qualification.
+///
+/// Qualification promotion runs in an isolated data root. Its page-week stage
+/// receipt fingerprints this file, so promotion must materialize the same
+/// validated profile in production before candidate-family reuse can succeed.
+pub(crate) fn persist_qualified(data_dir: &Path, profile: &WorkloadProfile) -> Result<()> {
+    profile.validate(&profile.wiki, &profile.snapshot)?;
+    profile.ensure_compute_qualified()?;
+    let path = profile_path(data_dir, &profile.wiki, &profile.snapshot)?;
+    match fs::symlink_metadata(&path) {
+        Ok(metadata) => {
+            ensure!(
+                metadata.file_type().is_file(),
+                "persisted workload profile is not a regular file"
+            );
+            let existing = load(data_dir, &profile.wiki, &profile.snapshot)?
+                .context("persisted workload profile disappeared")?;
+            ensure!(
+                &existing == profile,
+                "persisted workload profile conflicts with the qualified candidate"
+            );
+            Ok(())
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => write_atomic(&path, profile),
+        Err(error) => Err(error.into()),
+    }
+}
+
 pub(crate) fn load_or_select(
     data_dir: &Path,
     plan: &SnapshotPlan,
@@ -629,6 +657,24 @@ mod tests {
             signals: signals(1, 1, None),
             parameters: name.parameters(),
         }
+    }
+
+    #[test]
+    fn qualified_profile_propagates_non_missing_path_errors() -> Result<()> {
+        let root = TestDir::new()?;
+        fs::write(root.path().join("snapshots"), b"not a directory")?;
+        let profile = profile(
+            "testwiki",
+            WorkloadProfileName::Small,
+            ProfileSelectionMode::Automatic,
+        );
+        let error = persist_qualified(root.path(), &profile)
+            .expect_err("a non-directory snapshot root should fail profile persistence");
+        let io_error = error
+            .downcast_ref::<std::io::Error>()
+            .expect("the filesystem error should be preserved");
+        assert_eq!(io_error.kind(), std::io::ErrorKind::NotADirectory);
+        Ok(())
     }
 
     #[test]
