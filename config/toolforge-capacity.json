@@ -28,7 +28,7 @@
     "qualification": 4000,
     "controller": 1000,
     "admin_dispatcher": 250,
-    "publisher": 1000,
+    "publisher": 4000,
     "scrubber": 1000
   },
   "capacity_policy": {

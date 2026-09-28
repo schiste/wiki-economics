@@ -1439,7 +1439,8 @@ fn scan_variation_partition_with_batch_rows(
         .map(str::to_string)
         .collect(),
     );
-    let mut reader = storage::SequentialParquetReader::new(&path, columns, batch_rows)?;
+    let mut reader =
+        storage::SequentialParquetReader::new_with_column_parallelism(&path, columns, batch_rows)?;
     let rows = reader.rows();
     ensure!(rows > 0, "page_weekly_edits.parquet is empty");
     let mut scope = VariationScope {

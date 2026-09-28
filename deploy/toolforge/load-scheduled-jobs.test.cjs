@@ -115,6 +115,14 @@ test("scheduled job resources match the capacity admission source of truth", () 
     assert.ok(request.bytes <= capacity.per_job_memory_limit_bytes);
     assert.ok(request.millicores <= capacity.per_job_cpu_limit_millicores);
   }
+  const publisher = manifest
+    .split("- name: wiki-econ-publish-ready\n")[1]
+    ?.split("\n- name:", 1)[0];
+  assert.ok(publisher, "missing ready publisher job");
+  assert.match(
+    publisher,
+    /^  command: \/usr\/bin\/env RAYON_NUM_THREADS=4 POLARS_MAX_THREADS=4 deploy\/toolforge\/run-publish-ready\.sh$/m,
+  );
 });
 
 test("a missing manifest fails before Toolforge is contacted", () => {

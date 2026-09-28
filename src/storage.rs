@@ -1986,6 +1986,7 @@ pub(crate) struct SequentialParquetReader {
     file: File,
     metadata: FileMetadataRef,
     columns: Option<Vec<String>>,
+    parallel_strategy: ParallelStrategy,
     slices: Vec<ParquetBatchSlice>,
     next_slice: usize,
     rows: usize,
@@ -1998,6 +1999,23 @@ impl SequentialParquetReader {
         path: &Path,
         columns: Option<Vec<String>>,
         maximum_batch_rows: usize,
+    ) -> Result<Self> {
+        Self::new_with_strategy(path, columns, maximum_batch_rows, ParallelStrategy::None)
+    }
+
+    pub(crate) fn new_with_column_parallelism(
+        path: &Path,
+        columns: Option<Vec<String>>,
+        maximum_batch_rows: usize,
+    ) -> Result<Self> {
+        Self::new_with_strategy(path, columns, maximum_batch_rows, ParallelStrategy::Columns)
+    }
+
+    fn new_with_strategy(
+        path: &Path,
+        columns: Option<Vec<String>>,
+        maximum_batch_rows: usize,
+        parallel_strategy: ParallelStrategy,
     ) -> Result<Self> {
         ensure!(
             maximum_batch_rows > 0,
@@ -2046,6 +2064,7 @@ impl SequentialParquetReader {
             file,
             metadata,
             columns,
+            parallel_strategy,
             slices,
             next_slice: 0,
             rows,
@@ -2088,7 +2107,7 @@ impl SequentialParquetReader {
             .with_columns(self.columns.clone())
             .with_slice(Some((offset, rows)))
             .set_low_memory(true)
-            .read_parallel(ParallelStrategy::None);
+            .read_parallel(self.parallel_strategy);
         reader.set_metadata(self.metadata.clone());
         reader
             .finish()
@@ -2647,6 +2666,14 @@ mod tests {
         }
         assert_eq!(values, [1, 2, 3, 4, 5]);
         assert!(reader.next_batch()?.is_none());
+
+        let columns = Some(vec!["key".to_string()]);
+        let mut parallel = SequentialParquetReader::new_with_column_parallelism(&path, columns, 1)?;
+        let mut parallel_values = Vec::new();
+        while let Some(batch) = parallel.next_batch()? {
+            parallel_values.extend(batch.column("key")?.i64()?.into_no_null_iter());
+        }
+        assert_eq!(parallel_values, [1, 2, 3, 4, 5]);
         Ok(())
     }
 
