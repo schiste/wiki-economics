@@ -101,17 +101,16 @@
   mem: 512Mi
   cpu: "0.25"
 
-# Publication is intentionally short and independent. It selects only fully
-# validated ready candidates, merges, builds, validates, and switches the
-# release while holding the sole global publication lock.
+# Publication selects only fully validated ready candidates, merges, builds,
+# validates, and switches the release while holding the sole global lock.
 - name: wiki-econ-publish-ready
   image: tool-wiki-economics/tool-wiki-economics:latest
-  command: deploy/toolforge/run-publish-ready.sh
+  command: /usr/bin/env RAYON_NUM_THREADS=4 POLARS_MAX_THREADS=4 deploy/toolforge/run-publish-ready.sh
   schedule: "30 */2 * * *"
   filelog: true
   mount: all
   mem: 6Gi
-  cpu: "1"
+  cpu: "4"
 
 # Independent full-byte verification is intentionally infrequent. It detects
 # corruption even when file size and mtime are unchanged, while normal

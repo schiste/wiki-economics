@@ -85,10 +85,13 @@ and higher resource envelope are being qualified.
   therefore come from different commits; each is verified independently and
   all three identities are recorded in refresh run provenance.
 - `jobs.yaml` — one Rust fleet controller, two fixed small-wiki workers, two
-  fixed medium/large workers, a 512 MiB admin routing dispatcher,
-  and the short `wiki-econ-publish-ready` job, plus
-  legacy recovery jobs and six unscheduled large-wiki pipeline jobs. The controller represents the sixteen
-  scheduled wikis declared by the lifecycle registry: afwiki, arwiki, arzwiki,
+  fixed medium/large workers, a 512 MiB admin routing dispatcher, and the
+  `wiki-econ-publish-ready` job, plus legacy recovery jobs and six unscheduled
+  large-wiki pipeline jobs. The scheduled publisher reserves its per-job
+  envelope of four CPU and six GiB and sets Rayon and Polars thread pools to
+  four; the dashboard Parquet scan retains bounded 250,000-row batches. The
+  controller represents the sixteen scheduled wikis declared by the lifecycle
+  registry: afwiki, arwiki, arzwiki,
   elwiki, eswiki, frwiki, hawiki, itwiki, jawiki, nlwiki, ptwiki, svwiki,
   swwiki, viwiki, yowiki, and zhwiki. Adding a wiki does not add a Toolforge
   Job definition. Monthly layouts remain isolated

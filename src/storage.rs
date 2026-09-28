@@ -2000,10 +2000,18 @@ impl SequentialParquetReader {
         columns: Option<Vec<String>>,
         maximum_batch_rows: usize,
     ) -> Result<Self> {
-        Self::new_with_parallel_strategy(path, columns, maximum_batch_rows, ParallelStrategy::None)
+        Self::new_with_strategy(path, columns, maximum_batch_rows, ParallelStrategy::None)
     }
 
-    pub(crate) fn new_with_parallel_strategy(
+    pub(crate) fn new_with_column_parallelism(
+        path: &Path,
+        columns: Option<Vec<String>>,
+        maximum_batch_rows: usize,
+    ) -> Result<Self> {
+        Self::new_with_strategy(path, columns, maximum_batch_rows, ParallelStrategy::Columns)
+    }
+
+    fn new_with_strategy(
         path: &Path,
         columns: Option<Vec<String>>,
         maximum_batch_rows: usize,
@@ -2659,11 +2667,10 @@ mod tests {
         assert_eq!(values, [1, 2, 3, 4, 5]);
         assert!(reader.next_batch()?.is_none());
 
-        let mut parallel_reader = SequentialParquetReader::new_with_parallel_strategy(
+        let mut parallel_reader = SequentialParquetReader::new_with_column_parallelism(
             &path,
             Some(vec!["key".to_string()]),
             1,
-            ParallelStrategy::Columns,
         )?;
         let mut parallel_values = Vec::new();
         while let Some(batch) = parallel_reader.next_batch()? {
