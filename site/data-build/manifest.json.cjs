@@ -389,10 +389,13 @@ function workloadProfile(dataDir, wiki, snapshot) {
   if (!fs.existsSync(file)) return null;
   const profile = readJson(file);
   const parameters = profile?.parameters;
-  const supportedSchema = (profile?.schema_version === 1
-      && profile?.selection_algorithm_version === "adaptive-workload-profile-v1")
-    || (profile?.schema_version === 2
-      && profile?.selection_algorithm_version === "adaptive-workload-profile-v2-measured");
+  const schemaPolicies = {
+    1: {selectionAlgorithmVersion: "adaptive-workload-profile-v1", largeSourceWorkers: [3]},
+    2: {selectionAlgorithmVersion: "adaptive-workload-profile-v2-measured", largeSourceWorkers: [3, 4]},
+    3: {selectionAlgorithmVersion: "adaptive-workload-profile-v3-capacity", largeSourceWorkers: [4]},
+  };
+  const schemaPolicy = schemaPolicies[profile?.schema_version];
+  const supportedSchema = schemaPolicy?.selectionAlgorithmVersion === profile?.selection_algorithm_version;
   const optionalSignalNames = [
     "prior_measured_rows",
     "prior_fragment_count",
@@ -405,10 +408,14 @@ function workloadProfile(dataDir, wiki, snapshot) {
     return value === null || value === undefined || (Number.isSafeInteger(value) && value >= 0);
   });
   const expectedParameters = profile?.profile === "small"
-    ? {source_workers: 2, primary_buckets: 32, secondary_buckets: 8}
+    ? [{source_workers: 2, primary_buckets: 32, secondary_buckets: 8}]
     : profile?.profile === "large"
-      ? {source_workers: 3, primary_buckets: 64, secondary_buckets: 32}
-      : null;
+      ? (schemaPolicy?.largeSourceWorkers || []).map((source_workers) => ({
+        source_workers,
+        primary_buckets: 64,
+        secondary_buckets: 32,
+      }))
+      : [];
   if (!supportedSchema || profile.wiki !== wiki || profile.snapshot !== snapshot
       || !["small", "large"].includes(profile.profile)
       || !["automatic", "manual_qualification_override"].includes(profile.selection_mode)
@@ -419,7 +426,7 @@ function workloadProfile(dataDir, wiki, snapshot) {
       || !Number.isSafeInteger(parameters?.source_workers) || parameters.source_workers <= 0
       || !Number.isSafeInteger(parameters?.primary_buckets) || parameters.primary_buckets <= 0
       || !Number.isSafeInteger(parameters?.secondary_buckets) || parameters.secondary_buckets <= 0
-      || JSON.stringify(parameters) !== JSON.stringify(expectedParameters)) {
+      || !expectedParameters.some((expected) => JSON.stringify(parameters) === JSON.stringify(expected))) {
     throw new Error(`invalid workload profile: ${file}`);
   }
   return profile;
