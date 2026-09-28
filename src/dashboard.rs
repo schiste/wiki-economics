@@ -1413,6 +1413,14 @@ impl<'a> VariationColumns<'a> {
 }
 
 fn scan_variation_partition(output_dir: &Path, expected_wiki: &str) -> Result<VariationScope> {
+    scan_variation_partition_with_batch_rows(output_dir, expected_wiki, LARGE_METRIC_BATCH_ROWS)
+}
+
+fn scan_variation_partition_with_batch_rows(
+    output_dir: &Path,
+    expected_wiki: &str,
+    batch_rows: usize,
+) -> Result<VariationScope> {
     let path = output_dir
         .join(expected_wiki)
         .join("page_weekly_edits.parquet");
@@ -1431,8 +1439,7 @@ fn scan_variation_partition(output_dir: &Path, expected_wiki: &str) -> Result<Va
         .map(str::to_string)
         .collect(),
     );
-    let mut reader =
-        storage::SequentialParquetReader::new(&path, columns, LARGE_METRIC_BATCH_ROWS)?;
+    let mut reader = storage::SequentialParquetReader::new(&path, columns, batch_rows)?;
     let rows = reader.rows();
     ensure!(rows > 0, "page_weekly_edits.parquet is empty");
     let mut scope = VariationScope {
@@ -1469,7 +1476,7 @@ fn scan_variation_partition(output_dir: &Path, expected_wiki: &str) -> Result<Va
             let chunk_scope = chunk_scope?;
             scope.merge(&chunk_scope)?;
         }
-        if batch_count == 1 || batch_count % 100 == 0 {
+        if batch_count == 1 || batch_count.is_multiple_of(100) {
             tracing::info!(
                 wiki = expected_wiki,
                 scanned_rows = observed_rows,
@@ -2460,7 +2467,8 @@ mod tests {
             "edits" => vec![7_i64; row_count],
             "wow_change" => vec![5_i64; row_count],
             "wow_rate" => (0..row_count).map(|row| row as f64).collect::<Vec<_>>(),
-        )?;
+        )
+        .expect("variation scan fixture columns have equal lengths");
         write_parquet(&partition, "page_weekly_edits", frame)?;
 
         let scope = scan_variation_partition(output.path(), "nlwiki")?;
@@ -2473,6 +2481,32 @@ mod tests {
             assert_eq!(row.previous_week_edits, (index + 1) as i64);
             assert_eq!(row.wow_rate, Some(index as f64));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn variation_partition_scan_logs_progress_on_the_hundredth_batch() -> Result<()> {
+        let row_count = 100;
+        let output = TestDir::new()?;
+        let partition = output.path().join("nlwiki");
+        fs::create_dir_all(&partition)?;
+        let frame = df!(
+            "wiki" => vec!["nlwiki"; row_count],
+            "page_namespace" => vec![0_i32; row_count],
+            "week_start" => vec!["2026-01-01"; row_count],
+            "page_title" => vec!["Same"; row_count],
+            "previous_week_edits" => vec![1_i64; row_count],
+            "edits" => vec![7_i64; row_count],
+            "wow_change" => vec![5_i64; row_count],
+            "wow_rate" => vec![1.0_f64; row_count],
+        )
+        .expect("variation scan progress fixture columns have equal lengths");
+        write_parquet(&partition, "page_weekly_edits", frame)?;
+
+        let scope = scan_variation_partition_with_batch_rows(output.path(), "nlwiki", 1)?;
+
+        assert_eq!(scope.matching_rows, i64::try_from(row_count)?);
+        assert_eq!(scope.top.len(), 20);
         Ok(())
     }
 
