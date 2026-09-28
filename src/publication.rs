@@ -2216,14 +2216,10 @@ fn promote_wiki_qualification_from_dirs(
         collect_promotion_files(&qualification_dir, &qualification_dir, &mut files)?;
         files.sort();
         copy_candidate_files(&qualification_dir, &staging, &files)?;
-        fs::copy(
-            &qualification_path,
-            staging.join(QUALIFICATION_SOURCE_RECEIPT),
-        )?;
-        fs::copy(
-            &source_generation_manifest,
-            staging.join(QUALIFICATION_SOURCE_GENERATION_MANIFEST),
-        )?;
+        #[rustfmt::skip]
+        fs::copy(&qualification_path, staging.join(QUALIFICATION_SOURCE_RECEIPT))?;
+        let source_generation_target = staging.join(QUALIFICATION_SOURCE_GENERATION_MANIFEST);
+        fs::copy(&source_generation_manifest, source_generation_target)?;
         ensure!(
             storage::sha256_file(&staging.join(QUALIFICATION_SOURCE_RECEIPT))?.1
                 == promotion.receipt_sha256,
@@ -3047,12 +3043,12 @@ fn ensure_qualification_fallback_authorized(
         return validate_promoted_qualification_lineage(candidate_dir, ready);
     }
 
+    #[rustfmt::skip]
     let qualification_dir = wiki_qualification_dir(
         output_dir,
         &ready.wiki,
         &promotion.snapshot,
-        &promotion.run_id,
-    )?;
+        &promotion.run_id)?;
     let qualification_path = qualification_dir.join("qualification.json");
     let (_, observed_receipt_sha256) = storage::sha256_file(&qualification_path)?;
     ensure!(
@@ -3060,14 +3056,14 @@ fn ensure_qualification_fallback_authorized(
         "qualification promotion receipt identity changed"
     );
     let qualification: QualificationReceipt = read_json(&qualification_path)?;
+    #[rustfmt::skip]
     validate_qualification_receipt(
         data_dir,
         &qualification_dir,
         &qualification,
         &ready.wiki,
         &ready.snapshot,
-        &promotion.run_id,
-    )?;
+        &promotion.run_id)?;
     ensure!(
         ready.generating_commit == qualification.generating_commit
             && ready.cutoff_date == qualification.cutoff_date
@@ -3138,7 +3134,7 @@ fn validate_promoted_qualification_lineage(
     );
     let generation: storage::GenerationManifest = read_json(&generation_path)?;
     ensure!(
-        matches!(generation.schema_version, 1 | 2 | 3)
+        matches!(generation.schema_version, 1..=3)
             && generation.wiki == ready.wiki
             && generation.snapshot_version == ready.snapshot
             && !generation.fragments.is_empty()
@@ -11537,17 +11533,10 @@ mod tests {
             fs::remove_file(fixture.data.path().join(&fragment.path))
                 .expect("test should remove production generation fragments");
         }
-        if let Some(compaction_path) = &isolated_generation.compaction_manifest_path {
-            let source_compaction_path = isolated_data.join(compaction_path);
-            let compaction: crate::compaction::CompactionManifest =
-                read_json(&source_compaction_path).expect("compaction manifest should parse");
-            for source in compaction.sources {
-                fs::remove_file(fixture.data.path().join(source.marker_path))
-                    .expect("test should remove production source markers");
-            }
-            fs::remove_file(fixture.data.path().join(compaction_path))
-                .expect("test should remove production compaction manifest");
-        }
+        assert!(
+            isolated_generation.compaction_manifest_path.is_none(),
+            "this fixture exercises a direct generation; compacted generation copying is covered separately"
+        );
         fs::remove_file(
             crate::snapshot_plan::plan_path(fixture.data.path(), "nlwiki", "2026-03")
                 .expect("production source plan path should resolve"),
@@ -11564,10 +11553,7 @@ mod tests {
             "2026-03",
             "ingest",
         );
-        if production_ingest_receipt.is_file() {
-            fs::remove_file(production_ingest_receipt)
-                .expect("test should remove the production ingest receipt");
-        }
+        let _ = fs::remove_file(production_ingest_receipt);
         let ready_path =
             promote_wiki_qualification_with_expected_receipt(QualificationPromotionRequest {
                 data_dir: fixture.data.path(),
@@ -11747,6 +11733,29 @@ mod tests {
         assert_eq!(index.newest_valid_ready.run_id, "promotion-after-release");
 
         let ready: ReadyWikiCandidate = read_json(&ready_path).expect("ready receipt should parse");
+        let candidate_dir = ready_path
+            .parent()
+            .expect("ready candidate should have a directory");
+        ensure_qualification_fallback_authorized(
+            fixture.data.path(),
+            fixture.output.path(),
+            candidate_dir,
+            &ready,
+        )
+        .expect("embedded qualification lineage should authenticate directly");
+        let mut legacy_promotion = ready.clone();
+        legacy_promotion
+            .promoted_from_qualification
+            .as_mut()
+            .expect("promotion identity should exist")
+            .source_generation_manifest_sha256 = None;
+        ensure_qualification_fallback_authorized(
+            fixture.data.path(),
+            fixture.output.path(),
+            candidate_dir,
+            &legacy_promotion,
+        )
+        .expect("legacy production qualification evidence should authenticate");
         let mut unsafe_promotion = ready.clone();
         unsafe_promotion
             .promoted_from_qualification
@@ -11774,7 +11783,7 @@ mod tests {
             .expect("invalid qualification fixture should persist");
         let (_, invalid_qualification_sha256) = storage::sha256_file(&promoted_qualification_path)
             .expect("invalid qualification should hash");
-        let mut invalid_ready = ready;
+        let mut invalid_ready = ready.clone();
         invalid_ready
             .promoted_from_qualification
             .as_mut()
@@ -11789,6 +11798,21 @@ mod tests {
             &invalid_ready,
         )
         .expect_err("structurally invalid qualification evidence must fail closed");
+
+        let mut incomplete_ready = ready.clone();
+        incomplete_ready.artifacts[0].path = "nlwiki/missing.parquet".to_string();
+        let fallback_error = resilient_ready_candidate_reference(
+            fixture.data.path(),
+            fixture.output.path(),
+            candidate_dir,
+            &incomplete_ready,
+        )
+        .expect_err("failed candidate and qualification fallbacks must retain their context");
+        assert!(
+            format!("{fallback_error:#}")
+                .contains("qualification-backed candidate authentication failed"),
+            "unexpected fallback error: {fallback_error:#}"
+        );
 
         fs::remove_file(ready_index_path(fixture.output.path(), "nlwiki"))
             .expect("ready index should be removable");

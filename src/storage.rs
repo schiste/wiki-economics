@@ -835,11 +835,11 @@ pub(crate) fn materialize_generation_snapshot(
         "generation materialization target root is not a regular directory"
     );
 
+    #[rustfmt::skip]
     let (_, plan_path) = crate::snapshot_plan::SnapshotPlan::load_or_resolve(
         source_data_dir,
         wiki,
-        snapshot_version,
-    )?;
+        snapshot_version)?;
     let (_, plan_sha256) = sha256_file(&plan_path)?;
     ensure!(
         plan_sha256 == manifest.source_plan_sha256,
@@ -848,13 +848,13 @@ pub(crate) fn materialize_generation_snapshot(
     let plan_relative = plan_path
         .strip_prefix(source_data_dir)
         .context("snapshot plan is outside its source data root")?;
+    #[rustfmt::skip]
     copy_verified_generation_file(
         source_data_dir,
         target_data_dir,
         &path_to_string(plan_relative)?,
         &manifest.source_plan_sha256,
-        None,
-    )?;
+        None)?;
 
     for fragment in &manifest.fragments {
         copy_verified_generation_file(
@@ -866,44 +866,41 @@ pub(crate) fn materialize_generation_snapshot(
         )?;
     }
 
-    match (
-        manifest.compaction_manifest_path.as_deref(),
-        manifest.compaction_manifest_sha256.as_deref(),
-    ) {
-        (Some(path), Some(expected_sha256)) => {
-            let compaction_path = checked_stored_path(source_data_dir, path)?;
-            let (_, observed_sha256) = sha256_file(&compaction_path)?;
-            ensure!(
-                observed_sha256 == expected_sha256,
-                "source compaction manifest identity changed before materialization"
-            );
-            let compaction: crate::compaction::CompactionManifest =
-                serde_json::from_slice(&fs::read(&compaction_path)?)?;
-            crate::compaction::validate_structure(
-                source_data_dir,
-                wiki,
-                snapshot_version,
-                &compaction,
-            )?;
+    if let Some(path) = manifest.compaction_manifest_path.as_deref() {
+        let expected_sha256 = manifest
+            .compaction_manifest_sha256
+            .as_deref()
+            .context("validated generation has no compaction manifest digest")?;
+        let compaction_path = checked_stored_path(source_data_dir, path)?;
+        let (_, observed_sha256) = sha256_file(&compaction_path)?;
+        ensure!(
+            observed_sha256 == expected_sha256,
+            "source compaction manifest identity changed before materialization"
+        );
+        let compaction: crate::compaction::CompactionManifest =
+            serde_json::from_slice(&fs::read(&compaction_path)?)?;
+        #[rustfmt::skip]
+        crate::compaction::validate_structure(
+            source_data_dir,
+            wiki,
+            snapshot_version,
+            &compaction)?;
+        #[rustfmt::skip]
+        copy_verified_generation_file(
+            source_data_dir,
+            target_data_dir,
+            path,
+            expected_sha256,
+            None)?;
+        for source in &compaction.sources {
+            #[rustfmt::skip]
             copy_verified_generation_file(
                 source_data_dir,
                 target_data_dir,
-                path,
-                expected_sha256,
-                None,
-            )?;
-            for source in &compaction.sources {
-                copy_verified_generation_file(
-                    source_data_dir,
-                    target_data_dir,
-                    &source.marker_path,
-                    &source.marker_sha256,
-                    None,
-                )?;
-            }
+                &source.marker_path,
+                &source.marker_sha256,
+                None)?;
         }
-        (None, None) => {}
-        _ => anyhow::bail!("generation compaction manifest identity is incomplete"),
     }
 
     let ingest_receipt = crate::fingerprint::data_stage_receipt_path(
@@ -920,13 +917,13 @@ pub(crate) fn materialize_generation_snapshot(
         let target_receipt = target_data_dir.join(&receipt_relative);
         if !target_receipt.exists() {
             let (_, receipt_sha256) = sha256_file(&ingest_receipt)?;
+            #[rustfmt::skip]
             copy_verified_generation_file(
                 source_data_dir,
                 target_data_dir,
                 &receipt_relative,
                 &receipt_sha256,
-                None,
-            )?;
+                None)?;
         }
     }
 
@@ -935,13 +932,13 @@ pub(crate) fn materialize_generation_snapshot(
     let manifest_relative = manifest_path
         .strip_prefix(source_data_dir)
         .context("generation manifest is outside its source data root")?;
+    #[rustfmt::skip]
     copy_verified_generation_file(
         source_data_dir,
         target_data_dir,
         &path_to_string(manifest_relative)?,
         &manifest_sha256,
-        None,
-    )?;
+        None)?;
     ensure_generation_manifest(target_data_dir, wiki, snapshot_version)
         .context("materialized production generation failed validation")?;
     Ok(())
@@ -987,9 +984,6 @@ fn copy_verified_generation_file(
     let parent_relative = relative_path.parent().unwrap_or_else(|| Path::new(""));
     let mut target_parent = target_data_dir.to_path_buf();
     for component in parent_relative.components() {
-        let Component::Normal(component) = component else {
-            anyhow::bail!("generation materialization parent path is unsafe")
-        };
         target_parent.push(component);
         match fs::symlink_metadata(&target_parent) {
             Ok(metadata) => ensure!(
@@ -2934,6 +2928,7 @@ mod tests {
         let source_manifest: GenerationManifest =
             serde_json::from_slice(&fs::read(&source_manifest_path)?)?;
 
+        materialize_generation_snapshot(source.path(), source.path(), wiki, snapshot)?;
         materialize_generation_snapshot(source.path(), target.path(), wiki, snapshot)?;
         materialize_generation_snapshot(source.path(), target.path(), wiki, snapshot)?;
         let target_manifest = ensure_generation_manifest(target.path(), wiki, snapshot)?;
@@ -2954,6 +2949,148 @@ mod tests {
                 .to_string()
                 .contains("differs from the validated source")
         );
+
+        let linked_target = target.path().join("linked-target");
+        std::os::unix::fs::symlink(source.path(), &linked_target)?;
+        assert!(
+            materialize_generation_snapshot(source.path(), &linked_target, wiki, snapshot)
+                .expect_err("symlinked target root must be rejected")
+                .to_string()
+                .contains("target root is not a regular directory")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn verified_generation_file_copy_rejects_unsafe_inputs_and_cleans_failed_copies() -> Result<()>
+    {
+        let source = TestDir::new()?;
+        let target = TestDir::new()?;
+        let source_file = source.path().join("source.bin");
+        fs::write(&source_file, b"verified generation bytes")?;
+        let (bytes, sha256) = sha256_file(&source_file)?;
+        let nested_source = source.path().join("nested/copy.bin");
+        nested_source.parent().map(fs::create_dir_all).transpose()?;
+        fs::write(&nested_source, b"verified generation bytes")?;
+
+        assert!(
+            copy_verified_generation_file(source.path(), target.path(), "../escape", &sha256, None)
+                .is_err()
+        );
+        assert!(
+            copy_verified_generation_file(
+                source.path(),
+                target.path(),
+                "bad-hash",
+                "not-a-digest",
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            copy_verified_generation_file(
+                source.path(),
+                target.path(),
+                "wrong-size",
+                &sha256,
+                Some(bytes + 1)
+            )
+            .is_err()
+        );
+
+        let symlink_source = source.path().join("source-link");
+        std::os::unix::fs::symlink(&source_file, &symlink_source)?;
+        let symlink_hash = sha256_file(&source_file)?.1;
+        assert!(
+            copy_verified_generation_file(
+                source.path(),
+                target.path(),
+                "source-link",
+                &symlink_hash,
+                None
+            )
+            .is_err()
+        );
+
+        let wrong_hash = "0".repeat(64);
+        let copy_error = copy_verified_generation_file(
+            source.path(),
+            target.path(),
+            "nested/copy.bin",
+            &wrong_hash,
+            None,
+        )
+        .expect_err("wrong content hash must fail its verified copy");
+        assert!(
+            format!("{copy_error:#}").contains("copy does not match"),
+            "unexpected failed-copy error: {copy_error:#}"
+        );
+        assert!(!target.path().join("nested/copy.bin").exists());
+        fs::write(target.path().join("nested/preserved.bin"), b"preserved")?;
+        assert!(
+            fs::read_dir(target.path().join("nested"))
+                .expect("failed copy should leave its destination parent directory")
+                .all(|entry| {
+                    entry.is_ok_and(|entry| {
+                        !entry.file_name().to_string_lossy().ends_with(".copy.tmp")
+                    })
+                })
+        );
+
+        let linked_file = target.path().join("linked-file");
+        #[rustfmt::skip]
+        fs::write(source.path().join("linked-file"), b"verified generation bytes")?;
+        std::os::unix::fs::symlink(&source_file, &linked_file)?;
+        assert!(
+            copy_verified_generation_file(
+                source.path(),
+                target.path(),
+                "linked-file",
+                &sha256,
+                None
+            )
+            .is_err()
+        );
+
+        let denied_parent = target.path().join("denied-parent");
+        fs::create_dir(&denied_parent)?;
+        let denied_parent_source = source.path().join("denied-parent/child/file.bin");
+        denied_parent_source
+            .parent()
+            .map(fs::create_dir_all)
+            .transpose()?;
+        fs::write(&denied_parent_source, b"verified generation bytes")?;
+        fs::set_permissions(&denied_parent, fs::Permissions::from_mode(0o000))?;
+        let nested_error = copy_verified_generation_file(
+            source.path(),
+            target.path(),
+            "denied-parent/child/file.bin",
+            &sha256,
+            None,
+        )
+        .expect_err("unreadable generation parent must fail closed");
+        fs::set_permissions(&denied_parent, fs::Permissions::from_mode(0o700))?;
+        assert!(nested_error.to_string().contains("Permission denied"));
+
+        let denied_target = target.path().join("denied-target");
+        fs::create_dir(&denied_target)?;
+        let denied_target_source = source.path().join("denied-target/file.bin");
+        denied_target_source
+            .parent()
+            .map(fs::create_dir_all)
+            .transpose()?;
+        fs::write(&denied_target_source, b"verified generation bytes")?;
+        fs::set_permissions(&denied_target, fs::Permissions::from_mode(0o000))?;
+        let target_error = copy_verified_generation_file(
+            source.path(),
+            target.path(),
+            "denied-target/file.bin",
+            &sha256,
+            None,
+        )
+        .expect_err("unreadable generation target must fail closed");
+        fs::set_permissions(&denied_target, fs::Permissions::from_mode(0o700))?;
+        assert!(target_error.to_string().contains("Permission denied"));
         Ok(())
     }
 

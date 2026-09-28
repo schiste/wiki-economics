@@ -2468,6 +2468,59 @@ mod tests {
     }
 
     #[test]
+    fn materialize_compacted_generation_copies_markers_and_ingest_receipt() -> Result<()> {
+        let source = TestDir::new()?;
+        let target = TestDir::new()?;
+        let wiki = "testwiki";
+        let version = "2026-08";
+        let source_manifest = prepare_compaction_fixture(source.path(), wiki, version)?;
+        let compaction =
+            crate::compaction::compact_generation(source.path(), wiki, version, &source_manifest)?;
+        #[rustfmt::skip]
+        storage::publish_compacted_generation_manifest(
+            source.path(),
+            wiki,
+            version,
+            &source_manifest,
+            &compaction)?;
+
+        let roots = IngestRoots::snapshot(source.path(), wiki, version)?;
+        let receipt_path =
+            fingerprint::data_stage_receipt_path(source.path(), wiki, version, "ingest");
+        #[rustfmt::skip]
+        fingerprint::record(
+            &receipt_path,
+            StageSpec {
+                stage: "ingest",
+                scope: wiki,
+                selected_snapshot: Some(version),
+                algorithm_version: INGEST_ALGORITHM_VERSION,
+            },
+            &snapshot_marker_inputs(source.path(), wiki, version)?,
+            &ingest_stage_outputs(source.path(), wiki, &roots)?)?;
+
+        storage::materialize_generation_snapshot(source.path(), target.path(), wiki, version)?;
+        storage::materialize_generation_snapshot(source.path(), target.path(), wiki, version)?;
+
+        let source_generation = storage::ensure_generation_manifest(source.path(), wiki, version)?;
+        let target_generation = storage::ensure_generation_manifest(target.path(), wiki, version)?;
+        assert_eq!(target_generation, source_generation);
+        let target_compaction_path =
+            crate::compaction::manifest_path(target.path(), wiki, version)?;
+        let target_compaction: crate::compaction::CompactionManifest =
+            serde_json::from_slice(&fs::read(target_compaction_path)?)?;
+        assert_eq!(target_compaction, compaction);
+        for source in &compaction.sources {
+            assert!(target.path().join(&source.marker_path).is_file());
+        }
+        let source_receipt = fs::read(receipt_path)?;
+        let target_receipt =
+            fingerprint::data_stage_receipt_path(target.path(), wiki, version, "ingest");
+        assert_eq!(fs::read(target_receipt)?, source_receipt);
+        Ok(())
+    }
+
+    #[test]
     fn compacted_generation_manifest_commit_failure_cleans_its_temporary() -> Result<()> {
         let data_dir = TestDir::new()?;
         let wiki = "testwiki";
