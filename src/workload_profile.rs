@@ -660,6 +660,24 @@ mod tests {
     }
 
     #[test]
+    fn qualified_profile_propagates_non_missing_path_errors() -> Result<()> {
+        let root = TestDir::new()?;
+        fs::write(root.path().join("snapshots"), b"not a directory")?;
+        let profile = profile(
+            "testwiki",
+            WorkloadProfileName::Small,
+            ProfileSelectionMode::Automatic,
+        );
+        let error = persist_qualified(root.path(), &profile)
+            .expect_err("a non-directory snapshot root should fail profile persistence");
+        let io_error = error
+            .downcast_ref::<std::io::Error>()
+            .expect("the filesystem error should be preserved");
+        assert_eq!(io_error.kind(), std::io::ErrorKind::NotADirectory);
+        Ok(())
+    }
+
+    #[test]
     fn unsupported_profile_schema_has_no_parameter_set() {
         let parameters = WorkloadProfileName::Large.parameters();
         assert_eq!(
