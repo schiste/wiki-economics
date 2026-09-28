@@ -1587,10 +1587,8 @@ pub(crate) fn migrate_retained_candidate(
             #[rustfmt::skip]
             crate::retained_monthly_migration::migrate_candidate(wiki, snapshot, &source_ready.run_id, &source_candidate, staged.path())?;
         }
-        if activity_tier_receipt_migrated {
-            #[rustfmt::skip]
-            crate::retained_activity_migration::stage_activity_tier_receipts(wiki, snapshot, &source_ready.run_id, &source_candidate, staged.path())?;
-        }
+        #[rustfmt::skip]
+        if activity_tier_receipt_migrated { crate::retained_activity_migration::stage_activity_tier_receipts(wiki, snapshot, &source_ready.run_id, &source_candidate, staged.path())?; }
         Some(staged)
     } else {
         None
@@ -1615,33 +1613,21 @@ pub(crate) fn migrate_retained_candidate(
         #[rustfmt::skip]
         crate::retained_monthly_migration::migrate_candidate(wiki, snapshot, &source_ready.run_id, &source_candidate, &target_candidate)?;
     } else {
-        if lifecycle_receipt_migrated {
-            #[rustfmt::skip]
-            crate::compute::migrate_retained_candidate_families(wiki, snapshot, &source_ready.run_id, data_dir, migration_source_candidate, &target_candidate)?;
-            if activity_tier_receipt_migrated {
-                #[rustfmt::skip]
-                crate::retained_activity_migration::rebind_lifecycle_receipts(wiki, snapshot, &source_ready.run_id, &source_candidate, &target_candidate)?;
-            }
-        }
+        #[rustfmt::skip]
+        if lifecycle_receipt_migrated { crate::compute::migrate_retained_candidate_families(wiki, snapshot, &source_ready.run_id, data_dir, migration_source_candidate, &target_candidate)?; }
+        #[rustfmt::skip]
+        if lifecycle_receipt_migrated && activity_tier_receipt_migrated { crate::retained_activity_migration::rebind_lifecycle_receipts(wiki, snapshot, &source_ready.run_id, &source_candidate, &target_candidate)?; }
     }
-    let patrol_receipt_migrated = crate::retained_patrol_migration::migrate_if_required(
-        wiki,
-        snapshot,
-        &source_ready.run_id,
-        &source_candidate,
-        &target_candidate,
-    )?;
+    #[rustfmt::skip]
+    let patrol_receipt_migrated = crate::retained_patrol_migration::migrate_if_required(wiki, snapshot, &source_ready.run_id, &source_candidate, &target_candidate)?;
     ensure!(
         patrol_receipt_migrated == patrol_receipt_migration_required,
         "retained candidate {wiki} patrol migration state changed during staging"
     );
+    #[rustfmt::skip]
+    let current_core_receipts = crate::compute::retained_candidate_receipts_current_without_inputs(wiki, snapshot, &target_candidate, source_ready.workload_profile.as_ref())?;
     ensure!(
-        crate::compute::retained_candidate_receipts_current_without_inputs(
-            wiki,
-            snapshot,
-            &target_candidate,
-            source_ready.workload_profile.as_ref(),
-        )?,
+        current_core_receipts,
         "retained candidate {wiki} does not have a complete current core receipt set"
     );
     let patrol_output = crate::fingerprint::TrackedPath::new(
@@ -1851,11 +1837,8 @@ fn validate_retained_lifecycle_projection(
         );
     }
     if migrated_families.contains("lifecycle") {
-        crate::compute::validate_retained_lifecycle_migration(
-            &ready.wiki,
-            &source_dir,
-            candidate_dir,
-        )?;
+        #[rustfmt::skip]
+        crate::compute::validate_retained_lifecycle_migration(&ready.wiki, &source_dir, candidate_dir)?;
         changed_artifacts.insert(format!("{}/labor_churn.parquet", ready.wiki));
     }
     if migrated_families.contains("activity_tiers") {
@@ -1882,13 +1865,10 @@ fn validate_retained_lifecycle_projection(
             artifact.path
         );
     }
+    #[rustfmt::skip]
+    let current_core_receipts = crate::compute::retained_candidate_receipts_current_without_inputs(&ready.wiki, &ready.snapshot, candidate_dir, ready.workload_profile.as_ref())?;
     ensure!(
-        crate::compute::retained_candidate_receipts_current_without_inputs(
-            &ready.wiki,
-            &ready.snapshot,
-            candidate_dir,
-            ready.workload_profile.as_ref(),
-        )?,
+        current_core_receipts,
         "retained candidate {} migration has an outdated core family receipt",
         ready.wiki
     );
@@ -7186,7 +7166,7 @@ mod tests {
             assert_eq!(
                 observed_families,
                 expected_families
-                    .into_iter()
+                    .iter()
                     .map(|family| (*family).to_string())
                     .collect::<BTreeSet<_>>()
             );
@@ -10261,14 +10241,8 @@ mod tests {
             .expect("retention should authorize and purge the exact migrated source");
         }
 
-        let migrated_ready_path = migrate_retained_candidate(
-            fixture.data.path(),
-            fixture.output.path(),
-            &fixture.lifecycle_path,
-            "nlwiki",
-            "2026-03",
-            "retained-family-composition-migrated",
-        )?;
+        #[rustfmt::skip]
+        let migrated_ready_path = migrate_retained_candidate(fixture.data.path(), fixture.output.path(), &fixture.lifecycle_path, "nlwiki", "2026-03", "retained-family-composition-migrated")?;
         let migrated_candidate = migrated_ready_path
             .parent()
             .context("composed migration ready receipt should have a candidate directory")?;
