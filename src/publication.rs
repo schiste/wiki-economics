@@ -5341,6 +5341,17 @@ fn rollback_selection_files(
         if !selected_is_live && !backup_exists && previous_is_live && snapshot_is_restored {
             continue;
         }
+        // An initial publication has no prior candidate, snapshot, or backup
+        // to restore. If its active pointer is already absent, rollback is
+        // complete even when recovery is replaying the selected journal.
+        let initial_publication_already_rolled_back = entry.previous_candidate_relative.is_none()
+            && entry.previous_snapshot.is_none()
+            && !active.exists()
+            && !active.is_symlink()
+            && !backup_exists;
+        if initial_publication_already_rolled_back {
+            continue;
+        }
         ensure!(
             selected_is_live || backup_exists || previous_is_live,
             "publication rollback cannot prove a selected, backup, or previously restored target for {}",
@@ -13089,6 +13100,16 @@ mod tests {
         entry.previous_candidate_relative = None;
         entry.previous_snapshot = None;
         rollback_selection_files(fixture.data.path(), fixture.output.path(), &selection)?;
+        assert_eq!(
+            storage::current_snapshot_version(fixture.data.path(), "nlwiki")?,
+            None
+        );
+        rollback_selection_files(fixture.data.path(), fixture.output.path(), &selection)?;
+        assert_eq!(
+            active_candidate_relative(fixture.output.path(), "nlwiki")?,
+            None,
+            "replaying an already completed initial-publication rollback should be a no-op"
+        );
         assert_eq!(
             storage::current_snapshot_version(fixture.data.path(), "nlwiki")?,
             None
