@@ -1588,7 +1588,7 @@ pub(crate) fn migrate_retained_candidate(
             crate::retained_monthly_migration::migrate_candidate(wiki, snapshot, &source_ready.run_id, &source_candidate, staged.path())?;
         }
         #[rustfmt::skip]
-        if activity_tier_receipt_migrated { crate::retained_activity_migration::stage_activity_tier_receipts(wiki, snapshot, &source_ready.run_id, &source_candidate, staged.path())?; }
+        let _ = activity_tier_receipt_migrated.then(|| crate::retained_activity_migration::stage_activity_tier_receipts(wiki, snapshot, &source_ready.run_id, &source_candidate, staged.path())).transpose()?;
         Some(staged)
     } else {
         None
@@ -1614,9 +1614,9 @@ pub(crate) fn migrate_retained_candidate(
         crate::retained_monthly_migration::migrate_candidate(wiki, snapshot, &source_ready.run_id, &source_candidate, &target_candidate)?;
     } else {
         #[rustfmt::skip]
-        if lifecycle_receipt_migrated { crate::compute::migrate_retained_candidate_families(wiki, snapshot, &source_ready.run_id, data_dir, migration_source_candidate, &target_candidate)?; }
+        let _ = lifecycle_receipt_migrated.then(|| crate::compute::migrate_retained_candidate_families(wiki, snapshot, &source_ready.run_id, data_dir, migration_source_candidate, &target_candidate)).transpose()?;
         #[rustfmt::skip]
-        if lifecycle_receipt_migrated && activity_tier_receipt_migrated { crate::retained_activity_migration::rebind_lifecycle_receipts(wiki, snapshot, &source_ready.run_id, &source_candidate, &target_candidate)?; }
+        let _ = (lifecycle_receipt_migrated && activity_tier_receipt_migrated).then(|| crate::retained_activity_migration::rebind_lifecycle_receipts(wiki, snapshot, &source_ready.run_id, &source_candidate, &target_candidate)).transpose()?;
     }
     #[rustfmt::skip]
     let patrol_receipt_migrated = crate::retained_patrol_migration::migrate_if_required(wiki, snapshot, &source_ready.run_id, &source_candidate, &target_candidate)?;
