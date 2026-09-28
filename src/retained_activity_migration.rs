@@ -22,29 +22,13 @@ pub(crate) fn lifecycle_migration_required(
 ) -> Result<bool> {
     let receipt_path = family_receipt_path(source_candidate_dir, wiki, MetricFamily::Lifecycle);
     let outputs = family_outputs(source_candidate_dir, wiki, MetricFamily::Lifecycle);
-    let current = fingerprint::retained_outputs_reusable(
-        &receipt_path,
-        family_spec(
-            wiki,
-            snapshot,
-            MetricFamily::Lifecycle,
-            crate::compute::lifecycle::ALGORITHM_VERSION,
-        ),
-        &outputs,
-    )?;
+    #[rustfmt::skip]
+    let current = fingerprint::retained_outputs_reusable(&receipt_path, family_spec(wiki, snapshot, MetricFamily::Lifecycle, crate::compute::lifecycle::ALGORITHM_VERSION), &outputs)?;
     if current {
         return Ok(false);
     }
-    let legacy = fingerprint::retained_outputs_reusable(
-        &receipt_path,
-        family_spec(
-            wiki,
-            snapshot,
-            MetricFamily::Lifecycle,
-            LEGACY_LIFECYCLE_ALGORITHM,
-        ),
-        &outputs,
-    )?;
+    #[rustfmt::skip]
+    let legacy = fingerprint::retained_outputs_reusable(&receipt_path, family_spec(wiki, snapshot, MetricFamily::Lifecycle, LEGACY_LIFECYCLE_ALGORITHM), &outputs)?;
     ensure!(
         legacy,
         "retained candidate {wiki} has an outdated or invalid lifecycle family"
