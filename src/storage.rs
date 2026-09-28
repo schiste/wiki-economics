@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,6 +28,7 @@ const MARKER_SCHEMA_VERSION: u64 = 2;
 const DIRECT_METRIC_INPUT_MANIFEST_SCHEMA_VERSION: u64 = 2;
 const COMPACTED_METRIC_INPUT_MANIFEST_SCHEMA_VERSION: u64 = 3;
 static GENERATION_MANIFEST_TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
+static GENERATION_COPY_TEMP_NONCE: AtomicU64 = AtomicU64::new(0);
 static GENERATION_VALIDATION_CACHE: OnceLock<
     Mutex<BTreeMap<GenerationValidationKey, GenerationManifest>>,
 > = OnceLock::new();
@@ -812,6 +813,257 @@ pub(crate) fn ensure_generation_manifest(
         write_generation_manifest(data_dir, wiki, snapshot_version)?;
     }
     read_generation_manifest(data_dir, wiki, snapshot_version)
+}
+
+/// Copy one validated snapshot generation into its production data root.
+/// Files are allowlisted by the immutable generation manifest and copied
+/// atomically, with their hashes checked during the copy. Existing files are
+/// reused only when they match the same manifest.
+pub(crate) fn materialize_generation_snapshot(
+    source_data_dir: &Path,
+    target_data_dir: &Path,
+    wiki: &str,
+    snapshot_version: &str,
+) -> Result<()> {
+    let manifest = ensure_generation_manifest(source_data_dir, wiki, snapshot_version)?;
+    if source_data_dir == target_data_dir {
+        return Ok(());
+    }
+    fs::create_dir_all(target_data_dir)?;
+    ensure!(
+        fs::symlink_metadata(target_data_dir)?.file_type().is_dir(),
+        "generation materialization target root is not a regular directory"
+    );
+
+    let (_, plan_path) = crate::snapshot_plan::SnapshotPlan::load_or_resolve(
+        source_data_dir,
+        wiki,
+        snapshot_version,
+    )?;
+    let (_, plan_sha256) = sha256_file(&plan_path)?;
+    ensure!(
+        plan_sha256 == manifest.source_plan_sha256,
+        "source generation plan identity changed before materialization"
+    );
+    let plan_relative = plan_path
+        .strip_prefix(source_data_dir)
+        .context("snapshot plan is outside its source data root")?;
+    copy_verified_generation_file(
+        source_data_dir,
+        target_data_dir,
+        &path_to_string(plan_relative)?,
+        &manifest.source_plan_sha256,
+        None,
+    )?;
+
+    for fragment in &manifest.fragments {
+        copy_verified_generation_file(
+            source_data_dir,
+            target_data_dir,
+            &fragment.path,
+            &fragment.sha256,
+            Some(fragment.bytes),
+        )?;
+    }
+
+    match (
+        manifest.compaction_manifest_path.as_deref(),
+        manifest.compaction_manifest_sha256.as_deref(),
+    ) {
+        (Some(path), Some(expected_sha256)) => {
+            let compaction_path = checked_stored_path(source_data_dir, path)?;
+            let (_, observed_sha256) = sha256_file(&compaction_path)?;
+            ensure!(
+                observed_sha256 == expected_sha256,
+                "source compaction manifest identity changed before materialization"
+            );
+            let compaction: crate::compaction::CompactionManifest =
+                serde_json::from_slice(&fs::read(&compaction_path)?)?;
+            crate::compaction::validate_structure(
+                source_data_dir,
+                wiki,
+                snapshot_version,
+                &compaction,
+            )?;
+            copy_verified_generation_file(
+                source_data_dir,
+                target_data_dir,
+                path,
+                expected_sha256,
+                None,
+            )?;
+            for source in &compaction.sources {
+                copy_verified_generation_file(
+                    source_data_dir,
+                    target_data_dir,
+                    &source.marker_path,
+                    &source.marker_sha256,
+                    None,
+                )?;
+            }
+        }
+        (None, None) => {}
+        _ => anyhow::bail!("generation compaction manifest identity is incomplete"),
+    }
+
+    let ingest_receipt = crate::fingerprint::data_stage_receipt_path(
+        source_data_dir,
+        wiki,
+        snapshot_version,
+        "ingest",
+    );
+    if ingest_receipt.is_file() {
+        let receipt_relative = ingest_receipt
+            .strip_prefix(source_data_dir)
+            .context("ingest receipt is outside its source data root")?;
+        let receipt_relative = path_to_string(receipt_relative)?;
+        let target_receipt = target_data_dir.join(&receipt_relative);
+        if !target_receipt.exists() {
+            let (_, receipt_sha256) = sha256_file(&ingest_receipt)?;
+            copy_verified_generation_file(
+                source_data_dir,
+                target_data_dir,
+                &receipt_relative,
+                &receipt_sha256,
+                None,
+            )?;
+        }
+    }
+
+    let manifest_path = generation_manifest_path(source_data_dir, wiki, snapshot_version)?;
+    let (_, manifest_sha256) = sha256_file(&manifest_path)?;
+    let manifest_relative = manifest_path
+        .strip_prefix(source_data_dir)
+        .context("generation manifest is outside its source data root")?;
+    copy_verified_generation_file(
+        source_data_dir,
+        target_data_dir,
+        &path_to_string(manifest_relative)?,
+        &manifest_sha256,
+        None,
+    )?;
+    ensure_generation_manifest(target_data_dir, wiki, snapshot_version)
+        .context("materialized production generation failed validation")?;
+    Ok(())
+}
+
+fn copy_verified_generation_file(
+    source_data_dir: &Path,
+    target_data_dir: &Path,
+    relative: &str,
+    expected_sha256: &str,
+    expected_bytes: Option<u64>,
+) -> Result<()> {
+    let relative_path = Path::new(relative);
+    ensure!(
+        !relative_path.as_os_str().is_empty()
+            && relative_path
+                .components()
+                .all(|component| matches!(component, Component::Normal(_))),
+        "generation materialization contains an unsafe relative path"
+    );
+    ensure!(
+        expected_sha256.len() == 64 && expected_sha256.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "generation materialization contains an invalid SHA-256"
+    );
+    let source_path = checked_stored_path(source_data_dir, relative)?;
+    let target_path = target_data_dir.join(relative_path);
+    let source_metadata = fs::symlink_metadata(&source_path).with_context(|| {
+        format!(
+            "generation materialization source is unavailable: {}",
+            source_path.display()
+        )
+    })?;
+    ensure!(
+        source_metadata.file_type().is_file(),
+        "generation materialization source is not a regular file"
+    );
+    let source_bytes = expected_bytes.unwrap_or(source_metadata.len());
+    ensure!(
+        source_metadata.len() == source_bytes,
+        "generation materialization source size changed"
+    );
+
+    let parent_relative = relative_path.parent().unwrap_or_else(|| Path::new(""));
+    let mut target_parent = target_data_dir.to_path_buf();
+    for component in parent_relative.components() {
+        let Component::Normal(component) = component else {
+            anyhow::bail!("generation materialization parent path is unsafe")
+        };
+        target_parent.push(component);
+        match fs::symlink_metadata(&target_parent) {
+            Ok(metadata) => ensure!(
+                metadata.file_type().is_dir(),
+                "generation materialization parent is not a regular directory"
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir(&target_parent)?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    match fs::symlink_metadata(&target_path) {
+        Ok(metadata) => {
+            ensure!(
+                metadata.file_type().is_file(),
+                "generation materialization target is not a regular file"
+            );
+            let (bytes, sha256) = sha256_file(&target_path)?;
+            ensure!(
+                bytes == source_bytes && sha256 == expected_sha256,
+                "existing production generation file differs from the validated source"
+            );
+            return Ok(());
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let file_name = relative_path
+        .file_name()
+        .context("generation materialization path has no filename")?;
+    let temporary = target_parent.join(format!(
+        ".{}.{}.{}.copy.tmp",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        GENERATION_COPY_TEMP_NONCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| -> Result<()> {
+        let mut source = File::open(&source_path)?;
+        prepare_sequential_read(&source);
+        let mut target = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0_u8; 8 * 1024 * 1024];
+        let mut bytes = 0_u64;
+        loop {
+            let read = source.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            target.write_all(&buffer[..read])?;
+            hasher.update(&buffer[..read]);
+            discard_file_cache(&source, bytes, u64::try_from(read)?);
+            bytes = bytes
+                .checked_add(u64::try_from(read)?)
+                .context("generation materialization byte count overflow")?;
+        }
+        target.flush()?;
+        target.sync_all()?;
+        ensure!(
+            bytes == source_bytes && hex::encode(hasher.finalize()) == expected_sha256,
+            "generation materialization copy does not match its validated identity"
+        );
+        drop(target);
+        fs::rename(&temporary, &target_path)?;
+        File::open(&target_parent)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 pub(crate) fn active_fragment_files(
@@ -2665,6 +2917,43 @@ mod tests {
 
         fs::write(&manifest_path, b"{truncated")?;
         assert!(active_fragment_files(data.path(), wiki, GenerationLayer::Analytical).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn materialize_generation_snapshot_copies_and_reuses_only_validated_files() -> Result<()> {
+        let source = TestDir::new()?;
+        let target = TestDir::new()?;
+        let wiki = "testwiki";
+        let snapshot = "2026-08";
+        let (plan, _) =
+            crate::snapshot_plan::SnapshotPlan::load_or_resolve(source.path(), wiki, snapshot)?;
+        let analytical = snapshot_analytical_wiki_dir(source.path(), wiki, snapshot)?;
+        write_test_marker_in(source.path(), &analytical, &plan.sources[0].source_id)?;
+        let source_manifest_path = write_generation_manifest(source.path(), wiki, snapshot)?;
+        let source_manifest: GenerationManifest =
+            serde_json::from_slice(&fs::read(&source_manifest_path)?)?;
+
+        materialize_generation_snapshot(source.path(), target.path(), wiki, snapshot)?;
+        materialize_generation_snapshot(source.path(), target.path(), wiki, snapshot)?;
+        let target_manifest = ensure_generation_manifest(target.path(), wiki, snapshot)?;
+        assert_eq!(target_manifest, source_manifest);
+        assert_eq!(current_snapshot_version(target.path(), wiki)?, None);
+        publish_current_snapshot(target.path(), wiki, snapshot)?;
+        assert_eq!(
+            current_snapshot_version(target.path(), wiki)?.as_deref(),
+            Some(snapshot)
+        );
+
+        let target_fragment = target.path().join(&source_manifest.fragments[0].path);
+        fs::write(&target_fragment, b"changed after materialization")?;
+        let error = materialize_generation_snapshot(source.path(), target.path(), wiki, snapshot)
+            .expect_err("existing production fragment must match its source identity");
+        assert!(
+            error
+                .to_string()
+                .contains("differs from the validated source")
+        );
         Ok(())
     }
 

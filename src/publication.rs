@@ -17,6 +17,9 @@ const CANDIDATE_FILE: &str = ".publication-candidate.json";
 const READY_INDEX_DIR: &str = "_ready-index";
 const PUBLICATION_BACKUP_DIR: &str = "publication-backup";
 const PUBLICATION_BACKUP_MANIFEST: &str = "backup.json";
+const QUALIFICATION_SOURCE_RECEIPT: &str = "qualification-source.json";
+const QUALIFICATION_SOURCE_GENERATION_MANIFEST: &str =
+    "qualification-source-generation-manifest.json";
 pub(crate) const READY_INDEX_SCHEMA_VERSION: u8 = 2;
 const PUBLICATION_CONTRACT_VERSION: &str =
     "ready-candidate-publication-v3-incremental-receipt-composition";
@@ -133,6 +136,8 @@ struct QualificationPromotion {
     snapshot: String,
     run_id: String,
     receipt_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_generation_manifest_sha256: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Eq, PartialEq)]
@@ -1925,6 +1930,24 @@ fn validate_qualification_receipt(
     snapshot: &str,
     run_id: &str,
 ) -> Result<()> {
+    validate_qualification_receipt_contents(qualification_dir, receipt, wiki, snapshot, run_id)?;
+    if storage::generation_manifest_path(data_dir, wiki, snapshot)?.is_file() {
+        storage::ensure_generation_manifest(data_dir, wiki, snapshot)?;
+    } else {
+        crate::retention::validate_purged_snapshot(data_dir, wiki, snapshot).context(
+            "qualification input generation is absent without valid retention authorization",
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_qualification_receipt_contents(
+    qualification_dir: &Path,
+    receipt: &QualificationReceipt,
+    wiki: &str,
+    snapshot: &str,
+    run_id: &str,
+) -> Result<()> {
     ensure!(
         receipt.schema_version == 2,
         "unsupported qualification receipt schema"
@@ -1955,13 +1978,6 @@ fn validate_qualification_receipt(
     );
     for artifact in &receipt.artifacts {
         validate_prepared_artifact(qualification_dir, artifact)?;
-    }
-    if storage::generation_manifest_path(data_dir, wiki, snapshot)?.is_file() {
-        storage::ensure_generation_manifest(data_dir, wiki, snapshot)?;
-    } else {
-        crate::retention::validate_purged_snapshot(data_dir, wiki, snapshot).context(
-            "qualification input generation is absent without valid retention authorization",
-        )?;
     }
     Ok(())
 }
@@ -2148,10 +2164,19 @@ fn promote_wiki_qualification_from_dirs(
             "qualification receipt changed after it was selected by the admin"
         );
     }
+    let source_generation_manifest =
+        storage::generation_manifest_path(qualification_data_dir, wiki, snapshot)?;
+    ensure!(
+        source_generation_manifest.is_file(),
+        "qualification promotion requires a durable source generation manifest"
+    );
+    let (_, source_generation_manifest_sha256) = storage::sha256_file(&source_generation_manifest)?;
+    storage::materialize_generation_snapshot(qualification_data_dir, data_dir, wiki, snapshot)?;
     let promotion = QualificationPromotion {
         snapshot: snapshot.to_string(),
         run_id: qualification_run_id.to_string(),
         receipt_sha256: qualification_sha256,
+        source_generation_manifest_sha256: Some(source_generation_manifest_sha256.clone()),
     };
     let target = wiki_candidate_dir(output_dir, wiki, snapshot, promotion_run_id)?;
     let ready_path = target.join("ready.json");
@@ -2191,6 +2216,24 @@ fn promote_wiki_qualification_from_dirs(
         collect_promotion_files(&qualification_dir, &qualification_dir, &mut files)?;
         files.sort();
         copy_candidate_files(&qualification_dir, &staging, &files)?;
+        fs::copy(
+            &qualification_path,
+            staging.join(QUALIFICATION_SOURCE_RECEIPT),
+        )?;
+        fs::copy(
+            &source_generation_manifest,
+            staging.join(QUALIFICATION_SOURCE_GENERATION_MANIFEST),
+        )?;
+        ensure!(
+            storage::sha256_file(&staging.join(QUALIFICATION_SOURCE_RECEIPT))?.1
+                == promotion.receipt_sha256,
+            "qualification receipt changed while promotion evidence was copied"
+        );
+        ensure!(
+            storage::sha256_file(&staging.join(QUALIFICATION_SOURCE_GENERATION_MANIFEST))?.1
+                == source_generation_manifest_sha256,
+            "source generation manifest changed while promotion evidence was copied"
+        );
         for artifact in &qualification.artifacts {
             validate_prepared_artifact(&staging, artifact)?;
         }
@@ -2319,9 +2362,16 @@ fn validate_ready_candidate_metadata(
         ),
         "ready candidate path does not match its identity"
     );
+    let qualification_lineage = ready
+        .promoted_from_qualification
+        .as_ref()
+        .is_some_and(|promotion| promotion.source_generation_manifest_sha256.is_some());
+    if qualification_lineage {
+        validate_promoted_qualification_lineage(candidate_dir, ready)?;
+    }
     if storage::generation_manifest_path(data_dir, &ready.wiki, &ready.snapshot)?.is_file() {
         storage::ensure_generation_manifest(data_dir, &ready.wiki, &ready.snapshot)?;
-    } else {
+    } else if !qualification_lineage {
         let retention = crate::retention::validate_purged_snapshot(
             data_dir,
             &ready.wiki,
@@ -2993,6 +3043,10 @@ fn ensure_qualification_fallback_authorized(
         promotion.snapshot == ready.snapshot,
         "qualification promotion snapshot does not match ready candidate"
     );
+    if promotion.source_generation_manifest_sha256.is_some() {
+        return validate_promoted_qualification_lineage(candidate_dir, ready);
+    }
+
     let qualification_dir = wiki_qualification_dir(
         output_dir,
         &ready.wiki,
@@ -3026,6 +3080,83 @@ fn ensure_qualification_fallback_authorized(
     for artifact in &ready.artifacts {
         validate_prepared_artifact(candidate_dir, artifact)?;
     }
+    Ok(())
+}
+
+fn validate_promoted_qualification_lineage(
+    candidate_dir: &Path,
+    ready: &ReadyWikiCandidate,
+) -> Result<()> {
+    let promotion = ready
+        .promoted_from_qualification
+        .as_ref()
+        .context("ready candidate has no qualification promotion identity")?;
+    ensure!(
+        promotion.snapshot == ready.snapshot,
+        "qualification promotion snapshot does not match ready candidate"
+    );
+    let qualification_path = candidate_dir.join(QUALIFICATION_SOURCE_RECEIPT);
+    let (_, observed_receipt_sha256) = storage::sha256_file(&qualification_path)?;
+    ensure!(
+        observed_receipt_sha256 == promotion.receipt_sha256,
+        "qualification promotion receipt identity changed"
+    );
+    let qualification: QualificationReceipt = read_json(&qualification_path)?;
+    validate_qualification_receipt_contents(
+        candidate_dir,
+        &qualification,
+        &ready.wiki,
+        &ready.snapshot,
+        &promotion.run_id,
+    )?;
+    ensure!(
+        ready.generating_commit == qualification.generating_commit
+            && ready.cutoff_date == qualification.cutoff_date
+            && ready.workload_profile.as_ref() == Some(&qualification.workload_profile)
+            && ready.editor_identity_coverage == qualification.editor_identity_coverage
+            && ready.quality_signals == qualification.quality_signals
+            && ready.artifacts == qualification.artifacts,
+        "ready candidate does not match its authenticated qualification"
+    );
+
+    let expected_generation_sha256 = promotion
+        .source_generation_manifest_sha256
+        .as_deref()
+        .context("qualification promotion has no source generation manifest identity")?;
+    ensure!(
+        expected_generation_sha256.len() == 64
+            && expected_generation_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit()),
+        "qualification promotion has an invalid source generation manifest digest"
+    );
+    let generation_path = candidate_dir.join(QUALIFICATION_SOURCE_GENERATION_MANIFEST);
+    let (_, observed_generation_sha256) = storage::sha256_file(&generation_path)?;
+    ensure!(
+        observed_generation_sha256 == expected_generation_sha256,
+        "qualification source generation manifest identity changed"
+    );
+    let generation: storage::GenerationManifest = read_json(&generation_path)?;
+    ensure!(
+        matches!(generation.schema_version, 1 | 2 | 3)
+            && generation.wiki == ready.wiki
+            && generation.snapshot_version == ready.snapshot
+            && !generation.fragments.is_empty()
+            && generation.source_plan_sha256.len() == 64
+            && generation
+                .source_plan_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+            && generation.fragments.iter().all(|fragment| {
+                fragment.sha256.len() == 64
+                    && fragment.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+                    && !fragment.source_id.is_empty()
+                    && Path::new(&fragment.path)
+                        .components()
+                        .all(|component| matches!(component, Component::Normal(_)))
+            }),
+        "qualification source generation manifest identity is invalid"
+    );
     Ok(())
 }
 
@@ -11189,6 +11320,18 @@ mod tests {
                 receipt_sha256: storage::sha256_file(&qualification_path)
                     .expect("qualification should hash")
                     .1,
+                source_generation_manifest_sha256: Some(
+                    storage::sha256_file(
+                        &storage::generation_manifest_path(
+                            fixture.data.path(),
+                            "nlwiki",
+                            "2026-03",
+                        )
+                        .expect("generation manifest path should resolve"),
+                    )
+                    .expect("generation manifest should hash")
+                    .1,
+                ),
             })
         );
         assert_eq!(
@@ -11387,6 +11530,44 @@ mod tests {
             },)
             .is_err()
         );
+        let isolated_generation =
+            storage::ensure_generation_manifest(&isolated_data, "nlwiki", "2026-03")
+                .expect("isolated generation should validate");
+        for fragment in &isolated_generation.fragments {
+            fs::remove_file(fixture.data.path().join(&fragment.path))
+                .expect("test should remove production generation fragments");
+        }
+        if let Some(compaction_path) = &isolated_generation.compaction_manifest_path {
+            let source_compaction_path = isolated_data.join(compaction_path);
+            let compaction: crate::compaction::CompactionManifest =
+                read_json(&source_compaction_path).expect("compaction manifest should parse");
+            for source in compaction.sources {
+                fs::remove_file(fixture.data.path().join(source.marker_path))
+                    .expect("test should remove production source markers");
+            }
+            fs::remove_file(fixture.data.path().join(compaction_path))
+                .expect("test should remove production compaction manifest");
+        }
+        fs::remove_file(
+            crate::snapshot_plan::plan_path(fixture.data.path(), "nlwiki", "2026-03")
+                .expect("production source plan path should resolve"),
+        )
+        .expect("test should remove the production source plan");
+        fs::remove_file(
+            storage::generation_manifest_path(fixture.data.path(), "nlwiki", "2026-03")
+                .expect("production generation manifest path should resolve"),
+        )
+        .expect("test should remove the production generation manifest");
+        let production_ingest_receipt = crate::fingerprint::data_stage_receipt_path(
+            fixture.data.path(),
+            "nlwiki",
+            "2026-03",
+            "ingest",
+        );
+        if production_ingest_receipt.is_file() {
+            fs::remove_file(production_ingest_receipt)
+                .expect("test should remove the production ingest receipt");
+        }
         let ready_path =
             promote_wiki_qualification_with_expected_receipt(QualificationPromotionRequest {
                 data_dir: fixture.data.path(),
@@ -11408,6 +11589,46 @@ mod tests {
                 .expect("promotion identity should be recorded")
                 .receipt_sha256,
             expected_sha256
+        );
+        let candidate_dir = ready_path
+            .parent()
+            .expect("promoted candidate should have a directory");
+        assert!(
+            candidate_dir.join(QUALIFICATION_SOURCE_RECEIPT).is_file(),
+            "promotion should retain its qualification receipt"
+        );
+        assert!(
+            candidate_dir
+                .join(QUALIFICATION_SOURCE_GENERATION_MANIFEST)
+                .is_file(),
+            "promotion should retain its validated generation manifest"
+        );
+        validate_ready_candidate_metadata(fixture.data.path(), candidate_dir, &ready)
+            .expect("materialized production generation should validate");
+        let production_manifest =
+            storage::generation_manifest_path(fixture.data.path(), "nlwiki", "2026-03")
+                .expect("production generation manifest path should resolve");
+        let hidden_production_manifest = production_manifest.with_extension("temporarily-hidden");
+        fs::rename(&production_manifest, &hidden_production_manifest)
+            .expect("test should temporarily hide production generation manifest");
+        validate_ready_candidate_metadata(fixture.data.path(), candidate_dir, &ready)
+            .expect("embedded qualification provenance should validate independently");
+        fs::rename(&hidden_production_manifest, &production_manifest)
+            .expect("test should restore production generation manifest");
+        storage::publish_current_snapshot(fixture.data.path(), "nlwiki", "2026-03")
+            .expect("materialized generation should activate its snapshot pointer");
+        assert_eq!(
+            storage::current_snapshot_version(fixture.data.path(), "nlwiki")
+                .expect("current snapshot pointer should parse")
+                .as_deref(),
+            Some("2026-03")
+        );
+        let ready_index: ReadyCandidateIndex =
+            read_json(&ready_index_path(fixture.output.path(), "nlwiki"))
+                .expect("isolated promotion should create a ready index");
+        assert_eq!(
+            ready_index.newest_valid_ready.run_id,
+            "isolated-promotion-1"
         );
         assert!(
             isolated_receipt.is_file(),
@@ -11542,13 +11763,17 @@ mod tests {
         )
         .expect_err("unsafe qualification identity must fail closed");
 
+        let promoted_qualification_path = ready_path
+            .parent()
+            .expect("promoted candidate should have a directory")
+            .join(QUALIFICATION_SOURCE_RECEIPT);
         let mut invalid_qualification: Value =
-            read_json(&qualification_path).expect("qualification receipt should parse");
+            read_json(&promoted_qualification_path).expect("qualification receipt should parse");
         invalid_qualification["publication_eligible"] = json!(true);
-        atomic_json(&qualification_path, &invalid_qualification)
+        atomic_json(&promoted_qualification_path, &invalid_qualification)
             .expect("invalid qualification fixture should persist");
-        let (_, invalid_qualification_sha256) =
-            storage::sha256_file(&qualification_path).expect("invalid qualification should hash");
+        let (_, invalid_qualification_sha256) = storage::sha256_file(&promoted_qualification_path)
+            .expect("invalid qualification should hash");
         let mut invalid_ready = ready;
         invalid_ready
             .promoted_from_qualification
