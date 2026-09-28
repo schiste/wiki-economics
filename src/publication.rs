@@ -5933,12 +5933,11 @@ fn rollback_unpublished_selection(
             let gate: GateReceipt = read_json(&output_dir.join(RECEIPT_FILE))?;
             ensure!(
                 selection.entries.iter().all(|entry| {
-                    if entry.previous_candidate_relative.is_some() {
-                        entry.previous_snapshot.as_ref().is_some_and(|snapshot| {
+                    match entry.previous_snapshot.as_ref() {
+                        Some(snapshot) => {
                             gate.selected_snapshot_versions.get(&entry.wiki) == Some(snapshot)
-                        })
-                    } else {
-                        !gate.selected_snapshot_versions.contains_key(&entry.wiki)
+                        }
+                        None => !gate.selected_snapshot_versions.contains_key(&entry.wiki),
                     }
                 }),
                 "previous publication gate does not cover every rollback snapshot"
