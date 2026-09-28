@@ -981,25 +981,64 @@ fn open_file_descriptors() -> Option<usize> {
     fs::read_dir("/proc/self/fd").ok().map(Iterator::count)
 }
 
-fn directory_bytes(path: &Path) -> Result<u64> {
-    if !path.exists() {
-        return Ok(0);
+fn ignore_disappeared<T>(result: std::io::Result<T>) -> Result<Option<T>> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
     }
+}
+
+enum DirectoryScanEntry {
+    Directory(PathBuf),
+    File(u64),
+    Other,
+    Gone,
+}
+
+fn inspect_directory_entry(entry: fs::DirEntry) -> Result<DirectoryScanEntry> {
+    let file_type = ignore_disappeared(entry.file_type())?;
+    inspect_directory_entry_with_type(entry, file_type)
+}
+
+fn inspect_directory_entry_with_type(
+    entry: fs::DirEntry,
+    file_type: Option<fs::FileType>,
+) -> Result<DirectoryScanEntry> {
+    let Some(file_type) = file_type else {
+        return Ok(DirectoryScanEntry::Gone);
+    };
+    if file_type.is_dir() {
+        return Ok(DirectoryScanEntry::Directory(entry.path()));
+    }
+    if !file_type.is_file() {
+        return Ok(DirectoryScanEntry::Other);
+    }
+    let Some(metadata) = ignore_disappeared(entry.metadata())? else {
+        return Ok(DirectoryScanEntry::Gone);
+    };
+    Ok(DirectoryScanEntry::File(metadata.len()))
+}
+
+fn directory_bytes(path: &Path) -> Result<u64> {
     let mut total = 0_u64;
     let mut pending = vec![path.to_path_buf()];
     while let Some(directory) = pending.pop() {
-        for entry in fs::read_dir(&directory)? {
-            let entry = entry?;
-            let file_type = entry.file_type()?;
-            if file_type.is_dir() {
-                pending.push(entry.path());
-                continue;
-            }
-            if file_type.is_file() {
-                let bytes = entry.metadata()?.len();
-                total = total
-                    .checked_add(bytes)
-                    .context("resource directory byte count overflow")?;
+        // Scratch files can be reclaimed while the governor samples usage.
+        // A missing entry makes this best-effort size estimate slightly stale,
+        // but should not fail otherwise successful compute work.
+        let Some(entries) = ignore_disappeared(fs::read_dir(&directory))? else {
+            continue;
+        };
+        for entry in entries {
+            match inspect_directory_entry(entry?)? {
+                DirectoryScanEntry::Directory(path) => pending.push(path),
+                DirectoryScanEntry::File(bytes) => {
+                    total = total
+                        .checked_add(bytes)
+                        .context("resource directory byte count overflow")?;
+                }
+                DirectoryScanEntry::Other | DirectoryScanEntry::Gone => {}
             }
         }
     }
@@ -1253,6 +1292,63 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(root.path().join("one"), root.path().join("ignored-link"))?;
         assert_eq!(directory_bytes(root.path())?, 7);
+        Ok(())
+    }
+
+    #[test]
+    fn directory_bytes_ignores_a_missing_root() -> Result<()> {
+        let root = TestDir::new()?;
+        assert_eq!(directory_bytes(&root.path().join("missing"))?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn directory_bytes_ignores_a_missing_file_type() -> Result<()> {
+        let root = TestDir::new()?;
+        let path = root.path().join("vanishing");
+        fs::write(&path, b"bytes")?;
+        let entry = fs::read_dir(root.path())?
+            .next()
+            .context("the temporary directory should contain the test file")??;
+        assert!(matches!(
+            inspect_directory_entry_with_type(entry, None)?,
+            DirectoryScanEntry::Gone
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn directory_bytes_ignores_a_file_removed_after_listing() -> Result<()> {
+        let root = TestDir::new()?;
+        let path = root.path().join("vanishing");
+        fs::write(&path, b"bytes")?;
+        let entry = fs::read_dir(root.path())?
+            .next()
+            .context("the temporary directory should contain the test file")??;
+        fs::remove_file(path)?;
+        assert!(matches!(
+            inspect_directory_entry(entry)?,
+            DirectoryScanEntry::Gone
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn ignore_disappeared_preserves_other_io_errors() -> Result<()> {
+        let missing =
+            ignore_disappeared::<()>(Err(std::io::Error::from(std::io::ErrorKind::NotFound)))?;
+        assert!(missing.is_none());
+
+        let denied = ignore_disappeared::<()>(Err(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        )))
+        .unwrap_err();
+        assert_eq!(
+            denied
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind),
+            Some(std::io::ErrorKind::PermissionDenied)
+        );
         Ok(())
     }
 
