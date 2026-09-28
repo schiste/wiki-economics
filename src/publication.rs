@@ -13148,7 +13148,8 @@ mod tests {
             &site_dist,
             run_id,
             "initial-publication-recovery-run",
-        )?;
+        )
+        .expect("initial publication rollback should preserve the previous site");
 
         assert!(
             !regenerated,
@@ -13161,10 +13162,10 @@ mod tests {
             active_candidate_relative(fixture.output.path(), "enwiki")?,
             None
         );
-        assert!(crate::fingerprint::current_site_matches_publication(
-            fixture.output.path(),
-            &site_dist
-        )?);
+        assert!(
+            crate::fingerprint::current_site_matches_publication(fixture.output.path(), &site_dist)
+                .expect("previous publication receipt should still match the site")
+        );
         Ok(())
     }
 
