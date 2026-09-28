@@ -2667,13 +2667,10 @@ mod tests {
         assert_eq!(values, [1, 2, 3, 4, 5]);
         assert!(reader.next_batch()?.is_none());
 
-        let mut parallel_reader = SequentialParquetReader::new_with_column_parallelism(
-            &path,
-            Some(vec!["key".to_string()]),
-            1,
-        )?;
+        let columns = Some(vec!["key".to_string()]);
+        let mut parallel = SequentialParquetReader::new_with_column_parallelism(&path, columns, 1)?;
         let mut parallel_values = Vec::new();
-        while let Some(batch) = parallel_reader.next_batch()? {
+        while let Some(batch) = parallel.next_batch()? {
             parallel_values.extend(batch.column("key")?.i64()?.into_no_null_iter());
         }
         assert_eq!(parallel_values, [1, 2, 3, 4, 5]);
