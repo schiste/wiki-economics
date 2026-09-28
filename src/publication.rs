@@ -5341,6 +5341,17 @@ fn rollback_selection_files(
         if !selected_is_live && !backup_exists && previous_is_live && snapshot_is_restored {
             continue;
         }
+        // An initial publication has no prior candidate, snapshot, or backup
+        // to restore. If its active pointer is already absent, rollback is
+        // complete even when recovery is replaying the selected journal.
+        let initial_publication_already_rolled_back = entry.previous_candidate_relative.is_none()
+            && !active.exists()
+            && !active.is_symlink()
+            && !backup_exists
+            && snapshot_is_restored;
+        if initial_publication_already_rolled_back {
+            continue;
+        }
         ensure!(
             selected_is_live || backup_exists || previous_is_live,
             "publication rollback cannot prove a selected, backup, or previously restored target for {}",
@@ -5922,9 +5933,12 @@ fn rollback_unpublished_selection(
             let gate: GateReceipt = read_json(&output_dir.join(RECEIPT_FILE))?;
             ensure!(
                 selection.entries.iter().all(|entry| {
-                    entry.previous_snapshot.as_ref().is_some_and(|snapshot| {
-                        gate.selected_snapshot_versions.get(&entry.wiki) == Some(snapshot)
-                    })
+                    match entry.previous_snapshot.as_ref() {
+                        Some(snapshot) => {
+                            gate.selected_snapshot_versions.get(&entry.wiki) == Some(snapshot)
+                        }
+                        None => !gate.selected_snapshot_versions.contains_key(&entry.wiki),
+                    }
                 }),
                 "previous publication gate does not cover every rollback snapshot"
             );
@@ -13092,6 +13106,65 @@ mod tests {
         assert_eq!(
             storage::current_snapshot_version(fixture.data.path(), "nlwiki")?,
             None
+        );
+        rollback_selection_files(fixture.data.path(), fixture.output.path(), &selection)?;
+        assert_eq!(
+            active_candidate_relative(fixture.output.path(), "nlwiki")?,
+            None,
+            "replaying an already completed initial-publication rollback should be a no-op"
+        );
+        assert_eq!(
+            storage::current_snapshot_version(fixture.data.path(), "nlwiki")?,
+            None
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recovery_rolls_back_an_already_absent_initial_publication() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let (_site_root, site_dist) = fixture.published_site("initial-recovery-baseline")?;
+        let run_id = "initial-publication-recovery";
+        let selection = PublicationSelection {
+            schema_version: 1,
+            run_id: run_id.to_string(),
+            state: "selected".to_string(),
+            entries: vec![SelectionEntry {
+                wiki: "enwiki".to_string(),
+                snapshot: "2026-08".to_string(),
+                candidate_relative: "_candidates/enwiki/2026-08/qualification".to_string(),
+                previous_candidate_relative: None,
+                previous_snapshot: None,
+                backup_relative: None,
+                workload_profile: None,
+            }],
+        };
+        atomic_json(&selection_path(fixture.output.path(), run_id)?, &selection)?;
+
+        let regenerated = rollback_unpublished_selection(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            &site_dist,
+            run_id,
+            "initial-publication-recovery-run",
+        )
+        .expect("initial publication rollback should preserve the previous site");
+
+        assert!(
+            !regenerated,
+            "the authenticated previous site should be preserved"
+        );
+        let restored: PublicationSelection =
+            read_json(&selection_path(fixture.output.path(), run_id)?)?;
+        assert_eq!(restored.state, "rolled_back");
+        assert_eq!(
+            active_candidate_relative(fixture.output.path(), "enwiki")?,
+            None
+        );
+        assert!(
+            crate::fingerprint::current_site_matches_publication(fixture.output.path(), &site_dist)
+                .expect("previous publication receipt should still match the site")
         );
         Ok(())
     }
