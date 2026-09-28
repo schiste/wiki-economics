@@ -997,7 +997,15 @@ enum DirectoryScanEntry {
 }
 
 fn inspect_directory_entry(entry: fs::DirEntry) -> Result<DirectoryScanEntry> {
-    let Some(file_type) = ignore_disappeared(entry.file_type())? else {
+    let file_type = ignore_disappeared(entry.file_type())?;
+    inspect_directory_entry_with_type(entry, file_type)
+}
+
+fn inspect_directory_entry_with_type(
+    entry: fs::DirEntry,
+    file_type: Option<fs::FileType>,
+) -> Result<DirectoryScanEntry> {
+    let Some(file_type) = file_type else {
         return Ok(DirectoryScanEntry::Gone);
     };
     if file_type.is_dir() {
@@ -1291,6 +1299,21 @@ mod tests {
     fn directory_bytes_ignores_a_missing_root() -> Result<()> {
         let root = TestDir::new()?;
         assert_eq!(directory_bytes(&root.path().join("missing"))?, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn directory_bytes_ignores_a_missing_file_type() -> Result<()> {
+        let root = TestDir::new()?;
+        let path = root.path().join("vanishing");
+        fs::write(&path, b"bytes")?;
+        let entry = fs::read_dir(root.path())?
+            .next()
+            .context("the temporary directory should contain the test file")??;
+        assert!(matches!(
+            inspect_directory_entry_with_type(entry, None)?,
+            DirectoryScanEntry::Gone
+        ));
         Ok(())
     }
 
