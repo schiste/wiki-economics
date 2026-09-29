@@ -10855,7 +10855,8 @@ mod tests {
             "nlwiki",
             "2026-03",
             &proof.candidate_run_id,
-        )?;
+        )
+        .expect("fixture root candidate path should be valid");
         let (.., root_ready_sha256) = storage::sha256_file(&root_candidate_dir.join("ready.json"))?;
         assert_eq!(root_ready_sha256, authorized_ready_sha256);
 
@@ -10874,7 +10875,8 @@ mod tests {
             "nlwiki",
             "2026-03",
             "retained-parent",
-        )?;
+        )
+        .expect("fixture parent candidate path should be valid");
         fs::create_dir_all(&parent_candidate_dir)?;
         let parent_ready_path = parent_candidate_dir.join("ready.json");
         atomic_json(&parent_ready_path, &parent_ready)?;
@@ -10894,6 +10896,7 @@ mod tests {
         fs::create_dir_all(&child_candidate_dir)?;
         let child_ready_path = child_candidate_dir.join("ready.json");
         atomic_json(&child_ready_path, &child_ready)?;
+        let child_ready_contents = fs::read(&child_ready_path)?;
         let (.., child_ready_sha256) = storage::sha256_file(&child_ready_path)?;
         let mut migrated_current_proof = proof.clone();
         migrated_current_proof.candidate_run_id = "retained-child".to_string();
@@ -10903,6 +10906,68 @@ mod tests {
             .into_owned();
         migrated_current_proof.ready_receipt_sha256 = child_ready_sha256;
         migrated_current_proof.retention_source_ready_sha256 = Some(parent_ready_sha256);
+
+        assert!(publication_proof_matches_retained_lineage(
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            &migrated_current_proof,
+            &authorized_ready_sha256,
+        )?);
+        let mut wrong_lineage_snapshot = migrated_current_proof.clone();
+        wrong_lineage_snapshot.snapshot = "2026-02".to_string();
+        assert!(!publication_proof_matches_retained_lineage(
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            &wrong_lineage_snapshot,
+            &authorized_ready_sha256,
+        )?);
+
+        let mut legacy_import_proof = proof.clone();
+        legacy_import_proof.candidate_run_id = "legacy-import".to_string();
+        legacy_import_proof.candidate_relative = "nlwiki".to_string();
+        legacy_import_proof.ready_receipt_sha256 = authorized_ready_sha256.clone();
+        assert!(publication_proof_matches_retained_lineage(
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            &legacy_import_proof,
+            &authorized_ready_sha256,
+        )?);
+
+        let mut wrong_candidate_path = migrated_current_proof.clone();
+        wrong_candidate_path.candidate_relative =
+            "_candidates/nlwiki/2026-03/another-candidate".to_string();
+        assert!(!publication_proof_matches_retained_lineage(
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            &wrong_candidate_path,
+            &authorized_ready_sha256,
+        )?);
+        let mut wrong_retention_source = migrated_current_proof.clone();
+        wrong_retention_source.retention_source_ready_sha256 = Some("f".repeat(64));
+        assert!(!publication_proof_matches_retained_lineage(
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            &wrong_retention_source,
+            &authorized_ready_sha256,
+        )?);
+
+        let mut mismatched_ready = child_ready.clone();
+        mismatched_ready.run_id = "different-run".to_string();
+        atomic_json(&child_ready_path, &mismatched_ready)?;
+        assert!(!publication_proof_matches_retained_lineage(
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            &migrated_current_proof,
+            &authorized_ready_sha256,
+        )?);
+        fs::write(&child_ready_path, &child_ready_contents)?;
+
         let mut migrated_gate = gate.clone();
         let migrated_previous_proof = migrated_gate
             .wiki_proofs
@@ -10919,6 +10984,50 @@ mod tests {
                 &migrated_current_proof,
             )
             .is_ok()
+        );
+
+        let mut broken_child_ready = child_ready.clone();
+        broken_child_ready
+            .migrated_from_retained_candidate
+            .as_mut()
+            .context("fixture child migration should exist")?
+            .source_ready_sha256 = "f".repeat(64);
+        atomic_json(&child_ready_path, &broken_child_ready)?;
+        let (.., broken_child_sha256) = storage::sha256_file(&child_ready_path)?;
+        let mut broken_lineage_proof = migrated_current_proof.clone();
+        broken_lineage_proof.ready_receipt_sha256 = broken_child_sha256;
+        broken_lineage_proof.retention_source_ready_sha256 = Some("f".repeat(64));
+        assert!(
+            publication_patrol_source_report(
+                fixture.data.path(),
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                Some(&migrated_gate),
+                &broken_lineage_proof,
+            )
+            .is_err()
+        );
+        fs::write(&child_ready_path, &child_ready_contents)?;
+
+        let mut missing_previous_lineage_gate = migrated_gate.clone();
+        let missing_previous_proof = missing_previous_lineage_gate
+            .wiki_proofs
+            .get_mut("nlwiki")
+            .context("fixture prior proof should exist")?;
+        missing_previous_proof.candidate_run_id = "missing-lineage".to_string();
+        missing_previous_proof.candidate_relative =
+            "_candidates/nlwiki/2026-03/missing-lineage".to_string();
+        assert!(
+            publication_patrol_source_report(
+                fixture.data.path(),
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                Some(&missing_previous_lineage_gate),
+                &migrated_current_proof,
+            )
+            .is_err()
         );
         assert!(
             publication_patrol_source_report(
