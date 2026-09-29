@@ -706,6 +706,7 @@ fn candidate_quality_signals(
 
 fn publication_patrol_source_report(
     data_dir: &Path,
+    output_dir: &Path,
     wiki: &str,
     snapshot: &str,
     previous_gate: Option<&GateReceipt>,
@@ -722,11 +723,13 @@ fn publication_patrol_source_report(
         "retention receipt does not authorize purged patrol inputs for {wiki}"
     );
     ensure!(
-        retention.authorized_ready_sha256
-            == current_proof
-                .retention_source_ready_sha256
-                .as_deref()
-                .unwrap_or(&current_proof.ready_receipt_sha256),
+        publication_proof_matches_retained_lineage(
+            output_dir,
+            wiki,
+            snapshot,
+            current_proof,
+            &retention.authorized_ready_sha256,
+        )?,
         "retention receipt does not authorize the active ready candidate lineage for {wiki}"
     );
     let previous_gate = previous_gate.with_context(|| {
@@ -745,9 +748,13 @@ fn publication_patrol_source_report(
         .get(wiki)
         .with_context(|| format!("prior publication gate has no wiki proof for {wiki}"))?;
     ensure!(
-        previous_proof.ready_receipt_sha256 == retention.authorized_ready_sha256
-            || previous_proof.retention_source_ready_sha256.as_deref()
-                == Some(retention.authorized_ready_sha256.as_str()),
+        publication_proof_matches_retained_lineage(
+            output_dir,
+            wiki,
+            snapshot,
+            previous_proof,
+            &retention.authorized_ready_sha256,
+        )?,
         "prior patrol source report is not tied to the retention-authorized ready candidate for {wiki}"
     );
     let report = previous_gate
@@ -762,6 +769,49 @@ fn publication_patrol_source_report(
         "prior publication gate has empty patrol or rights source data for {wiki}"
     );
     Ok(report)
+}
+
+fn publication_proof_matches_retained_lineage(
+    output_dir: &Path,
+    wiki: &str,
+    snapshot: &str,
+    proof: &WikiPublicationProof,
+    authorized_ready_sha256: &str,
+) -> Result<bool> {
+    if proof.snapshot != snapshot {
+        return Ok(false);
+    }
+    if proof.candidate_run_id == "legacy-import" {
+        return Ok(proof.candidate_relative == wiki
+            && proof.ready_receipt_sha256 == authorized_ready_sha256);
+    }
+
+    let candidate_dir = wiki_candidate_dir(output_dir, wiki, snapshot, &proof.candidate_run_id)?;
+    let expected_relative = candidate_dir
+        .strip_prefix(output_dir)
+        .context("ready candidate is outside the output directory")?
+        .to_string_lossy();
+    if proof.candidate_relative != expected_relative {
+        return Ok(false);
+    }
+    let ready_path = candidate_dir.join("ready.json");
+    let ready: ReadyWikiCandidate = read_json(&ready_path)?;
+    if ready.wiki != wiki || ready.snapshot != snapshot || ready.run_id != proof.candidate_run_id {
+        return Ok(false);
+    }
+    let (_, observed_ready_sha256) = storage::sha256_file(&ready_path)?;
+    if observed_ready_sha256 != proof.ready_receipt_sha256 {
+        return Ok(false);
+    }
+    let expected_source_sha256 = ready
+        .migrated_from_retained_candidate
+        .as_ref()
+        .map(|migration| migration.source_ready_sha256.as_str());
+    if proof.retention_source_ready_sha256.as_deref() != expected_source_sha256 {
+        return Ok(false);
+    }
+
+    retained_ready_lineage_matches(&candidate_dir, &ready, authorized_ready_sha256, 0)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -7025,6 +7075,7 @@ pub fn validate(
             wiki.clone(),
             publication_patrol_source_report(
                 data_dir,
+                output_dir,
                 &wiki,
                 snapshot,
                 previous_gate.as_ref(),
@@ -10799,20 +10850,152 @@ mod tests {
         let authorized_ready_sha256 =
             crate::retention::validate_purged_snapshot(fixture.data.path(), "nlwiki", "2026-03")?
                 .authorized_ready_sha256;
+        let root_candidate_dir = wiki_candidate_dir(
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            &proof.candidate_run_id,
+        )
+        .expect("fixture root candidate path should be valid");
+        let (.., root_ready_sha256) = storage::sha256_file(&root_candidate_dir.join("ready.json"))?;
+        assert_eq!(root_ready_sha256, authorized_ready_sha256);
+
+        let mut parent_ready: ReadyWikiCandidate =
+            read_json(&root_candidate_dir.join("ready.json"))?;
+        parent_ready.run_id = "retained-parent".to_string();
+        parent_ready.migrated_from_retained_candidate = Some(RetainedCandidateMigration {
+            schema_version: 1,
+            source_run_id: proof.candidate_run_id.clone(),
+            source_ready_sha256: authorized_ready_sha256.clone(),
+            migration: RETAINED_LIFECYCLE_MIGRATION_ID.to_string(),
+            migrated_families: Vec::new(),
+        });
+        let parent_candidate_dir = wiki_candidate_dir(
+            fixture.output.path(),
+            "nlwiki",
+            "2026-03",
+            "retained-parent",
+        )
+        .expect("fixture parent candidate path should be valid");
+        fs::create_dir_all(&parent_candidate_dir)?;
+        let parent_ready_path = parent_candidate_dir.join("ready.json");
+        atomic_json(&parent_ready_path, &parent_ready)?;
+        let (.., parent_ready_sha256) = storage::sha256_file(&parent_ready_path)?;
+
+        let mut child_ready = parent_ready;
+        child_ready.run_id = "retained-child".to_string();
+        child_ready.migrated_from_retained_candidate = Some(RetainedCandidateMigration {
+            schema_version: 1,
+            source_run_id: "retained-parent".to_string(),
+            source_ready_sha256: parent_ready_sha256.clone(),
+            migration: RETAINED_LIFECYCLE_MIGRATION_ID.to_string(),
+            migrated_families: Vec::new(),
+        });
+        let child_candidate_dir =
+            wiki_candidate_dir(fixture.output.path(), "nlwiki", "2026-03", "retained-child")?;
+        fs::create_dir_all(&child_candidate_dir)?;
+        let child_ready_path = child_candidate_dir.join("ready.json");
+        atomic_json(&child_ready_path, &child_ready)?;
+        let child_ready_contents = fs::read(&child_ready_path)?;
+        let (.., child_ready_sha256) = storage::sha256_file(&child_ready_path)?;
         let mut migrated_current_proof = proof.clone();
-        migrated_current_proof.ready_receipt_sha256 = "e".repeat(64);
-        migrated_current_proof.retention_source_ready_sha256 =
-            Some(authorized_ready_sha256.clone());
+        migrated_current_proof.candidate_run_id = "retained-child".to_string();
+        migrated_current_proof.candidate_relative = child_candidate_dir
+            .strip_prefix(fixture.output.path())?
+            .to_string_lossy()
+            .into_owned();
+        migrated_current_proof.ready_receipt_sha256 = child_ready_sha256;
+        migrated_current_proof.retention_source_ready_sha256 = Some(parent_ready_sha256);
+
+        assert!(
+            publication_proof_matches_retained_lineage(
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                &migrated_current_proof,
+                &authorized_ready_sha256,
+            )
+            .expect("two-hop retained candidate lineage should match")
+        );
+        let mut wrong_lineage_snapshot = migrated_current_proof.clone();
+        wrong_lineage_snapshot.snapshot = "2026-02".to_string();
+        assert!(
+            !publication_proof_matches_retained_lineage(
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                &wrong_lineage_snapshot,
+                &authorized_ready_sha256,
+            )
+            .expect("snapshot mismatch should be rejected")
+        );
+
+        let mut legacy_import_proof = proof.clone();
+        legacy_import_proof.candidate_run_id = "legacy-import".to_string();
+        legacy_import_proof.candidate_relative = "nlwiki".to_string();
+        legacy_import_proof.ready_receipt_sha256 = authorized_ready_sha256.clone();
+        assert!(
+            publication_proof_matches_retained_lineage(
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                &legacy_import_proof,
+                &authorized_ready_sha256,
+            )
+            .expect("authorized legacy import proof should match")
+        );
+
+        let mut wrong_candidate_path = migrated_current_proof.clone();
+        wrong_candidate_path.candidate_relative =
+            "_candidates/nlwiki/2026-03/another-candidate".to_string();
+        assert!(
+            !publication_proof_matches_retained_lineage(
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                &wrong_candidate_path,
+                &authorized_ready_sha256,
+            )
+            .expect("candidate path mismatch should be rejected")
+        );
+        let mut wrong_retention_source = migrated_current_proof.clone();
+        wrong_retention_source.retention_source_ready_sha256 = Some("f".repeat(64));
+        assert!(
+            !publication_proof_matches_retained_lineage(
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                &wrong_retention_source,
+                &authorized_ready_sha256,
+            )
+            .expect("retention source mismatch should be rejected")
+        );
+
+        let mut mismatched_ready = child_ready.clone();
+        mismatched_ready.run_id = "different-run".to_string();
+        atomic_json(&child_ready_path, &mismatched_ready)?;
+        assert!(
+            !publication_proof_matches_retained_lineage(
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                &migrated_current_proof,
+                &authorized_ready_sha256,
+            )
+            .expect("candidate identity mismatch should be rejected")
+        );
+        fs::write(&child_ready_path, &child_ready_contents)?;
+
         let mut migrated_gate = gate.clone();
         let migrated_previous_proof = migrated_gate
             .wiki_proofs
             .get_mut("nlwiki")
             .context("fixture prior proof should exist")?;
-        migrated_previous_proof.ready_receipt_sha256 = "e".repeat(64);
-        migrated_previous_proof.retention_source_ready_sha256 = Some(authorized_ready_sha256);
+        *migrated_previous_proof = migrated_current_proof.clone();
         assert!(
             publication_patrol_source_report(
                 fixture.data.path(),
+                fixture.output.path(),
                 "nlwiki",
                 "2026-03",
                 Some(&migrated_gate),
@@ -10820,9 +11003,54 @@ mod tests {
             )
             .is_ok()
         );
+
+        let mut broken_child_ready = child_ready.clone();
+        broken_child_ready
+            .migrated_from_retained_candidate
+            .as_mut()
+            .context("fixture child migration should exist")?
+            .source_ready_sha256 = "f".repeat(64);
+        atomic_json(&child_ready_path, &broken_child_ready)?;
+        let (.., broken_child_sha256) = storage::sha256_file(&child_ready_path)?;
+        let mut broken_lineage_proof = migrated_current_proof.clone();
+        broken_lineage_proof.ready_receipt_sha256 = broken_child_sha256;
+        broken_lineage_proof.retention_source_ready_sha256 = Some("f".repeat(64));
         assert!(
             publication_patrol_source_report(
                 fixture.data.path(),
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                Some(&migrated_gate),
+                &broken_lineage_proof,
+            )
+            .is_err()
+        );
+        fs::write(&child_ready_path, &child_ready_contents)?;
+
+        let mut missing_previous_lineage_gate = migrated_gate.clone();
+        let missing_previous_proof = missing_previous_lineage_gate
+            .wiki_proofs
+            .get_mut("nlwiki")
+            .context("fixture prior proof should exist")?;
+        missing_previous_proof.candidate_run_id = "missing-lineage".to_string();
+        missing_previous_proof.candidate_relative =
+            "_candidates/nlwiki/2026-03/missing-lineage".to_string();
+        assert!(
+            publication_patrol_source_report(
+                fixture.data.path(),
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                Some(&missing_previous_lineage_gate),
+                &migrated_current_proof,
+            )
+            .is_err()
+        );
+        assert!(
+            publication_patrol_source_report(
+                fixture.data.path(),
+                fixture.output.path(),
                 "nlwiki",
                 "2026-03",
                 None,
@@ -10838,6 +11066,7 @@ mod tests {
         assert!(
             publication_patrol_source_report(
                 fixture.data.path(),
+                fixture.output.path(),
                 "nlwiki",
                 "2026-03",
                 Some(&gate),
@@ -10853,6 +11082,7 @@ mod tests {
         assert!(
             publication_patrol_source_report(
                 fixture.data.path(),
+                fixture.output.path(),
                 "nlwiki",
                 "2026-03",
                 Some(&gate),
@@ -10867,6 +11097,7 @@ mod tests {
         assert!(
             publication_patrol_source_report(
                 fixture.data.path(),
+                fixture.output.path(),
                 "nlwiki",
                 "2026-03",
                 Some(&gate),
@@ -10882,6 +11113,7 @@ mod tests {
         assert!(
             publication_patrol_source_report(
                 fixture.data.path(),
+                fixture.output.path(),
                 "nlwiki",
                 "2026-03",
                 Some(&wrong_snapshot_gate),
@@ -10895,6 +11127,7 @@ mod tests {
         assert!(
             publication_patrol_source_report(
                 fixture.data.path(),
+                fixture.output.path(),
                 "nlwiki",
                 "2026-03",
                 Some(&missing_proof_gate),
@@ -10912,6 +11145,7 @@ mod tests {
         assert!(
             publication_patrol_source_report(
                 fixture.data.path(),
+                fixture.output.path(),
                 "nlwiki",
                 "2026-03",
                 Some(&wrong_prior_proof_gate),
@@ -10925,6 +11159,7 @@ mod tests {
         assert!(
             publication_patrol_source_report(
                 fixture.data.path(),
+                fixture.output.path(),
                 "nlwiki",
                 "2026-03",
                 Some(&missing_patrol_gate),
@@ -10941,6 +11176,7 @@ mod tests {
         assert!(
             publication_patrol_source_report(
                 fixture.data.path(),
+                fixture.output.path(),
                 "nlwiki",
                 "2026-03",
                 Some(&empty_patrol_gate),
