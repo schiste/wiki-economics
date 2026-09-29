@@ -10907,65 +10907,83 @@ mod tests {
         migrated_current_proof.ready_receipt_sha256 = child_ready_sha256;
         migrated_current_proof.retention_source_ready_sha256 = Some(parent_ready_sha256);
 
-        assert!(publication_proof_matches_retained_lineage(
-            fixture.output.path(),
-            "nlwiki",
-            "2026-03",
-            &migrated_current_proof,
-            &authorized_ready_sha256,
-        )?);
+        assert!(
+            publication_proof_matches_retained_lineage(
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                &migrated_current_proof,
+                &authorized_ready_sha256,
+            )
+            .expect("two-hop retained candidate lineage should match")
+        );
         let mut wrong_lineage_snapshot = migrated_current_proof.clone();
         wrong_lineage_snapshot.snapshot = "2026-02".to_string();
-        assert!(!publication_proof_matches_retained_lineage(
-            fixture.output.path(),
-            "nlwiki",
-            "2026-03",
-            &wrong_lineage_snapshot,
-            &authorized_ready_sha256,
-        )?);
+        assert!(
+            !publication_proof_matches_retained_lineage(
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                &wrong_lineage_snapshot,
+                &authorized_ready_sha256,
+            )
+            .expect("snapshot mismatch should be rejected")
+        );
 
         let mut legacy_import_proof = proof.clone();
         legacy_import_proof.candidate_run_id = "legacy-import".to_string();
         legacy_import_proof.candidate_relative = "nlwiki".to_string();
         legacy_import_proof.ready_receipt_sha256 = authorized_ready_sha256.clone();
-        assert!(publication_proof_matches_retained_lineage(
-            fixture.output.path(),
-            "nlwiki",
-            "2026-03",
-            &legacy_import_proof,
-            &authorized_ready_sha256,
-        )?);
+        assert!(
+            publication_proof_matches_retained_lineage(
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                &legacy_import_proof,
+                &authorized_ready_sha256,
+            )
+            .expect("authorized legacy import proof should match")
+        );
 
         let mut wrong_candidate_path = migrated_current_proof.clone();
         wrong_candidate_path.candidate_relative =
             "_candidates/nlwiki/2026-03/another-candidate".to_string();
-        assert!(!publication_proof_matches_retained_lineage(
-            fixture.output.path(),
-            "nlwiki",
-            "2026-03",
-            &wrong_candidate_path,
-            &authorized_ready_sha256,
-        )?);
+        assert!(
+            !publication_proof_matches_retained_lineage(
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                &wrong_candidate_path,
+                &authorized_ready_sha256,
+            )
+            .expect("candidate path mismatch should be rejected")
+        );
         let mut wrong_retention_source = migrated_current_proof.clone();
         wrong_retention_source.retention_source_ready_sha256 = Some("f".repeat(64));
-        assert!(!publication_proof_matches_retained_lineage(
-            fixture.output.path(),
-            "nlwiki",
-            "2026-03",
-            &wrong_retention_source,
-            &authorized_ready_sha256,
-        )?);
+        assert!(
+            !publication_proof_matches_retained_lineage(
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                &wrong_retention_source,
+                &authorized_ready_sha256,
+            )
+            .expect("retention source mismatch should be rejected")
+        );
 
         let mut mismatched_ready = child_ready.clone();
         mismatched_ready.run_id = "different-run".to_string();
         atomic_json(&child_ready_path, &mismatched_ready)?;
-        assert!(!publication_proof_matches_retained_lineage(
-            fixture.output.path(),
-            "nlwiki",
-            "2026-03",
-            &migrated_current_proof,
-            &authorized_ready_sha256,
-        )?);
+        assert!(
+            !publication_proof_matches_retained_lineage(
+                fixture.output.path(),
+                "nlwiki",
+                "2026-03",
+                &migrated_current_proof,
+                &authorized_ready_sha256,
+            )
+            .expect("candidate identity mismatch should be rejected")
+        );
         fs::write(&child_ready_path, &child_ready_contents)?;
 
         let mut migrated_gate = gate.clone();
