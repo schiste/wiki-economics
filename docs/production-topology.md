@@ -68,7 +68,10 @@ mount:
 - `wiki-econ-fleet-controller` discovers the sixteen scheduled lifecycle
   entries (afwiki, arwiki, arzwiki, elwiki, eswiki, frwiki, hawiki, itwiki,
   jawiki, nlwiki, ptwiki, svwiki, swwiki, viwiki, yowiki, and zhwiki) and
-  writes atomic tasks.
+  writes atomic tasks. Two further wikis, dewiki and enwiki, are in the
+  lifecycle registry with `refresh: qualification` and are deliberately not
+  scheduled: enwiki is excluded from scheduled publication until bounded
+  compute and production-capacity qualification pass.
   `wiki-econ-fleet-small-a`, `wiki-econ-fleet-small-b`,
   `wiki-econ-fleet-medium`, and `wiki-econ-fleet-medium-b` are a fixed worker
   pool. Each claimed task owns only
@@ -79,15 +82,23 @@ mount:
   the global publication lock and mutates merged output and the live site.
 - `wiki-econ-refresh` is retained as an unscheduled, on-demand compatibility
   Job for explicit recovery or operator drills; it is not the normal scheduler.
+- `wiki-econ-pipeline-ingest`, `-metrics`, `-lifecycle`, `-page-week`, `-patrol`,
+  and `-publish` are the bounded enwiki path. Each is unscheduled and takes 6 GiB
+  with 4 CPUs, the per-job ceiling. The state coordinator admits independent
+  compute stages in parallel up to the capacity-derived limit, which for the
+  current envelope is two, and publish waits for every compute receipt. The
+  shared capacity ledger counts fleet-worker leases before each pipeline pod
+  starts, while the service, admin-dispatcher, and publisher reserves stay
+  available.
 - `wiki-econ-admin` is a Build Service webservice launched from `Procfile`. It
   serves the current static site and reads the refresh status files. It has no
   shared process memory or Kubernetes control API with the pipeline Jobs.
 
 The lifecycle registry—not a deployment-script wiki list—is authoritative.
 The [generated lifecycle table](generated/stack-reference.md#published-wiki-lifecycle)
-shows the current split: scheduled Toolforge datasets refresh weekly, while
-paused local imports remain published and retained until their deliberate
-reactivation procedure completes.
+shows the current split: sixteen scheduled Toolforge datasets refresh weekly,
+while dewiki and enwiki are held at `refresh: qualification` and stay published
+but unscheduled until their promotion gates pass.
 
 ## Persistent storage
 

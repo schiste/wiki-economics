@@ -148,15 +148,19 @@ Equivalent expanded commands:
 
 ```sh
 bash -n scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh deploy/toolforge/*.sh
-node --check site/admin-auth.cjs
-node --check site/admin-server.cjs
-node --check site/machine-api.cjs
-node --check site/observablehq.config.js
+shellcheck scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh deploy/toolforge/*.sh
+shopt -s nullglob
+for module in scripts/*.cjs scripts/*.mjs deploy/toolforge/*.cjs \
+  site/*.cjs site/*.mjs site/data-build/*.cjs site/*.js; do
+  node --check "$module"
+done
+node --test \
+  'deploy/toolforge/*.test.cjs' \
+  'scripts/*.test.cjs' \
+  'site/*.test.cjs' \
+  'site/*.test.mjs' \
+  'site/data-build/*.test.cjs'
 node scripts/generate-stack-reference.cjs --check
-for f in site/data-build/*.cjs; do node --check "$f"; done
-node --test site/admin-auth.test.cjs
-node --test site/admin-server.test.cjs
-node --test site/machine-api.test.cjs
 ./scripts/build-site.sh --help
 ./scripts/refresh.sh --help
 cargo fmt --all -- --check

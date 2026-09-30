@@ -349,7 +349,10 @@ The repo is expected to stay green on:
 
 - `cargo fmt --all -- --check`
 - `cargo clippy --all-targets --all-features -- -D warnings`
-- `cargo test --all-targets --all-features`
+- `cargo test --all-targets --all-features` (run locally; in CI the suite
+  executes under the `coverage` job's `cargo llvm-cov`, which subsumes a plain
+  `cargo test`. That job is itself conditional on the `rust` path filter, so a
+  change that touches no Rust file runs no Rust tests at all.)
 - `cargo doc --no-deps`
 - `cargo deny check advisories bans licenses sources`
 - `cargo audit -D warnings`

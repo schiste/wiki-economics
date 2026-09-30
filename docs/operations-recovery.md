@@ -81,10 +81,13 @@ current preflight.
 
 ## Imported-data backup and restore
 
-The current `local-import` datasets (`elwiki` and `svwiki`) are not
-reconstructible from Toolforge's current warehouse. Create the archive on
-Toolforge, download it to physically separate storage, verify it there, and
-then remove only the temporary Toolforge copy:
+No dataset currently carries `provenance: local-import`: all eighteen lifecycle
+entries are `toolforge`. This procedure applies only if a local import is
+reintroduced, and `create-imported-backup.sh` refuses to run while the registry
+contains none. When one exists it is not reconstructible from Toolforge's
+current warehouse. Create the archive on Toolforge, download it to physically
+separate storage, verify it there, and then remove only the temporary Toolforge
+copy:
 
 ```sh
 backup=/data/project/wiki-economics/operations/export/imported-2026-08-23.tar.gz

@@ -2,6 +2,30 @@
 
 This document records the policies and maintenance rules that still matter after the recent refactors.
 
+## Fast Inner Loop
+
+`./scripts/ci-local.sh` is the full pre-push gate and takes tens of minutes,
+most of it an instrumented coverage rebuild. Do not use it to check a single
+change. Run the narrowest thing that covers what you touched:
+
+```sh
+# One Rust module or its tests
+cargo test --locked resource_governor
+cargo clippy --locked --all-targets --all-features -- -D warnings
+
+# One Node suite, or the whole Node surface (~1 min)
+node --test deploy/toolforge/pipeline-state.test.cjs
+node --test 'deploy/toolforge/*.test.cjs' 'scripts/*.test.cjs' 'site/*.test.cjs' 'site/*.test.mjs' 'site/data-build/*.test.cjs'
+
+# One shell script
+bash -n deploy/toolforge/run-refresh.sh
+shellcheck deploy/toolforge/*.sh
+```
+
+Both test layers name their files after the module they cover, so the file
+name is the fastest way to find the right suite. CI and `ci-local.sh` glob
+every suite rather than listing them, so a new test file is always executed.
+
 ## Local Quality Gates
 
 For first-time local bootstrap, prefer:
@@ -12,41 +36,25 @@ For first-time local bootstrap, prefer:
 
 That setup script installs repo dependencies, ensures the Rust toolchain is ready, prepares local directories, and builds the CLI plus dashboard before you start iterating.
 
-Preferred full local verification command:
+The full local verification command, to run before pushing:
 
 ```sh
 ./scripts/ci-local.sh
 ```
 
-Expanded commands:
+It runs, in order: `bash -n` and shellcheck over every shell script, `node
+--check` over every Node module, the complete Node test surface, three CLI
+`--help` probes, `cargo fmt`, `cargo clippy`, the generated metric-catalog
+check, `cargo test`, two reproducible Observable builds, a browser
+performance-budget run, `cargo doc`, `cargo llvm-cov` with the LCOV
+zero-uncovered-line check, `cargo deny`, `cargo audit`, the npm advisory and
+license policies, the vendored-patch register, and the Python LCOV-helper
+tests. Two notes: it needs several GB of disk for the instrumented build, and
+the coverage target directory is shared across checkouts and serialised by a
+lock, so two worktrees on one machine cannot run coverage concurrently.
 
-```sh
-bash -n scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh deploy/toolforge/*.sh
-node --check site/admin-auth.cjs
-node --check site/admin-server.cjs
-node --check site/machine-api.cjs
-node --check site/observablehq.config.js
-for f in site/data-build/*.cjs; do node --check "$f"; done
-node --test site/admin-auth.test.cjs
-node --test site/admin-server.test.cjs
-node --test site/machine-api.test.cjs
-node scripts/generate-stack-reference.cjs --check
-node --test scripts/check-compute-versions.test.cjs
-node scripts/check-compute-versions.cjs
-cargo fmt --all -- --check
-cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo test --locked --all-targets --all-features
-cargo doc --locked --no-deps
-cargo llvm-cov --locked --workspace --all-features --all-targets --lcov --output-path target/llvm-cov.info
-python3 scripts/check_lcov.py target/llvm-cov.info
-cargo deny check advisories bans licenses sources
-cargo audit -D warnings
-node scripts/check-npm-advisories.cjs
-node scripts/check-npm-licenses.cjs
-scripts/check_vendor_patches.sh
-python3 -m py_compile scripts/check_lcov.py scripts/test_check_lcov.py
-python3 -m unittest discover -s scripts -p 'test_*.py'
-```
+The individual commands are in `scripts/ci-local.sh`; prefer the fast loop
+above while iterating and that script before pushing.
 
 Cargo build artifacts use the standard, gitignored `target/` directory. This
 keeps local builds and CI cache paths aligned. Override `CARGO_TARGET_DIR` if
@@ -98,29 +106,31 @@ call those shared scripts rather than reimplementing pipeline steps.
 
 ## CI Structure
 
-GitHub Actions is split into eight jobs, gated by a `changes` job that uses
-`dorny/paths-filter` to detect whether a push/PR touches anything under the
-`backend` path set (`src/**`, `Cargo.{toml,lock}`, `rust-toolchain.toml`,
-`deploy/**`, `scripts/**`, `site/data-build/**`, `config/**`, or the workflow
-file itself):
+GitHub Actions is split into nine jobs, gated by a `changes` job that uses
+`dorny/paths-filter`. It computes three booleans, but only `rust` currently
+gates anything: `quality-rust`, `coverage`, and `security-rust` are the three
+conditional jobs. The `rust` path set is `src/**`, `Cargo.toml`, `Cargo.lock`,
+`rust-toolchain.toml`, `.cargo/**`, `vendor/**`, and `deny.toml`. The `site`
+and `image` filters are declared but consumed by no job.
 
-- `changes`: computes the `backend` boolean other jobs gate on
+- `changes`: computes the `rust`, `site`, and `image` booleans
 - `quality-node`: formatting-free Node/shell/Python checks — shellcheck,
   `node --check`/unit tests, the small Python LCOV helper tests, and
   generated-document consistency. No Rust toolchain, always runs.
-- `quality-rust`: `cargo fmt --check`, `cargo clippy`, `cargo doc`. Gated on
-  `backend` — skipped when a change touches only site content.
+- `quality-rust`: `cargo fmt --check`, `cargo clippy`, `cargo doc`, and the
+  generated metric-catalog check. Gated on `rust` — skipped when a change
+  touches no Rust source.
 - `site`: a clean npm workspace install, advisory check, Rust-generated
   deterministic fixture, and real Observable production build with page and
   attachment verification. Always runs (front-end changes need this
   signal too); `Swatinem/rust-cache` keeps it fast when Rust is unchanged.
 - `coverage`: `cargo llvm-cov` LCOV export plus `scripts/check_lcov.py`
-  enforcing zero uncovered lines. Gated on `backend` — this is the single
+  enforcing zero uncovered lines. Gated on `rust` — this is the single
   most expensive job (a fully instrumented rebuild), and it produces no new
   signal when Rust source hasn't changed.
 - `security-node`: fail-closed npm advisory/license policies, REUSE, and
   registered vendored-patch validation. No Rust toolchain, always runs.
-- `security-rust`: `cargo-deny` and `cargo-audit`. Gated on `backend`.
+- `security-rust`: `cargo-deny` and `cargo-audit`. Gated on `rust`.
 - `toolforge-release`: after the other jobs pass (or are skipped, for the
   Rust-gated ones) on `main`, builds and retains the attested Linux release
   envelope, three SBOMs, checksums, provenance, and complete notices for an
@@ -132,12 +142,16 @@ file itself):
 That split is intentional. Keep fast correctness failures separate from
 coverage drift and dependency-policy drift, and keep the expensive Rust
 recompiles (instrumented coverage, lint, dependency audit) off the critical
-path for changes that only touch `site/**` content. GitHub has no production
-credentials; Toolforge deployment remains an explicit operator action. The
-coverage run subsumes the ordinary Rust test suite.
+path for changes that only touch `site/**` content. Note the consequence: a
+docs-only or site-only push to `main` satisfies `toolforge-release` with the
+coverage job skipped, so that release carries no Rust test evidence.
+
+GitHub has no production credentials; Toolforge deployment remains an
+explicit operator action. The coverage run subsumes the ordinary Rust test
+suite.
 
 Dependabot checks Cargo, npm, and pinned GitHub Actions weekly using
-`.github/dependabot.yml`; its pull requests must still pass all five jobs.
+`.github/dependabot.yml`; its pull requests must still pass every applicable job.
 
 The LCOV check is deliberate. `cargo llvm-cov --summary-only` can under-report line coverage on fully exercised lines because of sub-line region artifacts around `?` and similar expressions. CI treats the exported LCOV file as the source of truth for line coverage.
 

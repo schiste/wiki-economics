@@ -99,7 +99,7 @@ estimate the next runtime. It never branches on a wiki name.
 | Profile | Preferred source workers | Primary buckets | Secondary buckets | Logical buckets |
 | --- | ---: | ---: | ---: | ---: |
 | `small` | 2 | 32 | 8 | 256 |
-| `large` | 3 | 64 | 32 | 2,048 |
+| `large` | 4 | 64 | 32 | 2,048 |
 
 `small` is selected only at or below 64 GiB compressed, 64 sources, five
 billion prior measured rows, 2,048 fragments, 4.5 GB historical memory, 8 GiB
