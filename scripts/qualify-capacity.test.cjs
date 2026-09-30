@@ -1,8 +1,10 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const path = require("node:path");
 const {test} = require("node:test");
-const {qualify} = require("./qualify-capacity.cjs");
+const {qualify, SUPPORTED_REPORT_SCHEMA_VERSION} = require("./qualify-capacity.cjs");
 
 const policy = {
   schema_version: 1,
@@ -20,7 +22,7 @@ const policy = {
 function report(wiki, buckets, overrides = {}) {
   const bucketRows = Array.from({length: buckets}, (_, index) => index === 0 ? 30 : 0);
   return {
-    schema_version: 3, run_id: `${wiki}-${buckets}`, source_commit: "a".repeat(40),
+    schema_version: 5, run_id: `${wiki}-${buckets}`, source_commit: "a".repeat(40),
     generated_at_unix: buckets, wiki, selected_snapshot: "2026-07", bucket_count: buckets,
     rayon_threads: 1, polars_threads: 1, storage_reserve_bytes: 50,
     observed_memory_peak_bytes: 300, memory_limit_bytes: 600,
@@ -80,4 +82,25 @@ test("qualification policy requires explicit workload profile and layout admissi
   const unsupportedProfile = structuredClone(policy);
   unsupportedProfile.wikis.nlwiki.qualified_workload_profiles.push("huge");
   assert.throws(() => qualify(completeReports(), unsupportedProfile), /invalid workload profile admission policy/);
+});
+
+test("the gate rejects a report schema version it does not understand", () => {
+  assert.throws(() => qualify(
+    completeReports().map((value) => ({...value, schema_version: 3})), policy,
+  ), /schema version 3 is not supported by this gate \(supports 5/);
+  assert.throws(() => qualify(
+    completeReports().map((value) => ({...value, schema_version: 99})), policy,
+  ), /schema version 99 is not supported/);
+});
+
+test("the gate's supported schema version matches REPORT_SCHEMA_VERSION in src/capacity.rs", () => {
+  const source = fs.readFileSync(path.join(__dirname, "..", "src", "capacity.rs"), "utf8");
+  const declared = source.match(/const REPORT_SCHEMA_VERSION: u32 = (\d+);/);
+  assert.ok(declared, "REPORT_SCHEMA_VERSION not found in src/capacity.rs");
+  assert.equal(
+    Number(declared[1]),
+    SUPPORTED_REPORT_SCHEMA_VERSION,
+    "scripts/qualify-capacity.cjs SUPPORTED_REPORT_SCHEMA_VERSION is stale; "
+    + "keep it in step with REPORT_SCHEMA_VERSION in src/capacity.rs",
+  );
 });
