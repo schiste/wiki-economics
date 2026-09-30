@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 "use strict";
 
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -151,17 +152,37 @@ function activeLeases(root, now = Date.now()) {
     const lease = readJson(file);
     const heartbeat = Date.parse(lease?.heartbeatAt || 0);
     if (lease?.schemaVersion !== 1 || !Number.isFinite(heartbeat) || now - heartbeat > LEASE_STALE_MS) {
-      const archived = path.join(root, `.stale-${Date.now()}-${name.name}`);
-      try {
-        fs.renameSync(file, archived);
-      } catch (error) {
-        if (error.code !== "ENOENT") throw error;
-      }
+      archiveStaleLease(file, name.name, now);
       continue;
     }
     leases.push({...lease, file});
   }
   return leases;
+}
+
+// Move a stale lease aside under a fixed-length name.
+//
+// The archived name must not embed the previous name: `activeLeases` is
+// reachable concurrently because the guard directory is only held for the
+// read-modify-write, and it is stolen after LOCK_STALE_MS. A pod that lost the
+// race then archived the winner's already-archived name, stacking one
+// `.stale-<ts>-` prefix per occurrence until the name exceeded the 255-byte
+// filesystem limit and `renameSync` failed with ENAMETOOLONG — which then
+// aborted every subsequent admission. Deriving the archived name from a hash
+// of the original keeps it bounded no matter how often it is re-archived.
+function archiveStaleLease(file, name, now) {
+  const digest = crypto.createHash("sha256").update(name).digest("hex").slice(0, 32);
+  const archived = path.join(path.dirname(file), `.stale-${now}-${digest}.json`);
+  try {
+    fs.renameSync(file, archived);
+  } catch (error) {
+    // Another pod archived it first, or it is already gone. Both are the
+    // outcome this path wants, and neither should abort admission.
+    if (error.code !== "ENOENT" && error.code !== "EEXIST") {
+      if (error.code === "ENAMETOOLONG") return;
+      throw error;
+    }
+  }
 }
 
 function acquire({root, configFile, resourceClass, identity, now = Date.now()}) {
