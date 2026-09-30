@@ -2225,7 +2225,6 @@ fn compute_all_selected(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::resource_governor::ResourceBudget;
     use crate::test_support::{TestDir, init_test_tracing};
 
     #[test]
@@ -4221,7 +4220,7 @@ mod tests {
     fn two_level_routing_batches_more_secondary_buckets_than_budgeted() -> Result<()> {
         let output = TestDir::new()?;
         let runs = WeeklyRunDir::new(output.path(), "testwiki", None)?;
-        let mut budget = ResourceBudget::from_environment()?;
+        let mut budget = ResourceGovernor::budget_for_tests();
         budget.max_active_parquet_writers = 16;
         let governor = ResourceGovernor::new(
             budget,
@@ -4319,11 +4318,7 @@ mod tests {
                 staged_path: Some(staged_path),
             });
         }
-        let mut budget = ResourceBudget::from_environment()?;
-        budget.memory_ceiling_bytes = u64::MAX;
-        budget.memory_reserve_bytes = 0;
-        budget.scratch_limit_bytes = u64::MAX;
-        budget.max_open_files = usize::MAX;
+        let mut budget = ResourceGovernor::budget_for_tests();
         budget.thread_limit = workers;
         budget.weekly_worker_limit = workers;
         let governor = ResourceGovernor::new(
@@ -4409,11 +4404,7 @@ mod tests {
         let primary_path = runs.primary_path(0);
         ParquetWriter::new(File::create(&primary_path)?).finish(&mut frame)?;
 
-        let mut budget = ResourceBudget::from_environment()?;
-        budget.memory_ceiling_bytes = u64::MAX;
-        budget.memory_reserve_bytes = 0;
-        budget.scratch_limit_bytes = u64::MAX;
-        budget.max_open_files = usize::MAX;
+        let mut budget = ResourceGovernor::budget_for_tests();
         budget.max_active_parquet_writers = 16;
         let governor = ResourceGovernor::new(
             budget,

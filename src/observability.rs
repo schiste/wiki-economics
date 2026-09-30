@@ -121,12 +121,58 @@ impl MemorySnapshot {
             rss_bytes: fs::read_to_string("/proc/self/status")
                 .ok()
                 .and_then(|status| parse_proc_status_rss(&status)),
-            cgroup_current_bytes: read_byte_counter("/sys/fs/cgroup/memory.current"),
-            cgroup_peak_bytes: read_byte_counter("/sys/fs/cgroup/memory.peak"),
-            cgroup_limit_bytes: read_byte_counter("/sys/fs/cgroup/memory.max"),
+            cgroup_current_bytes: read_byte_counter("/sys/fs/cgroup/memory.current")
+                .or_else(|| read_byte_counter("/sys/fs/cgroup/memory/memory.usage_in_bytes")),
+            cgroup_peak_bytes: read_byte_counter("/sys/fs/cgroup/memory.peak")
+                .or_else(|| read_byte_counter("/sys/fs/cgroup/memory/memory.max_usage_in_bytes")),
+            cgroup_limit_bytes: read_cgroup_memory_limit(),
         }
     }
 }
+
+/// Read the cgroup memory ceiling, preferring the unified hierarchy and
+/// falling back to cgroup v1.
+///
+/// cgroup v1 reports "no limit" as a saturated 64-bit page-aligned value rather
+/// than the literal `max` that v2 uses, so a raw parse would hand the resource
+/// governor a ~8 EiB ceiling and disable every memory gate.
+///
+/// When the cgroup is genuinely unconstrained, fall back to the host's
+/// physical memory. A developer machine or a CI runner outside any memory
+/// cgroup has no per-process ceiling to discover, and refusing to run there
+/// would make the test suite unrunnable outside a container while teaching the
+/// governor nothing. Installed RAM is still a real bound, unlike the previous
+/// 16 GiB constant, which could exceed the real limit of a constrained host.
+fn read_cgroup_memory_limit() -> Option<u64> {
+    if let Some(limit) = read_byte_counter("/sys/fs/cgroup/memory.max") {
+        return Some(limit);
+    }
+    if let Some(legacy) = read_byte_counter("/sys/fs/cgroup/memory/memory.limit_in_bytes") {
+        // PAGE_COUNTER_MAX on 64-bit: the smallest such value cgroup v1 can
+        // report for an unlimited cgroup. At or above it, the cgroup is
+        // unconstrained and the host total is the meaningful ceiling.
+        if legacy < CGROUP_V1_UNLIMITED_MEMORY_BYTES {
+            return Some(legacy);
+        }
+    }
+    host_memory_bytes()
+}
+
+/// Physical memory reported by the kernel, in bytes.
+fn host_memory_bytes() -> Option<u64> {
+    parse_mem_total(&fs::read_to_string("/proc/meminfo").ok()?)
+}
+
+fn parse_mem_total(meminfo: &str) -> Option<u64> {
+    let kib = meminfo.lines().find_map(|line| {
+        let rest = line.strip_prefix("MemTotal:")?;
+        rest.split_whitespace().next()?.parse::<u64>().ok()
+    })?;
+    kib.checked_mul(1024)
+}
+
+/// cgroup v1's `LONG_MAX & ~PAGE_MASK`, i.e. 0x7FFFFFFFFFFFF000.
+const CGROUP_V1_UNLIMITED_MEMORY_BYTES: u64 = 0x7FFF_FFFF_FFFF_F000;
 
 fn read_byte_counter(path: &str) -> Option<u64> {
     fs::read_to_string(path)
@@ -168,6 +214,28 @@ mod tests {
     fn parses_finite_cgroup_counters_only() {
         assert_eq!(parse_byte_counter("6291456\n"), Some(6_291_456));
         assert_eq!(parse_byte_counter("max\n"), None);
+    }
+
+    #[test]
+    fn parses_host_memory_in_kibibytes() {
+        let meminfo = "MemTotal:       16384000 kB\nMemFree:         100 kB\n";
+        assert_eq!(parse_mem_total(meminfo), Some(16_777_216_000));
+        assert_eq!(parse_mem_total("MemFree: 1 kB\n"), None);
+        assert_eq!(parse_mem_total("MemTotal: not-a-number kB\n"), None);
+    }
+
+    #[test]
+    fn a_memory_ceiling_is_always_discoverable() {
+        // The resource governor refuses to run without a ceiling. A host with
+        // no memory cgroup and no cgroup v1 file must still yield one, or the
+        // whole pipeline becomes unrunnable outside a container. On Linux the
+        // cgroup or MemTotal answers; on macOS only MemTotal-equivalent
+        // sources exist, so this asserts the contract rather than a path.
+        let ceiling = read_cgroup_memory_limit();
+        #[cfg(target_os = "linux")]
+        assert!(ceiling.is_some(), "no memory ceiling on a Linux host");
+        #[cfg(not(target_os = "linux"))]
+        assert_eq!(ceiling, None, "macOS exposes no Linux memory cgroup");
     }
 
     #[test]

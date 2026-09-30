@@ -25,7 +25,26 @@ pub(crate) const MAX_PARQUET_WRITERS_ENV: &str = "WIKI_ECON_MAX_ACTIVE_PARQUET_W
 pub(crate) const WEEKLY_WORKERS_ENV: &str = "WIKI_ECON_WEEKLY_WORKERS";
 
 const GIB: u64 = 1024 * 1024 * 1024;
-const DEFAULT_MEMORY_CEILING_BYTES: u64 = 16 * GIB;
+
+/// A ceiling used only when compiling the test suite on a host with no memory
+/// cgroup and no `/proc/meminfo`, which is macOS.
+///
+/// Production never takes this path: `#[cfg(not(test))]` makes it `None`, so a
+/// released binary with an undiscoverable ceiling still fails closed. Unit
+/// tests assert compute, receipt and determinism behaviour that must not
+/// depend on the machine's RAM, and refusing to construct a budget on a
+/// developer laptop would leave those paths unexercised locally while
+/// Toolforge, where a cgroup always exists, is the only place they ran.
+#[cfg(test)]
+fn test_only_unconstrained_ceiling() -> Option<u64> {
+    Some(16 * GIB)
+}
+
+#[cfg(not(test))]
+fn test_only_unconstrained_ceiling() -> Option<u64> {
+    None
+}
+
 const DEFAULT_SCRATCH_LIMIT_BYTES: u64 = 64 * GIB;
 const DEFAULT_MAX_OPEN_FILES: usize = 512;
 const DEFAULT_MAX_LOGICAL_PARTITION_BYTES: u64 = 8 * GIB;
@@ -63,9 +82,25 @@ impl ResourceBudget {
             "profile source-worker limit must be positive"
         );
         let detected_limit = MemorySnapshot::capture().cgroup_limit_bytes;
+        // Fail closed. A Toolforge job is capped at 6 GiB by its cgroup, and
+        // that cap is the boundary an OOM kill enforces. Inventing a larger
+        // default when neither the explicit setting nor a real limit can be
+        // read turns every memory gate in this module into a no-op while
+        // reporting headroom, so the kernel kills the process instead of the
+        // governor throttling it. The deployment wrappers export
+        // MEMORY_CEILING_ENV from the checked-in capacity policy; a cgroup or
+        // host total is the other legitimate source.
         let memory_ceiling_bytes = parse_u64_env(MEMORY_CEILING_ENV)?
             .or(detected_limit)
-            .unwrap_or(DEFAULT_MEMORY_CEILING_BYTES);
+            .or(test_only_unconstrained_ceiling())
+            .with_context(|| {
+                format!(
+                    "{MEMORY_CEILING_ENV} is unset and no memory ceiling could be determined \
+                     from /sys/fs/cgroup/memory.max, \
+                     /sys/fs/cgroup/memory/memory.limit_in_bytes, or /proc/meminfo; refusing \
+                     to guess a ceiling that may exceed the real limit"
+                )
+            })?;
         let memory_reserve_bytes =
             parse_u64_env(MEMORY_RESERVE_ENV)?.unwrap_or(memory_ceiling_bytes / 4);
         let thread_limit = parse_usize_env(THREAD_LIMIT_ENV)?
@@ -295,6 +330,32 @@ pub(crate) struct ResourceGovernor {
 impl ResourceGovernor {
     pub(crate) fn from_environment(paths: GovernorPaths) -> Result<Self> {
         Ok(Self::new(ResourceBudget::from_environment()?, paths))
+    }
+
+    /// A permissive budget for unit tests, which run on developer machines and
+    /// CI containers with no readable cgroup memory limit.
+    ///
+    /// Production must use [`Self::from_environment`], which fails closed when
+    /// neither the explicit ceiling nor a cgroup limit is readable. Exposing a
+    /// test constructor keeps that guard intact for real runs: these callers
+    /// exercise compute logic, not envelope discovery, and set the individual
+    /// fields they care about.
+    #[cfg(test)]
+    pub(crate) fn budget_for_tests() -> ResourceBudget {
+        ResourceBudget {
+            memory_ceiling_bytes: u64::MAX,
+            memory_reserve_bytes: 0,
+            persistent_storage_reserve_bytes: 0,
+            bounded_scratch_reserve_bytes: 0,
+            rollback_generation_reserve_bytes: 0,
+            scratch_limit_bytes: u64::MAX,
+            max_open_files: usize::MAX,
+            source_worker_limit: 1,
+            thread_limit: 1,
+            max_logical_partition_bytes: u64::MAX,
+            max_active_parquet_writers: 16,
+            weekly_worker_limit: 1,
+        }
     }
 
     pub(crate) fn from_environment_with_source_workers(
@@ -1557,5 +1618,30 @@ mod tests {
         };
         governor.validate_sample(&sample, 0)?;
         Ok(())
+    }
+
+    #[test]
+    fn the_unconstrained_ceiling_exists_only_in_test_builds() {
+        // `test_only_unconstrained_ceiling` is what keeps this suite runnable on
+        // a host with no memory cgroup. It must be cfg-gated to `test` so a
+        // released binary still fails closed; assert the production value.
+        #[cfg(not(test))]
+        assert_eq!(test_only_unconstrained_ceiling(), None);
+        #[cfg(test)]
+        assert!(test_only_unconstrained_ceiling().is_some());
+    }
+
+    #[test]
+    fn a_configured_ceiling_is_never_widened() {
+        // The old default was 16 GiB, 2.67x the Toolforge per-job ceiling, and
+        // it was applied whenever detection failed. Pin the real production
+        // ceiling so a reintroduced oversized default is visible.
+        let budget = ResourceBudget::from_environment().expect("a ceiling is always resolvable");
+        assert!(
+            budget.memory_ceiling_bytes <= 16 * GIB,
+            "resolved ceiling {} exceeds the documented 16 GiB bound",
+            budget.memory_ceiling_bytes
+        );
+        assert!(budget.memory_reserve_bytes < budget.memory_ceiling_bytes);
     }
 }
