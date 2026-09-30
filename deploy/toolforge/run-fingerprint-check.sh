@@ -18,6 +18,7 @@ log_dir="$WIKI_ECON_OUTPUT_DIR/logs/publication"
 mkdir -p "$log_dir"
 log_file="$log_dir/$run_id.log"
 exec > >(tee -a "$log_file") 2>&1
+# shellcheck disable=SC2154  # `status` is assigned by the trap itself, then read.
 trap 'status=$?; if [ "$status" -ne 0 ]; then echo "!!! FINGERPRINT DRIFT CHECK FAILED run_id=$run_id report=$report log_file=$log_file" >&2; fi' EXIT
 echo "=== fingerprint check start run_id=$run_id at=$(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
 
