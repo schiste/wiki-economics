@@ -144,10 +144,26 @@ impl MemorySnapshot {
 /// governor nothing. Installed RAM is still a real bound, unlike the previous
 /// 16 GiB constant, which could exceed the real limit of a constrained host.
 fn read_cgroup_memory_limit() -> Option<u64> {
-    if let Some(limit) = read_byte_counter("/sys/fs/cgroup/memory.max") {
+    resolve_cgroup_memory_limit(
+        read_byte_counter("/sys/fs/cgroup/memory.max"),
+        read_byte_counter("/sys/fs/cgroup/memory/memory.limit_in_bytes"),
+        host_memory_bytes,
+    )
+}
+
+/// Select a memory ceiling from the candidates, most specific first.
+///
+/// Split from [`read_cgroup_memory_limit`] so the precedence and the
+/// "unlimited" sentinel are testable without a real cgroup on disk.
+fn resolve_cgroup_memory_limit(
+    unified: Option<u64>,
+    legacy: Option<u64>,
+    host_total: impl FnOnce() -> Option<u64>,
+) -> Option<u64> {
+    if let Some(limit) = unified {
         return Some(limit);
     }
-    if let Some(legacy) = read_byte_counter("/sys/fs/cgroup/memory/memory.limit_in_bytes") {
+    if let Some(legacy) = legacy {
         // PAGE_COUNTER_MAX on 64-bit: the smallest such value cgroup v1 can
         // report for an unlimited cgroup. At or above it, the cgroup is
         // unconstrained and the host total is the meaningful ceiling.
@@ -155,7 +171,7 @@ fn read_cgroup_memory_limit() -> Option<u64> {
             return Some(legacy);
         }
     }
-    host_memory_bytes()
+    host_total()
 }
 
 /// Physical memory reported by the kernel, in bytes.
@@ -236,6 +252,52 @@ mod tests {
         assert!(ceiling.is_some(), "no memory ceiling on a Linux host");
         #[cfg(not(target_os = "linux"))]
         assert_eq!(ceiling, None, "macOS exposes no Linux memory cgroup");
+    }
+
+    #[test]
+    fn the_unified_cgroup_ceiling_wins_over_every_other_source() {
+        assert_eq!(
+            resolve_cgroup_memory_limit(Some(6_442_450_944), Some(1), || Some(99)),
+            Some(6_442_450_944)
+        );
+    }
+
+    #[test]
+    fn a_legacy_ceiling_is_used_when_no_unified_one_exists() {
+        assert_eq!(
+            resolve_cgroup_memory_limit(None, Some(2_147_483_648), || Some(99)),
+            Some(2_147_483_648)
+        );
+    }
+
+    #[test]
+    fn an_unlimited_legacy_cgroup_falls_through_to_the_host_total() {
+        // cgroup v1 reports "unlimited" as a saturated page-aligned value. It
+        // must not be adopted as a ceiling: that is an ~8 EiB budget which
+        // disables every memory gate.
+        assert_eq!(
+            resolve_cgroup_memory_limit(None, Some(CGROUP_V1_UNLIMITED_MEMORY_BYTES), || Some(
+                16_777_216_000
+            )),
+            Some(16_777_216_000),
+        );
+        assert_eq!(
+            resolve_cgroup_memory_limit(
+                None,
+                Some(CGROUP_V1_UNLIMITED_MEMORY_BYTES + 4096),
+                || Some(1)
+            ),
+            Some(1),
+        );
+    }
+
+    #[test]
+    fn the_host_total_is_the_last_resort_and_may_itself_be_absent() {
+        assert_eq!(
+            resolve_cgroup_memory_limit(None, None, || Some(8_388_608_000)),
+            Some(8_388_608_000)
+        );
+        assert_eq!(resolve_cgroup_memory_limit(None, None, || None), None);
     }
 
     #[test]

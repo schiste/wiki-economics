@@ -26,23 +26,38 @@ pub(crate) const WEEKLY_WORKERS_ENV: &str = "WIKI_ECON_WEEKLY_WORKERS";
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
-/// A ceiling used only when compiling the test suite on a host with no memory
-/// cgroup and no `/proc/meminfo`, which is macOS.
+/// The largest ceiling this module will ever resolve on its own.
 ///
-/// Production never takes this path: `#[cfg(not(test))]` makes it `None`, so a
-/// released binary with an undiscoverable ceiling still fails closed. Unit
-/// tests assert compute, receipt and determinism behaviour that must not
-/// depend on the machine's RAM, and refusing to construct a budget on a
-/// developer laptop would leave those paths unexercised locally while
-/// Toolforge, where a cgroup always exists, is the only place they ran.
-#[cfg(test)]
-fn test_only_unconstrained_ceiling() -> Option<u64> {
-    Some(16 * GIB)
-}
+/// Production is bounded by a cgroup or an explicit setting, both of which are
+/// far smaller; this only applies to a host that has neither, which is a
+/// developer machine or a CI container with no memory cgroup. Unit tests assert
+/// compute, receipt and determinism behaviour that must not depend on the
+/// machine's RAM, so refusing to build a budget on a laptop would leave those
+/// paths unexercised everywhere except Toolforge.
+///
+/// It is deliberately not the old `DEFAULT_MEMORY_CEILING_BYTES`, and it is
+/// the last link in the chain rather than the first: a discoverable limit
+/// always takes precedence, and only when none exists does this apply.
+const UNCONSTRAINED_HOST_CEILING_BYTES: u64 = 16 * GIB;
 
+/// True only in test builds, so a released binary still fails closed when no
+/// ceiling can be discovered.
+#[cfg(test)]
+const ALLOW_UNCONSTRAINED_HOST_CEILING: bool = true;
 #[cfg(not(test))]
-fn test_only_unconstrained_ceiling() -> Option<u64> {
-    None
+const ALLOW_UNCONSTRAINED_HOST_CEILING: bool = false;
+
+/// The error surfaced when no memory ceiling can be determined.
+///
+/// Named so it can be asserted directly: the failure itself only occurs in
+/// non-test builds, since test builds always have the unconstrained fallback.
+fn undiscoverable_ceiling_message() -> String {
+    format!(
+        "{MEMORY_CEILING_ENV} is unset and no memory ceiling could be determined \
+         from /sys/fs/cgroup/memory.max, \
+         /sys/fs/cgroup/memory/memory.limit_in_bytes, or /proc/meminfo; refusing \
+         to guess a ceiling that may exceed the real limit"
+    )
 }
 
 const DEFAULT_SCRATCH_LIMIT_BYTES: u64 = 64 * GIB;
@@ -90,17 +105,12 @@ impl ResourceBudget {
         // governor throttling it. The deployment wrappers export
         // MEMORY_CEILING_ENV from the checked-in capacity policy; a cgroup or
         // host total is the other legitimate source.
+        let unconstrained_host_ceiling =
+            ALLOW_UNCONSTRAINED_HOST_CEILING.then_some(UNCONSTRAINED_HOST_CEILING_BYTES);
         let memory_ceiling_bytes = parse_u64_env(MEMORY_CEILING_ENV)?
             .or(detected_limit)
-            .or(test_only_unconstrained_ceiling())
-            .with_context(|| {
-                format!(
-                    "{MEMORY_CEILING_ENV} is unset and no memory ceiling could be determined \
-                     from /sys/fs/cgroup/memory.max, \
-                     /sys/fs/cgroup/memory/memory.limit_in_bytes, or /proc/meminfo; refusing \
-                     to guess a ceiling that may exceed the real limit"
-                )
-            })?;
+            .or(unconstrained_host_ceiling)
+            .with_context(undiscoverable_ceiling_message)?;
         let memory_reserve_bytes =
             parse_u64_env(MEMORY_RESERVE_ENV)?.unwrap_or(memory_ceiling_bytes / 4);
         let thread_limit = parse_usize_env(THREAD_LIMIT_ENV)?
@@ -330,32 +340,6 @@ pub(crate) struct ResourceGovernor {
 impl ResourceGovernor {
     pub(crate) fn from_environment(paths: GovernorPaths) -> Result<Self> {
         Ok(Self::new(ResourceBudget::from_environment()?, paths))
-    }
-
-    /// A permissive budget for unit tests, which run on developer machines and
-    /// CI containers with no readable cgroup memory limit.
-    ///
-    /// Production must use [`Self::from_environment`], which fails closed when
-    /// neither the explicit ceiling nor a cgroup limit is readable. Exposing a
-    /// test constructor keeps that guard intact for real runs: these callers
-    /// exercise compute logic, not envelope discovery, and set the individual
-    /// fields they care about.
-    #[cfg(test)]
-    pub(crate) fn budget_for_tests() -> ResourceBudget {
-        ResourceBudget {
-            memory_ceiling_bytes: u64::MAX,
-            memory_reserve_bytes: 0,
-            persistent_storage_reserve_bytes: 0,
-            bounded_scratch_reserve_bytes: 0,
-            rollback_generation_reserve_bytes: 0,
-            scratch_limit_bytes: u64::MAX,
-            max_open_files: usize::MAX,
-            source_worker_limit: 1,
-            thread_limit: 1,
-            max_logical_partition_bytes: u64::MAX,
-            max_active_parquet_writers: 16,
-            weekly_worker_limit: 1,
-        }
     }
 
     pub(crate) fn from_environment_with_source_workers(
@@ -1621,14 +1605,20 @@ mod tests {
     }
 
     #[test]
-    fn the_unconstrained_ceiling_exists_only_in_test_builds() {
-        // `test_only_unconstrained_ceiling` is what keeps this suite runnable on
-        // a host with no memory cgroup. It must be cfg-gated to `test` so a
-        // released binary still fails closed; assert the production value.
-        #[cfg(not(test))]
-        assert_eq!(test_only_unconstrained_ceiling(), None);
-        #[cfg(test)]
-        assert!(test_only_unconstrained_ceiling().is_some());
+    fn the_unconstrained_ceiling_is_bounded_and_test_only() {
+        // The fallback is what keeps the suite runnable on a host with no
+        // memory cgroup. It must stay a plausible ceiling, and its enabling
+        // flag must be `false` in a released binary, which the `cfg(not(test))`
+        // definition guarantees: this test only runs in test builds, where the
+        // flag is necessarily true.
+        let resolved = ALLOW_UNCONSTRAINED_HOST_CEILING
+            .then_some(UNCONSTRAINED_HOST_CEILING_BYTES)
+            .expect("test builds enable the fallback");
+        assert_eq!(
+            resolved,
+            16 * GIB,
+            "the unconstrained fallback must stay a plausible host ceiling, not an arbitrary size",
+        );
     }
 
     #[test]
@@ -1643,5 +1633,23 @@ mod tests {
             budget.memory_ceiling_bytes
         );
         assert!(budget.memory_reserve_bytes < budget.memory_ceiling_bytes);
+    }
+
+    #[test]
+    fn the_fail_closed_message_names_the_setting_and_every_ceiling_source() {
+        // The failure only occurs in non-test builds, so assert the message an
+        // operator would actually see, and that it is actionable.
+        let message = undiscoverable_ceiling_message();
+        assert!(message.contains(MEMORY_CEILING_ENV));
+        for source in [
+            "/sys/fs/cgroup/memory.max",
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+            "/proc/meminfo",
+        ] {
+            assert!(
+                message.contains(source),
+                "message omits the {source} source"
+            );
+        }
     }
 }
