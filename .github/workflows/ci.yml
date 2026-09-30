@@ -113,92 +113,32 @@ jobs:
       - name: Run shellcheck
         uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38  # 2.0.0
         with:
-          additional_files: scripts/lib/wiki_econ.sh
           scandir: ./scripts ./site/data-build ./deploy/cloud-vps ./deploy/toolforge
 
       - name: Check Node entrypoint syntax
         run: |
-          node --check site/admin-auth.cjs
-          node --check site/admin-server.cjs
-          node --check site/freshness.cjs
-          node --check deploy/toolforge/qualification-receipt.cjs
-          node --check deploy/toolforge/qualification-proof.cjs
-          node -e 'const p=require("./config/operations-slos.json"); if(p.schema_version !== 1) process.exit(1)'
-          node --check site/observablehq.config.js
-          node --check scripts/check-npm-advisories.cjs
-          node --check scripts/check-npm-licenses.cjs
-          node --check scripts/check-vendor-patches.cjs
-          node --check scripts/build-site-fixture.cjs
-          node --check scripts/deny-network.cjs
-          node --check scripts/check-freshness.cjs
-          node --check scripts/prepare-site-source.cjs
-          node --check scripts/publish-static-root.cjs
-          node --check scripts/release-provenance.cjs
-          node --check scripts/generate-sboms.cjs
-          node --check scripts/generate-stack-reference.cjs
-          node --check scripts/release-bundle.cjs
-          node --check scripts/verify-runtime.cjs
-          node --check scripts/verify-site-dependencies.cjs
-          node --check scripts/verify-site-reproducibility.cjs
-          node --check scripts/publish-browser-data.cjs
-          node --check scripts/browser-performance.cjs
-          node --check scripts/check-compute-versions.cjs
-          node --check scripts/site-source-bundle.cjs
+          # Syntax-check every Node module and script, not a hand-kept subset.
+          # The previous list silently skipped 15 modules, among them the
+          # pipeline coordinator, the capacity ledger and the public API.
+          shopt -s nullglob
+          for module in scripts/*.cjs scripts/*.mjs \
+            deploy/toolforge/*.cjs site/*.cjs site/*.mjs \
+            site/data-build/*.cjs site/*.js; do
+            node --check "$module"
+          done
 
       - name: Run Node unit tests
         run: |
-          node --test site/admin-auth.test.cjs
-          node --test site/admin-lifecycle.test.cjs
-          node --test site/admin-quality.test.cjs
-          node --test site/admin-operational-truth.test.cjs
-          node --test site/admin-page.test.cjs
-          node --test site/admin-server.test.cjs
-          node --test site/build-site.test.cjs
-          node --test site/mobile-layout.test.cjs
-          node --test site/robots.test.cjs
-          node --test site/data-build/manifest.test.cjs
-          node --test site/freshness.test.cjs
-          node --test deploy/toolforge/run-record.test.cjs
-          node --test deploy/toolforge/qualification-receipt.test.cjs
-          node --test deploy/toolforge/qualification-proof.test.cjs
-          node --test deploy/toolforge/run-refresh.test.cjs
-          node --test deploy/toolforge/run-publish-ready.test.cjs
-          node --test deploy/toolforge/install-binary.test.cjs
-          node --test deploy/toolforge/download-release.test.cjs
-          node --test deploy/toolforge/download-site-source.test.cjs
-          node --test deploy/toolforge/install-site-source.test.cjs
-          node --test deploy/toolforge/run-publication-qualification.test.cjs
-          node --test deploy/toolforge/prune-releases.test.cjs
-          node --test deploy/toolforge/run-capacity-benchmark.test.cjs
-          node --test deploy/toolforge/run-qualify-wiki.test.cjs
-          node --test deploy/toolforge/rebuild-image.test.cjs
-          node --test deploy/toolforge/load-scheduled-jobs.test.cjs
-          node --test deploy/toolforge/run-fleet-worker.test.cjs
-          node --test deploy/toolforge/imported-backup.test.cjs
-          node --test deploy/toolforge/recovery-operations.test.cjs
-          node --test scripts/check-npm-advisories.test.cjs
-          node --test scripts/check-npm-licenses.test.cjs
-          node --test scripts/build-site-fixture.test.cjs
-          node --test scripts/check-freshness.test.cjs
-          node --test scripts/prepare-site-source.test.cjs
-          node --test scripts/publish-static-root.test.cjs
-          node --test scripts/release-provenance.test.cjs
-          node --test scripts/generate-sboms.test.cjs
-          node --test scripts/generate-stack-reference.test.cjs
-          node --test scripts/release-bundle.test.cjs
-          node --test scripts/qualify-capacity.test.cjs
-          node --test scripts/verify-site-dependencies.test.cjs
-          node --test scripts/verify-site-reproducibility.test.cjs
-          node --test scripts/publish-browser-data.test.cjs
-          node --test scripts/browser-performance.test.cjs
-          node --test scripts/check-compute-versions.test.cjs
-          node --test scripts/check-fleet-qualification.test.cjs
-          node --test scripts/site-source-bundle.test.cjs
-          node --test site/browser-cache.test.mjs
-          node --test site/activity-tiers.test.mjs
-          node --test site/wiki-scope.test.mjs
-          node --test scripts/wiki-lifecycle.test.cjs
-          node --test scripts/wiki-econ-runtime.test.cjs
+          # Glob every suite so a new test file can never be added without
+          # being executed. An explicit list previously omitted 12 files,
+          # including the whole capacity-admission suite and the pipeline
+          # coordinator, none of which any gate ran.
+          node --test \
+            'deploy/toolforge/*.test.cjs' \
+            'scripts/*.test.cjs' \
+            'site/*.test.cjs' \
+            'site/*.test.mjs' \
+            'site/data-build/*.test.cjs'
           node scripts/check-fleet-qualification.cjs
 
       - name: Check helper CLI entrypoints

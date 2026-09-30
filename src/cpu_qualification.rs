@@ -12,6 +12,13 @@ const REQUIRED_WIKIS: [&str; 3] = ["nlwiki", "ptwiki", "frwiki"];
 const MINIMUM_MULTICPU_SPEEDUP: f64 = 1.15;
 const CPU_LIMIT_TOLERANCE: f64 = 0.05;
 
+/// Mirrors `minimum_memory_headroom_percent` in
+/// `config/capacity-qualification.json`, which `scripts/qualify-capacity.cjs`
+/// and `deploy/toolforge/run-capacity-benchmark.sh` also read. Kept as one
+/// named constant so a policy change is a single edit here rather than a hunt
+/// for a bare literal, and asserted against the checked-in policy by a test.
+const MINIMUM_MEMORY_HEADROOM_PERCENT: f64 = 25.0;
+
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub(crate) struct CpuProfile {
     pub cpu: usize,
@@ -323,9 +330,9 @@ pub(crate) fn run(paths: &[PathBuf], report_path: &Path) -> Result<CpuQualificat
         }
     }
 
-    if minimum_headroom < 25.0 {
+    if minimum_headroom < MINIMUM_MEMORY_HEADROOM_PERCENT {
         failures.push(format!(
-            "minimum observed memory headroom is {minimum_headroom:.2}%, below 25%"
+            "minimum observed memory headroom is {minimum_headroom:.2}%, below {MINIMUM_MEMORY_HEADROOM_PERCENT:.0}%"
         ));
     }
     let complete = actual_keys == required_keys;
@@ -375,7 +382,7 @@ pub(crate) fn run(paths: &[PathBuf], report_path: &Path) -> Result<CpuQualificat
     let promotion_eligible = complete
         && deterministic
         && telemetry_complete
-        && minimum_headroom >= 25.0
+        && minimum_headroom >= MINIMUM_MEMORY_HEADROOM_PERCENT
         && improvement_justified
         && failures.is_empty();
     let report = CpuQualificationReport {
@@ -675,5 +682,27 @@ mod tests {
                 .ends_with(".tmp")
         }));
         Ok(())
+    }
+
+    #[test]
+    fn memory_headroom_threshold_matches_the_checked_in_capacity_policy() {
+        // The threshold is duplicated in Rust, in scripts/qualify-capacity.cjs
+        // and in deploy/toolforge/run-capacity-benchmark.sh. This pins the Rust
+        // copy to the policy file the other two read.
+        const CAPACITY_POLICY: &str = include_str!("../config/capacity-qualification.json");
+        let declared = CAPACITY_POLICY
+            .lines()
+            .find_map(|line| {
+                let rest = line
+                    .trim()
+                    .strip_prefix("\"minimum_memory_headroom_percent\":")?;
+                rest.trim().trim_end_matches(',').parse::<f64>().ok()
+            })
+            .expect("minimum_memory_headroom_percent in config/capacity-qualification.json");
+        assert_eq!(
+            declared, MINIMUM_MEMORY_HEADROOM_PERCENT,
+            "MINIMUM_MEMORY_HEADROOM_PERCENT in src/cpu_qualification.rs is stale; \
+             update it to match config/capacity-qualification.json"
+        );
     }
 }

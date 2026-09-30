@@ -50,6 +50,17 @@ node scripts/check-compute-versions.cjs
 echo "==> bash -n scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh deploy/toolforge/*.sh"
 bash -n scripts/*.sh scripts/lib/*.sh site/data-build/*.sh deploy/cloud-vps/*.sh deploy/toolforge/*.sh
 
+# CI runs shellcheck on every script, so the local mirror must too. Skip with a
+# visible notice when the tool is absent, matching setup.sh --skip-quality-tools,
+# rather than letting a contributor discover the gap from a red CI run.
+echo "==> shellcheck"
+if command -v shellcheck >/dev/null 2>&1; then
+  shellcheck scripts/*.sh scripts/lib/*.sh site/data-build/*.sh \
+    deploy/cloud-vps/*.sh deploy/toolforge/*.sh
+else
+  echo "    shellcheck not installed; skipping (CI still enforces it)" >&2
+fi
+
 echo "==> node --check site/admin-auth.cjs"
 node --check site/admin-auth.cjs
 
@@ -87,101 +98,17 @@ node --check site/observablehq.config.js
 echo "==> node --check site/data-build/*.cjs"
 for f in site/data-build/*.cjs; do node --check "$f"; done
 
-echo "==> node --test site/admin-auth.test.cjs"
-node --test site/admin-auth.test.cjs
-node --test site/admin-lifecycle.test.cjs
-node --test site/admin-quality.test.cjs
-node --test site/admin-operational-truth.test.cjs
-node --test site/admin-operation-status.test.cjs
-node --test site/admin-page.test.cjs
-node --test site/admin-console.test.mjs
-
-echo "==> node --test site/admin-server.test.cjs"
-node --test site/admin-server.test.cjs
-node --test site/machine-api.test.cjs
-node --test scripts/build-admin-site.test.cjs
-
-echo "==> node --test site/build-site.test.cjs"
-node --test site/build-site.test.cjs
-
-echo "==> node --test site/mobile-layout.test.cjs"
-node --test site/mobile-layout.test.cjs
-
-echo "==> node --test site/robots.test.cjs"
-node --test site/robots.test.cjs
-
-echo "==> node --test site/data-build/manifest.test.cjs site/freshness.test.cjs"
-node --test site/data-build/manifest.test.cjs
-node --test site/freshness.test.cjs
-
-echo "==> node --test deploy/toolforge/run-record.test.cjs"
-node --test deploy/toolforge/run-record.test.cjs
-node --test deploy/toolforge/qualification-receipt.test.cjs
-
-echo "==> node --test deploy/toolforge/run-refresh.test.cjs"
-node --test deploy/toolforge/run-refresh.test.cjs
-node --test deploy/toolforge/run-publish-ready.test.cjs
-
-echo "==> node --test deploy/toolforge/prune-releases.test.cjs"
-node --test deploy/toolforge/prune-releases.test.cjs
-
-echo "==> node --test deploy/toolforge/install-binary.test.cjs"
-node --test deploy/toolforge/install-binary.test.cjs
-node --test deploy/toolforge/download-release.test.cjs
-node --test deploy/toolforge/download-site-source.test.cjs
-node --test deploy/toolforge/install-site-source.test.cjs
-node --test deploy/toolforge/run-publication-qualification.test.cjs
-
-echo "==> node --test deploy/toolforge/run-capacity-benchmark.test.cjs"
-node --test deploy/toolforge/run-capacity-benchmark.test.cjs
-node --test deploy/toolforge/run-qualify-wiki.test.cjs
-node --test deploy/toolforge/rebuild-image.test.cjs
-node --test deploy/toolforge/load-scheduled-jobs.test.cjs
-node --test deploy/toolforge/admin-operation-policy.test.cjs
-node --test deploy/toolforge/capacity-admission.test.cjs
-node --test deploy/toolforge/run-compatibility-cohort.test.cjs
-node --test deploy/toolforge/run-fleet-worker.test.cjs
-node --test deploy/toolforge/imported-backup.test.cjs
-node --test deploy/toolforge/recovery-operations.test.cjs
-
-echo "==> node --test scripts/check-freshness.test.cjs"
-node --test scripts/check-freshness.test.cjs
-
-echo "==> node --test scripts/check-npm-advisories.test.cjs"
-node --test scripts/check-npm-advisories.test.cjs
-
-echo "==> node --test scripts/check-npm-licenses.test.cjs"
-node --test scripts/check-npm-licenses.test.cjs
-
-echo "==> node --test scripts/build-site-fixture.test.cjs"
-node --test scripts/build-site-fixture.test.cjs
-
-echo "==> dependency closure and reproducibility unit tests"
-node --test scripts/prepare-site-source.test.cjs
-node --test scripts/release-provenance.test.cjs
-node --test scripts/generate-sboms.test.cjs
-node --test scripts/generate-stack-reference.test.cjs
-node --test scripts/release-bundle.test.cjs
-node --test scripts/qualify-capacity.test.cjs
-node --test scripts/verify-site-dependencies.test.cjs
-node --test scripts/verify-site-reproducibility.test.cjs
-node --test scripts/publish-browser-data.test.cjs
-node --test scripts/publish-static-root.test.cjs
-node --test scripts/browser-performance.test.cjs
-node --test scripts/check-compute-versions.test.cjs
-node --test scripts/check-fleet-qualification.test.cjs
-node --test scripts/site-source-bundle.test.cjs
-node --test site/browser-cache.test.mjs
-node --test site/activity-tiers.test.mjs
-node --test site/wiki-scope.test.mjs
-node --test site/metric-parity.test.mjs
-node --test site/account-cohorts.test.mjs
-
-echo "==> node --test scripts/wiki-lifecycle.test.cjs"
-node --test scripts/wiki-lifecycle.test.cjs
-
-echo "==> node --test scripts/wiki-econ-runtime.test.cjs"
-node --test scripts/wiki-econ-runtime.test.cjs
+echo "==> node --test (every suite, globbed)"
+# Glob so a new test file can never be added without being executed. The
+# previous explicit list omitted three suites entirely, including the
+# pipeline coordinator, which is why its stale expectations went unnoticed.
+shopt -s nullglob
+node --test \
+  'deploy/toolforge/*.test.cjs' \
+  'scripts/*.test.cjs' \
+  'site/*.test.cjs' \
+  'site/*.test.mjs' \
+  'site/data-build/*.test.cjs'
 
 echo "==> ./scripts/build-site.sh --help"
 ./scripts/build-site.sh --help

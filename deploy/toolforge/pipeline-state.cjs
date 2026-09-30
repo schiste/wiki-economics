@@ -271,9 +271,6 @@ function begin(args) {
     if (JSON.stringify([...state.wikis].sort()) !== JSON.stringify(wikis)) {
       fail(`pipeline wiki set does not match state: expected ${state.wikis.join(",")}, got ${wikis.join(",")}`);
     }
-    if (suppliedSnapshot && suppliedSnapshot !== state.snapshot) {
-      fail(`pipeline snapshot does not match state: expected ${state.snapshot}, got ${suppliedSnapshot}`);
-    }
     if (activeStages(state).length > 0) {
       const staleAfterSecs = Number(args["stale-after-secs"] || 0);
       if (recoverStaleStages(state, staleAfterSecs)) {
@@ -283,6 +280,12 @@ function begin(args) {
     if (stage === "ingest") {
       // A new ingest starts a new generation and invalidates all downstream
       // receipts. It is allowed only while no other pod owns a stage.
+      //
+      // A new generation deliberately carries a new snapshot, so the snapshot
+      // identity guard applies only to the compute and publish stages below.
+      // Applying it to ingest as well made every post-publication
+      // `begin ingest` fail with a snapshot mismatch, because this state
+      // document outlives a completed generation and nothing else removes it.
       if (activeStages(state).length > 0) {
         fail(`pipeline stages ${activeStages(state).join(", ")} are already running; refusing ingest reset`);
       }
@@ -291,6 +294,9 @@ function begin(args) {
       state.snapshot = suppliedSnapshot;
       state.stages = blankStages();
     } else {
+      if (suppliedSnapshot && suppliedSnapshot !== state.snapshot) {
+        fail(`pipeline snapshot does not match state: expected ${state.snapshot}, got ${suppliedSnapshot}`);
+      }
       const active = activeStages(state);
       if (active.includes(stage)) fail(`pipeline stage ${stage} is already running; refusing duplicate work`);
       for (const prerequisite of PREREQUISITES[stage]) {

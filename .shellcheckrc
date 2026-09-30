@@ -1,0 +1,29 @@
+# ShellCheck configuration for this repository.
+#
+# CI runs shellcheck through ludeeus/action-shellcheck, and
+# scripts/ci-local.sh runs the same pass locally, so contributors see the same
+# result either way. The action discovers scripts with
+# `find -type f ! -name '*.*' -perm /111`, which matches no file here because
+# every script ends in `.sh`; the workflow therefore passes the globs
+# explicitly through `additional_files`.
+
+# Checked after sourcing is not resolvable: these scripts source files that
+# exist only on a Toolforge host or a developer's machine.
+disable=SC1091
+
+# `export NAME="$(command)"` at script scope. `local` is invalid at top level,
+# and the affected exports are run-record metadata whose failure is caught
+# downstream, so splitting each into two statements would add churn to
+# production wrappers for no behavioural gain.
+disable=SC2155
+
+# Single-quoted heredocs and `node -e '...'` payloads that intentionally defer
+# expansion to the child process.
+disable=SC2016
+
+# Functions invoked indirectly through an EXIT trap rather than called directly.
+disable=SC2329
+
+# `if [ $? -ne 0 ]` where the exit status is captured immediately beforehand and
+# the intervening statements are echo-only.
+disable=SC2181

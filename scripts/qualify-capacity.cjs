@@ -4,6 +4,12 @@
 const fs = require("node:fs");
 const path = require("node:path");
 
+// Must track REPORT_SCHEMA_VERSION in src/capacity.rs. That constant is bumped
+// whenever the report gains or changes a field, so an unknown version here
+// means this gate is stale and would reject every report the binary can emit
+// before examining any memory evidence.
+const SUPPORTED_REPORT_SCHEMA_VERSION = 5;
+
 function parseArguments(argv) {
   const options = {
     reports: null,
@@ -79,7 +85,14 @@ function validatePolicy(policy) {
 
 function validateReport(report, policy, expectedWiki, expectedBuckets, requirePassingGates = true) {
   const aggregation = report?.aggregation;
-  if (report?.schema_version !== 3 || report.wiki !== expectedWiki
+  if (report?.schema_version !== SUPPORTED_REPORT_SCHEMA_VERSION) {
+    throw new Error(
+      `capacity report schema version ${report?.schema_version} is not supported by this gate `
+      + `(supports ${SUPPORTED_REPORT_SCHEMA_VERSION}; keep in step with REPORT_SCHEMA_VERSION in `
+      + "src/capacity.rs)",
+    );
+  }
+  if (report.wiki !== expectedWiki
       || report.bucket_count !== expectedBuckets || !/^\d{4}-\d{2}$/.test(report.selected_snapshot || "")
       || report.memory_limit_bytes !== policy.memory_limit_bytes
       || report.minimum_memory_headroom_percent < policy.minimum_memory_headroom_percent
@@ -223,4 +236,13 @@ if (require.main === module) {
   try { main(); } catch (error) { console.error(error.stack || error.message); process.exitCode = 1; }
 }
 
-module.exports = {atomicWriteJson, comparableIdentity, parseArguments, qualify, reportFiles, validatePolicy, validateReport};
+module.exports = {
+  SUPPORTED_REPORT_SCHEMA_VERSION,
+  atomicWriteJson,
+  comparableIdentity,
+  parseArguments,
+  qualify,
+  reportFiles,
+  validatePolicy,
+  validateReport,
+};

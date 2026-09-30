@@ -653,3 +653,22 @@ test("rate limits machine calls per client and announces the rejection", async (
   assert.equal(discovery.security.mcp.max_batch_messages, 64);
   assert.ok(logs.some((entry) => entry.level === "info" && entry.message.includes("limit=2/s")));
 });
+
+test("the metric source allowance stays well under the resident pod limit", () => {
+  // The admin webservice runs with a 512 MiB cgroup on Toolforge. A source
+  // allowance equal to that would admit a request that exhausts the pod by
+  // itself, and decoding expands well beyond the source size.
+  const residentServiceBytes = 536870912;
+  const source = fs.readFileSync(path.join(__dirname, "machine-api.cjs"), "utf8");
+  const declared = Number(source.match(
+    /const MAX_METRIC_SOURCE_BYTES = (\d+) \* 1024 \* 1024;/)[1]) * 1024 * 1024;
+  assert.ok(declared * 4 < residentServiceBytes,
+    `MAX_METRIC_SOURCE_BYTES (${declared}) is too close to the ${residentServiceBytes} byte pod allowance`);
+  const rows = Number(source.match(
+    /const MAX_METRIC_SOURCE_ROWS = ([\d_]+);/)[1].replace(/_/g, ""));
+  assert.ok(rows <= 250_000, `MAX_METRIC_SOURCE_ROWS (${rows}) permits an unbounded materialisation`);
+  // And the cache must be budgeted in bytes, not entry count.
+  assert.match(source, /METRIC_ROWS_CACHE_BUDGET_BYTES/);
+  assert.doesNotMatch(source, /metricRowsCache\.size >= \d/,
+    "the decoded-row cache must be byte-budgeted, not entry-counted");
+});

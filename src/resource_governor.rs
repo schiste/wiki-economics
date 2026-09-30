@@ -25,7 +25,41 @@ pub(crate) const MAX_PARQUET_WRITERS_ENV: &str = "WIKI_ECON_MAX_ACTIVE_PARQUET_W
 pub(crate) const WEEKLY_WORKERS_ENV: &str = "WIKI_ECON_WEEKLY_WORKERS";
 
 const GIB: u64 = 1024 * 1024 * 1024;
-const DEFAULT_MEMORY_CEILING_BYTES: u64 = 16 * GIB;
+
+/// The largest ceiling this module will ever resolve on its own.
+///
+/// Production is bounded by a cgroup or an explicit setting, both of which are
+/// far smaller; this only applies to a host that has neither, which is a
+/// developer machine or a CI container with no memory cgroup. Unit tests assert
+/// compute, receipt and determinism behaviour that must not depend on the
+/// machine's RAM, so refusing to build a budget on a laptop would leave those
+/// paths unexercised everywhere except Toolforge.
+///
+/// It is deliberately not the old `DEFAULT_MEMORY_CEILING_BYTES`, and it is
+/// the last link in the chain rather than the first: a discoverable limit
+/// always takes precedence, and only when none exists does this apply.
+const UNCONSTRAINED_HOST_CEILING_BYTES: u64 = 16 * GIB;
+
+/// True only in test builds, so a released binary still fails closed when no
+/// ceiling can be discovered.
+#[cfg(test)]
+const ALLOW_UNCONSTRAINED_HOST_CEILING: bool = true;
+#[cfg(not(test))]
+const ALLOW_UNCONSTRAINED_HOST_CEILING: bool = false;
+
+/// The error surfaced when no memory ceiling can be determined.
+///
+/// Named so it can be asserted directly: the failure itself only occurs in
+/// non-test builds, since test builds always have the unconstrained fallback.
+fn undiscoverable_ceiling_message() -> String {
+    format!(
+        "{MEMORY_CEILING_ENV} is unset and no memory ceiling could be determined \
+         from /sys/fs/cgroup/memory.max, \
+         /sys/fs/cgroup/memory/memory.limit_in_bytes, or /proc/meminfo; refusing \
+         to guess a ceiling that may exceed the real limit"
+    )
+}
+
 const DEFAULT_SCRATCH_LIMIT_BYTES: u64 = 64 * GIB;
 const DEFAULT_MAX_OPEN_FILES: usize = 512;
 const DEFAULT_MAX_LOGICAL_PARTITION_BYTES: u64 = 8 * GIB;
@@ -63,9 +97,20 @@ impl ResourceBudget {
             "profile source-worker limit must be positive"
         );
         let detected_limit = MemorySnapshot::capture().cgroup_limit_bytes;
+        // Fail closed. A Toolforge job is capped at 6 GiB by its cgroup, and
+        // that cap is the boundary an OOM kill enforces. Inventing a larger
+        // default when neither the explicit setting nor a real limit can be
+        // read turns every memory gate in this module into a no-op while
+        // reporting headroom, so the kernel kills the process instead of the
+        // governor throttling it. The deployment wrappers export
+        // MEMORY_CEILING_ENV from the checked-in capacity policy; a cgroup or
+        // host total is the other legitimate source.
+        let unconstrained_host_ceiling =
+            ALLOW_UNCONSTRAINED_HOST_CEILING.then_some(UNCONSTRAINED_HOST_CEILING_BYTES);
         let memory_ceiling_bytes = parse_u64_env(MEMORY_CEILING_ENV)?
             .or(detected_limit)
-            .unwrap_or(DEFAULT_MEMORY_CEILING_BYTES);
+            .or(unconstrained_host_ceiling)
+            .with_context(undiscoverable_ceiling_message)?;
         let memory_reserve_bytes =
             parse_u64_env(MEMORY_RESERVE_ENV)?.unwrap_or(memory_ceiling_bytes / 4);
         let thread_limit = parse_usize_env(THREAD_LIMIT_ENV)?
@@ -1557,5 +1602,54 @@ mod tests {
         };
         governor.validate_sample(&sample, 0)?;
         Ok(())
+    }
+
+    #[test]
+    fn the_unconstrained_ceiling_is_bounded_and_test_only() {
+        // The fallback is what keeps the suite runnable on a host with no
+        // memory cgroup. It must stay a plausible ceiling, and its enabling
+        // flag must be `false` in a released binary, which the `cfg(not(test))`
+        // definition guarantees: this test only runs in test builds, where the
+        // flag is necessarily true.
+        let resolved = ALLOW_UNCONSTRAINED_HOST_CEILING
+            .then_some(UNCONSTRAINED_HOST_CEILING_BYTES)
+            .expect("test builds enable the fallback");
+        assert_eq!(
+            resolved,
+            16 * GIB,
+            "the unconstrained fallback must stay a plausible host ceiling, not an arbitrary size",
+        );
+    }
+
+    #[test]
+    fn a_configured_ceiling_is_never_widened() {
+        // The old default was 16 GiB, 2.67x the Toolforge per-job ceiling, and
+        // it was applied whenever detection failed. Pin the real production
+        // ceiling so a reintroduced oversized default is visible.
+        let budget = ResourceBudget::from_environment().expect("a ceiling is always resolvable");
+        assert!(
+            budget.memory_ceiling_bytes <= 16 * GIB,
+            "resolved ceiling {} exceeds the documented 16 GiB bound",
+            budget.memory_ceiling_bytes
+        );
+        assert!(budget.memory_reserve_bytes < budget.memory_ceiling_bytes);
+    }
+
+    #[test]
+    fn the_fail_closed_message_names_the_setting_and_every_ceiling_source() {
+        // The failure only occurs in non-test builds, so assert the message an
+        // operator would actually see, and that it is actionable.
+        let message = undiscoverable_ceiling_message();
+        assert!(message.contains(MEMORY_CEILING_ENV));
+        for source in [
+            "/sys/fs/cgroup/memory.max",
+            "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+            "/proc/meminfo",
+        ] {
+            assert!(
+                message.contains(source),
+                "message omits the {source} source"
+            );
+        }
     }
 }

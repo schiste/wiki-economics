@@ -39,8 +39,19 @@ const METRICS_PREFIX = `${API_PREFIX}/metrics`;
 const DEFAULT_METRIC_LIMIT = 500;
 const MAX_METRIC_LIMIT = 1_000;
 const MAX_METRIC_WIKIS = 20;
-const MAX_METRIC_SOURCE_BYTES = 512 * 1024 * 1024;
-const MAX_METRIC_SOURCE_ROWS = 2_000_000;
+// The admin webservice runs on Toolforge with a 512 MiB resident cap, so a
+// source allowance of the same size would admit a request that exhausts the
+// pod on its own. Decoding also expands: a compressed Parquet column buffer
+// becomes Arrow objects, then one JS object per row, so a bound expressed
+// only in source bytes does not bound the heap. Both limits are therefore well
+// under the pod allowance, and rows are checked before materialisation.
+const MAX_METRIC_SOURCE_BYTES = 64 * 1024 * 1024;
+const MAX_METRIC_SOURCE_ROWS = 250_000;
+// Retained decoded rows cost far more than their count suggests (one object per
+// row plus its strings), so the cache is bounded by an estimated byte budget
+// rather than an entry count.
+const METRIC_ROWS_CACHE_BUDGET_BYTES = 32 * 1024 * 1024;
+const ESTIMATED_BYTES_PER_ROW = 128;
 const VALUE_FINGERPRINT_ALGORITHM = "sha256-canonical-query-rows-v1";
 const UNKNOWN_DIMENSION = "unknown";
 const PATROL_APPLICABILITY = Object.freeze({
@@ -1705,6 +1716,20 @@ function createMachineApi(options = {}) {
   const freshnessLoader = options.freshnessLoader || (() => ({status: "unknown", alerts: []}));
   const injectedMetricRowsLoader = options.metricRowsLoader;
   const metricRowsCache = new Map();
+  let metricRowsCacheBytes = 0;
+
+  // Evict least-recently-inserted entries until the estimate fits the budget,
+  // so a handful of large datasets cannot accumulate past the pod allowance.
+  function cacheMetricRows(key, rows) {
+    const estimate = rows.length * ESTIMATED_BYTES_PER_ROW;
+    while (metricRowsCache.size > 0 && metricRowsCacheBytes + estimate > METRIC_ROWS_CACHE_BUDGET_BYTES) {
+      const oldest = metricRowsCache.keys().next().value;
+      metricRowsCacheBytes -= oldest.estimatedBytes;
+      metricRowsCache.delete(oldest);
+    }
+    metricRowsCache.set(key, {rows, estimatedBytes: estimate});
+    metricRowsCacheBytes += estimate;
+  }
   const configuredOrigin = options.publicOrigin ? String(options.publicOrigin).replace(/\/+$/, "") : "";
   const rateLimiter = createRateLimiter({
     limitPerSecond: options.rateLimitPerSecond ?? process.env.WIKI_ECON_MACHINE_API_RATE_LIMIT_PER_SECOND,
@@ -1804,7 +1829,8 @@ function createMachineApi(options = {}) {
       throw error;
     }
     const cacheKey = `${loaded.artifact.name}:${loaded.stat.size}:${loaded.stat.mtimeMs}`;
-    if (metricRowsCache.has(cacheKey)) return metricRowsCache.get(cacheKey);
+    const cached = metricRowsCache.get(cacheKey);
+    if (cached) return cached.rows;
     let parquet;
     let arrow;
     try {
@@ -1814,17 +1840,19 @@ function createMachineApi(options = {}) {
       error.code = "metric_reader_unavailable";
       throw error;
     }
-    const bytes = new Uint8Array(fs.readFileSync(loaded.file));
+    // A Node Buffer is already a Uint8Array; wrapping it copied the whole
+    // source, doubling peak memory for no benefit.
+    const bytes = fs.readFileSync(loaded.file);
     const wasmTable = parquet.readParquet(bytes);
     const table = arrow.tableFromIPC(wasmTable.intoIPCStream());
-    const rows = table.toArray().map((row) => safeJsonValue(row));
-    if (rows.length > MAX_METRIC_SOURCE_ROWS) {
-      const error = new Error(`Metric source contains ${rows.length} rows; transformed responses are capped at ${MAX_METRIC_SOURCE_ROWS} rows. Use format=parquet for bulk download.`);
+    // Reject on the Arrow row count before turning every row into an object.
+    if (table.numRows > MAX_METRIC_SOURCE_ROWS) {
+      const error = new Error(`Metric source contains ${table.numRows} rows; transformed responses are capped at ${MAX_METRIC_SOURCE_ROWS} rows. Use format=parquet for bulk download.`);
       error.code = "metric_source_too_large";
       throw error;
     }
-    if (metricRowsCache.size >= 8) metricRowsCache.delete(metricRowsCache.keys().next().value);
-    metricRowsCache.set(cacheKey, rows);
+    const rows = table.toArray().map((row) => safeJsonValue(row));
+    cacheMetricRows(cacheKey, rows);
     return rows;
   }
 
@@ -1837,7 +1865,10 @@ function createMachineApi(options = {}) {
       error.code = "invalid_metric_rows";
       throw error;
     }
-    return rows.map(safeJsonValue);
+    // Rows from the built-in reader are already normalised on the way into the
+    // cache, so re-copying every row on each request only doubled the live set.
+    if (injectedMetricRowsLoader) return rows.map(safeJsonValue);
+    return rows;
   }
 
   function parseMetricQuery(url, catalog, metric, overrides = {}) {

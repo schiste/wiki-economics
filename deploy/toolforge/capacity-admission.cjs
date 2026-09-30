@@ -89,6 +89,32 @@ function validatedConfig(file) {
   return config;
 }
 
+/**
+ * Translate the checked-in capacity policy into the environment variables the
+ * resource governor and the refresh wrappers read.
+ *
+ * The per-job ceiling is the class's own memory request, not the namespace
+ * limit: a job is bounded by its cgroup, so a small job must not be told it
+ * may use the 6 GiB of a pipeline pod. The reserve keeps the existing
+ * quarter-of-ceiling default, which the wrappers previously hardcoded as 1.5
+ * GiB against a 6 GiB ceiling.
+ */
+function envelopeEnvironment(configFile, resourceClass) {
+  const config = validatedConfig(configFile);
+  const {requestedBytes} = requestFor(config, resourceClass);
+  const envelope = {
+    WIKI_ECON_MEMORY_CEILING_BYTES: String(requestedBytes),
+    WIKI_ECON_MEMORY_RESERVE_BYTES: String(Math.floor(requestedBytes / 4)),
+  };
+  if (process.env.WIKI_ECON_MEMORY_CEILING_BYTES) {
+    envelope.WIKI_ECON_MEMORY_CEILING_BYTES = process.env.WIKI_ECON_MEMORY_CEILING_BYTES;
+  }
+  if (process.env.WIKI_ECON_MEMORY_RESERVE_BYTES) {
+    envelope.WIKI_ECON_MEMORY_RESERVE_BYTES = process.env.WIKI_ECON_MEMORY_RESERVE_BYTES;
+  }
+  return envelope;
+}
+
 function requestFor(config, resourceClass) {
   const requestedBytes = config.resource_requests?.[resourceClass];
   const requestedMillicores = config.resource_cpu_requests_millicores?.[resourceClass];
@@ -230,10 +256,16 @@ async function run() {
     return;
   }
   console.log(JSON.stringify({type: "capacity_admission", ...admission, file: undefined, lease: undefined}));
+  // Hand the admitted resource class down to the child so the resource
+  // governor and the shell wrappers stop restating the per-job envelope. The
+  // admission decision already read the checked-in capacity policy, so
+  // deriving the ceiling and reserve from the same file removes the last
+  // opportunity for a wrapper default to drift away from it. An explicit
+  // value from the caller still wins.
   const [program, ...args] = process.argv.slice(separator + 1);
   const child = spawn(program, args, {
     stdio: "inherit",
-    env: {...process.env, WIKI_ECON_CAPACITY_ADMITTED: "1"},
+    env: {...process.env, ...envelopeEnvironment(configFile, resourceClass), WIKI_ECON_CAPACITY_ADMITTED: "1"},
   });
   const heartbeat = setInterval(() => {
     const current = readJson(admission.file);
@@ -264,4 +296,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = {acquire, activeLeases, requestFor, reservedCapacity, validatedConfig};
+module.exports = {acquire, activeLeases, envelopeEnvironment, requestFor, reservedCapacity, validatedConfig};

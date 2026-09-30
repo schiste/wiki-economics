@@ -130,3 +130,43 @@ test("a missing manifest fails before Toolforge is contacted", () => {
   assert.equal(result.status, 1);
   assert.match(result.stderr, /manifest is missing/);
 });
+
+test("wrapper memory defaults match the checked-in Toolforge capacity policy", () => {
+  const capacity = JSON.parse(fs.readFileSync(
+    path.join(__dirname, "..", "..", "config", "toolforge-capacity.json"), "utf8"));
+  // The admission helper now injects the envelope for the admitted class, so
+  // these fallbacks only apply to a direct invocation. They must still agree
+  // with the policy: a wrapper that restates the ceiling is a chance to drift.
+  const expected = {
+    "deploy/toolforge/run-refresh.sh": capacity.per_job_memory_limit_bytes,
+    "deploy/toolforge/run-prepare-wiki.sh": capacity.per_job_memory_limit_bytes,
+    "deploy/toolforge/run-qualify-wiki.sh": capacity.per_job_memory_limit_bytes,
+  };
+  for (const [file, ceiling] of Object.entries(expected)) {
+    const source = fs.readFileSync(path.join(__dirname, "..", "..", file), "utf8");
+    assert.match(
+      source,
+      new RegExp(`WIKI_ECON_MEMORY_CEILING_BYTES="\\$\\{WIKI_ECON_MEMORY_CEILING_BYTES:-${ceiling}\\}"`),
+      `${file} memory ceiling fallback is not per_job_memory_limit_bytes (${ceiling})`,
+    );
+  }
+
+  // run-fleet-worker.sh serves two classes and must match each one.
+  const worker = fs.readFileSync(
+    path.join(__dirname, "run-fleet-worker.sh"), "utf8");
+  assert.match(worker, new RegExp(
+    `WIKI_ECON_MEMORY_CEILING_BYTES="\\$\\{WIKI_ECON_MEMORY_CEILING_BYTES:-${capacity.resource_requests.small}\\}"`));
+  assert.match(worker, new RegExp(
+    `WIKI_ECON_MEMORY_CEILING_BYTES="\\$\\{WIKI_ECON_MEMORY_CEILING_BYTES:-${capacity.resource_requests.medium_large}\\}"`));
+
+  // And every scheduled job's declared mem: must not exceed the per-job limit.
+  const jobs = fs.readFileSync(path.join(__dirname, "jobs.yaml"), "utf8");
+  const unit = {K: 1024, M: 1024 ** 2, G: 1024 ** 3};
+  for (const match of jobs.matchAll(/^\s*mem:\s*"?([0-9.]+)([KMG])(?:i)?"?\s*$/gm)) {
+    const [, amount, suffix] = match;
+    const bytes = Number(amount) * unit[suffix];
+    assert.ok(bytes <= capacity.per_job_memory_limit_bytes,
+      `jobs.yaml requests ${amount}${suffix} which exceeds per_job_memory_limit_bytes `
+      + `(${capacity.per_job_memory_limit_bytes})`);
+  }
+});
