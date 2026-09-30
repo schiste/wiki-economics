@@ -5,7 +5,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const test = require("node:test");
-const {acquire} = require("./capacity-admission.cjs");
+const {acquire, activeLeases} = require("./capacity-admission.cjs");
 
 function fixture(t) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-capacity-"));
@@ -138,5 +138,51 @@ test("capacity admission tolerates a stale lease disappearing before it is archi
     assert.equal(admission.active, 0);
   } finally {
     fs.renameSync = originalRenameSync;
+  }
+});
+
+test("a stale lease is archived under a name that cannot grow without bound", () => {
+  // Before the `.stale-` skip was added, every pass re-archived the previous
+  // archival, stacking one `.stale-<ts>-` prefix per pass until the name
+  // exceeded the 255-byte limit and renameSync failed with ENAMETOOLONG. That
+  // aborted admission for every later caller. Production still carries the
+  // resulting debris, so the archived name must stay bounded by construction
+  // rather than relying on a skip that a future refactor could drop.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-stale-name-"));
+  try {
+    // A qualification pod's hostname is long enough that a 70-byte lease name
+    // plus nine archival prefixes reaches the limit.
+    const identity = `wiki-econ-qualify-enwiki-aug-b3c1af0-bswtz-7-${"p".repeat(150)}`;
+    const stale = {
+      schemaVersion: 1,
+      identity,
+      resourceClass: "qualification",
+      requestedBytes: 6442450944,
+      requestedMillicores: 4000,
+      heartbeatAt: 0,
+    };
+    const configFile = path.join(__dirname, "..", "..", "config", "toolforge-capacity.json");
+
+    // Each iteration re-creates the lease exactly as a re-appearing stale
+    // holder would, letting the archived set grow.
+    for (let round = 0; round < 12; round += 1) {
+      fs.writeFileSync(path.join(root, `${identity}.json`), JSON.stringify(stale));
+      const admission = acquire({
+        root,
+        configFile: path.resolve(configFile),
+        resourceClass: "qualification",
+        identity,
+        now: Date.now() + round * 60_000,
+      });
+      assert.equal(admission.admitted, true, "a stale lease must not block admission");
+    }
+    for (const entry of fs.readdirSync(root)) {
+      assert.ok(
+        Buffer.byteLength(entry) <= 255,
+        `archived lease name is ${Buffer.byteLength(entry)} bytes: renameSync cannot create it`,
+      );
+    }
+  } finally {
+    fs.rmSync(root, {recursive: true, force: true});
   }
 });
