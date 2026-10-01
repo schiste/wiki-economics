@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [ "$#" -lt 2 ] || [ "$#" -gt 3 ]; then
-  echo "Usage: run-fleet-worker.sh <small|medium_large> WORKER_ID [--once]" >&2
+  echo "Usage: run-fleet-worker.sh <small|medium_large|isolated> WORKER_ID [--once]" >&2
   exit 2
 fi
 resource_class=$1
@@ -14,7 +14,7 @@ elif [ "$#" -eq 3 ]; then
   echo "Unknown fleet worker option: $3" >&2
   exit 2
 fi
-case "$resource_class" in small|medium_large) ;; *) echo "Unsupported fleet resource class: $resource_class" >&2; exit 2 ;; esac
+case "$resource_class" in small|medium_large|isolated) ;; *) echo "Unsupported fleet resource class: $resource_class" >&2; exit 2 ;; esac
 case "$worker_id" in *[!A-Za-z0-9_-]*|'') echo "Unsafe worker ID: $worker_id" >&2; exit 2 ;; esac
 cli_resource_class=$resource_class
 if [ "$cli_resource_class" = medium_large ]; then
@@ -55,26 +55,45 @@ lease_timeout_secs="${WIKI_ECON_FLEET_LEASE_TIMEOUT_SECS:-900}"
 max_attempts="${WIKI_ECON_FLEET_MAX_ATTEMPTS:-3}"
 upstream_retry_secs="${WIKI_ECON_UPSTREAM_RETRY_SECS:-21600}"
 prepare_lock_stale_secs="${WIKI_ECON_PREPARE_LOCK_STALE_SECS:-$lease_timeout_secs}"
-prepare_wrapper="${WIKI_ECON_FLEET_PREPARE_WRAPPER:-$ROOT/deploy/toolforge/run-prepare-wiki.sh}"
+if [ -n "${WIKI_ECON_FLEET_PREPARE_WRAPPER:-}" ]; then
+  prepare_wrapper="$WIKI_ECON_FLEET_PREPARE_WRAPPER"
+elif [ "$resource_class" = isolated ]; then
+  prepare_wrapper="$ROOT/deploy/toolforge/run-fleet-isolated-prepare.sh"
+else
+  prepare_wrapper="$ROOT/deploy/toolforge/run-prepare-wiki.sh"
+fi
 for value in "$idle_secs" "$heartbeat_secs" "$lease_timeout_secs" "$max_attempts" "$prepare_lock_stale_secs" "$upstream_retry_secs"; do
   [[ "$value" =~ ^[1-9][0-9]*$ ]] || { echo "Fleet timing and retry settings must be positive integers" >&2; exit 2; }
 done
 [ -x "$prepare_wrapper" ] || { echo "Fleet preparation wrapper is not executable: $prepare_wrapper" >&2; exit 2; }
 export WIKI_ECON_PREPARE_LOCK_STALE_SECS="$prepare_lock_stale_secs"
 
-# Admin requests share the fixed worker pool instead of spawning long-running
-# work inside the lightweight dispatcher. Priority routing happens before
-# ordinary fleet claims, so recovery and lifecycle work cannot sit behind a
-# bulk preparation backlog.
-set +e
-node "$ROOT/deploy/toolforge/admin-dispatcher.cjs" --worker "$resource_class"
-admin_status=$?
-set -e
-case "$admin_status" in
-  0) exit 0 ;;
-  75) ;;
-  *) exit "$admin_status" ;;
-esac
+ready_index_matches() {
+  node - "$WIKI_ECON_OUTPUT_DIR/_ready-index/$1.json" "$1" "$2" <<'NODE'
+const fs = require("node:fs");
+const [file, wiki, snapshot] = process.argv.slice(2);
+let ready;
+try { ready = JSON.parse(fs.readFileSync(file, "utf8")); } catch { process.exit(1); }
+process.exit(ready?.schema_version === 2
+  && ready?.wiki === wiki
+  && ready?.newest_valid_ready?.snapshot === snapshot ? 0 : 1);
+NODE
+}
+
+# Admin requests share the fixed small and medium worker pool. The isolated
+# worker is reserved for monthly fleet tasks and is deliberately outside the
+# admin-operation routing classes.
+if [ "$resource_class" != isolated ]; then
+  set +e
+  node "$ROOT/deploy/toolforge/admin-dispatcher.cjs" --worker "$resource_class"
+  admin_status=$?
+  set -e
+  case "$admin_status" in
+    0) exit 0 ;;
+    75) ;;
+    *) exit "$admin_status" ;;
+  esac
+fi
 
 while true; do
   # PIDs are namespaced per container and are therefore commonly identical
@@ -145,10 +164,15 @@ process.stdout.write(`${claim.task.wiki} ${claim.task.snapshot} ${claim.task.tas
   export WIKI_ECON_RUN_ID="fleet-$worker_id-$wiki-${task_id:0:12}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
   export WIKI_ECON_PREPARE_SNAPSHOT="$snapshot"
   task_error="candidate preparation failed for $wiki/$snapshot"
-  set +e
-  "$prepare_wrapper" "$wiki"
-  prepare_status=$?
-  set -e
+  if ready_index_matches "$wiki" "$snapshot"; then
+    echo "=== fleet snapshot already has a validated ready candidate; skipping preparation wiki=$wiki snapshot=$snapshot ==="
+    prepare_status=0
+  else
+    set +e
+    "$prepare_wrapper" "$wiki"
+    prepare_status=$?
+    set -e
+  fi
   if [ "$prepare_status" -eq 75 ]; then
     task_error="waiting for upstream patrol inventory for $wiki/$snapshot"
     "$WIKI_ECON_BIN" \

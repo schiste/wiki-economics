@@ -2062,6 +2062,7 @@ mod tests {
     #[derive(Default)]
     struct SnapshotSpy {
         reset_obsolete_input: bool,
+        fail_resolve_wiki: Option<String>,
     }
 
     #[derive(Default)]
@@ -2329,6 +2330,14 @@ mod tests {
             _data_dir: &Path,
         ) -> Result<String> {
             self.record(format!("resolve_snapshot:{}", wikis.join(",")));
+            if self
+                .snapshots
+                .fail_resolve_wiki
+                .as_ref()
+                .is_some_and(|failed_wiki| wikis.iter().any(|wiki| wiki == failed_wiki))
+            {
+                anyhow::bail!("snapshot inventory unavailable for {}", wikis.join(","));
+            }
             Ok("2026-07".to_string())
         }
 
@@ -3903,6 +3912,89 @@ mod tests {
             ops.calls.into_inner(),
             vec!["resolve_snapshot:testwiki".to_string()]
         );
+        assert!(queue.join("pending/testwiki.json").is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn fleet_discovery_does_not_requeue_an_already_ready_snapshot() -> Result<()> {
+        let data = TestDir::new()?;
+        let output = TestDir::new()?;
+        let queue = output.path().join("_fleet-shadow");
+        let lifecycle = output.path().join("lifecycle.json");
+        fs::write(
+            &lifecycle,
+            br#"{"schema_version":1,"wikis":{"testwiki":{"publication":"published","refresh":"scheduled"}}}"#,
+        )?;
+        let ready_index_dir = output.path().join("_ready-index");
+        fs::create_dir_all(&ready_index_dir)?;
+        fs::write(
+            ready_index_dir.join("testwiki.json"),
+            br#"{"schema_version":2,"wiki":"testwiki","newest_valid_ready":{"snapshot":"2026-07"}}"#,
+        )?;
+        let ops = TestApplication::default();
+
+        let report = handle_fleet_discovery(
+            orchestration::RunContext {
+                paths: orchestration::AppPaths {
+                    data: data.path(),
+                    output: output.path(),
+                },
+                run_id: Some("fleet-ready-snapshot-test"),
+                now: chrono::Utc::now(),
+            },
+            &ops,
+            orchestration::FleetDiscoveryRequest {
+                lifecycle: &lifecycle,
+                queue_dir: &queue,
+                snapshot: None,
+            },
+        )?;
+
+        assert_eq!(report.unchanged, 1);
+        assert!(!queue.join("pending/testwiki.json").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn fleet_discovery_continues_when_one_wikis_snapshot_is_unavailable() -> Result<()> {
+        let data = TestDir::new()?;
+        let output = TestDir::new()?;
+        let queue = output.path().join("_fleet-shadow");
+        let lifecycle = output.path().join("lifecycle.json");
+        const LIFECYCLE: &[u8] = br#"{"schema_version":1,"wikis":{"afailwiki":{"publication":"published","refresh":"scheduled"},"testwiki":{"publication":"published","refresh":"scheduled"}}}"#;
+        fs::write(&lifecycle, LIFECYCLE)?;
+        let ops = TestApplication {
+            snapshots: SnapshotSpy {
+                fail_resolve_wiki: Some("afailwiki".to_string()),
+                ..SnapshotSpy::default()
+            },
+            ..TestApplication::default()
+        };
+        let discovery = handle_fleet_discovery(
+            orchestration::RunContext {
+                paths: orchestration::AppPaths {
+                    data: data.path(),
+                    output: output.path(),
+                },
+                run_id: Some("fleet-partial-discovery-test"),
+                now: chrono::Utc::now(),
+            },
+            &ops,
+            orchestration::FleetDiscoveryRequest {
+                lifecycle: &lifecycle,
+                queue_dir: &queue,
+                snapshot: None,
+            },
+        )?;
+        assert_eq!(discovery.failures.len(), 1);
+        assert_eq!(discovery.failures[0].wiki, "afailwiki");
+        assert!(
+            discovery.failures[0]
+                .error
+                .contains("snapshot inventory unavailable")
+        );
+        assert!(!queue.join("pending/afailwiki.json").exists());
         assert!(queue.join("pending/testwiki.json").is_file());
         Ok(())
     }

@@ -10,7 +10,7 @@ use chrono::Datelike;
 use chrono::{DateTime, Utc};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::{fleet, observability, publication, snapshot_plan, source_window};
 
@@ -484,31 +484,51 @@ pub(crate) fn handle_fleet_discovery(
     let overrides = fleet::lifecycle_resource_overrides(request.lifecycle)?;
     let mut report = fleet::DiscoveryReport::default();
     for wiki in wikis {
-        let version = match request.snapshot {
-            Some(version) => version.to_string(),
-            None => timed_stage("fleet_snapshot_resolve", Some(&wiki), || {
-                ops.resolve_snapshot(std::slice::from_ref(&wiki), context.now, context.paths.data)
-            })?,
-        };
-        ops.persist_snapshot_plans(std::slice::from_ref(&wiki), &version, context.paths.data)?;
-        let (plan, _) =
-            snapshot_plan::SnapshotPlan::load_or_resolve(context.paths.data, &wiki, &version)?;
-        let classification = fleet::classify(
-            context.paths.data,
-            context.paths.output,
-            &plan,
-            overrides.get(&wiki).copied(),
-        );
-        let (resource_class, signals) = classification?;
-        let enqueue = fleet::enqueue(
-            request.queue_dir,
-            &wiki,
-            &version,
-            resource_class,
-            signals,
-            controller_run_id,
-        );
-        report.merge(enqueue?);
+        let result = (|| -> Result<fleet::DiscoveryReport> {
+            let version = match request.snapshot {
+                Some(version) => version.to_string(),
+                None => timed_stage("fleet_snapshot_resolve", Some(&wiki), || {
+                    ops.resolve_snapshot(
+                        std::slice::from_ref(&wiki),
+                        context.now,
+                        context.paths.data,
+                    )
+                })?,
+            };
+            ops.persist_snapshot_plans(std::slice::from_ref(&wiki), &version, context.paths.data)?;
+            let (plan, _) =
+                snapshot_plan::SnapshotPlan::load_or_resolve(context.paths.data, &wiki, &version)?;
+            if fleet::ready_index_contains_snapshot(context.paths.output, &wiki, &version)? {
+                return Ok(fleet::DiscoveryReport {
+                    unchanged: 1,
+                    ..fleet::DiscoveryReport::default()
+                });
+            }
+            let (resource_class, signals) = fleet::classify(
+                context.paths.data,
+                context.paths.output,
+                &plan,
+                overrides.get(&wiki).copied(),
+            )?;
+            fleet::enqueue(
+                request.queue_dir,
+                &wiki,
+                &version,
+                resource_class,
+                signals,
+                controller_run_id,
+            )
+        })();
+        match result {
+            Ok(discovered) => report.merge(discovered),
+            Err(error) => {
+                let error = format!("{error:#}");
+                warn!(wiki, error = %error, "fleet discovery failed for one wiki; continuing with the remaining scheduled set");
+                report
+                    .failures
+                    .push(fleet::DiscoveryFailure { wiki, error });
+            }
+        }
     }
     Ok(report)
 }

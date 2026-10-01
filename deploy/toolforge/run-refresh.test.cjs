@@ -44,6 +44,9 @@ set -eu
 case " $* " in
   *" cleanup-stale "*) printf '%s\\n' '{"removed":[]}' ;;
   *" snapshot-resolve "*)
+    if [ -n "\${FAKE_SNAPSHOT_CALLS:-}" ]; then
+      printf '%s\\n' called >> "$FAKE_SNAPSHOT_CALLS"
+    fi
     if [ "\${FAKE_SNAPSHOT_LOG:-0}" = "1" ]; then
       printf '%s\\n' 'run_id=fake-run INFO snapshot resolver diagnostic=visible'
     fi
@@ -287,6 +290,29 @@ test("the staged ingest job records a resumable pipeline lease", () => {
   assert.equal(qualificationReceipt.stage, "ingest");
   assert.ok(qualificationReceipt.wall_time_ms >= 0);
   assert.ok(qualificationReceipt.resources.cgroup);
+});
+
+test("queued pipeline ingest uses its pinned snapshot without resolving again", () => {
+  const fixture = createFixture("pipeline-ingest-pinned-snapshot");
+  const snapshotCalls = path.join(fixture.output, "snapshot-resolve-calls.txt");
+  const result = runFixture(fixture, {
+    WIKI_ECON_REFRESH_STAGE: "ingest",
+    WIKI_ECON_PIPELINE_MODE: "1",
+    WIKI_ECON_PIPELINE_WIKIS: "enwiki",
+    WIKI_ECON_PREPARE_SNAPSHOT: "2026-09",
+    WIKI_ECON_RUN_ID: "pipeline-ingest-pinned-run",
+    FAKE_DRIVER_ARGS: fixture.driverArgs,
+    FAKE_SNAPSHOT_CALLS: snapshotCalls,
+  });
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  assert.equal(
+    fs.readFileSync(fixture.driverArgs, "utf8").trim(),
+    "--version 2026-09 enwiki --stage ingest",
+  );
+  assert.equal(fs.existsSync(snapshotCalls), false);
+  const state = JSON.parse(fs.readFileSync(
+    path.join(fixture.output, ".pipeline-state.json"), "utf8"));
+  assert.equal(state.snapshot, "2026-09");
 });
 
 test("the staged ingest job permits an explicitly registered qualification wiki", () => {

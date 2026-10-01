@@ -793,10 +793,9 @@ wikis=()
 if pipeline_stage_enabled && [ "$REFRESH_STAGE" != "ingest" ]; then
   load_pipeline_wikis || exit 1
 elif pipeline_stage_enabled && [ "$REFRESH_STAGE" = "ingest" ] && [ -n "${WIKI_ECON_PIPELINE_WIKIS:-}" ]; then
-  # Qualification wikis (for example enwiki) are intentionally hidden from
-  # the normal scheduled refresh resolver. The staged operator path may name
-  # them explicitly, but the registry is still authoritative: unregistered
-  # names are rejected before any network or storage work starts.
+  # A staged fleet task may name a single queue-pinned wiki (including the
+  # monthly enwiki pipeline). The lifecycle registry remains authoritative:
+  # unregistered names are rejected before network or storage work starts.
   pipeline_wikis_json="$(node - "$WIKI_ECON_WIKI_LIFECYCLE_FILE" <<'NODE'
 const fs = require("node:fs");
 const registry = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
@@ -918,40 +917,51 @@ elif pipeline_stage_enabled && [ "$REFRESH_STAGE" != "ingest" ]; then
   echo "==> Toolforge pipeline refresh: ${wikis[*]} (snapshot $SELECTED_SNAPSHOT, stage $REFRESH_STAGE)"
   refresh_driver_cmd+=(--version "$SELECTED_SNAPSHOT" "${wikis[@]}" --stage "$REFRESH_STAGE")
 else
-  declare -a resolve_cmd=(
-    "$WIKI_ECON_BIN"
-    --data-dir "$WIKI_ECON_DATA_DIR"
-    --output-dir "$WIKI_ECON_OUTPUT_DIR"
-    --run-id "$WIKI_ECON_RUN_ID"
-    snapshot-resolve
-    "${wikis[@]}"
-  )
-  printf '==> %s' "${resolve_cmd[0]}"
-  for arg in "${resolve_cmd[@]:1}"; do
-    printf ' %q' "$arg"
-  done
-  printf '\n'
-  # The Rust CLI emits verbose tracing records on stdout so standalone
-  # invocations remain self-contained and useful to operators.  Do not feed
-  # that mixed human log stream directly into the version validator: capture
-  # and retain it in the refresh log, then extract the final machine-readable
-  # YYYY-MM line.  A prior implementation treated the whole stream as the
-  # version and failed every Toolforge refresh before ingest began.
-  snapshot_resolve_output=""
-  if ! snapshot_resolve_output="$(RUST_LOG="$WIKI_ECON_RUST_LOG" "${resolve_cmd[@]}")"; then
-    REFRESH_FAILURE_STAGE=snapshot_resolve
-    REFRESH_FAILURE_ERROR="snapshot resolver command failed"
-    echo "Snapshot resolver failed for ${wikis[*]}" >&2
-    printf '%s\n' "$snapshot_resolve_output" >&2
-    exit 1
-  fi
-  printf '%s\n' "$snapshot_resolve_output"
   selected_snapshot=""
-  while IFS= read -r snapshot_line; do
-    if [[ "$snapshot_line" =~ ^[0-9]{4}-[0-9]{2}$ ]]; then
-      selected_snapshot="$snapshot_line"
+  if pipeline_stage_enabled && [ "$REFRESH_STAGE" = "ingest" ] \
+    && [ -n "${WIKI_ECON_PREPARE_SNAPSHOT:-}" ]; then
+    if [[ ! "$WIKI_ECON_PREPARE_SNAPSHOT" =~ ^[0-9]{4}-[0-9]{2}$ ]]; then
+      REFRESH_FAILURE_STAGE=snapshot_resolve
+      REFRESH_FAILURE_ERROR="queued pipeline snapshot is invalid"
+      echo "$REFRESH_FAILURE_ERROR: $WIKI_ECON_PREPARE_SNAPSHOT" >&2
+      exit 1
     fi
-  done <<< "$snapshot_resolve_output"
+    selected_snapshot="$WIKI_ECON_PREPARE_SNAPSHOT"
+    echo "==> Using queued pipeline snapshot $selected_snapshot"
+  else
+    declare -a resolve_cmd=(
+      "$WIKI_ECON_BIN"
+      --data-dir "$WIKI_ECON_DATA_DIR"
+      --output-dir "$WIKI_ECON_OUTPUT_DIR"
+      --run-id "$WIKI_ECON_RUN_ID"
+      snapshot-resolve
+      "${wikis[@]}"
+    )
+    printf '==> %s' "${resolve_cmd[0]}"
+    for arg in "${resolve_cmd[@]:1}"; do
+      printf ' %q' "$arg"
+    done
+    printf '\n'
+    # The Rust CLI emits verbose tracing records on stdout so standalone
+    # invocations remain self-contained and useful to operators. Do not feed
+    # that mixed human log stream directly into the version validator: capture
+    # and retain it in the refresh log, then extract the final machine-readable
+    # YYYY-MM line.
+    snapshot_resolve_output=""
+    if ! snapshot_resolve_output="$(RUST_LOG="$WIKI_ECON_RUST_LOG" "${resolve_cmd[@]}")"; then
+      REFRESH_FAILURE_STAGE=snapshot_resolve
+      REFRESH_FAILURE_ERROR="snapshot resolver command failed"
+      echo "Snapshot resolver failed for ${wikis[*]}" >&2
+      printf '%s\n' "$snapshot_resolve_output" >&2
+      exit 1
+    fi
+    printf '%s\n' "$snapshot_resolve_output"
+    while IFS= read -r snapshot_line; do
+      if [[ "$snapshot_line" =~ ^[0-9]{4}-[0-9]{2}$ ]]; then
+        selected_snapshot="$snapshot_line"
+      fi
+    done <<< "$snapshot_resolve_output"
+  fi
   if [ -z "$selected_snapshot" ]; then
     REFRESH_FAILURE_STAGE=snapshot_resolve
     REFRESH_FAILURE_ERROR="snapshot resolver returned no YYYY-MM version"

@@ -45,7 +45,10 @@
 - name: wiki-econ-fleet-controller
   image: tool-wiki-economics/tool-wiki-economics:latest
   command: deploy/toolforge/run-fleet-controller.sh
-  schedule: "0 1 * * 0"
+  # Resolve each scheduled wiki independently every six hours. Incomplete
+  # upstream snapshots stay on the last completed generation; a new task is
+  # enqueued as soon as that wiki's full source inventory is available.
+  schedule: "0 */6 * * *"
   filelog: true
   mount: all
   mem: 1Gi
@@ -88,6 +91,18 @@
   # Keep production at the qualified one-thread profile until the now-unblocked
   # 1/2/4-CPU matrix selects a faster deterministic profile.
   cpu: "1"
+
+# Monthly layouts such as enwiki use the same durable task queue, but run the
+# six bounded stages sequentially in one 6-GiB/4-CPU pod. This worker only
+# claims isolated tasks and exits immediately when none are ready.
+- name: wiki-econ-fleet-isolated
+  image: tool-wiki-economics/tool-wiki-economics:latest
+  command: deploy/toolforge/run-fleet-worker.sh isolated isolated-monthly --once
+  schedule: "20 */6 * * *"
+  filelog: true
+  mount: all
+  mem: 6Gi
+  cpu: "4"
 
 # Authenticated admin actions are written to an atomic NFS queue by the
 # webservice. This lightweight dispatcher validates and routes requests to the

@@ -21,10 +21,10 @@ frwiki completed the measured capacity qualification documented in
 [`docs/benchmarking.md`](../../docs/benchmarking.md) and uses the qualified
 256-logical-bucket envelope through the adaptive `small` profile. dewiki and
 enwiki were promoted to `published`/`scheduled` through the authenticated admin;
-enwiki is pinned to the `isolated` resource class, and because no isolated
-production worker exists its fleet task is not claimable, so its published
-generation is retained rather than refreshed. Adding one must still fit the
-per-job ceilings above.
+enwiki is pinned to the `isolated` resource class and its August 2026 promotion
+receipts are recorded in the capacity policy. The controller checks every
+scheduled wiki every six hours, and the isolated worker processes a complete
+monthly enwiki snapshot sequentially within the existing per-job ceilings.
 
 ## Files
 
@@ -88,17 +88,15 @@ per-job ceilings above.
   therefore come from different commits; each is verified independently and
   all three identities are recorded in refresh run provenance.
 - `jobs.yaml` — one Rust fleet controller, two fixed small-wiki workers, two
-  fixed medium/large workers, a 512 MiB admin routing dispatcher, and the
-  `wiki-econ-publish-ready` job, plus legacy recovery jobs and six unscheduled
-  large-wiki pipeline jobs. The scheduled publisher reserves its per-job
+  fixed medium/large workers, one 6 GiB / 4-CPU monthly isolated worker, a
+  512 MiB admin routing dispatcher, and the `wiki-econ-publish-ready` job, plus
+  legacy recovery jobs and six on-demand large-wiki pipeline jobs. The
+  controller resolves the scheduled wiki set every six hours; the publisher reserves its per-job
   envelope of four CPU and six GiB and sets Rayon and Polars thread pools to
   four; the dashboard Parquet scan retains bounded 250,000-row batches. The
-  controller represents the sixteen scheduled wikis declared by the lifecycle
-  registry: afwiki, arwiki, arzwiki,
-  elwiki, eswiki, frwiki, hawiki, itwiki, jawiki, nlwiki, ptwiki, svwiki,
-  swwiki, viwiki, yowiki, and zhwiki. Adding a wiki does not add a Toolforge
-  Job definition. Monthly layouts remain isolated
-  because no production isolated worker exists.
+  controller represents every scheduled wiki declared by the lifecycle
+  registry. Adding a wiki does not add a Toolforge Job definition. Monthly
+  layouts remain isolated and are claimed by the fixed isolated worker.
   The full state machine and recovery boundary are documented in
   [per-wiki candidate preparation and publication](../../docs/candidate-publication.md).
   `wiki-econ-admin` serves `/admin*` and the built static site as a separate

@@ -1,10 +1,16 @@
 # Enwiki correctness and recovery proof
 
-Enwiki stays `publication=hidden`, `refresh=qualification`, and
-`publication_eligible=false` until the isolated candidate has a complete proof
-receipt. The proof is intentionally separate from the six stage receipts: a
-stage can finish successfully while an inventory, invariant, recovery, or
-rollback drill is still unproven.
+The August 2026 enwiki candidate was promoted through the authenticated admin
+and is the live published generation. Its ready receipt and source
+qualification receipt are pinned by digest in
+`config/capacity-qualification.json`; the published lifecycle and the
+production capacity policy now admit recurring monthly snapshots. Every new
+candidate still passes the normal semantic publication gate and the scheduled
+publisher's transaction checks.
+
+The fuller correctness and recovery proof below remains a separate audit
+record. A successful six-stage run alone does not establish all inventory,
+invariant, determinism, recovery, and rollback checks described here.
 
 ## Acceptance sequence
 
@@ -74,9 +80,9 @@ deploy/toolforge/run-qualify-wiki.sh enwiki
 The rollover invocation must set `WIKI_ECON_QUALIFICATION_RUN_KIND=rollover`
 and pin the next completed snapshot after its completeness check. It must run
 with the first generation retained and never share a heavy-job slot with the
-initial candidate. No invocation changes the lifecycle registry or scheduled
-publication; those changes require the authenticated two-run proof and a
-separate promotion action.
+initial candidate. This qualification invocation does not change the lifecycle
+registry or scheduled publication. Under this path, promotion requires the
+authenticated two-run proof and a separate promotion action.
 
 The policy requires these stages in order:
 
@@ -97,8 +103,13 @@ and fingerprints, CPU and wall time, cgroup memory peak, persistent/scratch
 high-water marks, bucket-size distribution, warnings, retries, and recovery
 events. Missing or failed receipt fields keep the candidate hidden.
 
-Only after the proof digest and the capacity/resource receipts have been
-reviewed may an operator consider a separate promotion decision. This proof
-does not promote, schedule, or publish enwiki. The rollover check is the
-acceptance gate required before activation: it does not retire the preceding
-generation, so a failed activation can still serve the retained candidate.
+Under this qualification path, only after the proof digest and the
+capacity/resource receipts have been reviewed may an operator consider a
+separate promotion decision. The August 2026 enwiki generation was already
+promoted through the authenticated admin path; its ready and qualification
+receipt digests are recorded in `config/capacity-qualification.json`. That
+production promotion enabled recurring monthly processing, but it does not
+mean the fuller two-run correctness and recovery proof above has passed. Keep
+the distinction explicit until the proof evidence is complete. The rollover
+check retains the preceding generation, so a failed activation can still
+serve it.

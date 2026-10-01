@@ -18,8 +18,16 @@
       "required_bucket_counts": [256]
     },
     "enwiki": {
-      "qualification_status": "candidate",
-      "publication_eligible": false,
+      "qualification_status": "promoted",
+      "publication_eligible": true,
+      "publication_eligibility_basis": "receipt-backed production promotion of the August 2026 candidate",
+      "promotion_evidence": {
+        "snapshot": "2026-08",
+        "candidate_run_id": "admin-20260928T105401Z-enwiki-promote-qualification-3ebbacb1",
+        "ready_receipt_sha256": "1e63facd3db2b6e33ff2cb5c7dd58b403f26c25d55413e26763200c9d187467a",
+        "qualification_run_id": "qualify-enwiki-202608-max-capacity-c5c9543",
+        "qualification_receipt_sha256": "b0a4c3ce7e41def3a2d4769139ac09ef62060e8780e3abe75338fabc191896fa"
+      },
       "promotion_gate": {
         "minimum_successful_runs": 2,
         "required_run_kinds": ["initial_candidate", "rollover"],

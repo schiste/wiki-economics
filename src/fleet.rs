@@ -115,6 +115,14 @@ pub(crate) struct DiscoveryReport {
     pub(crate) recovered_stale: usize,
     pub(crate) quarantined: usize,
     pub(crate) by_resource_class: BTreeMap<String, usize>,
+    pub(crate) failures: Vec<DiscoveryFailure>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DiscoveryFailure {
+    pub(crate) wiki: String,
+    pub(crate) error: String,
 }
 
 impl DiscoveryReport {
@@ -125,6 +133,7 @@ impl DiscoveryReport {
         self.replaced_obsolete += other.replaced_obsolete;
         self.recovered_stale += other.recovered_stale;
         self.quarantined += other.quarantined;
+        self.failures.extend(other.failures);
         for (class, count) in other.by_resource_class {
             *self.by_resource_class.entry(class).or_default() += count;
         }
@@ -523,6 +532,35 @@ pub(crate) fn complete(queue_root: &Path, claim_path: &Path, output_dir: &Path) 
     fs::remove_dir_all(lease_dir(queue_root, &claim.task.wiki))?;
     sync_dir(queue_root)?;
     Ok(notification_path)
+}
+
+/// Whether publication already has a fully validated candidate for this
+/// exact wiki snapshot. This lets scheduled discovery avoid re-queuing an
+/// admin-promoted snapshot that predates fleet completion receipts.
+pub(crate) fn ready_index_contains_snapshot(
+    output_dir: &Path,
+    wiki: &str,
+    snapshot: &str,
+) -> Result<bool> {
+    validate_component(wiki, "wiki")?;
+    crate::storage::validate_snapshot_version(snapshot)?;
+    let path = output_dir.join("_ready-index").join(format!("{wiki}.json"));
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to read {}", path.display()));
+        }
+    };
+    let ready: Value = serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid ready index {}", path.display()))?;
+    Ok(ready.get("schema_version").and_then(Value::as_u64)
+        == Some(u64::from(READY_INDEX_SCHEMA_VERSION))
+        && ready.get("wiki").and_then(Value::as_str) == Some(wiki)
+        && ready
+            .pointer("/newest_valid_ready/snapshot")
+            .and_then(Value::as_str)
+            == Some(snapshot))
 }
 
 pub(crate) fn fail(
@@ -1611,6 +1649,7 @@ mod tests {
             recovered_stale: 5,
             quarantined: 6,
             by_resource_class: BTreeMap::from([("small".to_string(), 7)]),
+            ..DiscoveryReport::default()
         });
         combined.merge(DiscoveryReport {
             by_resource_class: BTreeMap::from([("small".to_string(), 1)]),
