@@ -144,28 +144,25 @@ artifact SHA-256 values across at least two worker counts with topology held
 constant; see `wiki-econ determinism-verify` in
 [deterministic builds](deterministic-builds.md).
 
-## enwiki qualification candidate (publication-hidden)
+## enwiki monthly production profile
 
-Enwiki is registered as an isolated, qualification-only candidate. The
-capacity entry in config/capacity-qualification.json pins the frozen
-2026-08 snapshot, a four-source worker/window ceiling, at most two concurrent
-source-window HTTP transactions, and the candidate 64 x 32 page-week layout
-(2,048 logical buckets). It also records the observed source inventory and a
-250 GiB persistent-storage reserve for rollover and retention checks. Source
-admission can reduce the concurrent count when live memory or disk headroom
-requires it. The default fetch gate stays at one after earlier four-stream
-runs received 429 responses; enwiki's isolated candidate opts into two with
-the same bounded retry and `Retry-After` handling. Its receipt records that
-fetch limit, and setting it back to one is the rollback.
+Enwiki's August 2026 candidate was promoted through the authenticated admin and
+is the live published generation. The capacity entry in
+`config/capacity-qualification.json` records the hashes and identities of that
+ready receipt and its source qualification receipt. The recurring isolated
+worker pins each newly completed monthly snapshot, runs the six stages
+sequentially, and uses the qualified 64 x 32 page-week layout (2,048 logical
+buckets). It retains the 250 GiB persistent-storage reserve for rollover and
+retention checks. Source admission can reduce concurrency when live memory or
+disk headroom requires it. The fetch gate stays at two, with bounded retry and
+`Retry-After` handling; the worker's receipt records the selected limit.
 
 The Toolforge envelope is binding: 6 GiB and 4 vCPU per job, within the
 existing 24 GiB/16-vCPU namespace quota. No future capacity increase is
-assumed; a larger-memory profile is not a valid fallback. Qualification must use
-`deploy/toolforge/run-qualify-wiki.sh enwiki` with
-`WIKI_ECON_PREPARE_SNAPSHOT=2026-08`, and the benchmark wrapper's `2048`
-variant expands to exactly `--weekly-buckets 64 --weekly-secondary-buckets 32`.
-The candidate remains publication-ineligible until the isolated fleet stage
-has passing capacity, correctness, recovery, and rollover evidence.
+assumed; a larger-memory profile is not a valid fallback. The existing
+`run-qualify-wiki.sh enwiki` path remains available for isolated correctness
+and recovery evidence. The benchmark wrapper's `2048` variant expands to
+exactly `--weekly-buckets 64 --weekly-secondary-buckets 32`.
 
 ## Telemetry
 

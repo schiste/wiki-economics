@@ -18,6 +18,7 @@ const [gdp, labor, inequality, patrol, variation] = await Promise.all([
 
 const wikiNames = {
   afwiki: "Afrikaans", arwiki: "Arabic", arzwiki: "Egyptian Arabic",
+  dewiki: "German", enwiki: "English",
   elwiki: "Greek", eswiki: "Spanish", frwiki: "French", hawiki: "Hausa",
   itwiki: "Italian", jawiki: "Japanese", nlwiki: "Dutch", ptwiki: "Portuguese",
   svwiki: "Swedish", swwiki: "Swahili", viwiki: "Vietnamese", yowiki: "Yoruba",

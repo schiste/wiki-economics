@@ -977,19 +977,14 @@ mod tests {
             ProfileSelectionMode::Automatic,
         );
         large.ensure_compute_qualified_with(true)?;
-        let enwiki_candidate = profile(
+        let enwiki_published = profile(
             "enwiki",
             WorkloadProfileName::Large,
             ProfileSelectionMode::Automatic,
         );
-        enwiki_candidate.ensure_compute_qualified_with(false)?;
-        enwiki_candidate.ensure_source_fetches_qualified(2)?;
-        assert!(enwiki_candidate.ensure_source_fetches_qualified(3).is_err());
-        assert!(
-            enwiki_candidate
-                .ensure_compute_qualified_with(true)
-                .is_err()
-        );
+        enwiki_published.ensure_compute_qualified_with(true)?;
+        enwiki_published.ensure_source_fetches_qualified(2)?;
+        assert!(enwiki_published.ensure_source_fetches_qualified(3).is_err());
         let unqualified_large = profile(
             "afwiki",
             WorkloadProfileName::Large,

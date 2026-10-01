@@ -34,7 +34,7 @@ coverage checker and its tests. There is no PyArrow dependency.
 ```text
 Rust fleet discovery/controller Job
   -> atomic NFS task queue
-  -> fixed small and medium/large worker Jobs
+  -> fixed small, medium/large, and monthly-isolated worker Jobs
   -> per-wiki NFS lock + live run record
   -> resolve one completed snapshot for that wiki
   -> fetch -> ingest immutable generation -> select generation
@@ -52,10 +52,12 @@ short publisher Job
   -> retain status/history and prune bounded stale/release artifacts
 ```
 
-Every stage receives the same run ID and selected snapshot. Stage receipts
-permit unchanged work to be reused; explicit algorithm/schema versions force a
-recompute even when inputs are unchanged. The site cannot switch unless the
-publication receipt still matches immediately before publication. See
+Stages share the selected snapshot and pipeline task identity; the isolated
+monthly worker gives each stage a distinct run ID so logs and resource receipts
+remain independently traceable. Stage receipts permit unchanged work to be
+reused; explicit algorithm/schema versions force a recompute even when inputs
+are unchanged. The site cannot switch unless the publication receipt still
+matches immediately before publication. See
 [stage fingerprints](stage-fingerprints.md), the
 [publication gate](publication-gate.md), and the
 [run record](run-record.md) for those contracts.
@@ -65,23 +67,21 @@ publication receipt still matches immediately before publication. See
 There are independent Kubernetes workloads sharing the tool account's NFS
 mount:
 
-- `wiki-econ-fleet-controller` discovers the eighteen scheduled lifecycle
+- `wiki-econ-fleet-controller` runs every six hours and discovers the eighteen scheduled lifecycle
   entries (afwiki, arwiki, arzwiki, dewiki, elwiki, enwiki, eswiki, frwiki,
   hawiki, itwiki, jawiki, nlwiki, ptwiki, svwiki, swwiki, viwiki, yowiki, and
   zhwiki) and writes atomic tasks. dewiki and enwiki were promoted through the
   authenticated admin rather than the original Toolforge rollout; they are
   registered as `published` and `scheduled` with admin provenance. enwiki is
-  pinned to the `isolated` resource class, and because there is deliberately no
-  isolated production worker, its fleet task is not claimable by the pool below
-  until one exists — its published generation is therefore retained rather than
-  refreshed by the fleet. The per-job ceilings that bound this are fixed in
+  pinned to the `isolated` resource class and its August 2026 promotion receipt
+  is recorded in the capacity policy. The per-job ceilings that bound this are fixed in
   [toolforge-resource-envelope.md](toolforge-resource-envelope.md).
   `wiki-econ-fleet-small-a`, `wiki-econ-fleet-small-b`,
   `wiki-econ-fleet-medium`, and `wiki-econ-fleet-medium-b` are a fixed worker
   pool. Each claimed task owns only
   its wiki's candidate-generation paths; leases, heartbeats, bounded retries,
-  and quarantine keep failures independent. There is deliberately no isolated
-  production worker.
+  and quarantine keep failures independent. `wiki-econ-fleet-isolated` runs the
+  monthly enwiki pipeline sequentially in one 6-GiB / 4-CPU job.
 - `wiki-econ-publish-ready` is the short scheduled publisher. It alone acquires
   the global publication lock and mutates merged output and the live site.
 - `wiki-econ-refresh` is retained as an unscheduled, on-demand compatibility
@@ -100,9 +100,9 @@ mount:
 
 The lifecycle registry—not a deployment-script wiki list—is authoritative.
 The [generated lifecycle table](generated/stack-reference.md#published-wiki-lifecycle)
-shows the current split: eighteen scheduled datasets, of which sixteen are the
-original Toolforge rollout on the weekly schedule and two (dewiki and enwiki)
-were promoted through the authenticated admin on a 14-day freshness SLA.
+shows eighteen scheduled datasets. Sixteen have a 10-day freshness SLA, while
+dewiki and enwiki were promoted through the authenticated admin and have a
+14-day SLA. All are checked independently every six hours.
 
 ## Persistent storage
 

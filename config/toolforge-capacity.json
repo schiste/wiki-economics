@@ -23,7 +23,7 @@
   "resource_cpu_requests_millicores": {
     "small": 1000,
     "medium_large": 1000,
-    "isolated": 1000,
+    "isolated": 4000,
     "pipeline": 4000,
     "qualification": 4000,
     "controller": 1000,

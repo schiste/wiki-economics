@@ -21,7 +21,17 @@ report_fleet_controller_exit() {
 trap report_fleet_controller_exit EXIT
 
 echo "=== fleet controller start run_id=$WIKI_ECON_RUN_ID at=$(date -u +%Y-%m-%dT%H:%M:%SZ) ==="
-wiki_econ_run_cli fleet-discover \
+controller_output="$(wiki_econ_run_cli fleet-discover \
   --lifecycle "$WIKI_ECON_WIKI_LIFECYCLE_FILE" \
-  --queue-dir "$queue_dir"
+  --queue-dir "$queue_dir")"
+printf '%s\n' "$controller_output"
+# wiki_econ_run_cli prints the invocation before the CLI's machine-readable
+# report. Command substitution strips trailing newlines, so the report is the
+# final output line.
+report="${controller_output##*$'\n'}"
+failure_count="$(node -e 'const report=JSON.parse(process.argv[1]); process.stdout.write(String(report.failures?.length || 0));' "$report")"
+if [ "$failure_count" -gt 0 ]; then
+  echo "Fleet discovery completed with $failure_count per-wiki failure(s); successful tasks remain queued for workers" >&2
+  exit 1
+fi
 echo "=== fleet controller end run_id=$WIKI_ECON_RUN_ID at=$(date -u +%Y-%m-%dT%H:%M:%SZ) ==="

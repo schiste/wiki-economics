@@ -33,7 +33,16 @@ test("fleet capacity uses a fixed controller and worker pool", () => {
     "wiki-econ-fleet-small-b",
     "wiki-econ-fleet-medium",
     "wiki-econ-fleet-medium-b",
+    "wiki-econ-fleet-isolated",
   ]);
+  assert.match(
+    manifest,
+    /- name: wiki-econ-fleet-controller[\s\S]*?schedule: "0 \*\/6 \* \* \*"/,
+  );
+  assert.match(
+    manifest,
+    /- name: wiki-econ-fleet-isolated[\s\S]*?command: deploy\/toolforge\/run-fleet-worker\.sh isolated isolated-monthly --once[\s\S]*?schedule: "20 \*\/6 \* \* \*"[\s\S]*?mem: 6Gi[\s\S]*?cpu: "4"/,
+  );
   assert.doesNotMatch(manifest, /^- name: wiki-econ-prepare-/m);
   assert.match(
     manifest,
@@ -73,6 +82,7 @@ esac
       `jobs load --job wiki-econ-fleet-small-b ${manifest}`,
       `jobs load --job wiki-econ-fleet-medium ${manifest}`,
       `jobs load --job wiki-econ-fleet-medium-b ${manifest}`,
+      `jobs load --job wiki-econ-fleet-isolated ${manifest}`,
       `jobs load --job wiki-econ-admin-dispatcher ${manifest}`,
       `jobs load --job wiki-econ-publish-ready ${manifest}`,
       `jobs load --job wiki-econ-artifact-scrub ${manifest}`,
@@ -100,6 +110,7 @@ test("scheduled job resources match the capacity admission source of truth", () 
     "wiki-econ-fleet-small-b": "small",
     "wiki-econ-fleet-medium": "medium_large",
     "wiki-econ-fleet-medium-b": "medium_large",
+    "wiki-econ-fleet-isolated": "isolated",
     "wiki-econ-admin-dispatcher": "admin_dispatcher",
     "wiki-econ-publish-ready": "publisher",
     "wiki-econ-artifact-scrub": "scrubber",

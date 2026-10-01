@@ -13,14 +13,24 @@ afterEach(() => {
   while (roots.length) fs.rmSync(roots.pop(), {recursive: true, force: true});
 });
 
-function fixture({prepareExit = 0, failPrepare = false} = {}) {
+function fixture({prepareExit = 0, failPrepare = false, readySnapshot = null} = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-fleet-worker-"));
   roots.push(root);
   const log = path.join(root, "calls.log");
   const claim = path.join(root, "claim.json");
+  const outputDir = path.join(root, "output");
   fs.writeFileSync(claim, JSON.stringify({
     task: {wiki: "testwiki", snapshot: "2026-08", task_id: "a".repeat(64)},
   }));
+  if (readySnapshot) {
+    const indexDir = path.join(outputDir, "_ready-index");
+    fs.mkdirSync(indexDir, {recursive: true});
+    fs.writeFileSync(path.join(indexDir, "testwiki.json"), JSON.stringify({
+      schema_version: 2,
+      wiki: "testwiki",
+      newest_valid_ready: {snapshot: readySnapshot},
+    }));
+  }
   const binary = path.join(root, "wiki-econ");
   fs.writeFileSync(binary, `#!/bin/sh
 set -eu
@@ -48,7 +58,7 @@ set -eu
 printf 'prepare %s %s %s stale=%s\n' "$1" "$WIKI_ECON_PREPARE_SNAPSHOT" "$WIKI_ECON_RUN_ID" "$WIKI_ECON_PREPARE_LOCK_STALE_SECS" >> "${log}"
 exit ${failPrepare ? 1 : prepareExit}
 `, {mode: 0o755});
-  return {root, log, binary, prepare};
+  return {root, log, binary, prepare, outputDir};
 }
 
 function runWorker({
@@ -65,7 +75,7 @@ function runWorker({
       ...process.env,
       WIKI_ECON_ROOT: state.root,
       WIKI_ECON_DATA_DIR: path.join(state.root, "data"),
-      WIKI_ECON_OUTPUT_DIR: path.join(state.root, "output"),
+      WIKI_ECON_OUTPUT_DIR: state.outputDir,
       WIKI_ECON_BIN: state.binary,
       WIKI_ECON_FLEET_PREPARE_WRAPPER: state.prepare,
       WIKI_ECON_FLEET_QUEUE_DIR: path.join(state.root, "queue"),
@@ -87,10 +97,27 @@ test("one-shot worker pins the claimed snapshot and completes independently", ()
   assert.ok(!calls.includes("fleet-fail"));
 });
 
+test("a validated ready candidate lets a stale task complete without reprocessing", () => {
+  const {result, calls} = runWorker({readySnapshot: "2026-08"});
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.equal(calls.length, 2);
+  assert.match(calls[0], /^fleet-claim small claim-test-pod-[0-9]+\.json$/);
+  assert.equal(calls[1], "fleet-complete");
+  assert.ok(!calls.some(call => call.startsWith("prepare ")));
+});
+
 test("medium worker translates the queue resource class to Clap's CLI spelling", () => {
   const {result, calls} = runWorker({resourceClass: "medium_large"});
   assert.equal(result.status, 0, result.stderr || result.stdout);
   assert.match(calls[0], /^fleet-claim medium-large claim-test-pod-[0-9]+\.json$/);
+  assert.equal(calls.at(-1), "fleet-complete");
+});
+
+test("isolated worker claims monthly work from the isolated queue", () => {
+  const {result, calls} = runWorker({resourceClass: "isolated"});
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.match(calls[0], /^fleet-claim isolated claim-test-pod-[0-9]+\.json$/);
+  assert.match(calls[1], /^prepare testwiki 2026-08 fleet-isolated-test-testwiki-/);
   assert.equal(calls.at(-1), "fleet-complete");
 });
 
@@ -116,7 +143,7 @@ test("an explicit preparation-lock timeout overrides the fleet lease timeout", (
 });
 
 test("worker rejects unsupported resource classes before touching the queue", () => {
-  const result = spawnSync("bash", [script, "isolated", "unsafe", "--once"], {encoding: "utf8"});
+  const result = spawnSync("bash", [script, "unknown", "unsafe", "--once"], {encoding: "utf8"});
   assert.equal(result.status, 2);
   assert.match(result.stderr, /Unsupported fleet resource class/);
 });

@@ -167,14 +167,24 @@ The scheduled jobs are:
 | `wiki-econ-fleet-controller` | atomic queue writes | Discover every scheduled lifecycle wiki |
 | `wiki-econ-fleet-small-a/b` | task lease + `<wiki>.lock` | Prepare small-class wiki candidates |
 | `wiki-econ-fleet-medium` / `wiki-econ-fleet-medium-b` | task lease + `<wiki>.lock` | Prepare medium/large-class wiki candidates |
+| `wiki-econ-fleet-isolated` | task lease + `<wiki>.lock` | Run monthly enwiki stages sequentially within 6 GiB / 4 CPUs |
 | `wiki-econ-publish-ready` | `.publication.lock` | Select, merge, build, validate, switch, retire |
 
-The weekly controller schedule is a discovery trigger rather than an
-instruction to rebuild. Each trigger resolves and pins the latest completed
-snapshot. If that version and its stage fingerprints are already represented
+The controller runs every six hours as a discovery trigger rather than an
+instruction to rebuild. It resolves and pins the latest completed snapshot for
+each scheduled wiki independently. If that version and its stage fingerprints are already represented
 by matching completed-task, notification, and ready-index evidence, no task is
-queued. If a worker still reaches an unchanged candidate, its run record reports
+queued. A snapshot already present in the ready index also stays out of the
+queue, including one promoted outside the fleet; if an older queued task for
+that snapshot remains, its worker completes it without recomputing stages. If a
+worker reaches an unchanged candidate, its run record reports
 `noOp: true`; no dump or patrol download and no compute stage starts.
+
+The isolated monthly worker runs at minute 20 of each six-hour interval. When a
+new enwiki snapshot is complete, it runs ingest, metrics, lifecycle, page-week,
+patrol, and candidate publication sequentially. The existing publisher checks
+for validated candidates every two hours and retains the prior live generation
+if candidate or site validation fails.
 
 Every Wikimedia monthly history dump is treated as a complete authoritative
 snapshot. Snapshot rollover performs the complete source-generation ingest.
