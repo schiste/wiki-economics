@@ -5609,6 +5609,16 @@ fn retire_superseded_candidates(
 fn migration_lineage_dirs(candidate_dir: &Path) -> BTreeSet<PathBuf> {
     let mut lineage = BTreeSet::new();
     let mut current = candidate_dir.to_path_buf();
+    // The walk stays inside one snapshot directory: each hop is resolved as
+    // `<snapshot_dir>/<source_run_id>`, exactly as the validator resolves it, so
+    // the snapshot directory is fixed for the whole chain and is read once here
+    // rather than re-derived per hop.
+    //
+    // A candidate path with no parent is not a real candidate path, so the walk
+    // protects nothing rather than guessing a directory to join onto.
+    let Some(snapshot_dir) = candidate_dir.parent() else {
+        return lineage;
+    };
     // `retained_ready_lineage_origin` refuses to walk deeper than this, so
     // protecting more would be dead weight and protecting less is impossible.
     for _ in 0..=MAX_RETAINED_MIGRATION_DEPTH {
@@ -5621,9 +5631,6 @@ fn migration_lineage_dirs(candidate_dir: &Path) -> BTreeSet<PathBuf> {
         if !valid_component(&migration.source_run_id) || migration.source_run_id == ready.run_id {
             break;
         }
-        let Some(snapshot_dir) = current.parent() else {
-            break;
-        };
         let source = snapshot_dir.join(&migration.source_run_id);
         if !lineage.insert(source.clone()) {
             break;
@@ -13154,14 +13161,10 @@ mod tests {
             }
         };
         let origin_ready = origin.join("ready.json");
-        atomic_json(
-            &origin_ready,
-            &ready_receipt("migrationwiki", "origin-run", None),
-        )?;
-        atomic_json(
-            &unrelated.join("ready.json"),
-            &ready_receipt("migrationwiki", "unrelated-run", None),
-        )?;
+        let origin_receipt = ready_receipt("migrationwiki", "origin-run", None);
+        atomic_json(&origin_ready, &origin_receipt)?;
+        let unrelated_receipt = ready_receipt("migrationwiki", "unrelated-run", None);
+        atomic_json(&unrelated.join("ready.json"), &unrelated_receipt)?;
         let origin_sha256 = storage::sha256_file(&origin_ready)?.1;
         let mut retained_ready = ready_receipt("migrationwiki", "retained-run", Some("origin-run"));
         if let Some(migration) = retained_ready.migrated_from_retained_candidate.as_mut() {
@@ -13297,6 +13300,48 @@ mod tests {
             migration_lineage_dirs(&dangling),
             BTreeSet::from([snapshot_dir.join("never-existed")]),
             "an unresolvable hop is protected but ends the walk"
+        );
+
+        // A self-referential source_run_id would otherwise resolve to the
+        // candidate's own directory, so the walk must refuse it before joining.
+        let self_referential = hop("self-referential")?;
+        write(
+            &self_referential,
+            "self-referential",
+            Some("self-referential"),
+        )?;
+        assert!(
+            migration_lineage_dirs(&self_referential).is_empty(),
+            "a candidate that claims itself as its own migration origin protects \
+             nothing and must not protect itself either"
+        );
+
+        // A source_run_id that is not a valid path component must never be
+        // joined onto the snapshot directory: it could otherwise resolve
+        // outside the candidate root and silently protect a path outside it, or
+        // walk somewhere retirement does not manage.
+        let traversing = hop("traversing")?;
+        write(&traversing, "traversing", Some("../2026-09"))?;
+        assert!(
+            migration_lineage_dirs(&traversing).is_empty(),
+            "a migration source that is not a valid path component must be \
+             rejected rather than joined onto the snapshot directory"
+        );
+
+        // The same rejection applies to an absolute path.
+        let absolute = hop("absolute")?;
+        write(&absolute, "absolute", Some("/etc"))?;
+        assert!(
+            migration_lineage_dirs(&absolute).is_empty(),
+            "an absolute migration source must be rejected, not resolved"
+        );
+
+        // A path with no parent has no snapshot directory to resolve a hop
+        // against, so there is nothing to protect. Retirement must treat this as
+        // an empty lineage rather than guess a directory.
+        assert!(
+            migration_lineage_dirs(Path::new("")).is_empty(),
+            "a candidate path with no parent has no lineage to protect"
         );
         Ok(())
     }
