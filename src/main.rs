@@ -552,6 +552,11 @@ enum Commands {
         #[arg(long, default_value = "site/dist")]
         site_dist_dir: PathBuf,
 
+        /// Defer wikis whose candidate is not publishable instead of
+        /// blocking the whole publication on them
+        #[arg(long)]
+        defer_unavailable: bool,
+
         /// Optional atomic JSON report retained by operations
         #[arg(long = "report")]
         report_path: Option<PathBuf>,
@@ -1638,12 +1643,14 @@ fn run_with_ops(cli: Cli, ops: &impl ApplicationOps) -> Result<()> {
             lifecycle,
             site_dist_dir,
             report_path,
+            defer_unavailable,
         } => publication::run_publication_preflight_command(
             &data_dir,
             &output_dir,
             &lifecycle,
             &site_dist_dir,
             report_path.as_deref(),
+            defer_unavailable,
         )?,
 
         Commands::PublicationFingerprintCheck {

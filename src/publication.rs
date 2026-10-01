@@ -394,9 +394,21 @@ pub(crate) struct PublicationPreflightReport {
     recovery_clean: bool,
     scrub_state: String,
     blockers: Vec<String>,
+    /// Wikis excluded from this publication because their candidate is not
+    /// publishable yet, with the reason. These are not blockers: publication
+    /// proceeds for every other wiki, and a deferred wiki keeps its previously
+    /// published generation untouched.
+    pub(crate) deferred: Vec<PublicationDeferral>,
     changed: Vec<PublicationChange>,
     reused: Vec<PublicationChange>,
     wikis: Vec<PublicationPreflightWiki>,
+}
+
+/// One wiki held back from a publication, and why.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct PublicationDeferral {
+    pub(crate) wiki: String,
+    pub(crate) reason: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -4839,11 +4851,53 @@ fn record_candidate_fingerprint_drift(
     }
 }
 
-pub(crate) fn publication_preflight(
+/// Whether a wiki that is not publishable yet blocks the whole publication or
+/// is deferred to the next one.
+///
+/// Wikimedia cuts every managed wiki's history dump in the same month, so a
+/// per-wiki trigger gains nothing on cadence alone. What progressive
+/// publication needs is to stop one unready candidate holding back the other
+/// fifteen: a measured production run took 9.67h against a 2h schedule, and on
+/// 2026-09-29 a single wiki's missing retained receipt failed the whole site.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum PublicationPreflightMode {
+    /// Any unpublishable wiki blocks publication. The historical behaviour.
+    Strict,
+    /// Unpublishable wikis are deferred and reported; the rest publish.
+    DeferUnavailable,
+}
+
+/// Record one wiki's blockers according to the preflight mode.
+///
+/// Returns true when the wiki contributed any blocker, meaning the caller must
+/// skip the rest of this wiki's selection.
+fn record_wiki_blockers(
+    wiki: &str,
+    mode: PublicationPreflightMode,
+    wiki_blockers: Vec<String>,
+    blockers: &mut Vec<String>,
+    deferred: &mut Vec<PublicationDeferral>,
+) -> bool {
+    if wiki_blockers.is_empty() {
+        return false;
+    }
+    if mode == PublicationPreflightMode::Strict {
+        blockers.extend(wiki_blockers);
+    } else {
+        deferred.push(PublicationDeferral {
+            wiki: wiki.to_string(),
+            reason: wiki_blockers.join("; "),
+        });
+    }
+    true
+}
+
+pub(crate) fn publication_preflight_with_mode(
     data_dir: &Path,
     output_dir: &Path,
     lifecycle_path: &Path,
     site_dist_dir: &Path,
+    mode: PublicationPreflightMode,
 ) -> Result<PublicationPreflightReport> {
     let registry = load_lifecycle(lifecycle_path)?;
     let gate = read_json::<GateReceipt>(&output_dir.join(RECEIPT_FILE)).ok();
@@ -4875,12 +4929,18 @@ pub(crate) fn publication_preflight(
     let mut changed = Vec::new();
     let mut reused = Vec::new();
     let mut wikis = Vec::new();
+    let mut deferred: Vec<PublicationDeferral> = Vec::new();
     let mut merge_contracts = BTreeMap::<MetricId, (String, CandidateMergeContract)>::new();
     let mut incompatible_merge_metrics = BTreeSet::new();
     for (wiki, lifecycle) in &registry.wikis {
         if lifecycle.publication != "published" {
             continue;
         }
+        // Blockers observed while inspecting this wiki alone. Under
+        // `DeferUnavailable` they become a deferral and the loop moves on, so
+        // one wiki cannot hold back the rest of the site; under `Strict` they
+        // become global blockers, which is the historical behaviour.
+        let mut wiki_blockers: Vec<String> = Vec::new();
         let previous = gate
             .as_ref()
             .and_then(|receipt| receipt.wiki_proofs.get(wiki));
@@ -4912,11 +4972,25 @@ pub(crate) fn publication_preflight(
                 index
             }
             Ok(_) => {
-                blockers.push(format!("{wiki} ready index has an invalid identity"));
+                wiki_blockers.push(format!("{wiki} ready index has an invalid identity"));
+                record_wiki_blockers(
+                    wiki,
+                    mode,
+                    std::mem::take(&mut wiki_blockers),
+                    &mut blockers,
+                    &mut deferred,
+                );
                 continue;
             }
             Err(error) => {
-                blockers.push(format!("{wiki} has no readable ready index: {error:#}"));
+                wiki_blockers.push(format!("{wiki} has no readable ready index: {error:#}"));
+                record_wiki_blockers(
+                    wiki,
+                    mode,
+                    std::mem::take(&mut wiki_blockers),
+                    &mut blockers,
+                    &mut deferred,
+                );
                 continue;
             }
         };
@@ -4925,19 +4999,48 @@ pub(crate) fn publication_preflight(
             match ready_from_reference(data_dir, output_dir, wiki, reference) {
                 Ok(candidate) => candidate,
                 Err(error) => {
-                    blockers.push(format!(
+                    wiki_blockers.push(format!(
                         "{wiki} newest ready candidate failed authentication: {error:#}"
                     ));
+                    record_wiki_blockers(
+                        wiki,
+                        mode,
+                        std::mem::take(&mut wiki_blockers),
+                        &mut blockers,
+                        &mut deferred,
+                    );
                     continue;
                 }
             };
+        // A value fingerprint that changed under a stable algorithm_version is
+        // an integrity violation, not a readiness problem, so it stays a global
+        // blocker under both modes and is never deferred to one wiki. The same
+        // applies to a merge contract that conflicts with an earlier wiki's: it
+        // is a whole-dataset problem, and deferring it would publish a merged
+        // dataset that no single wiki's fix repairs.
+        if let Some(previous) = previous.filter(|proof| proof.snapshot == reference.snapshot) {
+            record_candidate_fingerprint_drift(
+                wiki,
+                reference,
+                previous,
+                artifact_backed_family_proofs(&candidate_dir, &ready.artifacts),
+                &mut blockers,
+            );
+        }
         let mut contracts = BTreeMap::new();
         if !collect_ready_candidate_merge_contracts(
             wiki,
             ready_candidate_merge_contracts(&candidate_dir, &ready),
-            &mut blockers,
+            &mut wiki_blockers,
             &mut contracts,
         ) {
+            record_wiki_blockers(
+                wiki,
+                mode,
+                std::mem::take(&mut wiki_blockers),
+                &mut blockers,
+                &mut deferred,
+            );
             continue;
         }
         for (metric, contract) in contracts {
@@ -4950,20 +5053,15 @@ pub(crate) fn publication_preflight(
                 contract,
             );
         }
+        // A snapshot downgrade is a hard integrity violation, not a readiness
+        // problem, so it stays a global blocker under both modes: deferring it
+        // would keep serving older data silently. The wiki is still walked so
+        // the operator can see what it would have reused.
         if previous.is_some_and(|proof| reference.snapshot < proof.snapshot) {
             blockers.push(format!(
                 "{wiki} candidate {} would downgrade the published snapshot",
                 reference.snapshot
             ));
-        }
-        if let Some(previous) = previous.filter(|proof| proof.snapshot == reference.snapshot) {
-            record_candidate_fingerprint_drift(
-                wiki,
-                reference,
-                previous,
-                artifact_backed_family_proofs(&candidate_dir, &ready.artifacts),
-                &mut blockers,
-            );
         }
         let mut candidate_families = reference.core_family_receipt_identities.clone();
         if !reference.patrol_receipt_identity.is_empty() {
@@ -5004,10 +5102,23 @@ pub(crate) fn publication_preflight(
     changed.sort();
     reused.sort();
     wikis.sort_by(|left, right| left.wiki.cmp(&right.wiki));
+    deferred.sort_by(|left, right| left.wiki.cmp(&right.wiki));
+    // Deferral must not become a way to spend a 6 GiB / 4 CPU publisher slot on
+    // a run that changes nothing: if every published wiki was deferred there is
+    // no work to do, so the run is not eligible to publish.
+    let published_wikis = registry
+        .wikis
+        .values()
+        .filter(|entry| entry.publication == "published")
+        .count();
+    let eligible = blockers.is_empty()
+        && !(mode == PublicationPreflightMode::DeferUnavailable
+            && !deferred.is_empty()
+            && deferred.len() == published_wikis);
     Ok(PublicationPreflightReport {
         schema_version: 1,
         generated_at_unix: now_unix()?,
-        eligible: blockers.is_empty(),
+        eligible,
         would_change: !changed.is_empty(),
         current_publication_run_id: gate.as_ref().map(|receipt| receipt.run_id.clone()),
         generating_commit: licensing::generating_commit(),
@@ -5021,6 +5132,7 @@ pub(crate) fn publication_preflight(
         recovery_clean,
         scrub_state,
         blockers,
+        deferred,
         changed,
         reused,
         wikis,
@@ -5151,12 +5263,25 @@ pub(crate) fn run_publication_preflight_command(
     lifecycle_path: &Path,
     site_dist_dir: &Path,
     report_path: Option<&Path>,
+    defer_unavailable: bool,
 ) -> Result<()> {
-    let report = publication_preflight(data_dir, output_dir, lifecycle_path, site_dist_dir)?;
+    let mode = if defer_unavailable {
+        PublicationPreflightMode::DeferUnavailable
+    } else {
+        PublicationPreflightMode::Strict
+    };
+    let report =
+        publication_preflight_with_mode(data_dir, output_dir, lifecycle_path, site_dist_dir, mode)?;
     if let Some(path) = report_path {
         write_publication_preflight_report(path, &report)?;
     }
     println!("{}", serde_json::to_string_pretty(&report)?);
+    for deferral in &report.deferred {
+        eprintln!(
+            "deferring {} to the next publication: {}",
+            deferral.wiki, deferral.reason
+        );
+    }
     ensure!(report.eligible, "publication preflight is blocked");
     Ok(())
 }
@@ -7974,11 +8099,12 @@ mod tests {
         .expect("duplicate candidate index should be writable");
         let (_site_root, site_dist) =
             preflight_site_fixture().expect("preflight site fixture should initialize");
-        let report = publication_preflight(
+        let report = publication_preflight_with_mode(
             fixture.data.path(),
             fixture.output.path(),
             &fixture.lifecycle_path,
             &site_dist,
+            PublicationPreflightMode::Strict,
         )
         .expect("invalid merge contract should produce a preflight report");
         assert!(!report.eligible);
@@ -8164,11 +8290,12 @@ mod tests {
         fixture.ready_candidate("candidate")?;
         let (_site_root, site_dist) = preflight_site_fixture()?;
 
-        let report = publication_preflight(
+        let report = publication_preflight_with_mode(
             fixture.data.path(),
             fixture.output.path(),
             &fixture.lifecycle_path,
             &site_dist,
+            PublicationPreflightMode::Strict,
         )
         .expect("publication preflight should succeed");
         assert!(report.eligible);
@@ -8192,9 +8319,376 @@ mod tests {
             &fixture.lifecycle_path,
             &site_dist,
             Some(&report_path),
+            false,
         )
         .expect("eligible preflight should write its report");
         assert!(report_path.is_file());
+        Ok(())
+    }
+
+    #[test]
+    fn a_wiki_blocker_defers_or_blocks_according_to_the_mode() -> Result<()> {
+        // The point of DeferUnavailable: a wiki that is not publishable yet must
+        // not hold back the rest of the site. Strict keeps all-or-nothing.
+        let mut blockers: Vec<String> = Vec::new();
+        let mut deferred: Vec<PublicationDeferral> = Vec::new();
+
+        assert!(!record_wiki_blockers(
+            "frwiki",
+            PublicationPreflightMode::Strict,
+            Vec::new(),
+            &mut blockers,
+            &mut deferred,
+        ));
+        assert!(blockers.is_empty() && deferred.is_empty());
+
+        assert!(record_wiki_blockers(
+            "frwiki",
+            PublicationPreflightMode::Strict,
+            vec!["frwiki has no readable ready index".to_string()],
+            &mut blockers,
+            &mut deferred,
+        ));
+        assert_eq!(
+            blockers.len(),
+            1,
+            "strict mode blocks the whole publication"
+        );
+        assert!(deferred.is_empty(), "strict mode defers nothing");
+
+        let mut blockers: Vec<String> = Vec::new();
+        let mut deferred: Vec<PublicationDeferral> = Vec::new();
+        assert!(record_wiki_blockers(
+            "afwiki",
+            PublicationPreflightMode::DeferUnavailable,
+            vec![
+                "afwiki has no readable ready index".to_string(),
+                "afwiki candidate failed authentication".to_string(),
+            ],
+            &mut blockers,
+            &mut deferred,
+        ));
+        assert!(
+            blockers.is_empty(),
+            "a deferred wiki must not become a global blocker"
+        );
+        assert_eq!(deferred.len(), 1);
+        assert_eq!(deferred[0].wiki, "afwiki");
+        assert_eq!(
+            deferred[0].reason,
+            "afwiki has no readable ready index; afwiki candidate failed authentication",
+            "a deferral must preserve every reason, joined readably"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_snapshot_downgrade_blocks_in_both_modes() -> Result<()> {
+        // Deferring is for candidates that are not ready yet. A candidate that
+        // would move the published snapshot backwards is an integrity violation
+        // and must never be deferred into silent staleness.
+        let fixture = Fixture::new()?;
+        fixture.prepare("baseline")?;
+        validate(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "baseline",
+        )
+        .expect("baseline publication fixture should validate");
+        fixture.ready_candidate("candidate")?;
+        let (_site_root, site_dist) = preflight_site_fixture()?;
+
+        let index: ReadyCandidateIndex =
+            read_json(&ready_index_path(fixture.output.path(), "nlwiki"))?;
+        let mut gate: Value = read_json(&fixture.output.path().join(RECEIPT_FILE))?;
+        gate["wiki_proofs"]["nlwiki"]["snapshot"] = json!("2027-01");
+        for (family, identity) in &index.newest_valid_ready.core_family_receipt_identities {
+            gate["wiki_proofs"]["nlwiki"]["families"][family]["receipt_identity"] = json!(identity);
+        }
+        gate["wiki_proofs"]["nlwiki"]["families"]["patrol"]["receipt_identity"] =
+            json!(index.newest_valid_ready.patrol_receipt_identity);
+        atomic_json(&fixture.output.path().join(RECEIPT_FILE), &gate)?;
+
+        for mode in [
+            PublicationPreflightMode::Strict,
+            PublicationPreflightMode::DeferUnavailable,
+        ] {
+            let report = publication_preflight_with_mode(
+                fixture.data.path(),
+                fixture.output.path(),
+                &fixture.lifecycle_path,
+                &site_dist,
+                mode,
+            )
+            .expect("a downgrade should still produce a preflight report");
+            assert!(!report.eligible, "a downgrade blocks in {mode:?}");
+            assert!(
+                report
+                    .blockers
+                    .iter()
+                    .any(|blocker| blocker.contains("downgrade")),
+                "a downgrade is a global blocker in {mode:?}, not a deferral"
+            );
+            assert!(
+                report.deferred.is_empty(),
+                "a downgrade must not be deferred in {mode:?}"
+            );
+            assert!(
+                !report.reused.is_empty(),
+                "the wiki is still reported so the operator sees what was reused ({mode:?})"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn deferring_every_published_wiki_is_not_eligible() -> Result<()> {
+        // Deferral must not become a way to spend a 6 GiB / 4 CPU publisher slot
+        // on a run that changes nothing.
+        let fixture = Fixture::new()?;
+        fixture.prepare("baseline")?;
+        validate(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "baseline",
+        )
+        .expect("baseline publication fixture should validate");
+        let (_site_root, site_dist) = preflight_site_fixture()?;
+
+        // nlwiki is the only published wiki and has no ready index yet.
+        let report = publication_preflight_with_mode(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            &site_dist,
+            PublicationPreflightMode::DeferUnavailable,
+        )
+        .expect("deferring an unready wiki still produces a report");
+        assert_eq!(report.deferred.len(), 1, "the only wiki is deferred");
+        assert_eq!(report.deferred[0].wiki, "nlwiki");
+        assert!(
+            !report.eligible,
+            "a run that deferred every wiki must not report itself eligible"
+        );
+        assert!(!report.would_change);
+        Ok(())
+    }
+
+    #[test]
+    fn one_unready_wiki_does_not_hold_back_a_ready_one() -> Result<()> {
+        // The end-to-end property progressive publication depends on: a second
+        // published wiki whose candidate is not ready is deferred, while the
+        // ready wiki is still selected and the run stays eligible.
+        let fixture = Fixture::new()?;
+        fixture.prepare("baseline")?;
+        validate(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "baseline",
+        )
+        .expect("baseline publication fixture should validate");
+        fixture.ready_candidate("candidate")?;
+
+        let mut registry: Value = read_json(&fixture.lifecycle_path)?;
+        registry["wikis"]["afwiki"] = json!({
+            "publication": "published",
+            "refresh": "scheduled",
+            "freshness_sla_days": 10,
+            "retention": {
+                "source_recoverability": "redownloadable",
+                "history_input": "purge_after_ready",
+                "patrol_source": "purge_after_ready",
+                "computed_rollback_generations": 1
+            }
+        });
+        atomic_json(&fixture.lifecycle_path, &registry)?;
+        let (_site_root, site_dist) = preflight_site_fixture()?;
+
+        let strict = publication_preflight_with_mode(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            &site_dist,
+            PublicationPreflightMode::Strict,
+        )
+        .expect("strict preflight must still produce a report");
+        assert!(
+            !strict.eligible,
+            "strict mode lets one unready wiki block the whole site"
+        );
+        assert!(strict.deferred.is_empty(), "strict mode defers nothing");
+
+        let partial = publication_preflight_with_mode(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            &site_dist,
+            PublicationPreflightMode::DeferUnavailable,
+        )
+        .expect("deferral preflight must still produce a report");
+        assert!(
+            partial.eligible,
+            "an unready wiki must not block the ready one: {:?}",
+            partial.blockers
+        );
+        assert_eq!(partial.deferred.len(), 1, "exactly the unready wiki defers");
+        assert_eq!(partial.deferred[0].wiki, "afwiki");
+        assert!(
+            partial.deferred[0]
+                .reason
+                .contains("no readable ready index")
+        );
+        assert!(
+            partial
+                .wikis
+                .iter()
+                .any(|wiki| wiki.wiki == "nlwiki" && wiki.candidate_snapshot.is_some()),
+            "the ready wiki must still be selected: {:?}",
+            partial.wikis
+        );
+        assert!(
+            partial.would_change,
+            "the ready wiki still changes the site"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn a_candidate_whose_artifact_stops_authenticating_defers_the_wiki() -> Result<()> {
+        // A candidate whose artifact no longer authenticates is not publishable.
+        // This is the shape of the 2026-09-29 afwiki failure, where one wiki's
+        // candidate could not be authenticated: the failure is per-wiki, so
+        // deferral must keep it from blocking the other fifteen.
+        let fixture = Fixture::new()?;
+        fixture.prepare("baseline")?;
+        validate(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "baseline",
+        )
+        .expect("baseline publication fixture should validate");
+        // `ready_candidate` returns the ready receipt; the candidate directory
+        // holding the artifacts is its parent.
+        let candidate = fixture.ready_candidate("candidate")?;
+        let candidate_dir = candidate
+            .parent()
+            .expect("ready receipt has a parent candidate directory")
+            .to_path_buf();
+
+        // Corrupt the per-wiki artifact after the candidate was marked ready.
+        let weekly = candidate_dir
+            .join("nlwiki")
+            .join("page_weekly_edits.parquet");
+        fs::write(&weekly, b"not a parquet file")
+            .expect("per-wiki artifact should be overwritable");
+
+        let (_site_root, site_dist) = preflight_site_fixture()?;
+        let partial = publication_preflight_with_mode(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            &site_dist,
+            PublicationPreflightMode::DeferUnavailable,
+        )
+        .expect("an unauthenticatable family still produces a report");
+        let strict = publication_preflight_with_mode(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            &site_dist,
+            PublicationPreflightMode::Strict,
+        )
+        .expect("strict preflight must still produce a report");
+
+        assert_eq!(
+            partial.deferred.len(),
+            1,
+            "the wiki with an unauthenticatable family is deferred: {:?}",
+            partial.deferred
+        );
+        assert_eq!(partial.deferred[0].wiki, "nlwiki");
+        assert!(
+            partial.deferred[0]
+                .reason
+                .contains("newest ready candidate failed authentication"),
+            "the deferral names the failing stage"
+        );
+        assert!(
+            strict
+                .blockers
+                .iter()
+                .any(|blocker| blocker.contains("newest ready candidate failed authentication")),
+            "strict mode blocks on the same state: {:?}",
+            strict.blockers
+        );
+        assert!(strict.deferred.is_empty(), "strict mode defers nothing");
+        assert!(partial.wikis.is_empty(), "the wiki is not selected");
+        Ok(())
+    }
+
+    #[test]
+    fn the_preflight_command_reports_deferrals_and_retains_its_report() -> Result<()> {
+        let fixture = Fixture::new()?;
+        fixture.prepare("baseline")?;
+        validate(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            "baseline",
+        )
+        .expect("baseline publication fixture should validate");
+        let (_site_root, site_dist) = preflight_site_fixture()?;
+
+        // Deferral mode: the retained report must show the wiki and its reason.
+        let deferred_path = fixture.output.path().join("deferred-preflight.json");
+        run_publication_preflight_command(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            &site_dist,
+            Some(&deferred_path),
+            true,
+        )
+        .expect_err("a run that deferred every wiki cannot publish");
+        assert!(deferred_path.is_file(), "the report is retained either way");
+        let deferred: Value = read_json(&deferred_path)?;
+        assert_eq!(deferred["eligible"], json!(false));
+        assert_eq!(deferred["deferred"][0]["wiki"], json!("nlwiki"));
+        assert!(
+            deferred["deferred"][0]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("no readable ready index")),
+            "the retained report must carry the deferral reason"
+        );
+
+        // Strict mode on the same state reports a global blocker instead.
+        let strict_path = fixture.output.path().join("strict-preflight.json");
+        run_publication_preflight_command(
+            fixture.data.path(),
+            fixture.output.path(),
+            &fixture.lifecycle_path,
+            &site_dist,
+            Some(&strict_path),
+            false,
+        )
+        .expect_err("strict mode blocks when a wiki has no ready index");
+        let strict: Value = read_json(&strict_path)?;
+        assert_eq!(strict["eligible"], json!(false));
+        assert_eq!(strict["deferred"].as_array().map(Vec::len), Some(0));
+        assert!(
+            strict["blockers"]
+                .as_array()
+                .is_some_and(|blockers| blockers.iter().any(|blocker| {
+                    blocker
+                        .as_str()
+                        .is_some_and(|text| text.contains("no readable ready index"))
+                })),
+            "strict mode must report a global blocker instead of a deferral"
+        );
         Ok(())
     }
 
@@ -8289,11 +8783,12 @@ mod tests {
         )
         .expect("failed scrub fixture must be written");
         fs::remove_file(blocked.output.path().join(RECEIPT_FILE))?;
-        let blocked_report = publication_preflight(
+        let blocked_report = publication_preflight_with_mode(
             blocked.data.path(),
             blocked.output.path(),
             &blocked.lifecycle_path,
             &site_dist,
+            PublicationPreflightMode::Strict,
         )
         .expect("blocked preflight must still produce a report");
         assert!(!blocked_report.eligible);
@@ -8305,6 +8800,7 @@ mod tests {
                 &blocked.lifecycle_path,
                 &site_dist,
                 None,
+                false,
             )
             .is_err()
         );
@@ -8326,11 +8822,12 @@ mod tests {
             "refresh": "qualification"
         });
         atomic_json(&lifecycle_states.lifecycle_path, &registry)?;
-        let states_report = publication_preflight(
+        let states_report = publication_preflight_with_mode(
             lifecycle_states.data.path(),
             lifecycle_states.output.path(),
             &lifecycle_states.lifecycle_path,
             &site_dist,
+            PublicationPreflightMode::Strict,
         )
         .expect("paused and hidden lifecycle entries should be handled");
         assert!(states_report.eligible);
@@ -8371,11 +8868,12 @@ mod tests {
                     atomic_json(&index_path, &index)?;
                 }
             }
-            let report = publication_preflight(
+            let report = publication_preflight_with_mode(
                 fixture.data.path(),
                 fixture.output.path(),
                 &fixture.lifecycle_path,
                 &site_dist,
+                PublicationPreflightMode::Strict,
             )
             .expect("index failures should become preflight blockers");
             assert!(!report.eligible);
@@ -8407,11 +8905,12 @@ mod tests {
         gate["wiki_proofs"]["nlwiki"]["families"]["patrol"]["receipt_identity"] =
             json!(index.newest_valid_ready.patrol_receipt_identity);
         atomic_json(&downgrade.output.path().join(RECEIPT_FILE), &gate)?;
-        let downgrade_report = publication_preflight(
+        let downgrade_report = publication_preflight_with_mode(
             downgrade.data.path(),
             downgrade.output.path(),
             &downgrade.lifecycle_path,
             &site_dist,
+            PublicationPreflightMode::Strict,
         )
         .expect("downgrade should become a preflight blocker");
         assert!(!downgrade_report.eligible);
@@ -8425,11 +8924,12 @@ mod tests {
 
         let missing_site_dist = lifecycle_states.output.path().join("missing-site/dist");
         assert!(
-            publication_preflight(
+            publication_preflight_with_mode(
                 lifecycle_states.data.path(),
                 lifecycle_states.output.path(),
                 &lifecycle_states.lifecycle_path,
                 &missing_site_dist,
+                PublicationPreflightMode::Strict,
             )
             .is_err()
         );
