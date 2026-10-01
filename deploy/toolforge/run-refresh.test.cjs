@@ -7,6 +7,14 @@ const {after, test} = require("node:test");
 
 const repoRoot = path.resolve(__dirname, "../..");
 const wrapper = path.join(repoRoot, "deploy", "toolforge", "run-refresh.sh");
+// Derived from the registry rather than hardcoded, so promoting a wiki does not
+// require editing a positional argument assertion in this file.
+const scheduledWikis = require(path.join(repoRoot, "scripts", "wiki-lifecycle.cjs"))
+  .loadWikiLifecycle(repoRoot, {});
+const scheduledWikiArgs = (() => {
+  const {resolveRefreshWikis} = require(path.join(repoRoot, "scripts", "wiki-lifecycle.cjs"));
+  return resolveRefreshWikis(scheduledWikis, {}).join(" ");
+})();
 const runRecordHelper = path.join(repoRoot, "deploy", "toolforge", "run-record.cjs");
 const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "wiki-econ-refresh-lock-"));
 
@@ -221,7 +229,7 @@ test("an active refresh owns metadata, rejects overlap, and releases cleanly", a
   assert.doesNotMatch(runLog, /\u001b\[/);
   assert.equal(
     fs.readFileSync(fixture.driverArgs, "utf8").trim(),
-    "--version 2026-07 afwiki arwiki arzwiki elwiki eswiki frwiki hawiki itwiki jawiki nlwiki ptwiki svwiki swwiki viwiki yowiki zhwiki",
+    `--version 2026-07 ${scheduledWikiArgs}`,
   );
   assert.equal(fs.readFileSync(fixture.driverEnv, "utf8"), "1\n1\n1\n1\nunset\n");
 });
@@ -253,7 +261,7 @@ test("an on-demand stage is passed through to the refresh driver", () => {
   assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
   assert.equal(
     fs.readFileSync(fixture.driverArgs, "utf8").trim(),
-    "--version 2026-07 afwiki arwiki arzwiki elwiki eswiki frwiki hawiki itwiki jawiki nlwiki ptwiki svwiki swwiki viwiki yowiki zhwiki --stage ingest",
+    `--version 2026-07 ${scheduledWikiArgs} --stage ingest`,
   );
 });
 

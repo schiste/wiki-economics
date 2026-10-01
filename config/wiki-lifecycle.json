@@ -49,10 +49,11 @@
   },
   "wikis": {
     "dewiki": {
-      "publication": "hidden",
-      "refresh": "qualification",
-      "provenance": "toolforge-admin:operator",
+      "publication": "published",
+      "refresh": "scheduled",
+      "provenance": "toolforge-admin:Schiste",
       "fleet_resource_class": "medium_large",
+      "freshness_sla_days": 14,
       "retention": {
         "source_recoverability": "redownloadable",
         "history_input": "purge_after_ready",
@@ -73,10 +74,11 @@
       }
     },
     "enwiki": {
-      "publication": "hidden",
-      "refresh": "qualification",
-      "provenance": "toolforge-admin:enwiki-qualification-freeze-2026-09-21",
+      "publication": "published",
+      "refresh": "scheduled",
+      "provenance": "toolforge-admin:Schiste",
       "fleet_resource_class": "isolated",
+      "freshness_sla_days": 14,
       "retention": {
         "source_recoverability": "redownloadable",
         "history_input": "purge_after_ready",
@@ -136,6 +138,7 @@
       "publication": "published",
       "refresh": "scheduled",
       "provenance": "toolforge",
+      "fleet_resource_class": "medium_large",
       "freshness_sla_days": 10,
       "retention": {
         "source_recoverability": "redownloadable",

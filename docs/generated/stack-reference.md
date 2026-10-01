@@ -66,16 +66,16 @@ build or browser dependency.
 ## Published wiki lifecycle
 
 The table below is rendered from `config/wiki-lifecycle.json`. Scheduled
-datasets are `afwiki`, `arwiki`, `arzwiki`, `elwiki`, `eswiki`, `frwiki`, `hawiki`, `itwiki`, `jawiki`, `nlwiki`, `ptwiki`, `svwiki`, `swwiki`, `viwiki`, `yowiki`, `zhwiki`; paused imported datasets are none.
+datasets are `afwiki`, `arwiki`, `arzwiki`, `dewiki`, `elwiki`, `enwiki`, `eswiki`, `frwiki`, `hawiki`, `itwiki`, `jawiki`, `nlwiki`, `ptwiki`, `svwiki`, `swwiki`, `viwiki`, `yowiki`, `zhwiki`; paused imported datasets are none.
 
 | Wiki | Publication | Refresh | Provenance | Freshness SLA / imported cutoff |
 | --- | --- | --- | --- | --- |
 | `afwiki` | published | scheduled | toolforge | 10 days |
 | `arwiki` | published | scheduled | toolforge | 10 days |
 | `arzwiki` | published | scheduled | toolforge | 10 days |
-| `dewiki` | hidden | qualification | toolforge-admin:operator | — |
+| `dewiki` | published | scheduled | toolforge-admin:Schiste | 14 days |
 | `elwiki` | published | scheduled | toolforge | 10 days |
-| `enwiki` | hidden | qualification | toolforge-admin:enwiki-qualification-freeze-2026-09-21 | — |
+| `enwiki` | published | scheduled | toolforge-admin:Schiste | 14 days |
 | `eswiki` | published | scheduled | toolforge | 10 days |
 | `frwiki` | published | scheduled | toolforge | 10 days |
 | `hawiki` | published | scheduled | toolforge | 10 days |

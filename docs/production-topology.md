@@ -65,13 +65,17 @@ publication receipt still matches immediately before publication. See
 There are independent Kubernetes workloads sharing the tool account's NFS
 mount:
 
-- `wiki-econ-fleet-controller` discovers the sixteen scheduled lifecycle
-  entries (afwiki, arwiki, arzwiki, elwiki, eswiki, frwiki, hawiki, itwiki,
-  jawiki, nlwiki, ptwiki, svwiki, swwiki, viwiki, yowiki, and zhwiki) and
-  writes atomic tasks. Two further wikis, dewiki and enwiki, are in the
-  lifecycle registry with `refresh: qualification` and are deliberately not
-  scheduled: enwiki is excluded from scheduled publication until bounded
-  compute and production-capacity qualification pass.
+- `wiki-econ-fleet-controller` discovers the eighteen scheduled lifecycle
+  entries (afwiki, arwiki, arzwiki, dewiki, elwiki, enwiki, eswiki, frwiki,
+  hawiki, itwiki, jawiki, nlwiki, ptwiki, svwiki, swwiki, viwiki, yowiki, and
+  zhwiki) and writes atomic tasks. dewiki and enwiki were promoted through the
+  authenticated admin rather than the original Toolforge rollout; they are
+  registered as `published` and `scheduled` with admin provenance. enwiki is
+  pinned to the `isolated` resource class, and because there is deliberately no
+  isolated production worker, its fleet task is not claimable by the pool below
+  until one exists — its published generation is therefore retained rather than
+  refreshed by the fleet. The per-job ceilings that bound this are fixed in
+  [toolforge-resource-envelope.md](toolforge-resource-envelope.md).
   `wiki-econ-fleet-small-a`, `wiki-econ-fleet-small-b`,
   `wiki-econ-fleet-medium`, and `wiki-econ-fleet-medium-b` are a fixed worker
   pool. Each claimed task owns only
@@ -96,9 +100,9 @@ mount:
 
 The lifecycle registry—not a deployment-script wiki list—is authoritative.
 The [generated lifecycle table](generated/stack-reference.md#published-wiki-lifecycle)
-shows the current split: sixteen scheduled Toolforge datasets refresh weekly,
-while dewiki and enwiki are held at `refresh: qualification` and stay published
-but unscheduled until their promotion gates pass.
+shows the current split: eighteen scheduled datasets, of which sixteen are the
+original Toolforge rollout on the weekly schedule and two (dewiki and enwiki)
+were promoted through the authenticated admin on a 14-day freshness SLA.
 
 ## Persistent storage
 
