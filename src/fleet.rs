@@ -1188,6 +1188,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn ready_index_lookup_reports_non_not_found_read_errors() {
+        let output = TestDir::new().expect("output fixture should be created");
+        fs::write(output.path().join("_ready-index"), b"not a directory")
+            .expect("blocking ready-index path should be written");
+
+        let error = ready_index_contains_snapshot(output.path(), "testwiki", "2026-07")
+            .expect_err("a non-directory ready-index path should fail");
+
+        assert!(format!("{error:#}").contains("failed to read"));
+    }
+
     fn enqueue_fixture(
         root: &Path,
         wiki: &str,

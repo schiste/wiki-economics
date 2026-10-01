@@ -3925,13 +3925,16 @@ mod tests {
         fs::write(
             &lifecycle,
             br#"{"schema_version":1,"wikis":{"testwiki":{"publication":"published","refresh":"scheduled"}}}"#,
-        )?;
+        )
+        .expect("lifecycle fixture should be written");
         let ready_index_dir = output.path().join("_ready-index");
-        fs::create_dir_all(&ready_index_dir)?;
+        fs::create_dir_all(&ready_index_dir)
+            .expect("ready-index fixture directory should be created");
         fs::write(
             ready_index_dir.join("testwiki.json"),
             br#"{"schema_version":2,"wiki":"testwiki","newest_valid_ready":{"snapshot":"2026-07"}}"#,
-        )?;
+        )
+        .expect("ready-index fixture should be written");
         let ops = TestApplication::default();
 
         let report = handle_fleet_discovery(
@@ -3949,7 +3952,8 @@ mod tests {
                 queue_dir: &queue,
                 snapshot: None,
             },
-        )?;
+        )
+        .expect("ready snapshots should be skipped during discovery");
 
         assert_eq!(report.unchanged, 1);
         assert!(!queue.join("pending/testwiki.json").exists());
@@ -3962,8 +3966,19 @@ mod tests {
         let output = TestDir::new()?;
         let queue = output.path().join("_fleet-shadow");
         let lifecycle = output.path().join("lifecycle.json");
-        const LIFECYCLE: &[u8] = br#"{"schema_version":1,"wikis":{"afailwiki":{"publication":"published","refresh":"scheduled"},"testwiki":{"publication":"published","refresh":"scheduled"}}}"#;
-        fs::write(&lifecycle, LIFECYCLE)?;
+        const LIFECYCLE: &[u8] = br#"{"schema_version":1,"wikis":{"afailwiki":{"publication":"published","refresh":"scheduled"},"badprofilewiki":{"publication":"published","refresh":"scheduled"},"testwiki":{"publication":"published","refresh":"scheduled"}}}"#;
+        fs::write(&lifecycle, LIFECYCLE).expect("lifecycle fixture should be written");
+        let bad_profile = data
+            .path()
+            .join("snapshots/badprofilewiki/2026-07/workload-profile.json");
+        fs::create_dir_all(
+            bad_profile
+                .parent()
+                .expect("workload-profile fixture should have a parent"),
+        )
+        .expect("workload-profile fixture directory should be created");
+        fs::write(&bad_profile, b"not-json")
+            .expect("invalid workload-profile fixture should be written");
         let ops = TestApplication {
             snapshots: SnapshotSpy {
                 fail_resolve_wiki: Some("afailwiki".to_string()),
@@ -3986,15 +4001,23 @@ mod tests {
                 queue_dir: &queue,
                 snapshot: None,
             },
-        )?;
-        assert_eq!(discovery.failures.len(), 1);
+        )
+        .expect("discovery should continue after per-wiki failures");
+        assert_eq!(discovery.failures.len(), 2);
         assert_eq!(discovery.failures[0].wiki, "afailwiki");
         assert!(
             discovery.failures[0]
                 .error
                 .contains("snapshot inventory unavailable")
         );
+        assert_eq!(discovery.failures[1].wiki, "badprofilewiki");
+        assert!(
+            discovery.failures[1]
+                .error
+                .contains("invalid workload profile JSON")
+        );
         assert!(!queue.join("pending/afailwiki.json").exists());
+        assert!(!queue.join("pending/badprofilewiki.json").exists());
         assert!(queue.join("pending/testwiki.json").is_file());
         Ok(())
     }
