@@ -18,6 +18,10 @@ const READY_INDEX_DIR: &str = "_ready-index";
 const PUBLICATION_BACKUP_DIR: &str = "publication-backup";
 const PUBLICATION_BACKUP_MANIFEST: &str = "backup.json";
 const QUALIFICATION_SOURCE_RECEIPT: &str = "qualification-source.json";
+/// How many `migrated_from_retained_candidate` hops a retained candidate may
+/// declare. Shared by the lineage validator and by retirement, so the set of
+/// candidates retirement protects is exactly the set the validator can read.
+const MAX_RETAINED_MIGRATION_DEPTH: u8 = 16;
 const QUALIFICATION_SOURCE_GENERATION_MANIFEST: &str =
     "qualification-source-generation-manifest.json";
 pub(crate) const READY_INDEX_SCHEMA_VERSION: u8 = 2;
@@ -2610,7 +2614,7 @@ fn retained_ready_lineage_origin(
     depth: u8,
 ) -> Result<Option<PathBuf>> {
     ensure!(
-        depth <= 16,
+        depth <= MAX_RETAINED_MIGRATION_DEPTH,
         "retained candidate migration lineage is too deep"
     );
     let ready_path = candidate_dir.join("ready.json");
@@ -5587,6 +5591,48 @@ fn retire_superseded_candidates(
     )
 }
 
+/// The candidate directories a retained candidate was migrated from, walking
+/// `migrated_from_retained_candidate.source_run_id` to the end of its chain.
+///
+/// These must survive retirement alongside the candidate itself. A migrated
+/// candidate records the *original* family's receipts, and
+/// `retained_ready_lineage_origin` re-reads that origin's `ready.json` to
+/// authenticate the lineage — so deleting it does not merely lose history, it
+/// leaves the retained candidate permanently unauthenticatable. In production
+/// on 2026-09-29 retiring a wiki's superseded candidates deleted arwiki's
+/// migration origin, which broke `fingerprint-check` on every subsequent run
+/// while the published site itself looked healthy.
+///
+/// This walk is deliberately best-effort: it protects what it can resolve and
+/// ignores anything it cannot, because retirement must still be able to
+/// reclaim genuinely superseded candidates.
+fn migration_lineage_dirs(candidate_dir: &Path) -> BTreeSet<PathBuf> {
+    let mut lineage = BTreeSet::new();
+    let mut current = candidate_dir.to_path_buf();
+    // `retained_ready_lineage_origin` refuses to walk deeper than this, so
+    // protecting more would be dead weight and protecting less is impossible.
+    for _ in 0..=MAX_RETAINED_MIGRATION_DEPTH {
+        let Ok(ready) = read_json::<ReadyWikiCandidate>(&current.join("ready.json")) else {
+            break;
+        };
+        let Some(migration) = ready.migrated_from_retained_candidate.as_ref() else {
+            break;
+        };
+        if !valid_component(&migration.source_run_id) || migration.source_run_id == ready.run_id {
+            break;
+        }
+        let Some(snapshot_dir) = current.parent() else {
+            break;
+        };
+        let source = snapshot_dir.join(&migration.source_run_id);
+        if !lineage.insert(source.clone()) {
+            break;
+        }
+        current = source;
+    }
+    lineage
+}
+
 fn retire_candidates_outside_rollback(
     output_dir: &Path,
     wiki: &str,
@@ -5597,6 +5643,13 @@ fn retire_candidates_outside_rollback(
     let root = output_dir.join("_candidates").join(wiki);
     let retained = output_dir.join(retained_relative);
     let rollback = rollback_relative.map(|relative| output_dir.join(relative));
+    let mut protected: BTreeSet<PathBuf> = BTreeSet::new();
+    protected.insert(retained.clone());
+    protected.extend(migration_lineage_dirs(&retained));
+    if let Some(rollback) = rollback.as_ref() {
+        protected.insert(rollback.clone());
+        protected.extend(migration_lineage_dirs(rollback));
+    }
     let mut removed = 0;
     if !root.is_dir() {
         return Ok(0);
@@ -5609,8 +5662,7 @@ fn retire_candidates_outside_rollback(
         for run_entry in fs::read_dir(&snapshot_dir)? {
             let candidate_dir = run_entry?.path();
             if !candidate_dir.is_dir()
-                || candidate_dir == retained
-                || rollback.as_ref() == Some(&candidate_dir)
+                || protected.contains(&candidate_dir)
                 || !candidate_dir.join("ready.json").is_file()
             {
                 continue;
@@ -13052,6 +13104,201 @@ mod tests {
             "promotion-interrupted",
         )
         .expect("promotion retry should reconcile the ready state");
+    }
+
+    #[test]
+    fn retirement_preserves_a_retained_candidates_migration_lineage() -> Result<()> {
+        // Regression for the 2026-09-29 production failure. arwiki's retained
+        // candidate declared `migrated_from_retained_candidate.source_run_id`,
+        // and retirement deleted that origin because it was outside the rollback
+        // window. The site kept serving, but every later re-authentication of the
+        // lineage -- fingerprint-check, resume, rollback -- failed with
+        // "retained migration source ready receipt is missing", so the defect was
+        // invisible in the published output and fatal everywhere else.
+        let fixture = Fixture::new()?;
+        let root = fixture
+            .output
+            .path()
+            .join("_candidates/migrationwiki/2026-08");
+        let origin = root.join("origin-run");
+        let retained = root.join("retained-run");
+        let unrelated = root.join("unrelated-run");
+        fs::create_dir_all(&origin)?;
+        fs::create_dir_all(&retained)?;
+        fs::create_dir_all(&unrelated)?;
+
+        let ready_receipt = |wiki: &str,
+                             run_id: &str,
+                             source: Option<&str>|
+         -> ReadyWikiCandidate {
+            ReadyWikiCandidate {
+                schema_version: 1,
+                wiki: wiki.to_string(),
+                snapshot: "2026-08".to_string(),
+                run_id: run_id.to_string(),
+                ready_at_unix: 1,
+                generating_commit: None,
+                cutoff_date: "2026-08-31".to_string(),
+                workload_profile: None,
+                editor_identity_coverage: None,
+                quality_signals: None,
+                promoted_from_qualification: None,
+                migrated_from_retained_candidate: source.map(|source| RetainedCandidateMigration {
+                    schema_version: 1,
+                    source_run_id: source.to_string(),
+                    source_ready_sha256: String::new(),
+                    migration: "retained-candidate-family-composition-v1".to_string(),
+                    migrated_families: vec!["monthly".to_string()],
+                }),
+                artifacts: Vec::new(),
+            }
+        };
+        let origin_ready = origin.join("ready.json");
+        atomic_json(
+            &origin_ready,
+            &ready_receipt("migrationwiki", "origin-run", None),
+        )?;
+        atomic_json(
+            &unrelated.join("ready.json"),
+            &ready_receipt("migrationwiki", "unrelated-run", None),
+        )?;
+        let origin_sha256 = storage::sha256_file(&origin_ready)?.1;
+        let mut retained_ready = ready_receipt("migrationwiki", "retained-run", Some("origin-run"));
+        if let Some(migration) = retained_ready.migrated_from_retained_candidate.as_mut() {
+            migration.source_ready_sha256 = origin_sha256.clone();
+        }
+        atomic_json(&retained.join("ready.json"), &retained_ready)?;
+
+        let entry = SelectionEntry {
+            wiki: "migrationwiki".to_string(),
+            snapshot: "2026-08".to_string(),
+            candidate_relative: "_candidates/migrationwiki/2026-08/retained-run".to_string(),
+            previous_candidate_relative: None,
+            previous_snapshot: None,
+            backup_relative: None,
+            workload_profile: None,
+        };
+
+        // The lineage is discoverable from the retained candidate alone.
+        assert_eq!(
+            migration_lineage_dirs(&retained),
+            BTreeSet::from([origin.clone()]),
+            "the retained candidate's migration origin must be discoverable"
+        );
+
+        // The unrelated candidate is still reclaimed: the fix must not turn
+        // retirement into a no-op.
+        assert_eq!(
+            retire_superseded_candidates(fixture.output.path(), &entry, "publication")?,
+            1
+        );
+        assert!(
+            origin.join("ready.json").is_file(),
+            "retirement deleted the migration origin, which leaves the retained \
+             candidate permanently unauthenticatable"
+        );
+        assert!(retained.join("ready.json").is_file());
+        assert!(
+            !unrelated.exists(),
+            "genuinely superseded candidates must still be retired"
+        );
+
+        // And the retained candidate's lineage still authenticates afterwards,
+        // which is exactly what broke in production.
+        let ready: ReadyWikiCandidate = read_json(&retained.join("ready.json"))?;
+        let origin = retained_ready_lineage_origin(&retained, &ready, &origin_sha256, 0)?;
+        assert_eq!(
+            origin.as_deref(),
+            Some(origin_ready.as_path()),
+            "the retained candidate's lineage still resolves to its origin"
+        );
+        // An unauthorized hash must still resolve to no origin at all, which is
+        // what the caller turns into a hard error.
+        assert_eq!(
+            retained_ready_lineage_origin(&retained, &ready, &"0".repeat(64), 0)?,
+            None,
+            "a mismatched authorized hash must not resolve a lineage origin"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn migration_lineage_walks_a_multi_hop_chain_and_stops_at_the_end() -> Result<()> {
+        // Retirement must protect the whole chain, not just the first hop, and
+        // must not loop forever on a cycle.
+        let dir = TestDir::new()?;
+        let snapshot_dir = dir.path().join("2026-08");
+        let hop = |run: &str| -> Result<PathBuf> {
+            let candidate = snapshot_dir.join(run);
+            fs::create_dir_all(&candidate)?;
+            Ok(candidate)
+        };
+        let ready_receipt = |run: &str, source: Option<&str>| -> ReadyWikiCandidate {
+            ReadyWikiCandidate {
+                schema_version: 1,
+                wiki: "nlwiki".to_string(),
+                snapshot: "2026-08".to_string(),
+                run_id: run.to_string(),
+                ready_at_unix: 1,
+                generating_commit: None,
+                cutoff_date: "2026-08-31".to_string(),
+                workload_profile: None,
+                editor_identity_coverage: None,
+                quality_signals: None,
+                promoted_from_qualification: None,
+                migrated_from_retained_candidate: source.map(|source| RetainedCandidateMigration {
+                    schema_version: 1,
+                    source_run_id: source.to_string(),
+                    source_ready_sha256: String::new(),
+                    migration: "retained-candidate-family-composition-v1".to_string(),
+                    migrated_families: vec!["monthly".to_string()],
+                }),
+                artifacts: Vec::new(),
+            }
+        };
+        let oldest = hop("oldest")?;
+        let middle = hop("middle")?;
+        let newest = hop("newest")?;
+        let write = |candidate: &Path, run: &str, source: Option<&str>| -> Result<()> {
+            atomic_json(&candidate.join("ready.json"), &ready_receipt(run, source))
+        };
+        write(&oldest, "oldest", None)?;
+        write(&middle, "middle", Some("oldest"))?;
+        write(&newest, "newest", Some("middle"))?;
+
+        assert_eq!(
+            migration_lineage_dirs(&newest),
+            BTreeSet::from([middle.clone(), oldest.clone()]),
+            "the whole chain is protected, not just the first hop"
+        );
+        assert!(
+            migration_lineage_dirs(&oldest).is_empty(),
+            "the origin of the chain has no further lineage"
+        );
+
+        // A cycle must terminate rather than spin.
+        let cycle_a = hop("cycle-a")?;
+        let cycle_b = hop("cycle-b")?;
+        write(&cycle_a, "cycle-a", Some("cycle-b"))?;
+        write(&cycle_b, "cycle-b", Some("cycle-a"))?;
+        assert_eq!(
+            migration_lineage_dirs(&cycle_a),
+            BTreeSet::from([cycle_a.clone(), cycle_b.clone()]),
+            "a cyclic provenance chain terminates once it revisits a directory \
+             instead of spinning"
+        );
+
+        // An unresolvable hop stops the walk instead of failing retirement: the
+        // declared path is still protected (it may exist again on a later run)
+        // and nothing panics.
+        let dangling = hop("dangling")?;
+        write(&dangling, "dangling", Some("never-existed"))?;
+        assert_eq!(
+            migration_lineage_dirs(&dangling),
+            BTreeSet::from([snapshot_dir.join("never-existed")]),
+            "an unresolvable hop is protected but ends the walk"
+        );
+        Ok(())
     }
 
     #[test]
