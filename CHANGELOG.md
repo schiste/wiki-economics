@@ -7,11 +7,30 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Defer publication of wikis whose ready candidate is not publishable instead
+  of blocking the whole site on them, behind `--defer-unavailable`. Readiness
+  blockers become per-wiki deferrals; integrity problems (snapshot downgrade,
+  stable-version fingerprint drift, cross-wiki merge-contract conflict, and
+  recovery, scrub or gate failures) remain global blockers under both modes.
+
+### Changed
+
+- Promote dewiki and enwiki to published and scheduled refresh on a 14-day
+  freshness SLA, matching the state the authenticated admin already applied in
+  production.
+
 ### Fixed
 
 - Compose receipt-backed retained-candidate migrations when multiple metric
   families need schema upgrades at once, while preserving the source candidate
   and validating every changed family before publication.
+- Keep a retained candidate's migration lineage across candidate retirement.
+  Retirement previously deleted the `migrated_from_retained_candidate` origin
+  when it fell outside the rollback window, which left the retained candidate
+  permanently unauthenticatable: the site kept serving, but later
+  fingerprint-check, resume and rollback runs all failed.
 
 ## [0.1.3] - 2026-09-25
 

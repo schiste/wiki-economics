@@ -55,11 +55,18 @@ function validRegistry() {
 
 test("production lifecycle schedules qualified Toolforge wikis", () => {
   const registry = loadWikiLifecycle(path.join(__dirname, ".."), {});
-  const productionWikis = [
+  // Wikis promoted by an operator through the authenticated admin, rather than
+  // by the original Toolforge rollout. They are scheduled and published on the
+  // same terms, but they carry admin provenance and a longer freshness SLA
+  // because their refresh cadence is not yet the weekly Toolforge schedule.
+  const adminPromotedWikis = ["dewiki", "enwiki"];
+  const toolforgeWikis = [
     "afwiki", "arwiki", "arzwiki", "elwiki", "eswiki", "frwiki",
     "hawiki", "itwiki", "jawiki", "nlwiki", "ptwiki", "svwiki",
     "swwiki", "viwiki", "yowiki", "zhwiki",
   ];
+  const productionWikis = [...toolforgeWikis, ...adminPromotedWikis]
+    .sort();
   assert.deepEqual(
     resolveRefreshWikis(registry, {}),
     productionWikis,
@@ -75,13 +82,29 @@ test("production lifecycle schedules qualified Toolforge wikis", () => {
   assert.equal(registry.wikis.ptwiki.refresh, "scheduled");
   assert.equal(registry.wikis.ptwiki.provenance, "toolforge");
   assert.equal(registry.wikis.ptwiki.imported_cutoff, undefined);
-  for (const wiki of productionWikis) {
+  for (const wiki of toolforgeWikis) {
     assert.equal(registry.wikis[wiki].publication, "published");
     assert.equal(registry.wikis[wiki].refresh, "scheduled");
     assert.equal(registry.wikis[wiki].provenance, "toolforge");
     assert.equal(registry.wikis[wiki].freshness_sla_days, 10);
     assert.equal(registry.wikis[wiki].imported_cutoff, undefined);
   }
+  for (const wiki of adminPromotedWikis) {
+    assert.equal(registry.wikis[wiki].publication, "published");
+    assert.equal(registry.wikis[wiki].refresh, "scheduled");
+    assert.equal(
+      registry.wikis[wiki].provenance.startsWith("toolforge-admin:"),
+      true,
+      `${wiki} must record who promoted it`,
+    );
+    assert.equal(registry.wikis[wiki].freshness_sla_days, 14);
+    assert.equal(registry.wikis[wiki].imported_cutoff, undefined);
+  }
+  // enwiki is the only wiki bound to the isolated resource class, which no
+  // fleet worker currently serves; that gap is tracked in the repository audit
+  // rather than hidden here.
+  assert.equal(registry.wikis.enwiki.fleet_resource_class, "isolated");
+  assert.equal(registry.wikis.dewiki.fleet_resource_class, "medium_large");
   assert.equal(
     registry.publication_contract.datasets.page_weekly_edits.minimum_rows_by_wiki.elwiki,
     5_000_000,
@@ -197,15 +220,17 @@ test("CLI validates and lists lifecycle selections", () => {
   assert.equal(execFileSync(process.execPath, [SCRIPT, "validate"], { env, encoding: "utf8" }), "");
   assert.equal(
     execFileSync(process.execPath, [SCRIPT, "refresh-wikis"], { env, encoding: "utf8" }),
-    "afwiki\narwiki\narzwiki\nelwiki\neswiki\nfrwiki\nhawiki\nitwiki\njawiki\nnlwiki\nptwiki\nsvwiki\nswwiki\nviwiki\nyowiki\nzhwiki\n",
+    "afwiki\narwiki\narzwiki\ndewiki\nelwiki\nenwiki\neswiki\nfrwiki\nhawiki\nitwiki\njawiki\nnlwiki\nptwiki\nsvwiki\nswwiki\nviwiki\nyowiki\nzhwiki\n",
   );
   assert.equal(
     execFileSync(process.execPath, [SCRIPT, "published-wikis"], { env, encoding: "utf8" }),
-    "afwiki\narwiki\narzwiki\nelwiki\neswiki\nfrwiki\nhawiki\nitwiki\njawiki\nnlwiki\nptwiki\nsvwiki\nswwiki\nviwiki\nyowiki\nzhwiki\n",
+    "afwiki\narwiki\narzwiki\ndewiki\nelwiki\nenwiki\neswiki\nfrwiki\nhawiki\nitwiki\njawiki\nnlwiki\nptwiki\nsvwiki\nswwiki\nviwiki\nyowiki\nzhwiki\n",
   );
+  // Every registered wiki is now promoted, so nothing is held at qualification.
+  // The list commands always terminate with a newline, so an empty set is "\n".
   assert.equal(
     execFileSync(process.execPath, [SCRIPT, "qualification-wikis"], { env, encoding: "utf8" }),
-    "dewiki\nenwiki\n",
+    "\n",
   );
   assert.equal(JSON.parse(execFileSync(process.execPath, [SCRIPT, "json"], { env, encoding: "utf8" })).schema_version, 1);
   assert.throws(() => execFileSync(process.execPath, [SCRIPT, "unknown"], { env, stdio: "pipe" }));
