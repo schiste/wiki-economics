@@ -17,6 +17,9 @@ Enwiki must fit the current 6 GiB/4-vCPU per-job and 24 GiB/16-vCPU namespace
 ceilings; no quota increase is assumed or requested as part of onboarding.
 The [generated lifecycle table](../../docs/generated/stack-reference.md#published-wiki-lifecycle)
 is the source of truth for scheduled Toolforge datasets and paused imports.
+The scheduled datasets are afwiki, arwiki, arzwiki, dewiki, elwiki, enwiki,
+eswiki, frwiki, hawiki, itwiki, jawiki, nlwiki, ptwiki, svwiki, swwiki,
+viwiki, yowiki, and zhwiki; the controller checks each every six hours.
 frwiki completed the measured capacity qualification documented in
 [`docs/benchmarking.md`](../../docs/benchmarking.md) and uses the qualified
 256-logical-bucket envelope through the adaptive `small` profile. dewiki and
