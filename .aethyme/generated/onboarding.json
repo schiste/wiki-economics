@@ -1,0 +1,1132 @@
+{
+  "schema_version": "aethyme-onboarding-v2",
+  "repo": {
+    "name": "wiki-economics",
+    "root": ".",
+    "kind": "repository",
+    "languages": [
+      "rust",
+      "javascript"
+    ],
+    "primary_language": "rust",
+    "package_manager": "cargo",
+    "manifests": [
+      "Cargo.toml",
+      "Procfile",
+      "package.json",
+      "site/package.json",
+      "site/vendor/observable-cache/_npm/@observablehq/plot@0.6.17/package.json",
+      "site/vendor/observable-cache/_npm/apache-arrow@21.2.0/package.json",
+      "site/vendor/observable-cache/_npm/d3-array@3.2.4/package.json",
+      "site/vendor/observable-cache/_npm/d3-chord@3.0.1/package.json",
+      "site/vendor/observable-cache/_npm/d3-contour@4.0.2/package.json",
+      "site/vendor/observable-cache/_npm/d3-delaunay@6.0.4/package.json",
+      "site/vendor/observable-cache/_npm/d3-interpolate@3.0.1/package.json",
+      "site/vendor/observable-cache/_npm/d3-scale@4.0.2/package.json",
+      "site/vendor/observable-cache/_npm/d3-time-format@4.1.0/package.json",
+      "site/vendor/observable-cache/_npm/d3-time@3.1.0/package.json",
+      "site/vendor/observable-cache/_npm/d3-transition@3.0.1/package.json",
+      "site/vendor/observable-cache/_npm/d3@7.9.0/package.json",
+      "site/vendor/observable-cache/_npm/delaunator@5.1.0/package.json",
+      "site/vendor/observable-cache/_npm/interval-tree-1d@1.0.4/package.json",
+      "vendor/object-store/Cargo.toml",
+      "vendor/polars-utils/Cargo.toml"
+    ]
+  },
+  "workspaces": [
+    {
+      "root": ".",
+      "manifest": {
+        "path": "Cargo.toml",
+        "kind": "cargo"
+      },
+      "package_manager": "cargo",
+      "languages": [
+        "rust"
+      ],
+      "members": [],
+      "lockfiles": [
+        "Cargo.lock",
+        "vendor/object-store/Cargo.lock",
+        "vendor/polars-utils/Cargo.lock"
+      ],
+      "candidate_commands": [
+        {
+          "kind": "fast_test",
+          "command": "cargo test",
+          "source": "Cargo.toml",
+          "confidence": "high"
+        },
+        {
+          "kind": "build",
+          "command": "cargo build",
+          "source": "Cargo.toml",
+          "confidence": "high"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "tracked_manifest",
+          "detail": "Cargo.toml",
+          "confidence": "high"
+        },
+        {
+          "kind": "root_manifest",
+          "detail": "manifest is at repository root",
+          "confidence": "high"
+        }
+      ],
+      "confidence": "high",
+      "primary": true,
+      "ranking": {
+        "root_manifest": true,
+        "declares_workspace": false,
+        "member_count": 0,
+        "ci_mentions": 0,
+        "executable_entrypoints": 1,
+        "source_files": 250
+      }
+    },
+    {
+      "root": ".",
+      "manifest": {
+        "path": "package.json",
+        "kind": "node"
+      },
+      "package_manager": "npm",
+      "languages": [
+        "javascript"
+      ],
+      "members": [],
+      "lockfiles": [
+        "package-lock.json"
+      ],
+      "candidate_commands": [
+        {
+          "kind": "dev",
+          "command": "npm run dev",
+          "source": "package.json",
+          "confidence": "high"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "tracked_manifest",
+          "detail": "package.json",
+          "confidence": "high"
+        },
+        {
+          "kind": "root_manifest",
+          "detail": "manifest is at repository root",
+          "confidence": "high"
+        }
+      ],
+      "confidence": "high",
+      "primary": false,
+      "ranking": {
+        "root_manifest": true,
+        "declares_workspace": false,
+        "member_count": 0,
+        "ci_mentions": 0,
+        "executable_entrypoints": 1,
+        "source_files": 250
+      }
+    },
+    {
+      "root": "site",
+      "manifest": {
+        "path": "site/package.json",
+        "kind": "node"
+      },
+      "package_manager": "npm",
+      "languages": [
+        "javascript"
+      ],
+      "members": [],
+      "lockfiles": [],
+      "candidate_commands": [
+        {
+          "kind": "build",
+          "command": "npm --prefix site run build",
+          "source": "site/package.json",
+          "confidence": "high"
+        },
+        {
+          "kind": "dev",
+          "command": "npm --prefix site run dev",
+          "source": "site/package.json",
+          "confidence": "high"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "tracked_manifest",
+          "detail": "site/package.json",
+          "confidence": "high"
+        },
+        {
+          "kind": "ci_usage",
+          "detail": "workspace root mentioned 56 time(s) in CI",
+          "confidence": "medium"
+        }
+      ],
+      "confidence": "high",
+      "primary": false,
+      "ranking": {
+        "root_manifest": false,
+        "declares_workspace": false,
+        "member_count": 0,
+        "ci_mentions": 56,
+        "executable_entrypoints": 0,
+        "source_files": 58
+      }
+    },
+    {
+      "root": "vendor/polars-utils",
+      "manifest": {
+        "path": "vendor/polars-utils/Cargo.toml",
+        "kind": "cargo"
+      },
+      "package_manager": "cargo",
+      "languages": [
+        "rust"
+      ],
+      "members": [],
+      "lockfiles": [
+        "vendor/polars-utils/Cargo.lock"
+      ],
+      "candidate_commands": [
+        {
+          "kind": "fast_test",
+          "command": "cargo test --manifest-path vendor/polars-utils/Cargo.toml",
+          "source": "vendor/polars-utils/Cargo.toml",
+          "confidence": "high"
+        },
+        {
+          "kind": "build",
+          "command": "cargo build --manifest-path vendor/polars-utils/Cargo.toml",
+          "source": "vendor/polars-utils/Cargo.toml",
+          "confidence": "high"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "tracked_manifest",
+          "detail": "vendor/polars-utils/Cargo.toml",
+          "confidence": "high"
+        }
+      ],
+      "confidence": "high",
+      "primary": false,
+      "ranking": {
+        "root_manifest": false,
+        "declares_workspace": false,
+        "member_count": 0,
+        "ci_mentions": 0,
+        "executable_entrypoints": 0,
+        "source_files": 82
+      }
+    },
+    {
+      "root": "vendor/object-store",
+      "manifest": {
+        "path": "vendor/object-store/Cargo.toml",
+        "kind": "cargo"
+      },
+      "package_manager": "cargo",
+      "languages": [
+        "rust"
+      ],
+      "members": [],
+      "lockfiles": [
+        "vendor/object-store/Cargo.lock"
+      ],
+      "candidate_commands": [
+        {
+          "kind": "fast_test",
+          "command": "cargo test --manifest-path vendor/object-store/Cargo.toml",
+          "source": "vendor/object-store/Cargo.toml",
+          "confidence": "high"
+        },
+        {
+          "kind": "build",
+          "command": "cargo build --manifest-path vendor/object-store/Cargo.toml",
+          "source": "vendor/object-store/Cargo.toml",
+          "confidence": "high"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "tracked_manifest",
+          "detail": "vendor/object-store/Cargo.toml",
+          "confidence": "high"
+        }
+      ],
+      "confidence": "high",
+      "primary": false,
+      "ranking": {
+        "root_manifest": false,
+        "declares_workspace": false,
+        "member_count": 0,
+        "ci_mentions": 0,
+        "executable_entrypoints": 0,
+        "source_files": 57
+      }
+    },
+    {
+      "root": "site/vendor/observable-cache/_npm/@observablehq/plot@0.6.17",
+      "manifest": {
+        "path": "site/vendor/observable-cache/_npm/@observablehq/plot@0.6.17/package.json",
+        "kind": "node"
+      },
+      "package_manager": "npm",
+      "languages": [
+        "javascript"
+      ],
+      "members": [],
+      "lockfiles": [],
+      "candidate_commands": [
+        {
+          "kind": "fast_test",
+          "command": "npm --prefix site/vendor/observable-cache/_npm/@observablehq/plot@0.6.17 run test",
+          "source": "site/vendor/observable-cache/_npm/@observablehq/plot@0.6.17/package.json",
+          "confidence": "high"
+        },
+        {
+          "kind": "dev",
+          "command": "npm --prefix site/vendor/observable-cache/_npm/@observablehq/plot@0.6.17 run dev",
+          "source": "site/vendor/observable-cache/_npm/@observablehq/plot@0.6.17/package.json",
+          "confidence": "high"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "tracked_manifest",
+          "detail": "site/vendor/observable-cache/_npm/@observablehq/plot@0.6.17/package.json",
+          "confidence": "high"
+        }
+      ],
+      "confidence": "high",
+      "primary": false,
+      "ranking": {
+        "root_manifest": false,
+        "declares_workspace": false,
+        "member_count": 0,
+        "ci_mentions": 0,
+        "executable_entrypoints": 0,
+        "source_files": 1
+      }
+    },
+    {
+      "root": "site/vendor/observable-cache/_npm/apache-arrow@21.2.0",
+      "manifest": {
+        "path": "site/vendor/observable-cache/_npm/apache-arrow@21.2.0/package.json",
+        "kind": "node"
+      },
+      "package_manager": "npm",
+      "languages": [
+        "javascript"
+      ],
+      "members": [],
+      "lockfiles": [],
+      "candidate_commands": [],
+      "evidence": [
+        {
+          "kind": "tracked_manifest",
+          "detail": "site/vendor/observable-cache/_npm/apache-arrow@21.2.0/package.json",
+          "confidence": "high"
+        }
+      ],
+      "confidence": "high",
+      "primary": false,
+      "ranking": {
+        "root_manifest": false,
+        "declares_workspace": false,
+        "member_count": 0,
+        "ci_mentions": 0,
+        "executable_entrypoints": 0,
+        "source_files": 1
+      }
+    },
+    {
+      "root": "site/vendor/observable-cache/_npm/d3-array@3.2.4",
+      "manifest": {
+        "path": "site/vendor/observable-cache/_npm/d3-array@3.2.4/package.json",
+        "kind": "node"
+      },
+      "package_manager": "npm",
+      "languages": [
+        "javascript"
+      ],
+      "members": [],
+      "lockfiles": [],
+      "candidate_commands": [],
+      "evidence": [
+        {
+          "kind": "tracked_manifest",
+          "detail": "site/vendor/observable-cache/_npm/d3-array@3.2.4/package.json",
+          "confidence": "high"
+        }
+      ],
+      "confidence": "high",
+      "primary": false,
+      "ranking": {
+        "root_manifest": false,
+        "declares_workspace": false,
+        "member_count": 0,
+        "ci_mentions": 0,
+        "executable_entrypoints": 0,
+        "source_files": 1
+      }
+    },
+    {
+      "root": "site/vendor/observable-cache/_npm/d3-chord@3.0.1",
+      "manifest": {
+        "path": "site/vendor/observable-cache/_npm/d3-chord@3.0.1/package.json",
+        "kind": "node"
+      },
+      "package_manager": "npm",
+      "languages": [
+        "javascript"
+      ],
+      "members": [],
+      "lockfiles": [],
+      "candidate_commands": [],
+      "evidence": [
+        {
+          "kind": "tracked_manifest",
+          "detail": "site/vendor/observable-cache/_npm/d3-chord@3.0.1/package.json",
+          "confidence": "high"
+        }
+      ],
+      "confidence": "high",
+      "primary": false,
+      "ranking": {
+        "root_manifest": false,
+        "declares_workspace": false,
+        "member_count": 0,
+        "ci_mentions": 0,
+        "executable_entrypoints": 0,
+        "source_files": 1
+      }
+    },
+    {
+      "root": "site/vendor/observable-cache/_npm/d3-contour@4.0.2",
+      "manifest": {
+        "path": "site/vendor/observable-cache/_npm/d3-contour@4.0.2/package.json",
+        "kind": "node"
+      },
+      "package_manager": "npm",
+      "languages": [
+        "javascript"
+      ],
+      "members": [],
+      "lockfiles": [],
+      "candidate_commands": [],
+      "evidence": [
+        {
+          "kind": "tracked_manifest",
+          "detail": "site/vendor/observable-cache/_npm/d3-contour@4.0.2/package.json",
+          "confidence": "high"
+        }
+      ],
+      "confidence": "high",
+      "primary": false,
+      "ranking": {
+        "root_manifest": false,
+        "declares_workspace": false,
+        "member_count": 0,
+        "ci_mentions": 0,
+        "executable_entrypoints": 0,
+        "source_files": 1
+      }
+    },
+    {
+      "root": "site/vendor/observable-cache/_npm/d3-delaunay@6.0.4",
+      "manifest": {
+        "path": "site/vendor/observable-cache/_npm/d3-delaunay@6.0.4/package.json",
+        "kind": "node"
+      },
+      "package_manager": "npm",
+      "languages": [
+        "javascript"
+      ],
+      "members": [],
+      "lockfiles": [],
+      "candidate_commands": [],
+      "evidence": [
+        {
+          "kind": "tracked_manifest",
+          "detail": "site/vendor/observable-cache/_npm/d3-delaunay@6.0.4/package.json",
+          "confidence": "high"
+        }
+      ],
+      "confidence": "high",
+      "primary": false,
+      "ranking": {
+        "root_manifest": false,
+        "declares_workspace": false,
+        "member_count": 0,
+        "ci_mentions": 0,
+        "executable_entrypoints": 0,
+        "source_files": 1
+      }
+    },
+    {
+      "root": "site/vendor/observable-cache/_npm/d3-interpolate@3.0.1",
+      "manifest": {
+        "path": "site/vendor/observable-cache/_npm/d3-interpolate@3.0.1/package.json",
+        "kind": "node"
+      },
+      "package_manager": "npm",
+      "languages": [
+        "javascript"
+      ],
+      "members": [],
+      "lockfiles": [],
+      "candidate_commands": [],
+      "evidence": [
+        {
+          "kind": "tracked_manifest",
+          "detail": "site/vendor/observable-cache/_npm/d3-interpolate@3.0.1/package.json",
+          "confidence": "high"
+        }
+      ],
+      "confidence": "high",
+      "primary": false,
+      "ranking": {
+        "root_manifest": false,
+        "declares_workspace": false,
+        "member_count": 0,
+        "ci_mentions": 0,
+        "executable_entrypoints": 0,
+        "source_files": 1
+      }
+    },
+    {
+      "root": "site/vendor/observable-cache/_npm/d3-scale@4.0.2",
+      "manifest": {
+        "path": "site/vendor/observable-cache/_npm/d3-scale@4.0.2/package.json",
+        "kind": "node"
+      },
+      "package_manager": "npm",
+      "languages": [
+        "javascript"
+      ],
+      "members": [],
+      "lockfiles": [],
+      "candidate_commands": [],
+      "evidence": [
+        {
+          "kind": "tracked_manifest",
+          "detail": "site/vendor/observable-cache/_npm/d3-scale@4.0.2/package.json",
+          "confidence": "high"
+        }
+      ],
+      "confidence": "high",
+      "primary": false,
+      "ranking": {
+        "root_manifest": false,
+        "declares_workspace": false,
+        "member_count": 0,
+        "ci_mentions": 0,
+        "executable_entrypoints": 0,
+        "source_files": 1
+      }
+    },
+    {
+      "root": "site/vendor/observable-cache/_npm/d3-time-format@4.1.0",
+      "manifest": {
+        "path": "site/vendor/observable-cache/_npm/d3-time-format@4.1.0/package.json",
+        "kind": "node"
+      },
+      "package_manager": "npm",
+      "languages": [
+        "javascript"
+      ],
+      "members": [],
+      "lockfiles": [],
+      "candidate_commands": [],
+      "evidence": [
+        {
+          "kind": "tracked_manifest",
+          "detail": "site/vendor/observable-cache/_npm/d3-time-format@4.1.0/package.json",
+          "confidence": "high"
+        }
+      ],
+      "confidence": "high",
+      "primary": false,
+      "ranking": {
+        "root_manifest": false,
+        "declares_workspace": false,
+        "member_count": 0,
+        "ci_mentions": 0,
+        "executable_entrypoints": 0,
+        "source_files": 1
+      }
+    },
+    {
+      "root": "site/vendor/observable-cache/_npm/d3-time@3.1.0",
+      "manifest": {
+        "path": "site/vendor/observable-cache/_npm/d3-time@3.1.0/package.json",
+        "kind": "node"
+      },
+      "package_manager": "npm",
+      "languages": [
+        "javascript"
+      ],
+      "members": [],
+      "lockfiles": [],
+      "candidate_commands": [],
+      "evidence": [
+        {
+          "kind": "tracked_manifest",
+          "detail": "site/vendor/observable-cache/_npm/d3-time@3.1.0/package.json",
+          "confidence": "high"
+        }
+      ],
+      "confidence": "high",
+      "primary": false,
+      "ranking": {
+        "root_manifest": false,
+        "declares_workspace": false,
+        "member_count": 0,
+        "ci_mentions": 0,
+        "executable_entrypoints": 0,
+        "source_files": 1
+      }
+    },
+    {
+      "root": "site/vendor/observable-cache/_npm/d3-transition@3.0.1",
+      "manifest": {
+        "path": "site/vendor/observable-cache/_npm/d3-transition@3.0.1/package.json",
+        "kind": "node"
+      },
+      "package_manager": "npm",
+      "languages": [
+        "javascript"
+      ],
+      "members": [],
+      "lockfiles": [],
+      "candidate_commands": [],
+      "evidence": [
+        {
+          "kind": "tracked_manifest",
+          "detail": "site/vendor/observable-cache/_npm/d3-transition@3.0.1/package.json",
+          "confidence": "high"
+        }
+      ],
+      "confidence": "high",
+      "primary": false,
+      "ranking": {
+        "root_manifest": false,
+        "declares_workspace": false,
+        "member_count": 0,
+        "ci_mentions": 0,
+        "executable_entrypoints": 0,
+        "source_files": 1
+      }
+    },
+    {
+      "root": "site/vendor/observable-cache/_npm/d3@7.9.0",
+      "manifest": {
+        "path": "site/vendor/observable-cache/_npm/d3@7.9.0/package.json",
+        "kind": "node"
+      },
+      "package_manager": "npm",
+      "languages": [
+        "javascript"
+      ],
+      "members": [],
+      "lockfiles": [],
+      "candidate_commands": [],
+      "evidence": [
+        {
+          "kind": "tracked_manifest",
+          "detail": "site/vendor/observable-cache/_npm/d3@7.9.0/package.json",
+          "confidence": "high"
+        }
+      ],
+      "confidence": "high",
+      "primary": false,
+      "ranking": {
+        "root_manifest": false,
+        "declares_workspace": false,
+        "member_count": 0,
+        "ci_mentions": 0,
+        "executable_entrypoints": 0,
+        "source_files": 1
+      }
+    },
+    {
+      "root": "site/vendor/observable-cache/_npm/delaunator@5.1.0",
+      "manifest": {
+        "path": "site/vendor/observable-cache/_npm/delaunator@5.1.0/package.json",
+        "kind": "node"
+      },
+      "package_manager": "npm",
+      "languages": [
+        "javascript"
+      ],
+      "members": [],
+      "lockfiles": [],
+      "candidate_commands": [
+        {
+          "kind": "build",
+          "command": "npm --prefix site/vendor/observable-cache/_npm/delaunator@5.1.0 run build",
+          "source": "site/vendor/observable-cache/_npm/delaunator@5.1.0/package.json",
+          "confidence": "high"
+        }
+      ],
+      "evidence": [
+        {
+          "kind": "tracked_manifest",
+          "detail": "site/vendor/observable-cache/_npm/delaunator@5.1.0/package.json",
+          "confidence": "high"
+        }
+      ],
+      "confidence": "high",
+      "primary": false,
+      "ranking": {
+        "root_manifest": false,
+        "declares_workspace": false,
+        "member_count": 0,
+        "ci_mentions": 0,
+        "executable_entrypoints": 0,
+        "source_files": 1
+      }
+    },
+    {
+      "root": "site/vendor/observable-cache/_npm/interval-tree-1d@1.0.4",
+      "manifest": {
+        "path": "site/vendor/observable-cache/_npm/interval-tree-1d@1.0.4/package.json",
+        "kind": "node"
+      },
+      "package_manager": "npm",
+      "languages": [
+        "javascript"
+      ],
+      "members": [],
+      "lockfiles": [],
+      "candidate_commands": [],
+      "evidence": [
+        {
+          "kind": "tracked_manifest",
+          "detail": "site/vendor/observable-cache/_npm/interval-tree-1d@1.0.4/package.json",
+          "confidence": "high"
+        }
+      ],
+      "confidence": "high",
+      "primary": false,
+      "ranking": {
+        "root_manifest": false,
+        "declares_workspace": false,
+        "member_count": 0,
+        "ci_mentions": 0,
+        "executable_entrypoints": 0,
+        "source_files": 1
+      }
+    }
+  ],
+  "primary_workspace": {
+    "root": ".",
+    "manifest": {
+      "path": "Cargo.toml",
+      "kind": "cargo"
+    },
+    "package_manager": "cargo",
+    "languages": [
+      "rust"
+    ],
+    "members": [],
+    "lockfiles": [
+      "Cargo.lock",
+      "vendor/object-store/Cargo.lock",
+      "vendor/polars-utils/Cargo.lock"
+    ],
+    "candidate_commands": [
+      {
+        "kind": "fast_test",
+        "command": "cargo test",
+        "source": "Cargo.toml",
+        "confidence": "high"
+      },
+      {
+        "kind": "build",
+        "command": "cargo build",
+        "source": "Cargo.toml",
+        "confidence": "high"
+      }
+    ],
+    "evidence": [
+      {
+        "kind": "tracked_manifest",
+        "detail": "Cargo.toml",
+        "confidence": "high"
+      },
+      {
+        "kind": "root_manifest",
+        "detail": "manifest is at repository root",
+        "confidence": "high"
+      }
+    ],
+    "confidence": "high",
+    "primary": true,
+    "ranking": {
+      "root_manifest": true,
+      "declares_workspace": false,
+      "member_count": 0,
+      "ci_mentions": 0,
+      "executable_entrypoints": 1,
+      "source_files": 250
+    }
+  },
+  "commands": [
+    {
+      "kind": "dev",
+      "command": "npm run dev",
+      "source": "package.json",
+      "confidence": "high",
+      "workspace_root": ".",
+      "provenance": "derived from tracked workspace manifest"
+    },
+    {
+      "kind": "dev",
+      "command": "npm --prefix site run dev",
+      "source": "site/package.json",
+      "confidence": "high",
+      "workspace_root": "site",
+      "provenance": "derived from tracked workspace manifest"
+    },
+    {
+      "kind": "dev",
+      "command": "npm --prefix site/vendor/observable-cache/_npm/@observablehq/plot@0.6.17 run dev",
+      "source": "site/vendor/observable-cache/_npm/@observablehq/plot@0.6.17/package.json",
+      "confidence": "high",
+      "workspace_root": "site/vendor/observable-cache/_npm/@observablehq/plot@0.6.17",
+      "provenance": "derived from tracked workspace manifest"
+    },
+    {
+      "kind": "dev",
+      "command": "cargo run",
+      "source": "Cargo.toml",
+      "confidence": "medium"
+    },
+    {
+      "kind": "dev",
+      "command": "node site/admin-server.cjs",
+      "source": "Procfile:web",
+      "confidence": "medium"
+    },
+    {
+      "kind": "fast_test",
+      "command": "cargo test",
+      "source": "Cargo.toml",
+      "confidence": "high",
+      "workspace_root": ".",
+      "provenance": "derived from tracked workspace manifest"
+    },
+    {
+      "kind": "fast_test",
+      "command": "npm --prefix site/vendor/observable-cache/_npm/@observablehq/plot@0.6.17 run test",
+      "source": "site/vendor/observable-cache/_npm/@observablehq/plot@0.6.17/package.json",
+      "confidence": "high",
+      "workspace_root": "site/vendor/observable-cache/_npm/@observablehq/plot@0.6.17",
+      "provenance": "derived from tracked workspace manifest"
+    },
+    {
+      "kind": "fast_test",
+      "command": "cargo test --manifest-path vendor/object-store/Cargo.toml",
+      "source": "vendor/object-store/Cargo.toml",
+      "confidence": "high",
+      "workspace_root": "vendor/object-store",
+      "provenance": "derived from tracked workspace manifest"
+    },
+    {
+      "kind": "fast_test",
+      "command": "cargo test --manifest-path vendor/polars-utils/Cargo.toml",
+      "source": "vendor/polars-utils/Cargo.toml",
+      "confidence": "high",
+      "workspace_root": "vendor/polars-utils",
+      "provenance": "derived from tracked workspace manifest"
+    },
+    {
+      "kind": "build",
+      "command": "cargo build",
+      "source": "Cargo.toml",
+      "confidence": "high",
+      "workspace_root": ".",
+      "provenance": "derived from tracked workspace manifest"
+    },
+    {
+      "kind": "build",
+      "command": "npm --prefix site run build",
+      "source": "site/package.json",
+      "confidence": "high",
+      "workspace_root": "site",
+      "provenance": "derived from tracked workspace manifest"
+    },
+    {
+      "kind": "build",
+      "command": "npm --prefix site/vendor/observable-cache/_npm/delaunator@5.1.0 run build",
+      "source": "site/vendor/observable-cache/_npm/delaunator@5.1.0/package.json",
+      "confidence": "high",
+      "workspace_root": "site/vendor/observable-cache/_npm/delaunator@5.1.0",
+      "provenance": "derived from tracked workspace manifest"
+    },
+    {
+      "kind": "build",
+      "command": "cargo build --manifest-path vendor/object-store/Cargo.toml",
+      "source": "vendor/object-store/Cargo.toml",
+      "confidence": "high",
+      "workspace_root": "vendor/object-store",
+      "provenance": "derived from tracked workspace manifest"
+    },
+    {
+      "kind": "build",
+      "command": "cargo build --manifest-path vendor/polars-utils/Cargo.toml",
+      "source": "vendor/polars-utils/Cargo.toml",
+      "confidence": "high",
+      "workspace_root": "vendor/polars-utils",
+      "provenance": "derived from tracked workspace manifest"
+    }
+  ],
+  "primary_commands": {
+    "dev": "npm run dev",
+    "fast_test": "cargo test",
+    "build": "cargo build"
+  },
+  "areas": [
+    {
+      "path": ".github",
+      "role": "automation",
+      "reason": "automation and CI configuration",
+      "confidence": "high"
+    },
+    {
+      "path": "deploy",
+      "role": "infrastructure",
+      "reason": "deployment or infrastructure configuration",
+      "confidence": "high"
+    },
+    {
+      "path": "docs",
+      "role": "docs",
+      "reason": "documentation area",
+      "confidence": "high"
+    },
+    {
+      "path": "scripts",
+      "role": "tooling",
+      "reason": "developer tooling or scripts",
+      "confidence": "high"
+    },
+    {
+      "path": "src",
+      "role": "source",
+      "reason": "conventional source directory",
+      "confidence": "high"
+    },
+    {
+      "path": "tests",
+      "role": "tests",
+      "reason": "conventional test directory",
+      "confidence": "high"
+    },
+    {
+      "path": "vendor",
+      "role": "generated_or_vendor",
+      "reason": "generated output or vendored dependencies",
+      "confidence": "high"
+    }
+  ],
+  "entrypoints": [
+    {
+      "path": "Procfile:web",
+      "kind": "process",
+      "role": "app",
+      "reason": "Procfile process entrypoint",
+      "confidence": "high",
+      "relevance": "supporting"
+    },
+    {
+      "path": "src/main.rs",
+      "kind": "file",
+      "role": "app",
+      "reason": "conventional Rust binary entrypoint",
+      "confidence": "high",
+      "relevance": "supporting"
+    },
+    {
+      "path": "package.json:scripts.dev",
+      "kind": "script",
+      "role": "app",
+      "reason": "package dev script",
+      "confidence": "medium",
+      "relevance": "supporting"
+    },
+    {
+      "path": "package.json:scripts.start",
+      "kind": "script",
+      "role": "app",
+      "reason": "package start script",
+      "confidence": "medium",
+      "relevance": "supporting"
+    },
+    {
+      "path": "site/admin-server.cjs",
+      "kind": "file",
+      "role": "app",
+      "reason": "Procfile process entrypoint target",
+      "confidence": "medium",
+      "relevance": "supporting"
+    },
+    {
+      "path": "tests",
+      "kind": "directory",
+      "role": "test",
+      "reason": "conventional test root",
+      "confidence": "medium",
+      "relevance": "supporting"
+    }
+  ],
+  "primary_entrypoints": {
+    "app": {
+      "path": "src/main.rs",
+      "kind": "file",
+      "role": "app",
+      "reason": "conventional Rust binary entrypoint",
+      "confidence": "high",
+      "relevance": "supporting"
+    },
+    "test": {
+      "path": "tests",
+      "kind": "directory",
+      "role": "test",
+      "reason": "conventional test root",
+      "confidence": "medium",
+      "relevance": "supporting"
+    }
+  },
+  "caution_zones": [
+    {
+      "path": "vendor",
+      "reason": "likely generated, vendored, fixture, or migration-heavy area"
+    }
+  ],
+  "generated_paths": [
+    {
+      "path": ".aethyme/generated",
+      "reason": "tracked generated or vendored surface; verify ownership before editing",
+      "provenance": "tracked path classification"
+    },
+    {
+      "path": "config/generated",
+      "reason": "tracked generated or vendored surface; verify ownership before editing",
+      "provenance": "tracked path classification"
+    },
+    {
+      "path": "docs/generated",
+      "reason": "tracked generated or vendored surface; verify ownership before editing",
+      "provenance": "tracked path classification"
+    },
+    {
+      "path": "site/vendor",
+      "reason": "tracked generated or vendored surface; verify ownership before editing",
+      "provenance": "tracked path classification"
+    },
+    {
+      "path": "vendor",
+      "reason": "tracked generated or vendored surface; verify ownership before editing",
+      "provenance": "tracked path classification"
+    }
+  ],
+  "dangerous_paths": [
+    {
+      "path": ".aethyme/gates.toml",
+      "reason": "repository validation policy; changes affect every broker submission",
+      "provenance": "tracked path classification"
+    },
+    {
+      "path": ".github/workflows",
+      "reason": "repository automation; changes can affect publication or shared CI",
+      "provenance": "tracked path classification"
+    },
+    {
+      "path": "deploy",
+      "reason": "deployment, infrastructure, or migration surface; review repository policy before editing",
+      "provenance": "tracked path classification"
+    }
+  ],
+  "navigation_recipes": [
+    {
+      "purpose": "Broad repository orientation for a user request",
+      "command": "aethyme explore --repo \"$PWD\" --request \"<task>\" --format answer-json"
+    },
+    {
+      "purpose": "Quick deterministic repo summary",
+      "command": "aethyme repo inspect \"$PWD\" --mode brief --json-output"
+    },
+    {
+      "purpose": "Trace likely impact before editing",
+      "command": "aethyme graph callers \"$PWD\" \"<symbol-or-file>\" --json-output"
+    }
+  ],
+  "summon": {
+    "description": "Use when starting work in an unfamiliar repository, when the task asks for repo overview, setup, architecture, entrypoints, test commands, or where to begin. Skip for narrow file-scoped edits once the relevant paths are already known.",
+    "recommended_when": [
+      "first task in repo",
+      "repo overview",
+      "setup or run instructions",
+      "architecture or entrypoints",
+      "where should I start",
+      "broad debugging or feature-localization request"
+    ],
+    "skip_when": [
+      "known file-scoped edit",
+      "follow-up inside already identified area",
+      "task already localized to concrete files"
+    ],
+    "task_signals": [
+      "unfamiliar repository",
+      "broad task with no path named",
+      "user asks how the repo is organized"
+    ]
+  },
+  "freshness": {
+    "source_digest": "829ffa6f14b3f0c5c9fd531bc1a354d174403720a7db0380f888c505a6cd0e00",
+    "source_commit": null,
+    "source_file_count": 589,
+    "generator": "deterministic"
+  },
+  "telemetry": {
+    "sections": [
+      "repo",
+      "workspaces",
+      "primary_workspace",
+      "commands",
+      "areas",
+      "entrypoints",
+      "caution_zones",
+      "generated_paths",
+      "dangerous_paths",
+      "navigation_recipes",
+      "summon",
+      "freshness"
+    ],
+    "counts": {
+      "workspaces": 19,
+      "commands": 14,
+      "areas": 7,
+      "entrypoints": 6,
+      "caution_zones": 1,
+      "generated_paths": 5,
+      "dangerous_paths": 3,
+      "navigation_recipes": 3,
+      "notes": 0
+    },
+    "overrides_applied": false,
+    "override_source": null,
+    "override_invalid": false
+  }
+}
