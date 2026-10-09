@@ -1,0 +1,86 @@
+{
+  "schema_version": "aethyme-act-starter-v1",
+  "repo": {
+    "name": "wiki-economics",
+    "kind": "repository"
+  },
+  "recommended_mode": "repo-act",
+  "starter_checklists": {
+    "debugging": [
+      "Load repo-onboarding first if the repository or area is unfamiliar.",
+      "Run Aethyme Explore on the user task before broad manual search.",
+      "Verify answer candidates before concluding when trust_policy is not answer-safe.",
+      "Identify the nearest fast test or validation command before editing.",
+      "Inspect caution zones before changing generated or vendored areas."
+    ],
+    "change_validation": [
+      "Run the fastest relevant test command first.",
+      "Check likely entrypoints and impacted callers before finishing.",
+      "Re-run lint/build only after the focused validation passes.",
+      "Document any override-based maintainer note that affected the change plan."
+    ]
+  },
+  "commands": {
+    "fast_test": "cargo test",
+    "full_test": null,
+    "lint": null,
+    "build": "cargo build",
+    "dev": "npm run dev"
+  },
+  "entrypoints": [
+    {
+      "path": "Procfile:web",
+      "kind": "process",
+      "role": "app",
+      "reason": "Procfile process entrypoint",
+      "confidence": "high",
+      "relevance": "supporting"
+    },
+    {
+      "path": "src/main.rs",
+      "kind": "file",
+      "role": "app",
+      "reason": "conventional Rust binary entrypoint",
+      "confidence": "high",
+      "relevance": "supporting"
+    },
+    {
+      "path": "package.json:scripts.dev",
+      "kind": "script",
+      "role": "app",
+      "reason": "package dev script",
+      "confidence": "medium",
+      "relevance": "supporting"
+    }
+  ],
+  "primary_entrypoints": {
+    "app": {
+      "path": "src/main.rs",
+      "kind": "file",
+      "role": "app",
+      "reason": "conventional Rust binary entrypoint",
+      "confidence": "high",
+      "relevance": "supporting"
+    },
+    "test": {
+      "path": "tests",
+      "kind": "directory",
+      "role": "test",
+      "reason": "conventional test root",
+      "confidence": "medium",
+      "relevance": "supporting"
+    }
+  },
+  "caution_zones": [
+    {
+      "path": "vendor",
+      "reason": "likely generated, vendored, fixture, or migration-heavy area"
+    }
+  ],
+  "telemetry": {
+    "derived_from": ".aethyme/generated/onboarding.json",
+    "entrypoint_count": 6,
+    "primary_entrypoint_count": 2,
+    "caution_zone_count": 1
+  }
+}
