@@ -30,7 +30,7 @@ jobs:
       image: ${{ steps.filter.outputs.image }}
     steps:
       - name: Check out repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
         with:
           fetch-depth: 2
 
@@ -80,12 +80,12 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
         with:
           fetch-depth: 0
 
       - name: Install Node.js
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v6
         with:
           node-version-file: .node-version
           package-manager-cache: false
@@ -162,16 +162,16 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # @stable as of pin
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f  # @stable as of pin
         with:
           toolchain: 1.98.0
           components: rustfmt, clippy
 
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2
         with:
           workspaces: ". -> target"
           cache-on-failure: true
@@ -199,10 +199,10 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
 
       - name: Install Node.js
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v6
         with:
           node-version-file: .node-version
           package-manager-cache: false
@@ -217,12 +217,12 @@ jobs:
         run: node scripts/check-npm-advisories.cjs
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # @stable as of pin
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f  # @stable as of pin
         with:
           toolchain: 1.98.0
 
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2
         with:
           workspaces: ". -> target"
           cache-on-failure: true
@@ -252,7 +252,7 @@ jobs:
           --report "$RUNNER_TEMP/browser-performance.json"
 
       - name: Retain browser performance evidence
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: browser-performance
           path: ${{ runner.temp }}/browser-performance.json
@@ -268,10 +268,10 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
 
       - name: Install Node.js
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v6
         with:
           node-version-file: .node-version
           package-manager-cache: false
@@ -283,18 +283,18 @@ jobs:
         run: npm ci
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # @stable as of pin
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f  # @stable as of pin
         with:
           toolchain: 1.98.0
 
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2
         with:
           workspaces: ". -> target"
           cache-on-failure: true
 
       - name: Install coverage tooling
-        uses: taiki-e/install-action@51cd0b8c0499559d9a4d75c0f5c67bec3a894ec8  # v2
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad  # v2
         with:
           tool: cargo-llvm-cov
 
@@ -305,7 +305,7 @@ jobs:
         run: python3 scripts/check_lcov.py "$LLVM_COV_OUTPUT_PATH"
 
       - name: Upload coverage artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: llvm-cov-lcov
           path: ${{ env.LLVM_COV_OUTPUT_PATH }}
@@ -318,10 +318,10 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
 
       - name: Install Node.js
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v6
         with:
           node-version-file: .node-version
           package-manager-cache: false
@@ -342,7 +342,7 @@ jobs:
         run: node scripts/check-npm-licenses.cjs
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # @stable as of pin
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f  # @stable as of pin
         with:
           toolchain: 1.98.0
 
@@ -358,21 +358,21 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # @stable as of pin
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f  # @stable as of pin
         with:
           toolchain: 1.98.0
 
       - name: Cache cargo artifacts
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2
         with:
           workspaces: ". -> target"
           cache-on-failure: true
 
       - name: Install security tooling
-        uses: taiki-e/install-action@51cd0b8c0499559d9a4d75c0f5c67bec3a894ec8  # v2
+        uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad  # v2
         with:
           tool: cargo-deny,cargo-audit
 
@@ -412,12 +412,12 @@ jobs:
 
     steps:
       - name: Check out repository history
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
         with:
           fetch-depth: 0
 
       - name: Install Node.js
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v6
         with:
           node-version-file: .node-version
           package-manager-cache: false
@@ -429,12 +429,12 @@ jobs:
         run: npm ci
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@3c5f7ea28cd621ae0bf5283f0e981fb97b8a7af9  # @stable as of pin
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f  # @stable as of pin
         with:
           toolchain: 1.98.0
 
       - name: Cache release artifacts
-        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32  # v2
+        uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16  # v2
         with:
           workspaces: ". -> target"
           shared-key: toolforge-release
@@ -500,7 +500,7 @@ jobs:
           subject-path: target/release/wiki-econ-release-${{ github.sha }}.tar.gz
 
       - name: Upload release artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: wiki-econ-linux-x86_64-${{ github.sha }}
           path: |
@@ -534,10 +534,10 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v6
 
       - name: Install Node.js
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e  # v6
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1  # v6
         with:
           node-version-file: .node-version
           package-manager-cache: false
@@ -559,7 +559,7 @@ jobs:
           subject-path: wiki-econ-site-source-${{ github.sha }}.tar.gz
 
       - name: Upload site-source artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7
         with:
           name: wiki-econ-site-source-${{ github.sha }}
           path: |
